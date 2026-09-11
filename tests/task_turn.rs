@@ -302,15 +302,17 @@ fn prepared_task_turn_with_close(
     let (store, request, cancel) = prepared_task_turn_at(
         &temp.path().join("host"),
         script,
-        TaskSource::Local {
-            wip: false,
-            push_target: None,
+        PreparedTaskTurnSpec {
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            origin_url: None,
+            timeout_millis: 30_000,
+            close_policy,
         },
-        vec![PublishMode::Fetch],
-        None,
-        None,
-        30_000,
-        close_policy,
     );
     (temp, store, request, cancel)
 }
@@ -328,15 +330,17 @@ fn prepared_task_turn_with_timeout(
     let (store, request, cancel) = prepared_task_turn_at(
         &temp.path().join("host"),
         script,
-        TaskSource::Local {
-            wip: false,
-            push_target: None,
+        PreparedTaskTurnSpec {
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            origin_url: None,
+            timeout_millis,
+            close_policy: ClosePolicy::Never,
         },
-        vec![PublishMode::Fetch],
-        None,
-        None,
-        timeout_millis,
-        ClosePolicy::Never,
     );
     (temp, store, request, cancel)
 }
@@ -354,15 +358,17 @@ fn prepared_push_task_turn(
     let (store, request, cancel) = prepared_task_turn_at(
         &temp.path().join("host"),
         script,
-        TaskSource::Local {
-            wip: false,
-            push_target: Some(PushTarget::new(origin.to_owned()).unwrap()),
+        PreparedTaskTurnSpec {
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: Some(PushTarget::new(origin.to_owned()).unwrap()),
+            },
+            publish: vec![PublishMode::Fetch, PublishMode::Push],
+            publish_branch: Some("release-candidate".parse().unwrap()),
+            origin_url: Some(origin.to_owned()),
+            timeout_millis: 30_000,
+            close_policy: ClosePolicy::Never,
         },
-        vec![PublishMode::Fetch, PublishMode::Push],
-        Some("release-candidate".parse().unwrap()),
-        Some(origin.to_owned()),
-        30_000,
-        ClosePolicy::Never,
     );
     (temp, store, request, cancel)
 }
@@ -379,20 +385,32 @@ fn request_with_mismatched_origin(
     .unwrap()
 }
 
-fn prepared_task_turn_at(
-    host: &Path,
-    script: &str,
+struct PreparedTaskTurnSpec {
     task_source: TaskSource,
     publish: Vec<PublishMode>,
     publish_branch: Option<BranchName>,
     origin_url: Option<String>,
     timeout_millis: u64,
     close_policy: ClosePolicy,
+}
+
+fn prepared_task_turn_at(
+    host: &Path,
+    script: &str,
+    spec: PreparedTaskTurnSpec,
 ) -> (
     HostStore,
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
+    let PreparedTaskTurnSpec {
+        task_source,
+        publish,
+        publish_branch,
+        origin_url,
+        timeout_millis,
+        close_policy,
+    } = spec;
     let store = HostStore::open(host).unwrap();
     let source = GitRepo::init();
     source.write("base.txt", b"base\n");
@@ -2263,15 +2281,17 @@ fn scoped_close_on_done_leaves_a_peer_task_lease_untouched() {
     let (store, request, _cancel) = prepared_task_turn_at(
         &host,
         AUTO_CLOSE_DONE_SCRIPT,
-        TaskSource::Local {
-            wip: false,
-            push_target: None,
+        PreparedTaskTurnSpec {
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            origin_url: None,
+            timeout_millis: 30_000,
+            close_policy: ClosePolicy::Done,
         },
-        vec![PublishMode::Fetch],
-        None,
-        None,
-        30_000,
-        ClosePolicy::Done,
     );
     let status = submit_inline(&store, request);
     assert_eq!(status.state(), TaskState::Closed);
@@ -2788,15 +2808,17 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
     let (store, request, cancel_request) = prepared_task_turn_at(
         &host,
         script,
-        TaskSource::Local {
-            wip: false,
-            push_target: None,
+        PreparedTaskTurnSpec {
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            origin_url: None,
+            timeout_millis: 30_000,
+            close_policy: ClosePolicy::Never,
         },
-        vec![PublishMode::Fetch],
-        None,
-        None,
-        30_000,
-        ClosePolicy::Never,
     );
     write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
