@@ -19,7 +19,7 @@ npm install
 npm run dev
 ```
 
-Vite serves on <http://localhost:5173> and proxies `/api` to the dashboard.
+Vite serves on `http://localhost:5173` and proxies `/api` to the dashboard.
 Point it elsewhere with `DASHBOARD_ORIGIN=http://127.0.0.1:<port> npm run dev`.
 The proxy keeps the browser same-origin, which matters because the dashboard
 sends no CORS headers and validates the request Host against its own listener.

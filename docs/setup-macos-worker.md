@@ -53,7 +53,7 @@ cat "$HOME/.ssh/mac-worker_ed25519.pub" | \
 
 Add this block to the laptop's `~/.ssh/config`, replacing the hostname and username. It lets SSH find and unlock the dedicated key; an extra alias is optional:
 
-```sshconfig
+```ssh-config
 Host mini.local
     User yourname
     IdentityFile ~/.ssh/mac-worker_ed25519

@@ -1,0 +1,52 @@
+@font-face {
+  font-family: 'IBM Plex Sans';
+  src: url('/assets/plex-sans-regular.ttf') format('truetype');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  src: url('/assets/plex-sans-medium.ttf') format('truetype');
+  font-weight: 500 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/assets/plex-mono-regular.ttf') format('truetype');
+  font-display: swap;
+}
+:root {
+  --vp-font-family-base: 'IBM Plex Sans', sans-serif;
+  --vp-font-family-mono: 'IBM Plex Mono', monospace;
+  --vp-c-brand-1: #a3432b;
+  --vp-c-brand-2: #bd5135;
+  --vp-c-brand-3: #cf6347;
+  --vp-c-brand-soft: #b6533812;
+  --vp-c-bg: #fbfaf7;
+  --vp-c-bg-alt: #f1efe9;
+  --vp-c-bg-soft: #f3f1ec;
+  --vp-c-text-1: #282b28;
+  --vp-c-text-2: #62665e;
+  --vp-c-divider: #dedfd5;
+  --vp-sidebar-width: 278px;
+}
+.dark {
+  --vp-c-brand-1: #eea58c;
+  --vp-c-brand-2: #e78e71;
+  --vp-c-brand-3: #d77759;
+  --vp-c-brand-soft: #df88641c;
+  --vp-c-bg: #1c211e;
+  --vp-c-bg-alt: #171c19;
+  --vp-c-bg-soft: #252c27;
+  --vp-c-text-1: #e7e8e1;
+  --vp-c-text-2: #b6bcb4;
+  --vp-c-divider: #354038;
+}
+.VPNavBarTitle .title { font-family: var(--vp-font-family-mono); font-size: 15px; letter-spacing: -.6px; }
+.vp-doc h1 { font-size: 38px; letter-spacing: -1.4px; line-height: 1.15; }
+.vp-doc h2 { letter-spacing: -.5px; }
+.vp-doc p, .vp-doc li { line-height: 1.75; }
+.vp-doc div[class*='language-'] { border: 1px solid var(--vp-c-divider); border-radius: 7px; }
+.vp-doc img { border: 1px solid var(--vp-c-divider); border-radius: 8px; }
+.vp-doc .mermaid { overflow-x: auto; }
+@media (max-width: 640px) { .vp-doc h1 { font-size: 32px; } }

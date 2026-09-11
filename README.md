@@ -1,6 +1,6 @@
 # mac-worker
 
-**English** · [Русский](README.ru.md)
+**English** · [Русский](README.ru.md) · [Documentation website](https://kirchik95.github.io/mac-worker/)
 
 <!-- Keep README.md and README.ru.md in sync. Detailed instructions belong in docs/getting-started.md. -->
 

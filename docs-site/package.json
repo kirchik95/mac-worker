@@ -1,0 +1,16 @@
+{
+  "name": "mac-worker-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare": "node prepare.mjs",
+    "dev": "npm run prepare && vitepress dev --host 127.0.0.1",
+    "build": "npm run prepare && vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "mermaid": "^11.12.0",
+    "vitepress": "1.6.4",
+    "vitepress-plugin-mermaid": "2.0.17"
+  }
+}

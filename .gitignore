@@ -3,3 +3,8 @@
 /dist/
 /ui/node_modules/
 /ui/dist/
+/docs-site/node_modules/
+/docs-site/content/
+/docs-site/.vitepress/cache/
+/docs-site/.vitepress/dist/
+/docs-site/__pycache__/
