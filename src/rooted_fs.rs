@@ -1940,7 +1940,13 @@ impl RootedDir {
         if !same_file(&before, &opened) {
             return Err(os_error(libc::ESTALE));
         }
-        cvt(unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) })?;
+        // Idempotent repair: a concurrent steady-state ensure must not bump
+        // ctime (and trip a peer's snapshot-stability read) when the mode is
+        // already exactly right. Compare full permission bits like the checks
+        // below, not a narrower mask.
+        if opened.st_mode as u32 & 0o7777 != mode {
+            cvt(unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) })?;
+        }
         file.sync_all()?;
         let after = stat_fd(file.as_raw_fd())?;
         let rebound = stat_at(self.root.as_raw_fd(), &target)?;
@@ -20547,5 +20553,60 @@ mod tests {
         for (kind, plant) in cases {
             run_published_evidence_case(kind, plant);
         }
+    }
+}
+
+#[cfg(test)]
+mod mode_repair_interleaving_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn owner_hook_root() -> (tempfile::TempDir, RootedDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = RootedDir::create(&root_path).unwrap();
+        (temp, root)
+    }
+
+    fn hook_mode(root: &RootedDir) -> u32 {
+        let path_stat = stat_at(root.raw_directory_fd(), &CString::new("hook").unwrap()).unwrap();
+        (path_stat.st_mode & 0o7777) as u32
+    }
+
+    #[test]
+    fn stable_read_survives_redundant_same_mode_chmod() {
+        // Deterministic interleaving for the concurrent mirror-open ESTALE:
+        // every ensure_mirror_directory reads hooks/pre-receive and then
+        // unconditionally fchmods it. A peer fchmod bumps ctime mid-read and
+        // trips snapshot_metadata_stable. The read hook below replays the
+        // peer mutation deterministically (no threads, no sleeps).
+        let (_temp, root) = owner_hook_root();
+        root.write_private_atomic_no_replace("hook", b"expected")
+            .unwrap();
+        root.set_private_regular_mode("hook", 0o700).unwrap();
+        assert_eq!(hook_mode(&root), 0o700);
+        let bytes = root
+            .read_private_regular_with_hook("hook", 1024, || {
+                root.set_private_regular_mode("hook", 0o700).unwrap();
+            })
+            .expect("stable read must survive a redundant same-mode chmod");
+        assert_eq!(bytes, b"expected");
+        assert_eq!(hook_mode(&root), 0o700);
+    }
+
+    #[test]
+    fn mode_repair_still_changes_a_wrong_mode() {
+        // The idempotency guard must not disable real repair.
+        let (_temp, root) = owner_hook_root();
+        root.write_private_atomic_no_replace("hook", b"expected")
+            .unwrap();
+        root.set_private_regular_mode("hook", 0o600).unwrap();
+        assert_eq!(hook_mode(&root), 0o600);
+        root.set_private_regular_mode("hook", 0o700).unwrap();
+        assert_eq!(hook_mode(&root), 0o700);
+        let bytes = root
+            .read_private_regular("hook", 1024)
+            .expect("repaired file must read");
+        assert_eq!(bytes, b"expected");
     }
 }
