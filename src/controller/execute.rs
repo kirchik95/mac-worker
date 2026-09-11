@@ -35,7 +35,7 @@ use crate::{
         registry::{self, OwnedCheckoutMap, ProjectRegistry},
         store::{
             ActiveResumeConfig, ControllerAck, ControllerCommandHandler, ControllerFault,
-            ControllerStore, OperationMeta,
+            ControllerStore, OperationMeta, rejection_result,
         },
         stream_rpc::{is_transfer_command, serve_transfer_command},
         task_mutations::{
@@ -48,7 +48,7 @@ use crate::{
     paths::PathLayout,
     prepared_submit::FrozenSubmitBody,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    task_client::TaskClient,
+    task_client::{TaskClient, validate_close_target},
     transfer_repo::TransferRepo,
     turn_runner::DetachedRunnerExecutor,
 };
@@ -196,6 +196,14 @@ impl TaskSubmitHandler<'_> {
             .map_err(|_| {
                 WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared mutation is invalid".into())
             })?;
+        if let PreparedTaskMutation::Close { expected, .. } = &prepared {
+            let current = self.client_state.load_task(expected.meta().task_id())?;
+            if let Err(error) = validate_close_target(&current, expected) {
+                // Settle only the read-only stale-target fence. Errors from
+                // execution below may follow side effects and remain retryable.
+                return Ok(rejection_result(&error));
+            }
+        }
         let client = TaskClient::new(
             self.runner,
             self.config,

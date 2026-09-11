@@ -389,9 +389,11 @@ Controller Git object transfer uses one global lock for object verification and 
 
 After updating the CLI and helpers, restart the controller process and any running dashboard or dashboard tunnel with their existing configuration and port. Already-running processes keep the old code after a binary replacement. A dashboard that reports `INVALID_RESPONSE` while a fresh `worker workers` invocation reports ready workers may need this restart. See [Update or remove](getting-started.md#update-or-remove).
 
-### Known close-retry limitation
+### Close request recovery
 
-A `task.close` request issued while a turn is still active can remain in the controller journal after it fails. If the turn then changes the task's revision or head, the saved close request keeps failing the revision checks and may consume retry work. Closing the task with a new request after it becomes quiescent does not retire that older request. This cleanup limitation remains unresolved. Wait for `worker task wait --task-id <id>` before closing a task; preserve the journal when investigating an existing stale request.
+A saved `task.close` request whose target has changed is rejected before any close action with `TASK_REVISION_CONFLICT` or `TASK_CLOSED`. The controller saves that rejection and removes the request from the active retry index. Replaying the same request returns the saved rejection; it does not close a newer turn. Existing stale requests are settled when the updated controller next processes them, including through its recovery tick. Their journal records remain available for diagnosis.
+
+Errors from an already-started close, including transport failures after retaining the close intent, remain retryable. A repeated close of the same completed target is still idempotent. Wait for `worker task wait --task-id <id>` before closing an active task.
 
 ## What the pool will and will not do
 

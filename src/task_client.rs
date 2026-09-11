@@ -80,6 +80,37 @@ fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> b
         && current.status().turns().last().map(TurnSummary::turn_id)
             == expected.status().turns().last().map(TurnSummary::turn_id)
 }
+
+/// Read-only close fence, shared with the durable controller's rejection
+/// preflight. Errors here cannot follow queue, close-intent, or host writes.
+pub(crate) fn validate_close_target(
+    current: &LocalTaskRecord,
+    expected: &LocalTaskRecord,
+) -> Result<(), WorkerError> {
+    if matches!(
+        current.status().state(),
+        TaskState::Closed | TaskState::Abandoned
+    ) {
+        if same_close_target(current, expected)
+            && current
+                .close_intent()
+                .is_none_or(|intent| intent.matches_record(current))
+        {
+            return Ok(());
+        }
+        return Err(task_error("TASK_CLOSED", "task is terminal"));
+    }
+    if current.status().state() == TaskState::Lost {
+        return Err(task_error("TASK_CLOSED", "task is terminal"));
+    }
+    if !operator_revision_matches(current, expected) {
+        return Err(task_error(
+            "TASK_REVISION_CONFLICT",
+            "task changed before close",
+        ));
+    }
+    Ok(())
+}
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(100);
 pub(crate) const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 
@@ -2287,28 +2318,13 @@ impl<'a> TaskClient<'a> {
     ) -> Result<TaskReport, WorkerError> {
         let task_id = expected.meta().task_id();
         let record = self.client_state.load_task(task_id)?;
+        validate_close_target(&record, expected)?;
         if matches!(
             record.status().state(),
             TaskState::Closed | TaskState::Abandoned
         ) {
-            if same_close_target(&record, expected)
-                && record
-                    .close_intent()
-                    .is_none_or(|intent| intent.matches_record(&record))
-            {
-                let _ = self.release_task_base(&record);
-                return self.report_for(task_id);
-            }
-            return Err(task_error("TASK_CLOSED", "task is terminal"));
-        }
-        if record.status().state() == TaskState::Lost {
-            return Err(task_error("TASK_CLOSED", "task is terminal"));
-        }
-        if !operator_revision_matches(&record, expected) {
-            return Err(task_error(
-                "TASK_REVISION_CONFLICT",
-                "task changed before close",
-            ));
+            let _ = self.release_task_base(&record);
+            return self.report_for(task_id);
         }
         if let Some(reason) = self.operator_busy_reason(task_id, &record)?
             && !(record.close_intent().is_some() && reason == CLOSE_IN_PROGRESS)

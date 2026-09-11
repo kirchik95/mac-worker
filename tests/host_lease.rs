@@ -1376,10 +1376,10 @@ fn hidden_lease_acquire_failures_are_versioned_and_capacity_typed() {
     let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
     assert_eq!(error.error().code(), "CAPACITY_BUSY");
-    assert_eq!(error.error().message(), "worker admission rejected");
+    assert_eq!(error.error().message(), "all host execution slots are busy");
     assert_eq!(
         stdout,
-        br#"{"protocol_version":7,"error":{"code":"CAPACITY_BUSY","message":"worker admission rejected"}}
+        br#"{"protocol_version":7,"error":{"code":"CAPACITY_BUSY","message":"all host execution slots are busy"}}
 "#
     );
     let rendered = String::from_utf8(stdout).unwrap();

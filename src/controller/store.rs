@@ -1219,12 +1219,14 @@ fn validate_record(name: &str, record: &DurableRequest) -> Result<(), WorkerErro
 
 /// Reserved key for a saved terminal business rejection. No command result
 /// uses it: `task.submit` saves `{task_id, turn_id}`, `task.batch` saves
-/// `{run_id, task_ids}`, and mutations save a task status projection.
+/// `{run_id, task_ids}`, and successful mutations save a task status projection.
 const REJECTION_KEY: &str = "controller_rejection";
 const REJECTION_VERSION: u64 = 1;
 
-/// Definitive, no-effect business rejections that must settle instead of being
-/// retried. Deliberately narrow:
+/// Classify errors returned by execution. Close-target preflight rejections
+/// are encoded explicitly by TaskSubmitHandler before any execution effects;
+/// the same error codes from execution must remain retryable here.
+/// Definitive, no-effect admission rejections are deliberately narrow:
 ///
 /// * only `task.submit`, the one command whose rejection sites are proven to
 ///   precede any task row (`TaskClient::submit_with_ids` returns
@@ -1248,7 +1250,7 @@ fn terminal_rejection_code(command: &str, error: &WorkerError) -> Option<&'stati
     }
 }
 
-fn rejection_result(error: &WorkerError) -> Value {
+pub(super) fn rejection_result(error: &WorkerError) -> Value {
     serde_json::json!({
         REJECTION_KEY: {
             "version": REJECTION_VERSION,
@@ -1284,13 +1286,29 @@ fn saved_rejection(result: Option<&Value>) -> Result<Option<WorkerError>, Worker
         .and_then(Value::as_str)
         .filter(|message| !message.is_empty())
         .ok_or_else(invalid_rejection)?;
-    Ok(Some(WorkerError::capacity_public(code, message.to_owned())))
+    let error = match code {
+        "TASK_REVISION_CONFLICT" if message == "task changed before close" => {
+            WorkerError::task(code, "task changed before close")
+        }
+        "TASK_CLOSED" if message == "task is terminal" => {
+            WorkerError::task(code, "task is terminal")
+        }
+        "CAPACITY_BUSY" | "CAPABILITY_MISSING" => {
+            WorkerError::capacity_public(code, message.to_owned())
+        }
+        // Close preflight messages are static literals; do not turn arbitrary
+        // stored task text into a public diagnostic or change its exit kind.
+        _ => return Err(invalid_rejection()),
+    };
+    Ok(Some(error))
 }
 
 fn known_rejection_code(code: &str) -> Option<&'static str> {
     match code {
         "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),
         "CAPABILITY_MISSING" => Some("CAPABILITY_MISSING"),
+        "TASK_REVISION_CONFLICT" => Some("TASK_REVISION_CONFLICT"),
+        "TASK_CLOSED" => Some("TASK_CLOSED"),
         _ => None,
     }
 }

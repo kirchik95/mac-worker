@@ -20,7 +20,8 @@ use mac_worker::{
     client_state::ClientStateStore,
     config::Config,
     controller::{
-        PreparedTaskMutation, execute_task_mutation, parse_request, prepare_task_mutation,
+        ActiveResumeConfig, ControllerFault, ControllerStore, PreparedTaskMutation, RequestPhase,
+        TaskSubmitHandler, execute_task_mutation, parse_request, prepare_task_mutation,
     },
     error::WorkerError,
     job::ProcessIdentity,
@@ -706,4 +707,207 @@ fn close_without_discard_field_defaults_to_keep() {
     let host = CloseHost::new(expected.status().clone());
     let report = execute_task_mutation(&harness.client(&host), &close).unwrap();
     assert_eq!(report.status().state(), TaskState::Closed);
+}
+
+/// Keep the real controller, journal and TaskClient; only the SSH boundary is
+/// unavailable. A stale close must not reach it, including after a restart.
+struct UnavailableCloseHost {
+    calls: AtomicUsize,
+}
+
+impl ProcessRunner for UnavailableCloseHost {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            return SystemProcessRunner.run(request);
+        }
+        assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(WorkerError::Unavailable("test host is offline".into()))
+    }
+}
+
+fn assert_stale_close_is_settled(already_closed: bool) {
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(81, 82);
+    let task_id = expected.meta().task_id();
+    let envelope = request(REQUEST_ID, "task.close", json!({"task_id": task_id}));
+    let host = UnavailableCloseHost {
+        calls: AtomicUsize::new(0),
+    };
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let root = harness.paths.controller_state_root();
+    let journal = ControllerStore::open(&root).unwrap();
+    journal
+        .handle_with(&envelope, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let frozen = journal.load(REQUEST_ID).unwrap().unwrap();
+    assert_eq!(frozen.phase(), RequestPhase::Published);
+    assert!(frozen.result().is_none());
+    // Preparation may reconcile the selected task. Only execution of the
+    // already-published stale envelope must avoid further host calls.
+    let host_calls_before_execute = host.calls.load(Ordering::SeqCst);
+
+    let mut changed = serde_json::to_value(&expected).unwrap();
+    changed["status"]["updated_at_millis"] = json!(3);
+    let (expected_code, expected_message) = if already_closed {
+        changed["status"]["state"] = json!("closed");
+        changed["status"]["head_oid"] = json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        ("TASK_CLOSED", "task is terminal")
+    } else {
+        ("TASK_REVISION_CONFLICT", "task changed before close")
+    };
+    let changed: LocalTaskRecord = serde_json::from_value(changed).unwrap();
+    harness.store.update_task(changed.clone()).unwrap();
+
+    let error = journal
+        .handle_with(&envelope, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), expected_code);
+    assert_eq!(error.public_message(), expected_message);
+    assert!(matches!(error, WorkerError::Task { .. }));
+    let settled = journal.load(REQUEST_ID).unwrap().unwrap();
+    assert_eq!(
+        settled.phase(),
+        RequestPhase::Acked,
+        "stale close must stop consuming retries"
+    );
+    assert_eq!(settled.prepared(), frozen.prepared());
+    assert_eq!(
+        settled.result().unwrap()["controller_rejection"]["code"],
+        expected_code
+    );
+    assert!(
+        !root
+            .join("active")
+            .join(format!("{REQUEST_ID}.json"))
+            .exists()
+    );
+    drop(journal);
+
+    let reopened = ControllerStore::open(&root).unwrap();
+    for _ in 0..2 {
+        let tick = reopened
+            .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+            .unwrap();
+        assert!(tick.completed.is_empty());
+        assert!(tick.failed.is_empty());
+        let replay = reopened
+            .handle_with(&envelope, &handler, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(replay.public_code(), expected_code);
+        assert_eq!(replay.public_message(), expected_message);
+    }
+    assert_eq!(harness.store.load_task(task_id).unwrap(), changed);
+    assert_eq!(host.calls.load(Ordering::SeqCst), host_calls_before_execute);
+}
+
+#[test]
+fn journal_stale_close_revision_is_retired_and_replays_the_saved_rejection() {
+    assert_stale_close_is_settled(false);
+}
+
+#[test]
+fn journal_stale_close_of_a_different_terminal_head_is_retired() {
+    assert_stale_close_is_settled(true);
+}
+
+struct RetryCloseHost {
+    failure: Mutex<Option<WorkerError>>,
+    calls: AtomicUsize,
+    host: CloseHost,
+}
+
+impl ProcessRunner for RetryCloseHost {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            return SystemProcessRunner.run(request);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.failure.lock().unwrap().take() {
+            return Err(error);
+        }
+        self.host.run(request)
+    }
+}
+
+#[test]
+fn journal_close_failure_after_intent_stays_pending_and_recovers() {
+    // A transport failure after the durable close intent must keep enough
+    // state for a later retry to finish the same close.
+    let failure = WorkerError::Unavailable("test host is offline".into());
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(91, 92);
+    let task_id = expected.meta().task_id();
+    let envelope = request(REQUEST_ID, "task.close", json!({"task_id": task_id}));
+    let preparation_host = UnavailableCloseHost {
+        calls: AtomicUsize::new(0),
+    };
+    let preparation = TaskSubmitHandler::new(
+        &preparation_host,
+        &harness.config,
+        &harness.paths,
+        &harness.store,
+    );
+    let root = harness.paths.controller_state_root();
+    let journal = ControllerStore::open(&root).unwrap();
+    journal
+        .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let host = RetryCloseHost {
+        failure: Mutex::new(Some(failure)),
+        calls: AtomicUsize::new(0),
+        host: CloseHost::new(expected.status().clone()),
+    };
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    journal
+        .handle_with(&envelope, &handler, ControllerFault::None)
+        .unwrap_err();
+    let pending = journal.load(REQUEST_ID).unwrap().unwrap();
+    assert_eq!(pending.phase(), RequestPhase::Published);
+    assert!(pending.result().is_none());
+    assert!(
+        root.join("active")
+            .join(format!("{REQUEST_ID}.json"))
+            .exists()
+    );
+    assert!(
+        harness
+            .store
+            .load_task(task_id)
+            .unwrap()
+            .close_intent()
+            .is_some()
+    );
+    drop(journal);
+
+    let reopened = ControllerStore::open(&root).unwrap();
+    let tick = reopened
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(tick.failed.is_empty(), "{:?}", tick.failed);
+    assert_eq!(tick.completed.len(), 1);
+    assert_eq!(
+        reopened.load(REQUEST_ID).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    assert!(
+        !root
+            .join("active")
+            .join(format!("{REQUEST_ID}.json"))
+            .exists()
+    );
+    let closed = harness.store.load_task(task_id).unwrap();
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert!(closed.close_intent().is_none());
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+
+    reopened
+        .handle_with(&envelope, &handler, ControllerFault::None)
+        .unwrap();
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    let fresh_close = request(REQUEST_ID_2, "task.close", json!({"task_id": task_id}));
+    reopened
+        .handle_with(&fresh_close, &handler, ControllerFault::None)
+        .expect("a fresh close of the same terminal target remains idempotent");
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
 }

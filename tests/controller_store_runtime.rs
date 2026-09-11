@@ -1146,6 +1146,20 @@ impl SwitchableExecutor {
 }
 
 impl ControllerCommandHandler for SwitchableExecutor {
+    fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
+        if request.command() == "task.close" {
+            // Kernel-only fixture: preparation is irrelevant to the execution
+            // error classifier, but the durable row must retain the command.
+            return Ok(OperationMeta {
+                task_id: Some(REJECT_TASK_ID.into()),
+                turn_id: Some(REJECT_TURN_ID.into()),
+                created_at_millis: 1,
+                prepared: json!({}),
+            });
+        }
+        default_prepare_operation(request)
+    }
+
     fn execute(&self, record: &DurableRequest) -> Result<Value, WorkerError> {
         self.calls
             .lock()
@@ -1172,6 +1186,10 @@ fn clone_worker_error(error: &WorkerError) -> WorkerError {
         },
         WorkerError::Protocol(message) => WorkerError::Protocol(message.clone()),
         WorkerError::Unavailable(message) => WorkerError::Unavailable(message.clone()),
+        WorkerError::Task { code, message } => WorkerError::Task {
+            code,
+            message: message.clone(),
+        },
         other => WorkerError::Protocol(format!("unexpected test error shape: {other}")),
     }
 }
@@ -1411,6 +1429,45 @@ fn infrastructure_failure_stays_pending_and_recovers() {
     assert!(active_entries(&state).is_empty());
 }
 
+#[test]
+fn close_execution_errors_with_fence_codes_remain_retryable() {
+    // Unlike the read-only preflight, execution may already have retained a
+    // cancellation or sent host writes. Its error code alone cannot settle it.
+    for (code, message) in [
+        ("TASK_REVISION_CONFLICT", "task changed before close"),
+        ("TASK_CLOSED", "task is terminal"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = SwitchableExecutor::rejecting(WorkerError::task(code, message));
+        let request = request_for(ID_R5, "task.close", json!({"task_id": REJECT_TASK_ID}));
+        let error = store
+            .handle_with(&request, &executor, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(error.public_code(), code);
+        assert!(matches!(error, WorkerError::Task { .. }));
+        let pending = store.load(ID_R5).unwrap().unwrap();
+        assert_eq!(pending.phase(), RequestPhase::Published);
+        assert!(pending.result().is_none());
+        assert_eq!(active_entries(&state), vec![format!("{ID_R5}.json")]);
+        drop(store);
+
+        executor.stop_rejecting();
+        let reopened = ControllerStore::open(&state).unwrap();
+        let tick = reopened
+            .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+            .unwrap();
+        assert_eq!(tick.completed.len(), 1);
+        assert!(tick.failed.is_empty());
+        assert_eq!(executor.calls_for(ID_R5), 2);
+        assert_eq!(
+            reopened.load(ID_R5).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
+        assert!(active_entries(&state).is_empty());
+    }
+}
+
 /// An interruption BEFORE the rejection is durable leaves a genuinely
 /// ambiguous outcome: the caller never received the definitive rejection, and
 /// recovery may legitimately execute and succeed once capacity frees. The
@@ -1489,6 +1546,10 @@ fn malformed_saved_rejection_fails_closed_and_never_executes() {
         (
             "unknown code",
             json!({"controller_rejection": {"version": 1, "code": "NOT_A_REJECTION", "message": "x"}}),
+        ),
+        (
+            "nonpublic close diagnostic",
+            json!({"controller_rejection": {"version": 1, "code": "TASK_CLOSED", "message": "/private/task/path"}}),
         ),
         (
             "not an object",
