@@ -142,7 +142,7 @@ worker task submit --agent codex --wip --wait \
 
 `--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
 
-For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Start with this small file task to check the connection and agent before running a build.
+For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Preview also supports a controller-only laptop configuration: it preserves worker pins for the controller to validate at submit time. Named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Start with this small file task to check the connection and agent before running a build.
 
 ### 4. Follow the work
 
@@ -154,9 +154,9 @@ worker workers --refresh
 
 The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not start or cancel tasks. From a task card you can reply or accept using the same `say` / `close` paths as the CLI; a stale card is rejected. `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies. Details: [usage](docs/usage.md#dashboard).
 
-To submit and return immediately, omit `--wait`.
+To submit and return after admission, omit `--wait`. This still allows the task to wait for a free slot. `--no-wait` controls capacity instead: if eligible workers are at capacity, the submit fails with `CAPACITY_BUSY` and exit code **75**. In controller mode that rejection is final: the rejected task will not start when a slot becomes free. Submit a new request when you want to try again.
 
-`worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
+`worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
 
 Default `--close-on done` closes the task after an agent `done` turn. That is not human acceptance. For a review loop, submit with `--close-on never`, inspect summary/diff/ref, then `worker task close <id>` to accept or `worker task say` to follow up. `close --discard` drops the session.
 
@@ -209,7 +209,9 @@ The scheduler uses an available compatible worker. Each Mac defaults to **one** 
 
 ## Update or remove
 
-Install a newer published CLI with `install.sh --version <release-tag>`, then update the helpers:
+Before updating, let active tasks finish and keep a copy of the current binaries for rollback. If you use a remote controller, stop its `worker controller run` process for the update and keep the laptop CLI, controller CLI, and worker helpers on the same build.
+
+Install a newer published CLI with `install.sh --version <release-tag>` on the laptop and, if used, the controller host. Then update the helpers and check their health using a configuration containing the worker inventory:
 
 ```bash
 worker setup
@@ -217,6 +219,16 @@ worker workers --refresh
 ```
 
 `worker setup` with no names updates every configured worker. It does not install or update the agents themselves. It warms each helper before verification and refreshes facts under a separate 120 s deadline. After successful verification, a warm-up failure is a `WARMUP_FAILED` warning and a slow facts refresh is a `FACTS_REFRESH_FAILED` warning; verification failure still rolls back the helper. See [installation recovery](docs/setup-recovery.md) if an older installation needs attention.
+
+A controller-only laptop configuration has no local worker list; run these commands from the controller host or use an explicit inventory configuration. After updating, restart `worker controller run` on the controller host with its existing configuration.
+
+**Restart any running dashboard after replacing the CLI.** Stop a foreground dashboard with Ctrl+C in its terminal, then start it again with the same configuration and port, for example:
+
+```bash
+worker dashboard --port 9173
+```
+
+Replacing the binary on disk or reloading the browser tab does not update an already-running dashboard process. An older process can show every worker as `OFFLINE / INVALID_RESPONSE` because it cannot decode a newer helper's response. After restarting, check that the dashboard shows current workers and that `worker workers` reports them ready. Configuration and task history are retained.
 
 To remove the CLI installed by the script, delete `~/.local/bin/worker` (or the file in your chosen `--bin-dir`). This keeps configuration and task history. See [removal and stored data](docs/setup-macos-worker.md#removal-and-stored-data) before retiring a worker.
 

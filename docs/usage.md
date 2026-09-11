@@ -57,7 +57,7 @@ Confirm the installed grammar with `worker task --help`. There is no `worker tas
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). It keeps stderr and launch failures verbatim and prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing; use `--raw` for the original log bytes.
 
-`worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. `TASK_BUSY` and capacity errors such as `CAPABILITY_MISSING` include their reason.
+`worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
 
 `worker task reconcile` adopts, restarts, or finalizes a row only on positive proof that the previous runner exited: the pid was reused by a different process, or `Absent` was seen twice at least 750 ms apart. A single missed lookup, an ambiguous process-table read, or a transient error is unverifiable — the row is left alone, the report counts it, and `task list` shows `RUNNER_UNVERIFIABLE` only after that state has lasted 30 s. The operator path uses the same rule; it does not treat unverifiable as exited.
 
@@ -110,6 +110,8 @@ lockfiles = ["Cargo.lock"]
 Each `[[workers]]` entry defaults to `slots = 1` **per worker** (`1..=8`). That laptop value is a client **ceiling**. The Mac’s durable authority is `leases/capacity.json` `{ "slot_count": N }` on the host (hidden `worker host set-slots N`). Combined detached runner capacity is `sum(worker.slots)`, not the number of workers.
 
 Same `task_id` is serialized (`WORKSPACE_BUSY`). Distinct task IDs from one checkout may overlap when that host’s `slot_count >= 2`. Layout, migrate, and probe occupancy: [multiple execution slots](superpowers/specs/2026-09-10-slots-design.md). Extra slots do not make Git/object transfers independent: a worker still serializes a job behind its transfer lock. On a controller, slow object verification and pinning can delay unrelated transfer preparation and finalization. The streaming pack child does not hold the global transfer lock for its lifetime.
+
+`worker task submit` waits for capacity by default. Omitting `--wait` lets the CLI return after admission; it does not disable queueing. Add `--no-wait` to reject a submit when eligible workers are at capacity (`CAPACITY_BUSY`, exit 75). In controller mode an admission rejection with `CAPACITY_BUSY` or `CAPABILITY_MISSING` is saved as a final result: it keeps the public reason and cannot become a delayed task when capacity changes. To try again, submit a new request. Transport failures follow the controller's recovery path and are not capacity rejections.
 
 ## Origin delivery
 
@@ -373,7 +375,7 @@ The controller imports the worker’s published result so later DAG work can pro
 
 ### Batches and slots
 
-`worker task batch FILE --preview` stays local: it validates the file and does not open the controller store or dispatch.
+`worker task batch FILE --preview` stays local: it validates the file and does not open the controller store or dispatch. It works with a controller-only laptop configuration, including worker pins. The preview preserves those names; the controller checks its own inventory when you submit. A successful preview does not prove that a worker exists or is currently available.
 
 Named `depends_on` / `base = "from:<id>"` still wait for each parent to be **Closed and Done** (including `close_on = never`, which needs human `close` before a `from:` child may run). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`). `from:` binds that parent’s accepted **controller** import, not origin `pending` and not a laptop `fetch` you have not run.
 
@@ -384,6 +386,12 @@ Controller Git object transfer uses one global lock for object verification and 
 ### Dashboard
 
 `worker dashboard [--port N] [--no-open] [--no-facts-refresh]` on an enabled laptop is the tunnel described in [Dashboard](#dashboard). Reply and accept still require the current card against the store the dashboard is serving.
+
+After updating the CLI and helpers, restart the controller process and any running dashboard or dashboard tunnel with their existing configuration and port. Already-running processes keep the old code after a binary replacement. A dashboard that reports `INVALID_RESPONSE` while a fresh `worker workers` invocation reports ready workers may need this restart. See [Update or remove](../README.md#update-or-remove).
+
+### Known close-retry limitation
+
+A `task.close` request issued while a turn is still active can remain in the controller journal after it fails. If the turn then changes the task's revision or head, the saved close request keeps failing the revision checks and may consume retry work. Closing the task with a new request after it becomes quiescent does not retire that older request. This cleanup limitation remains unresolved. Wait for `worker task wait --task-id <id>` before closing a task; preserve the journal when investigating an existing stale request.
 
 ## What the pool will and will not do
 
