@@ -428,9 +428,49 @@ fn abandon_capture_threads(
     }
 }
 
+fn reap_owned_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    if let Err(error) = child.kill()
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err(error);
+    }
+    child.wait().map(|_| ())
+}
+
+/// Non-signalling probe of the saved pgid. Signal 0 does not kill a reused
+/// group. Only ESRCH means `pgrp_find` missed; POSIX empty/zombie-only groups
+/// still return EPERM and must not be treated as gone.
+fn saved_process_group_is_gone(process_group: libc::pid_t) -> bool {
+    (unsafe { libc::killpg(process_group, 0) }) == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+fn recover_after_killpg_eperm(
+    child: &mut Child,
+    process_group: libc::pid_t,
+    error: io::Error,
+) -> io::Result<()> {
+    if error.raw_os_error() != Some(libc::EPERM) {
+        return Err(error);
+    }
+    // Reap the owned leader only. getpgid(leader) ESRCH and kill(pid) do not
+    // prove the saved group is empty. Accept the original EPERM only if
+    // killpg of that same pgid with signal 0 is ESRCH.
+    reap_owned_child(child)?;
+    if saved_process_group_is_gone(process_group) {
+        return Ok(());
+    }
+    Err(error)
+}
+
 fn terminate_child(child: &mut Child, process_group: Option<libc::pid_t>) -> io::Result<()> {
     if let Some(process_group) = process_group {
-        terminate_process_group(process_group)?;
+        if let Err(error) = terminate_process_group(process_group) {
+            return recover_after_killpg_eperm(child, process_group, error);
+        }
     } else if let Err(error) = child.kill()
         && error.raw_os_error() != Some(libc::ESRCH)
     {
@@ -528,7 +568,10 @@ impl RollingByteWindow {
 mod tests {
     use super::*;
     use crate::error::ProcessStream;
-    use std::time::{Duration, Instant};
+    use std::{
+        os::unix::process::CommandExt,
+        time::{Duration, Instant},
+    };
 
     fn policy() -> ProcessPolicy {
         ProcessPolicy {
@@ -661,5 +704,99 @@ mod tests {
             })
         ));
         kill_recorded_grandchild(&temp);
+    }
+
+    struct SavedGroup {
+        pgid: libc::pid_t,
+        armed: bool,
+    }
+
+    impl SavedGroup {
+        fn new(pgid: libc::pid_t) -> Self {
+            Self { pgid, armed: true }
+        }
+
+        fn cleanup_once(&mut self) {
+            if !self.armed {
+                return;
+            }
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
+            self.armed = false;
+        }
+    }
+
+    impl Drop for SavedGroup {
+        fn drop(&mut self) {
+            if self.armed {
+                unsafe {
+                    libc::killpg(self.pgid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    fn injected_eperm() -> io::Error {
+        io::Error::from_raw_os_error(libc::EPERM)
+    }
+
+    #[test]
+    fn eperm_recovery_preserves_error_while_a_fixture_descendant_holds_the_group() {
+        // Leader exits; `cat` stays blocked on the stdin pipe we hold, so the
+        // saved pgid remains. Noninteractive sh redirects a bare `cat &` to
+        // /dev/null; dup the pipe onto fd 3 so the descendant actually holds
+        // it. Injected EPERM must not be swallowed (0d8 Ok-after-reap /
+        // getpgid-only).
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec 3<&0; PATH=/bin:/usr/bin /bin/cat <&3 & exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let process_group = child.id() as libc::pid_t;
+        let mut guard = SavedGroup::new(process_group);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            unsafe { libc::killpg(process_group, 0) },
+            0,
+            "fixture cat must remain live in the saved group, not zombie-only"
+        );
+        assert_eq!(
+            recover_after_killpg_eperm(&mut child, process_group, injected_eperm())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM),
+            "recovery must keep EPERM while the saved group still exists"
+        );
+        assert!(!saved_process_group_is_gone(process_group));
+        guard.cleanup_once();
+        drop(stdin);
+    }
+
+    #[test]
+    fn eperm_recovery_accepts_a_reaped_finite_group_that_is_absent() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "dd if=/dev/zero bs=65536 count=32 2>/dev/null"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process_group = child.id() as libc::pid_t;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = [0_u8; 32];
+        let _ = stdout.read(&mut buf);
+        let mut rest = [0_u8; 8192];
+        while stdout.read(&mut rest).unwrap_or(0) > 0 {}
+        drop(stdout);
+        child.wait().unwrap();
+        recover_after_killpg_eperm(&mut child, process_group, injected_eperm())
+            .expect("empty saved group after reap is the accepted EPERM recovery");
+        assert!(saved_process_group_is_gone(process_group));
     }
 }
