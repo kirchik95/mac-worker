@@ -1,15 +1,23 @@
 #[allow(dead_code)]
 mod support;
 
-use std::io::{self, Write};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{self, Write},
+};
 
 use mac_worker::{
+    RuntimeContext,
     agent::{AgentKind, PermissionPolicy},
+    cli::{Cli, Command, TaskCommand},
     client_state::ClientStateStore,
     config::Config,
     error::WorkerError,
+    failure_receipt::{FailureReceipt, RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
+    run_with_io_in_context,
     task::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
@@ -729,4 +737,133 @@ fn historical_empty_legacy_follow_does_not_wait_for_a_later_active_turn() {
         )
         .unwrap_err();
     assert_eq!(error.public_code(), "LOG_COMPLETION_UNKNOWN");
+}
+
+#[test]
+fn task_logs_render_the_host_io_stage_from_an_early_exit_line() {
+    let turn = finished_turn(1, TaskOutcome::failed("HOST_IO"));
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);
+    fixture.append(
+        turn.turn_id(),
+        b"exited after acceptance: HOST_IO stage=cleanup message=host state operation failed workers=mini-1\n",
+    );
+    let output = String::from_utf8(fixture.logs(None, false).unwrap()).unwrap();
+    assert!(
+        output.contains("exited after acceptance: HOST_IO stage=cleanup"),
+        "{output}"
+    );
+}
+
+#[test]
+fn task_status_json_includes_stage_and_residual() {
+    let _root = tempfile::tempdir().unwrap();
+    let root_path = _root.path().canonicalize().unwrap();
+    let home = root_path.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut environment = BTreeMap::new();
+    for (key, name) in [
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_STATE_HOME", "xdg-state"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_DATA_HOME", "xdg-data"),
+    ] {
+        let path = root_path.join(name);
+        fs::create_dir_all(&path).unwrap();
+        environment.insert(key.into(), path.into());
+    }
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+    fs::write(
+        &paths.config,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    )
+    .unwrap();
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let task_id = TaskId::generate();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id: "a".repeat(64),
+        worktree_id: "b".repeat(64),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid: "a".repeat(40).parse().unwrap(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Fixture", "fixture@example.test").unwrap(),
+        title: None,
+        prompt: "private prompt body".into(),
+        created_at_millis: 1,
+    })
+    .unwrap();
+    let status = TaskStatus::new(
+        TaskState::Closed,
+        Some(TaskOutcome::failed("HOST_IO")),
+        Some("mini-1".into()),
+        false,
+        Some(meta.base_oid().clone()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![finished_turn(1, TaskOutcome::failed("HOST_IO"))],
+        2,
+    )
+    .unwrap();
+    let receipt =
+        FailureReceipt::new(STAGE_CLEANUP, &[RESIDUAL_LEASE, RESIDUAL_CLEANUP_TREE]).unwrap();
+    store
+        .create_task(
+            LocalTaskRecord::new(
+                meta,
+                status,
+                None,
+                None,
+                None,
+                "c".repeat(64),
+                None,
+                true,
+                None,
+            )
+            .unwrap()
+            .with_failure_receipt(Some(receipt))
+            .unwrap(),
+        )
+        .unwrap();
+
+    let runtime = RuntimeContext::isolated(environment, home, root_path);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(
+        Cli {
+            config: Some(paths.config),
+            json: true,
+            command: Command::Task {
+                command: TaskCommand::Status {
+                    task_id,
+                    full: false,
+                },
+            },
+        },
+        &NoProcesses,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["stage"], "cleanup");
+    assert_eq!(
+        value["residual"],
+        serde_json::json!(["lease", "cleanup-tree"])
+    );
 }

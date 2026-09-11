@@ -2453,6 +2453,35 @@ mod tests {
     }
 
     #[test]
+    fn the_post_acceptance_early_exit_line_includes_a_host_io_stage() {
+        let receipt = crate::failure_receipt::FailureReceipt::new(
+            crate::failure_receipt::STAGE_CLEANUP,
+            &[
+                crate::failure_receipt::RESIDUAL_LEASE,
+                crate::failure_receipt::RESIDUAL_CLEANUP_TREE,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            early_exit_diagnostic_line(
+                true,
+                None,
+                "HOST_IO",
+                "protocol error: HOST_IO: host state operation failed",
+                &["mini-1"],
+                Some(&receipt),
+            ),
+            "exited after acceptance: HOST_IO stage=cleanup message=protocol error: HOST_IO: host state operation failed workers=mini-1\n"
+        );
+        assert_eq!(
+            last_post_acceptance_public_code(
+                b"exited after acceptance: HOST_IO stage=cleanup workers=mini-1\n"
+            ),
+            Some("HOST_IO")
+        );
+    }
+
+    #[test]
     fn last_post_acceptance_code_prefers_the_error_field_on_the_latest_line() {
         let log = b"exited after acceptance: WAITING_FOR_DISPATCH error=HOST_IO message=x workers=mini-1\n\
 exited after acceptance: HOST_IO message=again workers=mini-1\n";

@@ -5800,6 +5800,16 @@ fn crash_after_local_record_publication_is_recovered_on_the_next_pass() {
         unpublished[0].remote_uncertainty(),
         &RemoteUncertainty::None
     );
+    let crashed_owner = *stranded.entries()[0].owner();
+    assert!(
+        store.recover_dead_dispatches().unwrap().is_empty(),
+        "a single unconfirmed Absent must not free the heavy slot"
+    );
+    assert!(matches!(
+        store.queue_snapshot().unwrap().entries()[0].state(),
+        QueueState::Dispatching { .. }
+    ));
+    store.note_confirmed_runner_absence(crashed_owner);
 
     let follower = RecordingFollower::succeeding(0);
     let scheduler = TestSchedulerRuntime::new(60_000, 907);

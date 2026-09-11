@@ -25,7 +25,7 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::WorkerError,
-    failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP},
+    failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP, STAGE_DRAIN},
     host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
     inputs::RelativePath,
     job::{
@@ -1846,6 +1846,35 @@ fn terminal_cleanup_removes_a_fifo_left_in_tmp() {
     assert_eq!(response.status().cleanup_error_code(), None);
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
     assert_mutable_job_scopes_absent(&store, &lease);
+}
+
+#[test]
+fn a_log_chunk_read_failure_reports_stage_drain() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("log-drain-receipt");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = HoldingRecordingLauncher {
+        launches: Arc::new(AtomicUsize::new(0)),
+        job_path: job.clone(),
+        identity: identity(51_201),
+        guard: Mutex::new(None),
+    };
+    JobService::new(&store, &launcher)
+        .status(lease.job_id())
+        .unwrap();
+    fs::set_permissions(job.join("stdout.log"), fs::Permissions::from_mode(0o644)).unwrap();
+    let error = JobService::new(&store, &launcher)
+        .read_log(lease.job_id(), LogStream::Stdout, 0, 64)
+        .unwrap_err();
+    let receipt = error
+        .failure_receipt()
+        .unwrap_or_else(|| panic!("drain HOST_IO carries a receipt, got {error}"));
+    assert_eq!(receipt.stage(), STAGE_DRAIN);
+    assert!(error.to_string().contains("I/O error"), "{error}");
+    drop(launcher.guard.lock().unwrap().take());
 }
 
 #[test]
