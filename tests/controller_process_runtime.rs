@@ -1095,10 +1095,10 @@ fn terminal_head_oid<'a>(report: &'a Value, expected_turn: Option<&str>) -> Opti
     {
         return None;
     }
-    if let Some(expected_turn) = expected_turn {
-        if json_string(turn, "turn_id") != Some(expected_turn) {
-            return None;
-        }
+    if let Some(expected_turn) = expected_turn
+        && json_string(turn, "turn_id") != Some(expected_turn)
+    {
+        return None;
     }
     json_string(status, "head_oid")
 }
