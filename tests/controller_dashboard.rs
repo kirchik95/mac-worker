@@ -471,10 +471,10 @@ fn process_live(pid: u32) -> bool {
 fn wait_for_pid_file(path: &Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Ok(pid) = contents.trim().parse() {
-                return pid;
-            }
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse()
+        {
+            return pid;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
