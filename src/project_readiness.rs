@@ -744,10 +744,14 @@ mod tests {
 
     const EMPTY_REQUIRES: &[String] = &[];
 
-    fn request<'a>(
+    struct SetupTestIdentity<'a> {
         account: &'a Path,
         project_id: &'a str,
         task_id: &'a str,
+    }
+
+    fn request<'a>(
+        identity: SetupTestIdentity<'a>,
         workspace: &'a Path,
         cache: &'a Path,
         recipe: &'a SetupSettings,
@@ -755,9 +759,7 @@ mod tests {
         cancel: &'a dyn Fn() -> bool,
     ) -> SetupRequest<'a> {
         request_until(
-            account,
-            project_id,
-            task_id,
+            identity,
             workspace,
             cache,
             recipe,
@@ -768,9 +770,7 @@ mod tests {
     }
 
     fn request_until<'a>(
-        account: &'a Path,
-        project_id: &'a str,
-        task_id: &'a str,
+        identity: SetupTestIdentity<'a>,
         workspace: &'a Path,
         cache: &'a Path,
         recipe: &'a SetupSettings,
@@ -779,9 +779,9 @@ mod tests {
         cancel: &'a dyn Fn() -> bool,
     ) -> SetupRequest<'a> {
         SetupRequest {
-            account_home: account,
-            project_id,
-            task_id,
+            account_home: identity.account,
+            project_id: identity.project_id,
+            task_id: identity.task_id,
             env_profile_name: Some("agents"),
             workspace,
             cache_root: cache,
@@ -835,9 +835,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_a,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_a,
+                },
                 workspace_a.path(),
                 cache.path(),
                 &recipe,
@@ -849,9 +851,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_b,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_b,
+                },
                 workspace_b.path(),
                 cache.path(),
                 &recipe,
@@ -873,9 +877,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_a,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_a,
+                },
                 workspace_a.path(),
                 cache.path(),
                 &recipe,
@@ -920,9 +926,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -948,9 +956,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -978,9 +988,11 @@ mod tests {
         let failed = prepare_project_setup(
             &ScriptedRunner::failing(),
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1000,9 +1012,11 @@ mod tests {
         let cancelled = prepare_project_setup(
             &ScriptedRunner::succeeding(),
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1017,9 +1031,11 @@ mod tests {
         let timed_out = prepare_project_setup(
             &ScriptedRunner::timed_out(),
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1053,9 +1069,11 @@ mod tests {
         prepare_project_setup(
             &runner,
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1083,9 +1101,11 @@ mod tests {
         let debug = format!(
             "{:?}",
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1112,9 +1132,11 @@ mod tests {
         let error = prepare_project_setup(
             &ScriptedRunner::failing_with(b"boom profile-secret leaked"),
             request(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1162,7 +1184,7 @@ mod tests {
             "secret crossed the tail boundary: {diagnostic}"
         );
         assert!(diagnostic.contains("[token]"), "{diagnostic}");
-        assert!(diagnostic.as_bytes().len() <= DIAGNOSTIC_TAIL_BYTES);
+        assert!(diagnostic.len() <= DIAGNOSTIC_TAIL_BYTES);
     }
 
     #[test]
@@ -1209,9 +1231,11 @@ mod tests {
                 prepare_project_setup(
                     &SystemProcessRunner,
                     request(
-                        account.path(),
-                        &project_id,
-                        &task_id,
+                        SetupTestIdentity {
+                            account: account.path(),
+                            project_id: &project_id,
+                            task_id: &task_id,
+                        },
                         workspace.path(),
                         cache.path(),
                         &recipe,
@@ -1277,9 +1301,11 @@ mod tests {
         let error = prepare_project_setup(
             &SystemProcessRunner,
             request_until(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
@@ -1322,9 +1348,11 @@ mod tests {
         let error = prepare_project_setup(
             &SystemProcessRunner,
             request_until(
-                account.path(),
-                &project_id,
-                &task_id,
+                SetupTestIdentity {
+                    account: account.path(),
+                    project_id: &project_id,
+                    task_id: &task_id,
+                },
                 workspace.path(),
                 cache.path(),
                 &recipe,
