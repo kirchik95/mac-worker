@@ -1086,3 +1086,503 @@ fn busy_request_is_skipped_while_others_progress() {
     assert!(idle.completed.is_empty());
     assert!(idle.failed.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Terminal business rejection (C4). A rejected `task.submit` must become a
+// durable terminal row so leader ticks and exact-envelope replay can never
+// execute it later. Everything below asserts observable outcomes: executor
+// call counts against a real on-disk journal, the saved row, the pending
+// index, and the error the caller receives.
+// ---------------------------------------------------------------------------
+
+const ID_R1: &str = "018f0f4a6b5c7d8e9f00112233445570";
+const ID_R2: &str = "018f0f4a6b5c7d8e9f00112233445571";
+const ID_R3: &str = "018f0f4a6b5c7d8e9f00112233445572";
+const ID_R4: &str = "018f0f4a6b5c7d8e9f00112233445573";
+const ID_R5: &str = "018f0f4a6b5c7d8e9f00112233445574";
+const ID_R6: &str = "018f0f4a6b5c7d8e9f00112233445575";
+
+const REJECT_TASK_ID: &str = "018f0f4a6b5c7d8e9f0011223344aaa0";
+const REJECT_TURN_ID: &str = "018f0f4a6b5c7d8e9f0011223344aaa1";
+const REJECT_PROJECT_ID: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const REJECT_WORKTREE_ID: &str =
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const REJECT_BASE_OID: &str = "1111111111111111111111111111111111111111";
+
+/// The exact public admission reason `capacity_busy()` produces in
+/// `src/task_client.rs`. Kept as a literal so a drift in either place shows up
+/// as a failing assertion rather than a silently weaker test.
+const CAPACITY_REASON: &str = "no eligible worker currently has an available heavy slot";
+
+/// Executor whose next outcome is switchable between a rejection and a
+/// success, counting every real call. Used to prove "never executed again".
+struct SwitchableExecutor {
+    calls: Mutex<Vec<String>>,
+    outcome: Mutex<Option<WorkerError>>,
+    success: Value,
+}
+
+impl SwitchableExecutor {
+    fn rejecting(error: WorkerError) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            outcome: Mutex::new(Some(error)),
+            success: json!({"task_id": REJECT_TASK_ID, "turn_id": REJECT_TURN_ID}),
+        }
+    }
+
+    fn calls_for(&self, request_id: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_str() == request_id)
+            .count()
+    }
+
+    /// Capacity has "freed": from now on the executor would succeed.
+    fn stop_rejecting(&self) {
+        *self.outcome.lock().unwrap() = None;
+    }
+}
+
+impl ControllerCommandHandler for SwitchableExecutor {
+    fn execute(&self, record: &DurableRequest) -> Result<Value, WorkerError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(record.request_id().to_owned());
+        match self.outcome.lock().unwrap().as_ref() {
+            Some(error) => Err(clone_worker_error(error)),
+            None => Ok(self.success.clone()),
+        }
+    }
+}
+
+/// `WorkerError` is not `Clone`; rebuild the few shapes these tests use.
+fn clone_worker_error(error: &WorkerError) -> WorkerError {
+    match error {
+        WorkerError::Capacity {
+            code,
+            message,
+            public,
+        } => WorkerError::Capacity {
+            code,
+            message: message.clone(),
+            public: *public,
+        },
+        WorkerError::Protocol(message) => WorkerError::Protocol(message.clone()),
+        WorkerError::Unavailable(message) => WorkerError::Unavailable(message.clone()),
+        other => WorkerError::Protocol(format!("unexpected test error shape: {other}")),
+    }
+}
+
+/// Genuine public admission rejection, built through the same public
+/// constructor `capacity_busy()` uses (`WorkerError::capacity`), so the
+/// classifier sees `public: true` exactly as production does.
+fn admission_capacity_busy() -> WorkerError {
+    WorkerError::capacity("CAPACITY_BUSY", CAPACITY_REASON)
+}
+
+fn submit_body(prompt: &str) -> Value {
+    json!({
+        "task_id": REJECT_TASK_ID,
+        "turn_id": REJECT_TURN_ID,
+        "created_at_millis": 1_700_000_000_000_u64,
+        "prompt": prompt,
+        "agent": "codex",
+        "source": "local",
+        "publish": ["fetch"],
+        "close_on": "never",
+        "wip": true,
+        "project_id": REJECT_PROJECT_ID,
+        "worktree_id": REJECT_WORKTREE_ID,
+        "base_oid": REJECT_BASE_OID,
+        "timeout_millis": 2_700_000_u64,
+        "max_followups": 10,
+        "permissions": "workspace",
+        "requires": [],
+        "include_untracked": [],
+        "include_empty_dirs": [],
+        "allow_sensitive": [],
+        "cli_includes": [],
+        "wait_for_capacity": false,
+    })
+}
+
+fn submit_request_for(request_id: &str) -> ControllerRequest {
+    request_for(request_id, "task.submit", submit_body("reject me"))
+}
+
+fn active_entries(state: &std::path::Path) -> Vec<String> {
+    let dir = state.join("active");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
+fn saved_rejection_value(record: &DurableRequest) -> &Value {
+    record
+        .result()
+        .expect("terminal rejection must persist a result")
+        .get("controller_rejection")
+        .expect("saved result must carry the reserved rejection key")
+}
+
+/// C4 core: a no-wait admission rejection terminalises the row, and no later
+/// tick can execute it once capacity frees.
+#[test]
+fn terminal_capacity_rejection_is_acked_retired_and_never_executed_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
+
+    let error = store
+        .handle_with(
+            &submit_request_for(ID_R1),
+            &executor,
+            ControllerFault::None,
+        )
+        .expect_err("a no-wait admission rejection must reach the caller as an error");
+    assert_eq!(error.public_code(), "CAPACITY_BUSY");
+    assert_eq!(error.public_message(), CAPACITY_REASON);
+    assert_eq!(error.exit_code(), 75, "capacity category must survive");
+    assert_eq!(executor.calls_for(ID_R1), 1);
+
+    // Persisted-before-error guarantee: by the time the caller holds the
+    // definitive rejection, the row is already terminal and retired.
+    let record = store.load(ID_R1).unwrap().unwrap();
+    assert_eq!(record.phase(), RequestPhase::Acked);
+    let rejection = saved_rejection_value(&record);
+    assert_eq!(rejection.get("version"), Some(&json!(1)));
+    assert_eq!(rejection.get("code"), Some(&json!("CAPACITY_BUSY")));
+    assert_eq!(rejection.get("message"), Some(&json!(CAPACITY_REASON)));
+    assert!(
+        active_entries(&state).is_empty(),
+        "pending receipt must be retired: {:?}",
+        active_entries(&state)
+    );
+
+    // Capacity frees. Leader ticks must not resurrect the request.
+    executor.stop_rejecting();
+    for _ in 0..3 {
+        store
+            .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+            .unwrap();
+    }
+    assert_eq!(
+        executor.calls_for(ID_R1),
+        1,
+        "a terminal rejection must never be executed again"
+    );
+    let record = store.load(ID_R1).unwrap().unwrap();
+    assert_eq!(record.phase(), RequestPhase::Acked);
+    assert_eq!(
+        saved_rejection_value(&record).get("code"),
+        Some(&json!("CAPACITY_BUSY"))
+    );
+}
+
+/// Exact-envelope replay returns the same rejection metadata and executes
+/// nothing; a different payload under the same id still conflicts.
+#[test]
+fn replaying_a_rejected_envelope_returns_the_same_rejection_without_executing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
+    let first = store
+        .handle_with(
+            &submit_request_for(ID_R2),
+            &executor,
+            ControllerFault::None,
+        )
+        .expect_err("first attempt rejects");
+    executor.stop_rejecting();
+
+    let replay = store
+        .handle_with(
+            &submit_request_for(ID_R2),
+            &executor,
+            ControllerFault::None,
+        )
+        .expect_err("replay must return the saved rejection, not a fresh success");
+    assert_eq!(replay.public_code(), first.public_code());
+    assert_eq!(replay.public_message(), first.public_message());
+    assert_eq!(replay.exit_code(), 75);
+    assert_eq!(executor.calls_for(ID_R2), 1, "replay must not execute");
+    assert!(active_entries(&state).is_empty());
+
+    // Identity/hash conflict handling is untouched by terminalisation.
+    let conflicting = request_for(ID_R2, "task.submit", submit_body("different prompt"));
+    let conflict = store
+        .handle_with(&conflicting, &executor, ControllerFault::None)
+        .expect_err("a different payload under the same request id must conflict");
+    assert_eq!(conflict.public_code(), "CONTROLLER_REQUEST_CONFLICT");
+    assert_eq!(executor.calls_for(ID_R2), 1);
+}
+
+/// The classifier keys on the error VARIANT plus `public: true`, not on the
+/// code string. A non-public capacity error and the `Protocol`-variant
+/// `CAPACITY_BUSY` raised in the worker-host lease path must both stay
+/// retryable.
+#[test]
+fn nonpublic_and_protocol_capacity_errors_are_not_terminalised() {
+    for (index, (request_id, error)) in [
+        (
+            ID_R3,
+            WorkerError::Capacity {
+                code: "CAPACITY_BUSY",
+                message: "busy lease at /Users/alice/secret".into(),
+                public: false,
+            },
+        ),
+        (
+            ID_R4,
+            WorkerError::Protocol(
+                "CAPACITY_BUSY: live lease count exceeds the slot bound".into(),
+            ),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = SwitchableExecutor::rejecting(error);
+        let failure = store
+            .handle_with(
+                &submit_request_for(request_id),
+                &executor,
+                ControllerFault::None,
+            )
+            .expect_err("case {index} must still fail");
+        assert_eq!(failure.public_code(), "CAPACITY_BUSY", "case {index}");
+        let record = store.load(request_id).unwrap().unwrap();
+        assert_eq!(
+            record.phase(),
+            RequestPhase::Published,
+            "case {index} must stay pending"
+        );
+        assert!(record.result().is_none(), "case {index} must save no result");
+        assert_eq!(
+            active_entries(&state),
+            vec![format!("{request_id}.json")],
+            "case {index} must keep its pending receipt"
+        );
+
+        // Still retryable: the next tick executes again.
+        executor.stop_rejecting();
+        store
+            .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+            .unwrap();
+        assert_eq!(
+            executor.calls_for(request_id),
+            2,
+            "case {index} must be re-executed by the leader tick"
+        );
+        assert_eq!(
+            store.load(request_id).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
+    }
+}
+
+/// Infrastructure failures keep today's retry semantics exactly. This is a
+/// control, expected green before and after the change.
+#[test]
+fn infrastructure_failure_stays_pending_and_recovers() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = SwitchableExecutor::rejecting(WorkerError::Unavailable(
+        "CONTROLLER_UNAVAILABLE: transient".into(),
+    ));
+    store
+        .handle_with(
+            &submit_request_for(ID_R5),
+            &executor,
+            ControllerFault::None,
+        )
+        .expect_err("infrastructure failure surfaces");
+    let record = store.load(ID_R5).unwrap().unwrap();
+    assert_eq!(record.phase(), RequestPhase::Published);
+    assert!(record.result().is_none());
+    assert_eq!(active_entries(&state).len(), 1);
+
+    executor.stop_rejecting();
+    store
+        .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+        .unwrap();
+    assert_eq!(executor.calls_for(ID_R5), 2);
+    assert_eq!(
+        store.load(ID_R5).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    assert!(active_entries(&state).is_empty());
+}
+
+/// An interruption BEFORE the rejection is durable leaves a genuinely
+/// ambiguous outcome: the caller never received the definitive rejection, and
+/// recovery may legitimately execute and succeed once capacity frees. The
+/// guarantee is one-directional, and this test states it that way.
+#[test]
+fn interruption_before_durable_rejection_leaves_the_outcome_ambiguous() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
+    let stopped = store
+        .handle_with(
+            &submit_request_for(ID_R6),
+            &executor,
+            ControllerFault::StopAfterExecuteBeforeResult,
+        )
+        .expect("the fault seam simulates a crash, it is not a client contract");
+    assert_eq!(stopped.status(), "published");
+    assert_eq!(executor.calls_for(ID_R6), 1);
+    let record = store.load(ID_R6).unwrap().unwrap();
+    assert_eq!(record.phase(), RequestPhase::Published);
+    assert!(
+        record.result().is_none(),
+        "nothing durable was written, so nothing is terminal yet"
+    );
+    assert_eq!(active_entries(&state).len(), 1, "row stays discoverable");
+
+    // Capacity frees before recovery runs: executing here is correct, not a
+    // regression. No definitive rejection was ever returned to a client.
+    executor.stop_rejecting();
+    store
+        .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+        .unwrap();
+    assert_eq!(executor.calls_for(ID_R6), 2);
+    let record = store.load(ID_R6).unwrap().unwrap();
+    assert_eq!(record.phase(), RequestPhase::Acked);
+    assert!(
+        record.result().unwrap().get("controller_rejection").is_none(),
+        "recovery produced an ordinary success result"
+    );
+    assert!(active_entries(&state).is_empty());
+}
+
+const ID_R7: &str = "018f0f4a6b5c7d8e9f00112233445576";
+
+/// Rewrites the saved `result` of an existing row in place. The row is already
+/// `Acked`, so no CAS depends on the previous bytes.
+fn overwrite_saved_result(state: &std::path::Path, request_id: &str, result: Option<Value>) {
+    let path = state.join(format!("req-{request_id}.json"));
+    let mut row: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    match result {
+        Some(value) => {
+            row["result"] = value;
+        }
+        None => {
+            row.as_object_mut().unwrap().remove("result");
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
+}
+
+/// ROOT correction 1. A saved result carrying the reserved key but a
+/// malformed, unknown-version or unknown-code payload must fail closed as an
+/// integrity error. It must NEVER be handed back as an ordinary success ACK,
+/// and it must never cause a re-execution.
+#[test]
+fn malformed_saved_rejection_fails_closed_and_never_executes() {
+    let malformed = [
+        ("unknown version", json!({"controller_rejection": {"version": 99, "code": "CAPACITY_BUSY", "message": "x"}})),
+        ("unknown code", json!({"controller_rejection": {"version": 1, "code": "NOT_A_REJECTION", "message": "x"}})),
+        ("not an object", json!({"controller_rejection": "CAPACITY_BUSY"})),
+        ("missing message", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY"}})),
+        ("empty message", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": ""}})),
+        ("extra field", json!({"controller_rejection": {"version": 1, "code": "CAPACITY_BUSY", "message": "x", "extra": true}})),
+    ];
+    for (label, saved) in malformed {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
+        executor.stop_rejecting();
+        store
+            .handle_with(
+                &submit_request_for(ID_R7),
+                &executor,
+                ControllerFault::None,
+            )
+            .unwrap_or_else(|error| panic!("{label}: seeding a normal row failed: {error}"));
+        assert_eq!(executor.calls_for(ID_R7), 1, "{label}");
+        overwrite_saved_result(&state, ID_R7, Some(saved));
+
+        drop(store);
+        let store = ControllerStore::open(&state).unwrap();
+        let error = store
+            .handle_with(
+                &submit_request_for(ID_R7),
+                &executor,
+                ControllerFault::None,
+            )
+            .expect_err("malformed rejection must not read back as a success ACK");
+        assert_eq!(
+            error.public_code(),
+            "CONTROLLER_TRANSPORT",
+            "{label}: must fail closed as an integrity error"
+        );
+        assert_eq!(
+            executor.calls_for(ID_R7),
+            1,
+            "{label}: a malformed saved result must not trigger re-execution"
+        );
+    }
+}
+
+/// The compatibility policies the malformed guard must not disturb: an
+/// ordinary success result still reads back as a success ACK, a legacy row
+/// with no result at all still returns `None`, and an explicit saved `null`
+/// still does not re-execute.
+#[test]
+fn ordinary_and_legacy_saved_results_are_unaffected() {
+    for (label, saved, expected) in [
+        (
+            "ordinary success",
+            Some(json!({"task_id": REJECT_TASK_ID, "turn_id": REJECT_TURN_ID})),
+            Some(json!({"task_id": REJECT_TASK_ID, "turn_id": REJECT_TURN_ID})),
+        ),
+        ("legacy absent result", None, None),
+        ("explicit null", Some(Value::Null), Some(Value::Null)),
+        (
+            "unrelated key",
+            Some(json!({"controller_rejection_like": {"version": 1}})),
+            Some(json!({"controller_rejection_like": {"version": 1}})),
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = SwitchableExecutor::rejecting(admission_capacity_busy());
+        executor.stop_rejecting();
+        store
+            .handle_with(
+                &submit_request_for(ID_R7),
+                &executor,
+                ControllerFault::None,
+            )
+            .unwrap();
+        overwrite_saved_result(&state, ID_R7, saved);
+
+        drop(store);
+        let store = ControllerStore::open(&state).unwrap();
+        let ack = store
+            .handle_with(
+                &submit_request_for(ID_R7),
+                &executor,
+                ControllerFault::None,
+            )
+            .unwrap_or_else(|error| panic!("{label}: must still ACK: {error}"));
+        assert_eq!(ack.status(), "acked", "{label}");
+        assert_eq!(ack.result(), expected.as_ref(), "{label}");
+        assert_eq!(executor.calls_for(ID_R7), 1, "{label}: no re-execution");
+    }
+}

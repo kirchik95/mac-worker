@@ -16,7 +16,8 @@ use mac_worker::{
     client_state::ClientStateStore,
     config::Config,
     controller::{
-        ControllerFault, ControllerStore, ControllerTransfer, OwnedCheckoutMap, TaskSubmitHandler,
+        ActiveResumeConfig, ControllerFault, ControllerStore, ControllerTransfer, OwnedCheckoutMap,
+        TaskSubmitHandler,
         VerifiedResultMeta, canonical_request_sha256, controller_transfer_git_path,
         import_controller_result, load_operation_envelope, parse_request,
         registry::ProjectRegistry,
@@ -481,5 +482,124 @@ fn owned_checkout_map_fails_closed_when_unregistered() {
     assert!(
         format!("{error:?}").contains("TASK_CONFIG_INVALID"),
         "{error:?}"
+    );
+}
+
+/// C4 at the real submit seam: a genuine `--no-wait` admission rejection from
+/// the real `TaskClient` (no eligible worker for the frozen request) must
+/// terminalise the durable row, reach the caller with the capacity category,
+/// create no task, and stay terminal across a controller restart and an
+/// exact-envelope replay.
+///
+/// Complementary to the counting-executor kernel tests: this one produces the
+/// error from production code rather than injecting it.
+#[test]
+fn real_no_wait_admission_rejection_terminalises_the_durable_row() {
+    let isolated = Isolated::new();
+    let repo = GitRepo::init();
+    repo.write("README", b"no-wait-rejection\n");
+    repo.commit_all("init");
+    let oid = oid_of(&repo);
+    let request_id = format!("{:x}", Uuid::from_u128(0x5a).simple());
+    let mut body = frozen_body(&oid);
+    // The only difference from the accepted submit path: the caller asked not
+    // to be queued.
+    body.wait_for_capacity = false;
+    let request = submit_request(&request_id, &body);
+    let fingerprint = RequestFingerprint::new(request.payload_sha256().to_owned()).unwrap();
+
+    let identity = {
+        let transfer = ControllerTransfer::open(&isolated.paths.controller_state_root()).unwrap();
+        transfer
+            .prepare_source_receive(
+                &isolated.paths.cache,
+                &RUNNER,
+                &request_id,
+                &fingerprint,
+                PROJECT_ID,
+                WORKTREE_ID,
+                &oid,
+            )
+            .unwrap()
+    };
+    GitTransport::new(&RUNNER)
+        .push_controller_source(
+            isolated.fake_ssh.to_str().unwrap(),
+            FAKE_SSH_DEST,
+            "~/.local/bin/worker",
+            identity.token(),
+            identity.request_id(),
+            identity.fingerprint(),
+            identity.project_id(),
+            identity.worktree_id(),
+            identity.expected_oid(),
+            repo.root(),
+        )
+        .unwrap();
+    {
+        let transfer = ControllerTransfer::open(&isolated.paths.controller_state_root()).unwrap();
+        transfer
+            .finish_source_receive(&isolated.paths.cache, &RUNNER, &identity)
+            .unwrap();
+    }
+
+    // No configured worker: admission has nothing eligible, so a no-wait
+    // request is rejected by `capacity_busy()` in the real TaskClient.
+    let config = Config::parse("version = 1\n").unwrap();
+    let client_state = ClientStateStore::open(&isolated.paths.state).unwrap();
+    let handler = TaskSubmitHandler::new(&RUNNER, &config, &isolated.paths, &client_state);
+    let store = ControllerStore::open(&isolated.paths.controller_state_root()).unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .expect_err("a no-wait request with no eligible worker must be rejected");
+    assert_eq!(error.public_code(), "CAPACITY_BUSY");
+    assert_eq!(
+        error.public_message(),
+        "no eligible worker currently has an available heavy slot"
+    );
+    assert_eq!(error.exit_code(), 75, "capacity category must reach the caller");
+
+    // The rejection is durable and terminal, and no task exists.
+    let controller_state = isolated.paths.controller_state_root();
+    let row: serde_json::Value = serde_json::from_slice(
+        &fs::read(controller_state.join(format!("req-{request_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(row["phase"], serde_json::json!("acked"));
+    assert_eq!(
+        row["result"]["controller_rejection"]["code"],
+        serde_json::json!("CAPACITY_BUSY")
+    );
+    let active = controller_state.join("active");
+    let pending: Vec<_> = fs::read_dir(&active)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(pending.is_empty(), "pending receipt must be retired: {pending:?}");
+    assert!(
+        client_state.load_task(body.task_id).is_err(),
+        "a rejected submit must not create a task row"
+    );
+
+    // Controller restart plus an exact-envelope replay: same rejection, still
+    // no task, nothing re-executed.
+    drop(store);
+    let store = ControllerStore::open(&isolated.paths.controller_state_root()).unwrap();
+    store
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    let replay = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .expect_err("replay must return the saved rejection");
+    assert_eq!(replay.public_code(), "CAPACITY_BUSY");
+    assert_eq!(replay.exit_code(), 75);
+    assert!(
+        client_state.load_task(body.task_id).is_err(),
+        "replay must not create a task row"
     );
 }

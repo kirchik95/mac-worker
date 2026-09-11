@@ -3189,6 +3189,39 @@ mod versioned_host_error_tests {
             crate::protocol::PROTOCOL_VERSION
         );
     }
+
+    /// C2 (host half): a public admission reason is operator-facing text by
+    /// the contract in `WorkerError::capacity`, so it must travel on the wire
+    /// instead of being flattened to the generic category label. Without this
+    /// the laptop can restore the exit code but never the real reason.
+    #[test]
+    fn public_capacity_reasons_travel_on_the_wire() {
+        let error = versioned_host_error(&WorkerError::capacity(
+            "CAPACITY_BUSY",
+            "no eligible worker currently has an available heavy slot",
+        ));
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["error"]["code"], "CAPACITY_BUSY");
+        assert_eq!(
+            wire["error"]["message"],
+            "no eligible worker currently has an available heavy slot"
+        );
+    }
+
+    /// Redaction is unchanged: a non-public capacity message must never reach
+    /// the wire.
+    #[test]
+    fn nonpublic_capacity_messages_stay_redacted_on_the_wire() {
+        let error = versioned_host_error(&WorkerError::Capacity {
+            code: "CAPACITY_BUSY",
+            message: "busy lease at /Users/alice/PLANTED_PATH".into(),
+            public: false,
+        });
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["error"]["code"], "CAPACITY_BUSY");
+        assert_eq!(wire["error"]["message"], "worker admission rejected");
+        assert!(!serde_json::to_string(&wire).unwrap().contains("PLANTED_PATH"));
+    }
 }
 
 fn run_host_supervise(

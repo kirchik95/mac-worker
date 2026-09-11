@@ -690,6 +690,75 @@ pub fn tick_controller_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C2 (laptop half): a capacity rejection that crosses the controller RPC
+    /// must come back as a capacity error, not as a generic protocol failure.
+    /// Collapsing it loses the documented exit status 75 and replaces the
+    /// operator-facing reason with the literal "protocol error".
+    #[test]
+    fn capacity_codes_decode_back_into_capacity_errors() {
+        for code in ["CAPACITY_BUSY", "CAPABILITY_MISSING"] {
+            let wire = HostControlError::new(code, "no eligible worker currently has an available heavy slot")
+                .unwrap();
+            let error = host_control_to_worker(&wire);
+            assert!(
+                matches!(error, WorkerError::Capacity { .. }),
+                "{code} decoded as {error:?}"
+            );
+            assert_eq!(error.public_code(), code);
+            assert_eq!(
+                error.public_message(),
+                "no eligible worker currently has an available heavy slot",
+                "{code} lost its operator-facing reason"
+            );
+            assert_eq!(error.exit_code(), 75, "{code} lost the capacity category");
+        }
+    }
+
+    /// The narrow allow-list must not swallow other codes: controller outages
+    /// and every other error keep today's mapping.
+    #[test]
+    fn other_host_codes_keep_their_existing_mapping() {
+        let unavailable =
+            host_control_to_worker(&HostControlError::new("CONTROLLER_UNAVAILABLE", "down").unwrap());
+        assert!(matches!(unavailable, WorkerError::Unavailable(_)));
+        assert_eq!(unavailable.public_code(), "CONTROLLER_UNAVAILABLE");
+
+        let conflict = host_control_to_worker(
+            &HostControlError::new("CONTROLLER_REQUEST_CONFLICT", "bound elsewhere").unwrap(),
+        );
+        assert!(matches!(conflict, WorkerError::Protocol(_)));
+        assert_eq!(conflict.public_code(), "CONTROLLER_REQUEST_CONFLICT");
+        assert_eq!(conflict.exit_code(), 70);
+    }
+
+    /// The same guarantee through the real framed reply path the CLI uses.
+    #[test]
+    fn framed_capacity_reply_decodes_to_exit_seventy_five() {
+        let frame = crate::controller::protocol::encode_json_frame(
+            &HostControlError::new(
+                "CAPACITY_BUSY",
+                "no eligible worker currently has an available heavy slot",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let result = ProcessResult {
+            // The controller child exits non-zero alongside the error frame.
+            status: <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(
+                75 << 8,
+            ),
+            stdout: frame,
+            stderr: Vec::new(),
+        };
+        let error = decode_controller_stdout(&result).expect_err("a host error frame must fail");
+        assert_eq!(error.public_code(), "CAPACITY_BUSY");
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            error.public_message(),
+            "no eligible worker currently has an available heavy slot"
+        );
+    }
     use crate::agent::{AgentKind, PermissionPolicy};
     use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};
     use crate::task::{GitIdentity, PublishMode};

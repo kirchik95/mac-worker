@@ -747,3 +747,212 @@ lockfiles = ["Cargo.lock"]
     let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
     assert!(matches!(error, WorkerError::Config(_)), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// F1/F2: controller-only preview. `--preview` stays local, but with
+// `[controller] enabled = true` the controller host owns the worker list, so
+// preview must not reject pinned worker names against an empty laptop
+// inventory. The human-mode line must also match the enforced DAG status.
+// ---------------------------------------------------------------------------
+
+fn controller_only_config() -> Config {
+    Config::parse(
+        "version = 1\n[controller]\nenabled = true\nssh = \"mac1\"\nremote_binary = \"~/.local/bin/worker\"\n",
+    )
+    .unwrap()
+}
+
+fn pinned_dag_batch(repo: &GitRepo) {
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+agent = "opencode"
+source = "local"
+publish = ["fetch"]
+
+[[tasks]]
+id = "parent"
+worker = "mini-3"
+prompt = "parent work"
+
+[[tasks]]
+id = "child"
+worker = "mini-2"
+depends_on = ["parent"]
+base = "from:parent"
+prompt = "child work"
+"#,
+    );
+}
+
+/// F1: the controller host owns the dispatch inventory, so a controller-only
+/// laptop config must preview a pinned batch cleanly instead of reporting
+/// WORKER_NOT_FOUND for every pin.
+#[test]
+fn batch_preview_under_enabled_controller_keeps_pinned_workers() {
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    pinned_dag_batch(&repo);
+    let report = mac_worker::task_client::preview_batch_plan(
+        &SystemProcessRunner,
+        &controller_only_config(),
+        &repo.root().join("tasks.toml"),
+        repo.root(),
+    )
+    .unwrap();
+    let kinds: Vec<_> = report.issues.iter().map(|issue| issue.kind).collect();
+    assert!(
+        !kinds.contains(&"WORKER_NOT_FOUND"),
+        "controller-owned pins must not be validated locally: {kinds:?}"
+    );
+    assert!(!report.has_config_errors(), "{:?}", report.issues);
+    assert_eq!(report.tasks[0].worker.as_deref(), Some("mini-3"));
+    assert_eq!(report.tasks[1].worker.as_deref(), Some("mini-2"));
+    assert_eq!(report.dag.status, "enforced");
+}
+
+/// Over-fix guard: without a controller the laptop inventory IS the
+/// authority, so an unknown pin must still be an error. Green before and
+/// after the change.
+#[test]
+fn batch_preview_without_controller_still_rejects_unknown_worker() {
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    pinned_dag_batch(&repo);
+    let report = mac_worker::task_client::preview_batch_plan(
+        &SystemProcessRunner,
+        &preview_config(),
+        &repo.root().join("tasks.toml"),
+        repo.root(),
+    )
+    .unwrap();
+    assert!(report.has_config_errors());
+    let kinds: Vec<_> = report.issues.iter().map(|issue| issue.kind).collect();
+    assert!(kinds.contains(&"WORKER_NOT_FOUND"), "{kinds:?}");
+}
+
+/// F1 at the CLI seam: exit 0 for a controller-only pinned preview, and the
+/// documented locality guarantee (no client state opened) still holds.
+#[test]
+fn batch_preview_cli_under_enabled_controller_exits_zero_and_stays_local() {
+    use std::collections::BTreeMap;
+
+    use clap::Parser;
+    use mac_worker::{RuntimeContext, cli::Cli};
+
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    pinned_dag_batch(&repo);
+    let home = tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[controller]\nenabled = true\nssh = \"mac1\"\nremote_binary = \"~/.local/bin/worker\"\n",
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        home.path().to_path_buf(),
+        repo.root().to_path_buf(),
+    );
+    let cli = Cli::try_parse_from([
+        "worker",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--json",
+        "task",
+        "batch",
+        repo.root().join("tasks.toml").to_str().unwrap(),
+        "--preview",
+    ])
+    .unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = mac_worker::run_with_io_in_context(
+        cli,
+        &SystemProcessRunner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(
+        exit,
+        0,
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(report["issues"].as_array().unwrap().len(), 0);
+    assert_eq!(report["dag"]["status"], "enforced");
+    assert!(!home.path().join(".local/state/mac-worker").exists());
+}
+
+/// F2: the human-readable preview line must not claim this build cannot
+/// execute dependencies while the same report says `dag.status = enforced`.
+#[test]
+fn batch_preview_human_output_matches_enforced_dag() {
+    use std::collections::BTreeMap;
+
+    use clap::Parser;
+    use mac_worker::{RuntimeContext, cli::Cli};
+
+    let repo = GitRepo::init();
+    repo.write("src/lib.rs", b"fn main() {}\n");
+    repo.commit_all("base");
+    repo.write(
+        "tasks.toml",
+        br#"
+version = 1
+agent = "codex"
+
+[[tasks]]
+prompt = "fix login"
+"#,
+    );
+    let home = tempdir().unwrap();
+    let config_path = home.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        home.path().to_path_buf(),
+        repo.root().to_path_buf(),
+    );
+    let cli = Cli::try_parse_from([
+        "worker",
+        "--config",
+        config_path.to_str().unwrap(),
+        "task",
+        "batch",
+        repo.root().join("tasks.toml").to_str().unwrap(),
+        "--preview",
+    ])
+    .unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = mac_worker::run_with_io_in_context(
+        cli,
+        &SystemProcessRunner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
+    let text = String::from_utf8(stdout).unwrap();
+    assert!(
+        !text.contains("cannot execute them"),
+        "stale pre-enforcement wording survived: {text}"
+    );
+    assert!(
+        text.contains("Dependencies execute when parents are Closed and Done."),
+        "human output must state the enforced rule: {text}"
+    );
+}
