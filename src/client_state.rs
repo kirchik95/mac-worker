@@ -1227,8 +1227,9 @@ impl ClientStateStore {
             .collect()
     }
 
-    /// Reads waiting task-turn rows and their cached scheduler blocking codes
-    /// without refreshing worker observations or changing queue state.
+    /// Reads waiting and parked task-turn rows and their cached scheduler
+    /// blocking codes without refreshing worker observations or changing
+    /// queue state.
     pub fn task_blocking_codes(
         &self,
         config: &Config,
@@ -1255,12 +1256,18 @@ impl ClientStateStore {
                 codes.insert(task_id, crate::job::RUNNER_UNVERIFIABLE.to_owned());
                 continue;
             }
-            if !matches!(entry.state(), QueueState::Waiting { .. }) {
+            if !matches!(
+                entry.state(),
+                QueueState::Waiting { .. } | QueueState::Parked
+            ) {
                 continue;
             }
             codes.insert(
                 task_id,
-                crate::task_view::task_row_blocking_code(row.blocking_reason()),
+                crate::task_view::task_row_blocking_code_for_queue_state(
+                    entry.state(),
+                    row.blocking_reason(),
+                ),
             );
         }
         Ok(codes)
@@ -2301,7 +2308,10 @@ impl ClientStateStore {
         entry: &QueueEntry,
         observations: &[CandidateObservation],
     ) -> Result<Option<QueueBlockingReason>, WorkerError> {
-        if !matches!(entry.state(), QueueState::Waiting { .. }) {
+        if !matches!(
+            entry.state(),
+            QueueState::Waiting { .. } | QueueState::Parked
+        ) {
             return Ok(None);
         }
         match SchedulerPolicy::select(

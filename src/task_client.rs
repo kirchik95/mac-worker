@@ -119,6 +119,15 @@ pub(crate) enum FrozenSubmit<'a> {
     Prepared(&'a PreparedSubmit),
 }
 
+/// Result of unparking the oldest parked task-turn and trying to spawn it.
+enum ParkedStart {
+    Started,
+    /// Unparked into waiting; a later waiting-row start pass can spawn it.
+    Deferred,
+    /// Nothing parked, or this row was re-parked (saturated / recovery).
+    Stopped,
+}
+
 thread_local! {
     static ADVANCING_PENDING_DAGS: Cell<bool> = const { Cell::new(false) };
     static PENDING_DAG_CURSOR: Cell<Option<RunId>> = const { Cell::new(None) };
@@ -2837,9 +2846,19 @@ impl<'a> TaskClient<'a> {
             }
         }
 
-        while self.start_oldest_parked_runner_scoped(owner, &selection)? {
-            report.started_runners += 1;
+        loop {
+            match self.start_oldest_parked_runner_scoped(owner, &selection)? {
+                ParkedStart::Started => report.started_runners += 1,
+                ParkedStart::Deferred => {}
+                ParkedStart::Stopped => break,
+            }
         }
+        self.start_waiting_rows_without_runners(
+            owner,
+            &selection,
+            reset_failure_budget,
+            &mut report,
+        )?;
         if !selection.selected {
             self.advance_pending_dags()?;
         }
@@ -2970,7 +2989,7 @@ impl<'a> TaskClient<'a> {
         &self,
         owner: ProcessIdentity,
         selection: &ReconcileSelection,
-    ) -> Result<bool, WorkerError> {
+    ) -> Result<ParkedStart, WorkerError> {
         if !selection.selected {
             return self.start_oldest_parked_runner(owner);
         }
@@ -2987,13 +3006,13 @@ impl<'a> TaskClient<'a> {
             .min_by_key(|entry| entry.queue_id())
             .cloned()
         else {
-            return Ok(false);
+            return Ok(ParkedStart::Stopped);
         };
         if !selection.known_turns.contains(&entry.job_id()) {
-            return Ok(false);
+            return Ok(ParkedStart::Stopped);
         }
         let Some(_) = self.client_state.unpark_row(entry.job_id(), owner)? else {
-            return Ok(false);
+            return Ok(ParkedStart::Stopped);
         };
         let task_id = self
             .selection_recovery_task_for_turn(selection, entry.job_id())?
@@ -3001,29 +3020,68 @@ impl<'a> TaskClient<'a> {
             .ok_or_else(|| {
                 task_error("TASK_INCONSISTENT", "parked task turn has no task record")
             })?;
-        if self.task_has_submission_recovery_pending(task_id)? {
-            self.client_state.park_row(entry.job_id())?;
-            return Ok(false);
-        }
-        match self.start_runner(task_id, entry.job_id(), false, false) {
-            Ok(RunnerStart::Started(_)) => Ok(true),
-            Ok(RunnerStart::Pending) => Ok(false),
-            Ok(RunnerStart::Saturated) => {
-                self.client_state.park_row(entry.job_id())?;
-                Ok(false)
+        self.start_unparked_runner(task_id, entry.job_id())
+    }
+
+    fn start_waiting_rows_without_runners(
+        &self,
+        owner: ProcessIdentity,
+        selection: &ReconcileSelection,
+        reset_failure_budget: bool,
+        report: &mut ReconcileReport,
+    ) -> Result<(), WorkerError> {
+        let snapshot = self.client_state.queue_snapshot()?;
+        for entry in snapshot.entries() {
+            if entry.kind() != QueueEntryKind::TaskTurn
+                || !matches!(entry.state(), QueueState::Waiting { .. })
+            {
+                continue;
             }
-            Err(error) => {
-                if let Ok(record) = self.client_state.load_task(task_id)
-                    && let Ok(transfer) = self.transfer_for_record(&record)
-                {
-                    return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
+            if selection.selected && !selection.known_turns.contains(&entry.job_id()) {
+                continue;
+            }
+            let Some(task_id) = self.selection_task_for_turn(selection, entry.job_id())? else {
+                continue;
+            };
+            if self.task_has_submission_recovery_pending(task_id)? {
+                continue;
+            }
+            if self.client_state.runner_liveness(task_id)?.is_some() {
+                continue;
+            }
+            let Some(current_entry) = self.client_state.queue_entry(entry.job_id())? else {
+                continue;
+            };
+            if matches!(current_entry.state(), QueueState::Parked)
+                || current_entry.owner_opt().is_some_and(|row_owner| {
+                    *row_owner != owner
+                        && self.client_state.runner_identity_verdict(*row_owner)
+                            != RunnerLivenessVerdict::Exited
+                })
+            {
+                continue;
+            }
+            if !reset_failure_budget {
+                self.observe_replacement_failure(task_id, entry.job_id())?;
+            }
+            let Some(current_entry) = self.client_state.queue_entry(entry.job_id())? else {
+                continue;
+            };
+            if let Some(budget) = current_entry.replacement_failure() {
+                if budget.should_park() {
+                    self.park_repeated_replacement_failure(entry.job_id(), task_id)?;
+                    continue;
                 }
-                Err(task_error(
-                    "RUNNER_HANDOFF_FAILED",
-                    format!("runner handoff failed: {error}"),
-                ))
+                if !budget.backoff_elapsed(current_time_millis()?) {
+                    continue;
+                }
+            }
+            match self.start_runner(task_id, entry.job_id(), false, false)? {
+                RunnerStart::Started(_) => report.started_runners += 1,
+                RunnerStart::Pending | RunnerStart::Saturated => {}
             }
         }
+        Ok(())
     }
 
     pub fn say(
@@ -4184,7 +4242,7 @@ impl<'a> TaskClient<'a> {
             return Err(error);
         }
         drop(transfer);
-        self.advance_pending_dags_inner(true)?;
+        self.advance_pending_dags()?;
         let task_ids = self.client_state.load_run(run_id)?.task_ids().to_vec();
         Ok(RunReport { run_id, task_ids })
     }
@@ -4208,7 +4266,8 @@ impl<'a> TaskClient<'a> {
             }
         }
         let _guard = AdvancingGuard;
-        self.advance_pending_dags_inner(true)
+        self.advance_pending_dags_inner(true)?;
+        self.start_parked_runners_after_dag_advance()
     }
 
     pub fn advance_pending_dags_page(&self, max_runs: usize) -> Result<(), WorkerError> {
@@ -4245,7 +4304,7 @@ impl<'a> TaskClient<'a> {
         }
         match first_error {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => self.start_parked_runners_after_dag_advance(),
         }
     }
 
@@ -4267,7 +4326,7 @@ impl<'a> TaskClient<'a> {
                 claim.node.task_id,
             )?;
         }
-        Ok(())
+        self.start_parked_runners_after_dag_advance()
     }
 
     fn advance_pending_dags_inner(&self, skip_reconcile: bool) -> Result<(), WorkerError> {
@@ -4287,6 +4346,16 @@ impl<'a> TaskClient<'a> {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Submit may park a newly materialized child when this process still
+    /// occupies a runner slot. Start it here instead of waiting for `wait`.
+    fn start_parked_runners_after_dag_advance(&self) -> Result<(), WorkerError> {
+        let owner = current_process_identity()?;
+        while let ParkedStart::Started | ParkedStart::Deferred =
+            self.start_oldest_parked_runner(owner)?
+        {}
         Ok(())
     }
 
@@ -4333,18 +4402,16 @@ impl<'a> TaskClient<'a> {
                 .client_state
                 .queue_entry_for_task_turn(parent_record.meta().task_id())?
                 .is_some();
-            let journal_complete = match crate::runner_log::RunnerLog::try_open_existing(
+            // Read the checkpoint sidecar. Exclusive journal flock would
+            // miss a completion the finishing runner just published and still
+            // holds, so `from:` children would stay waiting until a later
+            // `wait` poll.
+            let journal_complete = crate::runner_log::snapshot(
                 &self.paths.state,
                 parent_record.meta().task_id(),
                 last_turn_id,
-            )? {
-                Some(log) => {
-                    let complete = log.completion().is_some();
-                    drop(log);
-                    complete
-                }
-                None => false,
-            };
+            )?
+            .is_some_and(|snapshot| snapshot.completion.is_some());
             let transfer = self.transfer_for_record(&parent_record)?;
             let object_exists = parent_record
                 .fetched_head()
@@ -4736,9 +4803,12 @@ impl<'a> TaskClient<'a> {
         Ok(None)
     }
 
-    fn start_oldest_parked_runner(&self, owner: ProcessIdentity) -> Result<bool, WorkerError> {
+    fn start_oldest_parked_runner(
+        &self,
+        owner: ProcessIdentity,
+    ) -> Result<ParkedStart, WorkerError> {
         let Some(entry) = self.client_state.unpark_oldest(owner)? else {
-            return Ok(false);
+            return Ok(ParkedStart::Stopped);
         };
         let task_id = self
             .submission_recovery_task_for_turn(entry.job_id())?
@@ -4746,24 +4816,32 @@ impl<'a> TaskClient<'a> {
             .ok_or_else(|| {
                 task_error("TASK_INCONSISTENT", "parked task turn has no task record")
             })?;
+        self.start_unparked_runner(task_id, entry.job_id())
+    }
+
+    fn start_unparked_runner(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<ParkedStart, WorkerError> {
         if self.task_has_submission_recovery_pending(task_id)? {
-            self.client_state.park_row(entry.job_id())?;
-            return Ok(false);
+            self.client_state.park_row(turn_id)?;
+            return Ok(ParkedStart::Stopped);
         }
         // Reconcile is not a finishing runner replacing its own slot.
         // exclude_reserver belongs only to TurnRunner::start_next_parked.
-        match self.start_runner(task_id, entry.job_id(), false, false) {
-            Ok(RunnerStart::Started(_)) => Ok(true),
-            Ok(RunnerStart::Pending) => Ok(false),
+        match self.start_runner(task_id, turn_id, false, false) {
+            Ok(RunnerStart::Started(_)) => Ok(ParkedStart::Started),
+            Ok(RunnerStart::Pending) => Ok(ParkedStart::Deferred),
             Ok(RunnerStart::Saturated) => {
-                self.client_state.park_row(entry.job_id())?;
-                Ok(false)
+                self.client_state.park_row(turn_id)?;
+                Ok(ParkedStart::Stopped)
             }
             Err(error) => {
                 if let Ok(record) = self.client_state.load_task(task_id)
                     && let Ok(transfer) = self.transfer_for_record(&record)
                 {
-                    return Err(self.fail_handoff(task_id, entry.job_id(), transfer, error));
+                    return Err(self.fail_handoff(task_id, turn_id, transfer, error));
                 }
                 Err(task_error(
                     "RUNNER_HANDOFF_FAILED",

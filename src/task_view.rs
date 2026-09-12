@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::{AgentKind, PermissionPolicy, Question, ReportedCheckStatus},
+    job::QueueState,
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
@@ -531,6 +532,30 @@ pub fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
         Some(QueueBlockingReason::PinnedWorkerBusy { .. }) => "PINNED_WORKER_BUSY".to_owned(),
         Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL".to_owned(),
         Some(QueueBlockingReason::NoEligibleWorker) | None => "WAITING_FOR_DISPATCH".to_owned(),
+    }
+}
+
+/// Parked rows must name the stall: a missing requirement, full eligible
+/// workers, or the existing waiting codes for pin/run-cap cases.
+pub fn parked_task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
+    match reason {
+        Some(QueueBlockingReason::CapabilityMissing { missing }) => {
+            format!("CAPABILITY_MISSING:{}", missing.join(","))
+        }
+        Some(QueueBlockingReason::PinnedWorkerBusy { .. }) => "PINNED_WORKER_BUSY".to_owned(),
+        Some(QueueBlockingReason::RunCap) => "RUN_MAX_PARALLEL".to_owned(),
+        Some(QueueBlockingReason::NoEligibleWorker) | None => "CAPACITY_BUSY".to_owned(),
+    }
+}
+
+pub fn task_row_blocking_code_for_queue_state(
+    state: &QueueState,
+    reason: Option<&QueueBlockingReason>,
+) -> String {
+    if matches!(state, QueueState::Parked) {
+        parked_task_row_blocking_code(reason)
+    } else {
+        task_row_blocking_code(reason)
     }
 }
 

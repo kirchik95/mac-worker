@@ -34,8 +34,8 @@ use mac_worker::{
     job::{
         AdmissionObservation, JobMeta, JobState, JobStatus, LeaseAcquireRequest,
         LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogChunkResponse, LogStream,
-        ProcessIdentity, StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
-        SubmitResponse,
+        ProcessIdentity, QueueState, StatusLogsRequest, StatusLogsResponse, StatusRequest,
+        StatusResponse, SubmitResponse,
     },
     lease::SlotState,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -51,7 +51,7 @@ use mac_worker::{
         RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
         TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     },
-    task_client::{TaskClient, TaskSubmitRequest, WaitSelector},
+    task_client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector},
     task_store::{
         SessionBinding, TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest,
         TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
@@ -60,7 +60,7 @@ use mac_worker::{
     transfer::HostOperation,
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{InlineRunnerExecutor, RunnerExecutor},
+    turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -629,6 +629,10 @@ fn dag_test_config() -> Config {
 }
 
 fn plant_bound_mini1_ready(state: &ClientStateStore) {
+    plant_bound_mini1_ready_with(state, vec!["darwin-arm64".into(), "agent:codex".into()]);
+}
+
+fn plant_bound_mini1_ready_with(state: &ClientStateStore, capabilities: Vec<String>) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -639,7 +643,7 @@ fn plant_bound_mini1_ready(state: &ClientStateStore) {
                 "mini-1".into(),
                 true,
                 CandidateSlot::Idle,
-                vec!["darwin-arm64".into(), "agent:codex".into()],
+                capabilities,
                 Some(8 * 1024 * 1024 * 1024),
                 64 * 1024 * 1024 * 1024,
                 now,
@@ -1878,6 +1882,9 @@ struct FollowupWorker {
     session_task: Mutex<Option<TaskId>>,
     prepared: Mutex<Option<(TaskId, TurnId)>>,
     turn_submitted: AtomicBool,
+    /// Host already auto-closed after Done. First-turn DAG parents use this
+    /// so laptop follow persists Closed before it advances `from:` children.
+    close_after_done: bool,
 }
 
 impl FollowupWorker {
@@ -1890,6 +1897,29 @@ impl FollowupWorker {
             session_task: Mutex::new(None),
             prepared: Mutex::new(None),
             turn_submitted: AtomicBool::new(false),
+            close_after_done: false,
+        }
+    }
+
+    fn auto_closed(result_oid: BaseOid) -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            first_turn: TurnSummary::new(
+                1,
+                TurnId::generate(),
+                None,
+                None,
+                None,
+                false,
+                Some(1),
+                None,
+            ),
+            first_oid: result_oid.clone(),
+            result_oid,
+            session_task: Mutex::new(None),
+            prepared: Mutex::new(None),
+            turn_submitted: AtomicBool::new(false),
+            close_after_done: true,
         }
     }
 
@@ -1917,8 +1947,8 @@ impl FollowupWorker {
         assert_eq!(prepared_task, task_id);
         let done = self.turn_submitted.load(Ordering::SeqCst);
         let now = Self::now_millis();
-        let second = TurnSummary::new(
-            2,
+        let current = TurnSummary::new(
+            if self.close_after_done { 1 } else { 2 },
             followup,
             done.then_some(TurnTerminal::Succeeded),
             done.then_some(TaskOutcome::Done),
@@ -1927,17 +1957,30 @@ impl FollowupWorker {
             Some(now.saturating_sub(1).max(1)),
             done.then_some(now),
         );
-        TaskStatus::new(
-            if done {
+        let turns = if self.close_after_done {
+            vec![current]
+        } else {
+            vec![self.first_turn.clone(), current]
+        };
+        let state = if done {
+            if self.close_after_done {
+                TaskState::Closed
+            } else {
                 TaskState::Open
-            } else {
-                TaskState::Active
-            },
-            if done {
-                Some(TaskOutcome::Done)
-            } else {
-                Some(TaskOutcome::NeedsInput)
-            },
+            }
+        } else {
+            TaskState::Active
+        };
+        let last_outcome = if done {
+            Some(TaskOutcome::Done)
+        } else if self.close_after_done {
+            None
+        } else {
+            Some(TaskOutcome::NeedsInput)
+        };
+        TaskStatus::new(
+            state,
+            last_outcome,
             Some("mini-1".into()),
             true,
             Some(if done {
@@ -1949,7 +1992,7 @@ impl FollowupWorker {
             Vec::new(),
             Vec::new(),
             None,
-            vec![self.first_turn.clone(), second],
+            turns,
             now,
         )
     }
@@ -3620,4 +3663,234 @@ fn unregistered_local_dag_does_not_bind_from_controller_transfer_cache() {
         "local DAG must not bind an OID that exists only in controller-transfer"
     );
     assert_eq!(dag.nodes["child"].state, DagNodeState::Waiting);
+}
+
+const ROOT_FROM_CHILD_CLOSE_ON_DONE: &[u8] = br#"
+version = 1
+agent = "codex"
+close_on = "done"
+
+[[tasks]]
+id = "root"
+prompt = "root work"
+
+[[tasks]]
+id = "child"
+prompt = "child work"
+depends_on = ["root"]
+base = "from:root"
+"#;
+
+const ROOT_FROM_CHILD_PUSH: &[u8] = br#"
+version = 1
+agent = "codex"
+close_on = "done"
+publish = ["fetch", "push"]
+
+[[tasks]]
+id = "root"
+prompt = "root work"
+
+[[tasks]]
+id = "child"
+prompt = "child work"
+depends_on = ["root"]
+base = "from:root"
+"#;
+
+fn run_auto_closed_turn(
+    harness: &BatchHarness,
+    worker: &FollowupWorker,
+    task_id: TaskId,
+    turn_id: TurnId,
+) -> mac_worker::turn_runner::TurnOutcomeReport {
+    finish_before_watchdog(Duration::from_secs(20), || {
+        TurnRunner::new(
+            worker,
+            &harness.config,
+            &harness.paths,
+            &harness.store,
+            &harness.executor,
+        )
+        .run(task_id, turn_id, Some(&mut std::io::sink()))
+        .unwrap()
+    })
+}
+
+/// A dependent batch without `--wait` must finish itself: parent Done
+/// auto-closes, the `from:` child is bound and started, then the child
+/// auto-closes. The operator does not call `wait` or `reconcile`.
+#[test]
+fn dependent_batch_without_wait_auto_closes_and_starts_the_child() {
+    let harness = BatchHarness::new(ROOT_FROM_CHILD_CLOSE_ON_DONE);
+    let report = harness.batch();
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    let root_task = dag.nodes["root"].task_id;
+    let root_turn = dag.nodes["root"].turn_id;
+    let child_id = dag.nodes["child"].task_id;
+    let child_turn = dag.nodes["child"].turn_id;
+    assert_eq!(dag.nodes["child"].state, DagNodeState::Waiting);
+    drop(dag);
+
+    let parent_oid = harness.commit_result(b"parent auto-close result\n");
+    let parent_worker = FollowupWorker::auto_closed(parent_oid.clone());
+    let parent = run_auto_closed_turn(&harness, &parent_worker, root_task, root_turn);
+    assert_eq!(parent.status().state(), TaskState::Closed);
+    assert_eq!(parent.status().last_outcome(), Some(&TaskOutcome::Done));
+
+    let parent_record = harness.store.load_task(root_task).unwrap();
+    assert_eq!(parent_record.status().state(), TaskState::Closed);
+    assert_eq!(
+        parent_record.status().last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    assert_eq!(parent_record.fetched_head(), Some(&parent_oid));
+    assert!(parent_record.runner().is_none());
+    assert!(
+        harness
+            .store
+            .queue_entry_for_task_turn(root_task)
+            .unwrap()
+            .is_none()
+    );
+
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(dag.nodes["child"].state, DagNodeState::Submitted);
+    assert_eq!(dag.nodes["child"].bound_oid.as_ref(), Some(&parent_oid));
+    assert_eq!(dag.nodes["child"].bound_turn_id, Some(root_turn));
+    drop(dag);
+    let child = harness.store.load_task(child_id).unwrap();
+    assert_eq!(child.meta().base_oid(), &parent_oid);
+    assert!(
+        harness.store.queue_entry(child_turn).unwrap().is_some(),
+        "child must be queued after the parent auto-closes"
+    );
+    assert!(
+        child.runner().is_some(),
+        "closing runner must start the child without wait/reconcile"
+    );
+
+    let child_oid = harness.commit_result(b"child auto-close result\n");
+    let child_worker = FollowupWorker::auto_closed(child_oid.clone());
+    let child_outcome = run_auto_closed_turn(&harness, &child_worker, child_id, child_turn);
+    assert_eq!(child_outcome.status().state(), TaskState::Closed);
+    assert_eq!(
+        child_outcome.status().last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    let child = harness.store.load_task(child_id).unwrap();
+    assert_eq!(child.status().state(), TaskState::Closed);
+    assert_eq!(child.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(child.fetched_head(), Some(&child_oid));
+    assert!(
+        harness
+            .store
+            .queue_entry_for_task_turn(child_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A parked root that requires `origin:github.com` must name that stall in
+/// `task list`. After the operator adds the capability, one `task reconcile`
+/// starts exactly one runner.
+#[test]
+fn parked_root_missing_origin_capability_shows_code_and_reconcile_starts_it() {
+    let harness = BatchHarness::new(ROOT_FROM_CHILD_PUSH);
+    assert!(
+        harness
+            .repo()
+            .git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/project.git"
+            ])
+            .status
+            .success()
+    );
+    let report = harness.batch();
+    let dag = harness
+        .store
+        .load_run_dag(report.run_id())
+        .unwrap()
+        .unwrap();
+    let root_task = dag.nodes["root"].task_id;
+    let root_turn = dag.nodes["root"].turn_id;
+    drop(dag);
+    let queued = harness
+        .store
+        .queue_entry(root_turn)
+        .unwrap()
+        .expect("root queued");
+    assert!(
+        queued
+            .requirements()
+            .iter()
+            .any(|item| item == "origin:github.com"),
+        "push publish must require origin:github.com: {:?}",
+        queued.requirements()
+    );
+    harness.store.record_runner(root_task, None).unwrap();
+    harness.store.park_row(root_turn).unwrap();
+    assert!(matches!(
+        harness
+            .store
+            .queue_entry(root_turn)
+            .unwrap()
+            .unwrap()
+            .state(),
+        QueueState::Parked
+    ));
+
+    let listed = harness.client().list(TaskListFilter::default()).unwrap();
+    let row = listed
+        .tasks()
+        .iter()
+        .find(|task| task.task_id == root_task)
+        .expect("parked root is listed");
+    assert_eq!(
+        row.blocking_code.as_deref(),
+        Some("CAPABILITY_MISSING:origin:github.com")
+    );
+
+    plant_bound_mini1_ready_with(
+        &harness.store,
+        vec![
+            "darwin-arm64".into(),
+            "agent:codex".into(),
+            "origin:github.com".into(),
+        ],
+    );
+    let config = Config::parse(
+        "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:github.com\"]\n",
+    )
+    .unwrap();
+    let client = TaskClient::new(
+        &harness.runner,
+        &config,
+        &harness.paths,
+        &harness.store,
+        &harness.executor,
+    );
+    let reconcile = client.operator_reconcile().unwrap();
+    assert_eq!(reconcile.started_runners(), 1);
+    let entry = harness.store.queue_entry(root_turn).unwrap().unwrap();
+    assert!(!matches!(entry.state(), QueueState::Parked));
+    assert!(
+        harness
+            .store
+            .load_task(root_task)
+            .unwrap()
+            .runner()
+            .is_some()
+    );
 }

@@ -31,8 +31,8 @@ use crate::{
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
     supervisor::SystemProcessInspector,
     task::{
-        LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+        ClosePolicy, LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus,
+        TurnId, TurnSummary, TurnTerminal,
     },
     task_store::{
         TaskCancelRequest, TaskPrebindRequest, TaskPrepareRequest, TaskSessionRequest,
@@ -1360,6 +1360,7 @@ impl<'a> TurnRunner<'a> {
             record
         };
         self.client_state.update_task(record)?;
+        self.persist_host_auto_close(worker, task_id)?;
         let outcome = terminal
             .last_outcome()
             .cloned()
@@ -1380,8 +1381,9 @@ impl<'a> TurnRunner<'a> {
             .remove_task_turn_after_terminal(turn_id, owner)?;
         self.client_state.remove_turn_prompt(task_id, turn_id)?;
         self.advance_pending_dags_after_transfer_drop()?;
+        let status = self.client_state.load_task(task_id)?.status().clone();
         Ok(TurnOutcomeReport {
-            status: terminal,
+            status,
             events: vec![event],
             exit_code,
         })
@@ -1537,7 +1539,7 @@ impl<'a> TurnRunner<'a> {
                     .status()
                     .clone();
                 self.persist_status(task_id, status.clone())?;
-                if status.state().is_terminal() || status.state() == TaskState::Open {
+                if follow_is_complete(&status) {
                     return Ok(status);
                 }
             }
@@ -1589,6 +1591,31 @@ impl<'a> TurnRunner<'a> {
         *drain = next;
         write_follower(follow, &bytes);
         Ok(!bytes.is_empty())
+    }
+
+    fn persist_host_auto_close(
+        &self,
+        worker: &WorkerEntry,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        let record = self.client_state.load_task(task_id)?;
+        if record.meta().close_policy() != ClosePolicy::Done
+            || record.status().state() != TaskState::Open
+            || record.status().last_outcome() != Some(&TaskOutcome::Done)
+        {
+            return Ok(());
+        }
+        let status = RemoteJobClient::new(self.runner)
+            .task_status(
+                worker,
+                &TaskStatusRequest::new(record.meta().project_id(), task_id),
+            )?
+            .status()
+            .clone();
+        if status.state() == TaskState::Closed {
+            self.persist_status(task_id, status)?;
+        }
+        Ok(())
     }
 
     fn persist_status(&self, task_id: TaskId, status: TaskStatus) -> Result<(), WorkerError> {
@@ -2209,6 +2236,10 @@ pub(crate) fn adopt_row_with_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn follow_is_complete(status: &TaskStatus) -> bool {
+    status.state().is_terminal() || status.state() == TaskState::Open
 }
 
 fn append_event(
