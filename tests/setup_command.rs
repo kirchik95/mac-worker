@@ -108,6 +108,11 @@ impl RecordingRunner {
 
 impl ProcessRunner for RecordingRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        // Setup lists the laptop process table through this runner. An empty
+        // table keeps byte-exact reports independent of a live dashboard.
+        if request.program == "/bin/ps" {
+            return Ok(result(0, b"", b""));
+        }
         self.requests.lock().unwrap().push(request.clone());
         self.results
             .lock()

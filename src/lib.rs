@@ -30,11 +30,9 @@ use job::{
     LogChunkResponse, ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
-#[cfg(test)]
-use laptop::EmptyLaptopProcessTable;
-#[cfg(not(test))]
-use laptop::SystemLaptopProcessTable;
-use laptop::{LaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli};
+use laptop::{
+    LaptopProcessTable, SystemLaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli,
+};
 use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
 use paths::PathLayout;
@@ -234,7 +232,7 @@ fn execute_with_context(
             Ok(CommandOutput::Setup(SetupReport {
                 protocol_version: PROTOCOL_VERSION,
                 workers,
-                warnings: laptop_setup_warnings(),
+                warnings: laptop_setup_warnings(runner),
             }))
         }
         Command::Doctor { project, includes } => {
@@ -245,11 +243,12 @@ fn execute_with_context(
                 Some(project) => project,
                 None => runtime.current_dir()?,
             };
+            let laptop_processes = SystemLaptopProcessTable::new(runner);
             let service = DoctorService {
                 runner,
                 config: &config,
                 paths: &paths,
-                laptop_processes: laptop_process_table(),
+                laptop_processes: &laptop_processes,
                 installed_binary_mtime: installed_binary_mtime(),
             };
             Ok(CommandOutput::Doctor(service.inspect(DoctorRequest {
@@ -4692,35 +4691,17 @@ fn herdr_notifier_socket(
     ))
 }
 
-fn laptop_process_table() -> &'static dyn LaptopProcessTable {
-    #[cfg(test)]
-    {
-        &EmptyLaptopProcessTable
-    }
-    #[cfg(not(test))]
-    {
-        &SystemLaptopProcessTable
-    }
-}
-
 fn installed_binary_mtime() -> Option<SystemTime> {
-    #[cfg(test)]
-    {
-        None
-    }
-    #[cfg(not(test))]
-    {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
-    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
 }
 
-fn laptop_setup_warnings() -> Vec<SetupWarning> {
+fn laptop_setup_warnings(runner: &dyn ProcessRunner) -> Vec<SetupWarning> {
     let Some(mtime) = installed_binary_mtime() else {
         return Vec::new();
     };
-    let Ok(processes) = laptop_process_table().list() else {
+    let Ok(processes) = SystemLaptopProcessTable::new(runner).list() else {
         return Vec::new();
     };
     let outdated = outdated_laptop_cli(&processes, mtime);

@@ -6,14 +6,17 @@
 //! file's mtime, and the dashboard snapshot can flag the same mismatch.
 
 use std::{
+    ffi::OsString,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::error::WorkerError;
+use crate::{
+    error::WorkerError,
+    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+};
 
 /// Identity of the CLI file a long-running laptop process started from.
 ///
@@ -117,23 +120,58 @@ pub trait LaptopProcessTable: Send + Sync {
     fn list(&self) -> Result<Vec<LaptopProcess>, WorkerError>;
 }
 
-/// Production table: `/bin/ps` with `LANG=C`. Not privileged.
-pub struct SystemLaptopProcessTable;
+const LAPTOP_PS_POLICY: ProcessPolicy = ProcessPolicy {
+    stdout_limit: 1024 * 1024,
+    stderr_limit: 64 * 1024,
+    deadline: Duration::from_secs(5),
+};
 
-impl LaptopProcessTable for SystemLaptopProcessTable {
+/// Production table: `/bin/ps` through the injected `ProcessRunner`.
+///
+/// Library code never spawns `ps` itself; tests' fake runners therefore
+/// cannot observe the real machine.
+pub struct SystemLaptopProcessTable<'a> {
+    runner: &'a dyn ProcessRunner,
+}
+
+impl<'a> SystemLaptopProcessTable<'a> {
+    pub fn new(runner: &'a dyn ProcessRunner) -> Self {
+        Self { runner }
+    }
+}
+
+impl LaptopProcessTable for SystemLaptopProcessTable<'_> {
     fn list(&self) -> Result<Vec<LaptopProcess>, WorkerError> {
-        let output = Command::new("/bin/ps")
-            .args(["-axww", "-o", "pid=", "-o", "etime=", "-o", "args="])
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .output()
-            .map_err(WorkerError::Io)?;
-        if !output.status.success() {
+        let result = self.runner.run(&laptop_ps_request())?;
+        if !result.status.success() {
             return Err(WorkerError::Protocol(
                 "laptop process table could not be listed".into(),
             ));
         }
-        Ok(parse_ps_table(&output.stdout, SystemTime::now()))
+        Ok(parse_ps_table(&result.stdout, SystemTime::now()))
+    }
+}
+
+fn laptop_ps_request() -> ProcessRequest {
+    ProcessRequest {
+        program: OsString::from("/bin/ps"),
+        args: vec![
+            OsString::from("-axww"),
+            OsString::from("-o"),
+            OsString::from("pid="),
+            OsString::from("-o"),
+            OsString::from("etime="),
+            OsString::from("-o"),
+            OsString::from("args="),
+        ],
+        environment: vec![
+            (OsString::from("LANG"), OsString::from("C")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+        ],
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy: LAPTOP_PS_POLICY,
+        isolate_parent_environment: false,
     }
 }
 
@@ -286,6 +324,9 @@ fn parse_etime(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
+
+    use crate::process::ProcessResult;
 
     #[test]
     fn laptop_cli_kind_matches_dashboard_and_controller_run_only() {
@@ -356,5 +397,64 @@ mod tests {
         assert_eq!(parsed[0].pid, 42);
         assert_eq!(parsed[0].started_at, now - Duration::from_secs(60));
         assert_eq!(parsed[0].args[1], "dashboard");
+    }
+
+    struct RecordingPsRunner {
+        requests: Mutex<Vec<ProcessRequest>>,
+        stdout: Vec<u8>,
+    }
+
+    impl ProcessRunner for RecordingPsRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: self.stdout.clone(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn process_table_lists_through_the_injected_runner() {
+        let runner = RecordingPsRunner {
+            requests: Mutex::new(Vec::new()),
+            stdout: b"  42  01:00 /Users/me/.local/bin/worker dashboard\n".to_vec(),
+        };
+        let processes = SystemLaptopProcessTable::new(&runner).list().unwrap();
+        let requests = runner.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, OsString::from("/bin/ps"));
+        assert_eq!(
+            requests[0].args,
+            vec![
+                OsString::from("-axww"),
+                OsString::from("-o"),
+                OsString::from("pid="),
+                OsString::from("-o"),
+                OsString::from("etime="),
+                OsString::from("-o"),
+                OsString::from("args="),
+            ]
+        );
+        assert_eq!(processes[0].pid, 42);
+        assert_eq!(processes[0].args[1], "dashboard");
+    }
+
+    struct FailingPsRunner;
+
+    impl ProcessRunner for FailingPsRunner {
+        fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            Err(WorkerError::Protocol("ps refused".into()))
+        }
+    }
+
+    #[test]
+    fn process_table_surfaces_runner_errors_instead_of_spawning() {
+        assert!(
+            SystemLaptopProcessTable::new(&FailingPsRunner)
+                .list()
+                .is_err()
+        );
     }
 }

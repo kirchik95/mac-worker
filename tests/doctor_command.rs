@@ -163,6 +163,15 @@ impl DoctorRunner {
 
 impl ProcessRunner for DoctorRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        // Doctor lists the laptop process table through this runner. Falling
+        // through to SystemProcessRunner would observe a live dashboard.
+        if request.program == OsStr::new("/bin/ps") {
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
         if request.program == OsStr::new("/usr/bin/ssh") {
             let result = self
                 .ssh_results
