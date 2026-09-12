@@ -21,6 +21,7 @@ use crate::{
     host_store::{HostStore, HostStoreWritePoint},
     job::ProcessIdentity,
     process::ProcessRunner,
+    protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     task::{BaseOid, BranchName, DeliveryState, OriginDelivery, TaskId, TurnId},
@@ -32,6 +33,8 @@ const MAX_BACKOFF_MILLIS: u64 = 300_000;
 pub const OUTBOX_WORKER_REQUIRED: &str = "OUTBOX_WORKER_REQUIRED";
 pub const OUTBOX_BUSY: &str = "OUTBOX_BUSY";
 pub const DELIVERY_UNREADABLE: &str = "DELIVERY_UNREADABLE";
+pub const DELIVERY_ALREADY_DELIVERED: &str = "DELIVERY_ALREADY_DELIVERED";
+pub const DELIVERY_NOT_FOUND: &str = "DELIVERY_NOT_FOUND";
 const DELIVERY_DIR: &str = "delivery";
 const DEFAULT_WATCH_IDLE_MILLIS: u64 = 1_000;
 const DUE_DIRECTORY: &str = "locks/outbox-due";
@@ -149,6 +152,37 @@ struct DeliveryIntent {
     superseded_by: Option<BaseOid>,
     created_at_millis: u64,
     updated_at_millis: u64,
+    /// Set when an operator re-drives a failed or retrying intent. Old files
+    /// omit it; `skip_serializing_if` keeps unretried intents identical so
+    /// `deny_unknown_fields` watchers still read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_requested_at_millis: Option<u64>,
+}
+
+/// Host JSON for `worker host outbox-retry`. Protocol 7; old helpers never
+/// emit this type, and old laptops never call the command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRetryResponse {
+    protocol_version: u32,
+    deliveries: Vec<OriginDelivery>,
+}
+
+impl OutboxRetryResponse {
+    pub fn new(deliveries: Vec<OriginDelivery>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            deliveries,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +255,7 @@ impl<'a> OriginOutbox<'a> {
             superseded_by: None,
             created_at_millis: commit.now_millis,
             updated_at_millis: commit.now_millis,
+            retry_requested_at_millis: None,
         };
         if let Some(existing) =
             self.read_intent(commit.project_id, commit.task_id, commit.turn_id)?
@@ -359,6 +394,54 @@ impl<'a> OriginOutbox<'a> {
             ));
         };
         self.pump_due_locked(now_millis)
+    }
+
+    /// Reset this task's failed or retrying intents so `MAX_ATTEMPTS` starts
+    /// again, then wake the pump. Delivered or superseded intents are refused.
+    pub fn retry_task(
+        &self,
+        task_id: TaskId,
+        now_millis: u64,
+        launcher: &dyn OutboxLauncher,
+    ) -> Result<Vec<OriginDelivery>, WorkerError> {
+        let Some(project_id) = self.find_project_for_task(task_id)? else {
+            return Err(WorkerError::task(
+                DELIVERY_NOT_FOUND,
+                "no delivery intents for this task",
+            ));
+        };
+        let intents = self.load_intents(&project_id, task_id)?;
+        if intents.is_empty() {
+            return Err(WorkerError::task(
+                DELIVERY_NOT_FOUND,
+                "no delivery intents for this task",
+            ));
+        }
+        let mut reset_any = false;
+        let mut blocked = false;
+        for intent in &intents {
+            if intent_is_blocked(intent) {
+                blocked = true;
+                continue;
+            }
+            if !intent_is_redriveable(intent) {
+                continue;
+            }
+            self.reset_intent(intent, now_millis)?;
+            reset_any = true;
+        }
+        if !reset_any {
+            if blocked {
+                return Err(WorkerError::task(
+                    DELIVERY_ALREADY_DELIVERED,
+                    "origin delivery is already delivered or superseded",
+                ));
+            }
+            let _ = self.wake(launcher)?;
+            return self.deliveries(&project_id, task_id);
+        }
+        let _ = self.wake(launcher)?;
+        self.deliveries(&project_id, task_id)
     }
 
     pub fn wake(&self, launcher: &dyn OutboxLauncher) -> Result<OutboxActivation, WorkerError> {
@@ -928,6 +1011,54 @@ impl<'a> OriginOutbox<'a> {
             .collect())
     }
 
+    fn find_project_for_task(&self, task_id: TaskId) -> Result<Option<String>, WorkerError> {
+        let tasks = match self.store.open_directory("tasks", false) {
+            Ok(tasks) => tasks,
+            Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = task_id.to_string();
+        for project in utf8_names(&tasks)? {
+            let project_dir = match tasks.open_child_directory(&relative(&project)?, false) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            if project_dir.entry_exists(&name)? {
+                return Ok(Some(project));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reset_intent(&self, snapshot: &DeliveryIntent, now_millis: u64) -> Result<(), WorkerError> {
+        let _guard = self.intent_lock(snapshot.task_id, snapshot.turn_id)?;
+        let Some(mut current) =
+            self.read_intent(&snapshot.project_id, snapshot.task_id, snapshot.turn_id)?
+        else {
+            return Err(WorkerError::task(
+                DELIVERY_NOT_FOUND,
+                "delivery intent was removed during retry",
+            ));
+        };
+        if intent_is_blocked(&current) {
+            return Err(WorkerError::task(
+                DELIVERY_ALREADY_DELIVERED,
+                "origin delivery is already delivered or superseded",
+            ));
+        }
+        if !intent_is_redriveable(&current) {
+            return Ok(());
+        }
+        current.state = DeliveryState::Retrying;
+        current.attempt = 0;
+        current.next_attempt_at_millis = now_millis;
+        current.retry_requested_at_millis = Some(now_millis);
+        current.updated_at_millis = now_millis;
+        self.write_intent(&current, false)
+    }
+
     fn unreadable_projections(
         &self,
         project_id: &str,
@@ -1320,6 +1451,18 @@ fn due_name(task_id: TaskId, turn_id: TurnId) -> String {
 
 fn intent_due(intent: &DeliveryIntent, now_millis: u64) -> bool {
     intent.state.retains_objects() && intent.next_attempt_at_millis <= now_millis
+}
+
+fn intent_is_blocked(intent: &DeliveryIntent) -> bool {
+    intent.state == DeliveryState::Delivered || intent.superseded_by.is_some()
+}
+
+fn intent_is_redriveable(intent: &DeliveryIntent) -> bool {
+    !intent_is_blocked(intent)
+        && matches!(
+            intent.state,
+            DeliveryState::Failed | DeliveryState::Retrying
+        )
 }
 
 fn delivery_origin(origin: &str) -> Result<String, WorkerError> {

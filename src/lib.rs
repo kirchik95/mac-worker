@@ -477,6 +477,11 @@ fn execute_with_context(
             "host outbox requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command: HostCommand::OutboxRetry { .. },
+        } => Err(WorkerError::Protocol(
+            "host outbox-retry requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::ControllerRpc,
         } => Err(WorkerError::Protocol(
             "host controller-rpc requires the stdio execution boundary".into(),
@@ -1291,6 +1296,11 @@ fn run_task_subcommand(
             write_task_report(&report, json, stdout)?;
             Ok(0)
         }
+        TaskCommand::PublishRetry { task_id } => {
+            let deliveries = client.publish_retry(task_id)?;
+            write_publish_retry_report(task_id, &deliveries, json, stdout)?;
+            Ok(0)
+        }
         TaskCommand::Wait {
             task_id,
             run,
@@ -1527,6 +1537,40 @@ pub(crate) fn write_task_report(
                 "receipt: stage={} residual={}",
                 receipt.stage(),
                 receipt.residual().join(",")
+            )?;
+        }
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+fn write_publish_retry_report(
+    task_id: crate::task::TaskId,
+    deliveries: &[crate::task::OriginDelivery],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "task_id": task_id.to_string(),
+                "deliveries": deliveries,
+            }),
+        )
+    } else {
+        if deliveries.is_empty() {
+            writeln!(stdout, "task {task_id}: no origin deliveries")?;
+        }
+        for delivery in deliveries {
+            writeln!(
+                stdout,
+                "delivery: {} turn={} attempt={} {}",
+                delivery_state_name(delivery.state()),
+                delivery.turn_id(),
+                delivery.attempt(),
+                delivery.oid()
             )?;
         }
         stdout.flush()?;
@@ -1857,6 +1901,12 @@ pub fn run_with_rsync_executor_in_context(
             host_root.clone(),
             *wake,
         );
+    }
+    if let Command::Host {
+        command: HostCommand::OutboxRetry { task_id },
+    } = &cli.command
+    {
+        return run_host_outbox_retry(cli.config, runtime, runner, stdout, *task_id);
     }
     if matches!(
         &cli.command,
@@ -2655,6 +2705,40 @@ fn run_host_outbox(
         Ok(()) => 0,
         Err(error) => error.exit_code(),
     }
+}
+
+fn run_host_outbox_retry(
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdout: &mut dyn Write,
+    task_id: crate::task::TaskId,
+) -> u8 {
+    let result = (|| -> Result<crate::outbox::OutboxRetryResponse, WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let store = HostStore::open(&paths.host_state_root())?;
+        let outbox = crate::outbox::OriginOutbox::new(&store, runner);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| {
+                WorkerError::task("TASK_CLOCK_INVALID", "system clock precedes the Unix epoch")
+            })?
+            .as_millis();
+        let now = u64::try_from(now).map_err(|_| {
+            WorkerError::task("TASK_CLOCK_INVALID", "system clock is outside the range")
+        })?;
+        let deliveries = outbox.retry_task(task_id, now, &crate::outbox::SystemOutboxLauncher)?;
+        Ok(crate::outbox::OutboxRetryResponse::new(deliveries))
+    })();
+    let exit = result.as_ref().map_or_else(WorkerError::exit_code, |_| 0);
+    let write_result = match result {
+        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
+        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
+    };
+    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
+        return crate::error::ExitKind::Io as u8;
+    }
+    exit
 }
 
 fn run_host_gc(

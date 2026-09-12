@@ -101,6 +101,8 @@ After failed push, `ls-remote` the exact target. Remote == ours → delivered. R
 
 Max 12 attempts. Backoff `min(1000 * 2^(attempt-1), 300_000)` ms.
 
+Hidden `worker host outbox-retry <task_id>` (laptop `worker task publish-retry`) resets failed or retrying intents to `retrying`, `attempt = 0`, `next_attempt_at_millis = now`, records additive `retry_requested_at_millis`, rewrites the due registry, and wakes. Delivered or superseded intents are `DELIVERY_ALREADY_DELIVERED`. Missing intents are `DELIVERY_NOT_FOUND`. `ORIGIN_AUTH_FAILED` is eligible like any other failure. The next 12 attempts start from zero.
+
 ## Close, observation, GC
 
 Non-discard close keeps pins/intents and returns `TaskCloseResponse.delivery` / `deliveries` from the outbox. The laptop close mutation **merges** those deliveries into the local record. Discard while any intent is `pending`/`retrying` (or unreadable) → `TASK_BUSY` (`DELIVERY_PENDING`).

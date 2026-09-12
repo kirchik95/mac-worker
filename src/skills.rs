@@ -49,6 +49,7 @@ const GRAMMAR_PATHS: &[&[&str]] = &[
     &["task", "result"],
     &["task", "fetch"],
     &["task", "close"],
+    &["task", "publish-retry"],
     &["task", "wait"],
     &["task", "reconcile"],
     &["workers"],

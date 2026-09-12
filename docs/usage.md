@@ -128,6 +128,8 @@ Host pump (hidden `worker host`, not in top-level `--help`):
 
 `--once` is a one-shot pump, not a substitute for `--watch`. Do not treat a single `--once` after a crash as proof that due-registry recovery already ran; `--watch` recovers the due index on start. Host layout of intents, pins, and the due registry: [durable origin outbox](superpowers/specs/2026-09-10-origin-outbox.md).
 
+After a delivery reaches terminal `failed` (12 attempts, typically while origin credentials were broken), the watcher ignores it. Repair the worker login, then `worker task publish-retry <task_id>` resets that task's failed or retrying intents to `retrying` with attempt 0, records `retry_requested_at_millis`, and wakes the pump. Delivered or superseded intents are refused (`DELIVERY_ALREADY_DELIVERED`). An older helper that does not know `host outbox-retry` returns `HOST_COMMAND_UNSUPPORTED`. The task itself can already be Closed; this command does not reopen it.
+
 Project defaults:
 
 ```toml
@@ -258,7 +260,8 @@ listed for that string.
 - `ORIGIN_AUTH_FAILED`: the worker could not authenticate to origin. Check
   `worker workers` for `helper missing`, then on the worker run
   `gh auth login` and `gh auth setup-git` (HTTPS) or register the worker's
-  SSH key. Delivery keeps retrying.
+  SSH key. Delivery keeps retrying until 12 attempts; after `failed`, run
+  `worker task publish-retry <task_id>` instead of resubmitting the task.
 
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.

@@ -34,6 +34,7 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     snapshot::Snapshot,
+    task::TaskId,
     task_store::{
         TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
         TaskDiffRequest, TaskDiffResponse, TaskPrebindRequest, TaskPrepareRequest,
@@ -83,6 +84,7 @@ pub enum HostOperation {
     ControllerRpc,
     ControllerReceivePack,
     ControllerUploadPack,
+    OutboxRetry,
 }
 
 impl HostOperation {
@@ -115,6 +117,7 @@ impl HostOperation {
             Self::ControllerRpc => "~/.local/bin/worker host controller-rpc",
             Self::ControllerReceivePack => "~/.local/bin/worker host controller-receive-pack",
             Self::ControllerUploadPack => "~/.local/bin/worker host controller-upload-pack",
+            Self::OutboxRetry => "~/.local/bin/worker host outbox-retry",
         }
     }
 }
@@ -734,6 +737,39 @@ impl<'a> SshJsonTransport<'a> {
         self.runner.run(&request).map_err(map_control_failure)
     }
 
+    fn run_named_command(
+        &self,
+        worker: &WorkerEntry,
+        command: String,
+        stdin: Vec<u8>,
+        policy: ProcessPolicy,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        validate_worker(worker)?;
+        validate_control_policy(policy)?;
+        let request = ProcessRequest {
+            program: crate::transport::ssh_program()?,
+            args: vec![
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=5".into(),
+                "-o".into(),
+                "ForwardAgent=no".into(),
+                "-o".into(),
+                "ClearAllForwardings=yes".into(),
+                "--".into(),
+                worker.ssh.clone().into(),
+                command.into(),
+            ],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: Some(stdin),
+            policy,
+            isolate_parent_environment: false,
+        };
+        self.runner.run(&request).map_err(map_control_failure)
+    }
+
     pub fn agent_settings_get(
         &self,
         worker: &WorkerEntry,
@@ -1301,6 +1337,31 @@ impl<'a> RemoteJobClient<'a> {
         }
         Ok(response)
     }
+
+    pub fn outbox_retry(
+        &self,
+        worker: &WorkerEntry,
+        task_id: TaskId,
+    ) -> Result<crate::outbox::OutboxRetryResponse, WorkerError> {
+        let policy = control_policy(MAX_CONTROL_DEADLINE);
+        let command = format!("{} {task_id}", HostOperation::OutboxRetry.command());
+        let result = self
+            .transport
+            .run_named_command(worker, command, Vec::new(), policy)?;
+        if !result.status.success() {
+            if is_unrecognized_host_subcommand("outbox-retry", &result) {
+                return Err(WorkerError::Protocol(
+                    "HOST_COMMAND_UNSUPPORTED: host helper does not support outbox-retry".into(),
+                ));
+            }
+            return Err(control_request_failure(&result, policy));
+        }
+        let response: crate::outbox::OutboxRetryResponse = parse_control_response(&result, policy)?;
+        if response.protocol_version() != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid_remote_response());
+        }
+        Ok(response)
+    }
 }
 
 fn control_policy(deadline: Duration) -> ProcessPolicy {
@@ -1395,16 +1456,30 @@ fn is_unrecognized_optional_command(
     operation: HostOperation,
     result: &crate::process::ProcessResult,
 ) -> bool {
-    if operation != HostOperation::StatusLogs
-        || result.status.success()
-        || result.status.code() == Some(255)
-        || !result.stdout.is_empty()
-    {
+    let Some(subcommand) = unrecognized_optional_subcommand(operation) else {
+        return false;
+    };
+    is_unrecognized_host_subcommand(subcommand, result)
+}
+
+fn unrecognized_optional_subcommand(operation: HostOperation) -> Option<&'static str> {
+    match operation {
+        HostOperation::StatusLogs => Some("status-logs"),
+        HostOperation::OutboxRetry => Some("outbox-retry"),
+        _ => None,
+    }
+}
+
+fn is_unrecognized_host_subcommand(
+    subcommand: &str,
+    result: &crate::process::ProcessResult,
+) -> bool {
+    if result.status.success() || result.status.code() == Some(255) || !result.stdout.is_empty() {
         return false;
     }
     let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
     (stderr.contains("unrecognized subcommand") || stderr.contains("unrecognised subcommand"))
-        && stderr.contains("status-logs")
+        && stderr.contains(subcommand)
 }
 
 fn validate_remote_log_chunk(

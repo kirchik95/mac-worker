@@ -58,6 +58,12 @@ fn task_commands_parse_the_documented_forms() {
             "close",
             "018f0f4a6b5c7d8e9f00112233445566",
         ],
+        vec![
+            "worker",
+            "task",
+            "publish-retry",
+            "018f0f4a6b5c7d8e9f00112233445566",
+        ],
         vec!["worker", "task", "reconcile"],
         vec![
             "worker",

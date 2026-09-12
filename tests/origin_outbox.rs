@@ -31,8 +31,9 @@ use mac_worker::{
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService, SlotState},
     outbox::{
-        DELIVERY_UNREADABLE, DeliveryCommit, OUTBOX_BUSY, OUTBOX_WORKER_REQUIRED, OriginOutbox,
-        OutboxActivation, OutboxLauncher, due_index_reads_for, task_directory_scans_for,
+        DELIVERY_ALREADY_DELIVERED, DELIVERY_NOT_FOUND, DELIVERY_UNREADABLE, DeliveryCommit,
+        OUTBOX_BUSY, OUTBOX_WORKER_REQUIRED, OriginOutbox, OutboxActivation, OutboxLauncher,
+        due_index_reads_for, task_directory_scans_for,
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::MemoryPressure,
@@ -64,6 +65,20 @@ impl OutboxLauncher for InactiveLauncher {
     fn ensure_watch(&self, host_root: &Path) -> Result<OutboxActivation, WorkerError> {
         assert!(host_root.is_absolute());
         Ok(OutboxActivation::Inactive)
+    }
+}
+
+/// Does not stamp `OUTBOX_WORKER_REQUIRED` onto live intents during `--wake`.
+struct SilentInactiveLauncher;
+
+impl OutboxLauncher for SilentInactiveLauncher {
+    fn ensure_watch(&self, host_root: &Path) -> Result<OutboxActivation, WorkerError> {
+        assert!(host_root.is_absolute());
+        Ok(OutboxActivation::Inactive)
+    }
+
+    fn report_unconfigured(&self) -> bool {
+        false
     }
 }
 
@@ -2708,4 +2723,104 @@ fn packed_baseline_receipt_is_retained_when_pin_publication_fails() {
         "recovery pin must not re-baseline already receipted packs"
     );
     assert_eq!(delivery_pack_stats(&mirror_path), (0, 0));
+}
+
+fn exhaust_until_failed(store: &HostStore, mut now: u64) -> mac_worker::task::OriginDelivery {
+    let mut last = None;
+    for _ in 0..20 {
+        let results = outbox(store).pump_due(now).unwrap();
+        if let Some(delivery) = results.into_iter().next() {
+            last = Some(delivery.clone());
+            if delivery.state() == DeliveryState::Failed {
+                return delivery;
+            }
+        }
+        now = now.saturating_add(300_001);
+    }
+    panic!("origin must exhaust attempts into Failed, last={last:?}");
+}
+
+#[test]
+fn failed_intent_publish_retry_resets_attempts_and_the_next_pump_delivers() {
+    let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
+    fs::write(origin.join("reject"), b"1").unwrap();
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    let failed = exhaust_until_failed(&store, 1);
+    assert_eq!(failed.state(), DeliveryState::Failed);
+    assert!(failed.attempt() > 1);
+    let due =
+        store
+            .root()
+            .join("locks/outbox-due")
+            .join(format!("{}-{}.json", task_id(1), turn_id(2)));
+    assert!(!due.is_file(), "failed intents must leave the due registry");
+    let retried = outbox(&store)
+        .retry_task(task_id(1), 9_000, &SilentInactiveLauncher)
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].state(), DeliveryState::Retrying);
+    assert_eq!(retried[0].attempt(), 0);
+    assert_eq!(retried[0].next_attempt_at_millis(), 9_000);
+    let intent: serde_json::Value = serde_json::from_slice(
+        &fs::read(delivery_path(
+            store.root(),
+            PROJECT_ID,
+            task_id(1),
+            turn_id(2),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(intent["retry_requested_at_millis"], 9_000);
+    assert!(due.is_file(), "retry must restore the due registry");
+    fs::remove_file(origin.join("reject")).unwrap();
+    let delivered = outbox(&store).pump_due(9_000).unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+}
+
+#[test]
+fn publish_retry_refuses_a_delivered_intent() {
+    let (_temp, store, _source, _origin_dir, _origin, origin_url, oid) = fixture();
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    let delivered = outbox(&store).pump_due(1).unwrap();
+    assert_eq!(delivered[0].state(), DeliveryState::Delivered);
+    let error = outbox(&store)
+        .retry_task(task_id(1), 2, &SilentInactiveLauncher)
+        .unwrap_err();
+    assert_eq!(error.public_code(), DELIVERY_ALREADY_DELIVERED);
+}
+
+#[test]
+fn publish_retry_reports_not_found_when_the_task_has_no_intents() {
+    let (_temp, store, _source, _origin_dir, _origin, _origin_url, _oid) = fixture();
+    let error = outbox(&store)
+        .retry_task(task_id(1), 1, &SilentInactiveLauncher)
+        .unwrap_err();
+    assert_eq!(error.public_code(), DELIVERY_NOT_FOUND);
+}
+
+#[test]
+fn origin_auth_failed_intents_are_eligible_for_manual_retry() {
+    let (_temp, store, _source, _origin_dir, _origin, _origin_url, oid) = fixture();
+    commit(
+        &store,
+        "https://github.com/example/repo.git",
+        &oid,
+        turn_id(2),
+        1,
+    );
+    let runner = UsernamePromptPush {
+        inner: SystemProcessRunner,
+    };
+    let results = OriginOutbox::new(&store, &runner).pump_due(1).unwrap();
+    assert_eq!(results[0].state(), DeliveryState::Retrying);
+    assert_eq!(results[0].last_error(), Some(ORIGIN_AUTH_FAILED));
+    let retried = OriginOutbox::new(&store, &runner)
+        .retry_task(task_id(1), 50, &SilentInactiveLauncher)
+        .unwrap();
+    assert_eq!(retried[0].state(), DeliveryState::Retrying);
+    assert_eq!(retried[0].attempt(), 0);
+    assert_eq!(retried[0].last_error(), Some(ORIGIN_AUTH_FAILED));
+    assert_eq!(retried[0].next_attempt_at_millis(), 50);
 }

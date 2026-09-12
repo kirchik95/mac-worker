@@ -2317,6 +2317,20 @@ impl<'a> TaskClient<'a> {
         self.close_from_expected(&record, discard)
     }
 
+    /// Re-drive failed or retrying origin intents after credentials are fixed.
+    pub fn publish_retry(&self, task_id: TaskId) -> Result<Vec<OriginDelivery>, WorkerError> {
+        let record = self.client_state.load_task(task_id)?;
+        if !record.meta().publish().contains(&PublishMode::Push) {
+            return Err(task_error(
+                "TASK_CONFIG_INVALID",
+                "publish-retry requires publish = push",
+            ));
+        }
+        let worker = task_worker(self.config, record.status())?;
+        let response = RemoteJobClient::new(self.runner).outbox_retry(worker, task_id)?;
+        Ok(response.deliveries().to_vec())
+    }
+
     /// Closes against a caller-supplied expected snapshot. Dashboard mutations
     /// pass the revision they already validated; CLI `close` loads after
     /// reconcile and then uses this path.

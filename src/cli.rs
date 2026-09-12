@@ -267,6 +267,10 @@ pub enum TaskCommand {
         #[arg(long)]
         discard: bool,
     },
+    #[command(about = "Re-drive a failed origin delivery after credentials are repaired")]
+    PublishRetry {
+        task_id: TaskId,
+    },
     Wait {
         #[arg(long)]
         task_id: Option<TaskId>,
@@ -401,6 +405,10 @@ pub enum HostCommand {
         /// Short-lived production launch: spawn `--watch` then exit.
         #[arg(long, hide = true)]
         wake: bool,
+    },
+    #[command(name = "outbox-retry", hide = true)]
+    OutboxRetry {
+        task_id: TaskId,
     },
     #[command(name = "rsync-receive", trailing_var_arg = true)]
     RsyncReceive {

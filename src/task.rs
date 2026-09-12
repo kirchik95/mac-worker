@@ -505,9 +505,6 @@ impl OriginDelivery {
         if !self.target.starts_with("refs/heads/") || self.target.len() > MAX_IDENTITY_BYTES + 16 {
             return Err(task_config("delivery target is invalid"));
         }
-        if self.attempt == 0 {
-            return Err(task_config("delivery attempt must be positive"));
-        }
         Ok(())
     }
 }

@@ -122,7 +122,20 @@ fn host_follow_turn_parses_three_identifiers_and_stays_hidden() {
         .success()
         .stdout(predicate::str::contains("task-close"))
         .stdout(predicate::str::contains("follow-turn").not())
+        .stdout(predicate::str::contains("outbox-retry").not())
         .stdout(predicate::str::contains("controller-rpc").not());
+}
+
+#[test]
+fn host_outbox_retry_parses_a_task_id() {
+    let task_id = "018f0f4a6b5c7d8e9f00112233445566";
+    let cli = Cli::try_parse_from(["worker", "host", "outbox-retry", task_id]).unwrap();
+    assert!(matches!(
+        cli.command,
+        WorkerCommand::Host {
+            command: HostCommand::OutboxRetry { .. }
+        }
+    ));
 }
 
 #[test]
@@ -224,6 +237,13 @@ fn task_help_keeps_the_released_option_names_discoverable() {
     list.assert()
         .success()
         .stdout(predicate::str::contains("--run <ID|NAME>"));
+
+    let mut task = Command::cargo_bin("worker").unwrap();
+    task.args(["task", "--help"]);
+    task.assert()
+        .success()
+        .stdout(predicate::str::contains("publish-retry"))
+        .stdout(predicate::str::contains("outbox-retry").not());
 }
 
 #[test]
