@@ -1,5 +1,5 @@
 import type { IconName } from '@/components/Icon'
-import type { Snapshot, Worker } from '@/lib/api'
+import { slotBusy, type Snapshot, type Worker } from '@/lib/api'
 
 /**
  * Agent capabilities are derived from facts that expire; see FACTS_TTL in
@@ -97,7 +97,7 @@ export interface Stall {
  */
 export function stall(snapshot: Snapshot, now: number): Stall | null {
   if (snapshot.queue.length === 0) return null
-  if (snapshot.workers.some((worker) => worker.slot.state !== 'idle')) return null
+  if (snapshot.workers.some((worker) => slotBusy(worker.slot) > 0)) return null
   const lapsed = snapshot.workers.filter((worker) => factsLapsed(worker, now))
   if (lapsed.length === 0) return null
   const oldest = Math.min(...snapshot.queue.map((entry) => entry.created_at_millis))

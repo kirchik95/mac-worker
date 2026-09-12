@@ -153,7 +153,7 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
           ],
         },
         herdr: { state: 'available', version: '0.9.0', interactive_agents: 0 },
-        slot: { state: 'idle', capacity: 1, active_job_id: null },
+        slot: { state: 'idle', capacity: 1, busy: 0, active_job_id: null, active_job_ids: [] },
         capabilities: ['darwin-arm64'],
         missing_capabilities: [],
         system: {
@@ -180,7 +180,7 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
           ],
         },
         herdr: { state: 'available', version: '0.9.0', interactive_agents: 2 },
-        slot: { state: 'busy', capacity: 1, active_job_id: 'turn-0fc80d46' },
+        slot: { state: 'busy', capacity: 1, busy: 1, active_job_id: 'turn-0fc80d46', active_job_ids: ['turn-0fc80d46'] },
         capabilities: ['darwin-arm64'],
         missing_capabilities: [],
         system: {
@@ -214,7 +214,7 @@ export function exampleSnapshot(now = Date.now()): Snapshot {
           ],
         },
         herdr: { state: 'no_socket', version: '0.9.0' },
-        slot: { state: 'idle', capacity: 1, active_job_id: null },
+        slot: { state: 'idle', capacity: 1, busy: 0, active_job_id: null, active_job_ids: [] },
         capabilities: ['darwin-arm64'],
         missing_capabilities: [],
         system: {

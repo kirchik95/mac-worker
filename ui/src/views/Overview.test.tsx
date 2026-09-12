@@ -45,7 +45,7 @@ describe('Overview', () => {
 
   it('names the running task and its launch settings', () => {
     const busy = worker({
-      slot: { state: 'busy', capacity: 1, active_job_id: 'job' },
+      slot: { state: 'busy', capacity: 1, busy: 1, active_job_id: 'job', active_job_ids: ['job'] },
       active_task: {
         task_id: 'a'.repeat(32),
         title: 'Cursor smoke test',
@@ -63,6 +63,50 @@ describe('Overview', () => {
     expect(within(mini).getByText('AGENT')).toBeInTheDocument()
     expect(within(mini).getByText('gpt-5')).toBeInTheDocument()
     expect(within(mini).getByText('High')).toBeInTheDocument()
+  })
+
+  it('shows occupancy against the worker capacity', () => {
+    const partial = worker({
+      slot: {
+        state: 'idle',
+        capacity: 2,
+        busy: 1,
+        active_job_id: 'job-aaaa',
+        active_job_ids: ['job-aaaa'],
+      },
+    })
+    render(<Overview snapshot={snapshot({ workers: [partial] })} />)
+    const mini = card('mini-1')
+
+    expect(within(mini).getByText('running')).toBeInTheDocument()
+    expect(within(mini).getByText('1 / 2 slots occupied')).toBeInTheDocument()
+  })
+
+  it('lists every active job when more than one slot is occupied', () => {
+    const first = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const second = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    const full = worker({
+      slot: {
+        state: 'busy',
+        capacity: 2,
+        busy: 2,
+        active_job_id: first,
+        active_job_ids: [first, second],
+      },
+      active_task: {
+        task_id: 'a'.repeat(32),
+        title: 'Cursor smoke test',
+        agent: 'cursor',
+        model: 'gpt-5',
+        effort: 'high',
+        turn_number: 1,
+      },
+    })
+    render(<Overview snapshot={snapshot({ workers: [full] })} />)
+    const mini = card('mini-1')
+
+    expect(within(mini).getByText(/2 \/ 2 slots/)).toBeInTheDocument()
+    expect(within(mini).getByText(`${first.slice(0, 8)} · ${second.slice(0, 8)}`)).toBeInTheDocument()
   })
 
   it('says a cached observation is out of date instead of implying it is live', () => {
@@ -90,7 +134,7 @@ describe('Overview', () => {
 
   it('renders a hostile task title as text', () => {
     const busy = worker({
-      slot: { state: 'busy', capacity: 1, active_job_id: 'job' },
+      slot: { state: 'busy', capacity: 1, busy: 1, active_job_id: 'job', active_job_ids: ['job'] },
       active_task: {
         task_id: 'a'.repeat(32),
         title: MALICIOUS,
@@ -170,7 +214,7 @@ describe('Overview', () => {
     const running = snapshot({
       workers: [
         worker({
-          slot: { state: 'busy', capacity: 1, active_job_id: 'job' },
+          slot: { state: 'busy', capacity: 1, busy: 1, active_job_id: 'job', active_job_ids: ['job'] },
           agent_facts: { collected_at_millis: 0, freshness: 'stale', agents: [] },
         }),
       ],

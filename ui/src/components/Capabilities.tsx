@@ -3,11 +3,11 @@ import { Icon, type IconName } from '@/components/Icon'
 import { duration, shortId } from '@/lib/format'
 import { FACTS_TTL_MILLIS, advertisedAgents, factsAge, factsLapsed } from '@/lib/queue'
 import { cn } from '@/lib/utils'
-import { describeError, type Snapshot, type Worker } from '@/lib/api'
+import { describeError, slotBusy, type Snapshot, type Worker } from '@/lib/api'
 
 function glyph(worker: Worker): IconName {
   if (worker.health === 'unavailable') return 'cpuOff'
-  return worker.slot.state === 'idle' ? 'cpu' : 'cpuBusy'
+  return slotBusy(worker.slot) > 0 ? 'cpuBusy' : 'cpu'
 }
 
 function Facts({ worker, now }: { worker: Worker; now: number }) {
@@ -57,6 +57,8 @@ function trailing(worker: Worker, now: number): string {
       ? 'never observed'
       : `last seen ${duration(now - worker.observed_at_millis)} ago`
   }
+  const busy = slotBusy(worker.slot)
+  if (busy > 0) return `${busy} / ${worker.slot.capacity} slots occupied`
   return 'slot free'
 }
 
@@ -104,9 +106,9 @@ export function Capabilities({ snapshot, now = Date.now() }: { snapshot: Snapsho
                   className={
                     worker.health === 'unavailable'
                       ? 'text-destructive'
-                      : worker.slot.state === 'idle'
-                        ? 'text-observatory-green'
-                        : 'text-primary'
+                      : slotBusy(worker.slot) > 0
+                        ? 'text-primary'
+                        : 'text-observatory-green'
                   }
                 />
                 <span className="text-[15px]">{worker.name}</span>
@@ -118,9 +120,9 @@ export function Capabilities({ snapshot, now = Date.now() }: { snapshot: Snapsho
                 >
                   {worker.health === 'unavailable'
                     ? 'offline'
-                    : worker.slot.state === 'idle'
-                      ? 'ready'
-                      : 'running'}
+                    : slotBusy(worker.slot) > 0
+                      ? 'running'
+                      : 'ready'}
                 </span>
               </span>
 

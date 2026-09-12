@@ -1,16 +1,16 @@
 import { HerdrChip } from '@/components/HerdrChip'
 import { Metric } from '@/components/Metric'
 import { WorkerIcon } from '@/components/WorkerIcon'
-import { bytes, humanize, relativeTime } from '@/lib/format'
+import { bytes, humanize, relativeTime, shortId } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { describeError, type Worker } from '@/lib/api'
+import { activeJobIds, describeError, slotBusy, type Worker } from '@/lib/api'
 
 type Presence = 'available' | 'running' | 'stale' | 'offline'
 
 function presenceOf(worker: Worker): Presence {
   if (worker.health === 'unavailable') return 'offline'
   if (worker.freshness !== 'current') return 'stale'
-  return worker.slot.state === 'idle' ? 'available' : 'running'
+  return slotBusy(worker.slot) > 0 ? 'running' : 'available'
 }
 
 const DOT: Record<Presence, string> = {
@@ -40,8 +40,15 @@ export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
   const presence = presenceOf(worker)
   const task = worker.active_task
   const running = presence === 'running'
-  const occupied = worker.slot.state !== 'idle'
+  const busy = slotBusy(worker.slot)
+  const jobIds = activeJobIds(worker.slot)
   const described = describeError(worker.error)
+  const extraJobs =
+    jobIds.length > 1 ? (
+      <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
+        {jobIds.map((id) => shortId(id, 8)).join(' · ')}
+      </p>
+    ) : null
 
   return (
     <article
@@ -96,9 +103,10 @@ export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
             <div className="flex items-baseline gap-3">
               <p className="min-w-0 flex-1 truncate text-sm text-primary">{task.title}</p>
               <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                {elapsed(worker.observed_at_millis, now)} · 1 / {worker.slot.capacity} slots
+                {elapsed(worker.observed_at_millis, now)} · {busy} / {worker.slot.capacity} slots
               </span>
             </div>
+            {extraJobs}
             <div className="mt-4 grid grid-cols-3 gap-6">
               <Metric label="AGENT" value={humanize(task.agent)} />
               <Metric label="MODEL" value={task.model ?? 'Agent default'} />
@@ -124,14 +132,15 @@ export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
                 {presence === 'stale' ? 'Observation is out of date' : 'Ready for the next task'}
               </p>
             )}
+            {extraJobs}
             <div className="mt-2.5 flex items-baseline gap-3">
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                {presence === 'available'
-                  ? `${occupied ? 1 : 0} / ${worker.slot.capacity} slots occupied`
-                  : `Last seen ${relativeTime(worker.observed_at_millis, now)}`}
+                {presence === 'offline' || presence === 'stale'
+                  ? `Last seen ${relativeTime(worker.observed_at_millis, now)}`
+                  : `${busy} / ${worker.slot.capacity} slots occupied`}
               </span>
               <span className="shrink-0 text-xs text-muted-foreground">
-                {presence === 'available' ? 'Current' : 'Cached metrics'}
+                {presence === 'offline' || presence === 'stale' ? 'Cached metrics' : 'Current'}
               </span>
             </div>
           </>

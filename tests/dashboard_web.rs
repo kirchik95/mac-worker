@@ -16,8 +16,8 @@ use mac_worker::{
         model::{
             ApiError, DASHBOARD_API_VERSION, DashboardCommandMode, DashboardCommandSummary,
             DashboardError, DashboardJob, DashboardJobState, DashboardLogChunk,
-            DashboardMemoryPressure, DashboardQueueEntry, DashboardSlotState, DashboardWorker,
-            Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            DashboardMemoryPressure, DashboardQueueEntry, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
@@ -576,11 +576,7 @@ impl DashboardDataSource for FakeSource {
                 hostname: Some("mini-1.local".into()),
                 agent_facts: None,
                 herdr: None,
-                slot: SlotSummary {
-                    state: DashboardSlotState::Idle,
-                    capacity: 1,
-                    active_job_id: None,
-                },
+                slot: SlotSummary::idle(1),
                 capabilities: vec!["swift".into()],
                 missing_capabilities: Vec::new(),
                 system: SystemSummary {
@@ -891,11 +887,7 @@ fn worker_observation(name: &str, observed_at_millis: u64) -> Observation {
             hostname: Some(format!("{name}.local")),
             agent_facts: None,
             herdr: None,
-            slot: SlotSummary {
-                state: DashboardSlotState::Idle,
-                capacity: 1,
-                active_job_id: None,
-            },
+            slot: SlotSummary::idle(1),
             capabilities: vec!["darwin-arm64".into()],
             missing_capabilities: Vec::new(),
             system: SystemSummary {

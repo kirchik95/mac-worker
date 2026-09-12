@@ -9,6 +9,7 @@ use mac_worker::{
     client_state::ClientStateStore,
     config::{Config, WorkerEntry},
     dashboard::{
+        cache::Observation,
         model::{DashboardJobState, DashboardMemoryPressure, DashboardSlotState, WorkerHealth},
         service::{
             DashboardDataSource, DashboardService, SystemClock, SystemMonotonicClock,
@@ -57,7 +58,9 @@ fn source_uses_typed_probe_data_without_exposing_ssh() {
     assert_eq!(observation.worker.hostname.as_deref(), Some("mini-1.local"));
     assert_eq!(observation.worker.slot.state, DashboardSlotState::Busy);
     assert_eq!(observation.worker.slot.capacity, 1);
+    assert_eq!(observation.worker.slot.busy, 1);
     assert_eq!(observation.worker.slot.active_job_id, Some(active_job_id));
+    assert_eq!(observation.worker.slot.active_job_ids, vec![active_job_id]);
     assert_eq!(
         observation.worker.system.memory_pressure,
         Some(DashboardMemoryPressure::Warn)
@@ -69,6 +72,61 @@ fn source_uses_typed_probe_data_without_exposing_ssh() {
     assert!(fixture.remote.status_calls().is_empty());
     assert!(fixture.remote.log_calls().is_empty());
     assert!(fixture.remote.mutating_calls().is_empty());
+}
+
+#[test]
+fn source_projects_a_two_slot_probe_with_one_busy_slot_as_idle() {
+    let active_job_id = job_id(91);
+    let mut report = ready_report(active_job_id);
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.configured_slots = 2;
+    probe.busy_slots = 1;
+    let fixture = Fixture::new(report);
+    let observation = current_observation(&fixture);
+
+    assert_eq!(observation.worker.slot.capacity, 2);
+    assert_eq!(observation.worker.slot.busy, 1);
+    assert_eq!(observation.worker.slot.state, DashboardSlotState::Idle);
+    assert_eq!(observation.worker.slot.active_job_id, Some(active_job_id));
+    assert_eq!(observation.worker.slot.active_job_ids, vec![active_job_id]);
+}
+
+#[test]
+fn source_projects_a_full_two_slot_probe_as_busy() {
+    let first = job_id(91);
+    let mut report = ready_report(first);
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.configured_slots = 2;
+    probe.busy_slots = 2;
+    let fixture = Fixture::new(report);
+    let observation = current_observation(&fixture);
+
+    assert_eq!(observation.worker.slot.capacity, 2);
+    assert_eq!(observation.worker.slot.busy, 2);
+    assert_eq!(observation.worker.slot.state, DashboardSlotState::Busy);
+}
+
+#[test]
+fn source_keeps_slot_state_when_an_older_probe_omits_configured_slots() {
+    let fixture = Fixture::new(ready_report(job_id(91)));
+    let busy = current_observation(&fixture);
+    assert_eq!(busy.worker.slot.capacity, 1);
+    assert_eq!(busy.worker.slot.busy, 1);
+    assert_eq!(busy.worker.slot.state, DashboardSlotState::Busy);
+
+    let mut report = ready_report(job_id(92));
+    let probe = report.workers[0].probe.as_mut().unwrap();
+    probe.slot_state = SlotState::Idle;
+    probe.active_lease = None;
+    probe.configured_slots = 0;
+    probe.busy_slots = 7;
+    let fixture = Fixture::new(report);
+    let idle = current_observation(&fixture);
+    assert_eq!(idle.worker.slot.capacity, 1);
+    assert_eq!(idle.worker.slot.busy, 0);
+    assert_eq!(idle.worker.slot.state, DashboardSlotState::Idle);
+    assert!(idle.worker.slot.active_job_id.is_none());
+    assert!(idle.worker.slot.active_job_ids.is_empty());
 }
 
 #[test]
@@ -782,6 +840,14 @@ fn cache_busy_observation(fixture: &Fixture, observed_at_millis: u64) {
 
 fn job_id(value: u128) -> JobId {
     JobId::new(uuid::Uuid::from_u128(value))
+}
+
+fn current_observation(fixture: &Fixture) -> Observation {
+    let rows = fixture.source().collect_workers(Duration::from_secs(7));
+    match rows.into_iter().next() {
+        Some(WorkerObservationResult::Current(observation)) => observation,
+        _ => panic!("ready probe must project to a current observation"),
+    }
 }
 
 #[test]

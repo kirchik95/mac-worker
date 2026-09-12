@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -96,6 +96,75 @@ fn workers_follow_first_configured_order_and_reject_ambiguous_or_unknown_rows() 
             "UNKNOWN_WORKER_OBSERVATION",
         ]
     );
+    assert_read_only(&source);
+}
+
+#[test]
+fn offline_worker_uses_the_laptop_config_slot_count_as_capacity() {
+    let source = FakeSource::new();
+    source.set_slots("mini-1", 2);
+    source.set_workers(vec![WorkerObservationResult::Failed {
+        worker_name: "mini-1".into(),
+        error: error("WORKER_DOWN", "current probe failed"),
+    }]);
+
+    let snapshot = service(source.clone())
+        .snapshot(Default::default())
+        .unwrap();
+
+    assert_eq!(snapshot.workers[0].freshness, Freshness::Offline);
+    assert_eq!(snapshot.workers[0].slot.capacity, 2);
+    assert_eq!(snapshot.workers[0].slot.busy, 0);
+    assert_eq!(snapshot.workers[0].slot.state, DashboardSlotState::Idle);
+    assert!(snapshot.workers[0].slot.active_job_ids.is_empty());
+    assert_read_only(&source);
+}
+
+#[test]
+fn snapshot_slot_totals_sum_busy_and_capacity_across_workers() {
+    let source = FakeSource::new();
+    source.set_configured(Ok(vec!["mini-1".into(), "mini-2".into()]));
+    let first_id = job_id(11);
+    let second_id = job_id(22);
+    let mut first = observation("mini-1", 100, "mini-1.local");
+    first.worker.slot = SlotSummary {
+        state: DashboardSlotState::Idle,
+        capacity: 2,
+        busy: 1,
+        active_job_id: Some(first_id),
+        active_job_ids: vec![first_id],
+    };
+    let mut second = observation("mini-2", 100, "mini-2.local");
+    second.worker.slot = SlotSummary {
+        state: DashboardSlotState::Busy,
+        capacity: 2,
+        busy: 2,
+        active_job_id: Some(second_id),
+        active_job_ids: vec![second_id, job_id(23)],
+    };
+    source.set_workers(vec![
+        WorkerObservationResult::Current(first),
+        WorkerObservationResult::Current(second),
+    ]);
+
+    let snapshot = service(source.clone())
+        .snapshot(Default::default())
+        .unwrap();
+
+    let busy: u32 = snapshot
+        .workers
+        .iter()
+        .map(|worker| u32::from(worker.slot.busy))
+        .sum();
+    let capacity: u32 = snapshot
+        .workers
+        .iter()
+        .map(|worker| u32::from(worker.slot.capacity))
+        .sum();
+    assert_eq!(busy, 3);
+    assert_eq!(capacity, 4);
+    assert_eq!(snapshot.workers[0].slot.state, DashboardSlotState::Idle);
+    assert_eq!(snapshot.workers[1].slot.state, DashboardSlotState::Busy);
     assert_read_only(&source);
 }
 
@@ -1222,6 +1291,7 @@ struct FakeSource(Arc<FakeSourceState>);
 
 struct FakeSourceState {
     configured: Mutex<Result<Vec<String>, DashboardError>>,
+    slots: Mutex<HashMap<String, u8>>,
     workers: Mutex<Vec<WorkerObservationResult>>,
     local_jobs: Mutex<Result<Vec<DashboardJob>, DashboardError>>,
     remote: Mutex<Vec<Result<DashboardJob, DashboardError>>>,
@@ -1247,6 +1317,7 @@ impl FakeSource {
     fn new() -> Self {
         Self(Arc::new(FakeSourceState {
             configured: Mutex::new(Ok(vec!["mini-1".into()])),
+            slots: Mutex::new(HashMap::new()),
             workers: Mutex::new(vec![WorkerObservationResult::Current(observation(
                 "mini-1",
                 100,
@@ -1275,6 +1346,10 @@ impl FakeSource {
 
     fn set_configured(&self, configured: Result<Vec<String>, DashboardError>) {
         *lock(&self.0.configured) = configured;
+    }
+
+    fn set_slots(&self, worker_name: &str, slots: u8) {
+        lock(&self.0.slots).insert(worker_name.to_owned(), slots);
     }
 
     fn set_workers(&self, workers: Vec<WorkerObservationResult>) {
@@ -1353,6 +1428,10 @@ impl FakeSource {
 impl DashboardDataSource for FakeSource {
     fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
         lock(&self.0.configured).clone()
+    }
+
+    fn configured_worker_slots(&self, worker_name: &str) -> u8 {
+        lock(&self.0.slots).get(worker_name).copied().unwrap_or(1)
     }
 
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult> {
@@ -1516,18 +1595,16 @@ fn offline_worker(worker_name: &str, error_code: &str) -> DashboardWorker {
 }
 
 fn idle_slot() -> SlotSummary {
-    SlotSummary {
-        state: DashboardSlotState::Idle,
-        capacity: 1,
-        active_job_id: None,
-    }
+    SlotSummary::idle(1)
 }
 
 fn busy_slot(job_id: JobId) -> SlotSummary {
     SlotSummary {
         state: DashboardSlotState::Busy,
         capacity: 1,
+        busy: 1,
         active_job_id: Some(job_id),
+        active_job_ids: vec![job_id],
     }
 }
 

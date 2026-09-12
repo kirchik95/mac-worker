@@ -50,7 +50,13 @@ export interface Worker {
   hostname: string | null
   agent_facts: { collected_at_millis: number; freshness: Freshness; agents: AgentFact[] } | null
   herdr: DashboardHerdr | null
-  slot: { state: string; capacity: number; active_job_id: string | null }
+  slot: {
+    state: string
+    capacity: number
+    busy: number
+    active_job_id: string | null
+    active_job_ids: string[]
+  }
   capabilities: string[]
   missing_capabilities: string[]
   system: {
@@ -336,6 +342,17 @@ export async function saveAgentSettings(worker: string, body: SaveSettings): Pro
     throw new ApiError(response.status, message)
   }
   return payload as AgentSetting
+}
+
+/** Occupied slots; an older snapshot omits `busy` and is treated as 0 or 1 from `state`. */
+export function slotBusy(slot: Worker['slot']): number {
+  return typeof slot.busy === 'number' ? slot.busy : slot.state === 'idle' ? 0 : 1
+}
+
+/** Live job ids; falls back to the single `active_job_id` the existing UI already reads. */
+export function activeJobIds(slot: Worker['slot']): string[] {
+  if (slot.active_job_ids?.length) return slot.active_job_ids
+  return slot.active_job_id ? [slot.active_job_id] : []
 }
 
 export const questionText = (question: string | Question) =>

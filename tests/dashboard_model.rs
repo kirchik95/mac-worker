@@ -67,7 +67,9 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "slot": {
                         "state": "idle",
                         "capacity": 1,
+                        "busy": 0,
                         "active_job_id": null,
+                        "active_job_ids": [],
                     },
                     "capabilities": [],
                     "missing_capabilities": ["swift"],
@@ -92,7 +94,9 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                     "slot": {
                         "state": "busy",
                         "capacity": 1,
+                        "busy": 1,
                         "active_job_id": "fedcba9876543210fedcba9876543210",
+                        "active_job_ids": ["fedcba9876543210fedcba9876543210"],
                     },
                     "capabilities": ["swift", "xcode"],
                     "missing_capabilities": [],
@@ -368,11 +372,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
             hostname: Some("mini-a.local".into()),
             agent_facts: None,
             herdr: None,
-            slot: SlotSummary {
-                state: DashboardSlotState::Idle,
-                capacity: 1,
-                active_job_id: None,
-            },
+            slot: SlotSummary::idle(1),
             capabilities: vec!["swift".into()],
             missing_capabilities: Vec::new(),
             system: SystemSummary {
@@ -414,11 +414,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 hostname: None,
                 agent_facts: None,
                 herdr: None,
-                slot: SlotSummary {
-                    state: DashboardSlotState::Idle,
-                    capacity: 1,
-                    active_job_id: None,
-                },
+                slot: SlotSummary::idle(1),
                 capabilities: Vec::new(),
                 missing_capabilities: vec!["swift".into()],
                 system: SystemSummary {
@@ -442,7 +438,9 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
                 slot: SlotSummary {
                     state: DashboardSlotState::Busy,
                     capacity: 1,
+                    busy: 1,
                     active_job_id: Some("fedcba9876543210fedcba9876543210".parse().unwrap()),
+                    active_job_ids: vec!["fedcba9876543210fedcba9876543210".parse().unwrap()],
                 },
                 capabilities: vec!["swift".into(), "xcode".into()],
                 missing_capabilities: Vec::new(),

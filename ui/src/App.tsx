@@ -11,7 +11,7 @@ import { Tasks } from '@/views/Tasks'
 import { useSnapshot } from '@/hooks/useSnapshot'
 import { attentionCount } from '@/lib/attention'
 import { clockTime, pad2 } from '@/lib/format'
-import type { Snapshot } from '@/lib/api'
+import { slotBusy, type Snapshot } from '@/lib/api'
 
 /** The tab carries the count so a question is noticed in a background tab. */
 export const documentTitle = (attention: number) =>
@@ -81,7 +81,8 @@ export default function App() {
     parseTaskHash(window.location.hash).status === 'none' ? 'overview' : 'tasks',
   )
 
-  const busy = snapshot?.workers.filter((worker) => worker.slot.state !== 'idle').length ?? 0
+  const busy =
+    snapshot?.workers.reduce((total, worker) => total + slotBusy(worker.slot), 0) ?? 0
   const capacity =
     snapshot?.workers.reduce((total, worker) => total + worker.slot.capacity, 0) ?? 0
   const attention = snapshot ? attentionCount(snapshot) : 0

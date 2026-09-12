@@ -2,7 +2,7 @@ import { Icon } from '@/components/Icon'
 import { duration, pad2, shortId } from '@/lib/format'
 import { TONE_TEXT, blockingDetail } from '@/lib/queue'
 import { cn } from '@/lib/utils'
-import type { QueueEntry, Snapshot } from '@/lib/api'
+import { slotBusy, type QueueEntry, type Snapshot } from '@/lib/api'
 
 const KIND_LABEL: Record<string, string> = { batch: 'task', task_turn: 'follow-up' }
 
@@ -92,7 +92,7 @@ function Row({
  * table never offers one.
  */
 export function QueueTable({ snapshot, now = Date.now() }: { snapshot: Snapshot; now?: number }) {
-  const running = snapshot.workers.filter((worker) => worker.slot.state !== 'idle').length
+  const running = snapshot.workers.reduce((total, worker) => total + slotBusy(worker.slot), 0)
 
   return (
     <section className="overflow-hidden rounded-[10px] border bg-card">

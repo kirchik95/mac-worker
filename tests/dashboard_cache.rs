@@ -4,8 +4,8 @@ use mac_worker::dashboard::{
         ObservationCache,
     },
     model::{
-        DashboardMemoryPressure, DashboardSlotState, DashboardWorker, Freshness, SlotSummary,
-        SystemSummary, WorkerHealth,
+        DashboardMemoryPressure, DashboardWorker, Freshness, SlotSummary, SystemSummary,
+        WorkerHealth,
     },
 };
 
@@ -308,11 +308,7 @@ fn observation(
             hostname: Some(format!("{worker_name}.local")),
             agent_facts: None,
             herdr: None,
-            slot: SlotSummary {
-                state: DashboardSlotState::Idle,
-                capacity: 1,
-                active_job_id: None,
-            },
+            slot: SlotSummary::idle(1),
             capabilities: vec!["swift".into()],
             missing_capabilities: Vec::new(),
             system: SystemSummary {

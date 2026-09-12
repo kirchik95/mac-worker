@@ -262,6 +262,13 @@ impl DashboardDataSource for MacWorkerDashboardSource {
             .collect())
     }
 
+    fn configured_worker_slots(&self, worker_name: &str) -> u8 {
+        self.config
+            .worker(worker_name)
+            .map(|worker| worker.slots)
+            .unwrap_or(1)
+    }
+
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult> {
         let report = self.workers.inspect(&self.config, deadline);
         let observed_at_millis = current_time_millis();
@@ -448,14 +455,7 @@ pub fn project_worker(
                 _ => None,
             },
             herdr: project_dashboard_herdr(probe, observed_at_millis),
-            slot: SlotSummary {
-                state: match probe.slot_state {
-                    SlotState::Idle => DashboardSlotState::Idle,
-                    SlotState::Busy => DashboardSlotState::Busy,
-                },
-                capacity: 1,
-                active_job_id: probe.active_lease.as_ref().map(|lease| lease.job_id),
-            },
+            slot: slot_summary(probe),
             capabilities: probe.capabilities.clone(),
             missing_capabilities: worker.missing_capabilities.clone(),
             system: SystemSummary {
@@ -476,6 +476,39 @@ pub fn project_worker(
         observed_at_millis,
         cpu_counters: probe.cpu_counters.clone().and_then(cache_counters),
     })
+}
+
+/// Occupancy the dashboard shows for one worker.
+///
+/// Capacity and busy come from the probe helpers. An older helper that omits
+/// `configured_slots` keeps `slot_state` as the Idle/Busy fallback. Protocol 7
+/// still carries a single `active_lease`, not a list of live leases, so
+/// `active_job_ids` is that job when present.
+fn slot_summary(probe: &ProbeResponse) -> SlotSummary {
+    let capacity = probe.configured_slot_count();
+    let busy = probe.busy_slot_count();
+    let state = if probe.configured_slots == 0 {
+        match probe.slot_state {
+            SlotState::Idle => DashboardSlotState::Idle,
+            SlotState::Busy => DashboardSlotState::Busy,
+        }
+    } else if busy < capacity {
+        DashboardSlotState::Idle
+    } else {
+        DashboardSlotState::Busy
+    };
+    let active_job_ids = probe
+        .active_lease
+        .as_ref()
+        .map(|lease| vec![lease.job_id])
+        .unwrap_or_default();
+    SlotSummary {
+        state,
+        capacity,
+        busy,
+        active_job_id: active_job_ids.first().copied(),
+        active_job_ids,
+    }
 }
 
 fn project_agent_facts(

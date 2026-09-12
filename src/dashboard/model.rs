@@ -325,7 +325,26 @@ impl Serialize for DashboardJob {
 pub struct SlotSummary {
     pub state: DashboardSlotState,
     pub capacity: u8,
+    pub busy: u8,
+    /// First live lease, kept for the existing worker-card / active-turn UI.
     pub active_job_id: Option<JobId>,
+    /// Every live lease on the worker. Protocol 7 still carries a single
+    /// `active_lease` on the probe, so this is that job when present.
+    pub active_job_ids: Vec<JobId>,
+}
+
+impl SlotSummary {
+    /// Offline / never-observed occupancy: the laptop config's slot count
+    /// is the capacity ceiling, and nothing is running.
+    pub fn idle(capacity: u8) -> Self {
+        Self {
+            state: DashboardSlotState::Idle,
+            capacity,
+            busy: 0,
+            active_job_id: None,
+            active_job_ids: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

@@ -18,7 +18,7 @@ export function worker(overrides: Partial<Worker> = {}): Worker {
       ],
     },
     herdr: null,
-    slot: { state: 'idle', capacity: 1, active_job_id: null },
+    slot: { state: 'idle', capacity: 1, busy: 0, active_job_id: null, active_job_ids: [] },
     capabilities: ['darwin-arm64'],
     missing_capabilities: [],
     system: {

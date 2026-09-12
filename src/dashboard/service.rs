@@ -16,8 +16,8 @@ use crate::{
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
             DashboardError, DashboardJob, DashboardJobState, DashboardProjectDefaults,
-            DashboardQueueEntry, DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness,
-            SlotSummary, SystemSummary, WorkerHealth,
+            DashboardQueueEntry, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
     },
     error::WorkerError,
@@ -152,6 +152,13 @@ pub trait DashboardDataSource: Send + Sync + 'static {
     }
 
     fn configured_workers(&self) -> Result<Vec<String>, DashboardError>;
+
+    /// Laptop-config slot count used as the occupancy ceiling when this
+    /// worker has no live probe (offline, or a stale cached projection).
+    fn configured_worker_slots(&self, _worker_name: &str) -> u8 {
+        1
+    }
+
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult>;
     fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError>;
     fn authoritative_active_jobs(
@@ -708,11 +715,13 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
 
     fn fallback_worker(&self, worker_name: &str, error: DashboardError) -> DashboardWorker {
         let now_millis = self.clock.now_millis();
+        let capacity = self.source.configured_worker_slots(worker_name);
         if let Some(mut worker) = lock_recover(&self.cache).stale_worker(worker_name, now_millis) {
             worker.error = Some(error);
+            worker.slot.capacity = capacity;
             return worker;
         }
-        offline_worker(worker_name, error)
+        offline_worker(worker_name, error, capacity)
     }
 
     /// Start a facts refresh outside the collection deadline. Unreachable
@@ -1007,7 +1016,7 @@ fn worker_result_name(result: &WorkerObservationResult) -> &str {
     }
 }
 
-fn offline_worker(worker_name: &str, error: DashboardError) -> DashboardWorker {
+fn offline_worker(worker_name: &str, error: DashboardError, capacity: u8) -> DashboardWorker {
     DashboardWorker {
         name: worker_name.to_owned(),
         health: WorkerHealth::Unavailable,
@@ -1015,11 +1024,7 @@ fn offline_worker(worker_name: &str, error: DashboardError) -> DashboardWorker {
         observed_at_millis: None,
         hostname: None,
         agent_facts: None,
-        slot: SlotSummary {
-            state: DashboardSlotState::Idle,
-            capacity: 1,
-            active_job_id: None,
-        },
+        slot: SlotSummary::idle(capacity),
         capabilities: Vec::new(),
         missing_capabilities: Vec::new(),
         system: SystemSummary {
