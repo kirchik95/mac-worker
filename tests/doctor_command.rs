@@ -13,6 +13,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, UNIX_EPOCH},
 };
 
 use mac_worker::{
@@ -23,6 +24,7 @@ use mac_worker::{
     doctor::{DoctorRequest, DoctorService},
     error::{ExitKind, WorkerError},
     inputs::InputSelector,
+    laptop::{FixedLaptopProcessTable, LaptopProcess},
     lease::SlotState,
     output::CommandOutput,
     paths::PathLayout,
@@ -375,6 +377,8 @@ fn inspect(
         runner,
         config,
         paths: &paths,
+        laptop_processes: &mac_worker::laptop::EmptyLaptopProcessTable,
+        installed_binary_mtime: None,
     }
     .inspect(DoctorRequest {
         project: repo.root().to_path_buf(),
@@ -2116,5 +2120,50 @@ fn declared_origin_with_a_helper_gets_no_origin_helper_warning() {
             .all(|issue| issue.code != "ORIGIN_HELPER_MISSING"),
         "{:?}",
         report.issues
+    );
+}
+
+#[test]
+fn doctor_warns_when_a_running_dashboard_is_older_than_the_installed_binary() {
+    let repo = GitRepo::init();
+    repo.write("tracked.txt", b"ok\n");
+    repo.commit_all("laptop binary warning fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &[])]);
+    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
+    let processes = FixedLaptopProcessTable {
+        processes: vec![LaptopProcess {
+            pid: 4242,
+            started_at: UNIX_EPOCH + Duration::from_secs(10),
+            args: vec!["/Users/me/.local/bin/worker".into(), "dashboard".into()],
+        }],
+    };
+    let paths = paths(state.path());
+    let report = DoctorService {
+        runner: &runner,
+        config: &config,
+        paths: &paths,
+        laptop_processes: &processes,
+        installed_binary_mtime: Some(UNIX_EPOCH + Duration::from_secs(50)),
+    }
+    .inspect(DoctorRequest {
+        project: repo.root().to_path_buf(),
+        cli_includes: Vec::new(),
+    })
+    .unwrap();
+
+    assert!(report.ready);
+    let warning = report
+        .issues
+        .iter()
+        .find(|issue| issue.code == "LAPTOP_BINARY_OUTDATED")
+        .expect("outdated dashboard must be a warning");
+    assert_eq!(warning.severity, IssueSeverity::Warning);
+    assert!(
+        warning
+            .message
+            .contains("worker dashboard (pid 4242) was started before the installed binary"),
+        "{}",
+        warning.message
     );
 }

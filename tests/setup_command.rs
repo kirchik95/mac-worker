@@ -1979,6 +1979,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 warnings: Vec::new(),
             },
         ],
+        warnings: Vec::new(),
     };
     let output = CommandOutput::Setup(report);
 
@@ -2015,6 +2016,7 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
                 message: "lock release failed".into(),
             }],
         }],
+        warnings: Vec::new(),
     });
 
     assert_eq!(
@@ -2042,6 +2044,7 @@ fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
                 message: "process exceeded its 90s execution deadline".into(),
             }],
         }],
+        warnings: Vec::new(),
     });
 
     assert_eq!(
@@ -2071,6 +2074,7 @@ fn setup_human_output_surfaces_facts_refresh_warning_after_verified_success() {
                         .into(),
             }],
         }],
+        warnings: Vec::new(),
     });
 
     assert_eq!(
@@ -2566,6 +2570,7 @@ fn successful_output_broken_pipe_is_typed_io_and_maps_to_exit_74() {
     let output = CommandOutput::Setup(SetupReport {
         protocol_version: PROTOCOL_VERSION,
         workers: Vec::new(),
+        warnings: Vec::new(),
     });
     let error = output
         .write_to(&mut BrokenWriter, true, false)
@@ -2602,6 +2607,7 @@ fn successful_output_flush_failure_is_typed_io() {
     let output = CommandOutput::Setup(SetupReport {
         protocol_version: PROTOCOL_VERSION,
         workers: Vec::new(),
+        warnings: Vec::new(),
     });
     let mut writer = FlushBrokenWriter::default();
 
@@ -2765,6 +2771,7 @@ fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
             failure_kind: None,
             warnings: vec![herdr_unavailable_warning()],
         }],
+        warnings: Vec::new(),
     });
 
     assert_eq!(
@@ -2779,4 +2786,36 @@ fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
         json["workers"][0]["warnings"],
         serde_json::json!([{ "code": "HERDR_UNAVAILABLE", "message": message }])
     );
+}
+
+#[test]
+fn setup_human_and_json_output_surface_an_outdated_laptop_binary_warning() {
+    let message = "worker dashboard (pid 7) was started before the installed binary; restart it";
+    let output = CommandOutput::Setup(SetupReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![SetupHostResult {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            installed: true,
+            protocol_version: Some(PROTOCOL_VERSION),
+            error_code: None,
+            error_message: None,
+            failure_kind: None,
+            warnings: Vec::new(),
+        }],
+        warnings: vec![SetupWarning {
+            code: SetupWarningCode::LaptopBinaryOutdated,
+            message: message.into(),
+        }],
+    });
+
+    assert_eq!(
+        output.render_human(),
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\nwarning [LAPTOP_BINARY_OUTDATED]: {message}"
+        )
+    );
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["warnings"][0]["code"], "LAPTOP_BINARY_OUTDATED");
+    assert_eq!(json["warnings"][0]["message"], message);
 }

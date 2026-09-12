@@ -161,6 +161,12 @@ export default function App() {
                 </span>
               </div>
             ) : null}
+            {snapshot.laptop?.binary_outdated ? (
+              <div className="mb-5 flex items-center gap-3 rounded-[10px] border border-primary/30 bg-observatory-highlight px-5 py-3.5">
+                <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true" />
+                <span className="text-sm">worker was updated, restart the dashboard</span>
+              </div>
+            ) : null}
             <div className="flex items-center pb-5">
               <p className="flex-1 text-sm text-muted-foreground">{fleetLine(snapshot)}</p>
               <div className="flex items-center gap-7">

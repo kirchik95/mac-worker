@@ -30,12 +30,17 @@ use job::{
     LogChunkResponse, ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
+#[cfg(test)]
+use laptop::EmptyLaptopProcessTable;
+#[cfg(not(test))]
+use laptop::SystemLaptopProcessTable;
+use laptop::{LaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli};
 use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
 use paths::PathLayout;
 use probe::ProbeCollector;
 use process::ProcessRunner;
-use protocol::{PROTOCOL_VERSION, SetupReport, WorkersReport};
+use protocol::{PROTOCOL_VERSION, SetupReport, SetupWarning, SetupWarningCode, WorkersReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use run::{
     CancelService, FleetReconciler, LogsService, RunRequest, RunService, StatusService,
@@ -88,6 +93,7 @@ pub mod install;
 pub mod job;
 pub mod job_service;
 pub mod keychain;
+pub mod laptop;
 pub mod lease;
 pub mod manifest;
 pub mod onboarding;
@@ -228,6 +234,7 @@ fn execute_with_context(
             Ok(CommandOutput::Setup(SetupReport {
                 protocol_version: PROTOCOL_VERSION,
                 workers,
+                warnings: laptop_setup_warnings(),
             }))
         }
         Command::Doctor { project, includes } => {
@@ -242,6 +249,8 @@ fn execute_with_context(
                 runner,
                 config: &config,
                 paths: &paths,
+                laptop_processes: laptop_process_table(),
+                installed_binary_mtime: installed_binary_mtime(),
             };
             Ok(CommandOutput::Doctor(service.inspect(DoctorRequest {
                 project,
@@ -4681,6 +4690,47 @@ fn herdr_notifier_socket(
         |key| runtime.environment.get(std::ffi::OsStr::new(key)).cloned(),
         &runtime.home,
     ))
+}
+
+fn laptop_process_table() -> &'static dyn LaptopProcessTable {
+    #[cfg(test)]
+    {
+        &EmptyLaptopProcessTable
+    }
+    #[cfg(not(test))]
+    {
+        &SystemLaptopProcessTable
+    }
+}
+
+fn installed_binary_mtime() -> Option<SystemTime> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
+    }
+}
+
+fn laptop_setup_warnings() -> Vec<SetupWarning> {
+    let Some(mtime) = installed_binary_mtime() else {
+        return Vec::new();
+    };
+    let Ok(processes) = laptop_process_table().list() else {
+        return Vec::new();
+    };
+    let outdated = outdated_laptop_cli(&processes, mtime);
+    let Some(message) = format_outdated_laptop_cli(&outdated) else {
+        return Vec::new();
+    };
+    vec![SetupWarning {
+        code: SetupWarningCode::LaptopBinaryOutdated,
+        message,
+    }]
 }
 
 fn discover_paths(

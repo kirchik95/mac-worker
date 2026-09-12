@@ -26,32 +26,41 @@ impl CommandOutput {
     pub fn render_human(&self) -> String {
         match self {
             Self::Init(report) => report.render_human(),
-            Self::Setup(report) => report
-                .workers
-                .iter()
-                .map(|worker| {
-                    let mut rendered = if worker.installed {
-                        match worker.protocol_version {
-                            Some(version) => {
-                                format!("{}: installed (protocol {version})", worker.name)
+            Self::Setup(report) => {
+                let mut lines = report
+                    .workers
+                    .iter()
+                    .map(|worker| {
+                        let mut rendered = if worker.installed {
+                            match worker.protocol_version {
+                                Some(version) => {
+                                    format!("{}: installed (protocol {version})", worker.name)
+                                }
+                                None => format!("{}: installed", worker.name),
                             }
-                            None => format!("{}: installed", worker.name),
+                        } else {
+                            let code = worker.error_code.as_deref().unwrap_or("UNKNOWN");
+                            let message = worker.error_message.as_deref().unwrap_or("setup failed");
+                            format!("{}: failed [{code}]: {message}", worker.name)
+                        };
+                        for warning in &worker.warnings {
+                            rendered.push_str("\n  warning [");
+                            rendered.push_str(setup_warning_code(&warning.code));
+                            rendered.push_str("]: ");
+                            rendered.push_str(&warning.message);
                         }
-                    } else {
-                        let code = worker.error_code.as_deref().unwrap_or("UNKNOWN");
-                        let message = worker.error_message.as_deref().unwrap_or("setup failed");
-                        format!("{}: failed [{code}]: {message}", worker.name)
-                    };
-                    for warning in &worker.warnings {
-                        rendered.push_str("\n  warning [");
-                        rendered.push_str(setup_warning_code(&warning.code));
-                        rendered.push_str("]: ");
-                        rendered.push_str(&warning.message);
-                    }
-                    rendered
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+                        rendered
+                    })
+                    .collect::<Vec<_>>();
+                for warning in &report.warnings {
+                    lines.push(format!(
+                        "warning [{}]: {}",
+                        setup_warning_code(&warning.code),
+                        warning.message
+                    ));
+                }
+                lines.join("\n")
+            }
             Self::Workers(report) => report
                 .workers
                 .iter()
@@ -497,6 +506,9 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
         }
         crate::protocol::SetupWarningCode::WarmupFailed => "WARMUP_FAILED",
         crate::protocol::SetupWarningCode::FactsRefreshFailed => "FACTS_REFRESH_FAILED",
+        crate::protocol::SetupWarningCode::LaptopBinaryOutdated => {
+            crate::protocol::LAPTOP_BINARY_OUTDATED_CODE
+        }
     }
 }
 

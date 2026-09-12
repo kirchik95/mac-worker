@@ -148,6 +148,7 @@ export interface Snapshot {
   queue: QueueEntry[]
   active_jobs: unknown[]
   recent_jobs: unknown[]
+  laptop?: { binary_outdated?: boolean } | null
 }
 
 export class ApiError extends Error {

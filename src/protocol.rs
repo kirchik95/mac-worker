@@ -20,9 +20,13 @@ pub const FACTS_REFRESH_FAILED_MESSAGE: &str =
 /// `doctor` warning when inventory declares `origin:<host>` but the worker
 /// account has no HTTPS credential helper for that host. Never a blocker.
 pub const ORIGIN_HELPER_MISSING_CODE: &str = "ORIGIN_HELPER_MISSING";
+/// `doctor` / `setup` warning when a long-running laptop CLI was started
+/// from a binary older than the one now installed. Never a blocker.
+pub const LAPTOP_BINARY_OUTDATED_CODE: &str = "LAPTOP_BINARY_OUTDATED";
 
+/// CPU counters on a host probe. Laptop readers ignore unknown keys so an
+/// additive host field cannot take the dashboard offline.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct CpuCounters {
     pub user_ticks: u64,
     pub system_ticks: u64,
@@ -30,8 +34,12 @@ pub struct CpuCounters {
     pub nice_ticks: u64,
 }
 
+/// Host-produced probe JSON.
+///
+/// A host may add fields. Laptop readers ignore unknown keys so a
+/// still-running older dashboard survives an additive helper. Known fields
+/// keep their existing validation after decode. Protocol stays 7.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ProbeResponse {
     pub protocol_version: u32,
     pub supervision_version: u32,
@@ -224,12 +232,19 @@ pub enum SetupWarningCode {
     /// Post-promotion `host refresh-facts` failed or timed out; the helper
     /// stayed installed and verification still decided the outcome.
     FactsRefreshFailed,
+    /// A long-running laptop `dashboard` or `controller run` was started
+    /// from a binary older than the one just installed.
+    LaptopBinaryOutdated,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SetupReport {
     pub protocol_version: u32,
     pub workers: Vec<SetupHostResult>,
+    /// Laptop-local warnings (outdated dashboard/controller). Omitted when
+    /// empty so older `--json` readers keep their existing shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SetupWarning>,
 }
 
 pub fn missing_capabilities(required: &[String], probe: &ProbeResponse) -> Vec<String> {
@@ -298,6 +313,33 @@ mod tests {
     }
 
     #[test]
+    fn laptop_probe_response_ignores_unknown_fields_and_keeps_known_validation() {
+        let mut value = serde_json::to_value(ProbeResponse::fixture()).unwrap();
+        value["origin_https_helpers"] = serde_json::json!({"generic": true});
+        value["cpu_counters"]["extra_counter"] = serde_json::json!(9);
+        let decoded: ProbeResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.hostname, "mini-1.local");
+        assert_eq!(decoded.cpu_counters.as_ref().unwrap().idle_ticks, 3);
+
+        let invalid = serde_json::json!({
+            "protocol_version": "not-a-number",
+            "supervision_version": 3,
+            "hostname": "mini-1.local",
+            "arch": "arm64",
+            "os_version": "26.2",
+            "free_disk_bytes": 1,
+            "total_disk_bytes": 2,
+            "memory_pressure": "normal",
+            "swap_used_bytes": 0,
+            "slot_state": "idle",
+            "active_lease": null,
+            "capabilities": [],
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<ProbeResponse>(invalid).is_err());
+    }
+
+    #[test]
     fn declared_capability_must_also_be_detected() {
         let response = ProbeResponse::fixture_with_capabilities(["darwin-arm64"]);
         let missing = missing_capabilities(&["darwin-arm64".into(), "docker".into()], &response);
@@ -354,6 +396,7 @@ mod tests {
                 failure_kind: None,
                 warnings: Vec::new(),
             }],
+            warnings: Vec::new(),
         };
 
         let workers_json = serde_json::to_value(workers).unwrap();

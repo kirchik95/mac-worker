@@ -388,6 +388,7 @@ fn fixture_snapshot() -> DashboardSnapshot {
         queue: Vec::new(),
         active_jobs: Vec::new(),
         recent_jobs: vec![fixture_job(None)],
+        laptop: None,
     }
 }
 
@@ -522,6 +523,7 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
             artifact_status: None,
             remote_uncertainty: None,
         }],
+        laptop: None,
     }
 }
 

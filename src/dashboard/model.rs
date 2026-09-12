@@ -37,6 +37,17 @@ pub struct DashboardSnapshot {
     pub queue: Vec<DashboardQueueEntry>,
     pub active_jobs: Vec<DashboardJob>,
     pub recent_jobs: Vec<DashboardJob>,
+    /// Present only when the process was started from a binary that no
+    /// longer matches the file at its executable path. Additive: older
+    /// UIs ignore the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub laptop: Option<DashboardLaptop>,
+}
+
+/// Laptop-local observation about the dashboard process itself.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardLaptop {
+    pub binary_outdated: bool,
 }
 
 impl TaskListProjection {

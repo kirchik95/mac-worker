@@ -335,8 +335,9 @@ impl Serialize for AgentProbe {
 
 impl<'de> Deserialize<'de> for AgentProbe {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Laptop wire: ignore additive host fields. Known values still go
+        // through [`Self::new`].
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Wire {
             name: String,
             version: Option<String>,
@@ -383,8 +384,9 @@ impl Serialize for ProfileProbe {
 
 impl<'de> Deserialize<'de> for ProfileProbe {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Laptop wire: ignore additive host fields. Known values still go
+        // through [`Self::new`].
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Wire {
             name: String,
             secure: bool,
@@ -503,6 +505,12 @@ impl<T: ProfileInput + ?Sized> ProfileInput for &T {
     }
 }
 
+/// Agent facts produced by a host helper.
+///
+/// A host may add fields. Laptop readers ([`Deserialize`]) ignore unknown
+/// keys so a still-running older dashboard survives an additive helper.
+/// The host's own `facts.json` still uses [`Self::from_host_store`], which
+/// rejects unknown fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentFacts {
     pub agents: Vec<AgentProbe>,
@@ -545,8 +553,10 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// What `refresh-facts` learned about herdr on the worker.
+///
+/// Laptop readers ignore unknown keys. The host store decoder still
+/// rejects them via [`AgentFacts::from_host_store`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HerdrFacts {
     pub state: HerdrFactState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -595,6 +605,92 @@ impl HerdrFacts {
 }
 
 impl AgentFacts {
+    /// Strict decode for the host's own `facts.json`.
+    ///
+    /// Unknown fields fail here so a foreign or future writer cannot
+    /// silently change the cache the helper is responsible for.
+    pub fn from_host_store(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        Self::deserialize_host(&mut deserializer)
+    }
+
+    fn deserialize_host<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HostAgentProbe {
+            name: String,
+            version: Option<String>,
+            auth: AgentAuth,
+            auth_by_profile: Vec<(String, AgentAuth)>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HostProfileProbe {
+            name: String,
+            secure: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HostHerdrFacts {
+            state: HerdrFactState,
+            #[serde(default)]
+            version: Option<String>,
+            #[serde(default)]
+            interactive_agents: Option<u32>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct HostOriginHttpsHelpers {
+            #[serde(default)]
+            generic: bool,
+            #[serde(default)]
+            hosts: BTreeMap<String, bool>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HostWire {
+            agents: Vec<HostAgentProbe>,
+            env_profiles: Vec<HostProfileProbe>,
+            git_identity: bool,
+            collected_at_millis: u64,
+            #[serde(default)]
+            origin_https_helpers: HostOriginHttpsHelpers,
+            #[serde(default)]
+            herdr: Option<HostHerdrFacts>,
+        }
+
+        let wire: HostWire = deserialize_unique_object(deserializer)?;
+        let mut agents = Vec::with_capacity(wire.agents.len());
+        for agent in wire.agents {
+            agents.push(
+                AgentProbe::new(agent.name, agent.version, agent.auth, agent.auth_by_profile)
+                    .map_err(de::Error::custom)?,
+            );
+        }
+        let mut env_profiles = Vec::with_capacity(wire.env_profiles.len());
+        for profile in wire.env_profiles {
+            env_profiles
+                .push(ProfileProbe::new(profile.name, profile.secure).map_err(de::Error::custom)?);
+        }
+        let facts = Self {
+            agents,
+            env_profiles,
+            git_identity: wire.git_identity,
+            collected_at_millis: wire.collected_at_millis,
+            herdr: wire.herdr.map(|herdr| HerdrFacts {
+                state: herdr.state,
+                version: herdr.version,
+                interactive_agents: herdr.interactive_agents,
+            }),
+            origin_https_helpers: OriginHttpsHelpers {
+                generic: wire.origin_https_helpers.generic,
+                hosts: wire.origin_https_helpers.hosts,
+            },
+        };
+        facts.validate().map_err(de::Error::custom)?;
+        Ok(facts)
+    }
+
     pub fn collected_at_millis(&self) -> u64 {
         self.collected_at_millis
     }
@@ -665,8 +761,9 @@ impl Serialize for AgentFacts {
 
 impl<'de> Deserialize<'de> for AgentFacts {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Laptop wire: ignore additive host fields. Known values still go
+        // through [`Self::validate`].
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Wire {
             agents: Vec<AgentProbe>,
             env_profiles: Vec<ProfileProbe>,

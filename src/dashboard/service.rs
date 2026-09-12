@@ -15,13 +15,14 @@ use crate::{
         cache::{Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS},
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
-            DashboardError, DashboardJob, DashboardJobState, DashboardProjectDefaults,
-            DashboardQueueEntry, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
-            SystemSummary, WorkerHealth,
+            DashboardError, DashboardJob, DashboardJobState, DashboardLaptop,
+            DashboardProjectDefaults, DashboardQueueEntry, DashboardSnapshot, DashboardWorker,
+            Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
     },
     error::WorkerError,
     job::JobId,
+    laptop::{BinaryIdentitySource, SystemBinaryIdentitySource, binary_is_outdated},
     task::TaskState,
     task_view::{TaskFreshness, TaskListProjection},
 };
@@ -223,6 +224,7 @@ pub struct DashboardService<S, C, M> {
     deadlines: DashboardDeadlines,
     refresh_stale_facts: bool,
     collection_interval: Duration,
+    binary: Arc<dyn BinaryIdentitySource>,
 }
 
 /// Stop handle for the single background observation collector.
@@ -364,7 +366,13 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             deadlines,
             refresh_stale_facts: config.refresh_stale_facts,
             collection_interval: Duration::from_millis(SNAPSHOT_INTERVAL_MILLIS),
+            binary: Arc::new(SystemBinaryIdentitySource::capture()),
         }
+    }
+
+    pub fn with_binary_source(mut self, source: Arc<dyn BinaryIdentitySource>) -> Self {
+        self.binary = source;
+        self
     }
 
     pub fn with_refresh_stale_facts(mut self, enabled: bool) -> Self {
@@ -389,6 +397,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             Some(snapshot) => {
                 let mut snapshot = snapshot.as_ref().clone();
                 refresh_agent_facts_freshness(&mut snapshot.workers, now_millis);
+                apply_laptop_binary(&self.binary, &mut snapshot);
                 if let Some(error) = failure {
                     apply_stale_collection(&mut snapshot, error);
                 }
@@ -554,7 +563,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         let generated_at_millis = self.clock.now_millis();
         refresh_agent_facts_freshness(&mut workers, generated_at_millis);
         let revision = self.next_revision()?;
-        Ok(DashboardSnapshot {
+        let mut snapshot = DashboardSnapshot {
             api_version: DASHBOARD_API_VERSION,
             revision,
             generated_at_millis,
@@ -568,7 +577,10 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             queue,
             active_jobs,
             recent_jobs,
-        })
+            laptop: None,
+        };
+        apply_laptop_binary(&self.binary, &mut snapshot);
+        Ok(snapshot)
     }
 
     fn collect_tasks(&self, deadline: u64, errors: &mut Vec<DashboardError>) -> TaskListProjection {
@@ -819,11 +831,12 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         if let Some(completed) = lock_recover(&self.completed).as_ref() {
             let mut fallback = completed.as_ref().clone();
             refresh_agent_facts_freshness(&mut fallback.workers, self.clock.now_millis());
+            apply_laptop_binary(&self.binary, &mut fallback);
             apply_stale_collection(&mut fallback, timeout);
             return fallback;
         }
 
-        DashboardSnapshot {
+        let mut snapshot = DashboardSnapshot {
             api_version: DASHBOARD_API_VERSION,
             revision: 0,
             generated_at_millis: self.clock.now_millis(),
@@ -837,8 +850,17 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             queue: Vec::new(),
             active_jobs: Vec::new(),
             recent_jobs: Vec::new(),
-        }
+            laptop: None,
+        };
+        apply_laptop_binary(&self.binary, &mut snapshot);
+        snapshot
     }
+}
+
+fn apply_laptop_binary(source: &Arc<dyn BinaryIdentitySource>, snapshot: &mut DashboardSnapshot) {
+    snapshot.laptop = binary_is_outdated(source.as_ref()).then_some(DashboardLaptop {
+        binary_outdated: true,
+    });
 }
 
 fn apply_stale_collection(snapshot: &mut DashboardSnapshot, error: DashboardError) {

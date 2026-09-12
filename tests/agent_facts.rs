@@ -810,7 +810,7 @@ fn facts_are_stale_only_after_the_ttl_and_age_subtraction_is_saturating() {
 }
 
 #[test]
-fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
+fn dto_json_is_canonical_and_laptop_readers_ignore_unknown_host_fields() {
     let facts = AgentFacts {
         agents: vec![AgentProbe {
             name: "codex".into(),
@@ -836,13 +836,19 @@ fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
     );
 
     let unknown = r#"{"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":1,"unexpected":true}"#;
-    assert!(serde_json::from_str::<AgentFacts>(unknown).is_err());
+    let parsed_unknown: AgentFacts = serde_json::from_str(unknown).unwrap();
+    assert!(parsed_unknown.agents.is_empty());
+    assert!(AgentFacts::from_host_store(unknown.as_bytes()).is_err());
     let duplicate = r#"{"agents":[],"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
     assert!(serde_json::from_str::<AgentFacts>(duplicate).is_err());
+    assert!(AgentFacts::from_host_store(duplicate.as_bytes()).is_err());
     let nested_unknown = r#"{"agents":[{"name":"codex","version":null,"auth":"unknown","auth_by_profile":[],"extra":1}],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
-    assert!(serde_json::from_str::<AgentFacts>(nested_unknown).is_err());
+    let parsed_nested: AgentFacts = serde_json::from_str(nested_unknown).unwrap();
+    assert_eq!(parsed_nested.agents[0].name, "codex");
+    assert!(AgentFacts::from_host_store(nested_unknown.as_bytes()).is_err());
     let nested_duplicate = r#"{"agents":[{"name":"codex","name":"claude","version":null,"auth":"unknown","auth_by_profile":[]}],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
     assert!(serde_json::from_str::<AgentFacts>(nested_duplicate).is_err());
+    assert!(AgentFacts::from_host_store(nested_duplicate.as_bytes()).is_err());
 
     let old = r#"{"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
     let parsed_old: AgentFacts = serde_json::from_str(old).unwrap();
@@ -870,17 +876,19 @@ fn origin_https_helpers_are_booleans_and_omit_helper_command_text() {
 }
 
 #[test]
-fn profile_probe_json_rejects_unknown_fields() {
+fn profile_probe_json_ignores_unknown_fields_on_the_laptop() {
     let profile = ProfileProbe {
         name: "agents".into(),
         secure: true,
     };
     let value = serde_json::to_value(profile).unwrap();
     assert_eq!(value, serde_json::json!({"name":"agents","secure":true}));
-    assert!(
-        serde_json::from_str::<ProfileProbe>(r#"{"name":"agents","secure":true,"extra":false}"#)
-            .is_err()
-    );
+    let decoded: ProfileProbe =
+        serde_json::from_str(r#"{"name":"agents","secure":true,"extra":false}"#).unwrap();
+    assert_eq!(decoded.name, "agents");
+    assert!(decoded.secure);
+    let nested = r#"{"agents":[],"env_profiles":[{"name":"agents","secure":true,"extra":false}],"git_identity":false,"collected_at_millis":1}"#;
+    assert!(AgentFacts::from_host_store(nested.as_bytes()).is_err());
 }
 
 #[test]

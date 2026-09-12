@@ -1103,6 +1103,60 @@ fn unreachable_workers_are_not_refreshed() {
     assert!(source.refresh_calls().is_empty());
 }
 
+#[test]
+fn snapshot_sets_laptop_binary_outdated_when_the_installed_file_changed() {
+    let source = FakeSource::new();
+    let started = mac_worker::laptop::BinaryIdentity {
+        path: "/tmp/worker".into(),
+        inode: 1,
+        size: 10,
+        mtime_millis: 100,
+    };
+    let mut installed = started.clone();
+    installed.inode = 2;
+    let service = DashboardService::new(source, ManualClock::new(10_000), ManualMonotonic::new(0))
+        .with_binary_source(std::sync::Arc::new(
+            mac_worker::laptop::FixedBinaryIdentitySource {
+                started: Some(started),
+                installed: Some(installed),
+            },
+        ));
+    let snapshot = service.snapshot(Default::default()).unwrap();
+    assert_eq!(
+        snapshot.laptop,
+        Some(mac_worker::dashboard::model::DashboardLaptop {
+            binary_outdated: true
+        })
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["laptop"]["binary_outdated"], true);
+}
+
+#[test]
+fn matching_laptop_binary_omits_the_additive_laptop_object() {
+    let identity = mac_worker::laptop::BinaryIdentity {
+        path: "/tmp/worker".into(),
+        inode: 1,
+        size: 10,
+        mtime_millis: 100,
+    };
+    let service = DashboardService::new(
+        FakeSource::new(),
+        ManualClock::new(10_000),
+        ManualMonotonic::new(0),
+    )
+    .with_binary_source(std::sync::Arc::new(
+        mac_worker::laptop::FixedBinaryIdentitySource {
+            started: Some(identity.clone()),
+            installed: Some(identity),
+        },
+    ));
+    let snapshot = service.snapshot(Default::default()).unwrap();
+    assert_eq!(snapshot.laptop, None);
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(json.get("laptop").is_none());
+}
+
 fn stale_facts_observation() -> Observation {
     project_worker(&worker_with_facts(1, FACTS_TTL + 1), 10_000).unwrap()
 }
@@ -1700,6 +1754,7 @@ fn empty_timeout_snapshot(generated_at_millis: u64) -> DashboardSnapshot {
         queue: Vec::new(),
         active_jobs: Vec::new(),
         recent_jobs: Vec::new(),
+        laptop: None,
     }
 }
 

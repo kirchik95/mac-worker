@@ -753,6 +753,25 @@ fn malformed_json_is_reported_as_an_invalid_response() {
 }
 
 #[test]
+fn additive_unknown_probe_and_facts_fields_stay_ready() {
+    let mut value = serde_json::from_slice::<serde_json::Value>(&valid_probe_json()).unwrap();
+    value["origin_https_helpers"] = serde_json::json!({"generic": true});
+    value["agent_facts"] = serde_json::json!({
+        "agents": [],
+        "env_profiles": [],
+        "git_identity": false,
+        "collected_at_millis": 1,
+        "future_host_field": true
+    });
+    value["facts_age_millis"] = serde_json::json!(0);
+    let runner = RecordingRunner::returning_json(serde_json::to_vec(&value).unwrap());
+    let health = SshTransport::new(runner).probe(&worker("mini-1", "mac1", &[]));
+    assert_eq!(health.status, HealthStatus::Ready, "{health:?}");
+    assert_eq!(health.error_code, None);
+    assert!(health.probe.as_ref().unwrap().agent_facts.is_some());
+}
+
+#[test]
 fn invalid_utf8_is_reported_as_an_invalid_response() {
     let runner = RecordingRunner::returning_json(vec![0xff]);
     let transport = SshTransport::new(runner);

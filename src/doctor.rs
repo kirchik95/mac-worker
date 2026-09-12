@@ -1,17 +1,18 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::SystemTime};
 
 use crate::{
     config::Config,
     error::WorkerError,
     inputs::{SelectionFailure, SelectionWarning},
+    laptop::{LaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli},
     paths::PathLayout,
     process::ProcessRunner,
     project::ProjectContext,
     project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
     protocol::{
         DoctorIssue, DoctorProject, DoctorReport, HERDR_UNAVAILABLE_CODE,
-        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, IssueSeverity, ORIGIN_HELPER_MISSING_CODE,
-        ProbeResponse, WorkerHealth,
+        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, IssueSeverity, LAPTOP_BINARY_OUTDATED_CODE,
+        ORIGIN_HELPER_MISSING_CODE, ProbeResponse, WorkerHealth,
     },
     transport::{SshTransport, WorkersService},
 };
@@ -33,6 +34,8 @@ pub struct DoctorService<'a> {
     pub runner: &'a dyn ProcessRunner,
     pub config: &'a Config,
     pub paths: &'a PathLayout,
+    pub laptop_processes: &'a dyn LaptopProcessTable,
+    pub installed_binary_mtime: Option<SystemTime>,
 }
 
 impl DoctorService<'_> {
@@ -47,6 +50,10 @@ impl DoctorService<'_> {
             ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
         let eligible_worker_count = workers.iter().filter(|worker| is_eligible(worker)).count();
         let mut issues = worker_issues(&mut workers, eligible_worker_count, self.config);
+        issues.extend(laptop_binary_issues(
+            self.laptop_processes,
+            self.installed_binary_mtime,
+        ));
         if before_probes != after_probes {
             issues.push(local_state_changed_issue());
             sort_issues(&mut issues);
@@ -318,6 +325,28 @@ fn origin_https_host(capability: &str) -> Option<&str> {
     capability
         .strip_prefix("origin:")
         .filter(|host| !host.is_empty() && *host != "file")
+}
+
+fn laptop_binary_issues(
+    processes: &dyn LaptopProcessTable,
+    installed_mtime: Option<SystemTime>,
+) -> Vec<DoctorIssue> {
+    let Some(installed_mtime) = installed_mtime else {
+        return Vec::new();
+    };
+    let Ok(processes) = processes.list() else {
+        return Vec::new();
+    };
+    let outdated = outdated_laptop_cli(&processes, installed_mtime);
+    let Some(message) = format_outdated_laptop_cli(&outdated) else {
+        return Vec::new();
+    };
+    vec![issue(
+        IssueSeverity::Warning,
+        LAPTOP_BINARY_OUTDATED_CODE,
+        &message,
+        Vec::new(),
+    )]
 }
 
 fn selection_warning_issue(warning: &SelectionWarning) -> DoctorIssue {
@@ -644,6 +673,8 @@ mod tests {
             runner: &ReadyDoctorRunner,
             config: &config,
             paths: &paths,
+            laptop_processes: &crate::laptop::EmptyLaptopProcessTable,
+            installed_binary_mtime: None,
         }
         .inspect(DoctorRequest {
             project: repository.path().to_path_buf(),
@@ -765,6 +796,8 @@ mod tests {
             runner: &runner,
             config: &config,
             paths: &paths,
+            laptop_processes: &crate::laptop::EmptyLaptopProcessTable,
+            installed_binary_mtime: None,
         }
         .inspect(DoctorRequest {
             project: repository.path().to_path_buf(),

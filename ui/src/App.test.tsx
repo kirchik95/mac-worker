@@ -40,6 +40,33 @@ describe('App states', () => {
     expect(screen.getByText(/LAST SNAPSHOT/)).toBeInTheDocument()
     expect(screen.getByText(/Last known snapshot/)).toBeInTheDocument()
   })
+
+  it('shows a one-line restart banner when the laptop binary is outdated', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => snapshot({ laptop: { binary_outdated: true } }),
+      }),
+    )
+    render(<App />)
+
+    await waitFor(() =>
+      expect(screen.getByText('worker was updated, restart the dashboard')).toBeInTheDocument(),
+    )
+  })
+
+  it('does not show the restart banner when the laptop binary matches', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => snapshot() }),
+    )
+    render(<App />)
+
+    await waitFor(() => expect(screen.getAllByText('mini-1').length).toBeGreaterThan(0))
+    expect(screen.queryByText('worker was updated, restart the dashboard')).not.toBeInTheDocument()
+  })
 })
 
 describe('tab title', () => {

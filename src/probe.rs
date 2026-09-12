@@ -362,7 +362,7 @@ fn read_cached_facts(root: &RootedDir) -> Result<AgentFacts, WorkerError> {
     let bytes = root
         .read_private_regular(FACTS_FILE, MAX_FACTS_BYTES)
         .map_err(WorkerError::Io)?;
-    let facts: AgentFacts = serde_json::from_slice(&bytes)
+    let facts = AgentFacts::from_host_store(&bytes)
         .map_err(|_| WorkerError::Protocol("cached agent facts are invalid".into()))?;
     let canonical = facts
         .canonical_bytes()
