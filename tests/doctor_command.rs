@@ -799,6 +799,7 @@ fn doctor_renders_a_turn_auth_failure_reason() {
         git_identity: true,
         collected_at_millis: 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
     let human = CommandOutput::Doctor(report).render_human();
@@ -2066,5 +2067,54 @@ fn herdr_warning_for_an_unreachable_herdr_worker_sorts_with_the_other_warnings()
                 "worker offline could not be reached by the SSH probe",
             ),
         ]
+    );
+}
+
+#[test]
+fn declared_origin_without_a_helper_warns_origin_helper_missing_and_stays_ready() {
+    let repo = herdr_repo();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &["origin:github.com"])]);
+    let runner = DoctorRunner::new(vec![ready_probe_with_facts(&[], None, 0)]);
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(report.ready);
+    assert_eq!(report.workers[0].status, HealthStatus::Ready);
+    assert_eq!(
+        issue_triples(&report),
+        vec![(
+            IssueSeverity::Warning,
+            "ORIGIN_HELPER_MISSING",
+            "worker mini-1 has no HTTPS credential helper for origin:github.com",
+        )]
+    );
+    let human = CommandOutput::Doctor(report).render_human();
+    assert!(human.starts_with("doctor: ready\n"), "{human}");
+    assert!(
+        human.contains("warning [ORIGIN_HELPER_MISSING]: worker mini-1 has no HTTPS credential helper for origin:github.com"),
+        "{human}"
+    );
+}
+
+#[test]
+fn declared_origin_with_a_helper_gets_no_origin_helper_warning() {
+    let repo = herdr_repo();
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![worker("mini-1", "mac1", &["origin:github.com"])]);
+    let mut probe = ready_probe_with_facts(&[], None, 0).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+    value["agent_facts"]["origin_https_helpers"] = serde_json::json!({ "generic": true });
+    probe.stdout = serde_json::to_vec(&value).unwrap();
+    let runner = DoctorRunner::new(vec![Ok(probe)]);
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(report.ready);
+    assert!(
+        report
+            .issues
+            .iter()
+            .all(|issue| issue.code != "ORIGIN_HELPER_MISSING"),
+        "{:?}",
+        report.issues
     );
 }

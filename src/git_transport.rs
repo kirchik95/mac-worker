@@ -15,7 +15,7 @@ use crate::{
     error::{ProcessError, WorkerError},
     host_store::{HostStore, HostStoreWritePoint},
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
-    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::RootedDir,
     task::{BaseOid, BranchName, TaskId},
     transfer::TransferIdentity,
@@ -39,6 +39,11 @@ const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
+const ORIGIN_CONFIG_DEADLINE: Duration = Duration::from_secs(5);
+/// Stable git-class code when origin push fails because Git could not
+/// authenticate. Public; retrying delivery keeps this instead of
+/// `PUBLISH_FAILED`. Stderr is classified, never stored.
+pub const ORIGIN_AUTH_FAILED: &str = "ORIGIN_AUTH_FAILED";
 
 pub const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
 
@@ -172,6 +177,11 @@ impl<'a> GitTransport<'a> {
     /// Publishes one exact object ID to a normalized origin branch.  The
     /// caller supplies the pinned OID; this never resolves a mutable task
     /// branch at retry time and never passes `--force`.
+    ///
+    /// HTTPS origins read the worker account's credential helpers from the
+    /// global config in a separate, non-hermetic call and pass only those
+    /// values into the hermetic push as `-c`. SSH and file origins are
+    /// unchanged.
     pub fn push_origin(
         &self,
         origin: &str,
@@ -180,12 +190,14 @@ impl<'a> GitTransport<'a> {
         mirror: &RootedDir,
     ) -> Result<(), WorkerError> {
         let normalized = delivery_origin(origin)?;
+        let extra_config = self.origin_credential_config(&normalized);
         let destination = format!("{oid}:refs/heads/{branch}");
         let result = self
             .runner
-            .run(&git_request(
+            .run(&git_request_with_config(
                 mirror.path(),
                 Some(ORIGIN_GIT_SSH_COMMAND.to_owned()),
+                &extra_config,
                 vec![
                     OsString::from("push"),
                     OsString::from("--no-verify"),
@@ -197,8 +209,35 @@ impl<'a> GitTransport<'a> {
         if result.status.success() {
             Ok(())
         } else {
-            Err(git_error("PUBLISH_FAILED", "origin publication failed"))
+            Err(origin_push_error(&result.stderr))
         }
+    }
+
+    /// Global credential-helper settings for one HTTPS origin. Empty for
+    /// SSH/file URLs. Never loads the global config into the hermetic push.
+    fn origin_credential_config(&self, origin: &str) -> Vec<(String, String)> {
+        let Some((scheme, host)) = http_origin_parts(origin) else {
+            return Vec::new();
+        };
+        let mut config = Vec::new();
+        for value in self.global_config_values("credential.helper") {
+            config.push(("credential.helper".into(), value));
+        }
+        let url_key = format!("credential.{scheme}://{host}.helper");
+        for value in self.global_config_values(&url_key) {
+            config.push((url_key.clone(), value));
+        }
+        for value in self.global_config_values("credential.useHttpPath") {
+            config.push(("credential.useHttpPath".into(), value));
+        }
+        config
+    }
+
+    fn global_config_values(&self, key: &str) -> Vec<String> {
+        let Ok(result) = self.runner.run(&global_config_get_all_request(key)) else {
+            return Vec::new();
+        };
+        config_get_all_values(&result)
     }
 
     /// Reads the advertised OID of one origin branch.  Missing refs are
@@ -760,6 +799,15 @@ impl<'a> HostGitService<'a> {
 fn git_request(
     transfer_repo: &Path,
     ssh: Option<String>,
+    operation: Vec<OsString>,
+) -> ProcessRequest {
+    git_request_with_config(transfer_repo, ssh, &[], operation)
+}
+
+fn git_request_with_config(
+    transfer_repo: &Path,
+    ssh: Option<String>,
+    extra_config: &[(String, String)],
     mut operation: Vec<OsString>,
 ) -> ProcessRequest {
     let mut args = vec![
@@ -774,6 +822,10 @@ fn git_request(
         OsString::from("-c"),
         OsString::from(format!("core.fsyncMethod={GIT_FSYNC_METHOD}")),
     ]);
+    for (key, value) in extra_config {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!("{key}={value}")));
+    }
     args.append(&mut operation);
     let mut environment = vec![
         (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
@@ -799,6 +851,79 @@ fn git_request(
         },
         isolate_parent_environment: false,
     }
+}
+
+/// Reads the worker account's global Git config. Must not set
+/// `GIT_CONFIG_GLOBAL=/dev/null`; that is the one place the account helpers
+/// are consulted. Inherited `GIT_CONFIG_GLOBAL` is stripped so a hermetic
+/// parent cannot hide `~/.gitconfig`.
+fn global_config_get_all_request(key: &str) -> ProcessRequest {
+    ProcessRequest {
+        program: GIT_PROGRAM.into(),
+        args: vec![
+            OsString::from("config"),
+            OsString::from("--global"),
+            OsString::from("--get-all"),
+            OsString::from(key),
+        ],
+        environment: vec![(GIT_TERMINAL_PROMPT.into(), "0".into())],
+        environment_remove: vec![
+            OsString::from(GIT_CONFIG_GLOBAL),
+            OsString::from(GIT_CONFIG_NOSYSTEM),
+            OsString::from("GIT_CONFIG"),
+            OsString::from("GIT_CONFIG_COUNT"),
+            OsString::from("GIT_CONFIG_PARAMETERS"),
+        ],
+        stdin: None,
+        policy: ProcessPolicy {
+            stdout_limit: GIT_OUTPUT_LIMIT,
+            stderr_limit: GIT_OUTPUT_LIMIT,
+            deadline: ORIGIN_CONFIG_DEADLINE,
+        },
+        isolate_parent_environment: false,
+    }
+}
+
+fn config_get_all_values(result: &ProcessResult) -> Vec<String> {
+    if !result.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&result.stdout);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // Preserve empty-string helper resets. `lines()` drops a sole `"\n"`.
+    let stripped = text.strip_suffix('\n').unwrap_or(&text);
+    stripped.split('\n').map(str::to_owned).collect()
+}
+
+fn http_origin_parts(origin: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(origin).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some((url.scheme().to_owned(), host))
+}
+
+fn origin_push_error(stderr: &[u8]) -> WorkerError {
+    if origin_auth_failed(stderr) {
+        git_error(ORIGIN_AUTH_FAILED, "origin authentication failed")
+    } else {
+        git_error("PUBLISH_FAILED", "origin publication failed")
+    }
+}
+
+fn origin_auth_failed(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("could not read Username")
+        || stderr.contains("Authentication failed")
+        || stderr.contains("401")
+        || stderr.contains("403")
+        || stderr.contains("Permission denied (publickey)")
 }
 
 fn origin_request(origin: String) -> ProcessRequest {
@@ -1336,5 +1461,267 @@ fn map_fetch_failure(error: WorkerError) -> WorkerError {
             "result fetch output exceeded its limit",
         ),
         _ => git_error("RESULT_FETCH_FAILED", "failed to launch result fetch"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
+
+    use super::*;
+    use crate::process::ProcessRunner;
+
+    struct ScriptedRunner {
+        requests: Mutex<Vec<ProcessRequest>>,
+        helpers: Vec<String>,
+        url_helpers: Vec<String>,
+        use_http_path: Vec<String>,
+        push_stderr: Vec<u8>,
+        push_ok: bool,
+    }
+
+    impl ScriptedRunner {
+        fn https_helpers(helpers: &[&str], url_helpers: &[&str], use_http_path: &[&str]) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                helpers: helpers.iter().map(|value| (*value).to_owned()).collect(),
+                url_helpers: url_helpers
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                use_http_path: use_http_path
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                push_stderr: Vec::new(),
+                push_ok: true,
+            }
+        }
+
+        fn failing_push(stderr: &str) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                helpers: Vec::new(),
+                url_helpers: Vec::new(),
+                use_http_path: Vec::new(),
+                push_stderr: stderr.as_bytes().to_vec(),
+                push_ok: false,
+            }
+        }
+
+        fn requests(&self) -> Vec<ProcessRequest> {
+            self.requests.lock().expect("runner lock").clone()
+        }
+
+        fn config_stdout(values: &[String]) -> Vec<u8> {
+            if values.is_empty() {
+                return Vec::new();
+            }
+            let mut stdout = values.join("\n");
+            stdout.push('\n');
+            stdout.into_bytes()
+        }
+    }
+
+    impl ProcessRunner for ScriptedRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.requests
+                .lock()
+                .expect("runner lock")
+                .push(request.clone());
+            let args: Vec<_> = request
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            if args.iter().any(|arg| arg == "config") {
+                let key = args.last().map(String::as_str).unwrap_or_default();
+                let values = if key == "credential.helper" {
+                    &self.helpers
+                } else if key.starts_with("credential.") && key.ends_with(".helper") {
+                    &self.url_helpers
+                } else if key == "credential.useHttpPath" {
+                    &self.use_http_path
+                } else {
+                    return Ok(ProcessResult {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                };
+                return Ok(ProcessResult {
+                    status: if values.is_empty() {
+                        ExitStatus::from_raw(1 << 8)
+                    } else {
+                        ExitStatus::from_raw(0)
+                    },
+                    stdout: Self::config_stdout(values),
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(if self.push_ok { 0 } else { 128 << 8 }),
+                stdout: Vec::new(),
+                stderr: self.push_stderr.clone(),
+            })
+        }
+    }
+
+    fn oid() -> BaseOid {
+        "0123456789012345678901234567890123456789".parse().unwrap()
+    }
+
+    fn branch() -> BranchName {
+        "release-candidate".parse().unwrap()
+    }
+
+    fn dash_c_pairs(request: &ProcessRequest) -> Vec<String> {
+        request
+            .args
+            .windows(2)
+            .filter(|window| window[0] == "-c")
+            .map(|window| window[1].to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn env(request: &ProcessRequest, name: &str) -> String {
+        request
+            .environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    fn push_request(requests: &[ProcessRequest]) -> &ProcessRequest {
+        requests
+            .iter()
+            .find(|request| request.args.iter().any(|arg| arg == "push"))
+            .expect("origin push")
+    }
+
+    #[test]
+    fn https_origin_push_forwards_credential_helpers_as_dash_c_and_stays_hermetic() {
+        let temp = tempfile::tempdir().unwrap();
+        let mirror = RootedDir::open(temp.path()).unwrap();
+        let runner = ScriptedRunner::https_helpers(
+            &["", "!/usr/bin/gh auth git-credential"],
+            &["", "!/usr/bin/gh auth git-credential"],
+            &["true"],
+        );
+        GitTransport::new(&runner)
+            .push_origin(
+                "https://github.com/example/repo.git",
+                &oid(),
+                &branch(),
+                &mirror,
+            )
+            .unwrap();
+        let requests = runner.requests();
+        let config_keys: Vec<_> = requests
+            .iter()
+            .filter(|request| request.args.iter().any(|arg| arg == "--get-all"))
+            .map(|request| request.args.last().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            config_keys,
+            [
+                "credential.helper",
+                "credential.https://github.com.helper",
+                "credential.useHttpPath",
+            ]
+        );
+        for request in requests
+            .iter()
+            .filter(|request| request.args.iter().any(|arg| arg == "--get-all"))
+        {
+            assert!(
+                !request
+                    .environment
+                    .iter()
+                    .any(|(key, _)| key == GIT_CONFIG_GLOBAL),
+                "the helper read must not load a hermetic global config"
+            );
+            assert!(
+                request
+                    .environment_remove
+                    .iter()
+                    .any(|name| name == GIT_CONFIG_GLOBAL)
+            );
+            assert_eq!(env(request, GIT_TERMINAL_PROMPT), "0");
+        }
+        let push = push_request(&requests);
+        assert_eq!(
+            dash_c_pairs(push),
+            [
+                "gc.auto=0".to_owned(),
+                format!("core.fsync={GIT_FSYNC_COMPONENTS}"),
+                format!("core.fsyncMethod={GIT_FSYNC_METHOD}"),
+                "credential.helper=".to_owned(),
+                "credential.helper=!/usr/bin/gh auth git-credential".to_owned(),
+                "credential.https://github.com.helper=".to_owned(),
+                "credential.https://github.com.helper=!/usr/bin/gh auth git-credential".to_owned(),
+                "credential.useHttpPath=true".to_owned(),
+            ]
+        );
+        assert_eq!(env(push, GIT_CONFIG_GLOBAL), "/dev/null");
+        assert_eq!(env(push, GIT_CONFIG_NOSYSTEM), "1");
+        assert_eq!(env(push, GIT_TERMINAL_PROMPT), "0");
+        assert_eq!(env(push, "GIT_SSH_COMMAND"), ORIGIN_GIT_SSH_COMMAND);
+    }
+
+    #[test]
+    fn ssh_origin_push_does_not_read_or_forward_credential_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mirror = RootedDir::open(temp.path()).unwrap();
+        let runner = ScriptedRunner::https_helpers(&["osxkeychain"], &[], &[]);
+        GitTransport::new(&runner)
+            .push_origin(
+                "ssh://git@github.com/example/repo.git",
+                &oid(),
+                &branch(),
+                &mirror,
+            )
+            .unwrap();
+        let requests = runner.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.args.iter().any(|arg| arg == "config"))
+        );
+        let push = push_request(&requests);
+        assert_eq!(
+            dash_c_pairs(push),
+            [
+                "gc.auto=0".to_owned(),
+                format!("core.fsync={GIT_FSYNC_COMPONENTS}"),
+                format!("core.fsyncMethod={GIT_FSYNC_METHOD}"),
+            ]
+        );
+        assert_eq!(env(push, GIT_CONFIG_GLOBAL), "/dev/null");
+    }
+
+    #[test]
+    fn origin_push_username_prompt_is_origin_auth_failed_without_storing_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let mirror = RootedDir::open(temp.path()).unwrap();
+        let stderr =
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
+        let runner = ScriptedRunner::failing_push(stderr);
+        let error = GitTransport::new(&runner)
+            .push_origin(
+                "https://github.com/example/repo.git",
+                &oid(),
+                &branch(),
+                &mirror,
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), ORIGIN_AUTH_FAILED);
+        assert_eq!(
+            error.failure_receipt().unwrap().stage(),
+            crate::failure_receipt::STAGE_PUBLISH
+        );
+        assert!(!format!("{error}").contains("could not read Username"));
+        assert!(!error.public_message().contains("could not read Username"));
     }
 }

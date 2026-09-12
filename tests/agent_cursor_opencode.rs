@@ -639,6 +639,7 @@ fn probe_response(agent: AgentKind) -> ProbeResponse {
             git_identity: true,
             collected_at_millis: u64::MAX / 2,
             herdr: None,
+            origin_https_helpers: Default::default(),
         }),
         facts_age_millis: Some(0),
         configured_slots: 0,

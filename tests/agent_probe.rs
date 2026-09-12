@@ -234,6 +234,7 @@ fn facts(collected_at_millis: u64) -> AgentFacts {
         git_identity: true,
         collected_at_millis,
         herdr: None,
+        origin_https_helpers: Default::default(),
     }
 }
 

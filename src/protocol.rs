@@ -17,6 +17,9 @@ pub const HERDR_FACTS_STALE_MESSAGE: &str = "herdr = true but the worker's herdr
 /// can retry collection without reinstalling.
 pub const FACTS_REFRESH_FAILED_MESSAGE: &str =
     "agent facts were not refreshed during setup; run `worker workers --refresh`";
+/// `doctor` warning when inventory declares `origin:<host>` but the worker
+/// account has no HTTPS credential helper for that host. Never a blocker.
+pub const ORIGIN_HELPER_MISSING_CODE: &str = "ORIGIN_HELPER_MISSING";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

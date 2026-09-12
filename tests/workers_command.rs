@@ -1481,6 +1481,7 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
                     git_identity: true,
                     collected_at_millis: 10,
                     herdr: None,
+                    origin_https_helpers: Default::default(),
                 }),
                 facts_age_millis: Some(1_000),
                 configured_slots: 0,
@@ -1549,6 +1550,7 @@ fn workers_render_a_turn_auth_failure_reason() {
                     git_identity: true,
                     collected_at_millis: 1,
                     herdr: None,
+                    origin_https_helpers: Default::default(),
                 }),
                 facts_age_millis: Some(0),
                 configured_slots: 0,
@@ -1886,6 +1888,7 @@ fn facts_with_herdr(herdr: Option<HerdrFacts>) -> AgentFacts {
         git_identity: true,
         collected_at_millis: 10,
         herdr,
+        origin_https_helpers: Default::default(),
     }
 }
 
@@ -2065,5 +2068,44 @@ fn workers_output_appends_interactive_agents_when_the_count_is_known_and_nonzero
         none.lines()
             .any(|line| line == "  herdr: available (0.9.0)"),
         "a zero count is omitted: {none}"
+    );
+}
+
+#[test]
+fn workers_output_renders_origin_https_helper_presence() {
+    let mut missing_health = herdr_health(Some(facts_with_herdr(None)), Some(0));
+    missing_health
+        .probe
+        .as_mut()
+        .unwrap()
+        .capabilities
+        .push("origin:github.com".into());
+    let (missing, _) = render_workers(missing_health);
+    assert!(
+        missing
+            .lines()
+            .any(|line| line == "  origin:github.com: helper missing"),
+        "{missing}"
+    );
+
+    let mut helpers = facts_with_herdr(None);
+    helpers.origin_https_helpers.generic = true;
+    let mut configured_health = herdr_health(Some(helpers), Some(0));
+    configured_health
+        .probe
+        .as_mut()
+        .unwrap()
+        .capabilities
+        .push("origin:github.com".into());
+    let (configured, json) = render_workers(configured_health);
+    assert!(
+        configured
+            .lines()
+            .any(|line| line == "  origin:github.com: helper configured"),
+        "{configured}"
+    );
+    assert!(
+        !json.contains("gh auth") && !json.contains("git-credential"),
+        "helper command text must never appear: {json}"
     );
 }

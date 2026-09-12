@@ -153,6 +153,7 @@ fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
             version: Some("0.9.0".into()),
             interactive_agents: Some(3),
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
 
@@ -171,6 +172,7 @@ fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
             version: Some("0.9.0".into()),
             interactive_agents: Some(3),
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(mac_worker::agent_facts::FACTS_TTL + 1);
     let stale_facts = SchedulerProbeAdapter::observations(&config(), &[stale]).unwrap();
@@ -193,6 +195,7 @@ fn a_turn_auth_failure_reason_is_not_an_agent_capability() {
         git_identity: true,
         collected_at_millis: 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
     let observations = SchedulerProbeAdapter::observations(&config(), &[health]).unwrap();

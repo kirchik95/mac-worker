@@ -256,6 +256,28 @@ fn render_agent_auth(auth: crate::agent_facts::AgentAuth) -> String {
     }
 }
 
+/// One line per inventory `origin:<host>` on the probe. Booleans only; the
+/// helper command never appears. `origin:file` is not an HTTPS host.
+fn render_origin_helper_lines(probe: &crate::protocol::ProbeResponse) -> Vec<String> {
+    probe
+        .capabilities
+        .iter()
+        .filter_map(|capability| {
+            let host = capability
+                .strip_prefix("origin:")
+                .filter(|host| !host.is_empty() && *host != "file")?;
+            let configured = probe
+                .agent_facts
+                .as_ref()
+                .is_some_and(|facts| facts.origin_https_helpers.configured_for(host));
+            Some(format!(
+                "  {capability}: helper {}",
+                if configured { "configured" } else { "missing" }
+            ))
+        })
+        .collect()
+}
+
 /// Spec 5.3: `available (0.9.0)`, `not installed`, `installed (0.9.0), no
 /// socket`, `installed (0.9.0), no response`, or `unknown` when the facts are
 /// missing or predate the fact. A known fact older than the TTL is still
@@ -384,6 +406,9 @@ fn render_worker_health_with_labels(
             probe.capabilities.join(", ")
         };
         lines.push(format!("  capabilities: {capabilities}"));
+        for line in render_origin_helper_lines(probe) {
+            lines.push(line);
+        }
         if let Some(facts) = &probe.agent_facts {
             lines.push(format!(
                 "  agent facts age millis: {}",

@@ -594,7 +594,9 @@ impl<'a> OriginOutbox<'a> {
                         .clone()
                         .into_state(DeliveryState::Delivered, now_millis, None, None)?
                 }
-                Err(_) => self.classify_after_failure(&snapshot, ledger.as_ref(), now_millis)?,
+                Err(error) => {
+                    self.classify_after_failure(&snapshot, ledger.as_ref(), now_millis, &error)?
+                }
             },
         };
         let _guard = self.intent_lock(snapshot.task_id, snapshot.turn_id)?;
@@ -620,7 +622,9 @@ impl<'a> OriginOutbox<'a> {
             next.attempt = current.attempt.saturating_add(1);
             if next.attempt > MAX_ATTEMPTS {
                 next.state = DeliveryState::Failed;
-                next.last_error = Some("PUBLISH_FAILED".into());
+                if next.last_error.is_none() {
+                    next.last_error = Some("PUBLISH_FAILED".into());
+                }
             }
             next.next_attempt_at_millis = now_millis.saturating_add(backoff_millis(next.attempt));
         }
@@ -694,6 +698,7 @@ impl<'a> OriginOutbox<'a> {
         intent: &DeliveryIntent,
         ledger: Option<&TargetLedger>,
         now_millis: u64,
+        error: &WorkerError,
     ) -> Result<DeliveryIntent, WorkerError> {
         let branch: BranchName = intent
             .branch
@@ -725,14 +730,14 @@ impl<'a> OriginOutbox<'a> {
                 intent.clone().into_state(
                     DeliveryState::Retrying,
                     now_millis,
-                    Some("PUBLISH_FAILED".into()),
+                    Some(delivery_retry_code(error)),
                     None,
                 )
             }
             _ => intent.clone().into_state(
                 DeliveryState::Retrying,
                 now_millis,
-                Some("PUBLISH_FAILED".into()),
+                Some(delivery_retry_code(error)),
                 None,
             ),
         }
@@ -792,11 +797,9 @@ impl<'a> OriginOutbox<'a> {
         }
         current.state = DeliveryState::Retrying;
         current.attempt = current.attempt.saturating_add(1);
+        current.last_error = Some(delivery_retry_code(error));
         if current.attempt > MAX_ATTEMPTS {
             current.state = DeliveryState::Failed;
-            current.last_error = Some("PUBLISH_FAILED".into());
-        } else {
-            current.last_error = Some(error.public_code());
         }
         current.next_attempt_at_millis = now_millis.saturating_add(backoff_millis(current.attempt));
         current.updated_at_millis = now_millis;
@@ -1327,6 +1330,15 @@ fn delivery_origin(origin: &str) -> Result<String, WorkerError> {
     }
     crate::project::normalize_origin(origin)
         .map_err(|_| WorkerError::task("PUBLISH_FAILED", "origin URL is invalid"))
+}
+
+fn delivery_retry_code(error: &WorkerError) -> String {
+    let code = error.public_code();
+    if code == crate::git_transport::ORIGIN_AUTH_FAILED {
+        code
+    } else {
+        "PUBLISH_FAILED".into()
+    }
 }
 
 fn target_key(origin: &str, branch: &str) -> String {

@@ -252,7 +252,11 @@ fn origin_push_uses_the_fixed_task_ref_and_normalized_destination() {
             &mirror,
         )
         .unwrap();
-    let request = runner.single_request();
+    let request = runner
+        .requests()
+        .into_iter()
+        .find(|request| request.args.iter().any(|argument| argument == "push"))
+        .expect("origin push");
     let args = request
         .args
         .iter()
@@ -278,11 +282,22 @@ fn origin_push_uses_the_fixed_task_ref_and_normalized_destination() {
 fn origin_push_failure_has_a_stable_code_without_remote_output() {
     let mirror_root = tempfile::tempdir().unwrap();
     let mirror = RootedDir::create(&mirror_root.path().join("mirror")).unwrap();
-    let runner = support::recording_runner::RecordingRunner::returning(ProcessResult {
+    let missing = || ProcessResult {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    let rejected = ProcessResult {
         status: std::process::ExitStatus::from_raw(1 << 8),
         stdout: Vec::new(),
         stderr: b"remote secret diagnostic\n".to_vec(),
-    });
+    };
+    let runner = support::recording_runner::RecordingRunner::returning_results(vec![
+        Ok(missing()),
+        Ok(missing()),
+        Ok(missing()),
+        Ok(rejected),
+    ]);
     let oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
     let branch: BranchName = "release-candidate".parse().unwrap();
     let error = GitTransport::new(&runner)

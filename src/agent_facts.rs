@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt,
     io::Write,
@@ -16,12 +16,12 @@ use serde::{
 use serde_json::{Map, Value};
 
 use crate::{
-    account_launch::account_login_shell_request,
+    account_launch::{account_environment_scaffold, account_login_shell_request},
     agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
     error::{ProcessError, WorkerError},
     herdr::{HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE},
     herdr_reporter::DISPLAY_AGENT,
-    process::{ProcessPolicy, ProcessResult, ProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 
 /// Agent facts remain usable for fifteen minutes before a runner must refresh them.
@@ -512,6 +512,36 @@ pub struct AgentFacts {
     /// Whether the worker's herdr can show turns; absent from facts written
     /// before the herdr reporter existed.
     pub herdr: Option<HerdrFacts>,
+    /// HTTPS credential-helper presence. Booleans only; helper command text
+    /// is never stored. Old facts omit this object.
+    pub origin_https_helpers: OriginHttpsHelpers,
+}
+
+/// Whether the worker account's global Git config has HTTPS credential
+/// helpers. `generic` is true when `credential.helper` has any value,
+/// including an empty-string reset. `hosts` names HTTPS hosts that have a
+/// URL-specific helper. Old readers skip an omitted object.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OriginHttpsHelpers {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub generic: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, bool>,
+}
+
+impl OriginHttpsHelpers {
+    pub fn is_empty(&self) -> bool {
+        !self.generic && self.hosts.is_empty()
+    }
+
+    pub fn configured_for(&self, host: &str) -> bool {
+        self.generic || self.hosts.get(host).copied().unwrap_or(false)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What `refresh-facts` learned about herdr on the worker.
@@ -611,12 +641,21 @@ impl Serialize for AgentFacts {
         agents.sort_by(|left, right| left.name.cmp(&right.name));
         let mut profiles = self.env_profiles.clone();
         profiles.sort_by(|left, right| left.name.cmp(&right.name));
-        let fields = if self.herdr.is_some() { 5 } else { 4 };
+        let mut fields = 4;
+        if !self.origin_https_helpers.is_empty() {
+            fields += 1;
+        }
+        if self.herdr.is_some() {
+            fields += 1;
+        }
         let mut record = serializer.serialize_struct("AgentFacts", fields)?;
         record.serialize_field("agents", &agents)?;
         record.serialize_field("env_profiles", &profiles)?;
         record.serialize_field("git_identity", &self.git_identity)?;
         record.serialize_field("collected_at_millis", &self.collected_at_millis)?;
+        if !self.origin_https_helpers.is_empty() {
+            record.serialize_field("origin_https_helpers", &self.origin_https_helpers)?;
+        }
         if let Some(herdr) = &self.herdr {
             record.serialize_field("herdr", herdr)?;
         }
@@ -634,6 +673,8 @@ impl<'de> Deserialize<'de> for AgentFacts {
             git_identity: bool,
             collected_at_millis: u64,
             #[serde(default)]
+            origin_https_helpers: OriginHttpsHelpers,
+            #[serde(default)]
             herdr: Option<HerdrFacts>,
         }
 
@@ -644,6 +685,7 @@ impl<'de> Deserialize<'de> for AgentFacts {
             git_identity: wire.git_identity,
             collected_at_millis: wire.collected_at_millis,
             herdr: wire.herdr,
+            origin_https_helpers: wire.origin_https_helpers,
         };
         facts.validate().map_err(de::Error::custom)?;
         Ok(facts)
@@ -1066,6 +1108,7 @@ where
         git_identity: collect_git_identity(runner, account_home),
         collected_at_millis,
         herdr: Some(collect_herdr_facts(runner, account_home, timing)),
+        origin_https_helpers: collect_origin_https_helpers(runner, account_home),
     }
 }
 
@@ -1508,6 +1551,86 @@ fn collect_git_identity(runner: &dyn ProcessRunner, account_home: &Path) -> bool
     })
 }
 
+fn collect_origin_https_helpers(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+) -> OriginHttpsHelpers {
+    let mut helpers = OriginHttpsHelpers::default();
+    if let Some(result) = run_account_git_config(
+        runner,
+        account_home,
+        &["config", "--global", "--get-all", "credential.helper"],
+    ) && result.status.success()
+        && !result.stdout.is_empty()
+    {
+        helpers.generic = true;
+    }
+    let Some(result) = run_account_git_config(
+        runner,
+        account_home,
+        &[
+            "config",
+            "--global",
+            "--get-regexp",
+            r"^credential\..*\.helper$",
+        ],
+    ) else {
+        return helpers;
+    };
+    if !result.status.success() {
+        return helpers;
+    }
+    for line in String::from_utf8_lossy(&result.stdout).lines() {
+        let Some(key) = line.split_whitespace().next() else {
+            continue;
+        };
+        if key == "credential.helper" {
+            helpers.generic = true;
+            continue;
+        }
+        if let Some(host) = https_credential_helper_host(key) {
+            helpers.hosts.insert(host, true);
+        }
+    }
+    helpers
+}
+
+fn run_account_git_config(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    args: &[&str],
+) -> Option<ProcessResult> {
+    let mut environment = account_environment_scaffold(account_home);
+    environment.push((OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")));
+    let request = ProcessRequest {
+        program: OsString::from("/usr/bin/git"),
+        args: args.iter().map(OsString::from).collect(),
+        environment,
+        environment_remove: vec![
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            OsString::from("GIT_CONFIG_NOSYSTEM"),
+            OsString::from("GIT_CONFIG"),
+            OsString::from("GIT_CONFIG_COUNT"),
+            OsString::from("GIT_CONFIG_PARAMETERS"),
+        ],
+        stdin: None,
+        policy: probe_policy(),
+        isolate_parent_environment: true,
+    };
+    runner.run(&request).ok()
+}
+
+fn https_credential_helper_host(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("credential.")?.strip_suffix(".helper")?;
+    let url = url::Url::parse(rest).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    url.host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.chars().any(char::is_control) {
         return Err(format!(
@@ -1690,7 +1813,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::collect_git_identity;
+    use super::{collect_git_identity, collect_origin_https_helpers};
     use crate::process::SystemProcessRunner;
 
     #[test]
@@ -1716,5 +1839,32 @@ mod tests {
             collect_git_identity(&SystemProcessRunner, &configured),
             "account .gitconfig name+email must count as a configured identity"
         );
+    }
+
+    #[test]
+    fn collect_origin_https_helpers_reports_boolean_presence_without_helper_text() {
+        let temp = tempdir().unwrap();
+        let empty_account = temp.path().join("empty-account");
+        fs::create_dir_all(&empty_account).unwrap();
+        fs::set_permissions(&empty_account, fs::Permissions::from_mode(0o700)).unwrap();
+        let empty = collect_origin_https_helpers(&SystemProcessRunner, &empty_account);
+        assert!(
+            empty.is_empty(),
+            "empty account HOME must not inherit the developer's helpers"
+        );
+
+        let configured = temp.path().join("configured-account");
+        fs::create_dir_all(&configured).unwrap();
+        fs::set_permissions(&configured, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            configured.join(".gitconfig"),
+            "[credential]\n    helper = osxkeychain\n[credential \"https://github.com\"]\n    helper = !/usr/bin/gh auth git-credential\n",
+        )
+        .unwrap();
+        let helpers = collect_origin_https_helpers(&SystemProcessRunner, &configured);
+        assert!(helpers.generic);
+        assert_eq!(helpers.hosts.get("github.com").copied(), Some(true));
+        let json = serde_json::to_string(&helpers).unwrap();
+        assert!(!json.contains("osxkeychain") && !json.contains("gh auth"));
     }
 }

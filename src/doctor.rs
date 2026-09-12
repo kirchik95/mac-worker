@@ -10,7 +10,8 @@ use crate::{
     project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
     protocol::{
         DoctorIssue, DoctorProject, DoctorReport, HERDR_UNAVAILABLE_CODE,
-        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, IssueSeverity, ProbeResponse, WorkerHealth,
+        HERDR_UNAVAILABLE_MESSAGE, HealthStatus, IssueSeverity, ORIGIN_HELPER_MISSING_CODE,
+        ProbeResponse, WorkerHealth,
     },
     transport::{SshTransport, WorkersService},
 };
@@ -202,6 +203,7 @@ fn worker_issues(
             ));
         }
     }
+    issues.extend(origin_helper_issues(workers, config));
     for worker in workers.iter_mut().filter(|worker| !is_eligible(worker)) {
         let code = if worker.status == HealthStatus::Ready
             && worker
@@ -272,6 +274,50 @@ fn wants_herdr(config: &Config, worker: &WorkerHealth) -> bool {
         .workers
         .iter()
         .any(|entry| entry.name == worker.name && entry.herdr)
+}
+
+/// Inventory `origin:<host>` without an HTTPS credential helper. Warning
+/// only: the worker stays eligible so the operator can still run local
+/// tasks while they fix Git credentials.
+fn origin_helper_issues(workers: &[WorkerHealth], config: &Config) -> Vec<DoctorIssue> {
+    let mut issues = Vec::new();
+    for worker in workers {
+        let Some(entry) = config
+            .workers
+            .iter()
+            .find(|entry| entry.name == worker.name)
+        else {
+            continue;
+        };
+        let helpers = worker
+            .probe
+            .as_ref()
+            .and_then(|probe| probe.agent_facts.as_ref())
+            .map(|facts| &facts.origin_https_helpers);
+        for capability in &entry.capabilities {
+            let Some(host) = origin_https_host(capability) else {
+                continue;
+            };
+            if helpers.is_some_and(|helpers| helpers.configured_for(host)) {
+                continue;
+            }
+            let name = sanitize_bounded(&worker.name, MAX_DISPLAY_NAME_CHARACTERS);
+            let capability = sanitize_bounded(capability, MAX_ISSUE_PATH_CHARACTERS);
+            issues.push(issue(
+                IssueSeverity::Warning,
+                ORIGIN_HELPER_MISSING_CODE,
+                &format!("worker {name} has no HTTPS credential helper for {capability}"),
+                vec![capability],
+            ));
+        }
+    }
+    issues
+}
+
+fn origin_https_host(capability: &str) -> Option<&str> {
+    capability
+        .strip_prefix("origin:")
+        .filter(|host| !host.is_empty() && *host != "file")
 }
 
 fn selection_warning_issue(warning: &SelectionWarning) -> DoctorIssue {

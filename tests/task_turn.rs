@@ -554,6 +554,7 @@ fn plant_authenticated_codex_facts(host: &Path, collected_at_millis: u64) -> Vec
         git_identity: true,
         collected_at_millis,
         herdr: None,
+        origin_https_helpers: Default::default(),
     };
     let bytes = facts.canonical_bytes().unwrap();
     let path = host.join("facts.json");

@@ -165,7 +165,7 @@ CLI exit codes keep v1 semantics. New stable codes sit in the v1 classes plus tw
 - `project`: `TASK_CONFIG_INVALID`, `PUBLISH_REQUIRES_COMMITTED_BASE`, `AGENT_UNSUPPORTED`, `BASE_NOT_ON_ORIGIN`.
 - `snapshot`: `SNAPSHOT_CHANGED`, `SENSITIVE_PATH`, `UNTRACKED_INPUT` as in v1.
 - `capacity`: unchanged, plus `CAPABILITY_MISSING` for pins.
-- `git` (new): `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`.
+- `git` (new): `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`.
 - `infrastructure`: `HOST_LAYOUT_OUTDATED`, reported by the probe as unavailable until `worker setup` migrates the worker.
 - `agent` (new): `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
 - `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
@@ -178,7 +178,7 @@ CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70
 | agent exited zero, status `blocked` | `1` | `1` |
 | agent exited non-zero with code N | `N`, unchanged, public code `AGENT_EXITED` | `1` |
 | signalled, timed out, or cancelled | the status v1 assigns to a signalled, timed-out, or cancelled command | `1` |
-| turn `lost`, `PUBLISH_FAILED`, `RESULT_UNPARSEABLE` | `70` | `1` |
+| turn `lost`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`, `RESULT_UNPARSEABLE` | `70` | `1` |
 | `wait --timeout` elapsed | not applicable | `70`, nothing cancelled |
 
 The durable task record remains the authoritative distinction; JSON output always carries the outcome and code alongside the exit status.

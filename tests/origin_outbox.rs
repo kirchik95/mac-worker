@@ -4,9 +4,12 @@ mod support;
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,7 +21,7 @@ use std::{
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
     error::WorkerError,
-    git_transport::{GitTransport, OBJECT_STORE_SYNC_RECEIPT},
+    git_transport::{GitTransport, OBJECT_STORE_SYNC_RECEIPT, ORIGIN_AUTH_FAILED},
     host_store::{HostGc, HostStore, HostStoreWritePoint},
     job::{
         CancelRequest, ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
@@ -31,7 +34,7 @@ use mac_worker::{
         DELIVERY_UNREADABLE, DeliveryCommit, OUTBOX_BUSY, OUTBOX_WORKER_REQUIRED, OriginOutbox,
         OutboxActivation, OutboxLauncher, due_index_reads_for, task_directory_scans_for,
     },
-    process::SystemProcessRunner,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::MemoryPressure,
     remote_snapshot::RemoteSnapshotService,
     supervisor::{Supervisor, SystemProcessInspector},
@@ -1039,6 +1042,81 @@ fn failing_origin_retries_without_flipping_agent_outcome() {
         .unwrap();
     assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
     assert_eq!(status.state(), TaskState::Open);
+    release_lease(&store, &request);
+}
+
+struct UsernamePromptPush {
+    inner: SystemProcessRunner,
+}
+
+impl ProcessRunner for UsernamePromptPush {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let args: Vec<_> = request
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let touches_https = args.iter().any(|argument| argument.starts_with("https://"));
+        if args.iter().any(|argument| argument == "push") && touches_https {
+            return Ok(username_prompt_failure());
+        }
+        if args.iter().any(|argument| argument == "ls-remote") && touches_https {
+            return Ok(username_prompt_failure());
+        }
+        if args.iter().any(|argument| argument == "--get-all") {
+            return Ok(ProcessResult {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+        self.inner.run(request)
+    }
+}
+
+fn username_prompt_failure() -> ProcessResult {
+    ProcessResult {
+        status: ExitStatus::from_raw(128 << 8),
+        stdout: Vec::new(),
+        stderr:
+            b"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"
+                .to_vec(),
+    }
+}
+
+#[test]
+fn https_origin_username_prompt_records_origin_auth_failed_with_a_publish_receipt() {
+    let (_temp, store, _source, _origin_dir, _origin, _origin_url, oid) = fixture();
+    let job = turn_id(2);
+    let request = prepare_task(&store, task_id(1), job, &oid);
+    commit(&store, "https://github.com/example/repo.git", &oid, job, 1);
+    finish_done(&store, task_id(1), job, &oid);
+    let runner = UsernamePromptPush {
+        inner: SystemProcessRunner,
+    };
+    let results = OriginOutbox::new(&store, &runner).pump_due(1).unwrap();
+    assert_eq!(results[0].state(), DeliveryState::Retrying);
+    assert_eq!(results[0].last_error(), Some(ORIGIN_AUTH_FAILED));
+    assert!(
+        results[0]
+            .last_error()
+            .is_some_and(|code| !code.contains("Username")),
+        "stderr must not be stored: {:?}",
+        results[0].last_error()
+    );
+    let error = GitTransport::new(&runner)
+        .push_origin(
+            "https://github.com/example/repo.git",
+            &oid,
+            &"release-candidate".parse().unwrap(),
+            &store.mirror_if_present(PROJECT_ID).unwrap().unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), ORIGIN_AUTH_FAILED);
+    assert_eq!(
+        error.failure_receipt().unwrap().stage(),
+        mac_worker::failure_receipt::STAGE_PUBLISH
+    );
     release_lease(&store, &request);
 }
 

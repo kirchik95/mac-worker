@@ -92,6 +92,7 @@ fn source_projects_only_allowlisted_agent_facts_and_profile_auth() {
         git_identity: true,
         collected_at_millis: u64::MAX - 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(FACTS_TTL + 99);
 
@@ -123,6 +124,7 @@ fn source_keeps_fresh_facts_current_despite_an_old_remote_timestamp() {
         git_identity: false,
         collected_at_millis: 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
 
@@ -154,6 +156,7 @@ fn source_keeps_agent_facts_unavailable_when_facts_or_worker_age_is_missing() {
         git_identity: false,
         collected_at_millis: 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     let fixture = Fixture::new(report);
     let rows = fixture.source().collect_workers(Duration::from_secs(7));
@@ -799,6 +802,7 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
             version: Some("0.9.0".into()),
             interactive_agents: None,
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
     let fixture = Fixture::new(report);
@@ -820,6 +824,7 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
         git_identity: true,
         collected_at_millis: 1,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
     let fixture = Fixture::new(report);
@@ -848,6 +853,7 @@ fn source_projects_a_fresh_herdr_chip_and_passes_a_stale_fact_through_with_its_a
             version: Some("0.9.0".into()),
             interactive_agents: Some(2),
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(0);
     let fixture = Fixture::new(report);
@@ -883,6 +889,7 @@ fn source_projects_a_fresh_herdr_chip_and_passes_a_stale_fact_through_with_its_a
             version: Some("0.9.0".into()),
             interactive_agents: Some(2),
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(FACTS_TTL + 1);
     let fixture = Fixture::new(report);
@@ -913,6 +920,7 @@ fn stale_herdr_report() -> WorkersReport {
             version: Some("0.9.0".into()),
             interactive_agents: None,
         }),
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(FACTS_TTL + 1);
     report

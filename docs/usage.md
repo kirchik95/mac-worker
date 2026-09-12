@@ -151,6 +151,26 @@ publish = ["fetch", "push"]
 
 The base commit must already be on the remote. The worker account needs its own Git access to that remote; SSH agent forwarding from the laptop is disabled. `--wip` cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`).
 
+### Origin URL and worker credentials
+
+The origin URL is the project's `origin` remote. mac-worker does not take a separate origin URL.
+
+Declare the host on each worker that should fetch from or push to that remote:
+
+```toml
+[[workers]]
+name = "mini-1"
+ssh = "yourname@mini.local"
+slots = 1
+capabilities = ["darwin-arm64", "origin:github.com"]
+```
+
+`source = origin` and `publish = push` require `origin:<host>` where `<host>` matches the remote (`github.com`, `gitlab.example.com`). A pinned worker without it fails with `CAPABILITY_MISSING`. See [Prepare a Mac worker](setup-macos-worker.md#origin-remotes-optional) for the worker-side Git login.
+
+Git on the worker stays hermetic during origin operations (the account `~/.gitconfig` is not loaded into the push). For **HTTPS** origins the worker account needs a credential helper: `gh auth login` then `gh auth setup-git` on the worker. For **SSH** origins the worker's own key must be registered with the remote.
+
+`worker workers` prints `origin:github.com: helper configured` or `helper missing`. `worker doctor` warns `ORIGIN_HELPER_MISSING` when a declared origin has no HTTPS helper. A push git rejects as unauthenticated is `ORIGIN_AUTH_FAILED` (not the generic `PUBLISH_FAILED`) and keeps retrying with the existing backoff.
+
 A batch file groups tasks into a run with shared defaults. Independent tasks (no `depends_on`, no `base = "from:<id>"`) still submit together:
 
 ```toml
@@ -235,6 +255,10 @@ listed for that string.
   job is gone and remaining stdout/stderr cannot be drained.
 - `CAPACITY_BUSY` on a pinned submit: wait, or choose another worker.
 - `TASK_BUSY` on close: wait for `worker task wait` to return, then retry.
+- `ORIGIN_AUTH_FAILED`: the worker could not authenticate to origin. Check
+  `worker workers` for `helper missing`, then on the worker run
+  `gh auth login` and `gh auth setup-git` (HTTPS) or register the worker's
+  SSH key. Delivery keeps retrying.
 
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.

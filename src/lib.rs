@@ -3145,6 +3145,20 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         } => (*code, message.as_ref().to_owned()),
         WorkerError::Capacity { code, .. } => (*code, "worker admission rejected".into()),
         WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed".into()),
+        WorkerError::Git {
+            code: crate::git_transport::ORIGIN_AUTH_FAILED,
+            ..
+        } => {
+            let receipt = crate::failure_receipt::FailureReceipt::new(
+                crate::failure_receipt::STAGE_PUBLISH,
+                &[],
+            )
+            .expect("publish is vocabulary");
+            (
+                crate::git_transport::ORIGIN_AUTH_FAILED,
+                receipt.host_message(),
+            )
+        }
         WorkerError::Git { code, .. } => (*code, "Git operation failed".into()),
         WorkerError::Task { code, .. } => (*code, "task operation failed".into()),
         WorkerError::Agent { code, .. } => (*code, "agent operation failed".into()),
@@ -3192,6 +3206,33 @@ mod versioned_host_error_tests {
         assert_eq!(
             serde_json::to_value(error).unwrap()["protocol_version"],
             crate::protocol::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn origin_auth_failures_keep_the_git_code_and_a_publish_receipt() {
+        let error = versioned_host_error(&WorkerError::Git {
+            code: crate::git_transport::ORIGIN_AUTH_FAILED,
+            message: "origin authentication failed".into(),
+        });
+        let receipt =
+            crate::failure_receipt::FailureReceipt::new(crate::failure_receipt::STAGE_PUBLISH, &[])
+                .unwrap();
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire["error"]["code"],
+            crate::git_transport::ORIGIN_AUTH_FAILED
+        );
+        assert_eq!(wire["error"]["message"], receipt.host_message());
+        assert_eq!(
+            WorkerError::Git {
+                code: crate::git_transport::ORIGIN_AUTH_FAILED,
+                message: "origin authentication failed".into(),
+            }
+            .failure_receipt()
+            .unwrap()
+            .stage(),
+            crate::failure_receipt::STAGE_PUBLISH
         );
     }
 

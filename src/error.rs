@@ -224,12 +224,16 @@ impl WorkerError {
         }
     }
 
-    /// Receipt carried by a host I/O error or parsed from `HOST_IO: …`.
-    /// Anything outside the grammar is `None`, never an error.
+    /// Receipt carried by a host I/O error, parsed from `HOST_IO: …`, or
+    /// attached to origin-auth publication failures (`stage=publish`).
     pub fn failure_receipt(&self) -> Option<FailureReceipt> {
         match self {
             Self::HostIo { receipt, .. } => Some(receipt.clone()),
             Self::Protocol(message) => FailureReceipt::parse_protocol_message(message),
+            Self::Git {
+                code: crate::git_transport::ORIGIN_AUTH_FAILED,
+                ..
+            } => FailureReceipt::new(crate::failure_receipt::STAGE_PUBLISH, &[]),
             _ => None,
         }
     }

@@ -59,6 +59,7 @@ enum Scenario {
     KeychainOrdering,
     StallingCodexAuth,
     StallingLocateVersion,
+    OriginHttpsHelpers,
 }
 
 /// What the scripted account login shell knows about a `herdr` binary.
@@ -139,6 +140,10 @@ impl ProcessRunner for FakeProcessRunner {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
+        if program == "/usr/bin/git" {
+            return Ok(self.origin_https_helper_result(&args));
+        }
+
         if program == "/usr/bin/security" {
             return match self.scenario {
                 Scenario::KeychainUnlockFailure => {
@@ -185,6 +190,27 @@ impl ProcessRunner for FakeProcessRunner {
 }
 
 impl FakeProcessRunner {
+    fn origin_https_helper_result(&self, args: &[String]) -> ProcessResult {
+        if self.scenario != Scenario::OriginHttpsHelpers {
+            return git_config_missing();
+        }
+        if args
+            .windows(2)
+            .any(|window| window[0] == "--get-all" && window[1] == "credential.helper")
+        {
+            return success(b"!/usr/bin/gh auth git-credential\n");
+        }
+        if args
+            .iter()
+            .any(|argument| argument.as_str() == "--get-regexp")
+        {
+            return success(
+                b"credential.helper !/usr/bin/gh auth git-credential\ncredential.https://github.com.helper !/usr/bin/gh auth git-credential\n",
+            );
+        }
+        git_config_missing()
+    }
+
     fn locate_or_merged(
         &self,
         request: &ProcessRequest,
@@ -343,6 +369,10 @@ fn failure(stderr: &[u8]) -> ProcessResult {
         stdout: Vec::new(),
         stderr: stderr.to_vec(),
     }
+}
+
+fn git_config_missing() -> ProcessResult {
+    failure(b"")
 }
 
 trait ExitStatusCode {
@@ -772,6 +802,7 @@ fn facts_are_stale_only_after_the_ttl_and_age_subtraction_is_saturating() {
         git_identity: false,
         collected_at_millis: COLLECTED_AT,
         herdr: None,
+        origin_https_helpers: Default::default(),
     };
     assert!(!facts.is_stale(COLLECTED_AT.saturating_sub(1)));
     assert!(!facts.is_stale(COLLECTED_AT + FACTS_TTL));
@@ -794,6 +825,7 @@ fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
         git_identity: true,
         collected_at_millis: COLLECTED_AT,
         herdr: None,
+        origin_https_helpers: Default::default(),
     };
     let bytes = facts.canonical_bytes().unwrap();
     let parsed: AgentFacts = serde_json::from_slice(&bytes).unwrap();
@@ -811,6 +843,30 @@ fn dto_json_is_canonical_and_rejects_unknown_or_duplicate_fields() {
     assert!(serde_json::from_str::<AgentFacts>(nested_unknown).is_err());
     let nested_duplicate = r#"{"agents":[{"name":"codex","name":"claude","version":null,"auth":"unknown","auth_by_profile":[]}],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
     assert!(serde_json::from_str::<AgentFacts>(nested_duplicate).is_err());
+
+    let old = r#"{"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":1}"#;
+    let parsed_old: AgentFacts = serde_json::from_str(old).unwrap();
+    assert!(parsed_old.origin_https_helpers.is_empty());
+}
+
+#[test]
+fn origin_https_helpers_are_booleans_and_omit_helper_command_text() {
+    let runner = FakeProcessRunner::new(Scenario::OriginHttpsHelpers);
+    let facts = collect_agent_facts_at(&runner, account_home(), &profiles(), COLLECTED_AT);
+    assert!(facts.origin_https_helpers.generic);
+    assert_eq!(
+        facts.origin_https_helpers.hosts.get("github.com").copied(),
+        Some(true)
+    );
+    let json = String::from_utf8(facts.canonical_bytes().unwrap()).unwrap();
+    assert!(
+        json.contains(r#""origin_https_helpers":{"generic":true,"hosts":{"github.com":true}}"#),
+        "{json}"
+    );
+    assert!(
+        !json.contains("gh auth") && !json.contains("git-credential"),
+        "helper command text must never be stored: {json}"
+    );
 }
 
 #[test]
@@ -998,6 +1054,7 @@ fn herdr_facts_round_trip_and_stay_absent_for_records_that_predate_them() {
         git_identity: false,
         collected_at_millis: COLLECTED_AT,
         herdr: None,
+        origin_https_helpers: Default::default(),
     };
     let bytes = without.canonical_bytes().unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("herdr"));

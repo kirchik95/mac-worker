@@ -129,6 +129,31 @@ A turn can still fail authentication while those status checks print logged-in: 
 
 Use only the selected agent to finish your first task. Additional agents can be installed and checked later.
 
+## Origin remotes (optional)
+
+If tasks use `source = origin` or `publish = push`, the origin URL comes from the project's `origin` remote. Declare that host on the laptop inventory and give the **worker account** its own Git credentials. Laptop SSH agent forwarding is disabled.
+
+On the **laptop**, add `origin:<host>` to that worker's `capabilities` in `~/.config/mac-worker/config.toml`:
+
+```toml
+[[workers]]
+name = "mini-1"
+ssh = "yourname@mini.local"
+slots = 1
+capabilities = ["origin:github.com"]
+```
+
+Use the host from the origin URL (`github.com`, `gitlab.example.com`). `worker workers` prints `origin:github.com: helper configured` or `helper missing`. `worker doctor` warns `ORIGIN_HELPER_MISSING` when a declared origin has no HTTPS helper. See [Origin delivery](usage.md#origin-delivery).
+
+On the **worker**, for HTTPS remotes:
+
+```bash
+gh auth login
+gh auth setup-git
+```
+
+`gh auth setup-git` writes a credential helper into the worker account's `~/.gitconfig`. mac-worker keeps Git hermetic during the push and forwards only that helper. For SSH remotes, register the worker account's own SSH key with the remote.
+
 ## Show turns in herdr (optional)
 
 If [herdr](https://herdr.dev) runs on the worker, the pool can show its turns in that herdr, and through herdr's machine link or the herdr-mirror plugin, in the herdr on your laptop.

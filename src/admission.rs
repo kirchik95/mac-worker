@@ -937,6 +937,7 @@ mod tests {
                 git_identity: true,
                 collected_at_millis: 1,
                 herdr: herdr.clone(),
+                origin_https_helpers: Default::default(),
             }),
             FactsKind::Unauthenticated => Some(AgentFacts {
                 agents: vec![AgentProbe {
@@ -952,6 +953,7 @@ mod tests {
                 git_identity: true,
                 collected_at_millis: 1,
                 herdr,
+                origin_https_helpers: Default::default(),
             }),
         };
         let probe = ProbeResponse {

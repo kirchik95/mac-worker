@@ -327,6 +327,7 @@ fn unverified_cursor_login_is_not_advertised_as_an_agent_capability() {
         git_identity: true,
         collected_at_millis: 10,
         herdr: None,
+        origin_https_helpers: Default::default(),
     });
     probe.facts_age_millis = Some(1_000);
 
