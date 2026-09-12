@@ -1109,6 +1109,7 @@ fn fixture_detail() -> TaskDetailProjection {
             review_state: mac_worker::task_view::ReviewState::NotReviewable,
             delivery: None,
             deliveries: Vec::new(),
+            publish_push: false,
         },
         project_id: "a".repeat(64),
         worktree_id: "b".repeat(64),

@@ -213,6 +213,14 @@ export interface OriginDelivery {
   updated_at_millis: number
 }
 
+export function lastDelivery(task: {
+  delivery?: OriginDelivery | null
+  deliveries?: OriginDelivery[]
+}): OriginDelivery | null {
+  if (task.deliveries && task.deliveries.length > 0) return task.deliveries[0]
+  return task.delivery ?? null
+}
+
 export interface TaskDetail {
   task: TaskRow
   project_id: string

@@ -45,6 +45,7 @@ use mac_worker::{
         TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
         TaskStatusResponse,
     },
+    task_view::TaskFreshness,
     transfer::HostOperation,
     turn_runner::InlineRunnerExecutor,
 };
@@ -207,7 +208,7 @@ impl TaskRemoteRunner {
     }
 
     fn fail_next_status(&self) {
-        self.status_failures.store(1, Ordering::SeqCst);
+        self.status_failures.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2805,6 +2806,142 @@ fn close_learns_pending_delivery_after_transient_status_failure() {
         format!("{:?}", store.queue_snapshot().unwrap()),
         before_queue
     );
+}
+
+#[test]
+fn status_list_and_result_surface_deliveries_from_the_fake_remote() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(990));
+    let turn = job(991);
+    let record = task_record(
+        task_id,
+        turn,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    let retrying = OriginDelivery::new(
+        turn,
+        DeliveryState::Retrying,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        4,
+        8,
+        Some("ORIGIN_AUTH_FAILED".into()),
+        None,
+        1,
+        2,
+    )
+    .unwrap();
+    store.create_task(record.clone()).unwrap();
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![retrying.clone()]);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let status = client.status(task_id).unwrap();
+    assert_eq!(
+        status.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Retrying)
+    );
+    assert_eq!(status.deliveries()[0].attempt(), 4);
+    assert_eq!(status.freshness(), TaskFreshness::Current);
+
+    let listed = client.list(TaskListFilter::default()).unwrap();
+    let row = listed
+        .tasks()
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("listed task");
+    assert_eq!(
+        row.delivery.as_ref().map(OriginDelivery::state),
+        Some(DeliveryState::Retrying)
+    );
+    assert_eq!(row.deliveries[0].last_error(), Some("ORIGIN_AUTH_FAILED"));
+
+    let result = client.result(task_id).unwrap();
+    assert_eq!(
+        result.last_delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Retrying)
+    );
+    assert_eq!(result.last_delivery().map(OriginDelivery::attempt), Some(4));
+}
+
+#[test]
+fn unreachable_host_keeps_the_last_observed_delivery() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(992));
+    let turn = job(993);
+    let record = task_record(
+        task_id,
+        turn,
+        TaskState::Open,
+        project.context.project_id.clone(),
+        project.context.worktree_id.clone(),
+        "mini-1",
+        None,
+    );
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    let pending = OriginDelivery::new(
+        turn,
+        DeliveryState::Pending,
+        head,
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        2,
+        3,
+        Some("ORIGIN_AUTH_FAILED".into()),
+        None,
+        1,
+        7,
+    )
+    .unwrap();
+    let record = record
+        .with_delivery(Some(pending.clone()))
+        .unwrap()
+        .with_status_observed_at(Some(7))
+        .unwrap();
+    store.create_task(record.clone()).unwrap();
+
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.fail_next_status();
+    remote.fail_next_status();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let report = client.status(task_id).unwrap();
+    assert_eq!(
+        report.delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
+    assert_eq!(report.freshness(), TaskFreshness::Stale);
+    assert_eq!(report.observed_at_millis(), Some(7));
+
+    let result = client.result(task_id).unwrap();
+    assert_eq!(
+        result.last_delivery().map(OriginDelivery::state),
+        Some(DeliveryState::Pending)
+    );
+    assert_eq!(result.freshness(), TaskFreshness::Stale);
+    assert_eq!(result.observed_at_millis(), Some(7));
 }
 
 fn matching_observation(pid: u32) -> ProcessObservation {

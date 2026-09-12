@@ -8,9 +8,9 @@ use crate::{
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
     task::{
-        BaseOid, BranchName, ClosePolicy, LocalTaskRecord, OriginDelivery, RunId, RunProgress,
-        RunRecord, RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary,
-        TurnTerminal,
+        BaseOid, BranchName, ClosePolicy, LocalTaskRecord, OriginDelivery, PublishMode, RunId,
+        RunProgress, RunRecord, RunnerState, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
+        TurnSummary, TurnTerminal,
     },
 };
 
@@ -33,14 +33,70 @@ pub enum ReviewState {
     Closed,
 }
 
-/// Remote task-status overlay is a read-only projection. Skip it while a
-/// local close fence is unresolved, and while a local drain diagnostic must
-/// remain visible. Extra local-only guards AND onto this predicate so CLI
-/// `status`/`list` and the dashboard cannot drift.
+/// Remote overlay is a read-only projection. Skip it while a local close
+/// fence is unresolved, and while a local drain diagnostic must remain visible.
+/// Extra local-only guards AND onto this predicate so CLI `status`/`list`
+/// and the dashboard cannot drift.
 pub fn remote_status_refresh_allowed(record: &LocalTaskRecord) -> bool {
     record.close_intent().is_none()
         && matches!(record.status().state(), TaskState::Active | TaskState::Open)
         && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
+}
+
+/// Same guards as [`remote_status_refresh_allowed`], plus closed tasks whose
+/// origin delivery is still pending or retrying. Status, list, result, and
+/// the dashboard share this so a failed push stays visible after close.
+pub fn remote_observation_allowed(record: &LocalTaskRecord) -> bool {
+    record.close_intent().is_none()
+        && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
+        && record.needs_remote_observation()
+}
+
+/// One CLI line per origin delivery. Short turn IDs match the dashboard chip.
+pub fn format_delivery_line(delivery: &OriginDelivery) -> String {
+    let mut line = format!(
+        "delivery: {} turn={} branch={} attempt={}",
+        delivery.state().as_str(),
+        short_turn_id(delivery.turn_id()),
+        delivery.branch(),
+        delivery.attempt(),
+    );
+    if let Some(error) = delivery.last_error() {
+        line.push_str(" error=");
+        line.push_str(error);
+    }
+    line
+}
+
+/// `push: retrying` suffix for text `task list`, only when publish includes push.
+pub fn format_list_push_suffix(row: &TaskListRow) -> Option<String> {
+    if !row.publish_push {
+        return None;
+    }
+    Some(format!(
+        " push: {}",
+        row.delivery.as_ref()?.state().as_str()
+    ))
+}
+
+/// Delivery for the latest turn, else the newest recorded delivery.
+pub fn last_turn_delivery<'a>(
+    status: &TaskStatus,
+    deliveries: &'a [OriginDelivery],
+) -> Option<&'a OriginDelivery> {
+    let last_turn = status.turns().last().map(TurnSummary::turn_id);
+    last_turn
+        .and_then(|turn_id| {
+            deliveries
+                .iter()
+                .find(|delivery| delivery.turn_id() == turn_id)
+        })
+        .or_else(|| deliveries.first())
+}
+
+fn short_turn_id(turn_id: TurnId) -> String {
+    let rendered = turn_id.to_string();
+    rendered.chars().take(8).collect()
 }
 
 pub fn review_state(record: &LocalTaskRecord, status: &TaskStatus) -> ReviewState {
@@ -131,6 +187,10 @@ pub struct TaskListRow {
     pub delivery: Option<OriginDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliveries: Vec<OriginDelivery>,
+    /// True when the task asked for an origin push. Text `task list` uses
+    /// this so fetch-only rows never grow a `push:` suffix.
+    #[serde(skip)]
+    pub publish_push: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +569,7 @@ fn task_list_row(
         review_state: review_state(record, status),
         delivery: record.delivery().cloned(),
         deliveries: record.deliveries().to_vec(),
+        publish_push: record.meta().publish().contains(&PublishMode::Push),
     })
 }
 
@@ -634,5 +695,320 @@ fn permission_name(policy: PermissionPolicy) -> &'static str {
     match policy {
         PermissionPolicy::Workspace => "workspace",
         PermissionPolicy::Unattended => "unattended",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TaskFreshness, TaskListRow, format_delivery_line, format_list_push_suffix,
+        last_turn_delivery, project_task_detail,
+    };
+    use crate::{
+        agent::{AgentKind, PermissionPolicy},
+        job::JobId,
+        protocol::PROTOCOL_VERSION,
+        task::{
+            BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord,
+            OriginDelivery, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
+            TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        },
+        task_client::{ControllerTaskProjection, TaskReport, TaskResultReport},
+        task_view::ReviewState,
+    };
+    use uuid::Uuid;
+
+    fn turn_id() -> crate::task::TurnId {
+        JobId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566))
+    }
+
+    fn origin_delivery(state: DeliveryState, error: Option<&str>) -> OriginDelivery {
+        OriginDelivery::new(
+            turn_id(),
+            state,
+            "0123456789abcdef0123456789abcdef01234567"
+                .parse::<BaseOid>()
+                .unwrap(),
+            "https://example.test/repo.git".into(),
+            "refs/heads/release-candidate".into(),
+            3,
+            9,
+            error.map(str::to_owned),
+            None,
+            1,
+            2,
+        )
+        .unwrap()
+    }
+
+    fn closed_record(
+        publish: Vec<PublishMode>,
+        delivery: Option<OriginDelivery>,
+    ) -> LocalTaskRecord {
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: publish.contains(&PublishMode::Push).then(|| {
+                    crate::task::PushTarget::new("https://example.test/repo.git".into()).unwrap()
+                }),
+            },
+            publish,
+            publish_branch: None,
+            base_oid: "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+            title: None,
+            prompt: "fixture".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Closed,
+            Some(TaskOutcome::Done),
+            Some("mini-1".into()),
+            false,
+            Some(meta.base_oid().clone()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn_id(),
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        let record = LocalTaskRecord::new(
+            meta,
+            status,
+            None,
+            None,
+            None,
+            "c".repeat(64),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        match delivery {
+            Some(delivery) => record.with_delivery(Some(delivery)).unwrap(),
+            None => record,
+        }
+    }
+
+    fn list_row(delivery: Option<OriginDelivery>, publish_push: bool) -> TaskListRow {
+        TaskListRow {
+            task_id: TaskId::new(Uuid::from_u128(1)),
+            run_id: None,
+            run_position: None,
+            title: "Repair login".into(),
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            permissions: None,
+            env_profile: None,
+            state: TaskState::Closed,
+            blocking_code: None,
+            stage: None,
+            residual: None,
+            last_outcome: Some(TaskOutcome::Done),
+            worker: Some("mini-1".into()),
+            branch: BranchName::for_task(TaskId::new(Uuid::from_u128(1))),
+            turn_count: 1,
+            runner: None,
+            freshness: TaskFreshness::Current,
+            created_at_millis: 1,
+            updated_at_millis: 2,
+            active_turn_id: None,
+            close_policy: ClosePolicy::Never,
+            review_state: ReviewState::Closed,
+            delivery: delivery.clone(),
+            deliveries: delivery.into_iter().collect(),
+            publish_push,
+        }
+    }
+
+    #[test]
+    fn delivery_line_names_state_short_turn_branch_attempt_and_error() {
+        let delivery = origin_delivery(DeliveryState::Retrying, Some("ORIGIN_AUTH_FAILED"));
+        assert_eq!(
+            format_delivery_line(&delivery),
+            "delivery: retrying turn=018f0f4a branch=release-candidate attempt=3 error=ORIGIN_AUTH_FAILED"
+        );
+    }
+
+    #[test]
+    fn list_push_suffix_is_reserved_for_origin_push_tasks() {
+        let delivered = origin_delivery(DeliveryState::Delivered, None);
+        assert_eq!(
+            format_list_push_suffix(&list_row(Some(delivered.clone()), true)).as_deref(),
+            Some(" push: delivered")
+        );
+        assert_eq!(
+            format_list_push_suffix(&list_row(Some(delivered), false)),
+            None
+        );
+        assert_eq!(format_list_push_suffix(&list_row(None, true)), None);
+    }
+
+    #[test]
+    fn last_turn_delivery_prefers_the_matching_turn() {
+        let first = origin_delivery(DeliveryState::Delivered, None);
+        let second = OriginDelivery::new(
+            JobId::new(Uuid::from_u128(0x118f_0f4a_6b5c_7d8e_9f00_1122_3344_5566)),
+            DeliveryState::Failed,
+            first.oid().clone(),
+            first.origin().to_owned(),
+            format!("refs/heads/{}", first.branch()),
+            1,
+            0,
+            Some("ORIGIN_AUTH_FAILED".into()),
+            None,
+            3,
+            4,
+        )
+        .unwrap();
+        let status = closed_record(vec![PublishMode::Fetch], Some(first.clone()))
+            .status()
+            .clone();
+        assert_eq!(
+            last_turn_delivery(&status, &[second.clone(), first.clone()])
+                .map(OriginDelivery::turn_id),
+            Some(first.turn_id())
+        );
+        assert_eq!(
+            last_turn_delivery(&status, std::slice::from_ref(&second)).map(OriginDelivery::state),
+            Some(DeliveryState::Failed)
+        );
+    }
+
+    #[test]
+    fn task_detail_and_list_rows_copy_origin_deliveries() {
+        let delivery = origin_delivery(DeliveryState::Retrying, Some("ORIGIN_AUTH_FAILED"));
+        let record = closed_record(
+            vec![PublishMode::Fetch, PublishMode::Push],
+            Some(delivery.clone()),
+        );
+        let detail =
+            project_task_detail(&record, record.status(), None, TaskFreshness::Stale).unwrap();
+        assert_eq!(
+            detail.delivery.as_ref().map(OriginDelivery::state),
+            Some(DeliveryState::Retrying)
+        );
+        assert_eq!(
+            detail.deliveries[0].last_error(),
+            Some("ORIGIN_AUTH_FAILED")
+        );
+        assert!(detail.task.publish_push);
+        assert_eq!(
+            detail.task.delivery.as_ref().map(OriginDelivery::state),
+            Some(DeliveryState::Retrying)
+        );
+    }
+
+    #[test]
+    fn status_text_and_json_surface_deliveries() {
+        let delivery = origin_delivery(DeliveryState::Failed, Some("ORIGIN_AUTH_FAILED"));
+        let report = TaskReport::from_controller(ControllerTaskProjection {
+            task_id: TaskId::new(Uuid::from_u128(1)),
+            run_id: None,
+            status: closed_record(vec![PublishMode::Fetch], Some(delivery.clone()))
+                .status()
+                .clone(),
+            warnings: Vec::new(),
+            events: Vec::new(),
+            runner: None,
+            exit_code: None,
+            delivery: Some(delivery.clone()),
+            deliveries: vec![delivery.clone()],
+            failure_receipt: None,
+        });
+        let mut text = Vec::new();
+        crate::write_task_report(&report, false, &mut text).unwrap();
+        let rendered = String::from_utf8(text).unwrap();
+        assert!(
+            rendered.contains(
+                "delivery: failed turn=018f0f4a branch=release-candidate attempt=3 error=ORIGIN_AUTH_FAILED"
+            ),
+            "{rendered}"
+        );
+
+        let mut json_bytes = Vec::new();
+        crate::write_task_report(&report, true, &mut json_bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(json["deliveries"][0]["state"], "failed");
+        assert_eq!(json["deliveries"][0]["last_error"], "ORIGIN_AUTH_FAILED");
+    }
+
+    #[test]
+    fn result_text_and_json_surface_the_last_turn_delivery() {
+        let delivery = origin_delivery(DeliveryState::Delivered, None);
+        let report = TaskResultReport::from_controller(
+            TaskId::new(Uuid::from_u128(1)),
+            closed_record(vec![PublishMode::Fetch], Some(delivery.clone()))
+                .status()
+                .clone(),
+            "task/1".into(),
+            "worker task fetch 1".into(),
+            None,
+            vec![delivery],
+        );
+        let mut text = Vec::new();
+        crate::write_task_result_report(&report, false, &mut text).unwrap();
+        let rendered = String::from_utf8(text).unwrap();
+        assert!(
+            rendered
+                .contains("delivery: delivered turn=018f0f4a branch=release-candidate attempt=3"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("error="), "{rendered}");
+
+        let mut json_bytes = Vec::new();
+        crate::write_task_result_report(&report, true, &mut json_bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(json["deliveries"][0]["state"], "delivered");
+        assert_eq!(json["delivery"]["state"], "delivered");
+    }
+
+    #[test]
+    fn list_text_adds_a_push_suffix_and_json_keeps_last_delivery() {
+        let delivery = origin_delivery(DeliveryState::Retrying, Some("ORIGIN_AUTH_FAILED"));
+        let row = list_row(Some(delivery.clone()), true);
+        let report =
+            crate::task_client::TaskListReport::from_projection(super::TaskListProjection {
+                tasks: vec![row],
+                runs: Vec::new(),
+                progress: crate::task::RunProgress::from_states([TaskState::Closed]),
+                dag_nodes: Vec::new(),
+            });
+        let mut text = Vec::new();
+        crate::write_task_list_report(&report, false, &mut text).unwrap();
+        let rendered = String::from_utf8(text).unwrap();
+        assert!(rendered.contains("push: retrying"), "{rendered}");
+
+        let mut json_bytes = Vec::new();
+        crate::write_task_list_report(&report, true, &mut json_bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(json["tasks"][0]["delivery"]["state"], "retrying");
+        assert!(json["tasks"][0].get("publish_push").is_none());
     }
 }

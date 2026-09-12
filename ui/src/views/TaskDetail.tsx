@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { CommandList } from '@/components/CommandList'
+import { DeliveryChip } from '@/components/DeliveryChip'
 import { Icon, type IconName } from '@/components/Icon'
 import { StatusMark } from '@/components/StatusMark'
 import { TurnLogPanel } from '@/components/TurnLogPanel'
@@ -20,19 +21,6 @@ import {
 } from '@/lib/api'
 
 const POLL_INTERVAL_MS = 2000
-
-function deliverySummary(detail: TaskDetailPayload): string | null {
-  const deliveries =
-    detail.deliveries && detail.deliveries.length > 0
-      ? detail.deliveries
-      : detail.delivery
-        ? [detail.delivery]
-        : []
-  if (deliveries.length === 0) {
-    return null
-  }
-  return deliveries.map((delivery) => `${delivery.state} · ${shortId(delivery.turn_id, 8)}`).join(' · ')
-}
 
 function Fact({ icon, label, value }: { icon: IconName; label: string; value: string }) {
   return (
@@ -272,7 +260,6 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
 
   const { task } = detail
   const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
-  const delivery = deliverySummary(detail)
 
   return (
     <div className="space-y-5">
@@ -296,6 +283,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
           <div className="flex flex-wrap items-center gap-x-4.5 gap-y-1.5">
             <StatusMark value={task.state} />
             {task.last_outcome ? <StatusMark value={task.last_outcome.kind} /> : null}
+            <DeliveryChip task={detail} freshness={task.freshness} />
             <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Icon name="cpu" /> {task.worker ?? 'unassigned'}
             </span>
@@ -348,7 +336,6 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
         <Fact icon="branch" label="BRANCH" value={task.branch ?? 'not published'} />
         <Fact icon="commit" label="BASE" value={shortId(detail.base_oid, 12)} />
         <Fact icon="commit" label="HEAD" value={shortId(detail.head_oid, 12)} />
-        {delivery ? <Fact icon="branch" label="DELIVERY" value={delivery} /> : null}
       </dl>
 
       <section className="overflow-hidden rounded-[10px] border bg-card">

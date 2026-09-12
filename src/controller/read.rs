@@ -366,6 +366,10 @@ pub struct ControllerTaskResult {
     stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     residual: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deliveries: Vec<OriginDelivery>,
 }
 
 impl ControllerTaskResult {
@@ -390,6 +394,7 @@ impl ControllerTaskResult {
                 }
                 None => None,
             },
+            self.deliveries,
         )
     }
 }
@@ -544,6 +549,8 @@ fn result_reply(
                     .map(|item| (*item).to_owned())
                     .collect()
             }),
+            delivery: report.last_delivery().cloned(),
+            deliveries: report.deliveries().to_vec(),
         },
     ))
 }
@@ -901,5 +908,44 @@ mod tests {
         assert!(laptop.get("deliveries").is_none());
         assert!(laptop.get("stage").is_none());
         assert!(laptop.get("residual").is_none());
+    }
+
+    #[test]
+    fn result_legacy_json_without_delivery_fields_is_empty() {
+        let legacy = json!({
+            "task_id": TaskId::generate().to_string(),
+            "status": fixture_status(),
+            "branch": "task/abcd",
+            "fetch": "worker task fetch abcd",
+        });
+        let parsed: ControllerTaskResult = serde_json::from_value(legacy).unwrap();
+        let restored = parsed.into_report();
+        assert!(restored.deliveries().is_empty());
+        assert!(restored.last_delivery().is_none());
+    }
+
+    #[test]
+    fn result_preserves_last_turn_delivery() {
+        let published = delivery(TurnId::generate(), DeliveryState::Delivered, 1);
+        let encoded = serde_json::to_value(&ControllerTaskResult {
+            task_id: TaskId::generate(),
+            status: fixture_status(),
+            branch: "task/abcd".into(),
+            fetch: "worker task fetch abcd".into(),
+            stage: None,
+            residual: None,
+            delivery: Some(published.clone()),
+            deliveries: vec![published.clone()],
+        })
+        .unwrap();
+        assert_eq!(encoded["delivery"]["state"], "delivered");
+        assert_eq!(encoded["deliveries"][0]["state"], "delivered");
+
+        let parsed: ControllerTaskResult = serde_json::from_value(encoded).unwrap();
+        let restored = parsed.into_report();
+        assert_eq!(
+            restored.last_delivery().map(OriginDelivery::state),
+            Some(DeliveryState::Delivered)
+        );
     }
 }

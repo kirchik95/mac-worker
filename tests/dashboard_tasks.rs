@@ -557,6 +557,73 @@ fn closed_task_with_pending_delivery_shows_remote_delivered_without_reopening() 
 }
 
 #[test]
+fn closed_task_with_pending_delivery_stays_visible_when_the_host_is_unreachable() {
+    let harness = DashboardTaskHarness::closed_local_task();
+    let record = harness.state.load_task(harness.task_id()).unwrap();
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    let turn = record.status().turns()[0].turn_id();
+    let pending = OriginDelivery::new(
+        turn,
+        DeliveryState::Retrying,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        3,
+        1,
+        Some("ORIGIN_AUTH_FAILED".into()),
+        None,
+        1,
+        7,
+    )
+    .unwrap();
+    harness
+        .state
+        .update_task(record.with_delivery(Some(pending.clone())).unwrap())
+        .unwrap();
+    harness
+        .remote
+        .set_task_status(Err("SSH_UNAVAILABLE".into()));
+
+    let detail = harness
+        .task_source()
+        .task_detail(harness.task_id())
+        .unwrap();
+    assert_eq!(detail.task.state, TaskState::Closed);
+    assert_eq!(
+        detail.task.freshness,
+        mac_worker::task_view::TaskFreshness::Stale
+    );
+    assert_eq!(
+        detail.delivery.as_ref().map(OriginDelivery::state),
+        Some(DeliveryState::Retrying)
+    );
+    assert_eq!(
+        detail.deliveries[0].last_error(),
+        Some("ORIGIN_AUTH_FAILED")
+    );
+
+    let snapshot = harness.snapshot().unwrap();
+    let row = snapshot
+        .task_view
+        .tasks
+        .iter()
+        .find(|row| row.task_id == harness.task_id())
+        .unwrap();
+    assert_eq!(row.freshness, mac_worker::task_view::TaskFreshness::Stale);
+    assert_eq!(
+        row.delivery.as_ref().map(OriginDelivery::state),
+        Some(DeliveryState::Retrying)
+    );
+    assert!(
+        snapshot
+            .collection
+            .errors
+            .iter()
+            .any(|error| error.code == "TASK_STATUS_STALE")
+    );
+}
+
+#[test]
 fn read_task_log_rejects_an_unknown_configured_worker() {
     let harness = DashboardTaskHarness::active_local_task();
     let ghost = harness.create_extra_task(2, Some("ghost"));

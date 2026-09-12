@@ -690,6 +690,7 @@ pub fn pending_list_row(run_id: RunId, node: &DagNode, created_at_millis: u64) -
         review_state: ReviewState::NotReviewable,
         delivery: None,
         deliveries: Vec::new(),
+        publish_push: node.frozen.publish.iter().any(|mode| mode == "push"),
     }
 }
 

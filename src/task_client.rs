@@ -45,7 +45,8 @@ use crate::{
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        filter_task_list, project_task_list_with_blocking_codes,
+        filter_task_list, last_turn_delivery, project_task_list_with_blocking_codes,
+        remote_observation_allowed,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -241,6 +242,8 @@ pub struct TaskReport {
     delivery: Option<OriginDelivery>,
     deliveries: Vec<OriginDelivery>,
     failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+    freshness: TaskFreshness,
+    observed_at_millis: Option<u64>,
 }
 
 impl TaskReport {
@@ -284,6 +287,14 @@ impl TaskReport {
         self.failure_receipt.as_ref()
     }
 
+    pub fn freshness(&self) -> TaskFreshness {
+        self.freshness
+    }
+
+    pub fn observed_at_millis(&self) -> Option<u64> {
+        self.observed_at_millis
+    }
+
     pub(crate) fn from_controller(projection: ControllerTaskProjection) -> Self {
         Self {
             task_id: projection.task_id,
@@ -296,7 +307,24 @@ impl TaskReport {
             delivery: projection.delivery,
             deliveries: projection.deliveries,
             failure_receipt: projection.failure_receipt,
+            freshness: TaskFreshness::Current,
+            observed_at_millis: None,
         }
+    }
+}
+
+struct ObservedTask {
+    record: LocalTaskRecord,
+    freshness: TaskFreshness,
+}
+
+impl ObservedTask {
+    fn observed_at_millis(&self) -> Option<u64> {
+        self.record.status_observed_at_millis().or_else(|| {
+            self.record
+                .delivery()
+                .map(OriginDelivery::updated_at_millis)
+        })
     }
 }
 
@@ -334,6 +362,9 @@ pub struct TaskResultReport {
     branch: String,
     fetch_instruction: String,
     failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+    deliveries: Vec<OriginDelivery>,
+    freshness: TaskFreshness,
+    observed_at_millis: Option<u64>,
 }
 
 impl TaskResultReport {
@@ -357,12 +388,29 @@ impl TaskResultReport {
         self.failure_receipt.as_ref()
     }
 
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
+    }
+
+    pub fn last_delivery(&self) -> Option<&OriginDelivery> {
+        last_turn_delivery(&self.status, &self.deliveries)
+    }
+
+    pub fn freshness(&self) -> TaskFreshness {
+        self.freshness
+    }
+
+    pub fn observed_at_millis(&self) -> Option<u64> {
+        self.observed_at_millis
+    }
+
     pub(crate) fn from_controller(
         task_id: TaskId,
         status: TaskStatus,
         branch: String,
         fetch_instruction: String,
         failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+        deliveries: Vec<OriginDelivery>,
     ) -> Self {
         Self {
             task_id,
@@ -370,6 +418,9 @@ impl TaskResultReport {
             branch,
             fetch_instruction,
             failure_receipt,
+            deliveries,
+            freshness: TaskFreshness::Current,
+            observed_at_millis: None,
         }
     }
 }
@@ -1941,10 +1992,15 @@ impl<'a> TaskClient<'a> {
                 ))
             })
             .collect::<Result<std::collections::HashMap<_, _>, WorkerError>>()?;
-        let freshness = records
-            .iter()
-            .map(|task| (task.meta().task_id(), TaskFreshness::Current))
-            .collect();
+        let mut projected = Vec::with_capacity(records.len());
+        let mut freshness = std::collections::HashMap::new();
+        for task in records {
+            let observed = self.observe_task(&task)?;
+            freshness.insert(task.meta().task_id(), observed.freshness);
+            // List is the laptop inventory: overlay origin deliveries from the
+            // host, keep the durable local status.
+            projected.push(task.with_deliveries(observed.record.deliveries().to_vec())?);
+        }
         let runs = self
             .client_state
             .list_runs()?
@@ -1953,7 +2009,7 @@ impl<'a> TaskClient<'a> {
             .collect::<Vec<_>>();
         let blocking_codes = self.client_state.task_blocking_codes(self.config)?;
         let mut projection = project_task_list_with_blocking_codes(
-            &records,
+            &projected,
             &runs,
             &runner_states,
             &freshness,
@@ -2265,12 +2321,16 @@ impl<'a> TaskClient<'a> {
 
     pub fn result(&self, task_id: TaskId) -> Result<TaskResultReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        let observed = self.observe_task(&record)?;
         Ok(TaskResultReport {
             task_id,
-            status: record.status().clone(),
+            status: observed.record.status().clone(),
             branch: format!("task/{task_id}"),
             fetch_instruction: format!("worker task fetch {task_id}"),
-            failure_receipt: record.failure_receipt().cloned(),
+            failure_receipt: observed.record.failure_receipt().cloned(),
+            deliveries: observed.record.deliveries().to_vec(),
+            freshness: observed.freshness,
+            observed_at_millis: observed.observed_at_millis(),
         })
     }
 
@@ -3605,6 +3665,8 @@ impl<'a> TaskClient<'a> {
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
             failure_receipt: record.failure_receipt().cloned(),
+            freshness: TaskFreshness::Current,
+            observed_at_millis: record.status_observed_at_millis(),
         })
     }
 
@@ -4920,43 +4982,49 @@ impl<'a> TaskClient<'a> {
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
             failure_receipt: record.failure_receipt().cloned(),
+            freshness: TaskFreshness::Current,
+            observed_at_millis: record.status_observed_at_millis(),
         })
     }
 
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
-        let observed = self.project_remote_task(record)?;
+        let observed = self.observe_task(record)?;
         Ok(TaskReport {
-            task_id: observed.meta().task_id(),
-            run_id: observed.meta().run_id(),
-            status: observed.status().clone(),
+            task_id: observed.record.meta().task_id(),
+            run_id: observed.record.meta().run_id(),
+            status: observed.record.status().clone(),
             warnings: Vec::new(),
             events: Vec::new(),
             runner: self
                 .client_state
-                .runner_liveness(observed.meta().task_id())?,
+                .runner_liveness(observed.record.meta().task_id())?,
             exit_code: None,
-            delivery: observed.delivery().cloned(),
-            deliveries: observed.deliveries().to_vec(),
-            failure_receipt: observed.failure_receipt().cloned(),
+            delivery: observed.record.delivery().cloned(),
+            deliveries: observed.record.deliveries().to_vec(),
+            failure_receipt: observed.record.failure_receipt().cloned(),
+            freshness: observed.freshness,
+            observed_at_millis: observed.observed_at_millis(),
         })
     }
 
-    fn project_remote_task(
-        &self,
-        record: &LocalTaskRecord,
-    ) -> Result<LocalTaskRecord, WorkerError> {
-        if record.close_intent().is_some() || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
-        {
-            return Ok(record.clone());
-        }
-        if !record.needs_remote_observation() {
-            return Ok(record.clone());
+    fn observe_task(&self, record: &LocalTaskRecord) -> Result<ObservedTask, WorkerError> {
+        if !remote_observation_allowed(record) {
+            return Ok(ObservedTask {
+                record: record.clone(),
+                freshness: TaskFreshness::Current,
+            });
         }
         let Some(worker_name) = record.status().worker() else {
-            return Ok(record.clone());
+            return Ok(ObservedTask {
+                record: record.clone(),
+                freshness: TaskFreshness::Current,
+            });
         };
         let Some(worker) = self.config.worker(worker_name) else {
-            return Ok(record.clone());
+            return Ok(ObservedTask {
+                record: record.clone(),
+                freshness: TaskFreshness::Stale,
+            });
         };
         let Ok(remote) = RemoteJobClient::new(self.runner).task_status(
             worker,
@@ -4965,7 +5033,10 @@ impl<'a> TaskClient<'a> {
                 record.meta().task_id(),
             ),
         ) else {
-            return Ok(record.clone());
+            return Ok(ObservedTask {
+                record: record.clone(),
+                freshness: TaskFreshness::Stale,
+            });
         };
         if let Some(pending) = pending_turn_id(record.status())
             && record.status().state() == TaskState::Active
@@ -4979,9 +5050,22 @@ impl<'a> TaskClient<'a> {
                 .last()
                 .is_some_and(|turn| turn.turn_id() == pending)
         {
-            return Ok(record.clone());
+            return Ok(ObservedTask {
+                record: record.clone(),
+                freshness: TaskFreshness::Current,
+            });
         }
-        record.with_remote_observation(remote.status(), remote.deliveries())
+        Ok(ObservedTask {
+            record: record.with_remote_observation(remote.status(), remote.deliveries())?,
+            freshness: TaskFreshness::Current,
+        })
+    }
+
+    fn project_remote_task(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        Ok(self.observe_task(record)?.record)
     }
 
     fn persist_remote_task(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {

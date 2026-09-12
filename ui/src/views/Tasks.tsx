@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 
 import { CommandList } from '@/components/CommandList'
+import { DeliveryChip } from '@/components/DeliveryChip'
 import { Icon } from '@/components/Icon'
 import { Input } from '@/components/ui/input'
 import { StatusMark } from '@/components/StatusMark'
@@ -386,6 +387,7 @@ export function Tasks({
                   <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
                     <StatusMark value={task.state} />
                     {task.last_outcome ? <StatusMark value={task.last_outcome.kind} /> : null}
+                    <DeliveryChip task={task} freshness={task.freshness} />
                   </span>
                 </td>
                 <td className="min-w-0 py-3.5 pr-5">

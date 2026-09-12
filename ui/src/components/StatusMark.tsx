@@ -13,6 +13,10 @@ const MARKS: Record<string, { icon: IconName; tone: string }> = {
   open: { icon: 'clockOpen', tone: 'text-muted-foreground' },
   closed: { icon: 'archive', tone: 'text-observatory-hollow' },
   abandoned: { icon: 'xCircle', tone: 'text-observatory-hollow' },
+  // Origin delivery.
+  pending: { icon: 'clock', tone: 'text-muted-foreground' },
+  retrying: { icon: 'cpuBusy', tone: 'text-primary' },
+  delivered: { icon: 'check', tone: 'text-observatory-green' },
   // Process terminal states.
   running: { icon: 'cpuBusy', tone: 'text-primary' },
   succeeded: { icon: 'check', tone: 'text-observatory-green' },

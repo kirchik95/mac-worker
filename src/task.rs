@@ -404,6 +404,15 @@ impl DeliveryState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Delivered | Self::Failed)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Retrying => "retrying",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +505,13 @@ impl OriginDelivery {
 
     pub fn updated_at_millis(&self) -> u64 {
         self.updated_at_millis
+    }
+
+    /// Branch name the outbox records as `refs/heads/<branch>`.
+    pub fn branch(&self) -> &str {
+        self.target
+            .strip_prefix("refs/heads/")
+            .unwrap_or(self.target.as_str())
     }
 
     fn validate(&self) -> Result<(), WorkerError> {
@@ -2573,4 +2589,46 @@ fn validate_pinned_worker(name: &str) -> Result<(), WorkerError> {
 
 fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerError {
     WorkerError::task("TASK_CONFIG_INVALID", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BaseOid, DeliveryState, OriginDelivery, TurnId};
+    use uuid::Uuid;
+
+    fn delivery(target: &str) -> OriginDelivery {
+        OriginDelivery::new(
+            TurnId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566)),
+            DeliveryState::Retrying,
+            "0123456789abcdef0123456789abcdef01234567"
+                .parse::<BaseOid>()
+                .unwrap(),
+            "https://example.test/repo.git".into(),
+            target.into(),
+            3,
+            9,
+            Some("ORIGIN_AUTH_FAILED".into()),
+            None,
+            1,
+            2,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn origin_delivery_branch_strips_the_heads_prefix() {
+        assert_eq!(
+            delivery("refs/heads/release-candidate").branch(),
+            "release-candidate"
+        );
+        assert_eq!(delivery("refs/heads/task/abcd").branch(), "task/abcd");
+    }
+
+    #[test]
+    fn delivery_state_names_match_the_wire_spellings() {
+        assert_eq!(DeliveryState::Pending.as_str(), "pending");
+        assert_eq!(DeliveryState::Retrying.as_str(), "retrying");
+        assert_eq!(DeliveryState::Delivered.as_str(), "delivered");
+        assert_eq!(DeliveryState::Failed.as_str(), "failed");
+    }
 }

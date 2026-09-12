@@ -23,7 +23,7 @@ use crate::{
     task_store::TaskStatusRequest,
     task_view::{
         TaskDetailProjection, TaskFreshness, TaskViewError, project_task_detail,
-        project_task_list_with_blocking_codes,
+        project_task_list_with_blocking_codes, remote_observation_allowed,
     },
     turn_runner::{DetachedRunnerExecutor, RunnerExecutor},
 };
@@ -87,11 +87,7 @@ impl MacWorkerTaskSource {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<(LocalTaskRecord, TaskFreshness), ApiError> {
-        if record.close_intent().is_some() || record.abandon_code() == Some("LOG_DRAIN_UNAVAILABLE")
-        {
-            return Ok((record.clone(), TaskFreshness::Current));
-        }
-        if !record.needs_remote_observation() {
+        if !remote_observation_allowed(record) {
             return Ok((record.clone(), TaskFreshness::Current));
         }
         let Some(worker_name) = record.status().worker() else {
@@ -111,10 +107,7 @@ impl MacWorkerTaskSource {
                     .map_err(map_local_api_error)?;
                 Ok((observed, TaskFreshness::Current))
             }
-            Err(_) if record.needs_remote_status_refresh() => {
-                Ok((record.clone(), TaskFreshness::Stale))
-            }
-            Err(_) => Ok((record.clone(), TaskFreshness::Current)),
+            Err(_) => Ok((record.clone(), TaskFreshness::Stale)),
         }
     }
 }
@@ -194,11 +187,7 @@ pub(crate) fn collect_task_projection(
         let mut status = record.status().clone();
         let mut task_freshness = TaskFreshness::Current;
         let mut view = record.clone();
-        if record.close_intent().is_none()
-            && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
-            && record.needs_remote_observation()
-            && status.worker().is_some()
-        {
+        if remote_observation_allowed(&record) && status.worker().is_some() {
             let remaining = deadline.saturating_sub(started.elapsed());
             let remote_status = config
                 .worker(status.worker().expect("worker presence checked"))
@@ -217,7 +206,7 @@ pub(crate) fn collect_task_projection(
                     .with_remote_observation(response.status(), response.deliveries())
                     .map_err(map_local_error)?;
                 status = view.status().clone();
-            } else if record.needs_remote_status_refresh() {
+            } else {
                 task_freshness = TaskFreshness::Stale;
                 errors.push(DashboardError::new(
                     "TASK_STATUS_STALE",

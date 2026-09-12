@@ -1509,6 +1509,12 @@ pub(crate) fn write_task_report(
         if !report.deliveries().is_empty() {
             response["deliveries"] = serde_json::json!(report.deliveries());
         }
+        if report.freshness() == crate::task_view::TaskFreshness::Stale {
+            response["freshness"] = serde_json::json!("stale");
+            if let Some(observed_at) = report.observed_at_millis() {
+                response["observed_at_millis"] = serde_json::json!(observed_at);
+            }
+        }
         insert_receipt_fields(&mut response, report.failure_receipt());
         write_json_line(stdout, &response)
     } else {
@@ -1523,12 +1529,11 @@ pub(crate) fn write_task_report(
             writeln!(stdout, "warning: {warning}")?;
         }
         for delivery in report.deliveries() {
-            writeln!(
+            write_delivery_line(
                 stdout,
-                "delivery: {} turn={} {}",
-                delivery_state_name(delivery.state()),
-                delivery.turn_id(),
-                delivery.oid()
+                delivery,
+                report.freshness(),
+                report.observed_at_millis(),
             )?;
         }
         if let Some(receipt) = report.failure_receipt() {
@@ -1567,7 +1572,7 @@ fn write_publish_retry_report(
             writeln!(
                 stdout,
                 "delivery: {} turn={} attempt={} {}",
-                delivery_state_name(delivery.state()),
+                delivery.state().as_str(),
                 delivery.turn_id(),
                 delivery.attempt(),
                 delivery.oid()
@@ -1578,7 +1583,7 @@ fn write_publish_retry_report(
     }
 }
 
-fn write_task_list_report(
+pub(crate) fn write_task_list_report(
     report: &task_client::TaskListReport,
     json: bool,
     stdout: &mut dyn Write,
@@ -1602,20 +1607,24 @@ fn write_task_list_report(
                 };
                 writeln!(
                     stdout,
-                    "{}: {} ({}) blocking: {}",
+                    "{}: {} ({}) blocking: {}{}",
                     task.task_id,
                     task_state_name(task.state),
                     task.worker.as_deref().unwrap_or("unassigned"),
-                    blocking
+                    blocking,
+                    crate::task_view::format_list_push_suffix(task).unwrap_or_default()
                 )?;
             } else {
-                writeln!(
-                    stdout,
+                let mut line = format!(
                     "{}: {} ({})",
                     task.task_id,
                     task_state_name(task.state),
                     task.worker.as_deref().unwrap_or("unassigned")
-                )?;
+                );
+                if let Some(suffix) = crate::task_view::format_list_push_suffix(task) {
+                    line.push_str(&suffix);
+                }
+                writeln!(stdout, "{line}")?;
             }
         }
         stdout.flush()?;
@@ -1623,7 +1632,7 @@ fn write_task_list_report(
     }
 }
 
-fn write_task_result_report(
+pub(crate) fn write_task_result_report(
     report: &task_client::TaskResultReport,
     json: bool,
     stdout: &mut dyn Write,
@@ -1637,6 +1646,18 @@ fn write_task_result_report(
             "fetch": report.fetch_instruction(),
         });
         insert_receipt_fields(&mut value, report.failure_receipt());
+        if !report.deliveries().is_empty() {
+            value["deliveries"] = serde_json::json!(report.deliveries());
+        }
+        if let Some(delivery) = report.last_delivery() {
+            value["delivery"] = serde_json::json!(delivery);
+        }
+        if report.freshness() == crate::task_view::TaskFreshness::Stale {
+            value["freshness"] = serde_json::json!("stale");
+            if let Some(observed_at) = report.observed_at_millis() {
+                value["observed_at_millis"] = serde_json::json!(observed_at);
+            }
+        }
         write_json_line(stdout, &value)
     } else {
         writeln!(
@@ -1664,6 +1685,14 @@ fn write_task_result_report(
         }
         writeln!(stdout, "branch: {}", report.branch())?;
         writeln!(stdout, "fetch: {}", report.fetch_instruction())?;
+        if let Some(delivery) = report.last_delivery() {
+            write_delivery_line(
+                stdout,
+                delivery,
+                report.freshness(),
+                report.observed_at_millis(),
+            )?;
+        }
         if let Some(receipt) = report.failure_receipt() {
             writeln!(
                 stdout,
@@ -1804,13 +1833,22 @@ fn task_state_name(state: crate::task::TaskState) -> &'static str {
     }
 }
 
-fn delivery_state_name(state: crate::task::DeliveryState) -> &'static str {
-    match state {
-        crate::task::DeliveryState::Pending => "pending",
-        crate::task::DeliveryState::Retrying => "retrying",
-        crate::task::DeliveryState::Delivered => "delivered",
-        crate::task::DeliveryState::Failed => "failed",
+fn write_delivery_line(
+    stdout: &mut dyn Write,
+    delivery: &crate::task::OriginDelivery,
+    freshness: crate::task_view::TaskFreshness,
+    observed_at_millis: Option<u64>,
+) -> Result<(), WorkerError> {
+    let mut line = crate::task_view::format_delivery_line(delivery);
+    if freshness == crate::task_view::TaskFreshness::Stale {
+        if let Some(observed_at) = observed_at_millis {
+            line.push_str(&format!(" observed={observed_at}"));
+        } else {
+            line.push_str(" stale");
+        }
     }
+    writeln!(stdout, "{line}")?;
+    Ok(())
 }
 
 #[doc(hidden)]

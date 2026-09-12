@@ -1,4 +1,4 @@
-import type { AgentSettings, QueueEntry, Snapshot, TaskRow, Worker } from '@/lib/api'
+import type { AgentSettings, OriginDelivery, QueueEntry, Snapshot, TaskRow, Worker } from '@/lib/api'
 
 export const MALICIOUS = '<img src=x onerror=1>'
 
@@ -58,6 +58,23 @@ export function task(overrides: Partial<TaskRow> = {}): TaskRow {
     active_turn_id: null,
     close_policy: 'done',
     review_state: 'not_reviewable',
+    ...overrides,
+  }
+}
+
+export function originDelivery(overrides: Partial<OriginDelivery> = {}): OriginDelivery {
+  return {
+    turn_id: 'e'.repeat(32),
+    state: 'delivered',
+    oid: '0123456789abcdef0123456789abcdef01234567',
+    origin: 'https://example.test/repo.git',
+    target: 'refs/heads/release-candidate',
+    attempt: 1,
+    next_attempt_at_millis: 0,
+    last_error: null,
+    superseded_by: null,
+    created_at_millis: 1,
+    updated_at_millis: 2,
     ...overrides,
   }
 }

@@ -2,7 +2,7 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { MALICIOUS, snapshot, task } from '@/test/fixtures'
+import { MALICIOUS, originDelivery, snapshot, task } from '@/test/fixtures'
 import { Tasks } from './Tasks'
 
 const fixture = snapshot({
@@ -35,6 +35,25 @@ describe('Tasks', () => {
     render(<Tasks snapshot={fixture} onSelect={() => {}} />)
     expect(screen.getByText(MALICIOUS)).toBeInTheDocument()
     expect(document.querySelector('img')).toBeNull()
+  })
+
+  it('shows a delivery chip on the task row', () => {
+    render(
+      <Tasks
+        snapshot={snapshot({
+          tasks: [
+            task({
+              title: 'Push the result',
+              delivery: originDelivery({ state: 'retrying' }),
+              deliveries: [originDelivery({ state: 'retrying' })],
+            }),
+          ],
+        })}
+        onSelect={() => {}}
+      />,
+    )
+    expect(screen.getByText('Push the result')).toBeInTheDocument()
+    expect(screen.getByText('retrying')).toBeInTheDocument()
   })
 
   it('filters locally without issuing a request', async () => {
