@@ -2928,6 +2928,14 @@ fn child_receives_only_the_exact_controlled_environment_and_workspace_cwd() {
         format!("MAC_WORKER_CLIENT_ID={}", lease.client_id()),
         format!("MAC_WORKER_PROJECT_ID={}", lease.project_id()),
         format!("MAC_WORKER_WORKTREE_ID={}", lease.worktree_id()),
+        format!(
+            "MAC_WORKER_ACCOUNT_HOME={}",
+            std::env::var_os("MAC_WORKER_ACCOUNT_HOME")
+                .filter(|home| !home.is_empty())
+                .or_else(|| std::env::var_os("HOME"))
+                .expect("HOME")
+                .to_string_lossy()
+        ),
     ]
     .into_iter()
     .collect::<std::collections::BTreeSet<_>>();

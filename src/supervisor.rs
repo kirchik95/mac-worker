@@ -294,6 +294,10 @@ impl LaunchPlan {
             ));
         };
         let mut env = account_environment_scaffold(account_home);
+        env.push((
+            crate::task_store::MAC_WORKER_ACCOUNT_HOME.into(),
+            account_home.as_os_str().to_os_string(),
+        ));
         env.extend([
             ("TMPDIR".into(), turn_dir.join("tmp").into_os_string()),
             (
@@ -457,7 +461,7 @@ fn batch_environment(
     home: &Path,
     tmp: &Path,
 ) -> Result<Vec<(OsString, OsString)>, WorkerError> {
-    let environment: Vec<(OsString, OsString)> = vec![
+    let mut environment: Vec<(OsString, OsString)> = vec![
         ("LC_ALL".into(), "C".into()),
         ("LANG".into(), "C".into()),
         ("PATH".into(), CONTROLLED_PATH.into()),
@@ -474,6 +478,12 @@ fn batch_environment(
         ("MAC_WORKER_PROJECT_ID".into(), lease.project_id().into()),
         ("MAC_WORKER_WORKTREE_ID".into(), lease.worktree_id().into()),
     ];
+    if let Some(account_home) = crate::task_store::herdr_account_home() {
+        environment.push((
+            crate::task_store::MAC_WORKER_ACCOUNT_HOME.into(),
+            account_home.into_os_string(),
+        ));
+    }
     if environment
         .iter()
         .any(|(name, value)| name.as_bytes().contains(&0) || value.as_bytes().contains(&0))
@@ -1018,6 +1028,19 @@ impl SystemSupervisorLauncher {
                     )
                 })?);
             }
+        }
+        if let Some(home) = crate::task_store::herdr_account_home() {
+            let mut entry = crate::task_store::MAC_WORKER_ACCOUNT_HOME
+                .as_bytes()
+                .to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(home.as_os_str().as_bytes());
+            environment.push(CString::new(entry).map_err(|_| {
+                protocol_code(
+                    "SUPERVISOR_ENVIRONMENT_INVALID",
+                    "supervisor control environment contains NUL",
+                )
+            })?);
         }
         Ok(Self {
             executable,
@@ -2833,8 +2856,9 @@ impl<'a> Supervisor<'a> {
             agent: section.turn().agent(),
             title,
         };
-        let reported =
-            crate::herdr_reporter::HerdrReporter::for_home(account_home).start(&identity);
+        let home =
+            crate::task_store::herdr_account_home().unwrap_or_else(|| account_home.to_path_buf());
+        let reported = crate::herdr_reporter::HerdrReporter::for_home(&home).start(&identity);
         if let Some(line) = &reported.diagnostic {
             append_supervisor_note(job, line);
         }

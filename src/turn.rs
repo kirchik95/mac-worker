@@ -743,6 +743,14 @@ impl TurnTerminalHook {
                     result.questions(),
                     &task_store,
                 );
+                if meta.close_policy() == ClosePolicy::Done
+                    && result.outcome() == &TaskOutcome::Done
+                {
+                    TaskStore::new(store, &runner).close_after_own_terminal_turn(
+                        &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
+                        job_meta.job_id(),
+                    )?;
+                }
                 Ok(result)
             }
             Err(error) => {
@@ -825,7 +833,7 @@ fn report_turn_to_herdr(
     if !section.herdr_reporter() {
         return;
     }
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+    let Some(home) = crate::task_store::herdr_account_home() else {
         return;
     };
     let identity = crate::herdr_reporter::TurnIdentity {
@@ -839,8 +847,13 @@ fn report_turn_to_herdr(
     };
     let pane_id = crate::herdr_reporter::take_start(&job_meta.job_id().to_string())
         .and_then(|report| report.pane_id);
-    let reported = crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home))
-        .terminal(&identity, pane_id.as_deref(), outcome, summary, questions);
+    let reported = crate::herdr_reporter::HerdrReporter::for_home(&home).terminal(
+        &identity,
+        pane_id.as_deref(),
+        outcome,
+        summary,
+        questions,
+    );
     let _ = task_store.record_turn_herdr(
         section.project_id(),
         section.turn().task_id(),
@@ -1031,7 +1044,6 @@ impl<'a> TurnPublisher<'a> {
             }
             outcome
         };
-        let close = meta.close_policy() == ClosePolicy::Done && outcome == TaskOutcome::Done;
         if meta.publish().contains(&PublishMode::Push) {
             let expected_origin = meta.push_origin_url().ok_or_else(|| {
                 turn_error("PUBLISH_FAILED", "push publication has no origin target")
@@ -1088,12 +1100,6 @@ impl<'a> TurnPublisher<'a> {
             structured.checks().to_vec(),
             false,
         )?;
-        if close {
-            TaskStore::new(self.store, self.runner).close_after_own_terminal_turn(
-                &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
-                turn_id,
-            )?;
-        }
         let _ = session;
         Ok(TurnResult {
             outcome,
@@ -2026,6 +2032,7 @@ fn worker_controlled_env_name(name: &str) -> bool {
             | "SHELL"
             | "TMPDIR"
             | "MAC_WORKER_TURN_DIR"
+            | "MAC_WORKER_ACCOUNT_HOME"
             | "MAC_WORKER_JOB_ID"
             | "MAC_WORKER_CLIENT_ID"
             | "MAC_WORKER_PROJECT_ID"

@@ -1136,6 +1136,13 @@ fn launch_plans_keep_batch_golden_and_turns_use_the_account_environment() {
             ),
             ("MAC_WORKER_PROJECT_ID".into(), "b".repeat(64).into()),
             ("MAC_WORKER_WORKTREE_ID".into(), "c".repeat(64).into()),
+            (
+                "MAC_WORKER_ACCOUNT_HOME".into(),
+                std::env::var_os("MAC_WORKER_ACCOUNT_HOME")
+                    .filter(|home| !home.is_empty())
+                    .or_else(|| std::env::var_os("HOME"))
+                    .expect("HOME"),
+            ),
         ]
     );
     assert!(batch.cwd().as_os_str().is_empty());
@@ -1192,6 +1199,11 @@ fn launch_plans_keep_batch_golden_and_turns_use_the_account_environment() {
             .iter()
             .any(|(name, value)| { name == "HOME" && value == "/Users/worker" })
     );
+    assert!(
+        plan.env()
+            .iter()
+            .any(|(name, value)| { name == "MAC_WORKER_ACCOUNT_HOME" && value == "/Users/worker" })
+    );
     for name in [
         "USER",
         "LOGNAME",
@@ -1203,6 +1215,7 @@ fn launch_plans_keep_batch_golden_and_turns_use_the_account_environment() {
         "GIT_AUTHOR_NAME",
         "GIT_COMMITTER_EMAIL",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "MAC_WORKER_ACCOUNT_HOME",
     ] {
         assert!(plan.env().iter().any(|(key, _)| key == name), "{name}");
     }
@@ -2610,6 +2623,211 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab() {
     TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
         .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
         .unwrap();
+}
+
+fn queue_herdr_turn_and_close_replies(server: &support::fake_herdr::FakeHerdr) {
+    use support::fake_herdr::Reply;
+    let idle = || {
+        Reply::Result(serde_json::json!({
+            "type": "pane_process_info",
+            "process_info": { "shell_pid": 500, "foreground_processes": [{ "name": "zsh", "pid": 500 }] }
+        }))
+    };
+    server.reply(
+        "workspace.list",
+        Reply::Result(serde_json::json!({ "type": "workspace_list", "workspaces": [] })),
+    );
+    server.reply(
+        "workspace.create",
+        Reply::Result(serde_json::json!({
+            "type": "workspace_created",
+            "workspace": { "workspace_id": "w9", "label": "mac-worker" },
+            "tab": { "tab_id": "w9:t1", "workspace_id": "w9" },
+            "root_pane": { "pane_id": "w9:p1" }
+        })),
+    );
+    server.reply(
+        "tab.list",
+        Reply::Result(serde_json::json!({ "type": "tab_list", "tabs": [] })),
+    );
+    server.reply(
+        "tab.create",
+        Reply::Result(serde_json::json!({
+            "type": "tab_created",
+            "tab": { "tab_id": "w9:t2", "label": "x", "workspace_id": "w9" },
+            "root_pane": { "pane_id": "w9:p2", "tab_id": "w9:t2", "workspace_id": "w9" }
+        })),
+    );
+    server.reply("pane.process_info", idle());
+    server.reply("pane.process_info", idle());
+    server.reply(
+        "workspace.list",
+        Reply::Result(serde_json::json!({
+            "type": "workspace_list",
+            "workspaces": [{ "workspace_id": "w9", "label": "mac-worker" }]
+        })),
+    );
+    server.reply(
+        "tab.list",
+        Reply::Result(serde_json::json!({
+            "type": "tab_list",
+            "tabs": [
+                { "tab_id": "w9:t1", "label": "1", "workspace_id": "w9" },
+                { "tab_id": "w9:t2", "label": "task 000000000000 · turn 1", "workspace_id": "w9" }
+            ]
+        })),
+    );
+    server.reply(
+        "tab.list",
+        Reply::Result(serde_json::json!({
+            "type": "tab_list",
+            "tabs": [{ "tab_id": "w9:t1", "label": "1", "workspace_id": "w9" }]
+        })),
+    );
+}
+
+fn assert_herdr_turn_attached_and_tab_closed(server: &support::fake_herdr::FakeHerdr) {
+    let requests = server.requests();
+    let methods: Vec<&str> = requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "workspace.list",
+            "workspace.create",
+            "tab.list",
+            "tab.create",
+            "pane.process_info",
+            "pane.send_input",
+            "pane.report_agent",
+            "pane.report_metadata",
+            "pane.process_info",
+            "pane.report_agent",
+            "pane.report_metadata",
+            "workspace.list",
+            "tab.list",
+            "tab.close",
+            "tab.list",
+            "workspace.close",
+        ],
+        "{requests:?}"
+    );
+    let by_method = |method: &str| -> Vec<&serde_json::Value> {
+        requests
+            .iter()
+            .filter(|request| request["method"] == method)
+            .map(|request| &request["params"])
+            .collect()
+    };
+    assert_eq!(
+        by_method("tab.create")[0]["label"],
+        "task 000000000000 · turn 1"
+    );
+    assert_eq!(
+        by_method("pane.send_input")[0]["text"],
+        format!(
+            "exec ~/.local/bin/worker host follow-turn {PROJECT_ID} {WORKTREE_ID} {}",
+            herdr_turn_job_id()
+        )
+    );
+    let agent = by_method("pane.report_agent");
+    assert_eq!(agent[0]["state"], "working");
+    assert_eq!(agent[0]["agent"], "codex");
+    assert_eq!(
+        agent[0]["message"], "turn prompt",
+        "the working message is the task title, which the harness derives from the prompt's first line"
+    );
+    assert_eq!(
+        agent[1]["state"], "idle",
+        "a done turn shows as done until seen"
+    );
+    assert_eq!(agent[1]["message"], "slept");
+    let metadata = by_method("pane.report_metadata");
+    assert_eq!(metadata[0]["tokens"]["mw_outcome"], "running");
+    assert_eq!(metadata[1]["tokens"]["mw_outcome"], "done");
+    assert_eq!(metadata[1]["display_agent"], "mac-worker");
+    assert_eq!(by_method("tab.close")[0]["tab_id"], "w9:t2");
+    for request in &requests {
+        let text = request.to_string();
+        for forbidden in [
+            "/Users/",
+            "/private/",
+            "/var/",
+            "/tmp/",
+            "prompt.md",
+            "session-1",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+}
+
+#[test]
+fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home_wrapper() {
+    let temp = tempdir().unwrap();
+    let account_home = temp.path().join("home");
+    let job_home = temp.path().join("job-home");
+    fs::create_dir_all(&account_home).unwrap();
+    fs::create_dir_all(&job_home).unwrap();
+    let server = support::fake_herdr::FakeHerdr::start_in_home(&account_home);
+    queue_herdr_turn_and_close_replies(&server);
+    support::agent_launch_fixture::assert_subprocess_success(
+        "auto_close_done_turn_closes_herdr_tabs_from_the_account_home",
+        &[
+            ("HOME", job_home.to_str().unwrap()),
+            ("MAC_WORKER_ACCOUNT_HOME", account_home.to_str().unwrap()),
+        ],
+        false,
+    );
+    assert_herdr_turn_attached_and_tab_closed(&server);
+}
+
+#[test]
+fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home() {
+    if support::agent_launch_fixture::skip_unless_subtest() {
+        return;
+    }
+    let job_home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    assert!(
+        !job_home.join(".config").join("herdr").exists(),
+        "process HOME during the turn must be the job home, not the account herdr home"
+    );
+    let account_home = PathBuf::from(
+        std::env::var_os("MAC_WORKER_ACCOUNT_HOME").expect("MAC_WORKER_ACCOUNT_HOME"),
+    );
+    assert!(
+        account_home.join(".config").join("herdr").exists(),
+        "MAC_WORKER_ACCOUNT_HOME must point at the account herdr home"
+    );
+
+    let (_temp, store, request, _cancel) =
+        prepared_task_turn_with_close(HERDR_TURN_SCRIPT, ClosePolicy::Done);
+    let status = run_flagged_turn(&store, request);
+
+    assert_eq!(status.state(), TaskState::Closed);
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    let turn = &status.turns()[0];
+    assert_eq!(
+        turn.herdr().map(|report| report.state),
+        Some(mac_worker::task::HerdrTurnState::Attached)
+    );
+    assert_eq!(
+        turn.herdr().and_then(|report| report.pane_id.as_deref()),
+        Some("w9:p2")
+    );
+    let log = fs::read_to_string(
+        store
+            .job(PROJECT_ID, WORKTREE_ID, herdr_turn_job_id())
+            .unwrap()
+            .join("supervisor.log"),
+    )
+    .unwrap_or_default();
+    assert!(
+        !log.contains("herdr reporter"),
+        "an attached turn leaves no reporter diagnostic: {log}"
+    );
 }
 
 fn write_workspace_setup(store: &HostStore, body: &str) {

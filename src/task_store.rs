@@ -2315,15 +2315,28 @@ fn parse_agent(value: &str) -> Result<AgentKind, WorkerError> {
     }
 }
 
+/// Account home for herdr socket resolution when process `HOME` is a job home.
+pub(crate) const MAC_WORKER_ACCOUNT_HOME: &str = "MAC_WORKER_ACCOUNT_HOME";
+
+/// The worker account home herdr listens under. Prefers the additive
+/// `MAC_WORKER_ACCOUNT_HOME` the supervisor injects into a job, then `HOME`.
+pub(crate) fn herdr_account_home() -> Option<PathBuf> {
+    for key in [MAC_WORKER_ACCOUNT_HOME, "HOME"] {
+        if let Some(home) = std::env::var_os(key).filter(|home| !home.is_empty()) {
+            return Some(PathBuf::from(home));
+        }
+    }
+    None
+}
+
 /// Best effort: remove the task's tabs from the worker's herdr.  Called only
 /// for tasks whose record shows a turn was reported, so a worker that never
 /// reported, and every test process, never opens the socket.
 fn close_herdr_tabs(task_id: TaskId) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+    let Some(home) = herdr_account_home() else {
         return;
     };
-    let _ =
-        crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home)).close(task_id);
+    let _ = crate::herdr_reporter::HerdrReporter::for_home(&home).close(task_id);
 }
 
 #[cfg(test)]
