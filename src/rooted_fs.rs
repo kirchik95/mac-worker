@@ -401,6 +401,9 @@ impl Drop for CopyPrivateCleanupFailureOverride {
 enum CleanupFault {
     AfterAcquisitionValidation(libc::c_int),
     AfterCleanupBootstrap(libc::c_int),
+    AfterFindCleanupIntent(libc::c_int),
+    AfterCleanupGenerationFromLoaded(libc::c_int),
+    AfterFindUnpublishedCleanupBootstrap(libc::c_int),
     DuringCleanupCapabilityProbe(usize, libc::c_int),
     AfterCleanupCapabilityProbeSync(libc::c_int),
     AfterCleanupPlaceholderObjectSync(libc::c_int),
@@ -2242,17 +2245,11 @@ impl RootedDir {
             }
             Ok(())
         };
-        let mut bound = None;
         let mut last_race = os_error(libc::ESTALE);
         for _ in 0..32 {
             match validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent) {
                 Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                     continue;
                 }
@@ -2272,163 +2269,215 @@ impl RootedDir {
                     metadata,
                     generation,
                 }) => {
-                    injected_cleanup_bootstrap_result()?;
-                    bound = Some((metadata, generation));
-                    break;
-                }
-                Ok(CleanupInitialSnapshot::Evidence) => {
-                    if let Some(loaded) =
-                        find_cleanup_intent(&namespace, parent, component.to_bytes())?
+                    match injected_cleanup_bootstrap_result() {
+                        Ok(()) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if file_type(metadata.st_mode) != libc::S_IFDIR
+                        || metadata.st_uid != effective_user_id()
+                        || metadata.st_dev != parent_metadata.st_dev
                     {
-                        let target = FileIdentity::from(loaded.intent.target);
-                        let original_mode = loaded.intent.original_mode;
-                        let generation = cleanup_generation_from_loaded(
-                            &namespace,
-                            parent,
-                            component.to_bytes(),
-                            &loaded,
-                        )?;
-                        drop(loaded);
-                        return complete_bound_cleanup(
+                        return Err(os_error(libc::ESTALE));
+                    }
+                    let target_identity = FileIdentity::from_stat(&metadata);
+                    let original_mode = metadata.st_mode as u32 & 0o7777;
+                    let relative = RelativePath::parse(component.to_bytes()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid child component")
+                    })?;
+                    let target = match self.open_child_directory(&relative, false) {
+                        Ok(target) => target,
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                target_identity,
+                                original_mode,
+                                Some(generation.clone()),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Tree,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let opened = match stat_fd(target.root.as_raw_fd()) {
+                        Ok(opened) => opened,
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !same_file(&metadata, &opened)
+                        || opened.st_uid != effective_user_id()
+                        || opened.st_dev != parent_metadata.st_dev
+                        || opened.st_mode as u32 & 0o7777 != original_mode
+                    {
+                        match complete_bound_cleanup(
                             &namespace,
                             self.root.as_raw_fd(),
                             parent,
                             component.to_bytes(),
-                            target,
+                            target_identity,
                             original_mode,
-                            Some(generation),
+                            Some(generation.clone()),
                             &verify_parent,
                             true,
                             CleanupTargetKind::Tree,
                             after_durable_delete,
-                        )
-                        .map(|_| ());
+                        ) {
+                            Ok(_) => return Ok(()),
+                            Err(error) if cleanup_is_missing_target_race(&error) => {
+                                last_race = error;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    if let Some(candidate) = find_unpublished_cleanup_bootstrap(
+                    match publish_tree_cleanup_intent(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        &component,
+                        target_identity,
+                        original_mode,
+                    ) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::EEXIST)
+                                    | Some(libc::EAGAIN)
+                                    | Some(libc::ENOENT)
+                                    | Some(libc::ESTALE)
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match complete_bound_cleanup(
                         &namespace,
                         self.root.as_raw_fd(),
                         parent,
                         component.to_bytes(),
-                    )? {
-                        return complete_bound_cleanup(
-                            &namespace,
-                            self.root.as_raw_fd(),
-                            parent,
-                            component.to_bytes(),
-                            candidate.target,
-                            candidate.original_mode,
-                            Some(candidate.generation),
-                            &verify_parent,
-                            true,
-                            CleanupTargetKind::Tree,
-                            after_durable_delete,
-                        )
-                        .map(|_| ());
+                        target_identity,
+                        original_mode,
+                        Some(generation),
+                        &verify_parent,
+                        true,
+                        CleanupTargetKind::Tree,
+                        after_durable_delete,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error) if cleanup_is_missing_target_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Ok(CleanupInitialSnapshot::Evidence) => {
+                    match find_cleanup_intent(&namespace, parent, component.to_bytes()) {
+                        Ok(Some(loaded)) => {
+                            let target = FileIdentity::from(loaded.intent.target);
+                            let original_mode = loaded.intent.original_mode;
+                            let generation = match cleanup_generation_from_loaded(
+                                &namespace,
+                                parent,
+                                component.to_bytes(),
+                                &loaded,
+                            ) {
+                                Ok(generation) => generation,
+                                Err(error) if cleanup_is_retryable_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            drop(loaded);
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                target,
+                                original_mode,
+                                Some(generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Tree,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    match find_unpublished_cleanup_bootstrap(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        component.to_bytes(),
+                    ) {
+                        Ok(Some(candidate)) => {
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                candidate.target,
+                                candidate.original_mode,
+                                Some(candidate.generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Tree,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                 }
                 Err(error) => return Err(error),
             }
         }
-        let Some((before, initial_generation)) = bound else {
-            return Err(last_race);
-        };
-        if file_type(before.st_mode) != libc::S_IFDIR
-            || before.st_uid != effective_user_id()
-            || before.st_dev != parent_metadata.st_dev
-        {
-            return Err(os_error(libc::ESTALE));
-        }
-        let target_identity = FileIdentity::from_stat(&before);
-        let original_mode = before.st_mode as u32 & 0o7777;
-        let relative = RelativePath::parse(component.to_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid child component"))?;
-        let target = match self.open_child_directory(&relative, false) {
-            Ok(target) => target,
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                ) =>
-            {
-                return complete_bound_cleanup(
-                    &namespace,
-                    self.root.as_raw_fd(),
-                    parent,
-                    component.to_bytes(),
-                    target_identity,
-                    original_mode,
-                    Some(initial_generation.clone()),
-                    &verify_parent,
-                    true,
-                    CleanupTargetKind::Tree,
-                    after_durable_delete,
-                )
-                .map(|_| ());
-            }
-            Err(error) => return Err(error),
-        };
-        let opened = stat_fd(target.root.as_raw_fd())?;
-        if !same_file(&before, &opened)
-            || opened.st_uid != effective_user_id()
-            || opened.st_dev != parent_metadata.st_dev
-            || opened.st_mode as u32 & 0o7777 != original_mode
-        {
-            return complete_bound_cleanup(
-                &namespace,
-                self.root.as_raw_fd(),
-                parent,
-                component.to_bytes(),
-                target_identity,
-                original_mode,
-                Some(initial_generation.clone()),
-                &verify_parent,
-                true,
-                CleanupTargetKind::Tree,
-                after_durable_delete,
-            )
-            .map(|_| ());
-        }
-        match publish_tree_cleanup_intent(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            &component,
-            target_identity,
-            original_mode,
-        ) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EEXIST)
-                        | Some(libc::EAGAIN)
-                        | Some(libc::ENOENT)
-                        | Some(libc::ESTALE)
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        complete_bound_cleanup(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            component.to_bytes(),
-            target_identity,
-            original_mode,
-            Some(initial_generation),
-            &verify_parent,
-            true,
-            CleanupTargetKind::Tree,
-            after_durable_delete,
-        )
-        .map(|_| ())
+        Err(last_race)
     }
 
     pub(crate) fn resume_pending_owned_child_cleanup(&self, name: &str) -> io::Result<bool> {
@@ -2832,17 +2881,11 @@ impl RootedDir {
             }
             Ok(())
         };
-        let mut bound = None;
         let mut last_race = os_error(libc::ESTALE);
         for _ in 0..32 {
             match validate_cleanup_namespace_evidence(&namespace, self.root.as_raw_fd(), parent) {
                 Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                     continue;
                 }
@@ -2862,177 +2905,228 @@ impl RootedDir {
                     metadata,
                     generation,
                 }) => {
-                    injected_cleanup_bootstrap_result()?;
-                    bound = Some((metadata, generation));
-                    break;
-                }
-                Ok(CleanupInitialSnapshot::Evidence) => {
-                    if let Some(loaded) =
-                        find_cleanup_intent(&namespace, parent, component.to_bytes())?
-                    {
-                        if loaded.intent.kind != CleanupTargetKind::Regular {
-                            return Err(os_error(libc::ESTALE));
+                    match injected_cleanup_bootstrap_result() {
+                        Ok(()) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
                         }
-                        let target = FileIdentity::from(loaded.intent.target);
-                        let original_mode = loaded.intent.original_mode;
-                        let generation = cleanup_generation_from_loaded(
-                            &namespace,
-                            parent,
-                            component.to_bytes(),
-                            &loaded,
-                        )?;
-                        drop(loaded);
-                        return complete_bound_cleanup(
+                        Err(error) => return Err(error),
+                    }
+                    if !cleanup_public_target_matches(
+                        &metadata,
+                        parent_metadata.st_dev as u64,
+                        CleanupTargetKind::Regular,
+                    ) {
+                        return Err(os_error(libc::ESTALE));
+                    }
+                    let target_identity = FileIdentity::from_stat(&metadata);
+                    let original_mode = metadata.st_mode as u32 & 0o7777;
+                    let file = match open_bound_cleanup_regular(
+                        self.root.as_raw_fd(),
+                        &component,
+                        target_identity,
+                        parent.device,
+                        original_mode,
+                    ) {
+                        Ok(file) => file,
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                target_identity,
+                                original_mode,
+                                Some(generation.clone()),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Regular,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let opened = match stat_fd(file.as_raw_fd()) {
+                        Ok(opened) => opened,
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !same_file(&metadata, &opened)
+                        || opened.st_uid != effective_user_id()
+                        || opened.st_dev != parent_metadata.st_dev
+                        || opened.st_nlink != 1
+                        || opened.st_mode as u32 & 0o7777 != original_mode
+                    {
+                        match complete_bound_cleanup(
                             &namespace,
                             self.root.as_raw_fd(),
                             parent,
                             component.to_bytes(),
-                            target,
+                            target_identity,
                             original_mode,
-                            Some(generation),
+                            Some(generation.clone()),
                             &verify_parent,
                             true,
                             CleanupTargetKind::Regular,
                             after_durable_delete,
-                        )
-                        .map(|_| ());
+                        ) {
+                            Ok(_) => return Ok(()),
+                            Err(error) if cleanup_is_missing_target_race(&error) => {
+                                last_race = error;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    if let Some(candidate) = find_unpublished_cleanup_bootstrap(
+                    drop(file);
+                    match publish_cleanup_intent(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        &component,
+                        target_identity,
+                        original_mode,
+                        CleanupTargetKind::Regular,
+                    ) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::EEXIST)
+                                    | Some(libc::EAGAIN)
+                                    | Some(libc::ENOENT)
+                                    | Some(libc::ESTALE)
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match complete_bound_cleanup(
                         &namespace,
                         self.root.as_raw_fd(),
                         parent,
                         component.to_bytes(),
-                    )? {
-                        if candidate.kind != CleanupTargetKind::Regular {
-                            return Err(os_error(libc::ESTALE));
+                        target_identity,
+                        original_mode,
+                        Some(generation),
+                        &verify_parent,
+                        true,
+                        CleanupTargetKind::Regular,
+                        after_durable_delete,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error) if cleanup_is_missing_target_race(&error) => {
+                            last_race = error;
+                            continue;
                         }
-                        return complete_bound_cleanup(
-                            &namespace,
-                            self.root.as_raw_fd(),
-                            parent,
-                            component.to_bytes(),
-                            candidate.target,
-                            candidate.original_mode,
-                            Some(candidate.generation),
-                            &verify_parent,
-                            true,
-                            CleanupTargetKind::Regular,
-                            after_durable_delete,
-                        )
-                        .map(|_| ());
+                        Err(error) => return Err(error),
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Ok(CleanupInitialSnapshot::Evidence) => {
+                    match find_cleanup_intent(&namespace, parent, component.to_bytes()) {
+                        Ok(Some(loaded)) => {
+                            if loaded.intent.kind != CleanupTargetKind::Regular {
+                                return Err(os_error(libc::ESTALE));
+                            }
+                            let target = FileIdentity::from(loaded.intent.target);
+                            let original_mode = loaded.intent.original_mode;
+                            let generation = match cleanup_generation_from_loaded(
+                                &namespace,
+                                parent,
+                                component.to_bytes(),
+                                &loaded,
+                            ) {
+                                Ok(generation) => generation,
+                                Err(error) if cleanup_is_retryable_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            drop(loaded);
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                target,
+                                original_mode,
+                                Some(generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Regular,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    match find_unpublished_cleanup_bootstrap(
+                        &namespace,
+                        self.root.as_raw_fd(),
+                        parent,
+                        component.to_bytes(),
+                    ) {
+                        Ok(Some(candidate)) => {
+                            if candidate.kind != CleanupTargetKind::Regular {
+                                return Err(os_error(libc::ESTALE));
+                            }
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.root.as_raw_fd(),
+                                parent,
+                                component.to_bytes(),
+                                candidate.target,
+                                candidate.original_mode,
+                                Some(candidate.generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Regular,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                 }
                 Err(error) => return Err(error),
             }
         }
-        let Some((before, initial_generation)) = bound else {
-            return Err(last_race);
-        };
-        if !cleanup_public_target_matches(
-            &before,
-            parent_metadata.st_dev as u64,
-            CleanupTargetKind::Regular,
-        ) {
-            return Err(os_error(libc::ESTALE));
-        }
-        let target_identity = FileIdentity::from_stat(&before);
-        let original_mode = before.st_mode as u32 & 0o7777;
-        let file = match open_bound_cleanup_regular(
-            self.root.as_raw_fd(),
-            &component,
-            target_identity,
-            parent.device,
-            original_mode,
-        ) {
-            Ok(file) => file,
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                ) =>
-            {
-                return complete_bound_cleanup(
-                    &namespace,
-                    self.root.as_raw_fd(),
-                    parent,
-                    component.to_bytes(),
-                    target_identity,
-                    original_mode,
-                    Some(initial_generation.clone()),
-                    &verify_parent,
-                    true,
-                    CleanupTargetKind::Regular,
-                    after_durable_delete,
-                )
-                .map(|_| ());
-            }
-            Err(error) => return Err(error),
-        };
-        let opened = stat_fd(file.as_raw_fd())?;
-        if !same_file(&before, &opened)
-            || opened.st_uid != effective_user_id()
-            || opened.st_dev != parent_metadata.st_dev
-            || opened.st_nlink != 1
-            || opened.st_mode as u32 & 0o7777 != original_mode
-        {
-            return complete_bound_cleanup(
-                &namespace,
-                self.root.as_raw_fd(),
-                parent,
-                component.to_bytes(),
-                target_identity,
-                original_mode,
-                Some(initial_generation.clone()),
-                &verify_parent,
-                true,
-                CleanupTargetKind::Regular,
-                after_durable_delete,
-            )
-            .map(|_| ());
-        }
-        drop(file);
-        match publish_cleanup_intent(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            &component,
-            target_identity,
-            original_mode,
-            CleanupTargetKind::Regular,
-        ) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EEXIST)
-                        | Some(libc::EAGAIN)
-                        | Some(libc::ENOENT)
-                        | Some(libc::ESTALE)
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        complete_bound_cleanup(
-            &namespace,
-            self.root.as_raw_fd(),
-            parent,
-            component.to_bytes(),
-            target_identity,
-            original_mode,
-            Some(initial_generation),
-            &verify_parent,
-            true,
-            CleanupTargetKind::Regular,
-            after_durable_delete,
-        )
-        .map(|_| ())
+        Err(last_race)
     }
 
     pub(crate) fn publish_owned_into(
@@ -3565,17 +3659,11 @@ impl RootedDir {
             }
             verify_lineage(&self.lineage)
         };
-        let mut bound = None;
         let mut last_race = os_error(libc::ESTALE);
         for _ in 0..32 {
             match validate_cleanup_namespace_evidence(&namespace, self.parent.as_raw_fd(), parent) {
                 Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                     continue;
                 }
@@ -3595,118 +3683,162 @@ impl RootedDir {
                     metadata,
                     generation,
                 }) => {
-                    injected_cleanup_bootstrap_result()?;
-                    bound = Some((metadata, generation));
-                    break;
-                }
-                Ok(CleanupInitialSnapshot::Evidence) => {
-                    if let Some(loaded) =
-                        find_cleanup_intent(&namespace, parent, self.root_name.to_bytes())?
-                    {
-                        let target = FileIdentity::from(loaded.intent.target);
-                        let original_mode = loaded.intent.original_mode;
-                        let generation = cleanup_generation_from_loaded(
-                            &namespace,
-                            parent,
-                            self.root_name.to_bytes(),
-                            &loaded,
-                        )?;
-                        drop(loaded);
-                        return complete_bound_cleanup(
-                            &namespace,
-                            self.parent.as_raw_fd(),
-                            parent,
-                            self.root_name.to_bytes(),
-                            target,
-                            original_mode,
-                            Some(generation),
-                            &verify_parent,
-                            true,
-                            CleanupTargetKind::Tree,
-                            after_durable_delete,
-                        )
-                        .map(|_| ());
+                    match injected_cleanup_bootstrap_result() {
+                        Ok(()) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    if let Some(candidate) = find_unpublished_cleanup_bootstrap(
+                    let opened = match stat_fd(self.root.as_raw_fd()) {
+                        Ok(opened) => opened,
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let original_mode = metadata.st_mode as u32 & 0o7777;
+                    if file_type(metadata.st_mode) != libc::S_IFDIR
+                        || metadata.st_uid != effective_user_id()
+                        || opened.st_uid != effective_user_id()
+                        || !same_file(&metadata, &opened)
+                        || FileIdentity::from_stat(&opened) != self.root_identity
+                        || opened.st_mode as u32 & 0o7777 != original_mode
+                    {
+                        return Err(os_error(libc::ESTALE));
+                    }
+                    match publish_tree_cleanup_intent(
+                        &namespace,
+                        self.parent.as_raw_fd(),
+                        parent,
+                        &self.root_name,
+                        self.root_identity,
+                        original_mode,
+                    ) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::EEXIST)
+                                    | Some(libc::EAGAIN)
+                                    | Some(libc::ENOENT)
+                                    | Some(libc::ESTALE)
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match complete_bound_cleanup(
                         &namespace,
                         self.parent.as_raw_fd(),
                         parent,
                         self.root_name.to_bytes(),
-                    )? {
-                        return complete_bound_cleanup(
-                            &namespace,
-                            self.parent.as_raw_fd(),
-                            parent,
-                            self.root_name.to_bytes(),
-                            candidate.target,
-                            candidate.original_mode,
-                            Some(candidate.generation),
-                            &verify_parent,
-                            true,
-                            CleanupTargetKind::Tree,
-                            after_durable_delete,
-                        )
-                        .map(|_| ());
+                        self.root_identity,
+                        original_mode,
+                        Some(generation),
+                        &verify_parent,
+                        true,
+                        CleanupTargetKind::Tree,
+                        after_durable_delete,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error) if cleanup_is_missing_target_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
-                    ) =>
-                {
+                Ok(CleanupInitialSnapshot::Evidence) => {
+                    match find_cleanup_intent(&namespace, parent, self.root_name.to_bytes()) {
+                        Ok(Some(loaded)) => {
+                            let target = FileIdentity::from(loaded.intent.target);
+                            let original_mode = loaded.intent.original_mode;
+                            let generation = match cleanup_generation_from_loaded(
+                                &namespace,
+                                parent,
+                                self.root_name.to_bytes(),
+                                &loaded,
+                            ) {
+                                Ok(generation) => generation,
+                                Err(error) if cleanup_is_retryable_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            drop(loaded);
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.parent.as_raw_fd(),
+                                parent,
+                                self.root_name.to_bytes(),
+                                target,
+                                original_mode,
+                                Some(generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Tree,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    match find_unpublished_cleanup_bootstrap(
+                        &namespace,
+                        self.parent.as_raw_fd(),
+                        parent,
+                        self.root_name.to_bytes(),
+                    ) {
+                        Ok(Some(candidate)) => {
+                            match complete_bound_cleanup(
+                                &namespace,
+                                self.parent.as_raw_fd(),
+                                parent,
+                                self.root_name.to_bytes(),
+                                candidate.target,
+                                candidate.original_mode,
+                                Some(candidate.generation),
+                                &verify_parent,
+                                true,
+                                CleanupTargetKind::Tree,
+                                after_durable_delete,
+                            ) {
+                                Ok(_) => return Ok(()),
+                                Err(error) if cleanup_is_missing_target_race(&error) => {
+                                    last_race = error;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if cleanup_is_retryable_race(&error) => {
+                            last_race = error;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if cleanup_is_retryable_race(&error) => {
                     last_race = error;
                 }
                 Err(error) => return Err(error),
             }
         }
-        let Some((current, initial_generation)) = bound else {
-            return Err(last_race);
-        };
-        let opened = stat_fd(self.root.as_raw_fd())?;
-        let original_mode = current.st_mode as u32 & 0o7777;
-        if file_type(current.st_mode) != libc::S_IFDIR
-            || current.st_uid != effective_user_id()
-            || opened.st_uid != effective_user_id()
-            || !same_file(&current, &opened)
-            || FileIdentity::from_stat(&opened) != self.root_identity
-            || opened.st_mode as u32 & 0o7777 != original_mode
-        {
-            return Err(os_error(libc::ESTALE));
-        }
-        match publish_tree_cleanup_intent(
-            &namespace,
-            self.parent.as_raw_fd(),
-            parent,
-            &self.root_name,
-            self.root_identity,
-            original_mode,
-        ) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EEXIST)
-                        | Some(libc::EAGAIN)
-                        | Some(libc::ENOENT)
-                        | Some(libc::ESTALE)
-                ) => {}
-            Err(error) => return Err(error),
-        }
-        complete_bound_cleanup(
-            &namespace,
-            self.parent.as_raw_fd(),
-            parent,
-            self.root_name.to_bytes(),
-            self.root_identity,
-            original_mode,
-            Some(initial_generation),
-            &verify_parent,
-            true,
-            CleanupTargetKind::Tree,
-            after_durable_delete,
-        )
-        .map(|_| ())
+        Err(last_race)
     }
 
     #[cfg(test)]
@@ -6777,6 +6909,7 @@ fn cleanup_generation_from_loaded(
     component: &[u8],
     loaded: &LoadedCleanupIntent,
 ) -> io::Result<CleanupGenerationFence> {
+    injected_cleanup_generation_from_loaded_result()?;
     let bindings = validate_cleanup_intent(&loaded.intent, parent, component, namespace)?;
     Ok(CleanupGenerationFence {
         intent: Some(loaded.identity),
@@ -6801,6 +6934,7 @@ fn find_cleanup_intent(
     parent: FileIdentity,
     component: &[u8],
 ) -> io::Result<Option<LoadedCleanupIntent>> {
+    injected_cleanup_find_intent_result()?;
     let key = cleanup_key(parent, component);
     let intent_name = cleanup_intent_name(&key)?;
     for _ in 0..32 {
@@ -7092,6 +7226,20 @@ fn wait_for_live_private_operation(namespace: &PrivateNamespace, name: &CStr) ->
         Ok(_) => Err(os_error(libc::ESTALE)),
         Err(error) => Err(error),
     }
+}
+
+fn cleanup_is_retryable_race(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOENT) | Some(libc::ESTALE)
+    )
+}
+
+fn cleanup_is_missing_target_race(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::ENOENT)
+    )
 }
 
 fn validate_cleanup_namespace_evidence(
@@ -8051,6 +8199,7 @@ fn find_unpublished_cleanup_bootstrap(
     parent: FileIdentity,
     component: &[u8],
 ) -> io::Result<Option<PendingTreeCleanupCandidate>> {
+    injected_cleanup_find_unpublished_bootstrap_result()?;
     let key = cleanup_key(parent, component);
     let slots = cleanup_bootstrap_slots(namespace, &key)?;
     if slots.len() > 1 {
@@ -11075,6 +11224,39 @@ fn injected_cleanup_bootstrap_result() -> io::Result<()> {
         }
         Ok(())
     })?;
+    Ok(())
+}
+
+fn injected_cleanup_find_intent_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterFindCleanupIntent(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_generation_from_loaded_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterCleanupGenerationFromLoaded(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
+    Ok(())
+}
+
+fn injected_cleanup_find_unpublished_bootstrap_result() -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(CleanupFault::AfterFindUnpublishedCleanupBootstrap(errno)) =
+        TEST_CLEANUP_FAULT.with(std::cell::Cell::get)
+    {
+        TEST_CLEANUP_FAULT.set(None);
+        return Err(os_error(errno));
+    }
     Ok(())
 }
 
@@ -16903,6 +17085,123 @@ mod tests {
                 result.unwrap_or_else(|error| panic!("iteration {iteration}: {error:?}"));
             }
         }
+    }
+
+    fn owned_child_tree_cleanup_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = physical.join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root_path.join("value"), b"owned").unwrap();
+        (fixture, physical, root_path)
+    }
+
+    fn interrupt_owned_child_tree_cleanup(physical: &Path, fault: CleanupFault) {
+        let parent = RootedDir::open(physical).unwrap();
+        let fault = CleanupFaultOverride::set(fault);
+        assert_eq!(
+            parent
+                .remove_owned_child("root")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        drop(fault);
+    }
+
+    fn assert_leaderless_retrier_converges_after_peer_progress_fault(
+        physical: &Path,
+        root_path: &Path,
+        fault: CleanupFault,
+    ) {
+        let parent = RootedDir::open(physical).unwrap();
+        let _fault = CleanupFaultOverride::set(fault);
+        parent.remove_owned_child_inner("root").unwrap();
+        assert!(!root_path.exists());
+        assert_eq!(
+            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_bound_bootstrap_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::AfterCleanupBootstrap(libc::ENOENT),
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_find_cleanup_intent_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        interrupt_owned_child_tree_cleanup(
+            &physical,
+            CleanupFault::AfterCleanupBootstrap(libc::EIO),
+        );
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::AfterFindCleanupIntent(libc::ENOENT),
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_cleanup_generation_from_loaded_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        interrupt_owned_child_tree_cleanup(
+            &physical,
+            CleanupFault::AfterCleanupIntentPublish(libc::EIO),
+        );
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::AfterCleanupGenerationFromLoaded(libc::ENOENT),
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_complete_bound_cleanup_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        interrupt_owned_child_tree_cleanup(
+            &physical,
+            CleanupFault::AfterCleanupBootstrap(libc::EIO),
+        );
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::BeforeBoundCompletion(libc::ENOENT),
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_bound_complete_bound_cleanup_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::BeforeBoundCompletion(libc::ENOENT),
+        );
+    }
+
+    #[test]
+    fn cleanup_retrier_converges_when_find_unpublished_bootstrap_reports_enoent() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        interrupt_owned_child_tree_cleanup(
+            &physical,
+            CleanupFault::AfterCleanupBootstrap(libc::EIO),
+        );
+        assert_leaderless_retrier_converges_after_peer_progress_fault(
+            &physical,
+            &root_path,
+            CleanupFault::AfterFindUnpublishedCleanupBootstrap(libc::ENOENT),
+        );
     }
 
     #[test]
