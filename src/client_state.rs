@@ -2076,6 +2076,21 @@ impl ClientStateStore {
         publish_observation(self.inner.observations.as_raw_fd(), worker, &bytes, self)
     }
 
+    /// Drops the cached admission row for `worker` after this laptop releases
+    /// a lease it holds. Occupancy snapshots stay reusable within TTL until
+    /// this call; a local release does not age the row on its own.
+    pub fn invalidate_admission_observation(&self, worker: &str) -> Result<(), WorkerError> {
+        validate_state_worker_name(worker)?;
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let name = observation_record_name(worker)?;
+        match unlink_at(self.inner.observations.as_raw_fd(), &name, 0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+        sync_directory(self.inner.observations.as_raw_fd())
+    }
+
     pub(crate) fn peek_admission_observation(
         &self,
         worker: &str,

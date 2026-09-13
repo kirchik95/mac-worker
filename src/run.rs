@@ -874,6 +874,8 @@ impl<'a> CancelService<'a> {
     ) -> Result<(), WorkerError> {
         let status = normalize_authoritative_status(record, response.status().clone())?;
         let persisted = persist_authoritative(self.client_state, record, status)?;
+        self.client_state
+            .invalidate_admission_observation(persisted.meta().worker_name())?;
         if let Some(owner) = dispatch_owner {
             if !persisted
                 .last_status()

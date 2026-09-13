@@ -1265,6 +1265,7 @@ fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
     runner
         .abandon_and_release(first.report.job_id)
         .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    store.invalidate_admission_observation("mini-a").unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
     assert_eq!(
         LeaseService::new(&host)
@@ -1284,6 +1285,144 @@ fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
                 &mut Vec::new(),
             )
             .unwrap_or_else(|error| panic!("fourth production dispatch failed: {error}"));
+    assert_eq!(runner.accepted_jobs().len(), 3);
+    let occupied = LeaseService::new(&host).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 2);
+    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
+    assert!(live.contains(&second.report.job_id));
+    assert!(live.contains(&fourth.report.job_id));
+    assert!(!live.contains(&first.report.job_id));
+}
+
+struct FrozenAdmissionRuntime {
+    now_millis: AtomicU64,
+    owner: ProcessIdentity,
+}
+
+impl FrozenAdmissionRuntime {
+    fn new() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock predates Unix epoch")
+            .as_millis() as u64;
+        let owner = SystemProcessInspector
+            .identity_for_pid(std::process::id())
+            .expect("admission clock must match the live client-state inspector");
+        Self {
+            now_millis: AtomicU64::new(now),
+            owner,
+        }
+    }
+
+    fn expire_observation_ttl(&self) {
+        self.now_millis.fetch_add(3_000, Ordering::SeqCst);
+    }
+}
+
+impl SchedulerRuntime for FrozenAdmissionRuntime {
+    fn now_millis(&self) -> Result<u64, WorkerError> {
+        Ok(self.now_millis.load(Ordering::SeqCst))
+    }
+
+    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
+        Ok(self.owner)
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        panic!("no-wait production dispatch must not sleep on capacity");
+    }
+}
+
+fn submit_two_slot_with_runtime(
+    runner: &ProductionLeaseRunner,
+    config: &Config,
+    paths: &PathLayout,
+    store: &ClientStateStore,
+    repo: &GitRepo,
+    runtime: &dyn SchedulerRuntime,
+    command: &'static str,
+) -> Result<RunCompletion, WorkerError> {
+    RunService::with_follower(runner, config, paths, store, &SuccessfulRunFollower)
+        .with_scheduler_runtime(runtime)
+        .submit_and_follow(
+            production_run_request_with(repo, false, command),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+}
+
+/// Mechanism: after the third dispatch probes a full two-slot host, the
+/// advisory cache keeps that Ready+Busy `AdmissionObservation` reusable for
+/// `OBSERVATION_TTL_MILLIS`. A local lease release does not age the row, so
+/// the fourth dispatch reused the saturated observation and returned
+/// `CAPACITY_BUSY` even though the lease store already showed a free slot.
+/// Invalidating the worker's observation on local release makes the freed
+/// slot visible without waiting for TTL.
+#[test]
+fn fourth_production_dispatch_reprobes_after_local_release_within_observation_ttl() {
+    let repo = production_run_repo();
+    let temp = tempfile::tempdir().unwrap();
+    let paths = production_run_paths(&temp);
+    let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    LeaseService::new(&host).set_slot_count(2).unwrap();
+    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
+    let config = production_run_config_with_slots(2);
+    let runtime = FrozenAdmissionRuntime::new();
+    let first = submit_two_slot_with_runtime(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        &runtime,
+        "scheduler-ttl-first",
+    )
+    .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
+    let second = submit_two_slot_with_runtime(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        &runtime,
+        "scheduler-ttl-second",
+    )
+    .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
+    assert_ne!(first.report.job_id, second.report.job_id);
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+
+    runtime.expire_observation_ttl();
+    let third = submit_two_slot_with_runtime(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        &runtime,
+        "scheduler-ttl-third",
+    )
+    .expect_err("third production dispatch must see a full host");
+    assert_eq!(third.public_code(), "CAPACITY_BUSY");
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+
+    runner
+        .abandon_and_release(first.report.job_id)
+        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    store.invalidate_admission_observation("mini-a").unwrap();
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
+
+    let fourth = submit_two_slot_with_runtime(
+        &runner,
+        &config,
+        &paths,
+        &store,
+        &repo,
+        &runtime,
+        "scheduler-ttl-fourth",
+    )
+    .unwrap_or_else(|error| panic!("fourth production dispatch failed: {error}"));
     assert_eq!(runner.accepted_jobs().len(), 3);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
     assert_eq!(occupied.len(), 2);
@@ -1416,6 +1555,7 @@ fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
     runner
         .abandon_and_release(first.report.job_id)
         .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    store.invalidate_admission_observation("mini-a").unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
     let after_release = wait_path_diagnostics("after-release", &store, &host, &runner, &config);
     eprintln!("{after_release}");

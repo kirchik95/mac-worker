@@ -1048,6 +1048,27 @@ mod tests {
         )
     }
 
+    fn bound_saturated(entry: &WorkerEntry, at: u64) -> AdmissionObservation {
+        AdmissionObservation::new(
+            entry.name.clone(),
+            true,
+            CandidateSlot::Busy,
+            vec!["darwin-arm64".into(), "agent:codex".into()],
+            Some(10),
+            20,
+            at,
+        )
+        .unwrap()
+        .with_local_binding(
+            entry.ssh.clone(),
+            entry.remote_binary.clone(),
+            entry.capabilities.clone(),
+            entry.slots,
+            Some(0),
+            at,
+        )
+    }
+
     fn now() -> u64 {
         now_millis().unwrap()
     }
@@ -1163,6 +1184,44 @@ mod tests {
             observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
         assert!(runner.probes.lock().unwrap().is_empty());
         assert!(!ranked[0].ready());
+    }
+
+    /// Mechanism: `reusable_for_admission` keeps a still-fresh Ready+Busy
+    /// row as a hit. A local lease release must drop that row, or the next
+    /// round skips SSH and keeps reporting a full host.
+    #[test]
+    fn local_release_invalidates_a_saturated_observation_within_ttl() {
+        let (_dir, store) = temp_store();
+        let mini1 = worker("mini-1", "mac1");
+        let config = config(vec![mini1.clone()]);
+        store
+            .publish_admission_observation(bound_saturated(&mini1, now()))
+            .unwrap();
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", 0);
+        let cached =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert!(
+            runner.probes.lock().unwrap().is_empty(),
+            "fresh saturated occupancy must stay on the TTL fast path until a local release"
+        );
+        assert_eq!(cached[0].slot(), CandidateSlot::Busy);
+
+        store.invalidate_admission_observation("mini-1").unwrap();
+        let ranked =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert!(
+            runner
+                .probes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ssh| ssh == "mac1"),
+            "local release must force a probe, probes={:?}",
+            runner.probes.lock().unwrap()
+        );
+        assert!(ranked[0].ready());
+        assert_eq!(ranked[0].slot(), CandidateSlot::Idle);
     }
 
     #[test]

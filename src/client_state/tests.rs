@@ -5,6 +5,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits},
+    scheduler::CandidateSlot,
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
     },
@@ -297,4 +298,102 @@ fn runner_identity_verdict_treats_ambiguous_as_unverifiable() {
         store.runner_identity_verdict(identity),
         RunnerLivenessVerdict::Unverifiable
     );
+}
+
+#[test]
+fn admission_observation_refreshes_after_local_release_invalidation() {
+    let (_dir, store, _) = open_store();
+    store
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Busy,
+                vec!["darwin-arm64".into()],
+                Some(10),
+                20,
+                1_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut refreshed = false;
+    store
+        .admission_observation("mini-1", 1_000, || {
+            refreshed = true;
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["darwin-arm64".into()],
+                Some(10),
+                20,
+                1_000,
+            )
+        })
+        .unwrap();
+    assert!(
+        !refreshed,
+        "fresh saturated occupancy must stay on the advisory fast path until a local release"
+    );
+
+    store.invalidate_admission_observation("mini-1").unwrap();
+    let cached = store
+        .admission_observation("mini-1", 1_000, || {
+            refreshed = true;
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["darwin-arm64".into()],
+                Some(10),
+                20,
+                1_000,
+            )
+        })
+        .unwrap();
+    assert!(
+        refreshed,
+        "local release must drop the saturated observation so the next dispatch probes"
+    );
+    assert_eq!(cached.observation().slot(), CandidateSlot::Idle);
+}
+
+#[test]
+fn admission_observation_reuses_fresh_idle_occupancy() {
+    let (_dir, store, _) = open_store();
+    store
+        .publish_admission_observation(
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["darwin-arm64".into()],
+                Some(10),
+                20,
+                1_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut refreshed = false;
+    let cached = store
+        .admission_observation("mini-1", 1_000, || {
+            refreshed = true;
+            AdmissionObservation::new(
+                "mini-1".into(),
+                true,
+                CandidateSlot::Busy,
+                vec!["darwin-arm64".into()],
+                Some(10),
+                20,
+                1_000,
+            )
+        })
+        .unwrap();
+    assert!(
+        !refreshed,
+        "fresh Idle occupancy must stay on the advisory fast path"
+    );
+    assert_eq!(cached.observation().slot(), CandidateSlot::Idle);
 }
