@@ -638,13 +638,76 @@ fn require_absent_group(
     runtime: &dyn ReconciliationRuntime,
     process_group: u32,
 ) -> Result<(), WorkerError> {
-    if runtime.observe_group(process_group) == ProcessGroupObservation::Absent {
-        Ok(())
-    } else {
-        Err(reconciliation_ambiguous(
-            "child leader is absent but its exact process group is not proven absent",
-        ))
+    match runtime.observe_group(process_group) {
+        ProcessGroupObservation::Absent => Ok(()),
+        ProcessGroupObservation::Present => drain_leaderless_group(runtime, process_group),
+        ProcessGroupObservation::Ambiguous => Err(group_not_proven_absent()),
     }
+}
+
+fn drain_leaderless_group(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+) -> Result<(), WorkerError> {
+    runtime.signal_process_group(process_group, libc::SIGTERM)?;
+    if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Term)? {
+        return Ok(());
+    }
+    runtime.signal_process_group(process_group, libc::SIGKILL)?;
+    if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Kill)? {
+        return Ok(());
+    }
+    Err(reconciliation_ambiguous(
+        "child leader is absent but its exact process group is not proven absent after TERM/KILL grace",
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum DrainPhase {
+    Term,
+    Kill,
+}
+
+impl DrainPhase {
+    fn overflow_message(self) -> &'static str {
+        match self {
+            Self::Term => "TERM grace deadline overflowed",
+            Self::Kill => "KILL grace deadline overflowed",
+        }
+    }
+}
+
+fn poll_leaderless_group_absent(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+    phase: DrainPhase,
+) -> Result<bool, WorkerError> {
+    let deadline = runtime
+        .monotonic_now()
+        .checked_add(TERM_GRACE)
+        .ok_or_else(|| reconciliation_ambiguous(phase.overflow_message()))?;
+    loop {
+        match runtime.observe_group(process_group) {
+            ProcessGroupObservation::Absent => return Ok(true),
+            ProcessGroupObservation::Present => {
+                let now = runtime.monotonic_now();
+                let Some(remaining) = deadline
+                    .checked_sub(now)
+                    .filter(|remaining| !remaining.is_zero())
+                else {
+                    return Ok(false);
+                };
+                runtime.sleep(POLL_INTERVAL.min(remaining));
+            }
+            ProcessGroupObservation::Ambiguous => return Err(group_not_proven_absent()),
+        }
+    }
+}
+
+fn group_not_proven_absent() -> WorkerError {
+    reconciliation_ambiguous(
+        "child leader is absent but its exact process group is not proven absent",
+    )
 }
 
 fn prove_killed_group_absent(
@@ -4625,6 +4688,7 @@ fn prepare_turn_executable() -> Result<PathBuf, WorkerError> {
 mod tests {
     use super::*;
     use std::{
+        collections::VecDeque,
         fs::{self, OpenOptions},
         os::unix::{ffi::OsStringExt, process::CommandExt},
         process::{Command, Stdio},
@@ -7104,5 +7168,214 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         validate_null_stdio([null_stat, null_stat, null_stat], null_stat).unwrap();
         assert!(validate_null_stdio([zero_stat, zero_stat, zero_stat], null_stat).is_err());
+    }
+
+    struct ScriptedReconciliationRuntime {
+        process: Mutex<VecDeque<ProcessObservation>>,
+        groups: Mutex<VecDeque<ProcessGroupObservation>>,
+        signals: Mutex<Vec<(u32, i32)>>,
+        sleeps: Mutex<Vec<Duration>>,
+        now: Mutex<Duration>,
+        clock: Mutex<Option<VecDeque<Duration>>>,
+    }
+
+    impl ScriptedReconciliationRuntime {
+        fn new(
+            process: impl IntoIterator<Item = ProcessObservation>,
+            groups: impl IntoIterator<Item = ProcessGroupObservation>,
+        ) -> Self {
+            Self {
+                process: Mutex::new(process.into_iter().collect()),
+                groups: Mutex::new(groups.into_iter().collect()),
+                signals: Mutex::new(Vec::new()),
+                sleeps: Mutex::new(Vec::new()),
+                now: Mutex::new(Duration::ZERO),
+                clock: Mutex::new(None),
+            }
+        }
+
+        fn with_clock(self, clock: impl IntoIterator<Item = Duration>) -> Self {
+            *self.clock.lock().unwrap() = Some(clock.into_iter().collect());
+            self
+        }
+
+        fn signals(&self) -> Vec<(u32, i32)> {
+            self.signals.lock().unwrap().clone()
+        }
+
+        fn sleeps(&self) -> Vec<Duration> {
+            self.sleeps.lock().unwrap().clone()
+        }
+
+        fn simulated_wait(&self) -> Duration {
+            self.sleeps().into_iter().sum()
+        }
+    }
+
+    impl ProcessInspector for ScriptedReconciliationRuntime {
+        fn identity_for_pid(&self, _pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            panic!("recorded-group termination must never derive a new process identity")
+        }
+
+        fn observe(&self, _expected: ProcessIdentity) -> ProcessObservation {
+            self.process
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected process observation")
+        }
+
+        fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+            self.groups
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected process-group observation")
+        }
+
+        fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+            panic!("recorded-group termination must not use parent wait anchors")
+        }
+    }
+
+    impl ReconciliationRuntime for ScriptedReconciliationRuntime {
+        fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
+            self.signals.lock().unwrap().push((process_group, signal));
+            Ok(())
+        }
+
+        fn monotonic_now(&self) -> Duration {
+            if let Some(clock) = self.clock.lock().unwrap().as_mut() {
+                return clock.pop_front().expect("unexpected monotonic clock read");
+            }
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+            *self.now.lock().unwrap() += duration;
+        }
+    }
+
+    fn recorded_child() -> ProcessIdentity {
+        ProcessIdentity::new(42_001, 42_001_000).unwrap()
+    }
+
+    #[test]
+    fn leaderless_group_absent_on_first_sample_is_a_clean_exit() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [ProcessGroupObservation::Absent],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn leaderless_group_drains_after_term_without_kill() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn leaderless_group_drains_after_kill_within_double_term_grace() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        )
+        .with_clock([Duration::ZERO, TERM_GRACE, TERM_GRACE]);
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+        );
+        assert!(
+            runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE,
+            "simulated wait {:?} exceeded 2 × TERM_GRACE",
+            runtime.simulated_wait()
+        );
+    }
+
+    #[test]
+    fn leaderless_group_that_never_drains_is_ambiguous_after_term_kill_grace() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+            ],
+        )
+        .with_clock([
+            Duration::ZERO,
+            TERM_GRACE,
+            TERM_GRACE,
+            TERM_GRACE + TERM_GRACE,
+        ]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("RECONCILIATION_AMBIGUOUS"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("child leader is absent but its exact process group is not proven absent after TERM/KILL grace"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+        );
+    }
+
+    #[test]
+    fn live_leader_exit_during_term_grace_drains_remaining_group() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGTERM)]
+        );
+        assert_eq!(runtime.sleeps(), vec![TERM_GRACE]);
     }
 }
