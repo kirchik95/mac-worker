@@ -1305,8 +1305,14 @@ fn run_task_subcommand(
             Ok(0)
         }
         TaskCommand::PublishRetry { task_id } => {
-            let deliveries = client.publish_retry(task_id)?;
-            write_publish_retry_report(task_id, &deliveries, json, stdout)?;
+            let report = client.publish_retry(task_id)?;
+            write_publish_retry_report(
+                task_id,
+                report.deliveries(),
+                report.warnings(),
+                json,
+                stdout,
+            )?;
             Ok(0)
         }
         TaskCommand::Wait {
@@ -1560,19 +1566,24 @@ pub(crate) fn write_task_report(
 fn write_publish_retry_report(
     task_id: crate::task::TaskId,
     deliveries: &[crate::task::OriginDelivery],
+    warnings: &[String],
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
     if json {
-        write_json_line(
-            stdout,
-            &serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "task_id": task_id.to_string(),
-                "deliveries": deliveries,
-            }),
-        )
+        let mut response = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "task_id": task_id.to_string(),
+            "deliveries": deliveries,
+        });
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
+        }
+        write_json_line(stdout, &response)
     } else {
+        for warning in warnings {
+            writeln!(stdout, "warning: {warning}")?;
+        }
         if deliveries.is_empty() {
             writeln!(stdout, "task {task_id}: no origin deliveries")?;
         }

@@ -2,8 +2,9 @@
 mod support;
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     ffi::OsStr,
+    fs,
     io::Write,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::PathBuf,
@@ -16,7 +17,9 @@ use std::{
 };
 
 use mac_worker::{
+    RuntimeContext,
     agent::{AgentKind, Question},
+    cli::{Cli, Command, TaskCommand},
     client_state::{ClientStateStore, RUNNER_ABSENCE_CONFIRMATION, RUNNER_UNVERIFIABLE_AFTER},
     config::Config,
     error::WorkerError,
@@ -25,8 +28,11 @@ use mac_worker::{
         QueueRunReference, QueueState, REPLACEMENT_FAILURE_PARK_AFTER, RUNNER_REPEATED_FAILURE,
         RUNNER_UNVERIFIABLE, ReplacementFailureBudget, RunId,
     },
+    outbox::OutboxRetryResponse,
+    paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
+    run_with_io_in_context,
     scheduler::{
         AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot,
         QueueBlockingReason, SchedulerPolicy, Selection, WorkerPreference,
@@ -36,9 +42,9 @@ use mac_worker::{
     },
     task::{
         BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnSummary, TurnTerminal,
+        PublishMode, PushTarget, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState,
+        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        TaskStatus, TurnSummary, TurnTerminal,
     },
     task_client::{TaskClient, TaskListFilter, WaitSelector},
     task_store::{
@@ -188,6 +194,7 @@ struct TaskRemoteRunner {
     status: Mutex<TaskStatus>,
     deliveries: Mutex<Vec<mac_worker::task::OriginDelivery>>,
     status_failures: AtomicUsize,
+    on_outbox_retry: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl TaskRemoteRunner {
@@ -196,6 +203,7 @@ impl TaskRemoteRunner {
             status: Mutex::new(status),
             deliveries: Mutex::new(Vec::new()),
             status_failures: AtomicUsize::new(0),
+            on_outbox_retry: Mutex::new(None),
         }
     }
 
@@ -209,6 +217,10 @@ impl TaskRemoteRunner {
 
     fn fail_next_status(&self) {
         self.status_failures.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn set_on_outbox_retry(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_outbox_retry.lock().unwrap() = Some(Box::new(hook));
     }
 }
 
@@ -287,6 +299,13 @@ impl ProcessRunner for TaskRemoteRunner {
                 stdout: Vec::new(),
                 stderr: b"error: unrecognized subcommand 'status-logs'\n".to_vec(),
             }),
+            value if value.starts_with(HostOperation::OutboxRetry.command()) => {
+                if let Some(hook) = self.on_outbox_retry.lock().unwrap().as_ref() {
+                    hook();
+                }
+                let deliveries = self.deliveries.lock().unwrap().clone();
+                canonical_process(&OutboxRetryResponse::new(deliveries))
+            }
             other => Err(WorkerError::Protocol(format!(
                 "unexpected fixture worker operation: {other}"
             ))),
@@ -416,6 +435,93 @@ fn task_record_in_run(
         None,
         true,
         None,
+    )
+    .unwrap()
+}
+
+fn closed_push_task_record(
+    task_id: TaskId,
+    turn_id: JobId,
+    project_id: String,
+    worktree_id: String,
+) -> LocalTaskRecord {
+    let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id,
+        worktree_id,
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: Some(PushTarget::new("https://example.test/repo.git".into()).unwrap()),
+        },
+        publish: vec![PublishMode::Fetch, PublishMode::Push],
+        publish_branch: Some("release-candidate".parse().unwrap()),
+        base_oid: base_oid.clone(),
+        limits: TaskLimits::default(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("mac-worker", "mac-worker@example.test").unwrap(),
+        title: None,
+        prompt: "fixture task".into(),
+        created_at_millis: 1,
+    })
+    .unwrap();
+    let turn = TurnSummary::new(
+        1,
+        turn_id,
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Done),
+        Some(true),
+        false,
+        Some(1),
+        Some(2),
+    );
+    let status = TaskStatus::new(
+        TaskState::Closed,
+        Some(TaskOutcome::Done),
+        Some("mini-1".into()),
+        true,
+        Some(base_oid),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        vec![turn],
+        2,
+    )
+    .unwrap();
+    LocalTaskRecord::new(
+        meta,
+        status,
+        None,
+        None,
+        None,
+        PROJECT_ID.into(),
+        None,
+        true,
+        None,
+    )
+    .unwrap()
+}
+
+fn retrying_delivery(turn: JobId, head: BaseOid) -> OriginDelivery {
+    OriginDelivery::new(
+        turn,
+        DeliveryState::Retrying,
+        head,
+        "https://example.test/repo.git".into(),
+        "refs/heads/release-candidate".into(),
+        0,
+        9_000,
+        Some("ORIGIN_AUTH_FAILED".into()),
+        None,
+        1,
+        9_000,
     )
     .unwrap()
 }
@@ -3105,4 +3211,172 @@ fn ambiguous_owner_never_restarts_and_lists_runner_unverifiable_after_30s() {
         store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
         Some(&dead_owner)
     );
+}
+
+#[test]
+fn publish_retry_merges_host_deliveries_into_the_local_record() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(994));
+    let turn = job(995);
+    let record = closed_push_task_record(task_id, turn, PROJECT_ID.into(), WORKTREE_ID.into());
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    assert!(record.deliveries().is_empty());
+    store.create_task(record.clone()).unwrap();
+
+    let retrying = retrying_delivery(turn, head);
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![retrying.clone()]);
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let returned = client.publish_retry(task_id).unwrap();
+    assert_eq!(returned.deliveries()[0].state(), DeliveryState::Retrying);
+    let stored = store.load_task(task_id).unwrap();
+    assert_eq!(stored.deliveries().len(), 1);
+    assert_eq!(stored.deliveries()[0].turn_id(), turn);
+    assert_eq!(stored.deliveries()[0].state(), DeliveryState::Retrying);
+    assert_eq!(stored.deliveries()[0].attempt(), 0);
+    assert_eq!(stored.status().state(), TaskState::Closed);
+}
+
+#[test]
+fn publish_retry_reloads_and_merges_when_the_local_record_changes() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(996));
+    let turn = job(997);
+    let record = closed_push_task_record(task_id, turn, PROJECT_ID.into(), WORKTREE_ID.into());
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    store.create_task(record.clone()).unwrap();
+
+    let retrying = retrying_delivery(turn, head);
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![retrying.clone()]);
+    let store_for_hook = store.clone();
+    remote.set_on_outbox_retry(move || {
+        let current = store_for_hook.load_task(task_id).unwrap();
+        store_for_hook
+            .update_task(current.with_status_observed_at(Some(99)).unwrap())
+            .unwrap();
+    });
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+
+    let returned = client.publish_retry(task_id).unwrap();
+    assert!(returned.warnings().is_empty(), "{:?}", returned.warnings());
+    let stored = store.load_task(task_id).unwrap();
+    assert_eq!(stored.status_observed_at_millis(), Some(99));
+    assert_eq!(
+        stored.deliveries()[0].state(),
+        DeliveryState::Retrying,
+        "reload must merge host deliveries onto the changed local record"
+    );
+}
+
+#[test]
+fn publish_retry_then_status_shows_delivery_for_a_closed_task() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let home = root_path.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut environment = BTreeMap::new();
+    for (key, name) in [
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_STATE_HOME", "xdg-state"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_DATA_HOME", "xdg-data"),
+    ] {
+        let path = root_path.join(name);
+        fs::create_dir_all(&path).unwrap();
+        environment.insert(key.into(), path.into());
+    }
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+    fs::write(
+        &paths.config,
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+    )
+    .unwrap();
+    let store = ClientStateStore::open(&paths.state).unwrap();
+
+    let task_id = TaskId::new(Uuid::from_u128(998));
+    let turn = job(999);
+    let record = closed_push_task_record(task_id, turn, PROJECT_ID.into(), WORKTREE_ID.into());
+    let head = record.status().head_oid().cloned().expect("fixture head");
+    assert!(record.deliveries().is_empty());
+    store.create_task(record.clone()).unwrap();
+
+    let retrying = retrying_delivery(turn, head);
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    remote.set_deliveries(vec![retrying]);
+    let runtime = RuntimeContext::isolated(environment, home, root_path);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let retry_exit = run_with_io_in_context(
+        Cli {
+            config: Some(paths.config.clone()),
+            json: false,
+            command: Command::Task {
+                command: TaskCommand::PublishRetry { task_id },
+            },
+        },
+        &remote,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(retry_exit, 0, "{}", String::from_utf8_lossy(&stderr));
+
+    stdout.clear();
+    stderr.clear();
+    let status_exit = run_with_io_in_context(
+        Cli {
+            config: Some(paths.config.clone()),
+            json: false,
+            command: Command::Task {
+                command: TaskCommand::Status {
+                    task_id,
+                    full: false,
+                },
+            },
+        },
+        &remote,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(status_exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    let status_text = String::from_utf8(stdout.clone()).unwrap();
+    assert!(
+        status_text.contains("delivery: retrying"),
+        "status must print the merged delivery after publish-retry: {status_text}"
+    );
+
+    stdout.clear();
+    stderr.clear();
+    let json_exit = run_with_io_in_context(
+        Cli {
+            config: Some(paths.config.clone()),
+            json: true,
+            command: Command::Task {
+                command: TaskCommand::Status {
+                    task_id,
+                    full: false,
+                },
+            },
+        },
+        &remote,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(json_exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["deliveries"][0]["state"], "retrying");
 }

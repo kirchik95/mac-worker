@@ -63,6 +63,8 @@ const DEFAULT_GIT_EMAIL: &str = "mac-worker@localhost";
 const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
 const CLOSE_IN_PROGRESS: &str = "task close is in progress";
 const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
+const PUBLISH_RETRY_MERGE_ATTEMPTS: usize = 3;
+const PUBLISH_RETRY_LOCAL_UPDATE_WARNING: &str = "origin retry was accepted on the worker, but the laptop record could not be updated with the returned deliveries";
 
 fn operator_revision_matches(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
     current.meta().task_id() == expected.meta().task_id()
@@ -228,6 +230,22 @@ pub(crate) struct ControllerTaskProjection {
     pub delivery: Option<OriginDelivery>,
     pub deliveries: Vec<OriginDelivery>,
     pub failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRetryReport {
+    deliveries: Vec<OriginDelivery>,
+    warnings: Vec<String>,
+}
+
+impl PublishRetryReport {
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2378,7 +2396,7 @@ impl<'a> TaskClient<'a> {
     }
 
     /// Re-drive failed or retrying origin intents after credentials are fixed.
-    pub fn publish_retry(&self, task_id: TaskId) -> Result<Vec<OriginDelivery>, WorkerError> {
+    pub fn publish_retry(&self, task_id: TaskId) -> Result<PublishRetryReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         if !record.meta().publish().contains(&PublishMode::Push) {
             return Err(task_error(
@@ -2388,7 +2406,32 @@ impl<'a> TaskClient<'a> {
         }
         let worker = task_worker(self.config, record.status())?;
         let response = RemoteJobClient::new(self.runner).outbox_retry(worker, task_id)?;
-        Ok(response.deliveries().to_vec())
+        let deliveries = response.deliveries().to_vec();
+        let warnings = self.persist_retry_deliveries(task_id, record, &deliveries)?;
+        Ok(PublishRetryReport {
+            deliveries,
+            warnings,
+        })
+    }
+
+    fn persist_retry_deliveries(
+        &self,
+        task_id: TaskId,
+        expected: LocalTaskRecord,
+        remote: &[OriginDelivery],
+    ) -> Result<Vec<String>, WorkerError> {
+        let mut current = expected;
+        for attempt in 0..PUBLISH_RETRY_MERGE_ATTEMPTS {
+            let merged =
+                current.with_deliveries(merge_origin_deliveries(current.deliveries(), remote))?;
+            if self.client_state.update_task_if_current(&current, merged)? {
+                return Ok(Vec::new());
+            }
+            if attempt + 1 < PUBLISH_RETRY_MERGE_ATTEMPTS {
+                current = self.client_state.load_task(task_id)?;
+            }
+        }
+        Ok(vec![PUBLISH_RETRY_LOCAL_UPDATE_WARNING.to_owned()])
     }
 
     /// Closes against a caller-supplied expected snapshot. Dashboard mutations
