@@ -645,7 +645,16 @@ fn require_absent_group(
     match runtime.observe_group(process_group) {
         ProcessGroupObservation::Absent => Ok(()),
         ProcessGroupObservation::Present => drain_leaderless_group(runtime, process_group),
-        ProcessGroupObservation::Ambiguous => Err(group_not_proven_absent()),
+        ProcessGroupObservation::Ambiguous => {
+            let deadline = runtime
+                .monotonic_now()
+                .checked_add(TERM_GRACE)
+                .ok_or_else(|| reconciliation_ambiguous("TERM grace deadline overflowed"))?;
+            match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+                ResolvedLeaderlessGroup::Absent => Ok(()),
+                ResolvedLeaderlessGroup::Present => drain_leaderless_group(runtime, process_group),
+            }
+        }
     }
 }
 
@@ -672,6 +681,12 @@ enum DrainPhase {
     Kill,
 }
 
+#[derive(Clone, Copy)]
+enum ResolvedLeaderlessGroup {
+    Absent,
+    Present,
+}
+
 impl DrainPhase {
     fn overflow_message(self) -> &'static str {
         match self {
@@ -694,23 +709,59 @@ fn poll_leaderless_group_absent(
         match runtime.observe_group(process_group) {
             ProcessGroupObservation::Absent => return Ok(true),
             ProcessGroupObservation::Present => {
-                let now = runtime.monotonic_now();
-                let Some(remaining) = deadline
-                    .checked_sub(now)
-                    .filter(|remaining| !remaining.is_zero())
-                else {
+                if !sleep_until_group_deadline(runtime, deadline) {
                     return Ok(false);
-                };
-                runtime.sleep(POLL_INTERVAL.min(remaining));
+                }
             }
-            ProcessGroupObservation::Ambiguous => return Err(group_not_proven_absent()),
+            ProcessGroupObservation::Ambiguous => {
+                match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+                    ResolvedLeaderlessGroup::Absent => return Ok(true),
+                    ResolvedLeaderlessGroup::Present => {
+                        if !sleep_until_group_deadline(runtime, deadline) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
+/// Poll `observe_group` without signaling while the sample stays `Ambiguous`.
+/// Returns as soon as the group is `Absent` or `Present`; if it is still
+/// `Ambiguous` when `deadline` elapses, fail closed with the after-grace error.
+fn poll_while_group_ambiguous(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+    deadline: Duration,
+) -> Result<ResolvedLeaderlessGroup, WorkerError> {
+    loop {
+        if !sleep_until_group_deadline(runtime, deadline) {
+            return Err(group_not_proven_absent());
+        }
+        match runtime.observe_group(process_group) {
+            ProcessGroupObservation::Absent => return Ok(ResolvedLeaderlessGroup::Absent),
+            ProcessGroupObservation::Present => return Ok(ResolvedLeaderlessGroup::Present),
+            ProcessGroupObservation::Ambiguous => {}
+        }
+    }
+}
+
+fn sleep_until_group_deadline(runtime: &dyn ReconciliationRuntime, deadline: Duration) -> bool {
+    let now = runtime.monotonic_now();
+    let Some(remaining) = deadline
+        .checked_sub(now)
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return false;
+    };
+    runtime.sleep(POLL_INTERVAL.min(remaining));
+    true
+}
+
 fn group_not_proven_absent() -> WorkerError {
     reconciliation_ambiguous(
-        "child leader is absent but its exact process group is not proven absent",
+        "child leader is absent but its exact process group is not proven absent after grace",
     )
 }
 
@@ -7712,5 +7763,85 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
             vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGTERM)]
         );
         assert_eq!(runtime.sleeps(), vec![TERM_GRACE]);
+    }
+
+    #[test]
+    fn leaderless_ambiguous_group_becomes_absent_after_two_polls() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL, POLL_INTERVAL]);
+    }
+
+    #[test]
+    fn leaderless_ambiguous_group_for_whole_grace_is_ambiguous_after_grace() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [ProcessGroupObservation::Ambiguous],
+        )
+        .with_clock([Duration::ZERO, TERM_GRACE]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("RECONCILIATION_AMBIGUOUS"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "child leader is absent but its exact process group is not proven absent after grace"
+            ),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("TERM/KILL"), "{error}");
+        assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn leaderless_ambiguous_group_becomes_present_then_drains_after_term() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+    }
+
+    #[test]
+    fn leaderless_group_ambiguous_mid_term_drain_then_absent_sends_term_only() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
     }
 }

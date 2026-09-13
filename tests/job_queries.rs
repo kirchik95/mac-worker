@@ -5207,11 +5207,6 @@ fn kill_proof_deadline_crossing_fails_closed_without_panicking() {
 #[test]
 fn unsafe_post_term_transitions_never_kill_mutate_or_release() {
     let cases = [
-        (
-            "leader-absent-group-ambiguous",
-            ProcessObservation::Absent,
-            Some(ProcessGroupObservation::Ambiguous),
-        ),
         ("reused", ProcessObservation::Reused, None),
         (
             "wrong-pgid",
@@ -5274,6 +5269,51 @@ fn unsafe_post_term_transitions_never_kill_mutate_or_release() {
             "{label}"
         );
     }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("post-term-leader-absent-group-ambiguous");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let supervisor = identity(84_201);
+    let child = identity(84_202);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let before_scopes = mutable_job_scope_presence(&store, &lease);
+    let runtime = ScriptedReconciliation::new(
+        [
+            ProcessObservation::Absent,
+            ProcessObservation::Matching {
+                process_group: child.pid(),
+            },
+            ProcessObservation::Absent,
+        ],
+        [ProcessGroupObservation::Ambiguous],
+    )
+    .with_clock([
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+        Duration::from_secs(20),
+    ]);
+
+    let error =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+            .unwrap_err();
+
+    assert_after_ambiguous_grace(&error, "leader-absent-group-ambiguous");
+    assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+    assert_eq!(runtime.sleeps(), vec![Duration::from_secs(10)]);
+    assert_eq!(read_job_status(&store, &lease), status);
+    assert_eq!(mutable_job_scope_presence(&store, &lease), before_scopes);
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp
@@ -5389,11 +5429,6 @@ fn child_identity_or_group_ambiguity_never_signals_cleans_or_releases() {
         ),
         ("reused", ProcessObservation::Reused, None),
         ("ambiguous", ProcessObservation::Ambiguous, None),
-        (
-            "leader-absent-group-ambiguous",
-            ProcessObservation::Absent,
-            Some(ProcessGroupObservation::Ambiguous),
-        ),
     ];
 
     for (index, (label, child_observation, group_observation)) in cases.into_iter().enumerate() {
@@ -5437,6 +5472,47 @@ fn child_identity_or_group_ambiguity_never_signals_cleans_or_releases() {
             "{label}"
         );
     }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("child-ambiguity-leader-absent-group");
+    let (store, lease, _request) = indexed_identityless_job(&root);
+    let supervisor = identity(85_001);
+    let child = identity(85_002);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(supervisor, 11)
+        .unwrap()
+        .with_child(child, 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    let runtime = ScriptedReconciliation::new(
+        [ProcessObservation::Absent, ProcessObservation::Absent],
+        [ProcessGroupObservation::Ambiguous],
+    )
+    .with_clock([Duration::ZERO, Duration::from_secs(10)]);
+
+    let error =
+        JobService::new_with_reconciliation(&store, &RejectLauncher, Arc::new(runtime.clone()))
+            .status(lease.job_id())
+            .unwrap_err();
+
+    assert_after_ambiguous_grace(&error, "leader-absent-group-ambiguous");
+    assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
+    assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert_eq!(read_job_status(&store, &lease), status);
+    assert!(
+        store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap()
+            .join("workspace")
+            .is_dir()
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("absent-leader-group-drains-after-term");
@@ -9013,6 +9089,24 @@ fn assert_after_term_kill_grace(error: &mac_worker::error::WorkerError, context:
             "child leader is absent but its exact process group is not proven absent after TERM/KILL grace"
         ),
         "{context}: expected after-grace wording, got {message}"
+    );
+}
+
+fn assert_after_ambiguous_grace(error: &mac_worker::error::WorkerError, context: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains("RECONCILIATION_AMBIGUOUS"),
+        "{context}: expected RECONCILIATION_AMBIGUOUS, got {message}"
+    );
+    assert!(
+        message.contains(
+            "child leader is absent but its exact process group is not proven absent after grace"
+        ),
+        "{context}: expected after-grace wording, got {message}"
+    );
+    assert!(
+        !message.contains("TERM/KILL"),
+        "{context}: TERM/KILL wording must not mix with the ambiguous-group grace: {message}"
     );
 }
 
