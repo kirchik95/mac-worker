@@ -29,6 +29,7 @@ use mac_worker::{
         StatusLogsRequest, SubmitRequest,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+    laptop::{BinaryIdentity, FixedBinaryIdentitySource},
     lease::{AdmissionFacts, LeaseService, SlotState},
     outbox::{
         DELIVERY_ALREADY_DELIVERED, DELIVERY_NOT_FOUND, DELIVERY_UNREADABLE, DeliveryCommit,
@@ -47,6 +48,7 @@ use mac_worker::{
     task_store::{TaskCloseRequest, TaskPrepareRequest, TaskStore},
     turn::{TaskTurnRequest, TurnMaterial},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use support::GitRepo;
 use tempfile::TempDir;
@@ -80,6 +82,27 @@ impl OutboxLauncher for SilentInactiveLauncher {
     fn report_unconfigured(&self) -> bool {
         false
     }
+}
+
+struct CountingLauncher {
+    calls: AtomicU64,
+}
+
+impl OutboxLauncher for CountingLauncher {
+    fn ensure_watch(&self, host_root: &Path) -> Result<OutboxActivation, WorkerError> {
+        assert!(host_root.is_absolute());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(OutboxActivation::Active)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedOutboxWorker {
+    identity: mac_worker::job::ProcessIdentity,
+    watch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binary: Option<BinaryIdentity>,
 }
 
 struct FalseActiveLauncher;
@@ -957,7 +980,47 @@ fn spawn_and_plist_pass_the_exact_host_root() {
     assert!(plist.contains("<true/>"));
     assert!(plist.contains("--host-root"));
     assert!(plist.contains(&xmlish(store.root())));
+    assert!(plist.contains("<key>StandardOutPath</key>"));
+    assert!(plist.contains("<key>StandardErrorPath</key>"));
+    assert!(plist.contains(&xmlish(&store.root().join("logs/outbox.log"))));
     assert!(!plist.contains("WorkingDirectory"));
+}
+
+#[test]
+fn watch_exits_between_pump_cycles_when_the_binary_is_replaced() {
+    let (_temp, store, _source, _origin_dir, _origin, origin_url, oid) = fixture();
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    let replaced = FixedBinaryIdentitySource {
+        started: Some(test_binary_identity(1)),
+        installed: Some(test_binary_identity(2)),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_timeout = stop.clone();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_secs(3));
+            stop_timeout.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        OriginOutbox::new(&store, &SystemProcessRunner)
+            .run_watch_with_identity(&stop, || 1, 5, &replaced)
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "watcher must return after the in-flight attempt, not the safety timeout"
+        );
+    });
+    let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
+    assert_eq!(delivery.state(), DeliveryState::Delivered);
+}
+
+fn test_binary_identity(inode: u64) -> BinaryIdentity {
+    BinaryIdentity {
+        path: PathBuf::from("/tmp/worker"),
+        inode,
+        size: 8,
+        mtime_millis: 1,
+    }
 }
 
 #[test]
@@ -2195,6 +2258,104 @@ fn unconfigured_launcher_surfaces_worker_required() {
     let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
     assert_eq!(delivery.last_error(), Some(OUTBOX_WORKER_REQUIRED));
     assert_eq!(delivery.state(), DeliveryState::Pending);
+}
+
+#[test]
+fn wake_leaves_a_live_watcher_with_the_same_binary_identity_alone() {
+    let (_temp, store, _source, _origin_dir, _origin, origin_url, oid) = fixture();
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let cloned = store.clone();
+    let stop_thread = stop.clone();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            OriginOutbox::new(&cloned, &SystemProcessRunner)
+                .run_watch_with(&stop_thread, || 1, 50)
+                .unwrap();
+        });
+        wait_until(2, || outbox(&store).live_watch().unwrap(), || {});
+        let launcher = CountingLauncher {
+            calls: AtomicU64::new(0),
+        };
+        let activation = outbox(&store).wake(&launcher).unwrap();
+        assert_eq!(activation, OutboxActivation::Active);
+        assert_eq!(launcher.calls.load(Ordering::SeqCst), 0);
+        assert!(outbox(&store).live_watch().unwrap());
+        stop.store(true, Ordering::SeqCst);
+    });
+}
+
+#[test]
+fn wake_restarts_a_live_watcher_with_a_different_binary_identity() {
+    let (temp, store, _source, origin_dir, origin, origin_url, oid) = fixture();
+    let host_root = store.root().to_path_buf();
+    fs::write(origin.join("reject"), b"1").unwrap();
+    commit(&store, &origin_url, &oid, turn_id(2), 1);
+    drop(store);
+    let _ = origin_dir;
+    let home = temp.path().join("home");
+    let data = temp.path().join("xdg");
+    let tmp = temp.path().join("tmp");
+    let first_log = temp.path().join("watch-old.err");
+    let first = WatchChild::spawn(&host_root, &home, &data, &tmp, first_log);
+    wait_until(
+        5,
+        || outbox_worker_pid(&host_root).is_some(),
+        || panic!("watcher did not publish liveness"),
+    );
+    let old_pid = outbox_worker_pid(&host_root).expect("old watcher pid");
+    tamper_published_binary(&host_root);
+    let wake_log = temp.path().join("wake-restart.err");
+    let stderr = fs::File::create(&wake_log).unwrap();
+    let stdout = fs::File::create(wake_log.with_extension("stdout")).unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .env("TMPDIR", &tmp)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "host",
+            "outbox",
+            "--wake",
+            "--host-root",
+            host_root.to_str().expect("utf-8 host root"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .status()
+        .expect("worker host outbox --wake");
+    assert!(
+        status.success(),
+        "wake failed: {}",
+        fs::read_to_string(&wake_log).unwrap_or_default()
+    );
+    let stdout_text = fs::read_to_string(wake_log.with_extension("stdout")).unwrap_or_default();
+    assert!(
+        stdout_text.trim() == "restarted",
+        "wake must restart an outdated watcher, got {stdout_text:?}"
+    );
+    wait_until(
+        15,
+        || outbox_worker_pid(&host_root).is_some_and(|pid| pid != old_pid),
+        || panic!("outdated watcher was not replaced"),
+    );
+    drop(first);
+    let _reaper = DetachedWatch {
+        host_root: host_root.clone(),
+    };
+}
+
+fn tamper_published_binary(host_root: &Path) {
+    let path = host_root.join("locks/outbox-worker.json");
+    let bytes = fs::read(&path).unwrap();
+    let mut record: PublishedOutboxWorker = serde_json::from_slice(&bytes).unwrap();
+    let binary = record.binary.as_mut().expect("published binary identity");
+    binary.inode ^= 1;
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 }
 
 #[test]

@@ -23,6 +23,9 @@ pub const ORIGIN_HELPER_MISSING_CODE: &str = "ORIGIN_HELPER_MISSING";
 /// `doctor` / `setup` warning when a long-running laptop CLI was started
 /// from a binary older than the one now installed. Never a blocker.
 pub const LAPTOP_BINARY_OUTDATED_CODE: &str = "LAPTOP_BINARY_OUTDATED";
+/// Setup installed the helper but could not wake the origin-outbox watcher.
+/// The host stays installed; the operator can run `host outbox --wake`.
+pub const OUTBOX_WAKE_FAILED_CODE: &str = "OUTBOX_WAKE_FAILED";
 
 /// CPU counters on a host probe. Laptop readers ignore unknown keys so an
 /// additive host field cannot take the dashboard offline.
@@ -193,6 +196,11 @@ pub struct SetupHostResult {
     pub failure_kind: Option<SetupFailureKind>,
     #[serde(default)]
     pub warnings: Vec<SetupWarning>,
+    /// Origin-outbox wake after a successful helper install. Omitted when
+    /// setup did not run wake (failed install) so older `--json` readers keep
+    /// their existing shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +243,8 @@ pub enum SetupWarningCode {
     /// A long-running laptop `dashboard` or `controller run` was started
     /// from a binary older than the one just installed.
     LaptopBinaryOutdated,
+    /// Post-install `host outbox --wake` failed; the helper stayed installed.
+    OutboxWakeFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -395,6 +405,7 @@ mod tests {
                 error_message: None,
                 failure_kind: None,
                 warnings: Vec::new(),
+                outbox: None,
             }],
             warnings: Vec::new(),
         };

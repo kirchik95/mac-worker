@@ -121,10 +121,25 @@ Host pump (hidden `worker host`, not in top-level `--help`):
 
 | Flag | Semantics |
 |---|---|
-| `--watch` | Take `outbox.lock` or exit immediately if another pump holds it. Publish watcher identity, recover the due registry once, then loop. |
+| `--watch` | Take `outbox.lock` or exit immediately if another pump holds it. Publish watcher identity, recover the due registry once, then loop. Between pump cycles (at most every ~10 s) the watcher stats its own executable; if the file on disk no longer matches, it logs `outbox watcher exiting: binary replaced` and returns so a KeepAlive LaunchAgent restarts the current binary. |
 | `--once` | Blocking one-shot pump. If the pump lock is held, `OUTBOX_BUSY`. Does not spawn `--watch`. |
 | `--enable` | Write `locks/outbox-enabled.json`. Does not start a watcher. Reboot recovery is `--enable` plus a LaunchAgent that actually starts `--watch`. |
-| `--wake` | Hidden. If a live watcher exists, no-op; else spawn `--watch` and exit. |
+| `--wake` | Hidden. If a live watcher is already this binary, no-op (`woken`). If it is a replaced image, SIGTERM it, wait up to 15 s for the pump lock, and start `--watch` (`restarted`). If `locks/outbox-enabled.json` is absent the setup path prints `not_enabled` and does not treat that as an error. |
+
+KeepAlive recipe (no `launchctl` from the helper itself):
+
+```sh
+worker host outbox --enable
+worker host outbox --write-agent ~/Library/LaunchAgents
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mac-worker.outbox.plist
+```
+
+`--write-agent` writes a KeepAlive plist whose `ProgramArguments` pass `--host-root` and whose stdout/stderr go to `<host_root>/logs/outbox.log`. After `worker setup` the worker helper wakes that watcher; the self-check plus KeepAlive keep it on the binary just installed. Setup prints the per-worker outcome under the installed line (`outbox: woken`, `restarted`, `not_enabled`, or `failed OUTBOX_WAKE_FAILED`); a wake failure is a worker warning, not a failed install.
+
+```text
+mini-1: installed (protocol 7)
+  outbox: restarted
+```
 
 `--once` is a one-shot pump, not a substitute for `--watch`. Do not treat a single `--once` after a crash as proof that due-registry recovery already ran; `--watch` recovers the due index on start. Host layout of intents, pins, and the due registry: [durable origin outbox](superpowers/specs/2026-09-10-origin-outbox.md).
 

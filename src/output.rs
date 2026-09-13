@@ -43,6 +43,10 @@ impl CommandOutput {
                             let message = worker.error_message.as_deref().unwrap_or("setup failed");
                             format!("{}: failed [{code}]: {message}", worker.name)
                         };
+                        if let Some(outbox) = &worker.outbox {
+                            rendered.push_str("\n  outbox: ");
+                            rendered.push_str(outbox);
+                        }
                         for warning in &worker.warnings {
                             rendered.push_str("\n  warning [");
                             rendered.push_str(setup_warning_code(&warning.code));
@@ -508,6 +512,9 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
         crate::protocol::SetupWarningCode::FactsRefreshFailed => "FACTS_REFRESH_FAILED",
         crate::protocol::SetupWarningCode::LaptopBinaryOutdated => {
             crate::protocol::LAPTOP_BINARY_OUTDATED_CODE
+        }
+        crate::protocol::SetupWarningCode::OutboxWakeFailed => {
+            crate::protocol::OUTBOX_WAKE_FAILED_CODE
         }
     }
 }

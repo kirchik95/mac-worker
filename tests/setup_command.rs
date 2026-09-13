@@ -447,6 +447,7 @@ fn success_results() -> Vec<Result<ProcessResult, WorkerError>> {
         Ok(result(0, b"", b"")),
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(0, b"", b"")),
+        Ok(result(0, b"not_enabled\n", b"")),
     ]
 }
 
@@ -463,6 +464,7 @@ struct GeneratedSetupCommands {
     success_cleanup: String,
     cleanup: String,
     rollback: String,
+    outbox_wake: String,
 }
 
 fn request_command(request: &ProcessRequest) -> String {
@@ -530,6 +532,7 @@ fn generated_setup_commands() -> GeneratedSetupCommands {
         success_cleanup: request_command(&requests[10]),
         cleanup: request_command(&cleanup_requests[3]),
         rollback: request_command(&rollback_requests[10]),
+        outbox_wake: request_command(&requests[11]),
     }
 }
 
@@ -1296,7 +1299,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     assert_eq!(installed.protocol_version, Some(PROTOCOL_VERSION));
     assert!(installed.warnings.is_empty());
     let requests = runner.requests();
-    assert_eq!(requests.len(), 11);
+    assert_eq!(requests.len(), 12);
     assert_eq!(
         requests[0],
         ProcessRequest {
@@ -1318,6 +1321,7 @@ fn success_locks_hashes_promotes_reconciles_verifies_and_releases_with_safe_argv
     assert_ssh_request_shape(&requests[8], facts_refresh_policy());
     assert_ssh_request_shape(&requests[9], preflight_policy());
     assert_ssh_request_shape(&requests[10], control_policy());
+    assert_ssh_request_shape(&requests[11], control_policy());
     assert!(
         requests
             .iter()
@@ -1454,7 +1458,7 @@ fn disconnected_promotion_reconciled_as_candidate_continues_to_probe() {
 
     assert!(installed.installed);
     let requests = runner.requests();
-    assert_eq!(requests.len(), 11);
+    assert_eq!(requests.len(), 12);
     assert_ssh_request_shape(&requests[5], control_policy());
     assert_ssh_request_shape(&requests[6], control_policy());
     let commands = generated_setup_commands();
@@ -1697,7 +1701,9 @@ fn a_failed_or_stalled_warmup_does_not_fail_setup_when_verification_passes() {
         assert_remote_command(&requests[8], &commands.facts_refresh);
         assert_remote_command(&requests[9], &commands.verification);
         assert_remote_command(&requests[10], &commands.success_cleanup);
+        assert_remote_command(&requests[11], &commands.outbox_wake);
         assert!(!contains_remote_command(&requests, &commands.rollback));
+        assert_eq!(installed.outbox.as_deref(), Some("not_enabled"), "{label}");
     }
 }
 
@@ -1793,7 +1799,9 @@ fn a_failed_or_stalled_facts_refresh_does_not_fail_setup_when_verification_passe
         assert_remote_command(&requests[8], &commands.facts_refresh);
         assert_remote_command(&requests[9], &commands.verification);
         assert_remote_command(&requests[10], &commands.success_cleanup);
+        assert_remote_command(&requests[11], &commands.outbox_wake);
         assert!(!contains_remote_command(&requests, &commands.rollback));
+        assert_eq!(installed.outbox.as_deref(), Some("not_enabled"), "{label}");
     }
 }
 
@@ -1851,6 +1859,7 @@ fn verified_install_with_cleanup_failure_stays_installed_with_typed_warning() {
             .message
             .contains("lock release failed")
     );
+    assert_eq!(installed.outbox.as_deref(), Some("not_enabled"));
 }
 
 #[test]
@@ -1972,6 +1981,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 error_message: None,
                 failure_kind: None,
                 warnings: Vec::new(),
+                outbox: None,
             },
             SetupHostResult {
                 name: "mini-2".into(),
@@ -1982,6 +1992,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 error_message: Some("transfer failed".into()),
                 failure_kind: Some(SetupFailureKind::Infrastructure),
                 warnings: Vec::new(),
+                outbox: None,
             },
         ],
         warnings: Vec::new(),
@@ -2003,6 +2014,104 @@ fn setup_json_and_human_output_keep_per_host_results() {
 }
 
 #[test]
+fn setup_wakes_the_outbox_after_a_successful_install_and_renders_the_outcome() {
+    let commands = generated_setup_commands();
+    assert!(
+        commands.outbox_wake.contains("host outbox --wake"),
+        "setup must invoke the installed helper: {}",
+        commands.outbox_wake
+    );
+    assert!(
+        commands.outbox_wake.contains("not_enabled"),
+        "setup must report not_enabled when the worker never enabled the outbox: {}",
+        commands.outbox_wake
+    );
+    assert!(
+        !commands.outbox_wake.contains("launchctl"),
+        "setup must not call launchctl: {}",
+        commands.outbox_wake
+    );
+
+    let (_directory, current_exe) = executable_fixture();
+    for (label, stdout, expected, warning) in [
+        (
+            "not_enabled",
+            b"not_enabled\n".as_slice(),
+            "not_enabled",
+            false,
+        ),
+        ("woken", b"woken\n".as_slice(), "woken", false),
+        ("restarted", b"restarted\n".as_slice(), "restarted", false),
+        ("failed", b"".as_slice(), "failed OUTBOX_WAKE_FAILED", true),
+    ] {
+        let mut results = success_results();
+        results[11] = if warning {
+            Ok(result(
+                70,
+                stdout,
+                b"outbox watcher did not acknowledge launch",
+            ))
+        } else {
+            Ok(result(0, stdout, b""))
+        };
+        let runner = RecordingRunner::returning_results(results);
+        let installer =
+            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+        let installed = installer.install(&current_exe, &worker());
+        assert!(installed.installed, "{label}");
+        assert_eq!(installed.outbox.as_deref(), Some(expected), "{label}");
+        if warning {
+            assert!(
+                installed
+                    .warnings
+                    .iter()
+                    .any(|item| item.code == SetupWarningCode::OutboxWakeFailed),
+                "{label}: {:?}",
+                installed.warnings
+            );
+        } else {
+            assert!(
+                !installed
+                    .warnings
+                    .iter()
+                    .any(|item| item.code == SetupWarningCode::OutboxWakeFailed),
+                "{label}"
+            );
+        }
+        let requests = runner.requests();
+        assert_remote_command(&requests[11], &commands.outbox_wake);
+    }
+
+    let output = CommandOutput::Setup(SetupReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers: vec![SetupHostResult {
+            name: "mini-1".into(),
+            ssh: "mac1".into(),
+            installed: true,
+            protocol_version: Some(PROTOCOL_VERSION),
+            error_code: None,
+            error_message: None,
+            failure_kind: None,
+            warnings: vec![SetupWarning {
+                code: SetupWarningCode::OutboxWakeFailed,
+                message: "outbox wake failed with exit 70".into(),
+            }],
+            outbox: Some("failed OUTBOX_WAKE_FAILED".into()),
+        }],
+        warnings: Vec::new(),
+    });
+    assert_eq!(
+        output.render_human(),
+        format!(
+            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  outbox: failed OUTBOX_WAKE_FAILED\n  warning [OUTBOX_WAKE_FAILED]: outbox wake failed with exit 70"
+        )
+    );
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["outbox"], "failed OUTBOX_WAKE_FAILED");
+    assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+}
+
+#[test]
 fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
     // Catches showing only "installed" while hiding that the owned lock or
     // installation-scoped state could not be removed.
@@ -2020,6 +2129,7 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
                 code: SetupWarningCode::CleanupFailed,
                 message: "lock release failed".into(),
             }],
+            outbox: None,
         }],
         warnings: Vec::new(),
     });
@@ -2048,6 +2158,7 @@ fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
                 code: SetupWarningCode::WarmupFailed,
                 message: "process exceeded its 90s execution deadline".into(),
             }],
+            outbox: None,
         }],
         warnings: Vec::new(),
     });
@@ -2078,6 +2189,7 @@ fn setup_human_output_surfaces_facts_refresh_warning_after_verified_success() {
                     "agent facts were not refreshed during setup; run `worker workers --refresh`"
                         .into(),
             }],
+            outbox: None,
         }],
         warnings: Vec::new(),
     });
@@ -2775,6 +2887,7 @@ fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
             error_message: None,
             failure_kind: None,
             warnings: vec![herdr_unavailable_warning()],
+            outbox: None,
         }],
         warnings: Vec::new(),
     });
@@ -2807,6 +2920,7 @@ fn setup_human_and_json_output_surface_an_outdated_laptop_binary_warning() {
             error_message: None,
             failure_kind: None,
             warnings: Vec::new(),
+            outbox: None,
         }],
         warnings: vec![SetupWarning {
             code: SetupWarningCode::LaptopBinaryOutdated,

@@ -1,21 +1,28 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
-    fs::File,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    fs::{self, File},
+    io,
+    os::{
+        fd::AsRawFd,
+        unix::{fs::PermissionsExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    binary_identity::{
+        BinaryIdentity, BinaryIdentitySource, SystemBinaryIdentitySource, binary_is_outdated,
+    },
     error::WorkerError,
     git_transport::{GitTransport, delivery_pin_ref},
     host_store::{HostStore, HostStoreWritePoint},
@@ -40,7 +47,12 @@ const DEFAULT_WATCH_IDLE_MILLIS: u64 = 1_000;
 const DUE_DIRECTORY: &str = "locks/outbox-due";
 const WATCH_HANDSHAKE_ATTEMPTS: u32 = 100;
 const WATCH_HANDSHAKE_MILLIS: u64 = 10;
+const BINARY_STAT_MILLIS: u64 = 10_000;
+const WATCH_STOP_WAIT_ATTEMPTS: u32 = 150;
+const WATCH_STOP_WAIT_MILLIS: u64 = 100;
+const WATCH_STOP_POLL_MILLIS: u64 = 50;
 
+static WATCH_STOP: AtomicBool = AtomicBool::new(false);
 static ROOT_COUNTERS: Mutex<Option<HashMap<PathBuf, (u64, u64)>>> = Mutex::new(None);
 
 fn bump_task_directory_scans(root: &Path) {
@@ -107,6 +119,7 @@ pub struct DeliveryCommit<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxActivation {
     Active,
+    Restarted,
     Inactive,
 }
 
@@ -202,6 +215,8 @@ struct TargetLedger {
 struct OutboxWorkerRecord {
     identity: ProcessIdentity,
     watch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binary: Option<BinaryIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,18 +460,37 @@ impl<'a> OriginOutbox<'a> {
     }
 
     pub fn wake(&self, launcher: &dyn OutboxLauncher) -> Result<OutboxActivation, WorkerError> {
+        let mut restarted = false;
         if self.live_watch()? {
-            return Ok(OutboxActivation::Active);
+            if !self.live_watch_is_outdated()? {
+                return Ok(OutboxActivation::Active);
+            }
+            self.request_watch_stop()?;
+            self.wait_for_watch_release()?;
+            restarted = true;
         }
         let _launch = self.launch_lock()?;
         if self.live_watch()? {
-            return Ok(OutboxActivation::Active);
+            if !self.live_watch_is_outdated()? {
+                return Ok(if restarted {
+                    OutboxActivation::Restarted
+                } else {
+                    OutboxActivation::Active
+                });
+            }
+            self.request_watch_stop()?;
+            self.wait_for_watch_release()?;
+            restarted = true;
         }
         match launcher.ensure_watch(self.store.root()) {
-            Ok(OutboxActivation::Active) => {
+            Ok(OutboxActivation::Active | OutboxActivation::Restarted) => {
                 for _ in 0..WATCH_HANDSHAKE_ATTEMPTS {
                     if self.live_watch()? {
-                        return Ok(OutboxActivation::Active);
+                        return Ok(if restarted {
+                            OutboxActivation::Restarted
+                        } else {
+                            OutboxActivation::Active
+                        });
                     }
                     std::thread::sleep(Duration::from_millis(WATCH_HANDSHAKE_MILLIS));
                 }
@@ -519,6 +553,7 @@ impl<'a> OriginOutbox<'a> {
             .map(|argument| format!("    <string>{argument}</string>"))
             .collect::<Vec<_>>()
             .join("\n");
+        let log = xml_escape(&root.join("logs/outbox.log").to_string_lossy());
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -532,6 +567,10 @@ impl<'a> OriginOutbox<'a> {
   <array>
 {argument_xml}
   </array>
+  <key>StandardOutPath</key>
+  <string>{log}</string>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
 </dict>
 </plist>
 "#
@@ -544,6 +583,13 @@ impl<'a> OriginOutbox<'a> {
         host_root: &Path,
     ) -> Result<PathBuf, WorkerError> {
         std::fs::create_dir_all(directory).map_err(WorkerError::Io)?;
+        let logs = host_root.join("logs");
+        fs::create_dir_all(&logs).map_err(WorkerError::Io)?;
+        let mut permissions = fs::metadata(&logs)
+            .map(|metadata| metadata.permissions())
+            .unwrap_or_else(|_| fs::Permissions::from_mode(0o700));
+        permissions.set_mode(0o700);
+        fs::set_permissions(&logs, permissions).map_err(WorkerError::Io)?;
         let path = directory.join("com.mac-worker.outbox.plist");
         std::fs::write(&path, Self::launchd_plist(executable, host_root)?)
             .map_err(WorkerError::Io)?;
@@ -551,7 +597,12 @@ impl<'a> OriginOutbox<'a> {
     }
 
     pub fn run_watch(&self, stop: &AtomicBool, now: impl Fn() -> u64) -> Result<(), WorkerError> {
-        self.run_watch_with(stop, now, DEFAULT_WATCH_IDLE_MILLIS)
+        self.run_watch_with_identity(
+            stop,
+            now,
+            DEFAULT_WATCH_IDLE_MILLIS,
+            &SystemBinaryIdentitySource::capture(),
+        )
     }
 
     pub fn run_watch_with(
@@ -560,21 +611,46 @@ impl<'a> OriginOutbox<'a> {
         now: impl Fn() -> u64,
         idle_millis: u64,
     ) -> Result<(), WorkerError> {
+        self.run_watch_with_identity(
+            stop,
+            now,
+            idle_millis,
+            &SystemBinaryIdentitySource::capture(),
+        )
+    }
+
+    pub fn run_watch_with_identity(
+        &self,
+        stop: &AtomicBool,
+        now: impl Fn() -> u64,
+        idle_millis: u64,
+        identity: &dyn BinaryIdentitySource,
+    ) -> Result<(), WorkerError> {
         let Some(_pump) = self.try_pump_lock()? else {
             return Ok(());
         };
         self.publish_worker(true)?;
         self.recover_due_index()?;
-        while !stop.load(Ordering::SeqCst) {
+        let mut last_binary_check: Option<Instant> = None;
+        while !watch_should_stop(stop) {
             let now_millis = now();
             let _ = self.pump_due_locked(now_millis);
-            if stop.load(Ordering::SeqCst) {
+            if watch_should_stop(stop) {
                 break;
+            }
+            if last_binary_check.is_none_or(|checked| {
+                checked.elapsed() >= Duration::from_millis(BINARY_STAT_MILLIS)
+            }) {
+                last_binary_check = Some(Instant::now());
+                if binary_is_outdated(identity) {
+                    eprintln!("outbox watcher exiting: binary replaced");
+                    return Ok(());
+                }
             }
             let sleep_for = self
                 .sleep_millis(now_millis, idle_millis.max(1))
                 .unwrap_or(idle_millis.max(1));
-            std::thread::sleep(Duration::from_millis(sleep_for));
+            interruptible_sleep(stop, sleep_for);
         }
         Ok(())
     }
@@ -584,11 +660,9 @@ impl<'a> OriginOutbox<'a> {
     }
 
     pub fn live_watch(&self) -> Result<bool, WorkerError> {
-        let locks = self.store.open_directory("locks", false)?;
-        if !locks.entry_exists("outbox-worker.json")? {
+        let Some(record) = self.read_worker_record()? else {
             return Ok(false);
-        }
-        let record: OutboxWorkerRecord = read_json(&locks, "outbox-worker.json")?;
+        };
         if !record.watch {
             return Ok(false);
         }
@@ -596,6 +670,52 @@ impl<'a> OriginOutbox<'a> {
             SystemProcessInspector.observe(record.identity),
             ProcessObservation::Matching { .. }
         ))
+    }
+
+    fn read_worker_record(&self) -> Result<Option<OutboxWorkerRecord>, WorkerError> {
+        let locks = self.store.open_directory("locks", false)?;
+        if !locks.entry_exists("outbox-worker.json")? {
+            return Ok(None);
+        }
+        Ok(Some(read_json(&locks, "outbox-worker.json")?))
+    }
+
+    fn live_watch_is_outdated(&self) -> Result<bool, WorkerError> {
+        if !self.live_watch()? {
+            return Ok(false);
+        }
+        let Some(record) = self.read_worker_record()? else {
+            return Ok(false);
+        };
+        let Some(mine) = BinaryIdentity::from_current_exe() else {
+            return Ok(false);
+        };
+        Ok(record.binary.as_ref() != Some(&mine))
+    }
+
+    fn request_watch_stop(&self) -> Result<(), WorkerError> {
+        let Some(record) = self.read_worker_record()? else {
+            return Ok(());
+        };
+        let pid = record.identity.pid();
+        if pid == 0 || pid == std::process::id() {
+            return Ok(());
+        }
+        let Ok(raw) = i32::try_from(pid) else {
+            return Ok(());
+        };
+        let _ = unsafe { libc::kill(raw, libc::SIGTERM) };
+        Ok(())
+    }
+
+    fn wait_for_watch_release(&self) -> Result<(), WorkerError> {
+        for _ in 0..WATCH_STOP_WAIT_ATTEMPTS {
+            if !self.live_watch()? {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(WATCH_STOP_WAIT_MILLIS));
+        }
+        Ok(())
     }
 
     fn pump_due_locked(&self, now_millis: u64) -> Result<Vec<OriginDelivery>, WorkerError> {
@@ -1296,7 +1416,11 @@ impl<'a> OriginOutbox<'a> {
     fn publish_worker(&self, watch: bool) -> Result<(), WorkerError> {
         let locks = self.store.open_directory("locks", false)?;
         let identity = current_identity()?;
-        let next = OutboxWorkerRecord { identity, watch };
+        let next = OutboxWorkerRecord {
+            identity,
+            watch,
+            binary: BinaryIdentity::from_current_exe(),
+        };
         if locks.entry_exists("outbox-worker.json")? {
             let current: OutboxWorkerRecord = read_json(&locks, "outbox-worker.json")?;
             replace_json(&locks, "outbox-worker.json", &current, &next)
@@ -1372,6 +1496,34 @@ impl DeliveryIntent {
 impl OriginOutbox<'_> {
     pub fn delivery_refs(task_id: TaskId, turn_id: TurnId) -> String {
         delivery_pin_ref(task_id, turn_id)
+    }
+}
+
+pub fn install_watch_stop_signals() -> Result<(), WorkerError> {
+    WATCH_STOP.store(false, Ordering::SeqCst);
+    let handler = request_watch_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        if unsafe { libc::signal(signal, handler) } == libc::SIG_ERR {
+            return Err(WorkerError::Io(io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+extern "C" fn request_watch_stop_signal(_signal: libc::c_int) {
+    WATCH_STOP.store(true, Ordering::SeqCst);
+}
+
+fn watch_should_stop(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::SeqCst) || WATCH_STOP.load(Ordering::SeqCst)
+}
+
+fn interruptible_sleep(stop: &AtomicBool, millis: u64) {
+    let mut remaining = millis;
+    while remaining > 0 && !watch_should_stop(stop) {
+        let chunk = remaining.min(WATCH_STOP_POLL_MILLIS);
+        std::thread::sleep(Duration::from_millis(chunk));
+        remaining = remaining.saturating_sub(chunk);
     }
 }
 

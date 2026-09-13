@@ -70,6 +70,7 @@ pub mod agent;
 pub mod agent_facts;
 pub mod agent_settings;
 pub mod auth_incidents;
+pub mod binary_identity;
 pub mod cli;
 pub mod client_state;
 pub mod config;
@@ -2701,7 +2702,7 @@ fn run_host_outbox(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
     runner: &dyn ProcessRunner,
-    _stdout: &mut dyn Write,
+    stdout: &mut dyn Write,
     watch: bool,
     once: bool,
     enable: bool,
@@ -2734,8 +2735,14 @@ fn run_host_outbox(
             outbox.enable_watch()?;
         }
         if wake {
-            let _ = outbox.wake(&crate::outbox::SystemOutboxLauncher)?;
+            let outcome = match outbox.wake(&crate::outbox::SystemOutboxLauncher)? {
+                crate::outbox::OutboxActivation::Restarted => "restarted",
+                crate::outbox::OutboxActivation::Active => "woken",
+                crate::outbox::OutboxActivation::Inactive => "not_enabled",
+            };
+            writeln!(stdout, "{outcome}").map_err(WorkerError::Io)?;
         } else if watch {
+            crate::outbox::install_watch_stop_signals()?;
             let stop = std::sync::atomic::AtomicBool::new(false);
             outbox.run_watch(&stop, || {
                 std::time::SystemTime::now()

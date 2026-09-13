@@ -8,8 +8,9 @@ use crate::{
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
-        FACTS_REFRESH_FAILED_MESSAGE, HERDR_UNAVAILABLE_MESSAGE, HealthStatus, PROTOCOL_VERSION,
-        ProbeResponse, SetupFailureKind, SetupHostResult, SetupWarning, SetupWarningCode,
+        FACTS_REFRESH_FAILED_MESSAGE, HERDR_UNAVAILABLE_MESSAGE, HealthStatus,
+        OUTBOX_WAKE_FAILED_CODE, PROTOCOL_VERSION, ProbeResponse, SetupFailureKind,
+        SetupHostResult, SetupWarning, SetupWarningCode,
     },
     transport::{SshTransport, ssh_request},
 };
@@ -414,6 +415,8 @@ impl<'a> Installer<'a> {
         }
         warnings.extend(self.success_cleanup_warnings(worker, &id, &digest));
         warnings.extend(herdr_warning);
+        let (outbox, wake_warning) = self.wake_outbox(worker);
+        warnings.extend(wake_warning);
         SetupHostResult {
             name: worker.name.clone(),
             ssh: worker.ssh.clone(),
@@ -423,6 +426,7 @@ impl<'a> Installer<'a> {
             error_message: None,
             failure_kind: None,
             warnings,
+            outbox,
         }
     }
 
@@ -579,6 +583,40 @@ impl<'a> Installer<'a> {
             })
             .into_iter()
             .collect()
+    }
+
+    fn wake_outbox(&self, worker: &WorkerEntry) -> (Option<String>, Option<SetupWarning>) {
+        let request = match ssh_request(worker, outbox_wake_command(), control_policy()) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    Some(format!("failed {OUTBOX_WAKE_FAILED_CODE}")),
+                    Some(SetupWarning {
+                        code: SetupWarningCode::OutboxWakeFailed,
+                        message: error.to_string(),
+                    }),
+                );
+            }
+        };
+        match self.runner.run(&request) {
+            Ok(result) if result.status.success() => {
+                (Some(parse_outbox_wake_stdout(&result.stdout)), None)
+            }
+            Ok(result) => (
+                Some(format!("failed {OUTBOX_WAKE_FAILED_CODE}")),
+                Some(SetupWarning {
+                    code: SetupWarningCode::OutboxWakeFailed,
+                    message: process_failure("outbox wake", &result),
+                }),
+            ),
+            Err(error) => (
+                Some(format!("failed {OUTBOX_WAKE_FAILED_CODE}")),
+                Some(SetupWarning {
+                    code: SetupWarningCode::OutboxWakeFailed,
+                    message: format!("failed to launch outbox wake: {error}"),
+                }),
+            ),
+        }
     }
 
     /// Roll back a promoted helper that did not pass verification. Layout
@@ -1008,6 +1046,21 @@ digest_regular_file "$worker_path" || exit 77
 "$worker_path" host migrate-layout || exit 77
 "$worker_path" host refresh-facts"#;
 
+const OUTBOX_WAKE_BODY: &str = r#"set -eu
+LC_ALL=C
+export LC_ALL
+umask 077
+home_root=$(cd -P "$HOME" 2>/dev/null && /bin/pwd -P) || exit 1
+[ -n "$home_root" ] || exit 1
+worker_path="$home_root/.local/bin/worker"
+[ ! -L "$worker_path" ] && [ -f "$worker_path" ] || exit 1
+enabled="$home_root/.local/share/mac-worker/host/locks/outbox-enabled.json"
+if [ ! -f "$enabled" ]; then
+    printf '%s\n' not_enabled
+    exit 0
+fi
+exec "$worker_path" host outbox --wake"#;
+
 const VERIFICATION_BODY: &str = r#"resolve_locked_context || exit 76
 require_exact_file "$transaction/state" promoted 8 || exit 77
 require_absent "$transaction/worker.new" || exit 77
@@ -1193,6 +1246,10 @@ fn success_cleanup_command(id: &str, digest: &str) -> String {
     )
 }
 
+fn outbox_wake_command() -> String {
+    OUTBOX_WAKE_BODY.to_owned()
+}
+
 fn rollback_command(id: &str) -> String {
     locked_command(id, ROLLBACK_BODY)
 }
@@ -1334,6 +1391,16 @@ fn process_failure(operation: &str, result: &ProcessResult) -> String {
     }
 }
 
+fn parse_outbox_wake_stdout(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    match line {
+        "woken" | "restarted" | "not_enabled" => line.to_owned(),
+        other if other.starts_with("failed ") => other.to_owned(),
+        _ => "woken".to_owned(),
+    }
+}
+
 fn failed(
     worker: &WorkerEntry,
     code: &str,
@@ -1350,5 +1417,6 @@ fn failed(
         error_message: Some(message),
         failure_kind: Some(failure_kind),
         warnings,
+        outbox: None,
     }
 }
