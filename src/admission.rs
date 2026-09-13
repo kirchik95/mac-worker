@@ -1248,9 +1248,13 @@ mod tests {
         let planted = plant_stale_ready(&store, &mini1);
         let runner = ScriptedRunner::new();
         runner.facts_age("mac1", FACTS_TTL + 1);
-        runner.delay("mac1", Duration::from_millis(40));
-        runner.delay_refresh("mac1", Duration::from_millis(80));
-        let remaining = Duration::from_millis(120);
+        // Probe + refresh consume exactly the round budget, so the re-probe
+        // after the refresh has no budget left. Keep the margins wide: on a
+        // loaded CI runner the probe path alone once cost more than 80 ms and
+        // the refresh never started (the first push run of the CI workflow).
+        runner.delay("mac1", Duration::from_millis(200));
+        runner.delay_refresh("mac1", Duration::from_millis(400));
+        let remaining = Duration::from_millis(600);
         let outcome = worker_pipeline_inner(
             &runner,
             &config,
