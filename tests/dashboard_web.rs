@@ -278,11 +278,19 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
     let server = DashboardHttpServer::bind(None, state).await.unwrap();
     let host = listener_host(&server);
 
+    // Wait for the complete expected state, not just mini-3: a collection
+    // that fails as a whole marks every worker stale until the next good
+    // round, and the CI runner has shown exactly that transient. On timeout
+    // the helper prints the body, so `collection.errors` names the cause.
     let snapshot_json = wait_for_snapshot_matching(&host, |snapshot| {
-        snapshot["workers"]
-            .as_array()
-            .is_some_and(|workers| workers.len() == 3 && workers[2]["freshness"] == "stale")
+        snapshot["workers"].as_array().is_some_and(|workers| {
+            workers.len() == 3
+                && workers[0]["freshness"] == "current"
+                && workers[1]["freshness"] == "current"
+                && workers[2]["freshness"] == "stale"
+        })
     });
+    assert_eq!(snapshot_json["collection"]["freshness"], "current");
     assert_eq!(snapshot_json["workers"][0]["freshness"], "current");
     assert_eq!(snapshot_json["workers"][1]["freshness"], "current");
     assert_eq!(snapshot_json["workers"][2]["freshness"], "stale");
