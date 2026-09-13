@@ -55,6 +55,10 @@ const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 #[doc(hidden)]
 pub const SUPERVISOR_TERM_GRACE: Duration = Duration::from_secs(10);
 const TERM_GRACE: Duration = SUPERVISOR_TERM_GRACE;
+/// After the child exits, wait this long for stdout/stderr EOF before
+/// recording whatever the pumps actually copied. Escaped writers that keep a
+/// pipe open must not block terminal publication forever.
+const JOB_LOG_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const SUPERVISOR_LOG_NAME: &str = "supervisor.log";
 pub(crate) const MAX_SUPERVISOR_LOG_BYTES: u64 = 1024;
 /// Longest error message kept beside its code in `supervisor.log`.
@@ -1545,11 +1549,39 @@ impl<'a> Supervisor<'a> {
             }
         };
 
+        let stdout_pipe = match Pipe::cloexec() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                return self.finish_owned_prelaunch_failure(
+                    &lease,
+                    &job,
+                    &status_bytes,
+                    &status,
+                    guard,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
+        let stderr_pipe = match Pipe::cloexec() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                return self.finish_owned_prelaunch_failure(
+                    &lease,
+                    &job,
+                    &status_bytes,
+                    &status,
+                    guard,
+                    "LOG_BINDING_INVALID",
+                    WorkerError::Io(error),
+                );
+            }
+        };
         let mut child = match GatedChild::spawn(
             &command,
             cwd.raw_directory_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdout_pipe.write.as_raw_fd(),
+            stderr_pipe.write.as_raw_fd(),
             self.inspector,
         ) {
             Ok(child) => child,
@@ -1566,8 +1598,33 @@ impl<'a> Supervisor<'a> {
                 );
             }
         };
+        drop(stdout_pipe.write);
+        drop(stderr_pipe.write);
+        let mut pumps = match JobIoPumps::start(
+            File::from(stdout_pipe.read),
+            stdout,
+            File::from(stderr_pipe.read),
+            stderr,
+        ) {
+            Ok(pumps) => pumps,
+            Err(error) => {
+                let abort = child.abort_and_reap();
+                let result = self.finish_owned_prelaunch_failure(
+                    &lease,
+                    &job,
+                    &status_bytes,
+                    &status,
+                    guard,
+                    "LOG_BINDING_INVALID",
+                    error,
+                );
+                let _ = abort;
+                return result;
+            }
+        };
         if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
             let abort_result = child.abort_and_reap();
+            let _ = pumps.stop_and_join();
             let terminal = match erase_payload_and_record_prelaunch(
                 self.store,
                 &lease,
@@ -1624,6 +1681,7 @@ impl<'a> Supervisor<'a> {
                         Ok(())
                     }
                 });
+                let _ = pumps.stop_and_join();
                 let terminal = match erase_payload_and_record_prelaunch(
                     self.store,
                     &lease,
@@ -1649,6 +1707,7 @@ impl<'a> Supervisor<'a> {
         status_bytes = canonical_json(&status)?;
         if self.fault == Some(SupervisorFaultPoint::AfterChildIdentity) {
             let abort_result = child.abort_and_reap();
+            let _ = pumps.stop_and_join();
             let terminal = match erase_payload_and_record_prelaunch(
                 self.store,
                 &lease,
@@ -1678,22 +1737,29 @@ impl<'a> Supervisor<'a> {
         };
         if let Err(error) = payload_removal {
             child.abort();
-            let _ = record_prelaunch_failure(
-                self.store,
-                &lease,
-                &mut guard,
-                &job,
-                &status_bytes,
-                &status,
-                &stdout,
-                &stderr,
-                "PAYLOAD_ERASURE_FAILED",
-            );
+            let _ = pumps.stop_and_join();
+            if let (Ok(stdout), Ok(stderr)) = (
+                job.open_private_append("stdout.log"),
+                job.open_private_append("stderr.log"),
+            ) {
+                let _ = record_prelaunch_failure(
+                    self.store,
+                    &lease,
+                    &mut guard,
+                    &job,
+                    &status_bytes,
+                    &status,
+                    &stdout,
+                    &stderr,
+                    "PAYLOAD_ERASURE_FAILED",
+                );
+            }
             drop(guard);
             return Err(WorkerError::Io(error));
         }
         if self.fault == Some(SupervisorFaultPoint::AfterPayloadErase) {
             let abort_result = child.abort_and_reap();
+            let _ = pumps.stop_and_join();
             drop(guard);
             abort_result?;
             return Err(injected_supervisor_fault("payload erasure"));
@@ -1703,6 +1769,9 @@ impl<'a> Supervisor<'a> {
             Ok(()) => {}
             Err(ExecStartError::ProvenPrelaunch { code, error }) => {
                 child.abort();
+                let _ = pumps.stop_and_join();
+                let stdout = job.open_private_append("stdout.log")?;
+                let stderr = job.open_private_append("stderr.log")?;
                 let terminal = prelaunch_terminal(
                     self.store,
                     &lease,
@@ -1726,8 +1795,7 @@ impl<'a> Supervisor<'a> {
                     &job,
                     &status_bytes,
                     &status,
-                    &stdout,
-                    &stderr,
+                    &mut pumps,
                     child_identity,
                     lease.timeout_millis(),
                     self.inspector,
@@ -1769,8 +1837,7 @@ impl<'a> Supervisor<'a> {
                     &job,
                     &status_bytes,
                     &status,
-                    &stdout,
-                    &stderr,
+                    &mut pumps,
                     child_identity,
                     lease.timeout_millis(),
                     self.inspector,
@@ -1794,9 +1861,11 @@ impl<'a> Supervisor<'a> {
                 remaining_lease_millis(&lease)?,
                 self.inspector,
             )?;
+            let _ = pumps.stop_and_join();
             return Err(injected_supervisor_fault("running status"));
         }
         if self.fault == Some(SupervisorFaultPoint::CrashAfterRunning) {
+            let _ = pumps.stop_and_join();
             return Err(injected_supervisor_fault("running crash"));
         }
 
@@ -1812,6 +1881,7 @@ impl<'a> Supervisor<'a> {
         // in that case do not touch stale status/log capabilities.
         let admission = self.store.admission_lock(job_id)?;
         let Some(mut guard) = self.store.supervisor_lock_after(&admission, job_id, true)? else {
+            let _ = pumps.stop_and_join();
             return Err(protocol_code(
                 "SUPERVISOR_LOCK_UNAVAILABLE",
                 "supervisor lock was unavailable after running handoff",
@@ -1825,6 +1895,7 @@ impl<'a> Supervisor<'a> {
             Ok(Some(live)) if live == lease => {
                 let values = self.revalidate_running_handoff(&lease, &status, &live)?;
                 if values.2.state().is_terminal() {
+                    let _ = pumps.stop_and_join();
                     drop(guard);
                     drop(admission);
                     return Ok(());
@@ -1832,6 +1903,7 @@ impl<'a> Supervisor<'a> {
                 values
             }
             Ok(Some(_)) => {
+                let _ = pumps.stop_and_join();
                 drop(guard);
                 drop(admission);
                 return Err(protocol_code(
@@ -1843,6 +1915,7 @@ impl<'a> Supervisor<'a> {
             // supervisor returns from its intentional unlocked wait. It owns
             // the terminal state now, so leave it untouched.
             Ok(None) => {
+                let _ = pumps.stop_and_join();
                 drop(guard);
                 drop(admission);
                 return Ok(());
@@ -1859,6 +1932,7 @@ impl<'a> Supervisor<'a> {
                 // the failure as before.
                 let values = self.revalidate_running_handoff(&lease, &status, &lease)?;
                 if values.2.state().is_terminal() {
+                    let _ = pumps.stop_and_join();
                     drop(guard);
                     drop(admission);
                     return Ok(());
@@ -1868,6 +1942,7 @@ impl<'a> Supervisor<'a> {
         };
         drop(admission);
 
+        let pump_result = pumps.drain_after_wait(outcome)?;
         let stdout = current_job.open_private_append("stdout.log")?;
         let stderr = current_job.open_private_append("stderr.log")?;
         stdout.sync_all()?;
@@ -1877,6 +1952,12 @@ impl<'a> Supervisor<'a> {
         }
         let stdout_length = current_job.validate_private_append_binding("stdout.log", &stdout)?;
         let stderr_length = current_job.validate_private_append_binding("stderr.log", &stderr)?;
+        if stdout_length != pump_result.stdout_bytes || stderr_length != pump_result.stderr_bytes {
+            return Err(protocol_code(
+                "LOG_BINDING_INVALID",
+                "job log length differs from pump accounting",
+            ));
+        }
         let terminal = match outcome {
             ChildOutcome::Exited(0) => {
                 status.into_succeeded(now_millis()?, stdout_length, stderr_length)?
@@ -2520,7 +2601,10 @@ impl<'a> Supervisor<'a> {
 
         // The handoff guard fences cancellation while the pumps are stopped and
         // the final log lengths are measured for terminal publication.
-        let pump_result = pump.stop_and_join()?;
+        let pump_result = match outcome {
+            ChildOutcome::Exited(_) => pump.join_until_eof()?,
+            ChildOutcome::Signalled(_) | ChildOutcome::TimedOut => pump.stop_and_join()?,
+        };
         let stderr = current_job.open_private_append("stderr.log")?;
         stderr.sync_all()?;
         let stderr_length = current_job.validate_private_append_binding("stderr.log", &stderr)?;
@@ -3217,6 +3301,7 @@ struct StreamPumpConfig {
     cap: u64,
     tail: usize,
     post_stop_drain: u64,
+    post_stop_idle: Duration,
     read_chunk: usize,
 }
 
@@ -3226,6 +3311,7 @@ impl StreamPumpConfig {
             cap: crate::turn::LOG_CAP_BYTES,
             tail: crate::turn::LOG_TAIL_BYTES,
             post_stop_drain: crate::turn::LOG_TAIL_BYTES as u64,
+            post_stop_idle: Duration::from_millis(50),
             read_chunk: 64 * 1024,
         }
     }
@@ -3283,6 +3369,10 @@ impl TurnOutputPump {
 
     fn stop_and_join(&mut self) -> Result<TurnPumpResult, WorkerError> {
         self.stop.store(true, Ordering::Release);
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<TurnPumpResult, WorkerError> {
         let join = self.join.take().ok_or_else(|| {
             protocol_code("TURN_PUMP_INVALID", "turn output pump was joined twice")
         })?;
@@ -3322,6 +3412,20 @@ impl TurnIoPumps {
             log_truncated: stdout.stdout_truncated || stderr.truncated,
         })
     }
+
+    fn join_until_eof(&mut self) -> Result<TurnPumpResult, WorkerError> {
+        arm_drain_watchdog(&self.stdout.stop, JOB_LOG_DRAIN_GRACE);
+        arm_drain_watchdog(&self.stderr.stop, JOB_LOG_DRAIN_GRACE);
+        let stdout = self.stdout.join();
+        let stderr = self.stderr.join();
+        let stderr = stderr?;
+        let stdout = stdout?;
+        Ok(TurnPumpResult {
+            stdout_bytes: stdout.stdout_bytes,
+            stdout_truncated: stdout.stdout_truncated,
+            log_truncated: stdout.stdout_truncated || stderr.truncated,
+        })
+    }
 }
 
 struct TurnStderrPump {
@@ -3350,6 +3454,10 @@ impl TurnStderrPump {
 
     fn stop_and_join(&mut self) -> Result<StderrPumpResult, WorkerError> {
         self.stop.store(true, Ordering::Release);
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<StderrPumpResult, WorkerError> {
         let join = self.join.take().ok_or_else(|| {
             protocol_code("TURN_PUMP_INVALID", "turn stderr pump was joined twice")
         })?;
@@ -3372,6 +3480,166 @@ impl Drop for TurnStderrPump {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobPumpResult {
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+}
+
+struct JobStreamPump {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<u64, WorkerError>>>,
+}
+
+impl JobStreamPump {
+    fn start(read: File, mut dest: File, name: &'static str) -> Result<Self, WorkerError> {
+        set_nonblocking(read.as_raw_fd())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || pump_job_stream(read, &mut dest, &thread_stop))
+            .map_err(WorkerError::Io)?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<u64, WorkerError> {
+        self.stop.store(true, Ordering::Release);
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<u64, WorkerError> {
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| protocol_code("TURN_PUMP_INVALID", "job log pump was joined twice"))?;
+        match join.join() {
+            Ok(result) => result,
+            Err(_) => Err(protocol_code(
+                "TURN_PUMP_FAILED",
+                "job log pump thread panicked",
+            )),
+        }
+    }
+}
+
+impl Drop for JobStreamPump {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            self.stop.store(true, Ordering::Release);
+            let _ = join.join();
+        }
+    }
+}
+
+struct JobIoPumps {
+    stdout: JobStreamPump,
+    stderr: JobStreamPump,
+}
+
+impl JobIoPumps {
+    fn start(
+        stdout_read: File,
+        stdout: File,
+        stderr_read: File,
+        stderr: File,
+    ) -> Result<Self, WorkerError> {
+        let stdout = JobStreamPump::start(stdout_read, stdout, "mac-worker-job-stdout-pump")?;
+        let stderr = match JobStreamPump::start(stderr_read, stderr, "mac-worker-job-stderr-pump") {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                let mut stdout = stdout;
+                let _ = stdout.stop_and_join();
+                return Err(error);
+            }
+        };
+        Ok(Self { stdout, stderr })
+    }
+
+    fn stop_and_join(&mut self) -> Result<JobPumpResult, WorkerError> {
+        let stdout = self.stdout.stop_and_join();
+        let stderr = self.stderr.stop_and_join();
+        Ok(JobPumpResult {
+            stdout_bytes: stdout?,
+            stderr_bytes: stderr?,
+        })
+    }
+
+    fn join_until_eof(&mut self) -> Result<JobPumpResult, WorkerError> {
+        arm_drain_watchdog(&self.stdout.stop, JOB_LOG_DRAIN_GRACE);
+        arm_drain_watchdog(&self.stderr.stop, JOB_LOG_DRAIN_GRACE);
+        let stdout = self.stdout.join();
+        let stderr = self.stderr.join();
+        Ok(JobPumpResult {
+            stdout_bytes: stdout?,
+            stderr_bytes: stderr?,
+        })
+    }
+
+    fn drain_after_wait(&mut self, outcome: ChildOutcome) -> Result<JobPumpResult, WorkerError> {
+        match outcome {
+            ChildOutcome::Exited(_) => self.join_until_eof(),
+            ChildOutcome::Signalled(_) | ChildOutcome::TimedOut => self.stop_and_join(),
+        }
+    }
+}
+
+fn arm_drain_watchdog(stop: &Arc<AtomicBool>, grace: Duration) {
+    let stop = Arc::clone(stop);
+    let _ = std::thread::Builder::new()
+        .name("mac-worker-drain-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            stop.store(true, Ordering::Release);
+        });
+}
+
+fn pump_job_stream(mut read: File, dest: &mut File, stop: &AtomicBool) -> Result<u64, WorkerError> {
+    let mut stored = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut idle_since = None;
+    loop {
+        match read.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                idle_since = None;
+                dest.write_all(&buffer[..count]).map_err(WorkerError::Io)?;
+                stored += count as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !pump_should_keep_idling(
+                    stop.load(Ordering::Acquire),
+                    &mut idle_since,
+                    Duration::from_millis(50),
+                ) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+    }
+    dest.sync_all().map_err(WorkerError::Io)?;
+    Ok(stored)
+}
+
+fn pump_should_keep_idling(
+    stopping: bool,
+    idle_since: &mut Option<Instant>,
+    grace: Duration,
+) -> bool {
+    if !stopping {
+        *idle_since = None;
+        return true;
+    }
+    let started = idle_since.get_or_insert_with(Instant::now);
+    started.elapsed() < grace
+}
+
 fn pump_stderr_output(
     mut read: File,
     stderr: &mut File,
@@ -3384,10 +3652,12 @@ fn pump_stderr_output(
     let mut buffer = vec![0_u8; config.read_chunk.max(1)];
     let mut stopping = false;
     let mut after_stop = 0_u64;
+    let mut idle_since = None;
     loop {
         match read.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                idle_since = None;
                 let take = match take_post_stop_bytes(
                     count,
                     stopping,
@@ -3418,7 +3688,11 @@ fn pump_stderr_output(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::Acquire) || stopping {
+                if !pump_should_keep_idling(
+                    stop.load(Ordering::Acquire) || stopping,
+                    &mut idle_since,
+                    config.post_stop_idle,
+                ) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3500,11 +3774,13 @@ fn pump_turn_output(
     let mut buffer = vec![0_u8; config.read_chunk.max(1)];
     let mut stopping = false;
     let mut after_stop = 0_u64;
+    let mut idle_since = None;
 
     loop {
         match read.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                idle_since = None;
                 let take = match take_post_stop_bytes(
                     count,
                     stopping,
@@ -3546,7 +3822,11 @@ fn pump_turn_output(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::Acquire) || stopping {
+                if !pump_should_keep_idling(
+                    stop.load(Ordering::Acquire) || stopping,
+                    &mut idle_since,
+                    config.post_stop_idle,
+                ) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3642,6 +3922,14 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+fn clear_nonblocking(fd: RawFd) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) >= 0 }
+}
+
 fn stop_turn_pump(pump: &mut TurnIoPumps) -> Result<TurnPumpResult, WorkerError> {
     std::thread::sleep(Duration::from_secs(1));
     pump.stop_and_join()
@@ -3678,6 +3966,9 @@ unsafe fn gated_child_main(
         || unsafe { libc::dup2(stdin, libc::STDIN_FILENO) } < 0
         || unsafe { libc::dup2(stdout, libc::STDOUT_FILENO) } < 0
         || unsafe { libc::dup2(stderr, libc::STDERR_FILENO) } < 0
+        || !clear_nonblocking(libc::STDIN_FILENO)
+        || !clear_nonblocking(libc::STDOUT_FILENO)
+        || !clear_nonblocking(libc::STDERR_FILENO)
     {
         unsafe { child_fail(exec_result) };
     }
@@ -4154,18 +4445,20 @@ fn finish_ambiguous_child(
     job: &RootedDir,
     expected_bytes: &[u8],
     status: &JobStatus,
-    stdout: &File,
-    stderr: &File,
+    pumps: &mut JobIoPumps,
     child_identity: ProcessIdentity,
     timeout_millis: u64,
     inspector: &dyn ProcessInspector,
     code: &str,
 ) -> Result<JobStatus, WorkerError> {
     let _ = wait_for_child(child_identity, timeout_millis, inspector)?;
+    let _ = pumps.stop_and_join();
+    let stdout = job.open_private_append("stdout.log")?;
+    let stderr = job.open_private_append("stderr.log")?;
     stdout.sync_all()?;
     stderr.sync_all()?;
-    let stdout_length = job.validate_private_append_binding("stdout.log", stdout)?;
-    let stderr_length = job.validate_private_append_binding("stderr.log", stderr)?;
+    let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
+    let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
     let terminal = status.into_infrastructure_terminal(
         JobState::Lost,
         now_millis()?,
@@ -4796,6 +5089,7 @@ mod tests {
             cap: 64,
             tail: 32,
             post_stop_drain: 256,
+            post_stop_idle: Duration::from_millis(20),
             read_chunk: 32,
         }
     }
@@ -4903,6 +5197,23 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "pump waited {elapsed:?} for an escaped stderr writer"
         );
+    }
+
+    #[test]
+    fn job_pump_copies_stderr_written_after_the_writer_pauses() {
+        let temp = tempfile::tempdir().unwrap();
+        let (read, mut writer) = open_pipe();
+        let stderr_path = temp.path().join("stderr.log");
+        let stderr = File::create(&stderr_path).unwrap();
+        let mut pump = JobStreamPump::start(read, stderr, "test-job-stderr-pump").unwrap();
+        writer.write_all(&[0; 17]).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        writer.write_all(&[0; 65_545]).unwrap();
+        drop(writer);
+        arm_drain_watchdog(&pump.stop, JOB_LOG_DRAIN_GRACE);
+        let stored = pump.join().unwrap();
+        assert_eq!(stored, 17 + 65_545);
+        assert_eq!(fs::read(&stderr_path).unwrap().len(), 17 + 65_545);
     }
 
     struct RejectingInspector {

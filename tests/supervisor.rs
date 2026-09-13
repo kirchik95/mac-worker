@@ -2305,6 +2305,43 @@ fn real_execution_records_exit_signal_timeout_and_binary_split_logs() {
 }
 
 #[test]
+fn terminal_status_counts_stderr_written_after_the_leader_exits() {
+    // The leader writes stdout, then exits while a setsid grandchild still
+    // holds stderr and writes after a short delay. Accounting that stats the
+    // log as soon as waitpid returns records zero; joining the copy until EOF
+    // (with a bound for a writer that never closes) keeps the late bytes.
+    let temp = tempfile::tempdir().unwrap();
+    let stdout_length = 65_536 + 17;
+    let stderr_length = 65_536 + 9;
+    let command = CommandSpec::argv(vec![
+        "/usr/bin/python3".into(),
+        "-c".into(),
+        format!(
+            "import os, time\nos.write(1, b'\\0' * {stdout_length})\nchild = os.fork()\nif child == 0:\n    os.setsid()\n    time.sleep(0.2)\n    os.write(2, b'\\0' * {stderr_length})\n    os._exit(0)\nos._exit(0)\n"
+        ),
+    ])
+    .unwrap();
+    let (store, _lease, request) =
+        prepared_host_with_command(&temp.path().join("late-stderr"), command);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(
+        response.status().final_stdout_bytes(),
+        Some(stdout_length as u64)
+    );
+    assert_eq!(
+        response.status().final_stderr_bytes(),
+        Some(stderr_length as u64)
+    );
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
 fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent() {
     let temp = tempfile::tempdir().unwrap();
     let command = CommandSpec::argv(vec![

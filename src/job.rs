@@ -2247,7 +2247,12 @@ pub struct JobStatus {
     child_start_identity: Option<u64>,
     exit_code: Option<u8>,
     terminating_signal: Option<u32>,
+    /// Bytes copied into stdout.log once the job is terminal. Published only
+    /// after the child has exited and the stdout copy has reached EOF, or after
+    /// the bounded drain when a holder never closes the pipe.
     final_stdout_bytes: Option<u64>,
+    /// Bytes copied into stderr.log once the job is terminal. Same EOF-or-bound
+    /// publication rule as `final_stdout_bytes`.
     final_stderr_bytes: Option<u64>,
     error_code: Option<String>,
     cleanup_error_code: Option<String>,
