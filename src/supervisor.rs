@@ -3579,11 +3579,11 @@ impl JobIoPumps {
         })
     }
 
-    fn drain_after_wait(&mut self, outcome: ChildOutcome) -> Result<JobPumpResult, WorkerError> {
-        match outcome {
-            ChildOutcome::Exited(_) => self.join_until_eof(),
-            ChildOutcome::Signalled(_) | ChildOutcome::TimedOut => self.stop_and_join(),
-        }
+    fn drain_after_wait(&mut self, _outcome: ChildOutcome) -> Result<JobPumpResult, WorkerError> {
+        // Every wait outcome has already reaped the leader. Join until EOF so
+        // last pipe bytes reach the log before terminal status; the drain
+        // watchdog still bounds a grandchild that never closes the write end.
+        self.join_until_eof()
     }
 }
 
@@ -5214,6 +5214,30 @@ mod tests {
         let stored = pump.join().unwrap();
         assert_eq!(stored, 17 + 65_545);
         assert_eq!(fs::read(&stderr_path).unwrap().len(), 17 + 65_545);
+    }
+
+    #[test]
+    fn job_pump_drains_a_one_byte_write_before_timeout_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let (stdout_read, mut stdout_writer) = open_pipe();
+        let (stderr_read, stderr_writer) = open_pipe();
+        let stdout_path = temp.path().join("stdout.log");
+        let stderr_path = temp.path().join("stderr.log");
+        let mut pumps = JobIoPumps::start(
+            stdout_read,
+            File::create(&stdout_path).unwrap(),
+            stderr_read,
+            File::create(&stderr_path).unwrap(),
+        )
+        .unwrap();
+        stdout_writer.write_all(b"x").unwrap();
+        drop(stdout_writer);
+        drop(stderr_writer);
+        let result = pumps.drain_after_wait(ChildOutcome::TimedOut).unwrap();
+        assert_eq!(result.stdout_bytes, 1);
+        assert_eq!(result.stderr_bytes, 0);
+        assert_eq!(fs::read(&stdout_path).unwrap(), b"x");
+        assert_eq!(fs::read(&stderr_path).unwrap(), b"");
     }
 
     struct RejectingInspector {

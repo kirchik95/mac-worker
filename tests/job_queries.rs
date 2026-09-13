@@ -3320,7 +3320,7 @@ fn terminal_statuses_remain_authoritative_after_the_lease_is_released() {
 fn post_release_success_binds_nonempty_stdout_to_the_recorded_length() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("terminal-output");
-    let (store, lease, request) = prepared_host_with_command(
+    let (store, lease, request) = prepared_host_with_live_command(
         &root,
         CommandSpec::argv(vec!["/usr/bin/printf".into(), "hello".into()]).unwrap(),
     );
@@ -3453,7 +3453,7 @@ fn read_log_returns_bounded_binary_chunks_from_independent_fixed_streams() {
 fn status_logs_returns_a_terminal_tail_and_rejects_an_offset_beyond_eof() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("status-logs-terminal-tail");
-    let (store, lease, request) = prepared_host_with_command(
+    let (store, lease, request) = prepared_host_with_live_command(
         &root,
         CommandSpec::argv(vec!["/usr/bin/printf".into(), "endpoint-log".into()]).unwrap(),
     );
@@ -3748,7 +3748,7 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
         "/usr/bin/head -c {stdout_length} /dev/zero; /usr/bin/head -c {stderr_length} /dev/zero >&2"
     ))
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&root, command);
+    let (store, lease, request) = prepared_host_with_live_command(&root, command);
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
@@ -3810,6 +3810,34 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
     assert!(!drain.is_complete());
     drain.revalidate_terminal_status(&terminal).unwrap();
     assert!(drain.is_complete());
+}
+
+#[test]
+fn terminal_status_is_published_after_one_byte_stdout_and_redirected_marker() {
+    // The retry test's empty marker (`left: []`, `right: [120]`) and the log
+    // drain's `final_stderr_bytes = Some(0)` are the same ordering: terminal
+    // status published before the child's last write is durable.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("one-byte-stdout-marker");
+    let marker = temp.path().join("one-byte-marker");
+    let marker_arg = marker.to_string_lossy().replace('\'', "'\\\"'\\\"'");
+    let command =
+        CommandSpec::shell(format!("/usr/bin/printf x | /usr/bin/tee '{marker_arg}'")).unwrap();
+    let (store, lease, request) = prepared_host_with_live_command(&root, command);
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let submitted = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    assert_eq!(submitted.status().state(), JobState::Succeeded);
+    assert_eq!(submitted.status().final_stdout_bytes(), Some(1));
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"x");
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 }
 
 #[test]
@@ -4416,10 +4444,13 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
     // Break caught: submit checks for a live lease before durable Accepted
     // authority, so an exact retry after legitimate terminal cleanup becomes
     // LEASE_MISSING and immutable conflicts are masked by the same error.
+    // The marker byte is the child's last write: publishing terminal before
+    // that write is durable is the same ordering race as under-counted
+    // stderr in terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("terminal-submit-retry");
     let marker = temp.path().join("terminal-submit-marker");
-    let (store, lease, request) = prepared_host_with_command(&root, matrix_command(&marker));
+    let (store, lease, request) = prepared_host_with_live_command(&root, matrix_command(&marker));
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
@@ -4427,6 +4458,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
         .submit_at(request.clone(), 10)
         .unwrap();
     assert!(original.status().state().is_terminal());
+    assert_eq!(original.status().state(), JobState::Succeeded);
     assert_eq!(fs::read(&marker).unwrap(), b"x");
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 
@@ -4587,7 +4619,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
         let corrupt_root = temp.path().join(format!("corrupt-terminal-{index}"));
         let corrupt_marker = temp.path().join(format!("corrupt-marker-{index}"));
         let (corrupt_store, corrupt_lease, corrupt_request) =
-            prepared_host_with_command(&corrupt_root, matrix_command(&corrupt_marker));
+            prepared_host_with_live_command(&corrupt_root, matrix_command(&corrupt_marker));
         let corrupt_launcher = InlineSupervisorLauncher {
             store: corrupt_store.clone(),
         };
@@ -4640,7 +4672,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("terminal-retry-unrelated-lease");
     let marker = temp.path().join("terminal-retry-unrelated-marker");
-    let (store, _lease, request) = prepared_host_with_command(&root, matrix_command(&marker));
+    let (store, _lease, request) = prepared_host_with_live_command(&root, matrix_command(&marker));
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
@@ -4648,6 +4680,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
         .submit_at(request.clone(), 10)
         .unwrap();
     assert!(original.status().state().is_terminal());
+    assert_eq!(original.status().state(), JobState::Succeeded);
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 
     let unrelated = lease_request_with_identity(
@@ -5869,7 +5902,7 @@ fn endpoint_runtime_and_completed_job(
     temp: &tempfile::TempDir,
 ) -> (RuntimeContext, SubmitRequest, StatusResponse) {
     let (runtime, paths) = endpoint_runtime_and_paths(temp);
-    let (store, _lease, submit) = prepared_host_with_command(
+    let (store, _lease, submit) = prepared_host_with_live_command(
         &paths.host_state_root(),
         CommandSpec::argv(vec!["/usr/bin/printf".into(), "endpoint-log".into()]).unwrap(),
     );
@@ -8313,11 +8346,40 @@ fn prepared_host_with_command(
     (store, lease, request)
 }
 
+fn prepared_host_with_live_command(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    // Supervisor::wait_for_child subtracts wall-clock now from expires_at.
+    // Epoch-one prepared_host saturates remaining_lease_millis to 0, so a
+    // still-starting child is SIGTERM'd before its last write — the same
+    // ordering that recorded final_stderr_bytes=0 and an empty retry marker
+    // on macos-15. Identity tests keep acquire-at-1 so they can assert
+    // expires_at=30_001.
+    let store = HostStore::open(root).unwrap();
+    let now = matrix_execution_now_millis();
+    let (lease, request) = prepared_host_on_at(&store, JOB_ID, LEASE_TOKEN, 10, now, now, command);
+    (store, lease, request)
+}
+
 fn prepared_host_on(
     store: &HostStore,
     job_id: &str,
     lease_token: &str,
     created_at_millis: u64,
+    command: CommandSpec,
+) -> (LeaseRecord, SubmitRequest) {
+    prepared_host_on_at(store, job_id, lease_token, created_at_millis, 1, 2, command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_host_on_at(
+    store: &HostStore,
+    job_id: &str,
+    lease_token: &str,
+    created_at_millis: u64,
+    acquire_now: u64,
+    verify_now: u64,
     command: CommandSpec,
 ) -> (LeaseRecord, SubmitRequest) {
     let manifest = valid_manifest_bytes();
@@ -8340,7 +8402,7 @@ fn prepared_host_on(
         .unwrap(),
     );
     let lease = match LeaseService::new(store)
-        .acquire(&acquire, &healthy(), 1)
+        .acquire(&acquire, &healthy(), acquire_now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -8371,7 +8433,7 @@ fn prepared_host_on(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, 2)
+        .verify_and_promote_at(&lease, &digest, verify_now)
         .unwrap();
     (lease, SubmitRequest::new(acquire.material().clone()))
 }

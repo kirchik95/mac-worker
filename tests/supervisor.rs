@@ -2342,6 +2342,29 @@ fn terminal_status_counts_stderr_written_after_the_leader_exits() {
 }
 
 #[test]
+fn terminal_status_includes_a_one_byte_stdout_write_before_publication() {
+    // Same publication order as terminal_accepted_submit_retry_after_lease_retirement:
+    // the child's one-byte write must be in the log before terminal status.
+    let temp = tempfile::tempdir().unwrap();
+    let command = CommandSpec::argv(vec!["/usr/bin/printf".into(), "x".into()]).unwrap();
+    let (store, lease, request) =
+        prepared_host_with_command(&temp.path().join("one-byte-stdout"), command);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_at(request, 10)
+        .unwrap();
+    assert_eq!(response.status().state(), JobState::Succeeded);
+    assert_eq!(response.status().final_stdout_bytes(), Some(1));
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"x");
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+}
+
+#[test]
 fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent() {
     let temp = tempfile::tempdir().unwrap();
     let command = CommandSpec::argv(vec![
