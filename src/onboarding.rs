@@ -40,6 +40,10 @@ pub struct InitReport {
     pub config_path: PathBuf,
     pub steps: Vec<InitStep>,
     pub next_steps: Vec<String>,
+    /// Origin-outbox wake after a helper install. Omitted when init did not
+    /// install (the helper was already ready).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbox: Option<String>,
     #[serde(skip)]
     pub exit_kind: Option<ExitKind>,
 }
@@ -84,6 +88,9 @@ impl InitReport {
                 "  {} {}{}: {}",
                 step.status, step.name, code, step.message
             ));
+        }
+        if let Some(outbox) = &self.outbox {
+            lines.push(format!("  outbox: {outbox}"));
         }
         lines.push(String::new());
         lines.push(if self.ready {
@@ -179,6 +186,7 @@ pub fn initialize(
         config_path: config_path.into(),
         steps: Vec::new(),
         next_steps: Vec::new(),
+        outbox: None,
         exit_kind: None,
     };
     let options = format!(
@@ -256,6 +264,7 @@ pub fn initialize(
             report.blocked("helper", setup.error_code.as_deref().unwrap_or("INSTALL_FAILED"), "The helper could not be installed. The worker configuration is saved.", vec!["Installation recovery: https://github.com/kirchik95/mac-worker/blob/main/docs/setup-recovery.md".into(), format!("After resolving the reported error: {retry}")], setup.failure_kind.map_or(ExitKind::Infrastructure, |k| k.exit_kind()));
             return Ok(report);
         }
+        report.outbox = setup.outbox;
     }
     report.passed("helper", "Compatible helper installed");
     if transport.refresh_facts(&worker).is_err() {

@@ -327,11 +327,19 @@ fn init_installs_a_missing_helper_through_the_transactional_installer() {
         reply(0, ""), // Standalone host refresh-facts (migrate-layout + refresh-facts) before verification.
         reply(0, &ready), // Verification probe.
         reply(0, ""), // Verified install, scoped cleanup.
+        reply(0, "not_enabled\n"), // Post-install origin-outbox wake.
         reply(0, ""),
         reply(0, &ready), // Refresh and readiness.
     ]);
     let (code, out, err) = fixture.run(&host, &["alice@mini.local"]);
     assert_eq!(code, 0, "{out}{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["kind"], "init");
+    assert_eq!(report["ready"], true);
+    assert_eq!(
+        report["outbox"], "not_enabled",
+        "init must render the post-install outbox wake outcome: {out}"
+    );
     let requests = host.requests.lock().unwrap();
     assert_eq!(requests.iter().filter(|r| r.stdin.is_some()).count(), 1);
     let remote_commands: Vec<String> = requests
@@ -370,6 +378,13 @@ fn init_installs_a_missing_helper_through_the_transactional_installer() {
         !remote_commands[facts_refresh].contains("host probe"),
         "facts-refresh must not run the verification probe"
     );
+    let wake = remote_commands
+        .iter()
+        .enumerate()
+        .find(|(index, command)| *index > verification && command.contains("host outbox --wake"))
+        .map(|(index, _)| index)
+        .expect("installer must wake the origin-outbox watcher after a verified install");
+    assert!(verification < wake, "verification then origin-outbox wake");
     assert!(host.replies.lock().unwrap().is_empty());
     assert_eq!(Config::load(&fixture.config).unwrap().workers.len(), 1);
 }
