@@ -686,10 +686,21 @@ impl DashboardDataSource for FixtureSource {
                 .pop_front()
                 .expect("fixture contains an observation row for each snapshot")
         } else {
-            observations
-                .front()
-                .cloned()
-                .expect("fixture contains a repeating observation row")
+            // The last row repeats for every further collection. A repeated
+            // Current observation must carry a newer timestamp, otherwise the
+            // service rejects it as INVALID_OBSERVATION_TIMESTAMP and the
+            // worker turns stale on a machine slow enough to collect again
+            // before the test reads its snapshot.
+            let row = observations
+                .front_mut()
+                .expect("fixture contains a repeating observation row");
+            for result in row.iter_mut() {
+                if let WorkerObservationResult::Current(observation) = result {
+                    observation.observed_at_millis += 1;
+                    observation.worker.observed_at_millis = Some(observation.observed_at_millis);
+                }
+            }
+            row.clone()
         }
     }
 
