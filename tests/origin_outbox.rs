@@ -1740,6 +1740,11 @@ fn identity_hit_restores_missing_due_for_a_running_watcher() {
         "identity-hit must restore the missing due key"
     );
     fs::remove_file(origin.join("reject")).unwrap();
+    // The watcher may have pumped the restored due key before `reject` was
+    // removed; that attempt fails and parks the intent at now + backoff on the
+    // injected clock. Move the clock past any backoff so the next pump is due
+    // regardless of that interleaving (seen on the slow CI runner).
+    now.fetch_add(3_600_000, Ordering::SeqCst);
     wait_until(
         8,
         || {
