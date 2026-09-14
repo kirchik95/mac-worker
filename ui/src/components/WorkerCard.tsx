@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { ChevronDown, ChevronRight, Info } from 'lucide-react'
+import { ChevronRight, Info } from 'lucide-react'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { AgentMark } from '@/components/AgentMark'
 import { MacIllustration } from '@/components/MacIllustration'
 import { HerdrChip } from '@/components/HerdrChip'
@@ -18,7 +18,6 @@ export function WorkerCard({
   onSetup?: (worker?: string, agent?: string) => void
   onSelectTask?: (id: string) => void
 }) {
-  const [expanded, setExpanded] = useState(false)
   const offline = worker.health === 'unavailable'
   const known = !offline && worker.freshness === 'current' && worker.slot.state !== 'unknown'
   const busy = slotBusy(worker.slot)
@@ -33,7 +32,7 @@ export function WorkerCard({
   const installed = agents.filter((agent) => agent.auth !== 'unauthenticated')
   const described = describeError(worker.error)
   return (
-    <article className="mw-panel mw-worker-card">
+    <Collapsible render={<article />} className="mw-panel mw-worker-card">
       <div className="mw-worker-top">
         <div className="mw-worker-visual">
           <MacIllustration state={running ? 'working' : known ? 'idle' : 'unknown'} />
@@ -124,85 +123,83 @@ export function WorkerCard({
             >
               {signIn.length ? 'Setup instructions' : 'Agent settings'}
             </button>
-            <button
-              type="button"
-              className="mw-link"
-              aria-expanded={expanded}
-              onClick={() => setExpanded(!expanded)}
-            >
-              Worker details{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            </button>
+            <CollapsibleTrigger className="mw-link">
+              Worker details
+              <ChevronRight className="mw-disclosure-chevron" size={13} />
+            </CollapsibleTrigger>
           </div>
         </div>
       </div>
-      <div className="mw-worker-diagnostics" hidden={!expanded}>
-        <div className="mb-4 flex items-center justify-between gap-3">
-          <span className="text-xs text-muted-foreground">{presence}</span>
-          <HerdrChip herdr={worker.herdr} />
-        </div>
-        {!known ? (
-          <p className="mb-3 text-sm">{described?.message ?? 'Observation is out of date'}</p>
-        ) : (
-          <p className="mb-3 text-sm">{task?.title ?? 'Ready for the next task'}</p>
-        )}
-        {described?.code ? (
-          <p className="mb-3 font-mono text-xs text-destructive">{described.code}</p>
-        ) : null}
-        <dl className="grid grid-cols-3 gap-3">
-          <div>
-            <dt className="mw-help">{known ? 'CPU' : 'LAST CPU'}</dt>
-            <dd>
-              {worker.system.cpu_busy_percent == null
-                ? '—'
-                : worker.system.cpu_busy_percent.toFixed(1) + '%'}
-            </dd>
+      <CollapsibleContent keepMounted>
+        <div className="mw-worker-diagnostics">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <span className="text-xs text-muted-foreground">{presence}</span>
+            <HerdrChip herdr={worker.herdr} />
           </div>
-          <div>
-            <dt className="mw-help">MEMORY</dt>
-            <dd>{humanize(worker.system.memory_pressure)}</dd>
-          </div>
-          <div>
-            <dt className="mw-help">DISK FREE</dt>
-            <dd>{bytes(worker.system.free_disk_bytes)}</dd>
-          </div>
-        </dl>
-        <p className="mt-3 text-xs text-muted-foreground">
-          {known
-            ? busy + ' / ' + worker.slot.capacity + ' slots occupied'
-            : 'Cached metrics · Last seen ' + relativeTime(worker.observed_at_millis, now)}
-        </p>
-        {jobs.length > 1 ? (
-          <p className="mt-2 break-all font-mono text-xs">
-            {jobs.map((id) => shortId(id, 8)).join(' · ')}
+          {!known ? (
+            <p className="mb-3 text-sm">{described?.message ?? 'Observation is out of date'}</p>
+          ) : (
+            <p className="mb-3 text-sm">{task?.title ?? 'Ready for the next task'}</p>
+          )}
+          {described?.code ? (
+            <p className="mb-3 font-mono text-xs text-destructive">{described.code}</p>
+          ) : null}
+          <dl className="grid grid-cols-3 gap-3">
+            <div>
+              <dt className="mw-help">{known ? 'CPU' : 'LAST CPU'}</dt>
+              <dd>
+                {worker.system.cpu_busy_percent == null
+                  ? '—'
+                  : worker.system.cpu_busy_percent.toFixed(1) + '%'}
+              </dd>
+            </div>
+            <div>
+              <dt className="mw-help">MEMORY</dt>
+              <dd>{humanize(worker.system.memory_pressure)}</dd>
+            </div>
+            <div>
+              <dt className="mw-help">DISK FREE</dt>
+              <dd>{bytes(worker.system.free_disk_bytes)}</dd>
+            </div>
+          </dl>
+          <p className="mt-3 text-xs text-muted-foreground">
+            {known
+              ? busy + ' / ' + worker.slot.capacity + ' slots occupied'
+              : 'Cached metrics · Last seen ' + relativeTime(worker.observed_at_millis, now)}
           </p>
-        ) : null}
-        {task ? (
-          <div className="mt-4 border-t pt-4">
-            <dl className="grid grid-cols-3 gap-3">
-              <div>
-                <dt className="mw-help">AGENT</dt>
-                <dd>{humanize(task.agent)}</dd>
-              </div>
-              <div>
-                <dt className="mw-help">MODEL</dt>
-                <dd>{task.model ?? 'Agent default'}</dd>
-              </div>
-              <div>
-                <dt className="mw-help">EFFORT</dt>
-                <dd>{task.effort ? humanize(task.effort) : 'Not reported'}</dd>
-              </div>
-            </dl>
-            <button
-              type="button"
-              className="mw-link mt-3"
-              onClick={() => onSelectTask?.(task.task_id)}
-            >
-              Open task
-              <ChevronRight size={13} />
-            </button>
-          </div>
-        ) : null}
-      </div>
-    </article>
+          {jobs.length > 1 ? (
+            <p className="mt-2 break-all font-mono text-xs">
+              {jobs.map((id) => shortId(id, 8)).join(' · ')}
+            </p>
+          ) : null}
+          {task ? (
+            <div className="mt-4 border-t pt-4">
+              <dl className="grid grid-cols-3 gap-3">
+                <div>
+                  <dt className="mw-help">AGENT</dt>
+                  <dd>{humanize(task.agent)}</dd>
+                </div>
+                <div>
+                  <dt className="mw-help">MODEL</dt>
+                  <dd>{task.model ?? 'Agent default'}</dd>
+                </div>
+                <div>
+                  <dt className="mw-help">EFFORT</dt>
+                  <dd>{task.effort ? humanize(task.effort) : 'Not reported'}</dd>
+                </div>
+              </dl>
+              <button
+                type="button"
+                className="mw-link mt-3"
+                onClick={() => onSelectTask?.(task.task_id)}
+              >
+                Open task
+                <ChevronRight size={13} />
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }

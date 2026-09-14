@@ -1,3 +1,4 @@
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useEffect, useMemo, useState } from 'react'
 import { Search, Terminal, MessageSquareText, ListFilter } from 'lucide-react'
 import { CommandList } from '@/components/CommandList'
@@ -211,15 +212,17 @@ export function Tasks({
             </>
           ) : null}
         </div>
-        <details className="max-w-full">
-          <summary className="mw-link">
+        <Collapsible className="max-w-full">
+          <CollapsibleTrigger className="mw-link">
             <Terminal size={14} aria-hidden="true" />
             CLI equivalent
-          </summary>
-          <div className="mt-3">
-            <CommandList commands={[command]} />
-          </div>
-        </details>
+          </CollapsibleTrigger>
+          <CollapsibleContent keepMounted>
+            <div className="mt-3">
+              <CommandList commands={[command]} />
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
       </div>
     </div>
   )

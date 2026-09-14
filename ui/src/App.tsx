@@ -11,6 +11,7 @@ import { TaskDetail } from '@/views/TaskDetail'
 import { Tasks } from '@/views/Tasks'
 import { useSnapshot } from '@/hooks/useSnapshot'
 import { useTaskPreviews } from '@/hooks/useTaskPreviews'
+import { useInputModality } from '@/hooks/useInputModality'
 import { attentionCount } from '@/lib/attention'
 import { needsAnswer, readyForReview } from '@/lib/taskPresentation'
 import { relativeTime } from '@/lib/format'
@@ -63,6 +64,7 @@ const VIEWS = [
 ] as const
 
 export default function App() {
+  useInputModality()
   const { snapshot, error, offline, example } = useSnapshot()
   const [route, setRoute] = useState(currentRoute)
   const attention = snapshot ? attentionCount(snapshot) : 0

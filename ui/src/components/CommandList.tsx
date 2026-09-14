@@ -48,8 +48,14 @@ export function CommandList({ commands }: { commands: string[] }) {
                 : 'text-muted-foreground hover:text-foreground'
             }`}
           >
-            <Icon name={copied === command ? 'check' : 'copy'} />
-            {copied === command ? 'Copied' : 'Copy'}
+            <span className="mw-copy-feedback">
+              <span aria-hidden={copied === command}>
+                <Icon name="copy" />Copy
+              </span>
+              <span aria-hidden={copied !== command}>
+                <Icon name="check" />Copied
+              </span>
+            </span>
           </button>
         </div>
       ))}

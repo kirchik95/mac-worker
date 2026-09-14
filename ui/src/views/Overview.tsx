@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { ChevronRight } from 'lucide-react'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { ActiveTurn } from '@/components/ActiveTurn'
 import { AttentionCards } from '@/components/AttentionCards'
 import { Capabilities } from '@/components/Capabilities'
@@ -28,7 +29,6 @@ export function Overview({
   onShowRun?: (id: string) => void
   previews?: TaskPreviews
 }) {
-  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const stalled = stall(snapshot, now)
   const known = snapshot.workers.filter(
     (worker) =>
@@ -106,33 +106,35 @@ export function Overview({
           now={now}
         />
       ) : null}
-      <details
-        className="mw-panel p-5"
-        onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}
-      >
-        <summary className="text-[13px] font-medium">Execution details</summary>
-        <div className="mt-5 space-y-5">
-          {diagnosticsOpen && active.length ? (
-            active.map((worker) => {
-              const row = snapshot.tasks.find(
-                (task) => task.task_id === worker.active_task?.task_id,
-              )
-              return (
-                <ActiveTurn
-                  key={worker.name}
-                  worker={worker}
-                  row={row}
-                  run={snapshot.runs.find((run) => run.run_id === row?.run_id)}
-                />
-              )
-            })
-          ) : (
-            <p className="text-sm text-muted-foreground">No turn is running.</p>
-          )}
-          <QueueTable snapshot={snapshot} now={now} />
-          <Capabilities snapshot={snapshot} now={now} />
-        </div>
-      </details>
+      <Collapsible className="mw-panel p-5">
+        <CollapsibleTrigger className="mw-link w-full font-medium">
+          <ChevronRight className="mw-disclosure-chevron" size={14} />
+          Execution details
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="mt-5 space-y-5">
+            {active.length ? (
+              active.map((worker) => {
+                const row = snapshot.tasks.find(
+                  (task) => task.task_id === worker.active_task?.task_id,
+                )
+                return (
+                  <ActiveTurn
+                    key={worker.name}
+                    worker={worker}
+                    row={row}
+                    run={snapshot.runs.find((run) => run.run_id === row?.run_id)}
+                  />
+                )
+              })
+            ) : (
+              <p className="text-sm text-muted-foreground">No turn is running.</p>
+            )}
+            <QueueTable snapshot={snapshot} now={now} />
+            <Capabilities snapshot={snapshot} now={now} />
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   )
 }

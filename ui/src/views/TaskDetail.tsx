@@ -10,6 +10,7 @@ import { Check, ChevronRight, History, Monitor, Reply, Terminal } from 'lucide-r
 import { AgentMark } from '@/components/AgentMark'
 import { TaskBadge } from '@/components/TaskBadge'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   acceptTask,
   ApiError,
@@ -73,11 +74,12 @@ function Turn({
   const waitingToStart = turn.started_at_millis == null && turn.ended_at_millis == null
 
   return (
-    <div className="overflow-hidden border-b last:border-b-0 bg-card">
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={open}
+    <Collapsible
+      open={open}
+      onOpenChange={onToggle}
+      className="overflow-hidden border-b last:border-b-0 bg-card"
+    >
+      <CollapsibleTrigger
         className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 px-5 py-3.5 text-left"
       >
         <span className="w-6 shrink-0 font-mono text-[15px]">
@@ -98,14 +100,14 @@ function Turn({
         </span>
         {turn.log_truncated ? <span className="text-xs text-warning">LOG TRUNCATED</span> : null}
         <Icon
-          name={open ? 'chevronDown' : 'chevronRight'}
+          name="chevronRight"
           size={14}
-          className="text-muted-foreground"
+          className="mw-disclosure-chevron text-muted-foreground"
         />
-      </button>
+      </CollapsibleTrigger>
 
-      {open ? (
-        waitingToStart ? (
+      <CollapsibleContent>
+        {waitingToStart ? (
           <p className="px-5 py-3.5 text-sm text-muted-foreground">
             Waiting for this turn to start…
           </p>
@@ -117,9 +119,9 @@ function Turn({
             live={live}
             truncated={turn.log_truncated}
           />
-        )
-      ) : null}
-    </div>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -496,72 +498,75 @@ export function TaskDetail({
                 ) : null}
               </section>
               {waiting ? (
-                <details className="mw-panel mw-panel-pad">
-                  <summary className="cursor-pointer font-semibold">
+                <Collapsible className="mw-panel mw-panel-pad">
+                  <CollapsibleTrigger className="mw-link w-full font-semibold">
+                    <ChevronRight className="mw-disclosure-chevron" size={14} />
                     Partial result and terminal commands
-                  </summary>
-                  <div className="mt-5 space-y-5">
-                    {detail.reported_checks.length ? (
+                  </CollapsibleTrigger>
+                  <CollapsibleContent keepMounted>
+                    <div className="mt-5 space-y-5">
+                      {detail.reported_checks.length ? (
+                        <div>
+                          <h3 className="mb-3 font-medium">
+                            Checks{' '}
+                            <span className="ml-2 text-xs font-normal text-muted-foreground">
+                              Agent reported
+                            </span>
+                          </h3>
+                          <ul className="space-y-3">
+                            {detail.reported_checks.map((check) => (
+                              <li key={check.name + check.command}>
+                                <span
+                                  className="mw-badge mr-2"
+                                  data-tone={check.status === 'pass' ? 'success' : 'neutral'}
+                                >
+                                  {checkMark(check.status)}
+                                </span>
+                                {check.name}
+                                {check.command ? (
+                                  <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                                    {check.command}
+                                  </p>
+                                ) : null}
+                                {check.detail ? (
+                                  <p className="mt-1 text-xs text-muted-foreground">{check.detail}</p>
+                                ) : null}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
                       <div>
                         <h3 className="mb-3 font-medium">
-                          Checks{' '}
-                          <span className="ml-2 text-xs font-normal text-muted-foreground">
-                            Agent reported
-                          </span>
+                          Changed files · {detail.files_changed.length}
                         </h3>
-                        <ul className="space-y-3">
-                          {detail.reported_checks.map((check) => (
-                            <li key={check.name + check.command}>
-                              <span
-                                className="mw-badge mr-2"
-                                data-tone={check.status === 'pass' ? 'success' : 'neutral'}
-                              >
-                                {checkMark(check.status)}
-                              </span>
-                              {check.name}
-                              {check.command ? (
-                                <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
-                                  {check.command}
-                                </p>
-                              ) : null}
-                              {check.detail ? (
-                                <p className="mt-1 text-xs text-muted-foreground">{check.detail}</p>
-                              ) : null}
-                            </li>
-                          ))}
-                        </ul>
+                        {detail.diff_stat ? (
+                          <p className="mb-3 text-xs text-muted-foreground">{detail.diff_stat}</p>
+                        ) : null}
+                        {detail.files_changed.length ? (
+                          <ul className="space-y-2">
+                            {detail.files_changed.map((file) => (
+                              <li className="break-all font-mono text-xs" key={file}>
+                                {file}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">No file changed.</p>
+                        )}
                       </div>
-                    ) : null}
-                    <div>
-                      <h3 className="mb-3 font-medium">
-                        Changed files · {detail.files_changed.length}
-                      </h3>
-                      {detail.diff_stat ? (
-                        <p className="mb-3 text-xs text-muted-foreground">{detail.diff_stat}</p>
-                      ) : null}
-                      {detail.files_changed.length ? (
-                        <ul className="space-y-2">
-                          {detail.files_changed.map((file) => (
-                            <li className="break-all font-mono text-xs" key={file}>
-                              {file}
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <p className="text-xs text-muted-foreground">No file changed.</p>
-                      )}
+                      <CommandList
+                        commands={[
+                          ...(detail.review_commands.length
+                            ? detail.review_commands
+                            : [detail.fetch_command]
+                          ).filter(Boolean),
+                          `worker task say ${task.task_id} --message-file reply.md`,
+                        ]}
+                      />
                     </div>
-                    <CommandList
-                      commands={[
-                        ...(detail.review_commands.length
-                          ? detail.review_commands
-                          : [detail.fetch_command]
-                        ).filter(Boolean),
-                        `worker task say ${task.task_id} --message-file reply.md`,
-                      ]}
-                    />
-                  </div>
-                </details>
+                  </CollapsibleContent>
+                </Collapsible>
               ) : null}
               {!waiting ? (
                 <section className="mw-panel overflow-hidden">

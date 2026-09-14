@@ -67,6 +67,20 @@
   --input: #667085;
   --destructive: #b42318;
   --radius: 10px;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --motion-fast: 120ms;
+  --motion-surface: 180ms;
+  --motion-disclosure: 200ms;
+  --motion-drawer: 240ms;
+}
+/* Capture modality at document level so portal surfaces follow the same rule. */
+:root[data-input-modality='keyboard'] {
+  --motion-fast: 0ms;
+  --motion-surface: 0ms;
+  --motion-disclosure: 0ms;
+  --motion-drawer: 0ms;
 }
 @layer base {
   * {
@@ -136,9 +150,13 @@
     font-weight: 500;
     white-space: nowrap;
     transition:
-      background-color 150ms,
-      border-color 150ms,
-      color 150ms;
+      transform var(--motion-fast) var(--ease-out),
+      background-color var(--motion-fast) ease,
+      border-color var(--motion-fast) ease,
+      color var(--motion-fast) ease;
+  }
+  :root[data-input-modality='pointer'] .mw-button:enabled:active {
+    transform: scale(0.97);
   }
   .mw-button[data-variant='default'] {
     background: var(--primary);
@@ -217,8 +235,8 @@
     font-size: 13px;
     line-height: 20px;
     transition:
-      border-color 150ms,
-      background-color 150ms;
+      border-color var(--motion-fast) ease,
+      background-color var(--motion-fast) ease;
   }
   .mw-input,
   .mw-select {
@@ -264,6 +282,57 @@
   }
   [data-slot='switch'][data-checked] {
     background: var(--primary);
+  }
+  [data-slot='switch'] {
+    transition: background-color var(--motion-fast) ease;
+  }
+  [data-slot='switch-thumb'] {
+    transform: translateX(0);
+    transition: transform var(--motion-fast) var(--ease-out);
+  }
+  [data-slot='switch-thumb'][data-checked] {
+    transform: translateX(calc(100% - 2px));
+  }
+  .mw-select-popup {
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity var(--motion-surface) var(--ease-out),
+      transform var(--motion-surface) var(--ease-out);
+  }
+  .mw-select-popup:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  .mw-select-popup[data-ending-style] {
+    transition-duration: var(--motion-fast);
+  }
+  .mw-select-chevron,
+  .mw-disclosure-chevron {
+    flex-shrink: 0;
+    transition: transform var(--motion-surface) var(--ease-out);
+  }
+  [data-slot='select-trigger'][aria-expanded='true'] .mw-select-chevron {
+    transform: rotate(180deg);
+  }
+  [aria-expanded='true'] > .mw-disclosure-chevron {
+    transform: rotate(90deg);
+  }
+  /* Height is confined to disclosures. Base UI measures and retains the panel
+     through exit, and retargets a transition when it is toggled again. */
+  .mw-disclosure-panel {
+    height: var(--collapsible-panel-height);
+    overflow: hidden;
+    opacity: 1;
+    transition:
+      height var(--motion-disclosure) var(--ease-out),
+      opacity var(--motion-disclosure) var(--ease-out);
+  }
+  .mw-disclosure-panel:is([data-starting-style], [data-ending-style]) {
+    height: 0;
+    opacity: 0;
+  }
+  .mw-disclosure-panel[data-ending-style] {
+    transition-duration: var(--motion-surface);
   }
 
   .mw-header {
@@ -430,6 +499,7 @@
   .mw-worker-card {
     padding: 16px;
     min-width: 0;
+    align-self: start;
   }
   .mw-worker-top {
     display: flex;
@@ -604,6 +674,11 @@
     inset: 71px 0 0;
     background: rgb(16 24 40 / 0.08);
     z-index: 40;
+    opacity: 1;
+    transition: opacity var(--motion-drawer) var(--ease-out);
+  }
+  .mw-dialog-backdrop:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
   }
   .mw-notifications {
     position: fixed;
@@ -618,6 +693,19 @@
     display: flex;
     flex-direction: column;
     outline: none;
+    transform: translateX(0);
+    opacity: 1;
+    transition:
+      transform var(--motion-drawer) var(--ease-drawer),
+      opacity var(--motion-drawer) var(--ease-out);
+  }
+  .mw-notifications:is([data-starting-style], [data-ending-style]) {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  .mw-notifications[data-ending-style],
+  .mw-dialog-backdrop[data-ending-style] {
+    transition-duration: var(--motion-surface);
   }
   .mw-notification-head {
     padding: 24px 24px 0;
@@ -628,6 +716,7 @@
     margin-top: 20px;
   }
   .mw-notification-tab {
+    position: relative;
     padding: 0 6px 14px;
     border-bottom: 2px solid transparent;
     font-size: 13px;
@@ -636,7 +725,22 @@
   .mw-notification-tab[aria-pressed='true'] {
     color: #101828;
     font-weight: 600;
-    border-bottom-color: #181d27;
+  }
+  .mw-notification-tab::after {
+    content: '';
+    position: absolute;
+    height: 2px;
+    inset: auto 0 -2px;
+    background: var(--primary);
+    opacity: 0;
+    transform: scaleX(0.8);
+    transition:
+      opacity var(--motion-fast) var(--ease-out),
+      transform var(--motion-fast) var(--ease-out);
+  }
+  .mw-notification-tab[aria-pressed='true']::after {
+    opacity: 1;
+    transform: scaleX(1);
   }
   .mw-notification-list {
     overflow-y: auto;
@@ -672,10 +776,12 @@
     overflow: visible;
   }
   .mw-mac-body {
-    transition: transform 150ms;
+    transition: transform var(--motion-fast) var(--ease-out);
   }
-  .mw-worker-card:hover .mw-mac-body {
-    transform: translateY(-4.3px);
+  @media (hover: hover) and (pointer: fine) {
+    .mw-worker-card:hover .mw-mac-body {
+      transform: translateY(-4.3px);
+    }
   }
   .mw-mac-shadow-outer {
     fill: #eaecf0;
@@ -699,29 +805,43 @@
   .mw-mac[data-state='working'] :is(.mw-mac-led, .mw-mac-glow) {
     fill: #f0b429;
   }
-  .mw-mac[data-animate='true'][data-state='working'] :is(.mw-mac-shadow-inner, .mw-mac-glow) {
-    animation: mw-working 3s ease-in-out infinite;
+  .mw-mac[data-state='working'] :is(.mw-mac-shadow-inner, .mw-mac-glow, .mw-mac-led) {
+    animation: mw-working 3s var(--ease-in-out) infinite;
+    animation-play-state: paused;
+  }
+  .mw-mac[data-animate='true'][data-state='working'] :is(.mw-mac-shadow-inner, .mw-mac-glow, .mw-mac-led) {
+    animation-play-state: running;
+  }
+  .mw-mac[data-state='working'] .mw-mac-shadow-outer {
+    animation: mw-working-ambient 3s var(--ease-in-out) infinite;
+    animation-play-state: paused;
+  }
+  .mw-mac[data-animate='true'][data-state='working'] .mw-mac-shadow-outer {
+    animation-play-state: running;
   }
   .mw-mac[data-completed='true'] :is(.mw-mac-shadow-inner, .mw-mac-led, .mw-mac-glow) {
-    animation: mw-completed 650ms ease-out both;
+    fill: #12b76a;
+    animation: mw-completed 650ms var(--ease-out) both;
   }
   @keyframes mw-working {
     0%,
     100% {
-      opacity: 0.45;
+      opacity: 0.3;
     }
     50% {
       opacity: 1;
     }
   }
+  @keyframes mw-working-ambient {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 0.9; }
+  }
   @keyframes mw-completed {
     0%,
     55% {
-      fill: #12b76a;
       opacity: 0.8;
     }
     100% {
-      fill: #98a2b3;
       opacity: 0.3;
     }
   }
@@ -783,23 +903,6 @@
       border-left: 0;
     }
   }
-  @media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
-      animation-duration: 0.01ms !important;
-      animation-iteration-count: 1 !important;
-      transition-duration: 0.01ms !important;
-      scroll-behavior: auto !important;
-    }
-    .mw-mac :is(.mw-mac-shadow-inner, .mw-mac-glow, .mw-mac-led) {
-      animation: none !important;
-    }
-    .mw-worker-card:hover .mw-mac-body {
-      transform: none;
-    }
-  }
-
   .mw-filters {
     display: flex;
     align-items: center;
@@ -817,6 +920,8 @@
     flex-wrap: wrap;
   }
   .mw-segmented button {
+    position: relative;
+    isolation: isolate;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -826,9 +931,23 @@
     font-size: 13px;
   }
   .mw-segmented button[aria-pressed='true'] {
-    background: #f2f4f7;
     color: #101828;
     font-weight: 500;
+  }
+  .mw-segmented button::before,
+  .mw-agent-option::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: #f2f4f7;
+    opacity: 0;
+    transition: opacity var(--motion-fast) ease;
+  }
+  .mw-segmented button[aria-pressed='true']::before,
+  .mw-agent-option[aria-pressed='true']::before {
+    opacity: 1;
   }
   .mw-segmented button span {
     font-size: 11px;
@@ -850,6 +969,8 @@
     border-right: 1px solid #eaecf0;
   }
   .mw-agent-option {
+    position: relative;
+    isolation: isolate;
     display: flex;
     align-items: start;
     text-align: left;
@@ -858,11 +979,25 @@
     padding: 16px 12px;
     border-radius: 8px;
   }
-  .mw-agent-option[aria-pressed='true'] {
-    background: #f2f4f7;
-  }
-  .mw-agent-option:hover {
+  .mw-agent-option:not([aria-pressed='true']):hover {
     background: #f9fafb;
+  }
+  .mw-copy-feedback {
+    display: grid;
+    min-width: 62px;
+  }
+  .mw-copy-feedback > span {
+    grid-area: 1 / 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition:
+      opacity var(--motion-fast) var(--ease-out),
+      transform var(--motion-fast) var(--ease-out);
+  }
+  .mw-copy-feedback > [aria-hidden='true'] {
+    opacity: 0;
+    transform: translateY(3px);
   }
   .mw-settings-editor {
     padding: 28px;
@@ -922,6 +1057,37 @@
     }
     .mw-settings-editor {
       padding: 20px;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .mw-notifications,
+    .mw-select-popup,
+    .mw-copy-feedback > span {
+      transform: none !important;
+      transition-property: opacity;
+    }
+    .mw-button {
+      transform: none !important;
+      transition-property: background-color, border-color, color;
+    }
+    .mw-disclosure-panel {
+      transition-property: opacity;
+    }
+    .mw-select-chevron,
+    .mw-disclosure-chevron,
+    [data-slot='switch-thumb'] {
+      transition: none;
+    }
+    .mw-notification-tab::after {
+      transform: none !important;
+      transition-property: opacity;
+    }
+    .mw-mac :is(.mw-mac-shadow-outer, .mw-mac-shadow-inner, .mw-mac-glow, .mw-mac-led) {
+      animation: none !important;
+    }
+    .mw-worker-card:hover .mw-mac-body {
+      transform: none;
     }
   }
 }

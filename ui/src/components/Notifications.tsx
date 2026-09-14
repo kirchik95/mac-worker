@@ -173,7 +173,12 @@ export function Notifications({
               <Dialog.Title className="text-xl leading-6 font-semibold tracking-[-.01em]">
                 Notifications
               </Dialog.Title>
-              <Dialog.Close className="mw-link p-1" aria-label="Close notifications">
+              <Dialog.Close
+                className="mw-button"
+                data-variant="ghost"
+                data-size="icon"
+                aria-label="Close notifications"
+              >
                 <X size={18} />
               </Dialog.Close>
             </div>

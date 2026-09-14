@@ -1,3 +1,4 @@
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -153,29 +154,31 @@ function Detail({
                 : 'The latest worker facts do not confirm an authenticated agent.'}
             </p>
           </div>
-          <details className="w-full">
-            <summary className="mw-button" data-variant="outline">
-              <ChevronRight size={14} aria-hidden="true" />
+          <Collapsible className="w-full">
+            <CollapsibleTrigger className="mw-button" data-variant="outline">
+              <ChevronRight className="mw-disclosure-chevron" size={14} aria-hidden="true" />
               Setup instructions
-            </summary>
-            <div className="mt-3 space-y-3">
-              <p>Open a terminal on {worker} using its configured SSH target, then run:</p>
-              <CommandList
-                commands={[
-                  (
-                    {
-                      codex: 'codex login',
-                      cursor: 'cursor-agent login',
-                      opencode: 'opencode auth login',
-                      claude: 'claude',
-                    } as Record<string, string>
-                  )[setting.agent] ?? agentBinary(setting.agent),
-                ]}
-              />
-              <p>After signing in, refresh the facts from your laptop:</p>
-              <CommandList commands={['worker workers --refresh']} />
-            </div>
-          </details>
+            </CollapsibleTrigger>
+            <CollapsibleContent keepMounted>
+              <div className="mt-3 space-y-3">
+                <p>Open a terminal on {worker} using its configured SSH target, then run:</p>
+                <CommandList
+                  commands={[
+                    (
+                      {
+                        codex: 'codex login',
+                        cursor: 'cursor-agent login',
+                        opencode: 'opencode auth login',
+                        claude: 'claude',
+                      } as Record<string, string>
+                    )[setting.agent] ?? agentBinary(setting.agent),
+                  ]}
+                />
+                <p>After signing in, refresh the facts from your laptop:</p>
+                <CommandList commands={['worker workers --refresh']} />
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
         </div>
       ) : null}
       {setting.message ? <p className="mw-banner mt-6">{setting.message}</p> : null}

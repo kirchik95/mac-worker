@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MALICIOUS, queueEntry, snapshot, task, worker } from '@/test/fixtures'
@@ -166,6 +166,7 @@ describe('Overview', () => {
       ],
     })
     render(<Overview snapshot={queued} now={60_000} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
 
     expect(screen.getByText('02')).toBeInTheDocument()
     expect(screen.getAllByText('Fix login redirect loop').length).toBeGreaterThan(0)
@@ -184,6 +185,7 @@ describe('Overview', () => {
       ],
     })
     render(<Overview snapshot={queued} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
 
     expect(screen.getByText('CAPABILITY_MISSING')).toBeInTheDocument()
     expect(screen.getByText(/Missing: agent:opencode/)).toBeInTheDocument()
@@ -192,6 +194,7 @@ describe('Overview', () => {
 
   it('says the queue is empty rather than drawing an empty table', () => {
     render(<Overview snapshot={snapshot()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
     expect(screen.getByText('The queue is empty.')).toBeInTheDocument()
   })
 
@@ -244,6 +247,7 @@ describe('Overview', () => {
       ],
     })
     render(<Overview snapshot={lapsed} now={40 * 60_000} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
 
     expect(screen.getByText('EXPIRED')).toBeInTheDocument()
     expect(screen.getByText('codex · lapsed')).toBeInTheDocument()
@@ -272,6 +276,7 @@ describe('Overview', () => {
       ],
     })
     render(<Overview snapshot={withHerdr} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
 
     expect(screen.getAllByText('herdr 0.9.0 · 2 agents').length).toBe(2)
     expect(screen.getAllByText('no herdr').length).toBe(2)
@@ -299,6 +304,7 @@ describe('Overview', () => {
       ],
     })
     render(<Overview snapshot={stale} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Execution details' }))
     expect(screen.getAllByText('herdr 0.9.0 · 69m ago').length).toBe(2)
     expect(within(card('mini-1')).getByText('herdr 0.9.0 · 69m ago')).toBeInTheDocument()
     expect(screen.queryByText('herdr: unknown')).toBeNull()
