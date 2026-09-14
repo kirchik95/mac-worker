@@ -6,6 +6,8 @@ const ATTENTION_OUTCOMES = ['blocked', 'failed', 'timed_out', 'lost', 'needs_inp
 /** A task the operator has to look at: still open, or ended a turn badly. */
 export const needsAttention = (task: TaskRow) =>
   task.state === 'open' ||
-  (task.last_outcome != null && ATTENTION_OUTCOMES.includes(task.last_outcome.kind))
+  (!['closed', 'abandoned'].includes(task.state) &&
+    task.last_outcome != null &&
+    ATTENTION_OUTCOMES.includes(task.last_outcome.kind))
 
 export const attentionCount = (snapshot: Snapshot) => snapshot.tasks.filter(needsAttention).length

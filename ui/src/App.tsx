@@ -1,62 +1,26 @@
 import { useEffect, useState } from 'react'
-
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs } from '@base-ui/react/tabs'
+import { LayoutGrid, Layers, ListFilter, SlidersHorizontal } from 'lucide-react'
 import { Wordmark } from '@/components/Wordmark'
 import { Skeleton } from '@/components/Skeleton'
+import { Notifications } from '@/components/Notifications'
 import { Overview } from '@/views/Overview'
 import { Runs } from '@/views/Runs'
 import { Settings } from '@/views/Settings'
 import { TaskDetail } from '@/views/TaskDetail'
 import { Tasks } from '@/views/Tasks'
 import { useSnapshot } from '@/hooks/useSnapshot'
+import { useTaskPreviews } from '@/hooks/useTaskPreviews'
 import { attentionCount } from '@/lib/attention'
-import { clockTime, pad2 } from '@/lib/format'
-import { slotBusy, type Snapshot } from '@/lib/api'
+import { needsAnswer, readyForReview } from '@/lib/taskPresentation'
+import { relativeTime } from '@/lib/format'
 
-/** The tab carries the count so a question is noticed in a background tab. */
 export const documentTitle = (attention: number) =>
-  `${attention > 0 ? `(${attention}) ` : ''}mac-worker — pool`
-
-const VIEWS = [
-  ['overview', 'Overview'],
-  ['tasks', 'Tasks'],
-  ['runs', 'Run history'],
-  ['settings', 'Settings'],
-] as const
-
-function fleetLine(snapshot: Snapshot): string {
-  const current = snapshot.workers.filter((worker) => worker.freshness === 'current').length
-  const stale = snapshot.workers.length - current
-  const parts = [`${current} current ${current === 1 ? 'worker' : 'workers'}`]
-  if (stale > 0) parts.push(`${stale} stale ${stale === 1 ? 'observation' : 'observations'}`)
-  return `Your personal pool · ${parts.join(' · ')}`
-}
-
-function Stat({ value, label, accent }: { value: string; label: string; accent?: boolean }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span
-        className={`font-mono text-[18px] leading-6 tracking-[-0.02em] ${
-          accent ? 'text-primary' : 'text-foreground'
-        }`}
-      >
-        {value}
-      </span>
-      <span className="text-xs text-muted-foreground">{label}</span>
-    </div>
-  )
-}
-
+  (attention > 0 ? '(' + attention + ') ' : '') + 'mac-worker — pool'
 const TASK_ID = /^[0-9a-f]{32}$/
-
-export type TaskHash =
-  | { status: 'none' }
-  | { status: 'task'; id: string }
-  | { status: 'invalid' }
-
-/** Hash deep links are `#/tasks/<lowercase simple UUID>`. Decode failures stay off the detail pane. */
+export type TaskHash = { status: 'none' } | { status: 'task'; id: string } | { status: 'invalid' }
 export function parseTaskHash(hash: string): TaskHash {
-  const match = hash.match(/^#\/tasks\/([^/]*)$/)
+  const match = hash.split('?')[0].match(/^#\/tasks\/([^/]*)$/)
   if (!match) return { status: 'none' }
   let decoded: string
   try {
@@ -64,163 +28,205 @@ export function parseTaskHash(hash: string): TaskHash {
   } catch {
     return { status: 'invalid' }
   }
-  if (!TASK_ID.test(decoded)) return { status: 'invalid' }
-  return { status: 'task', id: decoded }
+  return TASK_ID.test(decoded) ? { status: 'task', id: decoded } : { status: 'invalid' }
 }
+type View = 'overview' | 'tasks' | 'runs' | 'settings'
+type Route = {
+  view: View
+  taskId?: string
+  invalid?: boolean
+  run?: string
+  worker?: string
+  agent?: string
+}
+function currentRoute(): Route {
+  const [path, search] = window.location.hash.replace(/^#\//, '').split('?')
+  const query = new URLSearchParams(search)
+  const context = {
+    run: query.get('run') ?? undefined,
+    worker: query.get('worker') ?? undefined,
+    agent: query.get('agent') ?? undefined,
+  }
+  const task = parseTaskHash(window.location.hash)
+  if (task.status === 'task') return { view: 'tasks', taskId: task.id, ...context }
+  if (task.status === 'invalid') return { view: 'tasks', invalid: true, ...context }
+  return {
+    view: ['tasks', 'runs', 'settings'].includes(path) ? (path as View) : 'overview',
+    ...context,
+  }
+}
+const VIEWS = [
+  ['overview', 'The shelf', LayoutGrid],
+  ['tasks', 'Tasks', ListFilter],
+  ['runs', 'Runs', Layers],
+  ['settings', 'Settings', SlidersHorizontal],
+] as const
 
 export default function App() {
   const { snapshot, error, offline, example } = useSnapshot()
-  const [selectedTask, setSelectedTask] = useState<string | null>(() => {
-    const parsed = parseTaskHash(window.location.hash)
-    return parsed.status === 'task' ? parsed.id : null
-  })
-  const [invalidTaskLink, setInvalidTaskLink] = useState(
-    () => parseTaskHash(window.location.hash).status === 'invalid',
-  )
-  const [view, setView] = useState(() =>
-    parseTaskHash(window.location.hash).status === 'none' ? 'overview' : 'tasks',
-  )
-
-  const busy =
-    snapshot?.workers.reduce((total, worker) => total + slotBusy(worker.slot), 0) ?? 0
-  const capacity =
-    snapshot?.workers.reduce((total, worker) => total + worker.slot.capacity, 0) ?? 0
+  const [route, setRoute] = useState(currentRoute)
   const attention = snapshot ? attentionCount(snapshot) : 0
-  const collectionStale = snapshot?.collection.freshness === 'stale'
-
+  const previews = useTaskPreviews(
+    snapshot?.tasks.filter((task) => needsAnswer(task) || readyForReview(task)) ?? [],
+  )
   useEffect(() => {
     document.title = documentTitle(attention)
   }, [attention])
-
   useEffect(() => {
-    const apply = () => {
-      const parsed = parseTaskHash(window.location.hash)
-      if (parsed.status === 'task') {
-        setSelectedTask(parsed.id)
-        setInvalidTaskLink(false)
-        setView('tasks')
-        return
-      }
-      setSelectedTask(null)
-      setInvalidTaskLink(parsed.status === 'invalid')
-      if (parsed.status === 'invalid') setView('tasks')
-    }
+    const apply = () => setRoute(currentRoute())
     window.addEventListener('hashchange', apply)
     return () => window.removeEventListener('hashchange', apply)
   }, [])
-
-  const selectTask = (id: string | null) => {
-    setInvalidTaskLink(false)
-    setSelectedTask(id)
-    if (id) {
-      const next = `#/tasks/${id}`
-      if (window.location.hash !== next) window.location.hash = next
-      setView('tasks')
-      return
-    }
-    if (window.location.hash.startsWith('#/tasks/')) {
-      window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`)
-    }
+  const navigate = (next: Route) => {
+    const query = new URLSearchParams()
+    for (const key of ['run', 'worker', 'agent'] as const) if (next[key]) query.set(key, next[key]!)
+    const path = next.taskId
+      ? 'tasks/' + next.taskId
+      : next.view === 'overview'
+        ? 'shelf'
+        : next.view
+    const hash = '#/' + path + (query.size ? '?' + query.toString() : '')
+    setRoute(next)
+    if (window.location.hash !== hash) window.location.hash = hash
   }
+  const selectTask = (id: string) =>
+    navigate({ view: 'tasks', taskId: id, run: route.view === 'tasks' ? route.run : undefined })
+  const showRun = (id: string) => navigate({ view: 'tasks', run: id })
+  const setup = (worker?: string, agent?: string) => navigate({ view: 'settings', worker, agent })
+  const collectionStale = snapshot?.collection.freshness === 'stale'
+  const displayed =
+    snapshot && (offline || collectionStale)
+      ? {
+          ...snapshot,
+          workers: snapshot.workers.map((worker) => ({ ...worker, freshness: 'stale' as const })),
+        }
+      : snapshot
 
   return (
-    <Tabs value={view} onValueChange={(next) => setView(next ?? 'overview')} className="flex min-h-screen flex-col gap-0 bg-background text-foreground">
-      <header className="flex h-19 shrink-0 items-center gap-10 border-b bg-card px-10">
-        <Wordmark />
-        <TabsList className="h-19 gap-10 rounded-none bg-transparent p-0">
-          {VIEWS.map(([value, label]) => (
-            <TabsTrigger
+    <Tabs.Root
+      value={route.view}
+      onValueChange={(value) => navigate({ view: value as View })}
+      className="flex min-h-screen flex-col"
+    >
+      <header className="mw-header">
+        <button
+          type="button"
+          onClick={() => navigate({ view: 'overview' })}
+          aria-label="mac-worker home"
+          className="rounded"
+        >
+          <Wordmark />
+        </button>
+        <Tabs.List className="mw-navigation" aria-label="Main navigation">
+          {VIEWS.map(([value, label, Icon]) => (
+            <Tabs.Tab
               key={value}
               value={value}
-              className="h-19 rounded-none border-0 border-b-2 border-transparent px-0 text-sm text-muted-foreground shadow-none data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none"
+              onClick={() => {
+                if (route.taskId && value === 'tasks') navigate({ view: 'tasks' })
+              }}
+              className="mw-nav-link"
             >
+              <Icon size={16} strokeWidth={1.4} aria-hidden="true" />
               {label}
-            </TabsTrigger>
+            </Tabs.Tab>
           ))}
-        </TabsList>
-        <div className="ml-auto flex items-center gap-2">
-            <span className={`size-1.5 rounded-full ${offline || collectionStale ? 'bg-destructive' : 'bg-primary'}`}
-            aria-hidden="true"
-          />
-          <span className={`font-mono text-xs ${offline || collectionStale ? 'text-destructive' : 'text-muted-foreground'}`}>
-            {offline ? 'LAST SNAPSHOT' : collectionStale ? 'STALE SNAPSHOT' : 'SNAPSHOT'}{' '}
-            {snapshot ? clockTime(snapshot.generated_at_millis) : '--:--:--'}
-          </span>
-        </div>
+        </Tabs.List>
+        <p className="mw-header-status">
+          {offline
+            ? 'Showing last snapshot'
+            : collectionStale
+              ? 'Snapshot is stale'
+              : snapshot
+                ? 'Dashboard refreshed ' + relativeTime(snapshot.generated_at_millis)
+                : 'Connecting to your Macs…'}
+        </p>
+        <Notifications snapshot={snapshot} previews={previews} onSelectTask={selectTask} />
       </header>
-
-      <main className="px-10 pt-6.5 pb-6">
-        {snapshot ? (
+      <main className="mw-main flex-1">
+        {displayed ? (
           <>
             {offline ? (
-              <div className="mb-5 flex flex-wrap items-center gap-3 rounded-[10px] border border-destructive bg-destructive/5 px-5 py-3.5">
-                <span className="size-1.5 shrink-0 rounded-full bg-destructive" aria-hidden="true" />
-                <span className="text-sm">The dashboard API stopped answering</span>
-                <span className="ml-auto text-xs text-muted-foreground">
+              <div className="mw-banner mb-5" data-tone="error">
+                <span>The dashboard API stopped answering</span>
+                <span className="ml-auto text-xs">
                   Showing the last snapshot · retrying every 2s
                 </span>
               </div>
             ) : null}
-            {snapshot.laptop?.binary_outdated ? (
-              <div className="mb-5 flex items-center gap-3 rounded-[10px] border border-primary/30 bg-observatory-highlight px-5 py-3.5">
-                <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true" />
-                <span className="text-sm">worker was updated, restart the dashboard</span>
-              </div>
+            {snapshot?.laptop?.binary_outdated ? (
+              <div className="mw-banner mb-5">worker was updated, restart the dashboard</div>
             ) : null}
-            <div className="flex items-center pb-5">
-              <p className="flex-1 text-sm text-muted-foreground">{fleetLine(snapshot)}</p>
-              <div className="flex items-center gap-7">
-                <Stat value={`${pad2(busy)} / ${pad2(capacity)}`} label="Slots occupied" accent />
-                <Stat value={pad2(snapshot.progress.total)} label="Total tasks" />
-              </div>
-            </div>
-
-            <TabsContent value="overview">
-              <Overview snapshot={snapshot} onShowAttention={() => setView('tasks')} />
-            </TabsContent>
-
-            <TabsContent value="tasks">
-              {invalidTaskLink ? (
+            <Tabs.Panel value="overview">
+              <Overview
+                snapshot={displayed}
+                onSelectTask={selectTask}
+                onShowAttention={() => navigate({ view: 'tasks' })}
+                onSetup={setup}
+                onShowRun={showRun}
+                previews={previews}
+              />
+            </Tabs.Panel>
+            <Tabs.Panel value="tasks">
+              {route.invalid ? (
                 <p className="mb-5 text-sm text-destructive">That task link is not valid.</p>
               ) : null}
-              {selectedTask ? (
-                <TaskDetail taskId={selectedTask} onBack={() => selectTask(null)} />
+              {route.taskId ? (
+                <TaskDetail
+                  runName={
+                    displayed.runs.find(
+                      (run) =>
+                        run.run_id ===
+                        displayed.tasks.find((task) => task.task_id === route.taskId)?.run_id,
+                    )?.name ?? undefined
+                  }
+                  taskId={route.taskId}
+                  onBack={() => navigate({ view: 'tasks', run: route.run })}
+                />
               ) : (
-                <Tasks snapshot={snapshot} onSelect={selectTask} />
+                <Tasks
+                  snapshot={displayed}
+                  onSelect={selectTask}
+                  initialRun={route.run}
+                  onRunChange={(run) => navigate({ view: 'tasks', run })}
+                  onSetup={setup}
+                />
               )}
-            </TabsContent>
-
-            <TabsContent value="runs">
-              <Runs snapshot={snapshot} />
-            </TabsContent>
-
-            <TabsContent value="settings">
-              <Settings snapshot={snapshot} />
-            </TabsContent>
+            </Tabs.Panel>
+            <Tabs.Panel value="runs">
+              <Runs snapshot={displayed} onShowRun={showRun} />
+            </Tabs.Panel>
+            <Tabs.Panel value="settings">
+              <Settings
+                snapshot={displayed}
+                initialWorker={route.worker}
+                initialAgent={route.agent}
+              />
+            </Tabs.Panel>
           </>
         ) : error ? (
-          <p className="text-sm text-destructive">Cannot reach the dashboard API: {error}</p>
+          <div className="mw-panel mw-empty">
+            <h1 className="mw-section-title">Cannot reach the dashboard</h1>
+            <p className="text-sm text-destructive">Cannot reach the dashboard API: {error}</p>
+            <p className="text-sm text-muted-foreground">Retrying automatically.</p>
+          </div>
         ) : (
           <Skeleton />
         )}
       </main>
-
-      <footer className="mt-auto border-t px-10 py-4">
-        <div className="flex flex-wrap gap-x-8 gap-y-1 font-mono text-[10px] tracking-[0.06em] text-muted-foreground uppercase">
-          <span>Observatory · light</span>
-          <span className="mx-auto">
-            {example
-              ? 'Example snapshot · '
-              : snapshot == null
-                ? 'Waiting for the first snapshot · '
-                : offline
-                  ? 'Last known snapshot · '
-                  : ''}
-            Local observation
-          </span>
-          <span>mac-worker</span>
-        </div>
+      <footer className="flex justify-between gap-4 border-t px-10 py-3 text-xs text-muted-foreground">
+        <span>
+          {example
+            ? 'Example snapshot · '
+            : !snapshot
+              ? 'Waiting for the first snapshot · '
+              : offline
+                ? 'Last known snapshot · '
+                : ''}
+          Local observation
+        </span>
+        <span>mac-worker</span>
       </footer>
-    </Tabs>
+    </Tabs.Root>
   )
 }

@@ -6,7 +6,10 @@ import { Icon, type IconName } from '@/components/Icon'
 import { StatusMark } from '@/components/StatusMark'
 import { TurnLogPanel } from '@/components/TurnLogPanel'
 import { duration, humanize, relativeTime, shortId } from '@/lib/format'
-import { cn } from '@/lib/utils'
+import { Check, ChevronRight, History, Monitor, Reply, Terminal } from 'lucide-react'
+import { AgentMark } from '@/components/AgentMark'
+import { TaskBadge } from '@/components/TaskBadge'
+import { Button } from '@/components/ui/button'
 import {
   acceptTask,
   ApiError,
@@ -21,27 +24,6 @@ import {
 } from '@/lib/api'
 
 const POLL_INTERVAL_MS = 2000
-
-function Fact({ icon, label, value }: { icon: IconName; label: string; value: string }) {
-  return (
-    <div className="min-w-0 flex-1 border-l pl-8.5 first:border-l-0 first:pl-0">
-      <dt className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-        <Icon name={icon} size={11} />
-        {label}
-      </dt>
-      <dd className="mt-1.5 truncate font-mono text-[13px]">{value}</dd>
-    </div>
-  )
-}
-
-function Head({ icon, label }: { icon: IconName; label: string }) {
-  return (
-    <span className="flex items-center gap-2 text-muted-foreground">
-      <Icon name={icon} />
-      <span className="font-mono text-[11px] tracking-[0.1em]">{label}</span>
-    </span>
-  )
-}
 
 function fileIcon(path: string): IconName {
   if (/(^|\/)(tests?|spec)\//.test(path) || /\.(test|spec)\./.test(path)) return 'fileCheck'
@@ -76,7 +58,12 @@ function turnSpan(turn: TurnRow): string {
   return duration(turn.ended_at_millis - turn.started_at_millis)
 }
 
-function Turn({ taskId, turn, open, onToggle }: {
+function Turn({
+  taskId,
+  turn,
+  open,
+  onToggle,
+}: {
   taskId: string
   turn: TurnRow
   open: boolean
@@ -86,7 +73,7 @@ function Turn({ taskId, turn, open, onToggle }: {
   const waitingToStart = turn.started_at_millis == null && turn.ended_at_millis == null
 
   return (
-    <div className="overflow-hidden rounded-[10px] border bg-card">
+    <div className="overflow-hidden border-b last:border-b-0 bg-card">
       <button
         type="button"
         onClick={onToggle}
@@ -109,10 +96,12 @@ function Turn({ taskId, turn, open, onToggle }: {
             ? shortId(turn.turn_id, 12)
             : `started ${relativeTime(turn.started_at_millis)}`}
         </span>
-        {turn.log_truncated ? (
-          <span className="font-mono text-[11px] text-primary">LOG TRUNCATED</span>
-        ) : null}
-        <Icon name={open ? 'chevronDown' : 'chevronRight'} size={14} className="text-muted-foreground" />
+        {turn.log_truncated ? <span className="text-xs text-warning">LOG TRUNCATED</span> : null}
+        <Icon
+          name={open ? 'chevronDown' : 'chevronRight'}
+          size={14}
+          className="text-muted-foreground"
+        />
       </button>
 
       {open ? (
@@ -134,11 +123,20 @@ function Turn({ taskId, turn, open, onToggle }: {
   )
 }
 
-export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => void }) {
+export function TaskDetail({
+  taskId,
+  onBack,
+  runName,
+}: {
+  taskId: string
+  onBack?: () => void
+  runName?: string
+}) {
   const [detail, setDetail] = useState<TaskDetailPayload | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [openTurn, setOpenTurn] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
+  const replyInput = useRef<HTMLTextAreaElement>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const mutationGeneration = useRef(0)
@@ -195,11 +193,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
           setError(null)
         }
       } catch (cause) {
-        if (
-          !cancelled &&
-          !controller.signal.aborted &&
-          detailEpoch.current === epoch
-        ) {
+        if (!cancelled && !controller.signal.aborted && detailEpoch.current === epoch) {
           setError(cause instanceof Error ? cause.message : String(cause))
         }
       }
@@ -244,10 +238,7 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
       if (controller.signal.aborted || mutationGeneration.current !== generation) return
       setActionError(cause instanceof ApiError ? cause.message : String(cause))
     } finally {
-      if (
-        mutationGeneration.current === generation &&
-        mutationController.current === controller
-      ) {
+      if (mutationGeneration.current === generation && mutationController.current === controller) {
         mutationInFlight.current = false
         setBusy(false)
         resumePoll.current()
@@ -261,276 +252,423 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
   const { task } = detail
   const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
 
-  return (
-    <div className="space-y-5">
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      <nav className="flex items-center gap-2.5 text-xs">
-        <button
-          type="button"
-          onClick={onBack}
-          className="flex items-center gap-2.5 text-muted-foreground hover:text-foreground"
+  const waiting = detail.review_state === 'waiting_on_you'
+  const reviewable = detail.review_state === 'ready_for_review'
+  const closing = detail.review_state === 'close_pending'
+  const replyable = waiting || reviewable || detail.review_state === 'ready_for_follow_up'
+  const activeTurn =
+    task.state === 'active'
+      ? (turns.find((turn) => turn.turn_id === task.active_turn_id) ??
+        turns.findLast((turn) => turn.started_at_millis != null && turn.ended_at_millis == null))
+      : null
+  const history = activeTurn ? turns.filter((turn) => turn.turn_id !== activeTurn.turn_id) : turns
+  const replyForm = (
+    <div className="space-y-3">
+      <label
+        htmlFor="task-reply"
+        className={waiting ? 'text-[13px] text-warning' : 'text-[13px] text-muted-foreground'}
+      >
+        {waiting ? 'Your reply' : 'Follow-up'}
+      </label>
+      <textarea
+        ref={replyInput}
+        id="task-reply"
+        aria-label="Follow-up"
+        placeholder={
+          waiting ? 'Write your answer…' : 'Describe what you’d like the agent to change…'
+        }
+        value={draft}
+        disabled={busy}
+        onChange={(event) => setDraft(event.target.value)}
+        rows={4}
+        className="mw-textarea block"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className={'text-[13px] ' + (waiting ? 'text-warning' : 'text-muted-foreground')}>
+          Starts a new turn for this task.
+        </p>
+        <Button
+          disabled={busy || !draft.trim()}
+          aria-busy={busy}
+          onClick={() => void runMutation('reply', draft)}
         >
-          <Icon name="list" size={14} className="text-observatory-hollow" />
+          <Reply size={16} aria-hidden="true" />
+          Send reply
+        </Button>
+      </div>
+    </div>
+  )
+  return (
+    <div className="mw-page">
+      <nav className="flex items-center gap-3 text-[13px]" aria-label="Breadcrumb">
+        <button className="mw-link" onClick={onBack}>
           Tasks
         </button>
-        <Icon name="chevronRight" size={11} className="text-border" />
-        <span className="truncate">{task.title}</span>
+        <ChevronRight size={13} className="text-muted-foreground" aria-hidden="true" />
+        <span className="text-muted-foreground">Task details</span>
       </nav>
-
-      <header className="flex flex-wrap items-start gap-x-10 gap-y-4">
-        <div className="min-w-0 flex-1 space-y-2.5">
-          <h1 className="text-[34px] leading-10 font-medium tracking-[-0.03em]">{task.title}</h1>
-          <div className="flex flex-wrap items-center gap-x-4.5 gap-y-1.5">
-            <StatusMark value={task.state} />
-            {task.last_outcome ? <StatusMark value={task.last_outcome.kind} /> : null}
+      {error ? (
+        <p role="alert" className="mw-banner" data-tone="error">
+          {error}
+        </p>
+      ) : null}
+      <header className="mw-page-heading">
+        <div>
+          <h1 className="mw-page-title">{task.title}</h1>
+          <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-muted-foreground">
+            <TaskBadge task={{ ...task, review_state: detail.review_state }} />
             <DeliveryChip task={detail} freshness={task.freshness} />
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Icon name="cpu" /> {task.worker ?? 'unassigned'}
+            <span className="inline-flex items-center gap-2">
+              <Monitor size={14} aria-hidden="true" />
+              {task.worker ?? 'Unassigned'}
             </span>
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Icon name="repeat" /> {task.turn_count} {task.turn_count === 1 ? 'turn' : 'turns'}
+            <span className="inline-flex items-center gap-2">
+              <History size={14} aria-hidden="true" />
+              {task.turn_count} {task.turn_count === 1 ? 'turn' : 'turns'}
             </span>
-            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Icon name="clock" /> updated {relativeTime(task.updated_at_millis)}
-            </span>
+            <span>Updated {relativeTime(task.updated_at_millis)}</span>
           </div>
         </div>
-        <dl className="flex shrink-0 gap-8.5 pt-1.5">
-          {(
-            [
-              ['spark', 'AGENT', humanize(task.agent)],
-              ['stack', 'MODEL', task.model ?? 'Agent default'],
-              ['gauge', 'EFFORT', task.effort ? humanize(task.effort) : 'Not set'],
-            ] as [IconName, string, string][]
-          ).map(([icon, label, value]) => (
-            <div key={label}>
-              <dt className="flex items-center gap-1.5 font-mono text-[11px] tracking-[0.06em] text-muted-foreground">
-                <Icon name={icon} size={11} />
-                {label}
-              </dt>
-              <dd
-                className={cn(
-                  'mt-2 text-lg leading-5.5',
-                  label === 'MODEL' && 'max-w-80 truncate font-mono',
-                )}
-                title={value}
+        {reviewable || closing ? (
+          <div className="flex gap-3">
+            {reviewable ? (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  replyInput.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+                  replyInput.current?.focus()
+                }}
               >
-                {value}
-              </dd>
-            </div>
-          ))}
-        </dl>
+                <Reply size={16} aria-hidden="true" />
+                Write follow-up
+              </Button>
+            ) : null}
+            <Button disabled={busy} aria-busy={busy} onClick={() => void runMutation('accept')}>
+              <Check size={16} aria-hidden="true" />
+              {closing ? 'Retry accept' : 'Accept task'}
+            </Button>
+          </div>
+        ) : null}
       </header>
-
-      <dl className="flex flex-wrap gap-y-4 border-y py-3.5">
-        <Fact icon="hash" label="TASK" value={shortId(task.task_id, 12)} />
-        <Fact
-          icon="grid"
-          label="RUN"
-          value={
-            task.run_id
-              ? `${shortId(task.run_id, 12)}${task.run_position ? ` · ${task.run_position}` : ''}`
-              : 'standalone'
-          }
-        />
-        <Fact icon="branch" label="BRANCH" value={task.branch ?? 'not published'} />
-        <Fact icon="commit" label="BASE" value={shortId(detail.base_oid, 12)} />
-        <Fact icon="commit" label="HEAD" value={shortId(detail.head_oid, 12)} />
-      </dl>
-
-      <section className="overflow-hidden rounded-[10px] border bg-card">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b px-5.5 py-3.5">
-          <Head icon="fileCheck" label="RESULT" />
-          <span className="ml-auto font-mono text-[11px] tracking-[0.04em] text-observatory-hollow uppercase">
-            {turns.length} {turns.length === 1 ? 'turn' : 'turns'}
-            {detail.session_present ? ' · session on the worker' : ''}
-          </span>
-        </div>
-
-        <div className="flex flex-wrap items-stretch">
-          <div className="min-w-90 flex-1 space-y-4 border-r px-5.5 py-5">
-            <p className="max-w-150 text-sm leading-6 whitespace-pre-wrap">
-              {detail.summary ?? 'The agent reported no summary.'}
-            </p>
-
-            {detail.questions.length > 0 ? (
-              <div className="space-y-2.5 border-l-2 pl-4">
-                <p className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-                  <Icon name="messageQuestion" size={12} />
-                  WAITING ON YOU
-                </p>
-                {detail.questions.map((question, index) => (
-                  <div key={index} className="space-y-2">
-                    <p className="max-w-150 text-sm leading-5.5">{questionText(question)}</p>
-                    {questionOptions(question).length > 0 ? (
-                      <div className="flex flex-wrap gap-2">
-                        {questionOptions(question).map((option) => (
-                          <button
-                            key={option}
-                            type="button"
-                            onClick={() => setDraft(option)}
-                            className="rounded-full border border-observatory-highlight-line bg-observatory-highlight px-3 py-1.5 font-mono text-xs text-primary"
-                          >
-                            {option}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-xs text-observatory-hollow">
-                        the agent offered no options — this one needs a written answer
+      {actionError ? (
+        <p role="alert" className="mw-banner" data-tone="error">
+          {actionError}
+        </p>
+      ) : null}
+      {closing ? (
+        <p className="mw-banner">
+          Close is in progress on this task. Retry when you are ready; it will not double-close.
+        </p>
+      ) : null}
+      <div className="mw-detail-grid">
+        <div className="min-w-0 space-y-5">
+          {waiting ? (
+            <section className="mw-panel mw-panel-pad border-[#FEF0C7] bg-warning-soft">
+              <div className="mb-6 space-y-5">
+                {detail.questions.length ? (
+                  detail.questions.map((question, index) => (
+                    <div key={index}>
+                      <h2 className="text-xl leading-7 font-semibold">{questionText(question)}</h2>
+                      <p className="mt-3 text-[13px] text-warning">
+                        {questionOptions(question).length
+                          ? 'Choose an option or write your own answer.'
+                          : 'The agent offered no options. Write your answer below.'}
                       </p>
+                      {questionOptions(question).length ? (
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          {questionOptions(question).map((option) => (
+                            <Button
+                              key={option}
+                              variant="outline"
+                              aria-pressed={draft === option}
+                              className={draft === option ? '!border-warning !text-warning' : ''}
+                              disabled={busy}
+                              onClick={() => {
+                                setDraft(option)
+                                replyInput.current?.focus()
+                              }}
+                            >
+                              {draft === option ? <Check size={16} aria-hidden="true" /> : null}
+                              {option}
+                            </Button>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))
+                ) : (
+                  <>
+                    <h2 className="text-xl font-semibold">This task needs your answer</h2>
+                    <p>Read the last turn for context, then reply below.</p>
+                  </>
+                )}
+              </div>
+              {replyForm}
+            </section>
+          ) : null}
+          {activeTurn ? (
+            <section className="mw-panel overflow-hidden">
+              <div className="flex items-center justify-between gap-3 border-b p-6">
+                <h2 className="mw-section-title flex items-center gap-3">
+                  <AgentMark agent={task.agent} size={22} />
+                  Turn {activeTurn.turn_number}
+                </h2>
+                <span className="text-xs text-muted-foreground">{turnSpan(activeTurn)}</span>
+              </div>
+              <TurnLogPanel
+                taskId={task.task_id}
+                turnId={activeTurn.turn_id}
+                turnNumber={activeTurn.turn_number}
+                live={true}
+                truncated={activeTurn.log_truncated}
+              />
+            </section>
+          ) : (
+            <>
+              <section className="mw-panel mw-panel-pad">
+                <h2 className="mb-4 text-base font-semibold">
+                  {waiting ? 'Agent context' : 'Result'}
+                </h2>
+                <p className="text-sm leading-6 whitespace-pre-wrap">
+                  {detail.summary ??
+                    (task.state === 'active'
+                      ? 'Waiting for the current turn to report a result.'
+                      : 'The agent reported no summary.')}
+                </p>
+                {detail.questions.length > 0 && !waiting ? (
+                  <div className="mt-5 space-y-2">
+                    {detail.questions.map((question, index) => (
+                      <div key={index}>
+                        <p>{questionText(question)}</p>
+                        {questionOptions(question).length ? (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {questionOptions(question).map((option) => (
+                              <span className="mw-badge mr-2" key={option}>
+                                {option}
+                              </span>
+                            ))}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {!waiting ? (
+                  <div className="mt-6 border-t pt-5">
+                    <div className="mb-4 flex items-center justify-between">
+                      <h3 className="font-semibold">Checks</h3>
+                      <span className="mw-help">Agent reported</span>
+                    </div>
+                    {detail.reported_checks.length ? (
+                      <ul className="space-y-4">
+                        {detail.reported_checks.map((check) => (
+                          <li key={check.name + ':' + check.command} className="flex gap-3">
+                            <span
+                              className="mw-badge self-start"
+                              data-tone={
+                                check.status === 'pass'
+                                  ? 'success'
+                                  : check.status === 'fail' || check.status === 'error'
+                                    ? 'error'
+                                    : 'neutral'
+                              }
+                            >
+                              {checkMark(check.status)}
+                            </span>
+                            <div className="min-w-0">
+                              <p>{check.name}</p>
+                              {check.command ? (
+                                <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                                  {check.command}
+                                </p>
+                              ) : null}
+                              {check.detail ? (
+                                <p className="mt-1 text-xs text-muted-foreground">{check.detail}</p>
+                              ) : null}
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">AGENT REPORTED · not reported</p>
                     )}
                   </div>
-                ))}
-              </div>
-            ) : null}
-
-            {detail.reported_checks.length > 0 ? (
-              <div className="space-y-2">
-                <p className="flex items-center gap-1.5 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-                  <Icon name="shield" size={12} />
-                  AGENT REPORTED
-                </p>
-                <ul className="space-y-2">
-                  {detail.reported_checks.map((check) => (
-                    <li key={`${check.name}:${check.command}`} className="space-y-1">
-                      <div className="flex flex-wrap items-baseline gap-2">
-                        <span className="font-mono text-[11px] tracking-[0.06em] text-observatory-hollow">
-                          {checkMark(check.status)}
-                        </span>
-                        <span className="text-sm">{check.name}</span>
+                ) : null}
+              </section>
+              {waiting ? (
+                <details className="mw-panel mw-panel-pad">
+                  <summary className="cursor-pointer font-semibold">
+                    Partial result and terminal commands
+                  </summary>
+                  <div className="mt-5 space-y-5">
+                    {detail.reported_checks.length ? (
+                      <div>
+                        <h3 className="mb-3 font-medium">
+                          Checks{' '}
+                          <span className="ml-2 text-xs font-normal text-muted-foreground">
+                            Agent reported
+                          </span>
+                        </h3>
+                        <ul className="space-y-3">
+                          {detail.reported_checks.map((check) => (
+                            <li key={check.name + check.command}>
+                              <span
+                                className="mw-badge mr-2"
+                                data-tone={check.status === 'pass' ? 'success' : 'neutral'}
+                              >
+                                {checkMark(check.status)}
+                              </span>
+                              {check.name}
+                              {check.command ? (
+                                <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                                  {check.command}
+                                </p>
+                              ) : null}
+                              {check.detail ? (
+                                <p className="mt-1 text-xs text-muted-foreground">{check.detail}</p>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
                       </div>
-                      {check.command ? (
-                        <p className="font-mono text-[11px] text-muted-foreground">{check.command}</p>
+                    ) : null}
+                    <div>
+                      <h3 className="mb-3 font-medium">
+                        Changed files · {detail.files_changed.length}
+                      </h3>
+                      {detail.diff_stat ? (
+                        <p className="mb-3 text-xs text-muted-foreground">{detail.diff_stat}</p>
                       ) : null}
-                      {check.detail ? (
-                        <p className="text-xs text-muted-foreground">{check.detail}</p>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : (
-              <p className="font-mono text-[11px] tracking-[0.06em] text-observatory-hollow">
-                AGENT REPORTED · not reported
-              </p>
-            )}
-          </div>
-
-          <div className="w-full max-w-101 shrink-0 space-y-3.5 px-5.5 py-5">
-            <div className="space-y-1.5">
-              <span className="flex items-center gap-2 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-                <Icon name="fileDiff" size={12} />
-                CHANGED FILES · {detail.files_changed.length}
-              </span>
-              {detail.diff_stat ? (
-                <p className="font-mono text-[11px] break-words text-muted-foreground">
-                  {detail.diff_stat}
-                </p>
+                      {detail.files_changed.length ? (
+                        <ul className="space-y-2">
+                          {detail.files_changed.map((file) => (
+                            <li className="break-all font-mono text-xs" key={file}>
+                              {file}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">No file changed.</p>
+                      )}
+                    </div>
+                    <CommandList
+                      commands={[
+                        ...(detail.review_commands.length
+                          ? detail.review_commands
+                          : [detail.fetch_command]
+                        ).filter(Boolean),
+                        `worker task say ${task.task_id} --message-file reply.md`,
+                      ]}
+                    />
+                  </div>
+                </details>
               ) : null}
-            </div>
-            {detail.files_changed.length === 0 ? (
-              <p className="text-xs text-observatory-hollow">No file changed.</p>
-            ) : (
-              <ul className="space-y-2.5">
-                {detail.files_changed.map((file) => (
-                  <li key={file} className="flex items-center gap-3">
-                    <Icon name={fileIcon(file)} className="text-observatory-hollow" />
-                    <span className="truncate font-mono text-xs">{file}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
-      </section>
-
-      {['waiting_on_you', 'ready_for_review', 'ready_for_follow_up', 'close_pending'].includes(
-        detail.review_state,
-      ) ? (
-        <section className="space-y-3 rounded-[10px] border bg-card px-5.5 py-5">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-            <Head icon="reply" label="REVIEW" />
-            <span className="ml-auto font-mono text-[11px] tracking-[0.04em] text-observatory-hollow uppercase">
-              {detail.review_state.replaceAll('_', ' ')}
-            </span>
-          </div>
-          {detail.review_state === 'close_pending' ? (
-            <p className="text-sm text-muted-foreground">
-              Close is in progress on this task. Retry when you are ready; it will not double-close.
-            </p>
-          ) : (
-            <textarea
-              aria-label="Follow-up"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              rows={3}
-              className="w-full resize-y rounded-md border bg-background px-3 py-2 text-sm"
-            />
+              {!waiting ? (
+                <section className="mw-panel overflow-hidden">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
+                    <h2 className="font-semibold">
+                      Changed files{' '}
+                      <span className="ml-2 text-xs font-normal text-muted-foreground">
+                        {detail.files_changed.length}
+                      </span>
+                    </h2>
+                    {detail.diff_stat ? (
+                      <span className="text-xs text-muted-foreground">{detail.diff_stat}</span>
+                    ) : null}
+                  </div>
+                  {detail.files_changed.length ? (
+                    <ul className="divide-y">
+                      {detail.files_changed.map((file) => (
+                        <li key={file} className="flex items-start gap-3 px-6 py-3">
+                          <Icon
+                            name={fileIcon(file)}
+                            className="mt-0.5 shrink-0 text-muted-foreground"
+                          />
+                          <span className="break-all font-mono text-xs leading-5">{file}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="px-6 py-4 text-xs text-muted-foreground">No file changed.</p>
+                  )}
+                </section>
+              ) : null}
+              {!waiting ? (
+                <section className="mw-panel mw-panel-pad">
+                  <h2 className="mb-4 flex items-center gap-2 font-semibold">
+                    <Terminal size={16} aria-hidden="true" />
+                    Take it locally
+                  </h2>
+                  <CommandList
+                    commands={
+                      detail.review_commands.length
+                        ? detail.review_commands
+                        : [detail.fetch_command, `worker task diff ${task.task_id} --stat`].filter(
+                            Boolean,
+                          )
+                    }
+                  />
+                </section>
+              ) : null}
+              {replyable && !waiting ? (
+                <section className="mw-panel mw-panel-pad">
+                  <h2 className="mb-4 font-semibold">Ask for a change</h2>
+                  {replyForm}
+                </section>
+              ) : null}
+            </>
           )}
-          {actionError ? <p className="text-sm text-destructive">{actionError}</p> : null}
-          <div className="flex flex-wrap gap-2">
-            {detail.review_state !== 'close_pending' ? (
-              <button
-                type="button"
-                disabled={busy || draft.trim() === ''}
-                aria-busy={busy}
-                onClick={() => void runMutation('reply', draft)}
-                className="rounded-md border px-3.5 py-1.5 font-mono text-xs disabled:opacity-50"
-              >
-                Reply
-              </button>
-            ) : null}
-            {detail.review_state === 'ready_for_review' ||
-            detail.review_state === 'close_pending' ? (
-              <button
-                type="button"
-                disabled={busy}
-                aria-busy={busy}
-                onClick={() => void runMutation('accept')}
-                className="rounded-md border border-observatory-highlight-line bg-observatory-highlight px-3.5 py-1.5 font-mono text-xs text-primary disabled:opacity-50"
-              >
-                {detail.review_state === 'close_pending' ? 'Retry accept' : 'Accept'}
-              </button>
-            ) : null}
-          </div>
-        </section>
-      ) : null}
-
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-          <Head icon="terminal" label="TAKE IT LOCALLY" />
-          {task.branch ? (
-            <span className="ml-auto flex items-center gap-2 font-mono text-[11px]">
-              <Icon name="branch" size={12} className="text-observatory-hollow" />
-              <span className="text-observatory-hollow">RESULT BRANCH</span>
-              <span className="text-observatory-accent-soft">{task.branch}</span>
-            </span>
-          ) : null}
         </div>
-        <CommandList
-          commands={
-            detail.review_commands.length > 0
-              ? detail.review_commands
-              : [detail.fetch_command, `worker task diff ${task.task_id} --stat`]
-          }
-        />
-      </section>
-
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-          <Head icon="history" label="TURNS" />
-          <span className="ml-auto font-mono text-[11px] tracking-[0.04em] text-observatory-hollow uppercase">
-            {turns.length} recorded · open one to read its log
-          </span>
-        </div>
-        {turns.length === 0 ? (
-          <p className="rounded-[10px] border bg-card px-5 py-8 text-center text-sm text-muted-foreground">
-            This task has no recorded turns.
+        <aside className="mw-panel mw-panel-pad self-start">
+          <h2 className="mw-section-title mb-6">Task details</h2>
+          <dl className="mw-facts">
+            <dt>Agent</dt>
+            <dd>
+              <AgentMark agent={task.agent} label />
+            </dd>
+            <dt>Model</dt>
+            <dd>{task.model ?? 'Agent default'}</dd>
+            <dt>Effort</dt>
+            <dd>{task.effort ? humanize(task.effort) : 'Not reported'}</dd>
+            <dt>Mac</dt>
+            <dd>{task.worker ?? 'Unassigned'}</dd>
+            <dt>Run</dt>
+            <dd>{task.run_id ? (runName ?? shortId(task.run_id, 12)) : 'Standalone'}</dd>
+            <dt>Task</dt>
+            <dd className="font-mono text-xs" title={task.task_id}>
+              {task.task_id}
+            </dd>
+            <dt>Branch</dt>
+            <dd className="font-mono text-xs">{task.branch ?? 'Not published'}</dd>
+            <dt>Base</dt>
+            <dd className="font-mono text-xs" title={detail.base_oid ?? undefined}>
+              {shortId(detail.base_oid, 12)}
+            </dd>
+            <dt>Head</dt>
+            <dd className="font-mono text-xs" title={detail.head_oid ?? undefined}>
+              {detail.head_oid ? shortId(detail.head_oid, 12) : 'Not reported'}
+            </dd>
+          </dl>
+          <p className="mt-7 border-t pt-5 text-[13px] leading-6 text-muted-foreground">
+            {waiting
+              ? 'Replying starts a new agent turn. The Mac can be idle while this task waits for you.'
+              : task.state === 'active'
+                ? 'The current turn is still running. Its final result appears when the turn ends.'
+                : reviewable
+                  ? 'Review the result locally, then accept the task or send a follow-up.'
+                  : humanize(detail.review_state)}
+            {detail.session_present ? ' The agent session is on the worker.' : ''}
           </p>
-        ) : (
-          <div className="space-y-3">
-            {turns.map((turn) => (
+        </aside>
+      </div>
+      <section className="mw-panel overflow-hidden">
+        <div className="flex items-center justify-between gap-3 border-b px-6 py-4">
+          <h2 className="font-semibold">{activeTurn ? 'Previous turns' : 'Turn history'}</h2>
+          <span className="mw-help">{history.length} recorded · open one to read its log</span>
+        </div>
+        {history.length ? (
+          <div>
+            {history.map((turn) => (
               <Turn
                 key={turn.turn_id}
                 taskId={task.task_id}
@@ -540,6 +678,10 @@ export function TaskDetail({ taskId, onBack }: { taskId: string; onBack?: () => 
               />
             ))}
           </div>
+        ) : (
+          <p className="p-6 text-sm text-muted-foreground">
+            {activeTurn ? 'No previous turns.' : 'This task has no recorded turns.'}
+          </p>
         )}
       </section>
     </div>

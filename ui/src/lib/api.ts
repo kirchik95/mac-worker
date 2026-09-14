@@ -1,3 +1,4 @@
+import { exampleResponse, wantsExample } from '@/lib/exampleSnapshot'
 /** Shapes mirror the Rust dashboard snapshot projection; see src/dashboard/model.rs. */
 
 export type Freshness = 'current' | 'stale' | 'unknown'
@@ -67,7 +68,14 @@ export interface Worker {
     cpu_busy_percent: number | null
   }
   error: DashboardError | null
-  active_task: { task_id: string; title: string; agent: string; model: string | null; effort: string | null; turn_number: number } | null
+  active_task: {
+    task_id: string
+    title: string
+    agent: string
+    model: string | null
+    effort: string | null
+    turn_number: number
+  } | null
 }
 
 export interface TaskRow {
@@ -169,6 +177,7 @@ export class SnapshotPendingError extends Error {
 }
 
 export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  if (wantsExample()) return exampleResponse(path) as T
   const response = await fetch(path, { cache: 'no-store', signal })
   if (response.status === 503) {
     const payload: unknown = await response.json().catch(() => null)
@@ -298,6 +307,8 @@ async function postTaskMutation(
   body: TaskMutation,
   signal?: AbortSignal,
 ): Promise<TaskDetail> {
+  if (wantsExample())
+    throw new ApiError(403, 'Example mode is read-only. Open the live dashboard to change a task.')
   const response = await fetch(path, {
     method: 'POST',
     headers: {
@@ -315,9 +326,7 @@ async function postTaskMutation(
         : null
     const code = typeof error?.code === 'string' ? error.code : null
     const message =
-      typeof error?.message === 'string'
-        ? error.message
-        : `save responded ${response.status}`
+      typeof error?.message === 'string' ? error.message : `save responded ${response.status}`
     throw new ApiError(response.status, message, code)
   }
   return payload as TaskDetail
@@ -334,6 +343,8 @@ export const fetchAgentSettings = (worker: string, signal?: AbortSignal) =>
 
 /** Saves one agent. The revision is the optimistic check the host enforces. */
 export async function saveAgentSettings(worker: string, body: SaveSettings): Promise<AgentSetting> {
+  if (wantsExample())
+    throw new ApiError(403, 'Example mode is read-only. Open the live dashboard to save defaults.')
   const response = await fetch(`/api/v1/workers/${encodeURIComponent(worker)}/agent-settings`, {
     method: 'POST',
     headers: {

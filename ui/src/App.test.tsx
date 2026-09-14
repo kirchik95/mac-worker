@@ -12,11 +12,14 @@ afterEach(() => {
 
 describe('App states', () => {
   it('shows the skeleton until the first snapshot arrives', () => {
-    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => new Promise(() => {})),
+    )
     render(<App />)
 
     expect(screen.getByLabelText('Loading the first snapshot')).toBeInTheDocument()
-    expect(screen.getByText(/SNAPSHOT --:--:--/)).toBeInTheDocument()
+    expect(screen.getByText('Connecting to your Macs…')).toBeInTheDocument()
     expect(screen.getByText(/Waiting for the first snapshot/)).toBeInTheDocument()
   })
 
@@ -37,7 +40,7 @@ describe('App states', () => {
     )
     // The fleet stays readable; only the header and footer say it is not live.
     expect(screen.getAllByText('mini-1').length).toBeGreaterThan(0)
-    expect(screen.getByText(/LAST SNAPSHOT/)).toBeInTheDocument()
+    expect(screen.getByText('Showing last snapshot')).toBeInTheDocument()
     expect(screen.getByText(/Last known snapshot/)).toBeInTheDocument()
   })
 
@@ -131,9 +134,7 @@ describe('worker errors', () => {
     )
     render(<App />)
 
-    await waitFor(() =>
-      expect(screen.getAllByText('SSH_UNAVAILABLE').length).toBeGreaterThan(0),
-    )
+    await waitFor(() => expect(screen.getAllByText('SSH_UNAVAILABLE').length).toBeGreaterThan(0))
   })
 })
 

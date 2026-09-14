@@ -7,9 +7,27 @@ import { Tasks } from './Tasks'
 
 const fixture = snapshot({
   tasks: [
-    task({ task_id: 'a'.repeat(32), title: 'Repair login', agent: 'codex', worker: 'mini-1', state: 'active' }),
-    task({ task_id: 'b'.repeat(32), title: 'Extract billing', agent: 'cursor', worker: 'mini-2', state: 'closed' }),
-    task({ task_id: 'c'.repeat(32), title: MALICIOUS, agent: 'codex', worker: null, state: 'abandoned' }),
+    task({
+      task_id: 'a'.repeat(32),
+      title: 'Repair login',
+      agent: 'codex',
+      worker: 'mini-1',
+      state: 'active',
+    }),
+    task({
+      task_id: 'b'.repeat(32),
+      title: 'Extract billing',
+      agent: 'cursor',
+      worker: 'mini-2',
+      state: 'closed',
+    }),
+    task({
+      task_id: 'c'.repeat(32),
+      title: MALICIOUS,
+      agent: 'codex',
+      worker: null,
+      state: 'abandoned',
+    }),
   ],
 })
 
@@ -19,14 +37,6 @@ const titles = () =>
     .getAllByRole('row')
     .slice(1)
     .map((row) => within(row).getAllByRole('cell')[1].textContent ?? '')
-
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => {
-    resolve = done
-  })
-  return { promise, resolve }
-}
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -96,12 +106,17 @@ describe('Tasks', () => {
     const outcomes = snapshot({
       tasks: [
         task({ task_id: 'a'.repeat(32), title: 'Repair login', last_outcome: { kind: 'done' } }),
-        task({ task_id: 'b'.repeat(32), title: 'Extract billing', last_outcome: { kind: 'blocked' } }),
+        task({
+          task_id: 'b'.repeat(32),
+          title: 'Extract billing',
+          last_outcome: { kind: 'blocked' },
+        }),
       ],
     })
     render(<Tasks snapshot={outcomes} onSelect={() => {}} />)
 
-    await user.click(screen.getByRole('button', { name: /blocked/ }))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Outcome' }), 'blocked')
+    await user.click(screen.getByText('CLI equivalent'))
     expect(titles().some((title) => title.includes('Extract billing'))).toBe(true)
     expect(titles()).toHaveLength(1)
     expect(screen.getByText('worker task list --outcome blocked')).toBeInTheDocument()
@@ -119,65 +134,47 @@ describe('Tasks', () => {
     )
     render(<Tasks snapshot={waiting} onSelect={() => {}} />)
 
-    await user.click(screen.getAllByRole('button', { name: /needs input/ })[0])
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Outcome' }), 'needs_input')
+    await user.click(screen.getByText('CLI equivalent'))
     expect(screen.getByText('worker task list --outcome needs-input')).toBeInTheDocument()
     vi.unstubAllGlobals()
   })
 
-  it('shows the question, the answers the agent will take, and how to reply', async () => {
+  it('links a named question shortcut to the right task', async () => {
+    const onSelect = vi.fn()
+    const user = userEvent.setup()
     const waiting = snapshot({
       tasks: [
         task({
           task_id: 'd'.repeat(32),
           title: 'Give the dashboard a queue projection',
           state: 'open',
-          turn_count: 3,
           last_outcome: { kind: 'needs_input' },
         }),
       ],
     })
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          questions: [{ text: 'Keep dispatched entries?', options: ['keep them', 'drop them'] }],
-        }),
-      }),
+    render(<Tasks snapshot={waiting} onSelect={onSelect} />)
+    expect(screen.getByText('1 task needs your answer')).toBeInTheDocument()
+    await user.click(
+      screen.getAllByRole('button', { name: 'Give the dashboard a queue projection' })[0],
     )
-    render(<Tasks snapshot={waiting} onSelect={() => {}} />)
-
-    expect(screen.getByText('Waiting on you · 1')).toBeInTheDocument()
-    expect(await screen.findByText('Keep dispatched entries?')).toBeInTheDocument()
-    expect(screen.getByText('keep them')).toBeInTheDocument()
-    expect(screen.getByText('drop them')).toBeInTheDocument()
-    expect(
-      screen.getByText(`worker task say ${'d'.repeat(32)} --message-file reply.md`),
-    ).toBeInTheDocument()
-    expect(screen.getByText('your answer starts turn 4')).toBeInTheDocument()
-    vi.unstubAllGlobals()
+    expect(onSelect).toHaveBeenCalledWith('d'.repeat(32))
   })
 
-  it('says a question carries no options rather than leaving the row bare', async () => {
-    const waiting = snapshot({
-      tasks: [task({ state: 'open', last_outcome: { kind: 'needs_input' } })],
-    })
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: async () => ({ questions: ['Which base should it use?'] }),
-      }),
+  it('keeps the shortcut within the active filters', async () => {
+    const user = userEvent.setup()
+    render(
+      <Tasks
+        snapshot={snapshot({
+          tasks: [
+            task({ title: 'Waiting task', state: 'open', last_outcome: { kind: 'needs_input' } }),
+          ],
+        })}
+        onSelect={() => {}}
+      />,
     )
-    render(<Tasks snapshot={waiting} onSelect={() => {}} />)
-
-    expect(await screen.findByText('Which base should it use?')).toBeInTheDocument()
-    expect(
-      screen.getByText('the agent offered no options — this one needs a written answer'),
-    ).toBeInTheDocument()
-    vi.unstubAllGlobals()
+    await user.type(screen.getByLabelText('Filter tasks'), 'different')
+    expect(screen.queryByText('1 task needs your answer')).not.toBeInTheDocument()
   })
 
   it('opens the task the operator clicked', async () => {
@@ -188,63 +185,16 @@ describe('Tasks', () => {
     expect(onSelect).toHaveBeenCalledWith('a'.repeat(32))
   })
 
-  it('distinguishes unread, empty, and failed attention questions', async () => {
-    const pending = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>()
-    vi.stubGlobal(
-      'fetch',
-      vi.fn((url: string) => {
-        const href = String(url)
-        if (href.includes('wait-empty')) {
-          return Promise.resolve({ ok: true, status: 200, json: async () => ({ questions: [] }) })
-        }
-        if (href.includes('wait-fail')) return Promise.reject(new Error('detail missing'))
-        return pending.promise
-      }),
+  it('does not keep a closed question in the answer shortcuts', () => {
+    render(
+      <Tasks
+        snapshot={snapshot({
+          tasks: [task({ state: 'closed', last_outcome: { kind: 'needs_input' } })],
+        })}
+        onSelect={() => {}}
+      />,
     )
-    const waiting = snapshot({
-      tasks: [
-        task({
-          task_id: 'wait-pending',
-          title: 'Pending question task',
-          state: 'open',
-          last_outcome: { kind: 'needs_input' },
-        }),
-        task({
-          task_id: 'wait-empty',
-          title: 'Empty question task',
-          state: 'open',
-          last_outcome: { kind: 'needs_input' },
-        }),
-        task({
-          task_id: 'wait-fail',
-          title: 'Failed question task',
-          state: 'open',
-          last_outcome: { kind: 'needs_input' },
-        }),
-      ],
-    })
-    render(<Tasks snapshot={waiting} onSelect={() => {}} />)
-
-    expect(screen.getAllByText('Reading the question…')).toHaveLength(3)
-    const emptyCopy =
-      'The task record carries no question — open the task to read its last turn.'
-    expect(await screen.findByText(emptyCopy)).toBeInTheDocument()
-
-    const articleFor = (title: string) => {
-      const match = screen
-        .getAllByText(title)
-        .map((node) => node.closest('article'))
-        .find((node) => node != null)
-      expect(match).not.toBeNull()
-      return match as HTMLElement
-    }
-    const pendingArticle = articleFor('Pending question task')
-    const emptyArticle = articleFor('Empty question task')
-    const failArticle = articleFor('Failed question task')
-    expect(within(pendingArticle).getByText('Reading the question…')).toBeInTheDocument()
-    expect(within(emptyArticle).getByText(emptyCopy)).toBeInTheDocument()
-    expect(within(failArticle).getByText('Reading the question…')).toBeInTheDocument()
-    expect(within(pendingArticle).queryByText(emptyCopy)).not.toBeInTheDocument()
-    expect(within(failArticle).queryByText(emptyCopy)).not.toBeInTheDocument()
+    expect(screen.queryByText(/task needs your answer/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Answer' })).not.toBeInTheDocument()
   })
 })

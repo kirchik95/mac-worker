@@ -1,68 +1,120 @@
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ArrowRight, Layers, Info } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { relativeTime, shortId } from '@/lib/format'
-import type { Progress, RunRow, Snapshot } from '@/lib/api'
+import type { Snapshot, Progress } from '@/lib/api'
 
 const SEGMENTS: [keyof Progress, string, string][] = [
-  ['closed', 'Closed', 'bg-emerald-500'],
-  ['active', 'Active', 'bg-sky-500'],
-  ['open', 'Open', 'bg-amber-500'],
-  ['queued', 'Queued', 'bg-muted-foreground/40'],
-  ['failed_like', 'Failed', 'bg-red-500'],
+  ['closed', 'Closed', '#12B76A'],
+  ['active', 'Running', '#475467'],
+  ['open', 'Open', '#F79009'],
+  ['queued', 'Queued', '#D0D5DD'],
+  ['failed_like', 'Failed', '#F04438'],
 ]
-
-function ProgressBar({ progress }: { progress: Progress }) {
-  const total = Math.max(progress.total, 1)
+export function Runs({
+  snapshot,
+  onShowRun,
+}: {
+  snapshot: Snapshot
+  onShowRun?: (id: string) => void
+}) {
   return (
-    <div className="space-y-2">
-      <div className="flex h-2 overflow-hidden rounded-full bg-muted">
-        {SEGMENTS.map(([key, , tone]) =>
-          progress[key] > 0 ? (
-            <div key={key} className={tone} style={{ width: `${(progress[key] / total) * 100}%` }} />
-          ) : null,
-        )}
-      </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        {SEGMENTS.map(([key, label]) => (
-          <span key={key}>
-            {label} <span className="tabular-nums text-foreground">{progress[key]}</span>
-          </span>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function RunCard({ run }: { run: RunRow }) {
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <CardTitle className="truncate text-base">{run.name ?? 'Unnamed run'}</CardTitle>
-            <p className="font-mono text-xs text-muted-foreground">{shortId(run.run_id, 12)}</p>
-          </div>
-          <div className="shrink-0 text-right text-xs text-muted-foreground">
-            <div>max parallel {run.max_parallel}</div>
-            <div>{relativeTime(run.created_at_millis)}</div>
-          </div>
+    <div className="mw-page">
+      <header>
+        <h1 className="mw-page-title">Runs</h1>
+        <p className="mw-page-description">
+          Related tasks, their progress and how many can run at once.
+        </p>
+      </header>
+      {snapshot.runs.length ? (
+        <div className="mw-table-wrap">
+          <table className="mw-table">
+            <colgroup>
+              <col style={{ width: '27%' }} />
+              <col />
+              <col style={{ width: 140 }} />
+              <col style={{ width: 140 }} />
+              <col style={{ width: 158 }} />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>Progress</th>
+                <th>Max parallel</th>
+                <th>Created</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshot.runs.map((run) => (
+                <tr key={run.run_id}>
+                  <td>
+                    <button
+                      className="mw-task-title font-medium"
+                      onClick={() => onShowRun?.(run.run_id)}
+                    >
+                      {run.name ?? 'Unnamed run'}
+                    </button>
+                    <span className="mw-task-id">
+                      {shortId(run.run_id, 12)} · {run.progress.total}{' '}
+                      {run.progress.total === 1 ? 'task' : 'tasks'}
+                    </span>
+                  </td>
+                  <td>
+                    <div
+                      className="mb-2 flex h-1.5 overflow-hidden rounded-full bg-muted"
+                      role="img"
+                      aria-label={SEGMENTS.map(
+                        ([key, label]) => label + ': ' + run.progress[key],
+                      ).join(', ')}
+                    >
+                      {SEGMENTS.map(([key, , color]) => (
+                        <span
+                          key={key}
+                          style={{
+                            width:
+                              (100 * run.progress[key]) / Math.max(run.progress.total, 1) + '%',
+                            background: color,
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                      {SEGMENTS.filter(([key]) => run.progress[key] > 0).map(([key, label]) => (
+                        <span key={key}>
+                          {run.progress[key]} {label.toLowerCase()}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td>
+                    <span className="mw-badge">{run.max_parallel}</span>
+                  </td>
+                  <td>{relativeTime(run.created_at_millis)}</td>
+                  <td>
+                    <Button variant="outline" onClick={() => onShowRun?.(run.run_id)}>
+                      View tasks
+                      <ArrowRight size={16} aria-hidden="true" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      </CardHeader>
-      <CardContent>
-        <ProgressBar progress={run.progress} />
-      </CardContent>
-    </Card>
-  )
-}
-
-export function Runs({ snapshot }: { snapshot: Snapshot }) {
-  if (snapshot.runs.length === 0) {
-    return <p className="text-sm text-muted-foreground">No runs have been recorded yet.</p>
-  }
-  return (
-    <div className="grid gap-4 md:grid-cols-2">
-      {snapshot.runs.map((run) => (
-        <RunCard key={run.run_id} run={run} />
-      ))}
+      ) : (
+        <section className="mw-panel mw-empty">
+          <Layers size={28} aria-hidden="true" />
+          <h2 className="mw-section-title">No runs yet</h2>
+          <p className="text-muted-foreground">
+            Runs group related tasks under one concurrency limit.
+          </p>
+        </section>
+      )}
+      <p className="flex items-start gap-2 text-xs text-muted-foreground">
+        <Info size={15} className="shrink-0 mt-0.5" aria-hidden="true" />A run’s limit is separate
+        from Mac slots. Queued tasks start when both a run slot and a compatible Mac slot are
+        available.
+      </p>
     </div>
   )
 }

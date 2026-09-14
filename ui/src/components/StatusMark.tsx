@@ -23,7 +23,7 @@ const MARKS: Record<string, { icon: IconName; tone: string }> = {
   signalled: { icon: 'xCircle', tone: 'text-destructive' },
   // Outcomes.
   done: { icon: 'check', tone: 'text-observatory-green' },
-  needs_input: { icon: 'question', tone: 'text-primary' },
+  needs_input: { icon: 'question', tone: 'text-warning' },
   blocked: { icon: 'xCircle', tone: 'text-destructive' },
   failed: { icon: 'xCircle', tone: 'text-destructive' },
   timed_out: { icon: 'hourglass', tone: 'text-destructive' },
@@ -44,11 +44,11 @@ export function StatusMark({
   const key = (value ?? 'unknown').toLowerCase()
   const mark = MARKS[key] ?? MARKS.unknown
   return (
-    <span className={cn('inline-flex items-center gap-[7px] whitespace-nowrap', mark.tone, className)}>
+    <span
+      className={cn('inline-flex items-center gap-[7px] whitespace-nowrap', mark.tone, className)}
+    >
       <Icon name={mark.icon} size={size} />
-      <span className="font-mono text-[10px] tracking-[0.06em] uppercase">
-        {(value ?? 'unknown').replace(/_/g, ' ')}
-      </span>
+      <span className="text-xs">{(value ?? 'unknown').replace(/_/g, ' ')}</span>
     </span>
   )
 }

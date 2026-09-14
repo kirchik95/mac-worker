@@ -31,7 +31,7 @@ function deferred<T>() {
 }
 
 const codexPanel = async () => {
-  const heading = await screen.findByText('mini-1 / codex')
+  const heading = await screen.findByText('Codex on mini-1')
   return heading.closest('section') as HTMLElement
 }
 
@@ -72,9 +72,9 @@ describe('Settings', () => {
     render(<Settings snapshot={snapshot()} />)
 
     // codex is authenticated in the fixture; opencode is absent from the facts.
-    const table = await screen.findByRole('table')
-    expect(within(table).getByText('Connected')).toBeInTheDocument()
-    expect(within(table).getByText('Not configured')).toBeInTheDocument()
+    const table = await screen.findByRole('complementary', { name: 'Agents' })
+    expect(within(table).getByText(/Connected/)).toBeInTheDocument()
+    expect(within(table).getByText(/Not configured/)).toBeInTheDocument()
   })
 
   it('keeps Save and Cancel inert until the draft differs', async () => {
@@ -82,11 +82,11 @@ describe('Settings', () => {
     render(<Settings snapshot={snapshot()} />)
 
     const codex = await codexPanel()
-    expect(within(codex).getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
     expect(within(codex).getByRole('button', { name: 'Cancel' })).toBeDisabled()
 
     await userEvent.setup().click(within(codex).getByRole('switch'))
-    expect(within(codex).getByRole('button', { name: 'Save' })).toBeEnabled()
+    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
   })
 
   it('sends the revision the host checks', async () => {
@@ -100,7 +100,7 @@ describe('Settings', () => {
 
     const codex = await codexPanel()
     await user.click(within(codex).getByRole('switch'))
-    await user.click(within(codex).getByRole('button', { name: 'Save' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
 
     await waitFor(() => expect(calls).toHaveLength(1))
     expect(calls[0]).toMatchObject({ agent: 'codex', revision: 'rev-1', fast: true })
@@ -119,22 +119,22 @@ describe('Settings', () => {
 
     const codex = await codexPanel()
     await user.click(within(codex).getByRole('switch'))
-    await user.click(within(codex).getByRole('button', { name: 'Save' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
 
     expect(await within(codex).findByText('Saved.')).toBeInTheDocument()
-    const table = screen.getByRole('table')
-    expect(within(table).getByText('Low')).toBeInTheDocument()
+    const table = screen.getByRole('complementary', { name: 'Agents' })
+    expect(within(codex).getByText('Low')).toBeInTheDocument()
     expect(within(table).getByText('OpenCode')).toBeInTheDocument()
 
     await waitFor(() => {
       expect(within(codex).getByRole('switch')).toBeChecked()
-      expect(within(codex).getByRole('button', { name: 'Save' })).toBeDisabled()
+      expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
     })
     await user.click(within(codex).getByRole('switch'))
     await waitFor(() =>
-      expect(within(codex).getByRole('button', { name: 'Save' })).toBeEnabled(),
+      expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeEnabled(),
     )
-    await user.click(within(codex).getByRole('button', { name: 'Save' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
     await waitFor(() => expect(calls).toHaveLength(2))
     expect(calls[1]).toMatchObject({ agent: 'codex', revision: 'rev-2', fast: false })
   })
@@ -150,11 +150,11 @@ describe('Settings', () => {
 
     const codex = await codexPanel()
     await user.click(within(codex).getByRole('switch'))
-    await user.click(within(codex).getByRole('button', { name: 'Save' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
 
     // The draft must survive a conflict, or the operator loses what they typed.
     await waitFor(() => expect(within(codex).getByRole('switch')).toBeChecked())
-    expect(within(codex).getByRole('button', { name: 'Save' })).toBeEnabled()
+    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
     expect(within(codex).getByText(/REVISION_STALE/)).toBeInTheDocument()
   })
 
@@ -169,7 +169,7 @@ describe('Settings', () => {
 
     await user.click(within(codex).getByRole('button', { name: 'Cancel' }))
     expect(within(codex).getByRole('switch')).not.toBeChecked()
-    expect(within(codex).getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
   })
 
   it('ignores a delayed save after switching workers', async () => {
@@ -200,19 +200,15 @@ describe('Settings', () => {
       }),
     )
     const user = userEvent.setup()
-    render(
-      <Settings
-        snapshot={snapshot({ workers: [worker(), worker({ name: 'mini-2' })] })}
-      />,
-    )
+    render(<Settings snapshot={snapshot({ workers: [worker(), worker({ name: 'mini-2' })] })} />)
 
     const miniOne = await codexPanel()
     await user.click(within(miniOne).getByRole('switch'))
-    await user.click(within(miniOne).getByRole('button', { name: 'Save' }))
+    await user.click(within(miniOne).getByRole('button', { name: 'Save defaults' }))
     await user.click(screen.getByRole('combobox', { name: 'Worker' }))
     await user.click(await screen.findByRole('option', { name: 'mini-2' }))
 
-    const miniTwoHeading = await screen.findByText('mini-2 / codex')
+    const miniTwoHeading = await screen.findByText('Codex on mini-2')
     const miniTwo = miniTwoHeading.closest('section') as HTMLElement
     const beforeDelayedResolution = draftIn(miniTwo)
     workerOneSave.resolve({
@@ -221,9 +217,9 @@ describe('Settings', () => {
       json: async () => ({ ...agentSettings().agents[0], fast: true, revision: 'rev-2' }),
     })
 
-    await waitFor(() => expect(screen.getByText('mini-2 / codex')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('Codex on mini-2')).toBeInTheDocument())
     expect(draftIn(miniTwo)).toEqual(beforeDelayedResolution)
-    expect(within(miniTwo).getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(within(miniTwo).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
   })
 
   it('invalidates a delayed save when selecting another agent', async () => {
@@ -244,13 +240,13 @@ describe('Settings', () => {
 
     const codex = await codexPanel()
     await user.click(within(codex).getByRole('switch'))
-    await user.click(within(codex).getByRole('button', { name: 'Save' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
     await user.click(screen.getByText('OpenCode'))
 
-    const openCodeHeading = await screen.findByText('mini-1 / opencode')
+    const openCodeHeading = await screen.findByText('OpenCode on mini-1')
     const openCode = openCodeHeading.closest('section') as HTMLElement
     await waitFor(() =>
-      expect(within(openCode).getByRole('button', { name: 'Save' })).toBeInTheDocument(),
+      expect(within(openCode).getByRole('button', { name: 'Save defaults' })).toBeInTheDocument(),
     )
     const beforeDelayedResolution = draftIn(openCode)
     codexSave.resolve({
@@ -259,9 +255,55 @@ describe('Settings', () => {
       json: async () => ({ ...agentSettings().agents[0], fast: true, revision: 'rev-2' }),
     })
 
-    await waitFor(() => expect(screen.getByText('mini-1 / opencode')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('OpenCode on mini-1')).toBeInTheDocument())
     expect(draftIn(openCode)).toEqual(beforeDelayedResolution)
-    expect(within(openCode).getByText('Task settings can override these defaults.')).toBeInTheDocument()
-    expect(within(openCode).getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(
+      within(openCode).getByText('Task settings can override these defaults.'),
+    ).toBeInTheDocument()
+    expect(within(openCode).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
   })
+})
+
+it('keeps a manually selected Mac and its draft when the snapshot refreshes', async () => {
+  mockFetch(() => ({ ok: true, status: 200, payload: agentSettings().agents[0] }))
+  const user = userEvent.setup()
+  const pool = () => snapshot({ workers: [worker(), worker({ name: 'mini-2' })] })
+  const { rerender } = render(
+    <Settings snapshot={pool()} initialWorker="mini-1" initialAgent="codex" />,
+  )
+  await codexPanel()
+  await user.click(screen.getByRole('combobox', { name: 'Worker' }))
+  await user.click(await screen.findByRole('option', { name: 'mini-2' }))
+  const editor = (await screen.findByText('Codex on mini-2')).closest('section')!
+  await user.click(within(editor).getByRole('switch'))
+  rerender(<Settings snapshot={pool()} initialWorker="mini-1" initialAgent="codex" />)
+  expect(screen.getByText('Codex on mini-2')).toBeInTheDocument()
+  expect(within(editor).getByRole('switch')).toBeChecked()
+})
+
+it('presents unavailable native defaults as read-only facts', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        agents: [
+          {
+            ...agentSettings().agents[1],
+            model: null,
+            effort: null,
+            fast: null,
+            writable: false,
+            message: 'This Mac has not reported editable defaults.',
+          },
+        ],
+      }),
+    })),
+  )
+  render(<Settings snapshot={snapshot()} initialAgent="opencode" />)
+  await screen.findByRole('heading', { name: 'OpenCode on mini-1' })
+  expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Save defaults' })).not.toBeInTheDocument()
+  expect(screen.getByRole('heading', { name: 'Read-only defaults' })).toBeInTheDocument()
 })

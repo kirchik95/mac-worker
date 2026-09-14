@@ -10,15 +10,11 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import {
-  agentBinary,
-  agentInitials,
-  agentLabel,
-  agentVersion,
-  connection,
-} from '@/lib/agents'
-import { humanize, pad2 } from '@/lib/format'
+import { AlertTriangle, Check, ChevronRight } from 'lucide-react'
+import { AgentMark } from '@/components/AgentMark'
+import { CommandList } from '@/components/CommandList'
+import { agentBinary, agentLabel, agentVersion, connection } from '@/lib/agents'
+import { humanize } from '@/lib/format'
 import {
   fetchAgentSettings,
   saveAgentSettings,
@@ -46,15 +42,15 @@ const sameDraft = (a: Draft, b: Draft) =>
 
 const TONES: Record<string, string> = {
   connected: 'text-observatory-green',
-  attention: 'text-primary',
+  attention: 'text-warning',
   unknown: 'text-muted-foreground',
 }
 
 function Field({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground">{label}</span>
-      <span className="text-sm">{value}</span>
+      <span className="text-[13px] text-muted-foreground">{label}</span>
+      <span className="text-lg font-medium">{value}</span>
     </div>
   )
 }
@@ -136,127 +132,205 @@ function Detail({
   }, [identity, worker, setting.agent, setting.revision, draft, fastSupported, onSaved])
 
   return (
-    <section className="rounded-[10px] border bg-card p-5">
-      <h2 className="text-[18px] leading-6 font-medium tracking-[-0.02em]">
-        {worker} / {agentBinary(setting.agent)}
+    <section className="mw-settings-editor">
+      <h2 className="text-xl leading-7 font-semibold">
+        {agentLabel(setting.agent)} on {worker}
       </h2>
-
-      <div className="mt-5 grid gap-5 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <Label className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground">
-            MODEL
-          </Label>
-          <Select
-            value={draft.model ?? DEFAULT}
-            onValueChange={(next) => {
-              const model = next === DEFAULT || next == null ? null : next
-              const options =
-                setting.model_options.find((option) => option.id === model)?.effort_options ?? []
-              setDraft((current) => ({
-                model,
-                effort: current.effort && options.includes(current.effort) ? current.effort : null,
-                fast: current.fast,
-              }))
-            }}
-            disabled={!setting.writable}
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue>
-                {(value) =>
-                  value === DEFAULT
-                    ? 'Agent default'
-                    : (setting.model_options.find((option) => option.id === value)?.label ??
-                      String(value))
-                }
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={DEFAULT}>Agent default</SelectItem>
-              {setting.model_options.map((option) => (
-                <SelectItem key={option.id} value={option.id}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="space-y-1.5">
-          <Label className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground">
-            EFFORT
-          </Label>
-          <Select
-            value={draft.effort ?? DEFAULT}
-            onValueChange={(next) =>
-              setDraft((current) => ({
-                ...current,
-                effort: next === DEFAULT || next == null ? null : next,
-              }))
-            }
-            disabled={!setting.writable || effortOptions.length === 0}
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue>
-                {(value) => (value === DEFAULT ? 'Agent default' : humanize(String(value)))}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={DEFAULT}>Agent default</SelectItem>
-              {effortOptions.map((option) => (
-                <SelectItem key={option} value={option}>
-                  {humanize(option)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {effortOptions.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              {setting.agent} publishes no global effort setting.
+      <p className="mt-1 text-[13px] text-muted-foreground">
+        Native defaults for new turns. Task settings can override them.
+      </p>
+      {connectionLabel !== 'Connected' ? (
+        <div className="mw-banner my-6">
+          <AlertTriangle size={18} aria-hidden="true" />
+          <div className="flex-1">
+            <p className="font-medium">
+              {connectionLabel === 'Sign-in needed' ? 'Sign in to ' : 'Check '}
+              {agentLabel(setting.agent)} on {worker}
             </p>
-          ) : null}
+            <p className="mt-1">
+              {connectionLabel === 'Sign-in needed'
+                ? 'Authentication is required to run tasks on this Mac.'
+                : 'The latest worker facts do not confirm an authenticated agent.'}
+            </p>
+          </div>
+          <details className="w-full">
+            <summary className="mw-button" data-variant="outline">
+              <ChevronRight size={14} aria-hidden="true" />
+              Setup instructions
+            </summary>
+            <div className="mt-3 space-y-3">
+              <p>Open a terminal on {worker} using its configured SSH target, then run:</p>
+              <CommandList
+                commands={[
+                  (
+                    {
+                      codex: 'codex login',
+                      cursor: 'cursor-agent login',
+                      opencode: 'opencode auth login',
+                      claude: 'claude',
+                    } as Record<string, string>
+                  )[setting.agent] ?? agentBinary(setting.agent),
+                ]}
+              />
+              <p>After signing in, refresh the facts from your laptop:</p>
+              <CommandList commands={['worker workers --refresh']} />
+            </div>
+          </details>
+        </div>
+      ) : null}
+      {setting.message ? <p className="mw-banner mt-6">{setting.message}</p> : null}
+      <div className="mw-settings-columns">
+        {setting.writable ? (
+          <div className="space-y-6">
+            <h3 className="font-semibold">Default settings</h3>
+            <div className="space-y-1.5">
+              <Label className="text-[13px] text-muted-foreground">Model</Label>
+              <Select
+                value={draft.model ?? DEFAULT}
+                onValueChange={(next) => {
+                  const model = next === DEFAULT || next == null ? null : next
+                  const options =
+                    setting.model_options.find((option) => option.id === model)?.effort_options ??
+                    []
+                  setDraft((current) => ({
+                    model,
+                    effort:
+                      current.effort && options.includes(current.effort) ? current.effort : null,
+                    fast: current.fast,
+                  }))
+                }}
+                disabled={!setting.writable}
+              >
+                <SelectTrigger aria-label="Model" className="w-full">
+                  <SelectValue>
+                    {(value) =>
+                      value === DEFAULT
+                        ? 'Agent default'
+                        : (setting.model_options.find((option) => option.id === value)?.label ??
+                          String(value))
+                    }
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DEFAULT}>Agent default</SelectItem>
+                  {setting.model_options.map((option) => (
+                    <SelectItem key={option.id} value={option.id}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-[13px] text-muted-foreground">Reasoning effort</Label>
+              <Select
+                value={draft.effort ?? DEFAULT}
+                onValueChange={(next) =>
+                  setDraft((current) => ({
+                    ...current,
+                    effort: next === DEFAULT || next == null ? null : next,
+                  }))
+                }
+                disabled={!setting.writable || effortOptions.length === 0}
+              >
+                <SelectTrigger aria-label="Reasoning effort" className="w-full">
+                  <SelectValue>
+                    {(value) => (value === DEFAULT ? 'Agent default' : humanize(String(value)))}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DEFAULT}>Agent default</SelectItem>
+                  {effortOptions.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {humanize(option)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {effortOptions.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  {setting.agent} publishes no global effort setting.
+                </p>
+              ) : null}
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <Label htmlFor={`fast-${worker}-${setting.agent}`}>Fast mode</Label>
+                <p className="mw-help mt-1">
+                  {fastSupported ? 'Use the agent’s fast setting.' : 'Not supported by this model.'}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id={`fast-${worker}-${setting.agent}`}
+                  checked={draft.fast === true}
+                  onCheckedChange={(checked) =>
+                    setDraft((current) => ({ ...current, fast: checked }))
+                  }
+                  disabled={!setting.writable || !fastSupported}
+                />
+                <span className="text-xs text-muted-foreground">{draft.fast ? 'On' : 'Off'}</span>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <h3 className="mb-4 font-semibold">Read-only defaults</h3>
+            <p className="mb-5 text-[13px] text-muted-foreground">
+              This Mac has not reported editable defaults for {agentLabel(setting.agent)}.
+            </p>
+            <dl className="mw-facts grid-cols-[150px_minmax(0,1fr)]">
+              <dt>Model</dt>
+              <dd>{setting.model ?? 'Not reported'}</dd>
+              <dt>Reasoning effort</dt>
+              <dd>{setting.effort ? humanize(setting.effort) : 'Not reported'}</dd>
+              <dt>Fast mode</dt>
+              <dd>{setting.fast == null ? 'Not reported' : setting.fast ? 'On' : 'Off'}</dd>
+            </dl>
+          </div>
+        )}
+        <div className="mw-settings-facts">
+          <h3 className="mb-6 font-semibold">Connection and context</h3>
+          <dl className="mw-facts">
+            <dt>Authentication</dt>
+            <dd className={connectionLabel === 'Connected' ? '!text-success' : ''}>
+              {connectionLabel}
+            </dd>
+            <dt>Project permissions</dt>
+            <dd>{humanize(permissions)}</dd>
+            <dt>Project profile</dt>
+            <dd>{envProfile ?? 'Default'}</dd>
+            <dt>CLI version</dt>
+            <dd>{version ?? 'Not reported'}</dd>
+          </dl>
         </div>
       </div>
-
-      <div className="mt-5 grid gap-5 border-t pt-5 sm:grid-cols-3">
-        <Field label="PERMISSIONS" value={humanize(permissions)} />
-        <Field label="ENVIRONMENT PROFILE" value={envProfile ?? '—'} />
-        <Field label="AUTHENTICATION" value={connectionLabel} />
-        <Field label="CLI VERSION" value={version ?? '—'} />
-        <div className="flex items-center gap-3">
-          <Switch
-            id={`fast-${worker}-${setting.agent}`}
-            checked={draft.fast === true}
-            onCheckedChange={(checked) => setDraft((current) => ({ ...current, fast: checked }))}
-            disabled={!setting.writable || !fastSupported}
-          />
-          <Label htmlFor={`fast-${worker}-${setting.agent}`} className="text-sm">
-            Fast
-            {!fastSupported ? (
-              <span className="ml-1 text-xs text-muted-foreground">not supported</span>
-            ) : null}
-          </Label>
+      {setting.writable ? (
+        <div className="mt-7 flex flex-wrap items-center gap-3 border-t pt-6">
+          <p role="status" className="mr-auto text-[13px] text-muted-foreground">
+            {message ?? (dirty ? 'Unsaved changes' : 'Task settings can override these defaults.')}
+          </p>
+          <Button
+            variant="outline"
+            disabled={!dirty || busy}
+            onClick={() => {
+              setDraft(saved)
+              setActivity({ identity, busy: false, message: null })
+            }}
+          >
+            Cancel
+          </Button>
+          <Button disabled={!dirty || busy || !setting.writable} onClick={() => void save()}>
+            <Check size={16} aria-hidden="true" />
+            {busy ? 'Saving…' : 'Save defaults'}
+          </Button>
         </div>
-      </div>
-
-      <div className="mt-5 flex items-center gap-3 border-t pt-5">
-        <p className="flex-1 text-xs text-muted-foreground">
-          {message ?? 'Task settings can override these defaults.'}
+      ) : (
+        <p className="mt-7 border-t pt-6 text-[13px] text-muted-foreground">
+          Editing is unavailable for these native defaults.
         </p>
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled={!dirty || busy}
-          onClick={() => {
-            setDraft(saved)
-            setActivity({ identity, busy: false, message: null })
-          }}
-        >
-          Cancel
-        </Button>
-        <Button size="sm" disabled={!dirty || busy || !setting.writable} onClick={() => void save()}>
-          {busy ? 'Saving…' : 'Save'}
-        </Button>
-      </div>
+      )}
     </section>
   )
 }
@@ -273,30 +347,49 @@ function ProjectDefaults({ snapshot }: { snapshot: Snapshot }) {
   }
   const timeout = defaults.timeout_seconds
   return (
-    <section className="rounded-[10px] border bg-card p-5">
+    <section className="mw-panel mw-panel-pad">
       <h2 className="text-[18px] leading-6 font-medium tracking-[-0.02em]">
         Project launch defaults
       </h2>
-      <p className="mt-1 text-xs text-muted-foreground">mac-worker · .worker.toml</p>
+      <p className="mt-1 text-xs text-muted-foreground">From .worker.toml · read-only</p>
       <div className="mt-5 grid gap-5 sm:grid-cols-4">
         <Field
-          label="TASK TIMEOUT"
+          label="Task timeout"
           value={typeof timeout === 'number' ? `${Math.round(timeout / 60)} min` : '—'}
         />
-        <Field label="MAX FOLLOW-UPS" value={text('max_followups')} />
-        <Field label="SOURCE" value={text('source')} />
-        <Field label="PUBLICATION" value={text('publish')} />
+        <Field label="Max follow-ups" value={text('max_followups')} />
+        <Field label="Source" value={text('source')} />
+        <Field label="Publication" value={text('publish')} />
       </div>
     </section>
   )
 }
 
-export function Settings({ snapshot }: { snapshot: Snapshot }) {
+export function Settings({
+  snapshot,
+  initialWorker,
+  initialAgent,
+}: {
+  snapshot: Snapshot
+  initialWorker?: string
+  initialAgent?: string
+}) {
   const workers = snapshot.workers
-  const [workerName, setWorkerName] = useState<string | null>(workers[0]?.name ?? null)
+  const [workerName, setWorkerName] = useState<string | null>(
+    initialWorker && workers.some((entry) => entry.name === initialWorker)
+      ? initialWorker
+      : (workers[0]?.name ?? null),
+  )
   const [settings, setSettings] = useState<AgentSettings | null>(null)
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const contextWorker = workers.some((entry) => entry.name === initialWorker)
+    ? initialWorker
+    : undefined
+  useEffect(() => {
+    if (contextWorker) setWorkerName(contextWorker)
+  }, [contextWorker])
 
   const worker = workers.find((entry) => entry.name === workerName)
 
@@ -310,7 +403,11 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
       .then((payload) => {
         if (cancelled) return
         setSettings(payload)
-        setSelectedAgent(payload.agents[0]?.agent ?? null)
+        setSelectedAgent(
+          payload.agents.some((entry) => entry.agent === initialAgent)
+            ? initialAgent!
+            : (payload.agents[0]?.agent ?? null),
+        )
       })
       .catch((cause: unknown) => {
         if (cancelled || controller.signal.aborted) return
@@ -320,7 +417,7 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
       cancelled = true
       controller.abort()
     }
-  }, [workerName])
+  }, [workerName, initialAgent])
 
   // An unknown connection is not the same claim as "not connected": a fact older
   // than its TTL says nothing either way, and the summary must not pretend it does.
@@ -346,9 +443,7 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
         current == null
           ? current
           : {
-              agents: current.agents.map((agent) =>
-                agent.agent === saved.agent ? saved : agent,
-              ),
+              agents: current.agents.map((agent) => (agent.agent === saved.agent ? saved : agent)),
             },
       ),
     [],
@@ -361,101 +456,78 @@ export function Settings({ snapshot }: { snapshot: Snapshot }) {
   const setting = settings?.agents.find((entry) => entry.agent === selectedAgent) ?? null
 
   return (
-    <div className="space-y-5">
-      <section className="rounded-[10px] border bg-card p-5">
-        <div className="flex flex-wrap items-center gap-3">
-          <h2 className="text-[18px] leading-6 font-medium tracking-[-0.02em]">Agents</h2>
-          <span className="rounded border px-1.5 font-mono text-xs text-muted-foreground">
-            {pad2(settings?.agents.length ?? 0)}
-          </span>
-          <p className="text-sm text-muted-foreground">
-            {settings ? summary : 'Connections and latest launch settings'}
-          </p>
-          <div className="ml-auto flex items-center gap-2">
-            <Label htmlFor="settings-worker" className="text-sm text-muted-foreground">
-              Worker
-            </Label>
-            <Select value={workerName ?? ''} onValueChange={(next) => setWorkerName(next ?? null)}>
-              <SelectTrigger id="settings-worker" className="w-[180px]">
-                <SelectValue>{(value) => String(value)}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {workers.map((entry) => (
-                  <SelectItem key={entry.name} value={entry.name}>
-                    {entry.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+    <div className="mw-page">
+      <header className="mw-page-heading">
+        <div>
+          <h1 className="mw-page-title">Settings</h1>
+          <p className="mw-page-description">Agent defaults on each Mac.</p>
         </div>
-
-        {error ? <p className="mt-4 text-sm text-destructive">{error}</p> : null}
-        {settings == null && error == null ? (
-          <p className="mt-4 text-sm text-muted-foreground">Reading native defaults…</p>
-        ) : null}
-
-        {settings ? (
-          <Table className="mt-4">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="font-mono text-[11px] tracking-[0.06em]">AGENT</TableHead>
-                <TableHead className="font-mono text-[11px] tracking-[0.06em]">CONNECTION</TableHead>
-                <TableHead className="font-mono text-[11px] tracking-[0.06em]">MODEL</TableHead>
-                <TableHead className="font-mono text-[11px] tracking-[0.06em]">EFFORT</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {settings.agents.map((entry) => {
-                const state = connection(worker, entry.agent)
-                return (
-                  <TableRow
-                    key={entry.agent}
-                    onClick={() => setSelectedAgent(entry.agent)}
-                    className="cursor-pointer"
-                    data-state={entry.agent === selectedAgent ? 'selected' : undefined}
-                  >
-                    <TableCell>
-                      <div className="flex items-center gap-3">
-                        <span className="flex size-7 items-center justify-center rounded border font-mono text-[10px] text-muted-foreground">
-                          {agentInitials(entry.agent)}
-                        </span>
-                        <span>
-                          <span className="block text-sm">{agentLabel(entry.agent)}</span>
-                          <span className="block text-xs text-muted-foreground">
-                            {agentBinary(entry.agent)}
-                          </span>
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell className={TONES[state.tone]}>{state.label}</TableCell>
-                    <TableCell>{entry.model ?? 'Agent default'}</TableCell>
-                    <TableCell>{entry.effort ? humanize(entry.effort) : 'Not reported'}</TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        ) : null}
-
-        <p className="mt-4 text-xs text-muted-foreground">
-          Model and effort are the agent's own defaults on this worker. A task can override them for
-          one turn.
-        </p>
-      </section>
-
-      {setting && workerName ? (
-        <Detail
-          worker={workerName}
-          setting={setting}
-          version={agentVersion(worker, setting.agent)}
-          permissions={permissions?.[setting.agent] ?? null}
-          envProfile={envProfile ?? null}
-          connectionLabel={connection(worker, setting.agent).label}
-          onSaved={mergeSaved}
-        />
-      ) : null}
-
+        <div className="flex items-center gap-3">
+          <Label htmlFor="settings-worker" className="text-xs text-muted-foreground">
+            Worker
+          </Label>
+          <Select value={workerName ?? ''} onValueChange={(next) => setWorkerName(next ?? null)}>
+            <SelectTrigger id="settings-worker" className="w-38">
+              <SelectValue>{(value) => String(value)}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {workers.map((entry) => (
+                <SelectItem key={entry.name} value={entry.name}>
+                  {entry.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </header>
+      <div className="mw-panel mw-settings">
+        <aside className="mw-settings-sidebar" aria-label="Agents">
+          <h2 className="mw-section-title px-3 pb-4">Agents</h2>
+          <div className="space-y-2">
+            {settings?.agents.map((entry) => {
+              const state = connection(worker, entry.agent)
+              return (
+                <button
+                  type="button"
+                  key={entry.agent}
+                  className="mw-agent-option"
+                  aria-pressed={entry.agent === selectedAgent}
+                  onClick={() => setSelectedAgent(entry.agent)}
+                >
+                  <AgentMark agent={entry.agent} size={22} />
+                  <span className="min-w-0 flex-1">
+                    <span className="font-medium">{agentLabel(entry.agent)}</span>
+                    <span className={'mt-1 block whitespace-nowrap text-xs ' + TONES[state.tone]}>
+                      • {state.label}
+                    </span>
+                  </span>
+                  <ChevronRight size={14} aria-hidden="true" />
+                </button>
+              )
+            })}
+          </div>
+          <p className="mw-help px-3 pt-5">{settings ? summary : 'Reading native defaults…'}</p>
+        </aside>
+        {error ? (
+          <p className="p-7 text-sm text-destructive">{error}</p>
+        ) : setting && workerName ? (
+          <Detail
+            worker={workerName}
+            setting={setting}
+            version={agentVersion(worker, setting.agent)}
+            permissions={permissions?.[setting.agent] ?? null}
+            envProfile={envProfile ?? null}
+            connectionLabel={connection(worker, setting.agent).label}
+            onSaved={mergeSaved}
+          />
+        ) : (
+          <div className="mw-settings-editor">
+            <p className="text-muted-foreground">
+              {settings ? 'No agent defaults reported by this Mac.' : 'Reading native defaults…'}
+            </p>
+          </div>
+        )}
+      </div>
       <ProjectDefaults snapshot={snapshot} />
     </div>
   )

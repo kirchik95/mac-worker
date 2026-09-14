@@ -32,7 +32,7 @@ function Line({ event }: { event: LogEvent }) {
       </span>
       <span
         className={cn(
-          'w-16 shrink-0 truncate font-mono text-[11px] tracking-[0.06em] uppercase',
+          'w-16 shrink-0 truncate text-xs',
           glyph ? TONE[glyph.tone] : 'text-muted-foreground',
         )}
       >
@@ -68,24 +68,25 @@ export function TurnLogPanel({
 
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b bg-muted/60 py-2.5 pr-5 pl-15">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b bg-muted/60 py-2.5 pr-6 pl-6">
         <span className="w-19.5 shrink-0 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-          TIME
+          Time
         </span>
         <span className="w-16 shrink-0 font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-          KIND
+          Kind
         </span>
         <span className="font-mono text-[10px] tracking-[0.06em] text-observatory-hollow">
-          MESSAGE
+          Latest output
         </span>
         <span className="ml-auto flex items-center gap-3">
           {STREAMS.map(([value, label]) => (
             <button
               key={value}
               type="button"
+              aria-pressed={stream === value}
               onClick={() => setStream(value)}
               className={cn(
-                'font-mono text-[10px] tracking-[0.06em] uppercase',
+                'font-mono text-xs',
                 stream === value ? 'text-foreground' : 'text-observatory-hollow',
               )}
             >
@@ -100,7 +101,7 @@ export function TurnLogPanel({
         </span>
       </div>
 
-      <div className="py-2.5 pr-5 pl-15">
+      <div className="py-2.5 pr-6 pl-6">
         {log.error ? (
           <p className="py-2 text-xs text-destructive">Cannot read the log: {log.error}</p>
         ) : events.length === 0 ? (
@@ -112,8 +113,8 @@ export function TurnLogPanel({
         )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-4 border-t py-3 pr-5 pl-15">
-        <div className="min-w-90 flex-1">
+      <div className="flex flex-wrap items-center gap-4 border-t py-3 pr-6 pl-6">
+        <div className="min-w-0 w-full">
           <CommandList commands={[`worker task logs ${taskId} --turn ${turnNumber}`]} />
         </div>
         <span className="flex items-center gap-2 text-[11px] text-observatory-hollow">

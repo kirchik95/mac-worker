@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { fetchSnapshot, SnapshotPendingError, type Snapshot } from '@/lib/api'
-import { exampleSnapshot } from '@/lib/exampleSnapshot'
+import { exampleSnapshot, wantsExample } from '@/lib/exampleSnapshot'
 
 const POLL_INTERVAL_MS = 2000
 
@@ -15,8 +15,7 @@ export interface SnapshotState {
 }
 
 /** `?example` renders the artboard's snapshot so every state can be inspected. */
-export const wantsExample = () =>
-  typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('example')
+export { wantsExample } from '@/lib/exampleSnapshot'
 
 /** Polls the dashboard snapshot. The server has no push channel, as in the Rust client. */
 export function useSnapshot(): SnapshotState {

@@ -64,11 +64,7 @@ async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() 
     assert_eq!(content_type(&favicon), "image/svg+xml");
     assert_security(&favicon);
 
-    for name in [
-        "plex-sans-regular.ttf",
-        "plex-sans-medium.ttf",
-        "plex-mono-regular.ttf",
-    ] {
+    for name in ["inter-variable.ttf", "plex-mono-regular.ttf"] {
         let font = request(&host, &format!("/assets/{name}"), &host);
         assert_eq!(font.status, 200);
         assert_eq!(content_type(&font), "font/ttf");

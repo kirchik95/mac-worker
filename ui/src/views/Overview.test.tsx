@@ -106,7 +106,9 @@ describe('Overview', () => {
     const mini = card('mini-1')
 
     expect(within(mini).getByText(/2 \/ 2 slots/)).toBeInTheDocument()
-    expect(within(mini).getByText(`${first.slice(0, 8)} · ${second.slice(0, 8)}`)).toBeInTheDocument()
+    expect(
+      within(mini).getByText(`${first.slice(0, 8)} · ${second.slice(0, 8)}`),
+    ).toBeInTheDocument()
   })
 
   it('says a cached observation is out of date instead of implying it is live', () => {
@@ -166,11 +168,9 @@ describe('Overview', () => {
     render(<Overview snapshot={queued} now={60_000} />)
 
     expect(screen.getByText('02')).toBeInTheDocument()
-    expect(screen.getByText('Fix login redirect loop')).toBeInTheDocument()
+    expect(screen.getAllByText('Fix login redirect loop').length).toBeGreaterThan(0)
     expect(screen.getByText('NO_COMPATIBLE_IDLE_WORKER')).toBeInTheDocument()
-    expect(
-      screen.getByText('No idle worker advertises what this entry needs.'),
-    ).toBeInTheDocument()
+    expect(screen.getByText('No idle worker advertises what this entry needs.')).toBeInTheDocument()
     expect(screen.getByText('1m')).toBeInTheDocument()
   })
 
@@ -214,7 +214,13 @@ describe('Overview', () => {
     const running = snapshot({
       workers: [
         worker({
-          slot: { state: 'busy', capacity: 1, busy: 1, active_job_id: 'job', active_job_ids: ['job'] },
+          slot: {
+            state: 'busy',
+            capacity: 1,
+            busy: 1,
+            active_job_id: 'job',
+            active_job_ids: ['job'],
+          },
           agent_facts: { collected_at_millis: 0, freshness: 'stale', agents: [] },
         }),
       ],
@@ -308,14 +314,14 @@ describe('Overview attention strip', () => {
     })
     render(<Overview snapshot={needing} onShowAttention={onShowAttention} />)
 
-    expect(screen.getByText('1 task needs attention')).toBeInTheDocument()
-    await userEvent.setup().click(screen.getByRole('button', { name: /View/ }))
+    expect(screen.getByText('Needs your attention')).toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Answer' }))
     expect(onShowAttention).toHaveBeenCalled()
   })
 
   it('does not offer the action when nothing needs attention', () => {
     render(<Overview snapshot={snapshot()} onShowAttention={() => {}} />)
-    expect(screen.getByText('No task needs attention')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /View/ })).toBeNull()
+    expect(screen.queryByText('Needs your attention')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Answer' })).toBeNull()
   })
 })

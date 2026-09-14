@@ -261,8 +261,7 @@ async fn favicon() -> Response {
 
 async fn font(Path(name): Path<String>) -> Response {
     let bytes: &'static [u8] = match name.as_str() {
-        "plex-sans-regular.ttf" => include_bytes!("static/app/assets/plex-sans-regular.ttf"),
-        "plex-sans-medium.ttf" => include_bytes!("static/app/assets/plex-sans-medium.ttf"),
+        "inter-variable.ttf" => include_bytes!("static/app/assets/inter-variable.ttf"),
         "plex-mono-regular.ttf" => include_bytes!("static/app/assets/plex-mono-regular.ttf"),
         _ => return not_found().await,
     };

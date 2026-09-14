@@ -1,32 +1,37 @@
-/** The gold tile and wordmark from the Overview artboard. */
+/** Approved B Slots mark from Paper. */
+export function BrandMark({ size = 28 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 150 150" aria-hidden="true">
+      <path
+        d="m113.5 141.7h-76.7c-13.8 0-27.2-10.7-27.2-26.7v-80.3c0-12.9 11.4-26.4 27.2-26.4h76.7c14.1 0 27.3 11.4 27.3 26.4v80.3c0 14.9-11.3 26.7-27.3 26.7z"
+        fill="#171C26"
+      />
+      <path
+        d="m110.3 56.9h-70.6c-3 0-6.2-2.5-6.2-6.3v-5.8c0.1-2.8 2.6-5.7 6.1-5.7h70.6c3.1-0.1 6.2 2.4 6.3 5.5v5.9c-0.1 3.3-2.8 6.4-6.2 6.4z"
+        fill="none"
+        stroke="#D9DFE1"
+        strokeWidth="1.245"
+        strokeMiterlimit="10"
+      />
+      <path
+        d="m110.3 84.1h-70.6c-3.2 0-6.8-2.8-6.8-6.5v-5c0.1-3.2 2.9-6.6 6.7-6.6h70.6c3.2-0.1 6.7 2.5 6.8 6.3v5.3c-0.1 3.7-3.2 6.5-6.7 6.5z"
+        fill="#FAB415"
+      />
+      <path
+        d="m110.3 111.1h-70.6c-3 0-6.2-2.5-6.5-6.3l0.1-6.3c0.3-2.9 2.9-5.6 6.3-5.6h70.6c3.1-0.1 6.3 2.5 6.3 5.9v5.9c-0.1 3.3-2.8 6.4-6.2 6.4z"
+        fill="none"
+        stroke="#D9DFE1"
+        strokeWidth="1.245"
+        strokeMiterlimit="10"
+      />
+    </svg>
+  )
+}
 export function Wordmark() {
   return (
-    <div className="flex w-64 shrink-0 items-center gap-3">
-      <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-observatory-gold">
-        <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
-          {[
-            [3, 3],
-            [14, 3],
-            [3, 14],
-            [14, 14],
-          ].map(([x, y]) => (
-            <rect
-              key={`${x}-${y}`}
-              x={x}
-              y={y}
-              width="7"
-              height="7"
-              rx="1.5"
-              fill="none"
-              stroke="rgb(21 23 25)"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          ))}
-        </svg>
-      </div>
-      <span className="text-[20px] leading-6 font-medium tracking-[-0.04em]">mac-worker</span>
-    </div>
+    <span className="inline-flex shrink-0 items-center gap-[11px]">
+      <BrandMark />
+      <span className="text-[17px] leading-[22px] font-semibold tracking-[-.01em]">mac-worker</span>
+    </span>
   )
 }

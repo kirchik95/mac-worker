@@ -201,9 +201,7 @@ describe('TaskDetail', () => {
 
     await userEvent.setup().click(await screen.findByRole('button', { name: /02/ }))
     expect(await screen.findByText('cargo test --locked')).toBeInTheDocument()
-    expect(
-      screen.getByText('the turn is finished · read to the current end'),
-    ).toBeInTheDocument()
+    expect(screen.getByText('the turn is finished · read to the current end')).toBeInTheDocument()
   })
 
   it('says a task has no turns rather than drawing an empty card', async () => {
@@ -322,9 +320,7 @@ describe('TaskDetail', () => {
       await vi.advanceTimersByTimeAsync(2000)
     })
     expect(await screen.findByText('queued-to-terminal tail')).toBeInTheDocument()
-    expect(
-      screen.getByText('the turn is finished · read to the current end'),
-    ).toBeInTheDocument()
+    expect(screen.getByText('the turn is finished · read to the current end')).toBeInTheDocument()
     expect(screen.queryByText('Waiting for this turn to start…')).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/logs'))).toBe(true)
   })
@@ -528,11 +524,11 @@ describe('TaskDetail', () => {
     vi.stubGlobal('fetch', fetchMock)
     render(<TaskDetail taskId="aaaa" />)
 
-    expect(await screen.findByText('AGENT REPORTED')).toBeInTheDocument()
+    expect(await screen.findByText('Agent reported')).toBeInTheDocument()
     expect(screen.getByText('unit')).toBeInTheDocument()
     const box = screen.getByLabelText('Follow-up')
     fireEvent.change(box, { target: { value: 'please add tests' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
     expect(await screen.findByText('task changed before this action')).toBeInTheDocument()
     expect(screen.getByLabelText('Follow-up')).toHaveValue('please add tests')
   })
@@ -546,15 +542,17 @@ describe('TaskDetail', () => {
     vi.stubGlobal('fetch', fetchMock)
     render(<TaskDetail taskId="aaaa" />)
 
-    expect(await screen.findByRole('button', { name: 'Reply' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Send reply' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'please add tests' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
 
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
 
     await act(async () => {
-      pendingReply.resolve(jsonResponse(reviewable({ summary: 'Follow-up sent', review_state: 'not_reviewable' })))
+      pendingReply.resolve(
+        jsonResponse(reviewable({ summary: 'Follow-up sent', review_state: 'not_reviewable' })),
+      )
     })
     expect(await screen.findByText('Follow-up sent')).toBeInTheDocument()
   })
@@ -577,7 +575,7 @@ describe('TaskDetail', () => {
     const { rerender } = render(<TaskDetail taskId="task-a" />)
     expect(await screen.findByText('Task A summary')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'from A' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
     expect(replySignal?.aborted).toBe(false)
 
     rerender(<TaskDetail taskId="task-b" />)
@@ -609,8 +607,8 @@ describe('TaskDetail', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const { rerender } = render(<TaskDetail taskId="task-a" />)
-    expect(await screen.findByRole('button', { name: 'Accept' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
+    expect(await screen.findByRole('button', { name: 'Accept task' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Accept task' }))
     expect(acceptSignal?.aborted).toBe(false)
 
     rerender(<TaskDetail taskId="task-b" />)
@@ -660,7 +658,7 @@ describe('TaskDetail', () => {
     })
     expect(detailGets).toBe(2)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reply' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
     expect(await screen.findByText('Reply applied')).toBeInTheDocument()
 
     await act(async () => {
@@ -704,7 +702,7 @@ describe('TaskDetail', () => {
     })
     expect(detailGets).toBe(2)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Accept task' }))
     expect(await screen.findByText('Accept applied')).toBeInTheDocument()
 
     await act(async () => {
@@ -718,4 +716,28 @@ describe('TaskDetail', () => {
     })
     expect(await screen.findByText('Later accept poll')).toBeInTheDocument()
   })
+})
+
+it('keeps partial changes, reported checks and terminal commands accessible while waiting for an answer', async () => {
+  serve(
+    detail({
+      task: task({ state: 'open', review_state: 'waiting_on_you' }),
+      review_state: 'waiting_on_you',
+      questions: ['Keep these partial changes?'],
+      reported_checks: [
+        {
+          name: 'Partial checks',
+          command: 'cargo test partial',
+          status: 'pass',
+          detail: '2 passed',
+          source: 'agent_reported',
+        },
+      ],
+    }),
+  )
+  render(<TaskDetail taskId="aaaa" />)
+  await screen.findByText('Keep these partial changes?')
+  expect(screen.getByText('src/lib.rs')).toBeInTheDocument()
+  expect(screen.getByText('Partial checks')).toBeInTheDocument()
+  expect(screen.getByText('worker task fetch aaaa')).toBeInTheDocument()
 })

@@ -1,79 +1,138 @@
+import { useState } from 'react'
 import { ActiveTurn } from '@/components/ActiveTurn'
-import { AttentionStrip } from '@/components/AttentionStrip'
+import { AttentionCards } from '@/components/AttentionCards'
 import { Capabilities } from '@/components/Capabilities'
 import { QueueTable } from '@/components/QueueTable'
-import { RunProgress } from '@/components/RunProgress'
 import { StalledBanner } from '@/components/StalledBanner'
 import { WorkerCard } from '@/components/WorkerCard'
+import { TaskTable } from '@/components/TaskTable'
 import { stall } from '@/lib/queue'
-import type { Snapshot } from '@/lib/api'
+import { slotBusy, type Snapshot } from '@/lib/api'
+import { needsAnswer, readyForReview } from '@/lib/taskPresentation'
+import type { TaskPreviews } from '@/hooks/useTaskPreviews'
 
 export function Overview({
   snapshot,
   now = Date.now(),
   onShowAttention,
+  onSelectTask,
+  onSetup,
+  onShowRun,
+  previews,
 }: {
   snapshot: Snapshot
   now?: number
   onShowAttention?: () => void
+  onSelectTask?: (id: string) => void
+  onSetup?: (worker?: string, agent?: string) => void
+  onShowRun?: (id: string) => void
+  previews?: TaskPreviews
 }) {
-  const busy = snapshot.workers.filter((worker) => worker.active_task != null)
-  const runs = snapshot.runs.filter((run) => run.progress.total > 0)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const stalled = stall(snapshot, now)
-  const unreachable = snapshot.workers
-    .filter((worker) => worker.health === 'unavailable')
-    .map((worker) => worker.name)
-
+  const known = snapshot.workers.filter(
+    (worker) =>
+      worker.freshness === 'current' &&
+      worker.health !== 'unavailable' &&
+      worker.slot.state !== 'unknown',
+  )
+  const busy = known.reduce((total, worker) => total + slotBusy(worker.slot), 0)
+  const capacity = known.reduce((total, worker) => total + worker.slot.capacity, 0)
+  const other = snapshot.tasks.filter(
+    (task) => !needsAnswer(task) && !readyForReview(task) && task.state !== 'closed',
+  )
+  const active = snapshot.workers.filter((worker) => worker.active_task)
+  const select = onSelectTask ?? (() => onShowAttention?.())
   return (
-    <div className="space-y-5">
-      {stalled ? (
-        <StalledBanner stall={stalled} unreachable={unreachable} now={now} />
-      ) : null}
-
-      {snapshot.workers.length > 0 ? (
-        <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-          {snapshot.workers.map((worker) => (
-            <WorkerCard key={worker.name} worker={worker} now={now} />
-          ))}
+    <div className="mw-page">
+      <AttentionCards snapshot={snapshot} onSelect={select} previews={previews} now={now} />
+      <section>
+        <div className="mw-section-heading">
+          <h2 className="mw-section-title">Your Macs</h2>
+          <p className="text-[13px] text-muted-foreground">
+            {busy} of {capacity} slots busy
+            {known.length !== snapshot.workers.length ? ' · some capacity unknown' : ''}
+          </p>
         </div>
-      ) : (
-        <p className="text-sm text-muted-foreground">No workers are configured.</p>
-      )}
-
-      {busy.length > 0 ? (
-        <div className="space-y-5">
-          {busy.map((worker) => {
-            const row = snapshot.tasks.find((task) => task.task_id === worker.active_task?.task_id)
-            return (
-              <ActiveTurn
+        {snapshot.workers.length ? (
+          <div className="mw-card-grid">
+            {snapshot.workers.map((worker) => (
+              <WorkerCard
                 key={worker.name}
                 worker={worker}
-                row={row}
-                run={snapshot.runs.find((entry) => entry.run_id === row?.run_id)}
+                now={now}
+                onSetup={onSetup}
+                onSelectTask={select}
               />
-            )
-          })}
+            ))}
+          </div>
+        ) : (
+          <div className="mw-panel mw-empty">
+            <h3 className="mw-section-title">No Macs connected</h3>
+            <p className="text-muted-foreground">No workers are configured.</p>
+            <p className="text-sm">Add a Mac to your worker configuration to start your pool.</p>
+          </div>
+        )}
+      </section>
+      <section className="mt-1 border-t pt-6">
+        <div className="mw-section-heading">
+          <h2 className="mw-section-title">Other tasks</h2>
+          <p className="text-[13px] text-muted-foreground">
+            {other.filter((task) => task.state === 'active').length} running ·{' '}
+            {other.filter((task) => task.state === 'queued').length} queued
+          </p>
         </div>
-      ) : (
-        <section className="flex min-h-32 items-center justify-center rounded-[10px] border bg-card">
-          <p className="text-sm text-muted-foreground">No turn is running.</p>
-        </section>
-      )}
-
-      <div>
-        <QueueTable snapshot={snapshot} now={now} />
-        <AttentionStrip snapshot={snapshot} onShowAttention={onShowAttention} />
-      </div>
-
-      {runs.length > 0 ? (
-        <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-          {runs.map((run) => (
-            <RunProgress key={run.run_id} run={run} />
-          ))}
-        </div>
+        {other.length ? (
+          <TaskTable
+            tasks={other}
+            onSelect={select}
+            onSetup={onSetup}
+            onShowRun={onShowRun}
+            now={now}
+            compact
+          />
+        ) : (
+          <div className="mw-panel p-6 text-sm text-muted-foreground">
+            No other tasks are waiting or running.
+          </div>
+        )}
+      </section>
+      {stalled ? (
+        <StalledBanner
+          stall={stalled}
+          unreachable={snapshot.workers
+            .filter((worker) => worker.health === 'unavailable')
+            .map((worker) => worker.name)}
+          now={now}
+        />
       ) : null}
-
-      <Capabilities snapshot={snapshot} now={now} />
+      <details
+        className="mw-panel p-5"
+        onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}
+      >
+        <summary className="text-[13px] font-medium">Execution details</summary>
+        <div className="mt-5 space-y-5">
+          {diagnosticsOpen && active.length ? (
+            active.map((worker) => {
+              const row = snapshot.tasks.find(
+                (task) => task.task_id === worker.active_task?.task_id,
+              )
+              return (
+                <ActiveTurn
+                  key={worker.name}
+                  worker={worker}
+                  row={row}
+                  run={snapshot.runs.find((run) => run.run_id === row?.run_id)}
+                />
+              )
+            })
+          ) : (
+            <p className="text-sm text-muted-foreground">No turn is running.</p>
+          )}
+          <QueueTable snapshot={snapshot} now={now} />
+          <Capabilities snapshot={snapshot} now={now} />
+        </div>
+      </details>
     </div>
   )
 }

@@ -1,150 +1,207 @@
+import { useState } from 'react'
+import { ChevronDown, ChevronRight, Info } from 'lucide-react'
+import { AgentMark } from '@/components/AgentMark'
+import { MacIllustration } from '@/components/MacIllustration'
 import { HerdrChip } from '@/components/HerdrChip'
-import { Metric } from '@/components/Metric'
-import { WorkerIcon } from '@/components/WorkerIcon'
 import { bytes, humanize, relativeTime, shortId } from '@/lib/format'
-import { cn } from '@/lib/utils'
+import { agentLabel } from '@/lib/agents'
 import { activeJobIds, describeError, slotBusy, type Worker } from '@/lib/api'
 
-type Presence = 'available' | 'running' | 'stale' | 'offline'
-
-function presenceOf(worker: Worker): Presence {
-  if (worker.health === 'unavailable') return 'offline'
-  if (worker.freshness !== 'current') return 'stale'
-  return slotBusy(worker.slot) > 0 ? 'running' : 'available'
-}
-
-const DOT: Record<Presence, string> = {
-  available: 'bg-observatory-green',
-  running: 'bg-observatory-accent-soft',
-  // A stale reading is drawn hollow: the pool is not claiming to know.
-  stale: 'border border-observatory-hollow',
-  offline: 'bg-destructive',
-}
-
-/** Elapsed time of the running turn, in the artboard's mm:ss. */
-function elapsed(sinceMillis: number | null | undefined, now: number): string {
-  if (sinceMillis == null) return '--:--'
-  const seconds = Math.max(0, Math.round((now - sinceMillis) / 1000))
-  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
-}
-
-function ErrorCodeChip({ code }: { code: string }) {
-  return (
-    <span className="shrink-0 rounded-full border px-2 py-0.5 font-mono text-[10px] tracking-[0.06em] text-destructive">
-      {code}
-    </span>
-  )
-}
-
-export function WorkerCard({ worker, now }: { worker: Worker; now: number }) {
-  const presence = presenceOf(worker)
-  const task = worker.active_task
-  const running = presence === 'running'
+export function WorkerCard({
+  worker,
+  now,
+  onSetup,
+  onSelectTask,
+}: {
+  worker: Worker
+  now: number
+  onSetup?: (worker?: string, agent?: string) => void
+  onSelectTask?: (id: string) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const offline = worker.health === 'unavailable'
+  const known = !offline && worker.freshness === 'current' && worker.slot.state !== 'unknown'
   const busy = slotBusy(worker.slot)
-  const jobIds = activeJobIds(worker.slot)
+  const running = known && busy > 0 && worker.active_task != null
+  const task = worker.active_task
+  const presence = offline ? 'offline' : !known ? 'stale' : busy > 0 ? 'running' : 'available'
+  const jobs = activeJobIds(worker.slot)
+  const facts = worker.agent_facts
+  const factsCurrent = known && facts?.freshness === 'current'
+  const agents = facts?.agents ?? []
+  const signIn = agents.filter((agent) => agent.auth === 'unauthenticated')
+  const installed = agents.filter((agent) => agent.auth !== 'unauthenticated')
   const described = describeError(worker.error)
-  const extraJobs =
-    jobIds.length > 1 ? (
-      <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
-        {jobIds.map((id) => shortId(id, 8)).join(' · ')}
-      </p>
-    ) : null
-
   return (
-    <article
-      className={cn(
-        'flex flex-col rounded-[10px] border p-5',
-        running
-          ? 'border-observatory-highlight-line bg-observatory-highlight'
-          : 'border-border bg-card',
-      )}
-    >
-      <div className="flex items-center gap-3">
-        <span className="text-muted-foreground">
-          <WorkerIcon />
-        </span>
-        <h2 className="min-w-0 flex-1 truncate text-[22px] leading-7 font-medium tracking-[-0.025em]">
-          {worker.name}
-        </h2>
-        <HerdrChip herdr={worker.herdr} />
-        <span className="flex items-center gap-[7px]">
-          <span className={cn('size-[5px] shrink-0 rounded-full', DOT[presence])} aria-hidden="true" />
-          <span className="font-mono text-[10px] tracking-[0.06em] text-muted-foreground uppercase">
-            {presence}
-          </span>
-        </span>
-      </div>
-
-      <div className="mt-5 grid grid-cols-3 gap-6">
-        <Metric
-          label={presence === 'stale' ? 'LAST CPU' : 'CPU'}
-          value={
-            worker.system.cpu_busy_percent == null
-              ? '—'
-              : `${worker.system.cpu_busy_percent.toFixed(1)}%`
-          }
-          size="display"
-        />
-        <Metric
-          label="MEMORY"
-          value={humanize(worker.system.memory_pressure)}
-          tone={
-            worker.system.memory_pressure != null && worker.system.memory_pressure !== 'normal'
-              ? 'accent'
-              : undefined
-          }
-        />
-        <Metric label="DISK FREE" value={bytes(worker.system.free_disk_bytes)} />
-      </div>
-
-      <div className="mt-5 border-t pt-4">
-        {running && task ? (
-          <>
-            <div className="flex items-baseline gap-3">
-              <p className="min-w-0 flex-1 truncate text-sm text-primary">{task.title}</p>
-              <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                {elapsed(worker.observed_at_millis, now)} · {busy} / {worker.slot.capacity} slots
-              </span>
-            </div>
-            {extraJobs}
-            <div className="mt-4 grid grid-cols-3 gap-6">
-              <Metric label="AGENT" value={humanize(task.agent)} />
-              <Metric label="MODEL" value={task.model ?? 'Agent default'} />
-              <Metric label="EFFORT" value={task.effort ? humanize(task.effort) : 'Not reported'} />
-            </div>
-          </>
-        ) : (
-          <>
-            {presence === 'offline' ? (
-              <p
-                className="flex min-w-0 items-center gap-2 text-sm"
-                title={described?.code ?? undefined}
-              >
-                {described?.code && described.code !== described.message ? (
-                  <ErrorCodeChip code={described.code} />
-                ) : null}
-                <span className="min-w-0 truncate">
-                  {described?.message ?? 'The worker did not answer'}
+    <article className="mw-panel mw-worker-card">
+      <div className="mw-worker-top">
+        <div className="mw-worker-visual">
+          <MacIllustration state={running ? 'working' : known ? 'idle' : 'unknown'} />
+          <div className="mw-slots" aria-label={known ? 'Worker slots' : 'Last reported slots'}>
+            {known ? (
+              Array.from({ length: Math.min(worker.slot.capacity, 8) }, (_, index) => (
+                <span
+                  key={index}
+                  className="mw-slot"
+                  data-busy={index < busy}
+                  title={index < busy ? (jobs[index] ?? 'Occupied slot') : 'Free slot'}
+                >
+                  {busy === 1 && index === 0 && task ? (
+                    <AgentMark agent={task.agent} size={12} />
+                  ) : (
+                    <span aria-hidden="true">·</span>
+                  )}
+                  {index + 1}
+                </span>
+              ))
+            ) : (
+              <span className="mw-slot">Unknown</span>
+            )}
+            {known && worker.slot.capacity > 8 ? (
+              <span className="mw-help">+{worker.slot.capacity - 8}</span>
+            ) : null}
+          </div>
+          <p className="mt-1 text-center text-[10px] text-muted-foreground">Slots</p>
+        </div>
+        <div className="mw-worker-copy">
+          <h2 className="mw-worker-name">{worker.name}</h2>
+          <p className="mw-worker-state">
+            {!known
+              ? (offline ? 'Offline' : 'Stale') + ' · capacity unknown'
+              : busy > 0
+                ? (running ? 'Working' : 'Occupied') +
+                  ' · ' +
+                  busy +
+                  ' of ' +
+                  worker.slot.capacity +
+                  ' slots busy'
+                : 'Idle · ' + Math.max(0, worker.slot.capacity - busy) + ' slots free'}
+          </p>
+          <p className="text-[13px] text-muted-foreground">
+            {running && task
+              ? task.agent + ' · turn ' + task.turn_number
+              : (known ? 'Worker checked ' : 'Last report ') +
+                relativeTime(worker.observed_at_millis, now)}
+          </p>
+          <div className="mt-3 space-y-1">
+            {installed.length ? (
+              <p className="mw-worker-agent">
+                {installed.slice(0, 2).map((agent) => (
+                  <AgentMark key={agent.name} agent={agent.name} size={13} />
+                ))}
+                <span>
+                  {factsCurrent ? 'Installed: ' : 'Last reported: '}
+                  {installed.map((agent) => agentLabel(agent.name)).join(', ')}
                 </span>
               </p>
             ) : (
-              <p className="truncate text-sm">
-                {presence === 'stale' ? 'Observation is out of date' : 'Ready for the next task'}
+              <p className="mw-worker-agent">
+                <Info size={14} aria-hidden="true" />
+                Agent status not reported
               </p>
             )}
-            {extraJobs}
-            <div className="mt-2.5 flex items-baseline gap-3">
-              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                {presence === 'offline' || presence === 'stale'
-                  ? `Last seen ${relativeTime(worker.observed_at_millis, now)}`
-                  : `${busy} / ${worker.slot.capacity} slots occupied`}
-              </span>
-              <span className="shrink-0 text-xs text-muted-foreground">
-                {presence === 'offline' || presence === 'stale' ? 'Cached metrics' : 'Current'}
-              </span>
-            </div>
-          </>
+            {signIn.map((agent) => (
+              <p
+                key={agent.name}
+                className={'mw-worker-agent ' + (factsCurrent ? '!text-warning' : '')}
+              >
+                <AgentMark agent={agent.name} size={13} />
+                <span>
+                  {agentLabel(agent.name)}{' '}
+                  {factsCurrent ? 'needs sign-in on Mac' : 'sign-in unverified'}
+                </span>
+              </p>
+            ))}
+            {factsCurrent && installed.some((agent) => agent.auth === 'unknown') ? (
+              <p className="mw-help">Authentication not reported</p>
+            ) : null}
+          </div>
+          <div className="mw-worker-actions">
+            <button
+              type="button"
+              className="mw-link font-medium underline underline-offset-4"
+              onClick={() => onSetup?.(worker.name, signIn[0]?.name)}
+            >
+              {signIn.length ? 'Setup instructions' : 'Agent settings'}
+            </button>
+            <button
+              type="button"
+              className="mw-link"
+              aria-expanded={expanded}
+              onClick={() => setExpanded(!expanded)}
+            >
+              Worker details{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="mw-worker-diagnostics" hidden={!expanded}>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <span className="text-xs text-muted-foreground">{presence}</span>
+          <HerdrChip herdr={worker.herdr} />
+        </div>
+        {!known ? (
+          <p className="mb-3 text-sm">{described?.message ?? 'Observation is out of date'}</p>
+        ) : (
+          <p className="mb-3 text-sm">{task?.title ?? 'Ready for the next task'}</p>
         )}
+        {described?.code ? (
+          <p className="mb-3 font-mono text-xs text-destructive">{described.code}</p>
+        ) : null}
+        <dl className="grid grid-cols-3 gap-3">
+          <div>
+            <dt className="mw-help">{known ? 'CPU' : 'LAST CPU'}</dt>
+            <dd>
+              {worker.system.cpu_busy_percent == null
+                ? '—'
+                : worker.system.cpu_busy_percent.toFixed(1) + '%'}
+            </dd>
+          </div>
+          <div>
+            <dt className="mw-help">MEMORY</dt>
+            <dd>{humanize(worker.system.memory_pressure)}</dd>
+          </div>
+          <div>
+            <dt className="mw-help">DISK FREE</dt>
+            <dd>{bytes(worker.system.free_disk_bytes)}</dd>
+          </div>
+        </dl>
+        <p className="mt-3 text-xs text-muted-foreground">
+          {known
+            ? busy + ' / ' + worker.slot.capacity + ' slots occupied'
+            : 'Cached metrics · Last seen ' + relativeTime(worker.observed_at_millis, now)}
+        </p>
+        {jobs.length > 1 ? (
+          <p className="mt-2 break-all font-mono text-xs">
+            {jobs.map((id) => shortId(id, 8)).join(' · ')}
+          </p>
+        ) : null}
+        {task ? (
+          <div className="mt-4 border-t pt-4">
+            <dl className="grid grid-cols-3 gap-3">
+              <div>
+                <dt className="mw-help">AGENT</dt>
+                <dd>{humanize(task.agent)}</dd>
+              </div>
+              <div>
+                <dt className="mw-help">MODEL</dt>
+                <dd>{task.model ?? 'Agent default'}</dd>
+              </div>
+              <div>
+                <dt className="mw-help">EFFORT</dt>
+                <dd>{task.effort ? humanize(task.effort) : 'Not reported'}</dd>
+              </div>
+            </dl>
+            <button
+              type="button"
+              className="mw-link mt-3"
+              onClick={() => onSelectTask?.(task.task_id)}
+            >
+              Open task
+              <ChevronRight size={13} />
+            </button>
+          </div>
+        ) : null}
       </div>
     </article>
   )
