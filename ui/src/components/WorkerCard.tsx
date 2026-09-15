@@ -39,7 +39,7 @@ function WorkerAgent({
         id={triggerId}
         render={onSetup ? <button type="button" /> : <span role="img" tabIndex={0} />}
         className="mw-worker-agent-logo"
-        data-tone={factsCurrent && agent.auth === 'unauthenticated' ? 'sign-in-needed' : 'default'}
+        data-tone={agent.auth === 'unknown' ? 'unknown' : factsCurrent && agent.auth === 'unauthenticated' ? 'sign-in-needed' : 'default'}
         aria-label={agentLabel(agent.name) + (onSetup ? ' settings for ' + workerName : ' on ' + workerName)}
         aria-describedby={open ? triggerId + '-description' : undefined}
         closeOnClick={Boolean(onSetup)}
@@ -82,7 +82,9 @@ export function WorkerCard({
   const jobs = activeJobIds(worker.slot)
   const facts = worker.agent_facts
   const factsCurrent = known && facts?.freshness === 'current'
-  const agents = facts?.agents ?? []
+  const agents = [...(facts?.agents ?? [])].sort(
+    (left, right) => Number(left.auth === 'unknown') - Number(right.auth === 'unknown'),
+  )
   const signIn = agents.filter((agent) => agent.auth === 'unauthenticated')
   const described = describeError(worker.error)
   return (

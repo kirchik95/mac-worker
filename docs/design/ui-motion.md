@@ -31,8 +31,11 @@ worker. Initial mount, clock ticks, duplicate/out-of-order timestamps and stale
 reports are silent. Keyboard modality and reduced motion skip the turn. Report
 and agent tooltips use a 300 ms initial hover delay, then open immediately when
 moving between nearby icons; keyboard focus is immediate and tooltips do not animate.
-Agent logos use dark foreground by default and gray only for a current explicit
-sign-in requirement. Current task activity stays in the tooltip and task/slot text.
+Agent logos use dark foreground by default and gray for unknown sign-in status
+or a current explicit sign-in requirement. Unknown-status agents come last,
+preserving order within each group. Current task activity stays in the tooltip
+and task/slot text. Other tasks are ordered by latest update first, then creation
+time when updates tie.
 
 The log viewport is capped at `min(320px, 45dvh)`. Appended output follows the
 bottom only while the reader stays there; scrolling up pauses following. Jump to

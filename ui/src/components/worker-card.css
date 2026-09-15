@@ -56,7 +56,8 @@ button.mw-worker-agent-logo {
   cursor: pointer;
 }
 
-.mw-worker-agent-logo[data-tone='sign-in-needed'] {
+.mw-worker-agent-logo[data-tone='sign-in-needed'],
+.mw-worker-agent-logo[data-tone='unknown'] {
   color: #667085;
 }
 

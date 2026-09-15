@@ -59,11 +59,16 @@ describe('worker agent logos', () => {
     render(<WorkerCard worker={working} now={3_000} onSetup={setup} />)
 
     expect(screen.getByText('Agents:')).toBeInTheDocument()
-    for (const name of ['Claude Code', 'Codex', 'Cursor', 'OpenCode']) {
-      const icon = screen.getByRole('button', { name: `${name} settings for mini-1` })
+    const icons = screen.getAllByRole('button', { name: /^(Claude Code|Codex|Cursor|OpenCode) settings for mini-1$/ })
+    for (const [index, [name, tone]] of [
+      ['Claude Code', 'default'], ['Codex', 'default'],
+      ['OpenCode', 'sign-in-needed'], ['Cursor', 'unknown'],
+    ].entries()) {
+      const icon = icons[index]
+      expect(icon).toHaveAccessibleName(`${name} settings for mini-1`)
       expect(icon.querySelector('svg')).not.toBeNull()
       expect(icon).not.toHaveTextContent('CC')
-      expect(icon).toHaveAttribute('data-tone', name === 'OpenCode' ? 'sign-in-needed' : 'default')
+      expect(icon).toHaveAttribute('data-tone', tone)
     }
     expect(screen.queryByText(/Installed:/)).not.toBeInTheDocument()
     expect(screen.getByText('OpenCode needs sign-in on Mac')).toBeVisible()

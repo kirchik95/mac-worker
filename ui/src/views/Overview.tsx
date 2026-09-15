@@ -38,9 +38,12 @@ export function Overview({
   )
   const busy = known.reduce((total, worker) => total + slotBusy(worker.slot), 0)
   const capacity = known.reduce((total, worker) => total + worker.slot.capacity, 0)
-  const other = snapshot.tasks.filter(
-    (task) => !needsAnswer(task) && !readyForReview(task) && task.state !== 'closed',
-  )
+  const other = snapshot.tasks
+    .filter((task) => !needsAnswer(task) && !readyForReview(task) && task.state !== 'closed')
+    .sort((left, right) =>
+      right.updated_at_millis - left.updated_at_millis ||
+      right.created_at_millis - left.created_at_millis,
+    )
   const active = snapshot.workers.filter((worker) => worker.active_task)
   const select = onSelectTask ?? (() => onShowAttention?.())
   return (
