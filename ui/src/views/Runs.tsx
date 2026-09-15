@@ -1,4 +1,4 @@
-import { ArrowRight, Layers, Info } from 'lucide-react'
+import { Clock3, FileText, Layers } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { relativeTime, shortId } from '@/lib/format'
 import type { Snapshot, Progress } from '@/lib/api'
@@ -21,25 +21,23 @@ export function Runs({
     <div className="mw-page">
       <header>
         <h1 className="mw-page-title">Runs</h1>
-        <p className="mw-page-description">
-          Related tasks, their progress and how many can run at once.
-        </p>
+        <p className="mw-page-description">Task groups and their execution limits.</p>
       </header>
       {snapshot.runs.length ? (
-        <div className="mw-table-wrap">
+        <div className="mw-table-wrap mw-runs-table">
           <table className="mw-table">
             <colgroup>
-              <col style={{ width: '27%' }} />
+              <col style={{ width: '292px' }} />
               <col />
-              <col style={{ width: 140 }} />
-              <col style={{ width: 140 }} />
-              <col style={{ width: 158 }} />
+              <col style={{ width: 168 }} />
+              <col style={{ width: 162 }} />
+              <col style={{ width: 184 }} />
             </colgroup>
             <thead>
               <tr>
                 <th>Run</th>
-                <th>Progress</th>
-                <th>Max parallel</th>
+                <th>Task progress</th>
+                <th>Parallel limit</th>
                 <th>Created</th>
                 <th>Action</th>
               </tr>
@@ -54,12 +52,12 @@ export function Runs({
                     >
                       {run.name ?? 'Unnamed run'}
                     </button>
-                    <span className="mw-task-id">
-                      {shortId(run.run_id, 12)} · {run.progress.total}{' '}
-                      {run.progress.total === 1 ? 'task' : 'tasks'}
-                    </span>
+                    <span className="mw-task-id">{shortId(run.run_id, 12)}</span>
                   </td>
                   <td>
+                    <p className="mb-2 text-sm text-foreground">
+                      {run.progress.total} {run.progress.total === 1 ? 'task' : 'tasks'}
+                    </p>
                     <div
                       className="mb-2 flex h-1.5 overflow-hidden rounded-full bg-muted"
                       role="img"
@@ -85,15 +83,26 @@ export function Runs({
                         </span>
                       ))}
                     </div>
+                    {snapshot.collection.freshness === 'current' &&
+                    snapshot.tasks.some(
+                      (task) =>
+                        task.run_id === run.run_id &&
+                        task.state === 'queued' &&
+                        task.freshness === 'current' &&
+                        task.blocking_code === 'RUN_MAX_PARALLEL',
+                    ) ? (
+                      <p className="mt-4 flex items-center gap-2 text-xs text-warning">
+                        <Clock3 size={13} aria-hidden="true" />
+                        Parallel limit reached
+                      </p>
+                    ) : null}
                   </td>
-                  <td>
-                    <span className="mw-badge">{run.max_parallel}</span>
-                  </td>
+                  <td>{run.max_parallel} at a time</td>
                   <td>{relativeTime(run.created_at_millis)}</td>
                   <td>
                     <Button variant="outline" onClick={() => onShowRun?.(run.run_id)}>
+                      <FileText size={16} aria-hidden="true" />
                       View tasks
-                      <ArrowRight size={16} aria-hidden="true" />
                     </Button>
                   </td>
                 </tr>
@@ -110,11 +119,24 @@ export function Runs({
           </p>
         </section>
       )}
-      <p className="flex items-start gap-2 text-xs text-muted-foreground">
-        <Info size={15} className="shrink-0 mt-0.5" aria-hidden="true" />A run’s limit is separate
-        from Mac slots. Queued tasks start when both a run slot and a compatible Mac slot are
-        available.
-      </p>
+      {snapshot.runs.length ? (
+        <p className="text-[13px] text-muted-foreground">
+          {snapshot.runs.length} runs ·{' '}
+          {snapshot.runs.reduce((sum, run) => sum + run.progress.total, 0)} tasks
+        </p>
+      ) : null}
+      <div className="flex items-start gap-3 border-t py-6">
+        <Layers size={20} className="shrink-0 text-muted-foreground" aria-hidden="true" />
+        <div>
+          <h2 className="mb-2 font-semibold">Run limits and Mac slots</h2>
+          <p className="text-sm text-muted-foreground">
+            A run can wait at its parallel limit even when a Mac has a free slot.
+          </p>
+          <p className="mt-1 text-[13px] text-muted-foreground">
+            View its tasks to see which items are waiting for capacity, input or agent setup.
+          </p>
+        </div>
+      </div>
     </div>
   )
 }

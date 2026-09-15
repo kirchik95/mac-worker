@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -38,8 +38,8 @@ const codexPanel = async () => {
 const draftIn = (panel: HTMLElement) => {
   const selects = within(panel).getAllByRole('combobox')
   return {
-    model: selects[0].textContent,
-    effort: selects[1].textContent,
+    model: selects[0].querySelector('[data-slot="select-value"]')?.textContent,
+    effort: selects[1].querySelector('[data-slot="select-value"]')?.textContent,
     fast: within(panel).getByRole('switch').getAttribute('aria-checked'),
   }
 }
@@ -47,6 +47,167 @@ const draftIn = (panel: HTMLElement) => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('Settings', () => {
+  it('searches models without changing the draft until an option is selected and Save is pressed', async () => {
+    const calls = mockFetch((body) => ({
+      ok: true,
+      status: 200,
+      payload: { ...agentSettings().agents[0], ...(body as object) },
+    }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const panel = await codexPanel()
+    const trigger = within(panel).getByRole('combobox', { name: 'Model' })
+    const save = within(panel).getByRole('button', { name: 'Save defaults' })
+
+    await user.click(trigger)
+    const search = await screen.findByRole('combobox', { name: 'Search models' })
+    expect(search).toHaveFocus()
+    await user.type(search, 'TiNy')
+    expect(screen.getByRole('option', { name: 'Tiny' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'GPT-6-Astra' })).not.toBeInTheDocument()
+    expect(trigger).toHaveTextContent('GPT-6-Astra')
+    expect(save).toBeDisabled()
+    expect(calls).toHaveLength(0)
+
+    await user.keyboard('{ArrowDown}{Enter}')
+    expect(trigger).toHaveTextContent('Tiny')
+    expect(save).toBeEnabled()
+    expect(calls).toHaveLength(0)
+    await user.click(save)
+    await screen.findByText('Saved.')
+    expect(calls).toEqual([
+      { agent: 'codex', model: 'tiny', effort: null, fast: null, revision: 'rev-1' },
+    ])
+  })
+
+  it('dismisses an empty model search without losing the selection and starts fresh on reopen', async () => {
+    const calls = mockFetch(() => ({ ok: true, status: 200, payload: agentSettings().agents[0] }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const panel = await codexPanel()
+    const trigger = within(panel).getByRole('combobox', { name: 'Model' })
+
+    await user.click(trigger)
+    await user.type(await screen.findByRole('combobox', { name: 'Search models' }), 'no-such-model')
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.queryByRole('option')).not.toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(trigger).toHaveFocus())
+    expect(trigger).toHaveTextContent('GPT-6-Astra')
+    expect(within(panel).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
+
+    await user.keyboard('{ArrowDown}')
+    expect(await screen.findByRole('combobox', { name: 'Search models' })).toHaveValue('')
+    expect(screen.getByRole('option', { name: 'Agent default' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'GPT-6-Astra' })).toBeInTheDocument()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('uses the Mac’s live Cursor catalogue and saves the canonical native ID', async () => {
+    const cursor = {
+      ...agentSettings().agents[0],
+      agent: 'cursor',
+      model: 'grok-4.6',
+      effort: 'high',
+      fast: true,
+      model_catalog_source: 'live',
+      model_options: [
+        {
+          id: 'grok-4.6',
+          label: 'Cursor Grok 4.6 High Fast',
+          effort_options: ['high'],
+          fast_supported: true,
+          capabilities_known: true,
+        },
+        {
+          id: 'gpt-5.6-sol',
+          label: 'GPT-5.6 Sol',
+          effort_options: ['none', 'medium', 'extra-high'],
+          fast_supported: true,
+          capabilities_known: true,
+        },
+        {
+          id: 'worker-custom-model',
+          label: 'Worker custom model',
+          effort_options: [],
+          fast_supported: false,
+        },
+      ],
+    }
+    const saves: unknown[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        if (init?.method === 'POST') {
+          const request = JSON.parse(String(init.body))
+          saves.push(request)
+          return { ok: true, status: 200, json: async () => ({ ...cursor, ...request }) }
+        }
+        return { ok: true, status: 200, json: async () => ({ agents: [cursor] }) }
+      }),
+    )
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const panel = (await screen.findByRole('heading', { name: 'Cursor on mini-1' })).closest(
+      'section',
+    )!
+    expect(within(panel).getByRole('switch')).toBeChecked()
+    expect(within(panel).getByRole('switch')).toBeEnabled()
+    await user.click(within(panel).getByRole('combobox', { name: 'Model' }))
+    expect(await screen.findByRole('option', { name: 'Worker custom model' })).toBeInTheDocument()
+    await user.click(await screen.findByRole('option', { name: 'GPT-5.6 Sol' }))
+    await user.click(within(panel).getByRole('combobox', { name: 'Reasoning effort' }))
+    await user.click(await screen.findByRole('option', { name: /extra.high/i }))
+    await user.click(within(panel).getByRole('button', { name: 'Save defaults' }))
+    await screen.findByText('Saved.')
+    expect(saves).toEqual([
+      {
+        agent: 'cursor',
+        model: 'gpt-5.6-sol',
+        effort: 'extra-high',
+        fast: true,
+        revision: cursor.revision,
+      },
+    ])
+    expect(within(panel).getByRole('combobox', { name: 'Model' })).toHaveTextContent('GPT-5.6 Sol')
+  })
+
+  it('distinguishes unavailable Cursor capabilities from unsupported controls', async () => {
+    const cursor = { ...agentSettings().agents[0], agent: 'cursor', model: 'unknown', effort: null, fast: null,
+      model_options: [
+        { id: 'unknown', label: 'Remembered model', effort_options: [], fast_supported: false },
+        { id: 'default', label: 'Auto', effort_options: [], fast_supported: false, capabilities_known: true },
+      ], model_catalog_source: 'remembered' }
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ agents: [cursor] }) })))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const panel = (await screen.findByRole('heading', { name: 'Cursor on mini-1' })).closest('section')!
+    expect(within(panel).getByText('Fast support hasn’t been reported by this Mac.')).toBeInTheDocument()
+    expect(within(panel).getByRole('switch')).toHaveAttribute('aria-disabled', 'true')
+    await user.click(within(panel).getByRole('combobox', { name: 'Model' }))
+    await user.click(await screen.findByRole('option', { name: 'Auto' }))
+    expect(within(panel).getByText('Not supported by this model.')).toBeInTheDocument()
+    expect(within(panel).getByText('This model has no reasoning control.')).toBeInTheDocument()
+  })
+
+  it('clears Fast when switching from an enabled model to a model without Fast', async () => {
+    const cursor = { ...agentSettings().agents[0], agent: 'cursor', model: 'fast-model', fast: true,
+      model_options: [
+        { id: 'fast-model', label: 'Fast model', effort_options: [], fast_supported: true, capabilities_known: true },
+        { id: 'default', label: 'Auto', effort_options: [], fast_supported: false, capabilities_known: true },
+      ] }
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ agents: [cursor] }) })))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const panel = (await screen.findByRole('heading', { name: 'Cursor on mini-1' })).closest('section')!
+    expect(within(panel).getByRole('switch')).toBeChecked()
+    await user.click(within(panel).getByRole('combobox', { name: 'Model' }))
+    await user.click(await screen.findByRole('option', { name: 'Auto' }))
+    expect(within(panel).getByRole('switch')).not.toBeChecked()
+    expect(within(panel).getByRole('switch')).toHaveAttribute('aria-disabled', 'true')
+    expect(within(panel).getByText('Off')).toBeInTheDocument()
+  })
+
   it('shows the recorded defaults for each agent', async () => {
     mockFetch(() => ({ ok: true, status: 200, payload: agentSettings().agents[0] }))
     render(<Settings snapshot={snapshot()} />)
@@ -63,7 +224,7 @@ describe('Settings', () => {
 
     await user.click(await screen.findByText('OpenCode'))
     expect(
-      await screen.findByText('opencode publishes no global effort setting.'),
+      await screen.findByText('This agent does not expose a reasoning default.'),
     ).toBeInTheDocument()
   })
 
@@ -87,6 +248,150 @@ describe('Settings', () => {
 
     await userEvent.setup().click(within(codex).getByRole('switch'))
     expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
+  })
+
+  it('retains an unsaved draft when switching agents', async () => {
+    const calls = mockFetch(() => ({
+      ok: true,
+      status: 200,
+      payload: agentSettings().agents[0],
+    }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+
+    const codex = await codexPanel()
+    await user.click(within(codex).getByRole('switch'))
+    await user.click(within(codex).getByRole('combobox', { name: 'Reasoning effort' }))
+    await user.click(await screen.findByRole('option', { name: 'Low' }))
+    await user.click(screen.getByText('OpenCode'))
+    expect(await screen.findByText('OpenCode on mini-1')).toBeInTheDocument()
+    await user.click(screen.getByText('Codex', { selector: '.font-medium' }))
+
+    const restored = await codexPanel()
+    expect(draftIn(restored)).toEqual({ model: 'GPT-6-Astra', effort: 'Low', fast: 'true' })
+    expect(within(restored).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('keeps separate drafts for each Mac through refetch and Cancel', async () => {
+    const calls = mockFetch(() => ({
+      ok: true,
+      status: 200,
+      payload: agentSettings().agents[0],
+    }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot({ workers: [worker(), worker({ name: 'mini-2' })] })} />)
+
+    const miniOne = await codexPanel()
+    await user.click(within(miniOne).getByRole('switch'))
+    await user.click(screen.getByRole('combobox', { name: 'Worker' }))
+    await user.click(await screen.findByRole('option', { name: 'mini-2' }))
+    const miniTwo = (await screen.findByText('Codex on mini-2')).closest('section')!
+    expect(within(miniTwo).getByRole('switch')).not.toBeChecked()
+    await user.click(within(miniTwo).getByRole('combobox', { name: 'Reasoning effort' }))
+    await user.click(await screen.findByRole('option', { name: 'Low' }))
+
+    await user.click(screen.getByRole('combobox', { name: 'Worker' }))
+    await user.click(await screen.findByRole('option', { name: 'mini-1' }))
+    const restoredOne = await codexPanel()
+    expect(draftIn(restoredOne)).toEqual({ model: 'GPT-6-Astra', effort: 'Xhigh', fast: 'true' })
+    await user.click(within(restoredOne).getByRole('button', { name: 'Cancel' }))
+    expect(within(restoredOne).getByRole('switch')).not.toBeChecked()
+
+    await user.click(screen.getByRole('combobox', { name: 'Worker' }))
+    await user.click(await screen.findByRole('option', { name: 'mini-2' }))
+    const restoredTwo = (await screen.findByText('Codex on mini-2')).closest('section')!
+    expect(draftIn(restoredTwo)).toEqual({ model: 'GPT-6-Astra', effort: 'Low', fast: 'false' })
+    expect(within(restoredTwo).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('keeps the draft revision through a refetch until Cancel accepts the newer defaults', async () => {
+    let fetched = agentSettings()
+    const requests: unknown[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        if (init?.method === 'POST') {
+          requests.push(JSON.parse(String(init.body)))
+          return {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: { code: 'REVISION_STALE' } }),
+          }
+        }
+        return { ok: true, status: 200, json: async () => fetched }
+      }),
+    )
+    const user = userEvent.setup()
+    const { rerender } = render(<Settings snapshot={snapshot()} initialAgent="codex" />)
+    await user.click(within(await codexPanel()).getByRole('switch'))
+    fetched = {
+      agents: agentSettings().agents.map((agent) =>
+        agent.agent === 'codex'
+          ? { ...agent, model: 'tiny', effort: 'low', revision: 'rev-newer' }
+          : agent,
+      ),
+    }
+    rerender(<Settings snapshot={snapshot()} initialAgent="opencode" />)
+    await screen.findByText('OpenCode on mini-1')
+    await user.click(screen.getByText('Codex', { selector: '.font-medium' }))
+
+    const codex = await codexPanel()
+    expect(draftIn(codex)).toEqual({ model: 'GPT-6-Astra', effort: 'Xhigh', fast: 'true' })
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
+    await within(codex).findByText(/REVISION_STALE/)
+    expect(requests[0]).toMatchObject({ revision: 'rev-1', model: 'gpt-6-astra', fast: true })
+    expect(within(codex).getByRole('switch')).toBeChecked()
+
+    await user.click(within(codex).getByRole('button', { name: 'Cancel' }))
+    expect(draftIn(codex)).toEqual({ model: 'Tiny', effort: 'Low', fast: 'false' })
+    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
+    await user.click(within(codex).getByRole('combobox', { name: 'Model' }))
+    await user.click(await screen.findByRole('option', { name: 'GPT-6-Astra' }))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
+    await waitFor(() => expect(requests).toHaveLength(2))
+    expect(requests[1]).toMatchObject({ revision: 'rev-newer' })
+  })
+
+  it('locks mutable controls until the save completes and reports its result', async () => {
+    const response = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        if (init?.method === 'POST') return response.promise
+        return { ok: true, status: 200, json: async () => agentSettings() }
+      }),
+    )
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot()} />)
+    const codex = await codexPanel()
+    await user.click(within(codex).getByRole('switch'))
+    await user.click(within(codex).getByRole('button', { name: 'Save defaults' }))
+
+    const saving = within(codex).getByRole('button', { name: 'Saving…' })
+    expect(saving).toHaveAttribute('aria-busy', 'true')
+    expect(saving).toBeDisabled()
+    expect(within(codex).getByRole('combobox', { name: 'Model' })).toBeDisabled()
+    expect(within(codex).getByRole('combobox', { name: 'Reasoning effort' })).toBeDisabled()
+    expect(within(codex).getByRole('switch')).toHaveAttribute('aria-disabled', 'true')
+    expect(within(codex).getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    await user.click(within(codex).getByRole('switch'))
+    expect(within(codex).getByRole('switch')).toBeChecked()
+    expect(within(codex).queryByRole('button', { name: 'Saved' })).not.toBeInTheDocument()
+
+    await act(async () => {
+      response.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...agentSettings().agents[0], fast: true, revision: 'rev-saved' }),
+      })
+    })
+    const saved = await within(codex).findByRole('button', { name: 'Saved' })
+    expect(saved).toBeDisabled()
+    expect(saved).toHaveAttribute('aria-busy', 'false')
+    expect(within(codex).getByRole('switch')).not.toHaveAttribute('aria-disabled', 'true')
+    expect(within(codex).getByRole('switch')).toBeChecked()
   })
 
   it('sends the revision the host checks', async () => {
@@ -128,7 +433,7 @@ describe('Settings', () => {
 
     await waitFor(() => {
       expect(within(codex).getByRole('switch')).toBeChecked()
-      expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeDisabled()
+      expect(within(codex).getByRole('button', { name: 'Saved' })).toBeDisabled()
     })
     await user.click(within(codex).getByRole('switch'))
     await waitFor(() =>
@@ -154,7 +459,7 @@ describe('Settings', () => {
 
     // The draft must survive a conflict, or the operator loses what they typed.
     await waitFor(() => expect(within(codex).getByRole('switch')).toBeChecked())
-    expect(within(codex).getByRole('button', { name: 'Save defaults' })).toBeEnabled()
+    expect(await within(codex).findByRole('button', { name: 'Try again' })).toBeEnabled()
     expect(within(codex).getByText(/REVISION_STALE/)).toBeInTheDocument()
   })
 

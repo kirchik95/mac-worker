@@ -1,7 +1,13 @@
 /** The display glyph the Overview artboard puts beside each worker name. */
-export function WorkerIcon() {
+export function WorkerIcon({ className = '' }: { className?: string }) {
   return (
-    <svg width="28" height="28" viewBox="0 0 24 24" aria-hidden="true" className="shrink-0">
+    <svg
+      width="28"
+      height="28"
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className={'shrink-0 ' + className}
+    >
       <rect
         x="3"
         y="5"

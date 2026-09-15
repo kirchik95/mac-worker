@@ -75,13 +75,6 @@ export function Overview({
         )}
       </section>
       <section className="mt-1 border-t pt-6">
-        <div className="mw-section-heading">
-          <h2 className="mw-section-title">Other tasks</h2>
-          <p className="text-[13px] text-muted-foreground">
-            {other.filter((task) => task.state === 'active').length} running ·{' '}
-            {other.filter((task) => task.state === 'queued').length} queued
-          </p>
-        </div>
         {other.length ? (
           <TaskTable
             tasks={other}
@@ -90,9 +83,19 @@ export function Overview({
             onShowRun={onShowRun}
             now={now}
             compact
+            header={
+              <>
+                <h2 className="text-base font-semibold">Other tasks</h2>
+                <p className="text-[13px] text-muted-foreground">
+                  {other.filter((task) => task.state === 'active').length} running ·{' '}
+                  {other.filter((task) => task.state === 'queued').length} queued
+                </p>
+              </>
+            }
           />
         ) : (
           <div className="mw-panel p-6 text-sm text-muted-foreground">
+            <h2 className="mw-section-title mb-3">Other tasks</h2>
             No other tasks are waiting or running.
           </div>
         )}

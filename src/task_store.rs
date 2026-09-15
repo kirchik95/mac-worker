@@ -1491,6 +1491,13 @@ impl<'a> TaskStore<'a> {
         } else {
             TaskState::Open
         };
+        // A completed answer can explicitly leave no questions. Preserve the
+        // prior context only for other outcomes that provide no replacement.
+        let questions = if questions.is_empty() && outcome != TaskOutcome::Done {
+            current.questions().to_vec()
+        } else {
+            questions
+        };
         let next = TaskStatus::new(
             next_state,
             Some(outcome),
@@ -1498,11 +1505,7 @@ impl<'a> TaskStore<'a> {
             current.session_present(),
             head_oid.or_else(|| current.head_oid().cloned()),
             summary.or_else(|| current.summary().map(str::to_owned)),
-            if questions.is_empty() {
-                current.questions().to_vec()
-            } else {
-                questions
-            },
+            questions,
             if files_changed.is_empty() {
                 current.files_changed().to_vec()
             } else {

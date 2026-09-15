@@ -16,6 +16,7 @@ import { questionText, type Snapshot, type TaskRow } from '@/lib/api'
 import { relativeTime } from '@/lib/format'
 import { needsAnswer, readyForReview, taskEventKey, taskPresentation } from '@/lib/taskPresentation'
 import type { TaskPreviews } from '@/hooks/useTaskPreviews'
+import { useAttentionToasts } from '@/hooks/useAttentionToasts'
 
 const STORAGE = 'mac-worker:notification-read:v1'
 function readSaved(): string[] {
@@ -32,14 +33,26 @@ export function Notifications({
   snapshot,
   previews,
   onSelectTask,
+  offline = false,
+  activeTaskId,
 }: {
   snapshot: Snapshot | null
   previews: TaskPreviews
   onSelectTask: (id: string) => void
+  offline?: boolean
+  activeTaskId?: string
 }) {
   const [open, setOpen] = useState(false)
   const [unreadOnly, setUnreadOnly] = useState(false)
   const [read, setRead] = useState(readSaved)
+  useAttentionToasts({
+    snapshot,
+    offline,
+    activeTaskId,
+    panelOpen: open,
+    onSelectTask,
+    onOpenNotifications: () => setOpen(true),
+  })
   const tasks = snapshot?.tasks ?? []
   const action = tasks.filter((task) => needsAnswer(task) || readyForReview(task))
   const recent = tasks

@@ -4,6 +4,7 @@ import { LayoutGrid, Layers, ListFilter, SlidersHorizontal } from 'lucide-react'
 import { Wordmark } from '@/components/Wordmark'
 import { Skeleton } from '@/components/Skeleton'
 import { Notifications } from '@/components/Notifications'
+import { Toaster } from '@/components/ui/sonner'
 import { Overview } from '@/views/Overview'
 import { Runs } from '@/views/Runs'
 import { Settings } from '@/views/Settings'
@@ -143,7 +144,13 @@ export default function App() {
                 ? 'Dashboard refreshed ' + relativeTime(snapshot.generated_at_millis)
                 : 'Connecting to your Macs…'}
         </p>
-        <Notifications snapshot={snapshot} previews={previews} onSelectTask={selectTask} />
+        <Notifications
+          snapshot={snapshot}
+          previews={previews}
+          onSelectTask={selectTask}
+          offline={offline}
+          activeTaskId={route.taskId}
+        />
       </header>
       <main className="mw-main flex-1">
         {displayed ? (
@@ -229,6 +236,7 @@ export default function App() {
         </span>
         <span>mac-worker</span>
       </footer>
+      <Toaster />
     </Tabs.Root>
   )
 }

@@ -261,6 +261,7 @@ export interface ModelOption {
   label: string
   effort_options: string[]
   fast_supported: boolean
+  capabilities_known?: boolean
 }
 
 export interface AgentSetting {
@@ -275,6 +276,7 @@ export interface AgentSetting {
   revision: string
   writable: boolean
   message: string | null
+  model_catalog_source?: 'live' | 'remembered' | null
 }
 
 export interface AgentSettings {

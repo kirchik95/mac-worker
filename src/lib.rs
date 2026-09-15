@@ -77,6 +77,7 @@ pub mod cli;
 pub mod client_state;
 pub mod config;
 pub mod controller;
+pub mod cursor_catalog;
 pub mod dag;
 pub mod dashboard;
 pub mod doctor;
@@ -3284,7 +3285,13 @@ fn run_host_agent_settings_get(
         stdout,
         |request: AgentSettingsGetRequest, store| {
             let _ = request;
-            Ok(store.read_all())
+            Ok(store
+                .clone()
+                .with_cursor_catalog(cursor_catalog::discover(
+                    runtime.home(),
+                    runtime.environment(),
+                ))
+                .read_all())
         },
     )
 }
@@ -3299,6 +3306,14 @@ fn run_host_agent_settings_set(
         stdin,
         stdout,
         |request: AgentSettingsSaveRequest, store| {
+            let store = if request.agent == "cursor" {
+                store.clone().with_cursor_catalog(cursor_catalog::discover(
+                    runtime.home(),
+                    runtime.environment(),
+                ))
+            } else {
+                store.clone()
+            };
             store.save(&request).map_err(|error| {
                 WorkerError::Protocol(format!("{}: {}", error.code(), error.safe_message()))
             })

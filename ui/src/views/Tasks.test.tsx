@@ -94,11 +94,12 @@ describe('Tasks', () => {
     expect(screen.getByText('1 of 3')).toBeInTheDocument()
   })
 
-  it('says so when nothing matches instead of showing an empty table', async () => {
+  it('shows the query and retains table headings when nothing matches', async () => {
     const user = userEvent.setup()
     render(<Tasks snapshot={fixture} onSelect={() => {}} />)
     await user.type(screen.getByLabelText('Filter tasks'), 'nothing matches this')
-    expect(screen.getByText('No task matches these filters.')).toBeInTheDocument()
+    expect(screen.getByText('No tasks match “nothing matches this”')).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Action' })).toBeInTheDocument()
   })
 
   it('filters by outcome and offers the same view as a command', async () => {
@@ -115,7 +116,8 @@ describe('Tasks', () => {
     })
     render(<Tasks snapshot={outcomes} onSelect={() => {}} />)
 
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Outcome' }), 'blocked')
+    await user.click(screen.getByRole('combobox', { name: 'Outcome' }))
+    await user.click(await screen.findByRole('option', { name: 'Blocked' }))
     await user.click(screen.getByText('CLI equivalent'))
     expect(titles().some((title) => title.includes('Extract billing'))).toBe(true)
     expect(titles()).toHaveLength(1)
@@ -134,13 +136,14 @@ describe('Tasks', () => {
     )
     render(<Tasks snapshot={waiting} onSelect={() => {}} />)
 
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Outcome' }), 'needs_input')
+    await user.click(screen.getByRole('combobox', { name: 'Outcome' }))
+    await user.click(await screen.findByRole('option', { name: 'Needs input' }))
     await user.click(screen.getByText('CLI equivalent'))
     expect(screen.getByText('worker task list --outcome needs-input')).toBeInTheDocument()
     vi.unstubAllGlobals()
   })
 
-  it('links a named question shortcut to the right task', async () => {
+  it('links a named question to the right task', async () => {
     const onSelect = vi.fn()
     const user = userEvent.setup()
     const waiting = snapshot({
@@ -161,20 +164,33 @@ describe('Tasks', () => {
     expect(onSelect).toHaveBeenCalledWith('d'.repeat(32))
   })
 
-  it('keeps the shortcut within the active filters', async () => {
+  it('keeps unanswered questions reachable when the search has no matches', async () => {
     const user = userEvent.setup()
     render(
       <Tasks
         snapshot={snapshot({
           tasks: [
             task({ title: 'Waiting task', state: 'open', last_outcome: { kind: 'needs_input' } }),
+            task({
+              task_id: 'b'.repeat(32),
+              title: 'Review task',
+              state: 'open',
+              review_state: 'ready_for_review',
+            }),
           ],
         })}
         onSelect={() => {}}
       />,
     )
     await user.type(screen.getByLabelText('Filter tasks'), 'different')
-    expect(screen.queryByText('1 task needs your answer')).not.toBeInTheDocument()
+    expect(screen.getByText('1 task needs your answer')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Show questions' }))
+    expect(screen.getByLabelText('Filter tasks')).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Waiting task' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Answer' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Review task' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Show all tasks' }))
+    expect(screen.getByRole('button', { name: 'Review task' })).toBeInTheDocument()
   })
 
   it('opens the task the operator clicked', async () => {

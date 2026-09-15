@@ -1,4 +1,5 @@
-import { FileText, Reply, Settings2 } from 'lucide-react'
+import { FileText, Layers, Reply, Settings2 } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { TaskBadge } from '@/components/TaskBadge'
 import { AgentMark } from '@/components/AgentMark'
@@ -14,6 +15,8 @@ export function TaskTable({
   now = Date.now(),
   compact = false,
   onShowRun,
+  header,
+  empty,
 }: {
   tasks: TaskRow[]
   onSelect?: (id: string) => void
@@ -21,17 +24,20 @@ export function TaskTable({
   now?: number
   compact?: boolean
   onShowRun?: (id: string) => void
+  header?: ReactNode
+  empty?: ReactNode
 }) {
   return (
-    <div className="mw-table-wrap">
+    <div className="mw-table-wrap mw-task-table" data-compact={compact}>
+      {header ? <div className="mw-table-heading">{header}</div> : null}
       <table className="mw-table">
         <colgroup>
           <col style={{ width: compact ? '150px' : '196px' }} />
           <col />
           <col style={{ width: compact ? '280px' : '166px' }} />
           <col style={{ width: '108px' }} />
-          <col style={{ width: '110px' }} />
-          <col style={{ width: '192px' }} />
+          <col style={{ width: compact ? '128px' : '110px' }} />
+          <col style={{ width: '212px' }} />
         </colgroup>
         <thead>
           <tr>
@@ -44,13 +50,20 @@ export function TaskTable({
           </tr>
         </thead>
         <tbody>
+          {!tasks.length && empty ? (
+            <tr>
+              <td className="mw-table-empty" colSpan={6}>
+                {empty}
+              </td>
+            </tr>
+          ) : null}
           {tasks.map((task) => {
             const presentation = taskPresentation(task)
             const setup = setupAgent(task) && onSetup
             const run =
               compact && task.blocking_code === 'RUN_MAX_PARALLEL' && task.run_id && onShowRun
             const action = setup ? 'Setup instructions' : run ? 'Open run' : presentation.action
-            const Icon = setup ? Settings2 : action === 'Answer' ? Reply : FileText
+            const Icon = setup ? Settings2 : run ? Layers : action === 'Answer' ? Reply : FileText
             const open = () =>
               setup
                 ? onSetup?.(task.worker ?? undefined, setupAgent(task) ?? task.agent)

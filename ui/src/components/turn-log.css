@@ -1,0 +1,40 @@
+@layer components {
+  .mw-log-row {
+    display: grid;
+    grid-template-columns: 78px 22px 64px minmax(0, 1fr);
+    align-items: start;
+    padding-block: 5px;
+  }
+  .mw-log-columns {
+    padding: 8px 24px;
+    background: #f9fafb;
+    color: #667085;
+    font-size: 11px;
+    border-bottom: 1px solid var(--border);
+  }
+  .mw-log-viewport {
+    min-height: 120px;
+    max-height: min(320px, 45dvh);
+    overflow: auto;
+    overscroll-behavior: contain;
+    overflow-anchor: none;
+    scrollbar-gutter: stable;
+    padding: 10px 24px;
+    scroll-behavior: auto;
+  }
+  .mw-log-jump {
+    display: flex;
+    justify-content: center;
+    padding: 8px 24px;
+    border-top: 1px solid var(--border);
+  }
+  @media (max-width: 720px) {
+    .mw-log-row {
+      grid-template-columns: 66px 18px 46px minmax(0, 1fr);
+    }
+    .mw-log-columns,
+    .mw-log-viewport {
+      padding-inline: 12px;
+    }
+  }
+}

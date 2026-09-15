@@ -1544,6 +1544,7 @@ fn resumed_codex_turn_stays_alive_and_publishes_after_needs_input() {
         .expect("first turn should publish needs_input");
     assert_eq!(first.task().state(), TaskState::Open);
     assert_eq!(first.task().last_outcome(), Some(&TaskOutcome::NeedsInput));
+    assert_eq!(first.task().questions(), &[Question::open("Which detail?")]);
     assert!(first.task().session_present());
     let base_oid = first
         .task()
@@ -1658,6 +1659,10 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
         .unwrap_or_else(|error| panic!("resumed turn should publish done: {error}"));
     assert_eq!(resumed.task().state(), TaskState::Open);
     assert_eq!(resumed.task().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(
+        resumed.task().questions().is_empty(),
+        "done must clear questions answered in the previous turn"
+    );
     assert!(resumed.task().session_present());
     assert_eq!(resumed.task().turns().len(), 2);
 }

@@ -83,6 +83,7 @@ fn entry() -> AgentDefaultSettings {
         fast: None,
         fast_supported: false,
         source: "fixture".into(),
+        model_catalog_source: None,
         revision: Some("a".repeat(64)),
         writable: true,
         message: None,

@@ -1,0 +1,88 @@
+.mw-worker-state-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mw-worker-observation {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: #667085;
+  cursor: default;
+}
+
+.mw-worker-observation-icon {
+  display: flex;
+}
+
+.mw-worker-agents,
+.mw-worker-agent-logos {
+  display: flex;
+  align-items: center;
+}
+
+.mw-worker-agents {
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.mw-worker-agent-logos {
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.mw-worker-agent-logo {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--foreground);
+}
+
+button.mw-worker-agent-logo {
+  cursor: pointer;
+}
+
+.mw-worker-agent-logo[data-tone='sign-in-needed'] {
+  color: #667085;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  button.mw-worker-agent-logo:hover {
+    background: #f2f4f7;
+  }
+}
+
+/* These controls are used repeatedly; their tooltips appear without motion. */
+.mw-worker-tooltip {
+  animation: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.mw-worker-tooltip strong {
+  font-weight: 500;
+}
+
+@media (pointer: coarse) {
+  .mw-worker-agent-logo,
+  .mw-worker-observation {
+    width: 44px;
+    height: 44px;
+  }
+}

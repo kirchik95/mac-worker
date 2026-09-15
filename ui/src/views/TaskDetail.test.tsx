@@ -83,6 +83,28 @@ afterEach(() => {
 })
 
 describe('TaskDetail', () => {
+  it.each([
+    ['keyboard', false, 'instant'],
+    ['pointer', true, 'instant'],
+    ['pointer', false, 'smooth'],
+  ] as const)(
+    'focuses the follow-up for %s / reduced=%s using %s scrolling',
+    async (modality, reduce, behavior) => {
+      serve(reviewable())
+      vi.stubGlobal('matchMedia', () => ({ matches: reduce }))
+      document.documentElement.dataset.inputModality = modality
+      render(<TaskDetail taskId="aaaa" />)
+      const button = await screen.findByRole('button', { name: 'Write follow-up' })
+      const field = screen.getByRole('textbox', { name: 'Follow-up' })
+      const scroll = vi.fn()
+      field.scrollIntoView = scroll
+      fireEvent.click(button, { detail: modality === 'keyboard' ? 0 : 1 })
+      expect(scroll).toHaveBeenCalledWith({ block: 'center', behavior })
+      expect(field).toHaveFocus()
+      delete document.documentElement.dataset.inputModality
+    },
+  )
+
   it('shows the structured result and the exact fetch command', async () => {
     serve(detail())
     render(<TaskDetail taskId="aaaa" />)
@@ -544,8 +566,12 @@ describe('TaskDetail', () => {
 
     expect(await screen.findByRole('button', { name: 'Send reply' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'please add tests' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Send reply' }))
+    const submit = screen.getByRole('button', { name: 'Send reply' })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    expect(submit).toBeDisabled()
+    expect(submit).toHaveAccessibleName('Sending…')
+    expect(submit).toHaveAttribute('aria-busy', 'true')
 
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
 
@@ -555,6 +581,24 @@ describe('TaskDetail', () => {
       )
     })
     expect(await screen.findByText('Follow-up sent')).toBeInTheDocument()
+  })
+
+  it('keeps the retry action when accept succeeded but closing is still pending', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) =>
+        Promise.resolve(
+          jsonResponse(
+            reviewable(init?.method === 'POST' ? { review_state: 'close_pending' } : {}),
+          ),
+        ),
+      ),
+    )
+    render(<TaskDetail taskId="aaaa" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Accept task' }))
+    expect(await screen.findByText('Accept requested.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry accept' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Accepted' })).not.toBeInTheDocument()
   })
 
   it('aborts an in-flight reply and does not apply it after a task switch', async () => {

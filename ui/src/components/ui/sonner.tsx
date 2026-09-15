@@ -1,49 +1,27 @@
-"use client"
+import type { CSSProperties } from 'react'
+import { Toaster as Sonner } from 'sonner'
+import './sonner.css'
 
-import { useTheme } from "next-themes"
-import { Toaster as Sonner, type ToasterProps } from "sonner"
-import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
-
-const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme()
-
+export function Toaster() {
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
-      className="toaster group"
-      icons={{
-        success: (
-          <CircleCheckIcon className="size-4" />
-        ),
-        info: (
-          <InfoIcon className="size-4" />
-        ),
-        warning: (
-          <TriangleAlertIcon className="size-4" />
-        ),
-        error: (
-          <OctagonXIcon className="size-4" />
-        ),
-        loading: (
-          <Loader2Icon className="size-4 animate-spin" />
-        ),
-      }}
+      theme="light"
+      className="mw-toaster"
+      position="bottom-right"
+      offset={24}
+      mobileOffset={16}
+      visibleToasts={1}
+      closeButton
+      swipeDirections={[]}
       style={
         {
-          "--normal-bg": "var(--popover)",
-          "--normal-text": "var(--popover-foreground)",
-          "--normal-border": "var(--border)",
-          "--border-radius": "var(--radius)",
-        } as React.CSSProperties
+          '--normal-bg': 'var(--card)',
+          '--normal-text': 'var(--foreground)',
+          '--normal-border': 'var(--border)',
+          '--border-radius': '10px',
+          '--width': '400px',
+        } as CSSProperties
       }
-      toastOptions={{
-        classNames: {
-          toast: "cn-toast",
-        },
-      }}
-      {...props}
     />
   )
 }
-
-export { Toaster }

@@ -46,6 +46,8 @@ pub struct ModelOption {
     pub label: String,
     pub effort_options: Vec<String>,
     pub fast_supported: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capabilities_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +64,8 @@ pub struct AgentDefaultSettings {
     pub revision: Option<String>,
     pub writable: bool,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,6 +188,7 @@ impl AgentKind {
 pub struct NativeAgentSettingsStore {
     home: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+    cursor_catalog: Option<Vec<CursorCatalogModel>>,
 }
 
 impl NativeAgentSettingsStore {
@@ -194,12 +199,29 @@ impl NativeAgentSettingsStore {
             // once, while all native descendants remain no-follow checked.
             home: fs::canonicalize(&home).unwrap_or(home),
             environment: BTreeMap::new(),
+            cursor_catalog: None,
         }
     }
 
     pub fn with_environment(mut self, environment: BTreeMap<OsString, OsString>) -> Self {
         self.environment = environment;
         self
+    }
+
+    pub fn with_cursor_catalog(mut self, value: Option<serde_json::Value>) -> Self {
+        self.cursor_catalog = value.as_ref().and_then(parse_cursor_catalog);
+        self
+    }
+
+    fn model_catalog_source(&self, kind: AgentKind) -> Option<String> {
+        (kind == AgentKind::Cursor).then(|| {
+            if self.cursor_catalog.is_some() {
+                "live"
+            } else {
+                "remembered"
+            }
+            .to_owned()
+        })
     }
 
     pub fn read_all(&self) -> AgentSettingsList {
@@ -268,6 +290,7 @@ impl NativeAgentSettingsStore {
             revision,
             writable,
             message,
+            model_catalog_source: self.model_catalog_source(kind),
         })
     }
 
@@ -428,6 +451,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: Vec::new(),
                         fast_supported: false,
+                        capabilities_known: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -447,6 +471,7 @@ impl NativeAgentSettingsStore {
                     label: model.to_owned(),
                     effort_options: Vec::new(),
                     fast_supported: false,
+                    capabilities_known: false,
                 });
             if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
                 options.pop();
@@ -457,6 +482,26 @@ impl NativeAgentSettingsStore {
     }
 
     fn cursor_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
+        let Some(catalog) = &self.cursor_catalog else {
+            return self.cursor_remembered_model_options(current_model);
+        };
+        let mut options: Vec<_> = catalog.iter().map(|model| model.option.clone()).collect();
+        if let Some(model) = current_model
+            && !options.iter().any(|option| option.id == model)
+            && let Some(current) = self
+                .cursor_remembered_model_options(Some(model))
+                .into_iter()
+                .find(|option| option.id == model)
+        {
+            if options.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                options.pop();
+            }
+            options.push(current);
+        }
+        options
+    }
+
+    fn cursor_remembered_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
         let path = self.home.join(".cursor/cli-config.json");
         let Some(bytes) = read_source(&path).ok().flatten() else {
             return current_model
@@ -467,6 +512,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: Vec::new(),
                         fast_supported: false,
+                        capabilities_known: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -525,6 +571,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: efforts,
                         fast_supported,
+                        capabilities_known: false,
                     },
                     priority: None,
                     order: usize::MAX,
@@ -549,6 +596,7 @@ impl NativeAgentSettingsStore {
                 label: model.to_owned(),
                 effort_options: Vec::new(),
                 fast_supported: false,
+                capabilities_known: false,
             }));
         }
         options.truncate(MAX_SETTINGS_MODEL_OPTIONS);
@@ -566,6 +614,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: Vec::new(),
                         fast_supported: false,
+                        capabilities_known: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -582,6 +631,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: Vec::new(),
                         fast_supported: false,
+                        capabilities_known: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -598,6 +648,7 @@ impl NativeAgentSettingsStore {
                         label: model.to_owned(),
                         effort_options: Vec::new(),
                         fast_supported: false,
+                        capabilities_known: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -640,6 +691,7 @@ impl NativeAgentSettingsStore {
                 label: model.to_owned(),
                 effort_options: Vec::new(),
                 fast_supported: false,
+                capabilities_known: false,
             }));
         }
         options.truncate(MAX_SETTINGS_MODEL_OPTIONS);
@@ -661,6 +713,7 @@ impl NativeAgentSettingsStore {
                         .map(|value| (*value).to_owned())
                         .collect(),
                     fast_supported: false,
+                    capabilities_known: false,
                 },
                 priority: None,
                 order,
@@ -703,6 +756,7 @@ impl NativeAgentSettingsStore {
                         .map(|value| (*value).to_owned())
                         .collect(),
                     fast_supported: false,
+                    capabilities_known: false,
                 }
             }));
         }
@@ -729,6 +783,7 @@ impl NativeAgentSettingsStore {
             revision,
             writable: false,
             message: Some(error.safe_message().to_owned()),
+            model_catalog_source: self.model_catalog_source(kind),
         }
     }
 
@@ -801,6 +856,7 @@ impl NativeAgentSettingsStore {
             revision,
             writable,
             message,
+            model_catalog_source: None,
         })
     }
 
@@ -877,7 +933,15 @@ impl NativeAgentSettingsStore {
     ) -> Result<Option<Vec<u8>>, AgentSettingsError> {
         let replacement = match kind {
             AgentKind::Codex => edit_codex(bytes, request)?,
-            AgentKind::Cursor => edit_cursor(bytes, request)?,
+            AgentKind::Cursor => edit_cursor(
+                bytes,
+                request,
+                self.cursor_catalog.as_ref().and_then(|catalog| {
+                    catalog
+                        .iter()
+                        .find(|model| Some(model.option.id.as_str()) == request.model.as_deref())
+                }),
+            )?,
             AgentKind::Opencode => edit_json_root(bytes, request, false)?,
             AgentKind::Claude => edit_json_root(bytes, request, true)?,
         };
@@ -913,6 +977,113 @@ struct CatalogEntry {
     option: ModelOption,
     priority: Option<i64>,
     order: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CursorCatalogModel {
+    option: ModelOption,
+    effort_parameter: Option<String>,
+    default_parameters: Vec<serde_json::Value>,
+}
+
+fn parse_cursor_catalog(value: &serde_json::Value) -> Option<Vec<CursorCatalogModel>> {
+    let models = value.get("models")?.as_array()?;
+    let mut catalog = Vec::new();
+    for model in models {
+        let Some(id) = catalog_text(model.get("value"), MAX_SETTINGS_MODEL_BYTES) else {
+            continue;
+        };
+        // The native interactive picker hides these legacy ACP entries too.
+        if matches!(
+            id.as_str(),
+            "claude-4.5-haiku"
+                | "claude-4.5-haiku-thinking"
+                | "gemini-2.5-pro"
+                | "gemini-2.5-flash"
+        ) || catalog
+            .iter()
+            .any(|model: &CursorCatalogModel| model.option.id == id)
+        {
+            continue;
+        }
+        let Some(parameters) = model
+            .get("configOptions")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let mut effort_parameter = None;
+        let mut effort_options = Vec::new();
+        let mut fast_supported = false;
+        let mut defaults = Vec::new();
+        let mut valid = parameters.len() <= MAX_SETTINGS_EFFORT_OPTIONS;
+        for parameter in parameters {
+            let Some(parameter_id) = catalog_text(parameter.get("id"), MAX_SETTINGS_EFFORT_BYTES)
+            else {
+                valid = false;
+                break;
+            };
+            if defaults
+                .iter()
+                .any(|p: &serde_json::Value| p["id"] == parameter_id)
+            {
+                valid = false;
+                break;
+            }
+            let Some(default) =
+                catalog_text(parameter.get("currentValue"), MAX_SETTINGS_MODEL_BYTES)
+            else {
+                valid = false;
+                break;
+            };
+            if is_cursor_effort_parameter(&parameter_id) {
+                if effort_parameter.is_some() {
+                    valid = false;
+                    break;
+                }
+                effort_parameter = Some(parameter_id.clone());
+                if let Some(options) = parameter
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for option in options {
+                        if let Some(value) = option.get("value").and_then(serde_json::Value::as_str)
+                        {
+                            // These values are verified by Cursor itself; preserve native
+                            // spellings such as "extra-high" rather than inventing aliases.
+                            push_effort(&mut effort_options, value, false);
+                        }
+                    }
+                }
+            }
+            if parameter_id == "fast" {
+                fast_supported = parameter
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|options| options.iter().any(|option| option["value"] == "true"));
+            }
+            defaults.push(serde_json::json!({"id": parameter_id, "value": default}));
+        }
+        if !valid {
+            continue;
+        }
+        catalog.push(CursorCatalogModel {
+            option: ModelOption {
+                label: catalog_text(model.get("name"), MAX_SETTINGS_LABEL_BYTES)
+                    .unwrap_or_else(|| id.clone()),
+                id,
+                effort_options,
+                fast_supported,
+                capabilities_known: true,
+            },
+            effort_parameter,
+            default_parameters: defaults,
+        });
+        if catalog.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+            break;
+        }
+    }
+    (!catalog.is_empty()).then_some(catalog)
 }
 
 fn finalize_catalog(mut entries: Vec<CatalogEntry>, priority_order: bool) -> Vec<ModelOption> {
@@ -1030,7 +1201,14 @@ fn push_effort(options: &mut Vec<String>, value: &str, cursor: bool) {
 }
 
 fn cursor_effort_is_verified(value: &str) -> bool {
-    matches!(value, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "extra-high" | "max" | "ultra"
+    )
+}
+
+fn is_cursor_effort_parameter(id: &str) -> bool {
+    matches!(id, "effort" | "reasoning" | "reasoning_effort")
 }
 
 fn effort_options_from_value(value: &serde_json::Value, cursor: bool) -> Vec<String> {
@@ -1044,6 +1222,14 @@ fn effort_options_from_value(value: &serde_json::Value, cursor: bool) -> Vec<Str
             let Some(object) = item.as_object() else {
                 continue;
             };
+            if cursor
+                && object
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !is_cursor_effort_parameter(id))
+            {
+                continue;
+            }
             if object
                 .get("type")
                 .and_then(serde_json::Value::as_str)
@@ -1186,6 +1372,7 @@ fn catalog_entry(
             label: catalog_label(entry, &id, cursor),
             effort_options: model_effort_options(entry, cursor),
             fast_supported: fast_supported_from_value(entry),
+            capabilities_known: false,
         },
         priority,
         order,
@@ -2464,7 +2651,11 @@ fn parameter_effort(
                 "native model parameters have an unsupported type",
             ));
         };
-        if parameter.get("id").and_then(serde_json::Value::as_str) != Some("effort") {
+        if !parameter
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_cursor_effort_parameter)
+        {
             continue;
         }
         if effort.is_some() {
@@ -2759,6 +2950,7 @@ fn edit_json_root(
 fn edit_cursor(
     bytes: &[u8],
     request: &AgentSettingsSaveRequest,
+    definition: Option<&CursorCatalogModel>,
 ) -> Result<Vec<u8>, AgentSettingsError> {
     let parsed = parse_cursor(bytes)?;
     let mut text = String::from_utf8(bytes.to_vec())
@@ -2773,7 +2965,14 @@ fn edit_cursor(
     let model_changed = old_model.as_deref() != request.model.as_deref();
     let target_parameters = if model_changed {
         cursor_model_parameters_raw(&text, request.model.as_deref().unwrap_or_default())?
-            .unwrap_or_else(|| "[]".to_owned())
+            .unwrap_or_else(|| {
+                definition
+                    .map(|model| {
+                        serde_json::to_string(&model.default_parameters)
+                            .expect("JSON parameters serialize")
+                    })
+                    .unwrap_or_else(|| "[]".to_owned())
+            })
     } else {
         String::new()
     };
@@ -2789,6 +2988,14 @@ fn edit_cursor(
             &["selectedModel", "parameters"],
             Some(&target_parameters),
         )?;
+        text = json_set_path_raw(
+            &text,
+            &[
+                "modelParameters",
+                request.model.as_deref().unwrap_or_default(),
+            ],
+            Some(&target_parameters),
+        )?;
         for field in [
             "displayName",
             "displayNameShort",
@@ -2800,9 +3007,24 @@ fn edit_cursor(
             text = json_set_path(&text, &["selectedModel", field], None)?;
         }
     }
+    let root = parse_unique_json(text.as_bytes())?.0;
+    let selected_id = cursor_effort_parameter_id(&root["selectedModel"]["parameters"])?;
+    let cached_id = cursor_effort_parameter_id(
+        &root["modelParameters"][request.model.as_deref().unwrap_or_default()],
+    )?;
+    if selected_id.is_some() && cached_id.is_some() && selected_id != cached_id {
+        return Err(AgentSettingsError::config(
+            "native effort selection is ambiguous",
+        ));
+    }
+    let effort_id = selected_id
+        .or(cached_id)
+        .or_else(|| definition.and_then(|model| model.effort_parameter.as_deref()))
+        .unwrap_or("effort");
     text = json_set_parameter(
         &text,
         &["selectedModel", "parameters"],
+        effort_id,
         request.effort.as_deref(),
     )?;
     text = json_set_fast_parameter(&text, &["selectedModel", "parameters"], request.fast)?;
@@ -2810,6 +3032,7 @@ fn edit_cursor(
         text = json_set_parameter(
             &text,
             &["modelParameters", model],
+            effort_id,
             request.effort.as_deref(),
         )?;
         text = json_set_fast_parameter(&text, &["modelParameters", model], request.fast)?;
@@ -3120,10 +3343,29 @@ fn json_set_path_raw(
 fn json_set_parameter(
     text: &str,
     path: &[&str],
+    id: &str,
     value: Option<&str>,
 ) -> Result<String, AgentSettingsError> {
     let value = value.map(|value| JsonParameterValue::String(value.to_owned()));
-    json_set_parameter_value(text, path, "effort", value, false)
+    json_set_parameter_value(text, path, id, value, false)
+}
+
+fn cursor_effort_parameter_id(
+    parameters: &serde_json::Value,
+) -> Result<Option<&str>, AgentSettingsError> {
+    let mut ids = parameters
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|parameter| parameter.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| is_cursor_effort_parameter(id));
+    let id = ids.next();
+    if ids.next().is_some() {
+        return Err(AgentSettingsError::config(
+            "native effort selection is ambiguous",
+        ));
+    }
+    Ok(id)
 }
 
 fn json_set_fast_parameter(

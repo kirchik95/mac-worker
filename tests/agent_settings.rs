@@ -17,6 +17,187 @@ fn store(home: &Path) -> NativeAgentSettingsStore {
 }
 
 #[test]
+fn cursor_preserves_each_native_reasoning_parameter_when_reading_saving_and_clearing() {
+    for parameter_id in ["effort", "reasoning", "reasoning_effort"] {
+        let home = tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        let path = home.path().join(".cursor/cli-config.json");
+        let parameters = serde_json::json!([
+            {"id": parameter_id, "value": "medium", "options": ["low", "medium", "high"]},
+            {"id": "context", "value": "1m"},
+            {"id": "fast", "value": "true"}
+        ]);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "model": {"modelId": "test-model"},
+                "selectedModel": {"modelId": "test-model", "parameters": parameters},
+                "modelParameters": {"test-model": parameters},
+                "unrelated": {"retain": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let settings = store(home.path()).read("cursor").unwrap();
+        assert_eq!(settings.effort.as_deref(), Some("medium"), "{parameter_id}");
+        assert!(settings.effort_options.iter().any(|value| value == "high"));
+        let saved = store(home.path())
+            .save(&AgentSettingsSaveRequest {
+                agent: "cursor".into(),
+                model: settings.model.clone(),
+                effort: Some("high".into()),
+                fast: Some(false),
+                revision: settings.revision.unwrap(),
+            })
+            .unwrap();
+        assert_eq!(saved.effort.as_deref(), Some("high"));
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for values in [
+            &updated["selectedModel"]["parameters"],
+            &updated["modelParameters"]["test-model"],
+        ] {
+            assert_eq!(values[0]["id"], parameter_id);
+            assert_eq!(values[0]["value"], "high");
+            assert_eq!(values[1]["value"], "1m");
+            assert_eq!(values[2]["value"], "false");
+            assert_eq!(values.as_array().unwrap().len(), 3);
+        }
+        store(home.path())
+            .save(&AgentSettingsSaveRequest {
+                agent: "cursor".into(),
+                model: saved.model,
+                effort: None,
+                fast: Some(false),
+                revision: saved.revision.unwrap(),
+            })
+            .unwrap();
+        let cleared: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            cleared["selectedModel"]["parameters"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            cleared["modelParameters"]["test-model"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(cleared["unrelated"]["retain"], true);
+    }
+}
+
+#[test]
+fn cursor_rejects_ambiguous_reasoning_aliases_and_ignores_other_parameter_values() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let path = home.path().join(".cursor/cli-config.json");
+    fs::write(&path, r#"{"model":{"modelId":"test-model"},"selectedModel":{"modelId":"test-model","parameters":[{"id":"effort","value":"low"},{"id":"reasoning","value":"high"}]}}"#).unwrap();
+    assert_eq!(
+        store(home.path()).read("cursor").unwrap_err().code(),
+        "SETTINGS_INVALID_CONFIG"
+    );
+    fs::write(&path, r#"{"model":{"modelId":"test-model"},"selectedModel":{"modelId":"test-model","parameters":[{"id":"context","value":"max"},{"id":"reasoning_effort","value":"minimal","options":["minimal","low","medium","high"]}]}}"#).unwrap();
+    let settings = store(home.path()).read("cursor").unwrap();
+    assert_eq!(
+        settings.effort_options,
+        vec!["minimal", "low", "medium", "high"]
+    );
+}
+
+#[test]
+fn cursor_live_catalog_controls_choices_and_saves_unremembered_native_parameters() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let path = home.path().join(".cursor/cli-config.json");
+    fs::write(&path, r#"{"model":{"modelId":"retired-current"},"modelParameters":{"retired-current":[{"id":"effort","value":"high"}],"old-history":[{"id":"effort","value":"low"}]}}"#).unwrap();
+    let catalogue = serde_json::json!({"models":[
+        {"value":"default","name":"Auto","configOptions":[]},
+        {"value":"new-model","name":"New model","configOptions":[
+            {"id":"reasoning","type":"select","currentValue":"medium","options":[{"value":"none"},{"value":"medium"},{"value":"extra-high"}]},
+            {"id":"fast","type":"select","currentValue":"false","options":[{"value":"false"},{"value":"true"}]},
+            {"id":"context","type":"select","currentValue":"272k","options":[{"value":"272k"},{"value":"1m"}]}
+        ]}
+    ]});
+    let native = store(home.path()).with_cursor_catalog(Some(catalogue));
+    let settings = native.read("cursor").unwrap();
+    assert_eq!(settings.model_catalog_source.as_deref(), Some("live"));
+    assert_eq!(
+        settings
+            .model_options
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "new-model", "retired-current"]
+    );
+    assert!(settings.model_options[0].capabilities_known);
+    assert!(!settings.model_options[2].capabilities_known);
+    assert_eq!(
+        settings.model_options[1].effort_options,
+        vec!["none", "medium", "extra-high"]
+    );
+    let saved = native
+        .save(&AgentSettingsSaveRequest {
+            agent: "cursor".into(),
+            model: Some("new-model".into()),
+            effort: Some("extra-high".into()),
+            fast: Some(true),
+            revision: settings.revision.unwrap(),
+        })
+        .unwrap();
+    assert_eq!(saved.effort.as_deref(), Some("extra-high"));
+    assert_eq!(saved.fast, Some(true));
+    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        updated["selectedModel"]["parameters"],
+        serde_json::json!([
+            {"id":"reasoning","value":"extra-high"}, {"id":"fast","value":"true"}, {"id":"context","value":"272k"}
+        ])
+    );
+    assert_eq!(
+        updated["modelParameters"]["new-model"],
+        updated["selectedModel"]["parameters"]
+    );
+    let error = native
+        .save(&AgentSettingsSaveRequest {
+            agent: "cursor".into(),
+            model: Some("new-model".into()),
+            effort: Some("max".into()),
+            fast: Some(true),
+            revision: saved.revision.unwrap(),
+        })
+        .unwrap_err();
+    assert_eq!(error.code(), "SETTINGS_INVALID");
+}
+
+#[test]
+fn cursor_unavailable_catalog_keeps_native_selection_without_claiming_full_capabilities() {
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    fs::write(home.path().join(".cursor/cli-config.json"), r#"{"model":{"modelId":"remembered"},"modelParameters":{"remembered":[{"id":"reasoning_effort","value":"high"}]}}"#).unwrap();
+    for result in [
+        None,
+        Some(serde_json::json!({"models":[]})),
+        Some(
+            serde_json::json!({"models":[{"value":"bad\nmodel","name":"bad","configOptions":[]}]}),
+        ),
+    ] {
+        let settings = store(home.path())
+            .with_cursor_catalog(result)
+            .read("cursor")
+            .unwrap();
+        assert_eq!(settings.model_catalog_source.as_deref(), Some("remembered"));
+        assert_eq!(settings.model.as_deref(), Some("remembered"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.model_options.len(), 1);
+        assert!(!settings.model_options[0].capabilities_known);
+    }
+}
+
+#[test]
 fn reads_and_updates_codex_without_reformatting_unrelated_toml() {
     let home = tempdir().unwrap();
     fs::create_dir_all(home.path().join(".codex")).unwrap();
@@ -936,6 +1117,7 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         fast: None,
         fast_supported: false,
         source: "native-claude".into(),
+        model_catalog_source: None,
         revision: Some("b".repeat(64)),
         writable: true,
         message: None,
@@ -1010,12 +1192,14 @@ fn codex_catalog_exposes_luna_max_and_fast_capability_with_bounded_visible_order
                 label: "GPT-6-Astra".into(),
                 effort_options: vec!["max".into()],
                 fast_supported: false,
+                capabilities_known: false,
             },
             ModelOption {
                 id: "gpt-5.6-luna".into(),
                 label: "GPT-5.6-Luna".into(),
                 effort_options: vec!["low".into(), "max".into()],
                 fast_supported: true,
+                capabilities_known: false,
             },
         ]
     );

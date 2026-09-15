@@ -71,6 +71,7 @@
   --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
   --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
   --motion-fast: 120ms;
+  --motion-hover: 120ms;
   --motion-surface: 180ms;
   --motion-disclosure: 200ms;
   --motion-drawer: 240ms;
@@ -81,6 +82,9 @@
   --motion-surface: 0ms;
   --motion-disclosure: 0ms;
   --motion-drawer: 0ms;
+}
+:root[data-input-modality='keyboard'] .mw-action-spinner {
+  animation: none !important;
 }
 @layer base {
   * {
@@ -513,12 +517,29 @@
     min-width: 0;
     flex: 1;
   }
+  .mw-worker-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
   .mw-worker-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
     font-size: 20px;
     line-height: 24px;
     font-weight: 600;
-    margin: 0 0 16px;
+    margin: 0;
     letter-spacing: -0.015em;
+  }
+  .mw-worker-settings {
+    margin: -7px -7px -7px 0;
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .mw-worker-settings:enabled:hover {
+      background: #f2f4f7;
+    }
   }
   .mw-worker-state {
     font-size: 13px;
@@ -776,7 +797,8 @@
     overflow: visible;
   }
   .mw-mac-body {
-    transition: transform var(--motion-fast) var(--ease-out);
+    /* Hover is a pointer interaction even after keyboard use or before the first click. */
+    transition: transform var(--motion-hover) var(--ease-out);
   }
   @media (hover: hover) and (pointer: fine) {
     .mw-worker-card:hover .mw-mac-body {
@@ -1089,5 +1111,57 @@
     .mw-worker-card:hover .mw-mac-body {
       transform: none;
     }
+  }
+}
+
+@layer components {
+  .mw-action-feedback { display: inline-grid; }
+  .mw-action-status { display: flex; align-items: center; gap: 8px; color: #027a48; font-size: 13px; }
+  .mw-result-panel { display: flex; flex-direction: column; gap: 20px; }
+  .mw-result-panel > section + section { border-top: 1px solid var(--border); padding-top: 20px; }
+  .mw-followup-composer { padding: 20px 24px; }
+  .mw-reply-inline { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: end; }
+  .mw-reply-inline textarea { min-height: 66px; }
+  .mw-reply-submit { grid-column: 2; grid-row: 1; }
+  .mw-reply-note { grid-column: 1 / -1; grid-row: 2; }
+  .mw-table-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 22px; background: var(--background); }
+  .mw-task-table { container-type: inline-size; }
+  .mw-task-table th { padding: 10px 20px; white-space: nowrap; }
+  .mw-task-table td { padding: 10px 20px; height: 64px; }
+  .mw-task-table[data-compact='true'] td { padding-block: 8px; height: 56px; }
+  .mw-task-table .mw-table-empty { padding: 0; }
+  .mw-task-table .mw-table-empty .mw-empty {
+    min-height: 340px;
+    position: sticky;
+    left: 0;
+    width: 100cqw;
+  }
+  .mw-table-empty .mw-button { width: auto !important; }
+  .mw-tasks-page { gap: 16px; }
+  .mw-tasks-page > .mw-page-heading { margin-bottom: 4px; }
+  .mw-runs-table td { padding: 24px 20px; height: 113px; }
+  .mw-runs-table .mw-task-title { font-size: 16px; }
+  @media (max-width: 720px) {
+    .mw-reply-inline { grid-template-columns: minmax(0, 1fr); }
+    .mw-reply-submit { grid-column: 1; grid-row: 2; justify-self: end; }
+    .mw-reply-note { grid-row: 3; }
+    .mw-table-heading { align-items: start; flex-direction: column; gap: 4px; }
+  }
+  .mw-action-feedback > span {
+    grid-area: 1 / 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--ease-out);
+  }
+  .mw-action-feedback > [data-visible='true'] { opacity: 1; }
+  .mw-action-feedback[data-state='pending'] .mw-action-spinner {
+    animation: mw-pending 900ms linear infinite;
+  }
+  @keyframes mw-pending { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .mw-action-spinner { animation: none !important; }
   }
 }

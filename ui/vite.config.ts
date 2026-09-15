@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vitest/config'
 
+import { dashboardProxyOrigin } from './devProxy.ts'
+
 // The dashboard API is the Rust loopback server started by `worker dashboard`.
 // Proxying keeps the browser same-origin, which matters because that server
 // sends no CORS headers and validates the request Host against its listener.
@@ -35,7 +37,23 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': { target: DASHBOARD_ORIGIN, changeOrigin: true },
+      '/api': {
+        target: DASHBOARD_ORIGIN,
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (outgoing, incoming) => {
+            const origin = dashboardProxyOrigin(
+              incoming.headers.origin,
+              incoming.headers.host,
+              DASHBOARD_ORIGIN,
+              'encrypted' in incoming.socket && incoming.socket.encrypted === true,
+            )
+            if (origin !== undefined && origin !== incoming.headers.origin) {
+              outgoing.setHeader('origin', origin)
+            }
+          })
+        },
+      },
     },
   },
 })

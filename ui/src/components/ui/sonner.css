@@ -1,0 +1,42 @@
+/* Sonner owns positioning; use the dashboard's restrained surface motion. */
+[data-sonner-toaster].mw-toaster {
+  font-family: var(--font-sans);
+  transition: none;
+}
+.mw-toaster [data-sonner-toast][data-styled='true'] {
+  transition:
+    transform 180ms var(--ease-out),
+    opacity 180ms var(--ease-out);
+  gap: 10px;
+  box-shadow: 0 4px 16px #1018280f;
+}
+.mw-toaster [data-sonner-toast]:not([data-mounted='true']) {
+  --y: translateY(8px);
+}
+.mw-toaster [data-sonner-toast][data-removed='true'] {
+  transform: translateY(8px);
+  transition-duration: 120ms;
+}
+.mw-toaster [data-sonner-toast] > * {
+  transition: none;
+}
+.mw-toaster [data-sonner-toast][data-styled='true'] [data-description] {
+  color: var(--muted-foreground);
+  line-height: 1.5;
+}
+.mw-toaster [data-sonner-toast][data-styled='true'] [data-button] {
+  height: 32px;
+  border-radius: 6px;
+  background: var(--primary);
+  color: white;
+  font: inherit;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mw-toaster [data-sonner-toast] {
+    transform: none !important;
+    transition: opacity 180ms var(--ease-out) !important;
+  }
+}

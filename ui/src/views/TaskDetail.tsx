@@ -10,6 +10,7 @@ import { Check, ChevronRight, History, Monitor, Reply, Terminal } from 'lucide-r
 import { AgentMark } from '@/components/AgentMark'
 import { TaskBadge } from '@/components/TaskBadge'
 import { Button } from '@/components/ui/button'
+import { ActionFeedback, type ActionState } from '@/components/ActionFeedback'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   acceptTask,
@@ -79,9 +80,7 @@ function Turn({
       onOpenChange={onToggle}
       className="overflow-hidden border-b last:border-b-0 bg-card"
     >
-      <CollapsibleTrigger
-        className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 px-5 py-3.5 text-left"
-      >
+      <CollapsibleTrigger className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 px-5 py-3.5 text-left">
         <span className="w-6 shrink-0 font-mono text-[15px]">
           {String(turn.turn_number).padStart(2, '0')}
         </span>
@@ -141,6 +140,11 @@ export function TaskDetail({
   const replyInput = useRef<HTMLTextAreaElement>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [action, setAction] = useState<{
+    kind: 'reply' | 'accept'
+    state: ActionState
+    message?: string
+  } | null>(null)
   const mutationGeneration = useRef(0)
   const mutationController = useRef<AbortController | null>(null)
   const mutationInFlight = useRef(false)
@@ -163,6 +167,7 @@ export function TaskDetail({
     setActionError(null)
     setDraft('')
     setBusy(false)
+    setAction(null)
     setOpenTurn(null)
 
     const schedule = () => {
@@ -226,6 +231,7 @@ export function TaskDetail({
     pollController.current?.abort()
     pollController.current = null
     setBusy(true)
+    setAction({ kind, state: 'pending' })
     setActionError(null)
     try {
       const next =
@@ -235,10 +241,21 @@ export function TaskDetail({
       if (mutationGeneration.current !== generation || controller.signal.aborted) return
       detailEpoch.current += 1
       setDetail(next)
+      setAction({
+        kind,
+        state: 'success',
+        message:
+          kind === 'reply'
+            ? 'Reply sent. A new turn has been requested.'
+            : next.review_state === 'closed'
+              ? 'Task accepted. You choose when to merge the branch.'
+              : 'Accept requested.',
+      })
       if (kind === 'reply') setDraft('')
     } catch (cause) {
       if (controller.signal.aborted || mutationGeneration.current !== generation) return
       setActionError(cause instanceof ApiError ? cause.message : String(cause))
+      setAction({ kind, state: 'error' })
     } finally {
       if (mutationGeneration.current === generation && mutationController.current === controller) {
         mutationInFlight.current = false
@@ -257,6 +274,7 @@ export function TaskDetail({
   const waiting = detail.review_state === 'waiting_on_you'
   const reviewable = detail.review_state === 'ready_for_review'
   const closing = detail.review_state === 'close_pending'
+  const acceptState = action?.kind === 'accept' ? action.state : 'idle'
   const replyable = waiting || reviewable || detail.review_state === 'ready_for_follow_up'
   const activeTurn =
     task.state === 'active'
@@ -265,37 +283,53 @@ export function TaskDetail({
       : null
   const history = activeTurn ? turns.filter((turn) => turn.turn_id !== activeTurn.turn_id) : turns
   const replyForm = (
-    <div className="space-y-3">
-      <label
-        htmlFor="task-reply"
-        className={waiting ? 'text-[13px] text-warning' : 'text-[13px] text-muted-foreground'}
-      >
-        {waiting ? 'Your reply' : 'Follow-up'}
-      </label>
-      <textarea
-        ref={replyInput}
-        id="task-reply"
-        aria-label="Follow-up"
-        placeholder={
-          waiting ? 'Write your answer…' : 'Describe what you’d like the agent to change…'
-        }
-        value={draft}
-        disabled={busy}
-        onChange={(event) => setDraft(event.target.value)}
-        rows={4}
-        className="mw-textarea block"
-      />
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className={'text-[13px] ' + (waiting ? 'text-warning' : 'text-muted-foreground')}>
+    <div className={waiting ? 'space-y-3' : 'mw-reply-inline'}>
+      <div className="min-w-0">
+        <label
+          htmlFor="task-reply"
+          className={waiting ? 'mb-2 block text-[13px] text-warning' : 'sr-only'}
+        >
+          {waiting ? 'Your reply' : 'Follow-up'}
+        </label>
+        <textarea
+          ref={replyInput}
+          id="task-reply"
+          aria-label="Follow-up"
+          placeholder={
+            waiting ? 'Write your answer…' : 'Describe what you’d like the agent to change…'
+          }
+          value={draft}
+          disabled={busy}
+          onChange={(event) => {
+            setDraft(event.target.value)
+            setAction(null)
+          }}
+          rows={waiting ? 4 : 2}
+          className="mw-textarea block"
+        />
+      </div>
+      <div className={waiting ? 'flex flex-wrap items-center justify-between gap-3' : 'contents'}>
+        <p
+          className={
+            'text-[13px] ' + (waiting ? 'text-warning' : 'mw-reply-note text-muted-foreground')
+          }
+        >
           Starts a new turn for this task.
         </p>
         <Button
+          className={waiting ? undefined : 'mw-reply-submit'}
           disabled={busy || !draft.trim()}
           aria-busy={busy}
           onClick={() => void runMutation('reply', draft)}
         >
-          <Reply size={16} aria-hidden="true" />
-          Send reply
+          <ActionFeedback
+            state={action?.kind === 'reply' ? action.state : 'idle'}
+            idleLabel="Send reply"
+            pendingLabel="Sending…"
+            successLabel="Reply sent"
+            errorLabel="Try again"
+            idleIcon={<Reply size={16} />}
+          />
         </Button>
       </div>
     </div>
@@ -336,9 +370,16 @@ export function TaskDetail({
             {reviewable ? (
               <Button
                 variant="outline"
-                onClick={() => {
-                  replyInput.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-                  replyInput.current?.focus()
+                onClick={(event) => {
+                  const instant =
+                    event.detail === 0 ||
+                    document.documentElement.dataset.inputModality === 'keyboard' ||
+                    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+                  replyInput.current?.scrollIntoView({
+                    block: 'center',
+                    behavior: instant ? 'instant' : 'smooth',
+                  })
+                  replyInput.current?.focus({ preventScroll: true })
                 }}
               >
                 <Reply size={16} aria-hidden="true" />
@@ -346,8 +387,13 @@ export function TaskDetail({
               </Button>
             ) : null}
             <Button disabled={busy} aria-busy={busy} onClick={() => void runMutation('accept')}>
-              <Check size={16} aria-hidden="true" />
-              {closing ? 'Retry accept' : 'Accept task'}
+              <ActionFeedback
+                state={closing && acceptState === 'success' ? 'idle' : acceptState}
+                idleLabel={closing ? 'Retry accept' : 'Accept task'}
+                pendingLabel="Accepting…"
+                successLabel="Accepted"
+                errorLabel="Retry accept"
+              />
             </Button>
           </div>
         ) : null}
@@ -355,6 +401,12 @@ export function TaskDetail({
       {actionError ? (
         <p role="alert" className="mw-banner" data-tone="error">
           {actionError}
+        </p>
+      ) : null}
+      {action?.state === 'success' ? (
+        <p role="status" className="mw-action-status">
+          <Check size={16} aria-hidden="true" />
+          {action.message}
         </p>
       ) : null}
       {closing ? (
@@ -426,8 +478,8 @@ export function TaskDetail({
               />
             </section>
           ) : (
-            <>
-              <section className="mw-panel mw-panel-pad">
+            <div className={waiting ? 'contents' : 'mw-panel mw-panel-pad mw-result-panel'}>
+              <section className={waiting ? 'mw-panel mw-panel-pad' : undefined}>
                 <h2 className="mb-4 text-base font-semibold">
                   {waiting ? 'Agent context' : 'Result'}
                 </h2>
@@ -529,7 +581,9 @@ export function TaskDetail({
                                   </p>
                                 ) : null}
                                 {check.detail ? (
-                                  <p className="mt-1 text-xs text-muted-foreground">{check.detail}</p>
+                                  <p className="mt-1 text-xs text-muted-foreground">
+                                    {check.detail}
+                                  </p>
                                 ) : null}
                               </li>
                             ))}
@@ -569,8 +623,8 @@ export function TaskDetail({
                 </Collapsible>
               ) : null}
               {!waiting ? (
-                <section className="mw-panel overflow-hidden">
-                  <div className="flex flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
+                <section>
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                     <h2 className="font-semibold">
                       Changed files{' '}
                       <span className="ml-2 text-xs font-normal text-muted-foreground">
@@ -582,9 +636,9 @@ export function TaskDetail({
                     ) : null}
                   </div>
                   {detail.files_changed.length ? (
-                    <ul className="divide-y">
+                    <ul className="space-y-2">
                       {detail.files_changed.map((file) => (
-                        <li key={file} className="flex items-start gap-3 px-6 py-3">
+                        <li key={file} className="flex items-start gap-3">
                           <Icon
                             name={fileIcon(file)}
                             className="mt-0.5 shrink-0 text-muted-foreground"
@@ -594,15 +648,15 @@ export function TaskDetail({
                       ))}
                     </ul>
                   ) : (
-                    <p className="px-6 py-4 text-xs text-muted-foreground">No file changed.</p>
+                    <p className="text-xs text-muted-foreground">No file changed.</p>
                   )}
                 </section>
               ) : null}
               {!waiting ? (
-                <section className="mw-panel mw-panel-pad">
+                <section>
                   <h2 className="mb-4 flex items-center gap-2 font-semibold">
                     <Terminal size={16} aria-hidden="true" />
-                    Take it locally
+                    Review locally
                   </h2>
                   <CommandList
                     commands={
@@ -615,13 +669,7 @@ export function TaskDetail({
                   />
                 </section>
               ) : null}
-              {replyable && !waiting ? (
-                <section className="mw-panel mw-panel-pad">
-                  <h2 className="mb-4 font-semibold">Ask for a change</h2>
-                  {replyForm}
-                </section>
-              ) : null}
-            </>
+            </div>
           )}
         </div>
         <aside className="mw-panel mw-panel-pad self-start">
@@ -660,12 +708,18 @@ export function TaskDetail({
               : task.state === 'active'
                 ? 'The current turn is still running. Its final result appears when the turn ends.'
                 : reviewable
-                  ? 'Review the result locally, then accept the task or send a follow-up.'
+                  ? 'Accepting closes the task. You choose when to merge the branch.'
                   : humanize(detail.review_state)}
             {detail.session_present ? ' The agent session is on the worker.' : ''}
           </p>
         </aside>
       </div>
+      {replyable && !waiting && !activeTurn ? (
+        <section className="mw-panel mw-followup-composer">
+          <h2 className="mb-3 font-semibold">Ask for a change</h2>
+          {replyForm}
+        </section>
+      ) : null}
       <section className="mw-panel overflow-hidden">
         <div className="flex items-center justify-between gap-3 border-b px-6 py-4">
           <h2 className="font-semibold">{activeTurn ? 'Previous turns' : 'Turn history'}</h2>

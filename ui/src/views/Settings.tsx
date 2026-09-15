@@ -11,11 +11,15 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { AlertTriangle, Check, ChevronRight } from 'lucide-react'
+import { AlertTriangle, ChevronRight } from 'lucide-react'
+import { ActionFeedback } from '@/components/ActionFeedback'
 import { AgentMark } from '@/components/AgentMark'
+import { WorkerIcon } from '@/components/WorkerIcon'
 import { CommandList } from '@/components/CommandList'
+import { ModelPicker } from '@/components/ModelPicker'
 import { agentBinary, agentLabel, agentVersion, connection } from '@/lib/agents'
 import { humanize } from '@/lib/format'
+import { modelOptionsFor } from '@/lib/modelOptions'
 import {
   fetchAgentSettings,
   saveAgentSettings,
@@ -31,6 +35,8 @@ interface Draft {
   effort: string | null
   fast: boolean | null
 }
+type DraftEntry = { values: Draft; revision: AgentSetting['revision'] }
+type DraftUpdate = Draft | ((current: Draft) => Draft) | null
 
 const draftOf = (setting: AgentSetting): Draft => ({
   model: setting.model,
@@ -64,6 +70,8 @@ function Detail({
   envProfile,
   connectionLabel,
   onSaved,
+  draftEntry,
+  onDraftChange,
 }: {
   worker: string
   setting: AgentSetting
@@ -72,9 +80,10 @@ function Detail({
   envProfile: string | null
   connectionLabel: string
   onSaved: (setting: AgentSetting) => void
+  draftEntry?: DraftEntry
+  onDraftChange: (update: DraftUpdate) => void
 }) {
   const identity = `${worker}\0${setting.agent}`
-  const [draft, setDraft] = useState<Draft>(() => draftOf(setting))
   const [activity, setActivity] = useState<{
     identity: string
     busy: boolean
@@ -86,7 +95,11 @@ function Detail({
     setActivity({ identity, busy: false, message: null })
   }
   const saved = useMemo(() => draftOf(setting), [setting])
-  useEffect(() => setDraft(draftOf(setting)), [setting.agent, setting.revision, setting])
+  const draft = draftEntry?.values ?? saved
+  const setDraft = (update: Exclude<DraftUpdate, null>) => {
+    onDraftChange(update)
+    setActivity({ identity, busy: false, message: null })
+  }
   useEffect(
     () => () => {
       saveGeneration.current += 1
@@ -97,9 +110,13 @@ function Detail({
   const message = activity.identity === identity ? activity.message : null
   const dirty = !sameDraft(draft, saved)
 
-  const selectedModel = setting.model_options.find((option) => option.id === draft.model) ?? null
-  const effortOptions = selectedModel?.effort_options ?? setting.effort_options
-  const fastSupported = selectedModel?.fast_supported ?? setting.fast_supported
+  const modelOptions = useMemo(() => modelOptionsFor(setting), [setting])
+  const selectedModel = modelOptions.find((option) => option.id === draft.model) ?? null
+  const cursor = setting.agent === 'cursor'
+  const capabilitiesKnown = !cursor || selectedModel?.capabilities_known === true
+  const effortOptions = selectedModel?.effort_options ?? (cursor ? [] : setting.effort_options)
+  const fastSupported = (selectedModel?.fast_supported ?? (cursor ? false : setting.fast_supported))
+    || (draft.model === setting.model && setting.fast === true)
 
   const save = useCallback(async () => {
     const generation = ++saveGeneration.current
@@ -110,10 +127,11 @@ function Detail({
         model: draft.model,
         effort: draft.effort,
         fast: fastSupported ? draft.fast : null,
-        revision: setting.revision,
+        revision: draftEntry ? draftEntry.revision : setting.revision,
       })
       if (generation !== saveGeneration.current) return
       onSaved(next)
+      onDraftChange(null)
       setActivity({ identity, busy: true, message: 'Saved.' })
     } catch (error) {
       if (generation !== saveGeneration.current) return
@@ -130,7 +148,17 @@ function Detail({
         )
       }
     }
-  }, [identity, worker, setting.agent, setting.revision, draft, fastSupported, onSaved])
+  }, [
+    identity,
+    worker,
+    setting.agent,
+    setting.revision,
+    draftEntry,
+    draft,
+    fastSupported,
+    onSaved,
+    onDraftChange,
+  ])
 
   return (
     <section className="mw-settings-editor">
@@ -188,41 +216,29 @@ function Detail({
             <h3 className="font-semibold">Default settings</h3>
             <div className="space-y-1.5">
               <Label className="text-[13px] text-muted-foreground">Model</Label>
-              <Select
-                value={draft.model ?? DEFAULT}
-                onValueChange={(next) => {
-                  const model = next === DEFAULT || next == null ? null : next
-                  const options =
-                    setting.model_options.find((option) => option.id === model)?.effort_options ??
-                    []
+              <ModelPicker
+                options={modelOptions}
+                value={draft.model}
+                onValueChange={(model) => {
+                  const target = modelOptions.find((option) => option.id === model)
+                  const options = target?.effort_options ?? []
                   setDraft((current) => ({
                     model,
                     effort:
                       current.effort && options.includes(current.effort) ? current.effort : null,
-                    fast: current.fast,
+                    fast: target?.fast_supported || (model === setting.model && setting.fast === true)
+                      ? current.fast : null,
                   }))
                 }}
-                disabled={!setting.writable}
-              >
-                <SelectTrigger aria-label="Model" className="w-full">
-                  <SelectValue>
-                    {(value) =>
-                      value === DEFAULT
-                        ? 'Agent default'
-                        : (setting.model_options.find((option) => option.id === value)?.label ??
-                          String(value))
-                    }
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={DEFAULT}>Agent default</SelectItem>
-                  {setting.model_options.map((option) => (
-                    <SelectItem key={option.id} value={option.id}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                disabled={busy || !setting.writable}
+              />
+              {cursor ? (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  {setting.model_catalog_source === 'live'
+                    ? `Models available to Cursor on ${worker}.`
+                    : `Showing models remembered on ${worker}. The full catalogue is unavailable.`}
+                </p>
+              ) : null}
             </div>
 
             <div className="space-y-1.5">
@@ -235,7 +251,7 @@ function Detail({
                     effort: next === DEFAULT || next == null ? null : next,
                   }))
                 }
-                disabled={!setting.writable || effortOptions.length === 0}
+                disabled={busy || !setting.writable || effortOptions.length === 0}
               >
                 <SelectTrigger aria-label="Reasoning effort" className="w-full">
                   <SelectValue>
@@ -253,7 +269,9 @@ function Detail({
               </Select>
               {effortOptions.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  {setting.agent} publishes no global effort setting.
+                  {cursor
+                    ? (capabilitiesKnown ? 'This model has no reasoning control.' : 'Reasoning options are unavailable on this Mac.')
+                    : 'This agent does not expose a reasoning default.'}
                 </p>
               ) : null}
             </div>
@@ -261,7 +279,9 @@ function Detail({
               <div>
                 <Label htmlFor={`fast-${worker}-${setting.agent}`}>Fast mode</Label>
                 <p className="mw-help mt-1">
-                  {fastSupported ? 'Use the agent’s fast setting.' : 'Not supported by this model.'}
+                  {fastSupported ? 'Use the agent’s fast setting.'
+                    : capabilitiesKnown ? 'Not supported by this model.'
+                      : 'Fast support hasn’t been reported by this Mac.'}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -271,7 +291,7 @@ function Detail({
                   onCheckedChange={(checked) =>
                     setDraft((current) => ({ ...current, fast: checked }))
                   }
-                  disabled={!setting.writable || !fastSupported}
+                  disabled={busy || !setting.writable || !fastSupported}
                 />
                 <span className="text-xs text-muted-foreground">{draft.fast ? 'On' : 'Off'}</span>
               </div>
@@ -318,15 +338,26 @@ function Detail({
             variant="outline"
             disabled={!dirty || busy}
             onClick={() => {
-              setDraft(saved)
+              onDraftChange(null)
               setActivity({ identity, busy: false, message: null })
             }}
           >
             Cancel
           </Button>
-          <Button disabled={!dirty || busy || !setting.writable} onClick={() => void save()}>
-            <Check size={16} aria-hidden="true" />
-            {busy ? 'Saving…' : 'Save defaults'}
+          <Button
+            aria-busy={busy}
+            disabled={!dirty || busy || !setting.writable}
+            onClick={() => void save()}
+          >
+            <ActionFeedback
+              state={
+                busy ? 'pending' : message === 'Saved.' ? 'success' : message ? 'error' : 'idle'
+              }
+              idleLabel="Save defaults"
+              pendingLabel="Saving…"
+              successLabel="Saved"
+              errorLabel="Try again"
+            />
           </Button>
         </div>
       ) : (
@@ -386,6 +417,7 @@ export function Settings({
   const [settings, setSettings] = useState<AgentSettings | null>(null)
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [drafts, setDrafts] = useState<Record<string, DraftEntry>>({})
 
   const contextWorker = workers.some((entry) => entry.name === initialWorker)
     ? initialWorker
@@ -470,12 +502,24 @@ export function Settings({
             Worker
           </Label>
           <Select value={workerName ?? ''} onValueChange={(next) => setWorkerName(next ?? null)}>
-            <SelectTrigger id="settings-worker" className="w-38">
-              <SelectValue>{(value) => String(value)}</SelectValue>
+            <SelectTrigger id="settings-worker" className="w-52 max-w-full">
+              <SelectValue className="min-w-0">
+                {(value) => (
+                  <span className="flex min-w-0 items-center gap-2.5">
+                    <WorkerIcon className="size-5! text-muted-foreground" />
+                    <span className="truncate">{String(value)}</span>
+                  </span>
+                )}
+              </SelectValue>
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent align="end" alignItemWithTrigger={false} className="p-1">
               {workers.map((entry) => (
-                <SelectItem key={entry.name} value={entry.name}>
+                <SelectItem
+                  key={entry.name}
+                  value={entry.name}
+                  className="min-h-10 py-2 pl-2.5 text-[13px]"
+                >
+                  <WorkerIcon className="size-5! text-muted-foreground" />
                   {entry.name}
                 </SelectItem>
               ))}
@@ -522,6 +566,23 @@ export function Settings({
             envProfile={envProfile ?? null}
             connectionLabel={connection(worker, setting.agent).label}
             onSaved={mergeSaved}
+            draftEntry={drafts[`${workerName}\0${setting.agent}`]}
+            onDraftChange={(update) => {
+              const key = `${workerName}\0${setting.agent}`
+              setDrafts((current) => {
+                const next = { ...current }
+                if (update === null) delete next[key]
+                else
+                  next[key] = {
+                    values:
+                      typeof update === 'function'
+                        ? update(current[key]?.values ?? draftOf(setting))
+                        : update,
+                    revision: current[key] ? current[key].revision : setting.revision,
+                  }
+                return next
+              })
+            }}
           />
         ) : (
           <div className="mw-settings-editor">
