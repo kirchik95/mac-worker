@@ -7,18 +7,20 @@ import { MacIllustration } from '@/components/MacIllustration'
 import { HerdrChip } from '@/components/HerdrChip'
 import { WorkerObservation } from '@/components/WorkerObservation'
 import { bytes, humanize, relativeTime, shortId } from '@/lib/format'
-import { agentLabel } from '@/lib/agents'
+import { agentLabel, cursorProfile, reportedAgentAuth } from '@/lib/agents'
 import { activeJobIds, describeError, slotBusy, type AgentFact, type Worker } from '@/lib/api'
 import './worker-card.css'
 
 function WorkerAgent({
   agent,
+  profile,
   workerName,
   factsCurrent,
   activity,
   onSetup,
 }: {
   agent: AgentFact
+  profile: string | null
   workerName: string
   factsCurrent: boolean
   activity: string
@@ -56,6 +58,7 @@ function WorkerAgent({
       <TooltipContent id={triggerId + '-description'} role="tooltip" className="mw-worker-tooltip">
         <strong>{agentLabel(agent.name)}</strong>{' '}
         <span>{login}</span>{' '}
+        {profile ? <><span>Profile: {profile}</span>{' '}</> : null}
         <span>{activity}</span>
       </TooltipContent>
     </Tooltip>
@@ -64,11 +67,13 @@ function WorkerAgent({
 
 export function WorkerCard({
   worker,
+  envProfile,
   now,
   onSetup,
   onSelectTask,
 }: {
   worker: Worker
+  envProfile?: string | null
   now: number
   onSetup?: (worker?: string, agent?: string) => void
   onSelectTask?: (id: string) => void
@@ -82,7 +87,11 @@ export function WorkerCard({
   const jobs = activeJobIds(worker.slot)
   const facts = worker.agent_facts
   const factsCurrent = known && facts?.freshness === 'current'
-  const agents = [...(facts?.agents ?? [])].sort(
+  const cursorEnvProfile = cursorProfile(worker, envProfile)
+  const agents = (facts?.agents ?? []).map((agent) => {
+    const profile = agent.name === 'cursor' ? cursorEnvProfile : null
+    return { ...agent, auth: reportedAgentAuth(agent, profile), profile }
+  }).sort(
     (left, right) => Number(left.auth === 'unknown') - Number(right.auth === 'unknown'),
   )
   const signIn = agents.filter((agent) => agent.auth === 'unauthenticated')
@@ -174,6 +183,7 @@ export function WorkerCard({
                         <WorkerAgent
                           key={agent.name}
                           agent={agent}
+                          profile={agent.profile}
                           workerName={worker.name}
                           factsCurrent={factsCurrent}
                           activity={activity}

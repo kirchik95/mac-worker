@@ -53,6 +53,64 @@ afterEach(() => {
 })
 
 describe('worker agent logos', () => {
+  it.each(['unknown', 'unauthenticated'] as const)('uses the reported Cursor profile when the base status is %s', async (auth) => {
+    const user = userEvent.setup()
+    render(<WorkerCard worker={worker({ name: 'mini-2', agent_facts: {
+      ...reportedAgents,
+      agents: [
+        { name: 'claude', version: null, auth: 'unknown', auth_by_profile: [] },
+        { name: 'cursor', version: null, auth,
+          auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] },
+      ],
+    } })} now={3_000} onSetup={vi.fn()} />)
+    const icons = screen.getAllByRole('button', { name: /^(Claude Code|Cursor) settings for mini-2$/ })
+    expect(icons[0]).toHaveAccessibleName('Cursor settings for mini-2')
+    expect(icons[0]).toHaveAttribute('data-tone', 'default')
+    expect(screen.queryByText('Cursor needs sign-in on Mac')).not.toBeInTheDocument()
+    for (let i = 0; i < 6 && document.activeElement !== icons[0]; i++) await user.tab()
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent('Signed in')
+    expect(tooltip).toHaveTextContent('Profile: agents')
+    expect(tooltip).not.toHaveTextContent('Sign-in status unknown')
+  })
+
+  it.each([
+    { auth: 'unauthenticated' as const, tone: 'sign-in-needed', label: 'Sign-in needed' },
+    { auth: 'unknown' as const, tone: 'unknown', label: 'Sign-in status unknown' },
+    { auth: null, tone: 'unknown', label: 'Sign-in status unknown' },
+  ])('uses only the selected project profile for Cursor ($auth)', async ({ auth, tone, label }) => {
+    const user = userEvent.setup()
+    render(<WorkerCard worker={worker({ agent_facts: {
+      ...reportedAgents,
+      agents: [{ name: 'cursor', version: null, auth: 'authenticated', auth_by_profile: [
+        { profile: 'agents', auth: 'authenticated' },
+        ...(auth ? [{ profile: 'project', auth }] : []),
+      ] }],
+    } })} envProfile="project" now={3_000} onSetup={vi.fn()} />)
+    const icon = screen.getByRole('button', { name: 'Cursor settings for mini-1' })
+    expect(icon).toHaveAttribute('data-tone', tone)
+    for (let i = 0; i < 6 && document.activeElement !== icon; i++) await user.tab()
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent(label)
+    expect(tooltip).toHaveTextContent('Profile: project')
+    expect(tooltip).not.toHaveTextContent('Signed in')
+  })
+
+  it('does not claim a current sign-in from stale profile facts', async () => {
+    const user = userEvent.setup()
+    render(<WorkerCard worker={worker({ agent_facts: {
+      ...reportedAgents,
+      freshness: 'stale',
+      agents: [{ name: 'cursor', version: null, auth: 'unknown',
+        auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] }],
+    } })} now={3_000} onSetup={vi.fn()} />)
+    const icon = screen.getByRole('button', { name: 'Cursor settings for mini-1' })
+    for (let i = 0; i < 6 && document.activeElement !== icon; i++) await user.tab()
+    const tooltip = await screen.findByRole('tooltip')
+    expect(tooltip).toHaveTextContent('Sign-in unverified · last reported signed in')
+    expect(tooltip).toHaveTextContent('Profile: agents')
+  })
+
   it('shows every reported agent, including sign-in needed, and opens its settings', async () => {
     const user = userEvent.setup()
     const setup = vi.fn()

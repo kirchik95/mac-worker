@@ -36,8 +36,10 @@ profile clears an inherited API key instead of silently choosing another account
 
 Cursor responses include `model_catalog_profile` for live and remembered models.
 Save sends that same profile name for capability revalidation; saves for other
-agents do not use it. Authentication in Settings follows the selected profile's
-fresh facts. Missing profile facts stay unknown even when the base account is
+agents do not use it. Authentication in Settings and the shelf follows the same
+selected profile's fresh facts. The card's icon, ordering, and sign-in hints use
+that status, and its tooltip names the profile. Missing profile facts stay
+unknown even when the base account is
 authenticated. An explicitly selected missing, insecure, or unusable profile
 fails with a generic error; its contents are never returned to the dashboard.
 

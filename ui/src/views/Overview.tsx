@@ -30,6 +30,8 @@ export function Overview({
   previews?: TaskPreviews
 }) {
   const stalled = stall(snapshot, now)
+  const envProfile = (snapshot.project_defaults as { env_profile?: string | null } | null)
+    ?.env_profile
   const known = snapshot.workers.filter(
     (worker) =>
       worker.freshness === 'current' &&
@@ -63,6 +65,7 @@ export function Overview({
               <WorkerCard
                 key={worker.name}
                 worker={worker}
+                envProfile={envProfile}
                 now={now}
                 onSetup={onSetup}
                 onSelectTask={select}

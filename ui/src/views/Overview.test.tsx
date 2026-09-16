@@ -26,6 +26,24 @@ beforeEach(() =>
 afterEach(() => vi.unstubAllGlobals())
 
 describe('Overview', () => {
+  it('uses the project profile for Cursor authentication on the shelf', () => {
+    render(<Overview snapshot={snapshot({
+      project_defaults: { env_profile: 'project' },
+      workers: [worker({ agent_facts: {
+        collected_at_millis: 1_000,
+        freshness: 'current',
+        agents: [{ name: 'cursor', version: null, auth: 'authenticated', auth_by_profile: [
+          { profile: 'agents', auth: 'authenticated' },
+          { profile: 'project', auth: 'unauthenticated' },
+        ] }],
+      } })],
+    })} onSetup={vi.fn()} />)
+    const mini = card('mini-1')
+    expect(within(mini).getByRole('button', { name: 'Cursor settings for mini-1' }))
+      .toHaveAttribute('data-tone', 'sign-in-needed')
+    expect(within(mini).getByText('Cursor needs sign-in on Mac')).toBeVisible()
+  })
+
   it('reports an idle worker as available with its metrics', () => {
     render(<Overview snapshot={snapshot()} />)
     const mini = card('mini-1')

@@ -17,7 +17,7 @@ import { AgentMark } from '@/components/AgentMark'
 import { WorkerIcon } from '@/components/WorkerIcon'
 import { CommandList } from '@/components/CommandList'
 import { ModelPicker } from '@/components/ModelPicker'
-import { agentBinary, agentLabel, agentVersion, connection } from '@/lib/agents'
+import { agentBinary, agentLabel, agentVersion, connection, cursorProfile } from '@/lib/agents'
 import { humanize } from '@/lib/format'
 import { modelOptionsFor } from '@/lib/modelOptions'
 import {
@@ -434,9 +434,7 @@ export function Settings({
   const worker = workers.find((entry) => entry.name === workerName)
   const envProfile = (snapshot.project_defaults as { env_profile?: string | null } | null)
     ?.env_profile ?? null
-  const cursorCatalogProfile = envProfile ?? worker?.agent_facts?.agents
-    .find((entry) => entry.name === 'cursor')?.auth_by_profile
-    .find((entry) => entry.profile === 'agents')?.profile ?? null
+  const cursorCatalogProfile = cursorProfile(worker, envProfile)
   const profileFor = (setting: AgentSetting) => setting.agent === 'cursor'
     ? setting.model_catalog_profile ?? cursorCatalogProfile : null
 
