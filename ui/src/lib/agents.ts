@@ -22,15 +22,18 @@ export interface Connection {
  * A cached fact older than its TTL is not evidence of a live connection, so a
  * stale observation reports Unknown rather than the authentication it last saw.
  */
-export function connection(worker: Worker | undefined, agent: string): Connection {
+export function connection(worker: Worker | undefined, agent: string, envProfile?: string | null): Connection {
   const facts = worker?.agent_facts
   if (!worker || !facts || worker.freshness !== 'current' || facts.freshness !== 'current') {
     return { label: 'Unknown', tone: 'unknown' }
   }
   const fact: AgentFact | undefined = facts.agents.find((entry) => entry.name === agent)
   if (!fact) return { label: 'Not configured', tone: 'attention' }
-  if (fact.auth === 'authenticated') return { label: 'Connected', tone: 'connected' }
-  if (fact.auth === 'unauthenticated') return { label: 'Sign-in needed', tone: 'attention' }
+  const auth = envProfile
+    ? fact.auth_by_profile.find((entry) => entry.profile === envProfile)?.auth
+    : fact.auth
+  if (auth === 'authenticated') return { label: 'Connected', tone: 'connected' }
+  if (auth === 'unauthenticated') return { label: 'Sign-in needed', tone: 'attention' }
   return { label: 'Unknown', tone: 'unknown' }
 }
 

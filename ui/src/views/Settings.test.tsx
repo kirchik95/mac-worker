@@ -111,6 +111,7 @@ describe('Settings', () => {
       effort: 'high',
       fast: true,
       model_catalog_source: 'live',
+      model_catalog_profile: 'agents',
       model_options: [
         {
           id: 'grok-4.6',
@@ -135,22 +136,32 @@ describe('Settings', () => {
       ],
     }
     const saves: unknown[] = []
+    const reads: string[] = []
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (_url: string, init?: RequestInit) => {
+      vi.fn(async (url: string, init?: RequestInit) => {
         if (init?.method === 'POST') {
           const request = JSON.parse(String(init.body))
           saves.push(request)
           return { ok: true, status: 200, json: async () => ({ ...cursor, ...request }) }
         }
+        reads.push(url)
         return { ok: true, status: 200, json: async () => ({ agents: [cursor] }) }
       }),
     )
     const user = userEvent.setup()
-    render(<Settings snapshot={snapshot()} />)
+    render(<Settings snapshot={snapshot({ workers: [worker({ agent_facts: {
+      collected_at_millis: 1_000,
+      freshness: 'current',
+      agents: [{ name: 'cursor', version: 'test', auth: 'unknown',
+        auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] }],
+    } })] })} />)
     const panel = (await screen.findByRole('heading', { name: 'Cursor on mini-1' })).closest(
       'section',
     )!
+    expect(reads).toEqual(['/api/v1/workers/mini-1/agent-settings?env_profile=agents'])
+    expect(within(panel).getByText('Connected')).toBeInTheDocument()
+    expect(within(panel).getByText(/Profile: agents/)).toBeInTheDocument()
     expect(within(panel).getByRole('switch')).toBeChecked()
     expect(within(panel).getByRole('switch')).toBeEnabled()
     await user.click(within(panel).getByRole('combobox', { name: 'Model' }))
@@ -167,9 +178,86 @@ describe('Settings', () => {
         effort: 'extra-high',
         fast: true,
         revision: cursor.revision,
+        env_profile: 'agents',
       },
     ])
     expect(within(panel).getByRole('combobox', { name: 'Model' })).toHaveTextContent('GPT-5.6 Sol')
+  })
+
+  it('uses the project profile for the catalogue and keeps native saves for other agents profile-free', async () => {
+    const reads: string[] = []
+    const writes: Record<string, unknown>[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        const body = JSON.parse(String(init.body))
+        writes.push(body)
+        return { ok: true, status: 200, json: async () => ({ ...agentSettings().agents[0], ...body }) }
+      }
+      reads.push(url)
+      return { ok: true, status: 200, json: async () => agentSettings() }
+    }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot({
+      project_defaults: { env_profile: 'project+agents' },
+      workers: [worker({ agent_facts: {
+        collected_at_millis: 1_000,
+        freshness: 'current',
+        agents: [{ name: 'cursor', version: 'test', auth: 'unknown',
+          auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] }],
+      } })],
+    })} />)
+    const panel = await codexPanel()
+    expect(reads).toEqual(['/api/v1/workers/mini-1/agent-settings?env_profile=project%2Bagents'])
+    await user.click(within(panel).getByRole('switch'))
+    await user.click(within(panel).getByRole('button', { name: 'Save defaults' }))
+    await screen.findByText('Saved.')
+    expect(writes[0]).not.toHaveProperty('env_profile')
+  })
+
+  it('does not carry a Cursor profile to a Mac that has not reported it', async () => {
+    const reads: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      reads.push(url)
+      return { ok: true, status: 200, json: async () => agentSettings() }
+    }))
+    const user = userEvent.setup()
+    render(<Settings snapshot={snapshot({ workers: [worker({ agent_facts: {
+      collected_at_millis: 1_000,
+      freshness: 'current',
+      agents: [{ name: 'cursor', version: 'test', auth: 'unknown',
+        auth_by_profile: [{ profile: 'agents', auth: 'authenticated' }] }],
+    } }), worker({ name: 'mini-2' })] })} />)
+    await codexPanel()
+    await user.click(screen.getByRole('combobox', { name: 'Worker' }))
+    await user.click(await screen.findByRole('option', { name: 'mini-2' }))
+    await screen.findByText('Codex on mini-2')
+    expect(reads).toEqual([
+      '/api/v1/workers/mini-1/agent-settings?env_profile=agents',
+      '/api/v1/workers/mini-2/agent-settings',
+    ])
+  })
+
+  it.each([
+    { profileAuth: null, stale: false, label: 'Unknown' },
+    { profileAuth: 'unauthenticated' as const, stale: false, label: 'Sign-in needed' },
+    { profileAuth: 'authenticated' as const, stale: true, label: 'Unknown' },
+  ])('keeps Cursor profile authentication distinct from the base login ($label, stale=$stale)', async ({ profileAuth, stale, label }) => {
+    const cursor = { ...agentSettings().agents[0], agent: 'cursor', model_catalog_profile: 'project' }
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ agents: [cursor] }),
+    })))
+    render(<Settings snapshot={snapshot({
+      project_defaults: { env_profile: 'project' },
+      workers: [worker({ agent_facts: {
+        collected_at_millis: 1_000,
+        freshness: stale ? 'stale' : 'current',
+        agents: [{ name: 'cursor', version: 'test', auth: 'authenticated',
+          auth_by_profile: profileAuth ? [{ profile: 'project', auth: profileAuth }] : [] }],
+      } })],
+    })} />)
+    const panel = (await screen.findByRole('heading', { name: 'Cursor on mini-1' })).closest('section')!
+    expect(within(panel).getByText(label)).toBeInTheDocument()
+    expect(within(panel).queryByText('Connected')).not.toBeInTheDocument()
   })
 
   it('distinguishes unavailable Cursor capabilities from unsupported controls', async () => {

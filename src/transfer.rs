@@ -773,11 +773,14 @@ impl<'a> SshJsonTransport<'a> {
     pub fn agent_settings_get(
         &self,
         worker: &WorkerEntry,
+        request: &AgentSettingsGetRequest,
     ) -> Result<AgentSettingsList, WorkerError> {
+        crate::agent_settings::validate_get_request(request)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         self.request(
             worker,
             HostOperation::AgentSettingsGet,
-            &AgentSettingsGetRequest::default(),
+            request,
             control_policy(MAX_CONTROL_DEADLINE),
         )
     }
@@ -787,6 +790,8 @@ impl<'a> SshJsonTransport<'a> {
         worker: &WorkerEntry,
         request: &AgentSettingsSaveRequest,
     ) -> Result<AgentDefaultSettings, WorkerError> {
+        crate::agent_settings::validate_save_request(request)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         self.request(
             worker,
             HostOperation::AgentSettingsSet,

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    agent_settings::{AgentDefaultSettings, AgentSettingsList, AgentSettingsSaveRequest},
+    agent_settings::{
+        AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
+    },
     config::Config,
     dashboard::model::ApiError,
     error::WorkerError,
@@ -14,7 +16,11 @@ pub trait DashboardSettingsSource: Send + Sync + 'static {
         true
     }
 
-    fn read(&self, worker_name: &str) -> Result<AgentSettingsList, ApiError>;
+    fn read(
+        &self,
+        worker_name: &str,
+        request: &AgentSettingsGetRequest,
+    ) -> Result<AgentSettingsList, ApiError>;
     fn save(
         &self,
         worker_name: &str,
@@ -38,10 +44,14 @@ impl DashboardSettingsSource for SystemDashboardSettingsSource {
         self.config.worker(worker_name).is_some()
     }
 
-    fn read(&self, worker_name: &str) -> Result<AgentSettingsList, ApiError> {
+    fn read(
+        &self,
+        worker_name: &str,
+        request: &AgentSettingsGetRequest,
+    ) -> Result<AgentSettingsList, ApiError> {
         let worker = self.worker(worker_name)?;
         SshJsonTransport::new(self.runner.as_ref())
-            .agent_settings_get(worker)
+            .agent_settings_get(worker, request)
             .map_err(map_worker_error)
     }
 

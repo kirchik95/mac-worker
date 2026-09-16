@@ -25,6 +25,22 @@ selection, with `model_catalog_source: remembered`. Empty capability data is
 shown as unavailable, not as proof that a feature is unsupported. Reopening
 Settings or switching Macs performs a fresh lookup. Saves revalidate capabilities.
 
+Settings uses the project's `env_profile` when configured, otherwise the
+`agents` profile when that Mac has reported it for Cursor. The GET query carries
+only its name. The host loads the existing `EnvProfile`, verifies its permissions,
+and uses the existing bounded Keychain unlock when configured. Only Cursor's
+`CURSOR_API_KEY` is taken from the profile; reserved Keychain values and other
+agents' credentials never reach Cursor. The selected key is restored after login
+shell startup, without putting its value in shell arguments. A Keychain-only
+profile clears an inherited API key instead of silently choosing another account.
+
+Cursor responses include `model_catalog_profile` for live and remembered models.
+Save sends that same profile name for capability revalidation; saves for other
+agents do not use it. Authentication in Settings follows the selected profile's
+fresh facts. Missing profile facts stay unknown even when the base account is
+authenticated. An explicitly selected missing, insecure, or unusable profile
+fails with a generic error; its contents are never returned to the dashboard.
+
 Cursor uses `effort`, `reasoning`, or `reasoning_effort` depending on the model.
 Reading, changing, and clearing defaults preserve that native key, exact values
 such as `extra-high`, and unrelated settings. Both selected and remembered
@@ -35,19 +51,24 @@ string values `true` and `false`; older boolean files retain their existing type
 Regression coverage includes ACP ordering, bounds, timeout and process cleanup,
 native-file isolation, all three reasoning keys, unremembered model saves,
 unavailable catalogues, keyboard search, empty results, Escape focus return,
-and canonical IDs in dashboard save requests.
+canonical IDs in dashboard save requests, profile propagation through HTTP and
+SSH, post-login environment precedence, safe unlock failure, and profile-specific
+authentication states.
 
 ## Live validation
 
 The installed laptop Cursor returned 37 visible models through the host endpoint;
-its native `cli-config.json` stayed byte-for-byte unchanged. The three worker
-helpers were updated and their fallback responses verified. At the time of the
-check, normal Cursor `status` on all three minis reported its generic locked
-Keychain error; an actual Cursor smoke task also failed authentication. Native
-and isolated discovery had the same outcome. A recheck after a GUI unlock still
-returned remembered models. SSH and the console use the same account and login
-Keychain on each mini. The installed CLI's SSH diagnostic treats any failed or
-timed-out dummy Keychain write as "locked", so it proves unavailable access from
-that context, not the actual GUI lock state. The remaining check is interactive
-Keychain access in the SSH context, followed by the same supported CLI/API read.
-No credentials need to be copied or printed.
+its native `cli-config.json` stayed byte-for-byte unchanged.
+
+On 2026-09-16, real Cursor tasks using `--env-profile agents` completed on mini-1,
+mini-2, and mini-3. Each ran the disposable project's existing `npm test` suite:
+15 passed, 0 failed, unchanged repository files and commit. Raw SSH checks without
+the profile can still report Cursor's generic Keychain error; that does not
+describe authentication through the configured profile. No credentials were
+copied or printed during verification.
+
+After updating the helpers and dashboard, all three Settings API responses
+returned `model_catalog_source: live`, `model_catalog_profile: agents`, and
+37 models with verified capabilities. In the browser, Cursor on mini-2 showed
+Connected, the profile hint, all 37 native choices plus Agent default, and
+working model search.

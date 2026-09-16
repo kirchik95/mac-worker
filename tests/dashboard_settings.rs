@@ -1,6 +1,8 @@
 use std::{
     io::{Read, Write},
     net::TcpStream,
+    os::unix::process::ExitStatusExt,
+    process::ExitStatus,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -9,20 +11,25 @@ use std::{
 };
 
 use mac_worker::{
-    agent_settings::{AgentDefaultSettings, AgentSettingsList, AgentSettingsSaveRequest},
+    agent_settings::{
+        AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
+    },
+    config::Config,
     dashboard::{
         model::{ApiError, DashboardJob, DashboardLogChunk, DashboardQueueEntry},
         service::{
             Clock, DashboardDataSource, DashboardService, DashboardTaskCollection, MonotonicClock,
             WorkerObservationResult,
         },
-        settings::DashboardSettingsSource,
+        settings::{DashboardSettingsSource, SystemDashboardSettingsSource},
         task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
     },
     job::{JobId, LogStream},
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
     task::{TaskId, TurnId},
     task_view::TaskListProjection,
+    transfer::HostOperation,
 };
 
 #[derive(Clone)]
@@ -45,7 +52,11 @@ impl DashboardSettingsSource for SettingsFixture {
         worker_name == "mini-1"
     }
 
-    fn read(&self, worker_name: &str) -> Result<AgentSettingsList, ApiError> {
+    fn read(
+        &self,
+        worker_name: &str,
+        _request: &AgentSettingsGetRequest,
+    ) -> Result<AgentSettingsList, ApiError> {
         if worker_name != "mini-1" {
             return Err(ApiError::new(
                 "WORKER_NOT_FOUND",
@@ -84,6 +95,7 @@ fn entry() -> AgentDefaultSettings {
         fast_supported: false,
         source: "fixture".into(),
         model_catalog_source: None,
+        model_catalog_profile: None,
         revision: Some("a".repeat(64)),
         writable: true,
         message: None,
@@ -179,6 +191,10 @@ impl DashboardTaskSource for EmptyTasks {
 }
 
 async fn server(settings: Arc<SettingsFixture>) -> (DashboardHttpServer, Arc<SettingsFixture>) {
+    (server_for_source(settings.clone()).await, settings)
+}
+
+async fn server_for_source(settings: Arc<dyn DashboardSettingsSource>) -> DashboardHttpServer {
     let state = Arc::new(DashboardHttpState {
         service: Arc::new(DashboardService::new(
             EmptyDashboard,
@@ -187,13 +203,149 @@ async fn server(settings: Arc<SettingsFixture>) -> (DashboardHttpServer, Arc<Set
         )),
         log_source: Arc::new(EmptyLogs),
         task_source: Arc::new(EmptyTasks),
-        settings_source: Some(settings.clone()),
+        settings_source: Some(settings),
         mutation_source: None,
     });
-    (
-        DashboardHttpServer::bind(None, state).await.unwrap(),
-        settings,
-    )
+    DashboardHttpServer::bind(None, state).await.unwrap()
+}
+
+#[derive(Default)]
+struct SettingsTransportFixture {
+    requests: Mutex<Vec<ProcessRequest>>,
+}
+
+impl ProcessRunner for SettingsTransportFixture {
+    fn run(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let mut response = entry();
+        response.agent = "cursor".into();
+        response.model_catalog_source = Some("live".into());
+        response.model_catalog_profile = Some("agents".into());
+        let get = request.args.last().unwrap() == &HostOperation::AgentSettingsGet.command();
+        let response = if get {
+            serde_json::to_vec(&AgentSettingsList {
+                agents: vec![response],
+            })
+            .unwrap()
+        } else {
+            serde_json::to_vec(&response).unwrap()
+        };
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: [response, b"\n".to_vec()].concat(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+async fn transport_server() -> (DashboardHttpServer, Arc<SettingsTransportFixture>) {
+    let runner = Arc::new(SettingsTransportFixture::default());
+    let config =
+        Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mini-1\"\nslots = 1\n")
+            .unwrap();
+    let source = Arc::new(SystemDashboardSettingsSource::new(
+        Arc::new(config),
+        runner.clone(),
+    ));
+    (server_for_source(source).await, runner)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_profile_crosses_http_and_ssh_for_read_and_save() {
+    let (server, runner) = transport_server().await;
+    let address = server
+        .local_url()
+        .strip_prefix("http://")
+        .unwrap()
+        .to_owned();
+    let path = "/api/v1/workers/mini-1/agent-settings";
+    let read = request(
+        &address,
+        "GET",
+        &format!("{path}?env_profile=%61gents"),
+        &[],
+        b"",
+    );
+    assert_eq!(read.status, 200);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&read.body).unwrap()["agents"][0]["model_catalog_profile"],
+        "agents"
+    );
+    {
+        let requests = runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].stdin.as_deref(),
+            Some(br#"{"env_profile":"agents"}"#.as_slice())
+        );
+        assert_eq!(
+            requests[0].args.last().unwrap(),
+            &HostOperation::AgentSettingsGet.command()
+        );
+    }
+    let origin = format!("http://{address}");
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Origin", origin.as_str()),
+        ("X-Mac-Worker-Settings", "1"),
+    ];
+    let body = br#"{"agent":"cursor","model":"catalogue-model","effort":null,"fast":null,"revision":"aa","env_profile":"agents"}"#;
+    let saved = request(&address, "POST", path, &headers, body);
+    assert_eq!(saved.status, 200);
+    {
+        let requests = runner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].stdin.as_deref(), Some(body.as_slice()));
+        assert_eq!(
+            requests[1].args.last().unwrap(),
+            &HostOperation::AgentSettingsSet.command()
+        );
+    }
+    let default_read = request(&address, "GET", path, &[], b"");
+    assert_eq!(default_read.status, 200);
+    assert_eq!(
+        runner.requests.lock().unwrap()[2].stdin.as_deref(),
+        Some(b"{}".as_slice())
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_profile_queries_never_reach_the_worker() {
+    let (server, runner) = transport_server().await;
+    let address = server
+        .local_url()
+        .strip_prefix("http://")
+        .unwrap()
+        .to_owned();
+    let path = "/api/v1/workers/mini-1/agent-settings";
+    for query in [
+        "env_profile=",
+        "env_profile=.",
+        "env_profile=..",
+        "env_profile=..%2Fagents",
+        "env_profile=dir%5Cagents",
+        "env_profile=agents%0A",
+        "env_profile=agents&env_profile=other",
+        "unknown=agents",
+        &format!("env_profile={}", "a".repeat(129)),
+    ] {
+        let response = request(&address, "GET", &format!("{path}?{query}"), &[], b"");
+        assert_eq!(response.status, 400, "{query}");
+    }
+    let origin = format!("http://{address}");
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Origin", origin.as_str()),
+        ("X-Mac-Worker-Settings", "1"),
+    ];
+    let body = br#"{"agent":"cursor","model":null,"effort":null,"fast":null,"revision":"aa","env_profile":"../agents"}"#;
+    assert_eq!(request(&address, "POST", path, &headers, body).status, 400);
+    assert!(runner.requests.lock().unwrap().is_empty());
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -219,6 +371,7 @@ async fn settings_routes_read_and_protect_save() {
     );
 
     let body = serde_json::to_vec(&AgentSettingsSaveRequest {
+        env_profile: None,
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),
@@ -266,6 +419,7 @@ async fn settings_reject_unknown_worker_before_save() {
         .unwrap()
         .to_owned();
     let body = serde_json::to_vec(&AgentSettingsSaveRequest {
+        env_profile: None,
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),
@@ -301,6 +455,7 @@ async fn settings_rejects_invalid_save_variants_before_source_and_maps_conflict(
         .to_owned();
     let path = "/api/v1/workers/mini-1/agent-settings";
     let body = serde_json::to_vec(&AgentSettingsSaveRequest {
+        env_profile: None,
         agent: "codex".into(),
         model: Some("gpt-next".into()),
         effort: Some("high".into()),

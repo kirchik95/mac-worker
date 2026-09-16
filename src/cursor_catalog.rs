@@ -17,11 +17,74 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::process::{ProcessPolicy, ProcessRequest};
+use crate::{
+    agent_settings::{AgentSettingsError, validate_env_profile},
+    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+    turn::EnvProfile,
+};
+
+const CURSOR_AUTH_ENV: &str = "CURSOR_API_KEY";
+const STAGED_AUTH_ENV: &str = "MAC_WORKER_CURSOR_CATALOG_API_KEY";
+
+pub(crate) fn discover_for_profile(
+    home: &Path,
+    environment: &BTreeMap<OsString, OsString>,
+    profile_name: Option<&str>,
+    runner: &dyn ProcessRunner,
+) -> Result<Option<Value>, AgentSettingsError> {
+    validate_env_profile(profile_name)?;
+    let Some(name) = profile_name else {
+        return Ok(discover(home, environment));
+    };
+    let unavailable =
+        || AgentSettingsError::Unavailable("selected environment profile is unavailable");
+    let profile = EnvProfile::load_for_home(
+        &home
+            .join(".config/mac-worker/env")
+            .join(format!("{name}.env")),
+        home,
+    )
+    .map_err(|_| unavailable())?;
+    // Cursor's adapter allows only this authentication variable. Other agent
+    // credentials and reserved host Keychain values stay out of the child.
+    let api_key = profile
+        .entries()
+        .iter()
+        .find_map(|(key, value)| (key == CURSOR_AUTH_ENV && !value.is_empty()).then_some(value));
+    if api_key.is_none()
+        && !profile
+            .keychain()
+            .is_some_and(|config| !config.password().is_empty())
+    {
+        return Err(unavailable());
+    }
+    if let Some(config) = profile.keychain() {
+        crate::keychain::unlock_keychain_if_supported(
+            runner,
+            config,
+            &profile.redaction_boundary(home),
+        )
+        .map_err(|_| unavailable())?;
+    }
+    let mut environment = environment.clone();
+    environment.remove(std::ffi::OsStr::new(CURSOR_AUTH_ENV));
+    if let Some(value) = api_key {
+        environment.insert(CURSOR_AUTH_ENV.into(), value.clone());
+    }
+    Ok(discover_with_environment(home, &environment, true))
+}
 
 /// Uses the account's existing authentication; never initiates login or inference.
 /// Unsupported CLI versions and unavailable catalogues have no fallback snapshot.
 pub fn discover(home: &Path, environment: &BTreeMap<OsString, OsString>) -> Option<Value> {
+    discover_with_environment(home, environment, false)
+}
+
+fn discover_with_environment(
+    home: &Path,
+    environment: &BTreeMap<OsString, OsString>,
+    selected_profile: bool,
+) -> Option<Value> {
     let scratch = DiscoveryDirectory::create()?;
     let scratch_text = scratch.0.to_str()?;
     // Apply isolation after login-shell startup, which can otherwise overwrite
@@ -36,9 +99,28 @@ pub fn discover(home: &Path, environment: &BTreeMap<OsString, OsString>) -> Opti
     ];
     let entries = environment
         .iter()
+        .filter(|(key, _)| !crate::keychain::is_reserved_env_name(&key.to_string_lossy()))
+        .filter(|(key, _)| *key != STAGED_AUTH_ENV)
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
     let mut request = crate::agent::prebind_login_request(&argv, home, &entries).ok()?;
+    // Login startup can replace CURSOR_API_KEY. Stage the chosen value in the
+    // environment and restore it via a shell variable, never literal argv.
+    let mut prefix = "unset MAC_WORKER_KEYCHAIN_PASSWORD MAC_WORKER_KEYCHAIN_PATH; ".to_owned();
+    if let Some(api_key) = environment.get(std::ffi::OsStr::new(CURSOR_AUTH_ENV)) {
+        request
+            .environment
+            .push((STAGED_AUTH_ENV.into(), api_key.clone()));
+        prefix.push_str(&format!(
+            "export {CURSOR_AUTH_ENV}=\"${STAGED_AUTH_ENV}\"; "
+        ));
+    } else if selected_profile {
+        // A Keychain-only selection must not use a different account's API key.
+        prefix.push_str(&format!("unset {CURSOR_AUTH_ENV}; "));
+    }
+    prefix.push_str(&format!("unset {STAGED_AUTH_ENV}; "));
+    prefix.push_str(request.args.get(1)?.to_str()?);
+    request.args[1] = prefix.into();
     request.policy = ProcessPolicy {
         stdout_limit: 1024 * 1024,
         stderr_limit: 64 * 1024,

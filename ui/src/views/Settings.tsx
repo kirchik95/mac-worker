@@ -83,7 +83,7 @@ function Detail({
   draftEntry?: DraftEntry
   onDraftChange: (update: DraftUpdate) => void
 }) {
-  const identity = `${worker}\0${setting.agent}`
+  const identity = `${worker}\0${setting.agent}\0${setting.model_catalog_profile ?? ''}`
   const [activity, setActivity] = useState<{
     identity: string
     busy: boolean
@@ -104,7 +104,7 @@ function Detail({
     () => () => {
       saveGeneration.current += 1
     },
-    [worker, setting.agent],
+    [identity],
   )
   const busy = activity.identity === identity ? activity.busy : false
   const message = activity.identity === identity ? activity.message : null
@@ -128,6 +128,9 @@ function Detail({
         effort: draft.effort,
         fast: fastSupported ? draft.fast : null,
         revision: draftEntry ? draftEntry.revision : setting.revision,
+        ...(setting.agent === 'cursor' && setting.model_catalog_profile
+          ? { env_profile: setting.model_catalog_profile }
+          : {}),
       })
       if (generation !== saveGeneration.current) return
       onSaved(next)
@@ -153,6 +156,7 @@ function Detail({
     worker,
     setting.agent,
     setting.revision,
+    setting.model_catalog_profile,
     draftEntry,
     draft,
     fastSupported,
@@ -237,6 +241,7 @@ function Detail({
                   {setting.model_catalog_source === 'live'
                     ? `Models available to Cursor on ${worker}.`
                     : `Showing models remembered on ${worker}. The full catalogue is unavailable.`}
+                  {setting.model_catalog_profile ? ` Profile: ${setting.model_catalog_profile}.` : ''}
                 </p>
               ) : null}
             </div>
@@ -427,6 +432,13 @@ export function Settings({
   }, [contextWorker])
 
   const worker = workers.find((entry) => entry.name === workerName)
+  const envProfile = (snapshot.project_defaults as { env_profile?: string | null } | null)
+    ?.env_profile ?? null
+  const cursorCatalogProfile = envProfile ?? worker?.agent_facts?.agents
+    .find((entry) => entry.name === 'cursor')?.auth_by_profile
+    .find((entry) => entry.profile === 'agents')?.profile ?? null
+  const profileFor = (setting: AgentSetting) => setting.agent === 'cursor'
+    ? setting.model_catalog_profile ?? cursorCatalogProfile : null
 
   useEffect(() => {
     if (workerName == null) return
@@ -434,7 +446,7 @@ export function Settings({
     const controller = new AbortController()
     setSettings(null)
     setError(null)
-    fetchAgentSettings(workerName, controller.signal)
+    fetchAgentSettings(workerName, controller.signal, cursorCatalogProfile)
       .then((payload) => {
         if (cancelled) return
         setSettings(payload)
@@ -452,12 +464,12 @@ export function Settings({
       cancelled = true
       controller.abort()
     }
-  }, [workerName, initialAgent])
+  }, [workerName, initialAgent, cursorCatalogProfile])
 
   // An unknown connection is not the same claim as "not connected": a fact older
   // than its TTL says nothing either way, and the summary must not pretend it does.
   const tallies = (settings?.agents ?? []).reduce<Record<string, number>>((counts, setting) => {
-    const tone = connection(worker, setting.agent).tone
+    const tone = connection(worker, setting.agent, profileFor(setting)).tone
     counts[tone] = (counts[tone] ?? 0) + 1
     return counts
   }, {})
@@ -470,8 +482,6 @@ export function Settings({
     .join(' · ')
   const permissions = (snapshot.project_defaults as { permissions?: Record<string, string> } | null)
     ?.permissions
-  const envProfile = (snapshot.project_defaults as { env_profile?: string | null } | null)
-    ?.env_profile
   const mergeSaved = useCallback(
     (saved: AgentSetting) =>
       setSettings((current) =>
@@ -489,6 +499,7 @@ export function Settings({
   }
 
   const setting = settings?.agents.find((entry) => entry.agent === selectedAgent) ?? null
+  const draftKey = setting ? `${workerName}\0${setting.agent}\0${profileFor(setting) ?? ''}` : ''
 
   return (
     <div className="mw-page">
@@ -532,7 +543,7 @@ export function Settings({
           <h2 className="mw-section-title px-3 pb-4">Agents</h2>
           <div className="space-y-2">
             {settings?.agents.map((entry) => {
-              const state = connection(worker, entry.agent)
+              const state = connection(worker, entry.agent, profileFor(entry))
               return (
                 <button
                   type="button"
@@ -564,11 +575,11 @@ export function Settings({
             version={agentVersion(worker, setting.agent)}
             permissions={permissions?.[setting.agent] ?? null}
             envProfile={envProfile ?? null}
-            connectionLabel={connection(worker, setting.agent).label}
+            connectionLabel={connection(worker, setting.agent, profileFor(setting)).label}
             onSaved={mergeSaved}
-            draftEntry={drafts[`${workerName}\0${setting.agent}`]}
+            draftEntry={drafts[draftKey]}
             onDraftChange={(update) => {
-              const key = `${workerName}\0${setting.agent}`
+              const key = draftKey
               setDrafts((current) => {
                 const next = { ...current }
                 if (update === null) delete next[key]

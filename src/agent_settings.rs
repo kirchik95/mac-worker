@@ -66,6 +66,8 @@ pub struct AgentDefaultSettings {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_catalog_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub struct AgentSettingsSaveRequest {
     pub effort: Option<String>,
     pub fast: Option<bool>,
     pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_profile: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for AgentSettingsSaveRequest {
@@ -99,6 +103,8 @@ impl<'de> Deserialize<'de> for AgentSettingsSaveRequest {
             #[serde(default, deserialize_with = "deserialize_present_nullable")]
             fast: Option<Option<bool>>,
             revision: String,
+            #[serde(default)]
+            env_profile: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -117,6 +123,7 @@ impl<'de> Deserialize<'de> for AgentSettingsSaveRequest {
             effort,
             fast,
             revision: wire.revision,
+            env_profile: wire.env_profile,
         })
     }
 }
@@ -131,7 +138,10 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct AgentSettingsGetRequest {}
+pub struct AgentSettingsGetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_profile: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentKind {
@@ -189,6 +199,7 @@ pub struct NativeAgentSettingsStore {
     home: PathBuf,
     environment: BTreeMap<OsString, OsString>,
     cursor_catalog: Option<Vec<CursorCatalogModel>>,
+    cursor_catalog_profile: Option<String>,
 }
 
 impl NativeAgentSettingsStore {
@@ -200,6 +211,7 @@ impl NativeAgentSettingsStore {
             home: fs::canonicalize(&home).unwrap_or(home),
             environment: BTreeMap::new(),
             cursor_catalog: None,
+            cursor_catalog_profile: None,
         }
     }
 
@@ -211,6 +223,17 @@ impl NativeAgentSettingsStore {
     pub fn with_cursor_catalog(mut self, value: Option<serde_json::Value>) -> Self {
         self.cursor_catalog = value.as_ref().and_then(parse_cursor_catalog);
         self
+    }
+
+    pub fn with_cursor_catalog_profile(mut self, profile: Option<String>) -> Self {
+        self.cursor_catalog_profile = profile;
+        self
+    }
+
+    fn model_catalog_profile(&self, kind: AgentKind) -> Option<String> {
+        (kind == AgentKind::Cursor)
+            .then(|| self.cursor_catalog_profile.clone())
+            .flatten()
     }
 
     fn model_catalog_source(&self, kind: AgentKind) -> Option<String> {
@@ -291,6 +314,7 @@ impl NativeAgentSettingsStore {
             writable,
             message,
             model_catalog_source: self.model_catalog_source(kind),
+            model_catalog_profile: self.model_catalog_profile(kind),
         })
     }
 
@@ -784,6 +808,7 @@ impl NativeAgentSettingsStore {
             writable: false,
             message: Some(error.safe_message().to_owned()),
             model_catalog_source: self.model_catalog_source(kind),
+            model_catalog_profile: self.model_catalog_profile(kind),
         }
     }
 
@@ -857,6 +882,7 @@ impl NativeAgentSettingsStore {
             writable,
             message,
             model_catalog_source: None,
+            model_catalog_profile: None,
         })
     }
 
@@ -1514,6 +1540,7 @@ impl std::fmt::Display for AgentSettingsError {
 impl std::error::Error for AgentSettingsError {}
 
 pub fn validate_save_request(request: &AgentSettingsSaveRequest) -> Result<(), AgentSettingsError> {
+    validate_env_profile(request.env_profile.as_deref())?;
     let kind = AgentKind::parse(&request.agent)?;
     if request.revision.is_empty() || request.revision.len() > MAX_SETTINGS_REVISION_BYTES {
         return Err(AgentSettingsError::invalid("settings revision is invalid"));
@@ -1547,6 +1574,26 @@ pub fn validate_save_request(request: &AgentSettingsSaveRequest) -> Result<(), A
     if request.fast == Some(true) && matches!(kind, AgentKind::Opencode | AgentKind::Claude) {
         return Err(AgentSettingsError::invalid(
             "requested fast mode is not supported by this native agent",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_get_request(request: &AgentSettingsGetRequest) -> Result<(), AgentSettingsError> {
+    validate_env_profile(request.env_profile.as_deref())
+}
+
+pub(crate) fn validate_env_profile(profile: Option<&str>) -> Result<(), AgentSettingsError> {
+    if profile.is_some_and(|name| {
+        name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || name.contains('/')
+            || name.contains('\\')
+            || matches!(name, "." | "..")
+    }) {
+        return Err(AgentSettingsError::invalid(
+            "environment profile name is invalid",
         ));
     }
     Ok(())

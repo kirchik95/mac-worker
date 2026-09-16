@@ -277,6 +277,7 @@ export interface AgentSetting {
   writable: boolean
   message: string | null
   model_catalog_source?: 'live' | 'remembered' | null
+  model_catalog_profile?: string | null
 }
 
 export interface AgentSettings {
@@ -289,6 +290,7 @@ export interface SaveSettings {
   effort: string | null
   fast: boolean | null
   revision: string
+  env_profile?: string | null
 }
 
 export const fetchTaskDetail = (taskId: string, signal?: AbortSignal) =>
@@ -340,8 +342,12 @@ export const replyToTask = (taskId: string, body: TaskMutation, signal?: AbortSi
 export const acceptTask = (taskId: string, body: TaskMutation, signal?: AbortSignal) =>
   postTaskMutation(`/api/v1/tasks/${encodeURIComponent(taskId)}/accept`, body, signal)
 
-export const fetchAgentSettings = (worker: string, signal?: AbortSignal) =>
-  getJson<AgentSettings>(`/api/v1/workers/${encodeURIComponent(worker)}/agent-settings`, signal)
+export const fetchAgentSettings = (worker: string, signal?: AbortSignal, envProfile?: string | null) =>
+  getJson<AgentSettings>(
+    `/api/v1/workers/${encodeURIComponent(worker)}/agent-settings` +
+      (envProfile ? `?env_profile=${encodeURIComponent(envProfile)}` : ''),
+    signal,
+  )
 
 /** Saves one agent. The revision is the optimistic check the host enforces. */
 export async function saveAgentSettings(worker: string, body: SaveSettings): Promise<AgentSetting> {

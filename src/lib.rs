@@ -2125,7 +2125,7 @@ pub fn run_with_rsync_executor_in_context(
             command: HostCommand::AgentSettingsGet
         }
     ) {
-        return run_host_agent_settings_get(runtime, stdin, stdout);
+        return run_host_agent_settings_get(runtime, runner, stdin, stdout);
     }
     if matches!(
         &cli.command,
@@ -2133,7 +2133,7 @@ pub fn run_with_rsync_executor_in_context(
             command: HostCommand::AgentSettingsSet
         }
     ) {
-        return run_host_agent_settings_set(runtime, stdin, stdout);
+        return run_host_agent_settings_set(runtime, runner, stdin, stdout);
     }
     if matches!(
         &cli.command,
@@ -3276,6 +3276,7 @@ fn run_host_reconcile(
 
 fn run_host_agent_settings_get(
     runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
 ) -> u8 {
@@ -3283,14 +3284,20 @@ fn run_host_agent_settings_get(
         runtime,
         stdin,
         stdout,
+        agent_settings::validate_get_request,
         |request: AgentSettingsGetRequest, store| {
-            let _ = request;
             Ok(store
                 .clone()
-                .with_cursor_catalog(cursor_catalog::discover(
-                    runtime.home(),
-                    runtime.environment(),
-                ))
+                .with_cursor_catalog(
+                    cursor_catalog::discover_for_profile(
+                        runtime.home(),
+                        runtime.environment(),
+                        request.env_profile.as_deref(),
+                        runner,
+                    )
+                    .map_err(settings_host_error)?,
+                )
+                .with_cursor_catalog_profile(request.env_profile)
                 .read_all())
         },
     )
@@ -3298,6 +3305,7 @@ fn run_host_agent_settings_get(
 
 fn run_host_agent_settings_set(
     runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
 ) -> u8 {
@@ -3305,26 +3313,38 @@ fn run_host_agent_settings_set(
         runtime,
         stdin,
         stdout,
+        agent_settings::validate_save_request,
         |request: AgentSettingsSaveRequest, store| {
             let store = if request.agent == "cursor" {
-                store.clone().with_cursor_catalog(cursor_catalog::discover(
-                    runtime.home(),
-                    runtime.environment(),
-                ))
+                store
+                    .clone()
+                    .with_cursor_catalog(
+                        cursor_catalog::discover_for_profile(
+                            runtime.home(),
+                            runtime.environment(),
+                            request.env_profile.as_deref(),
+                            runner,
+                        )
+                        .map_err(settings_host_error)?,
+                    )
+                    .with_cursor_catalog_profile(request.env_profile.clone())
             } else {
                 store.clone()
             };
-            store.save(&request).map_err(|error| {
-                WorkerError::Protocol(format!("{}: {}", error.code(), error.safe_message()))
-            })
+            store.save(&request).map_err(settings_host_error)
         },
     )
+}
+
+fn settings_host_error(error: agent_settings::AgentSettingsError) -> WorkerError {
+    WorkerError::Protocol(format!("{}: {}", error.code(), error.safe_message()))
 }
 
 fn run_host_agent_settings_endpoint<Req, Res>(
     runtime: &RuntimeContext,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
+    validate: impl FnOnce(&Req) -> Result<(), agent_settings::AgentSettingsError>,
     operation: impl FnOnce(Req, &NativeAgentSettingsStore) -> Result<Res, WorkerError>,
 ) -> u8
 where
@@ -3355,6 +3375,7 @@ where
                 "SETTINGS_INVALID: settings request was not canonical JSON".into(),
             ));
         }
+        validate(&request).map_err(settings_host_error)?;
         let store = NativeAgentSettingsStore::new(runtime.home())
             .with_environment(runtime.environment().clone());
         operation(request, &store)

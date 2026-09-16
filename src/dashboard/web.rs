@@ -16,7 +16,10 @@ use axum::{
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
 use crate::{
-    agent_settings::{AgentSettingsError, AgentSettingsSaveRequest, validate_save_request},
+    agent_settings::{
+        AgentSettingsError, AgentSettingsGetRequest, AgentSettingsSaveRequest,
+        validate_get_request, validate_save_request,
+    },
     dashboard::{
         model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
         service::{Clock, CollectorHandle, DashboardDataSource, DashboardService, MonotonicClock},
@@ -294,12 +297,17 @@ where
 async fn agent_settings_get<S, C, M>(
     State(state): State<AppState<S, C, M>>,
     Path(worker_name): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response
 where
     S: DashboardDataSource,
     C: Clock,
     M: MonotonicClock,
 {
+    let request = match parse_settings_query(raw_query.as_deref()) {
+        Ok(request) => request,
+        Err(error) => return settings_request_error(error),
+    };
     let Some(source) = state.dashboard.settings_source.clone() else {
         return settings_error(ApiError::new(
             "SETTINGS_UNAVAILABLE",
@@ -312,7 +320,7 @@ where
             ApiError::new("WORKER_NOT_FOUND", "configured worker was not found"),
         );
     }
-    match tokio::task::spawn_blocking(move || source.read(&worker_name)).await {
+    match tokio::task::spawn_blocking(move || source.read(&worker_name, &request)).await {
         Ok(Ok(settings)) => api_json(StatusCode::OK, settings),
         Ok(Err(error)) => settings_error(error),
         Err(_) => settings_error(ApiError::new(
@@ -320,6 +328,28 @@ where
             "native settings are unavailable on this worker",
         )),
     }
+}
+
+fn parse_settings_query(
+    raw_query: Option<&str>,
+) -> Result<AgentSettingsGetRequest, AgentSettingsError> {
+    let query = raw_query.unwrap_or_default();
+    if query.len() > MAX_SETTINGS_REQUEST_BYTES {
+        return Err(AgentSettingsError::InvalidRequest(
+            "settings query is invalid",
+        ));
+    }
+    let mut request = AgentSettingsGetRequest::default();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key != "env_profile" || request.env_profile.is_some() {
+            return Err(AgentSettingsError::InvalidRequest(
+                "settings query is invalid",
+            ));
+        }
+        request.env_profile = Some(value.into_owned());
+    }
+    validate_get_request(&request)?;
+    Ok(request)
 }
 
 async fn agent_settings_post<S, C, M>(

@@ -2,8 +2,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::{fs, path::Path, process::ExitStatus, sync::Mutex};
 
 use mac_worker::agent_settings::{
-    AgentDefaultSettings, AgentSettingsList, AgentSettingsSaveRequest, ModelOption,
-    NativeAgentSettingsStore, SETTINGS_AGENT_IDS,
+    AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
+    ModelOption, NativeAgentSettingsStore, SETTINGS_AGENT_IDS,
 };
 use mac_worker::{
     config::WorkerEntry,
@@ -43,6 +43,7 @@ fn cursor_preserves_each_native_reasoning_parameter_when_reading_saving_and_clea
         assert!(settings.effort_options.iter().any(|value| value == "high"));
         let saved = store(home.path())
             .save(&AgentSettingsSaveRequest {
+                env_profile: None,
                 agent: "cursor".into(),
                 model: settings.model.clone(),
                 effort: Some("high".into()),
@@ -64,6 +65,7 @@ fn cursor_preserves_each_native_reasoning_parameter_when_reading_saving_and_clea
         }
         store(home.path())
             .save(&AgentSettingsSaveRequest {
+                env_profile: None,
                 agent: "cursor".into(),
                 model: saved.model,
                 effort: None,
@@ -141,6 +143,7 @@ fn cursor_live_catalog_controls_choices_and_saves_unremembered_native_parameters
     );
     let saved = native
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("new-model".into()),
             effort: Some("extra-high".into()),
@@ -163,6 +166,7 @@ fn cursor_live_catalog_controls_choices_and_saves_unremembered_native_parameters
     );
     let error = native
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("new-model".into()),
             effort: Some("max".into()),
@@ -221,6 +225,7 @@ fn reads_and_updates_codex_without_reformatting_unrelated_toml() {
 
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: Some("gpt-new".into()),
             effort: Some("max".into()),
@@ -261,6 +266,7 @@ model_reasoning_effort = "high" # root effort
     let settings = store(home.path()).read("codex").unwrap();
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: Some("gpt-new".into()),
             effort: Some("max".into()),
@@ -300,6 +306,7 @@ fn codex_effort_choices_follow_the_selected_model_cache_entry() {
     assert_eq!(settings.effort_options, vec!["low", "high"]);
     let error = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: None,
             effort: Some("ultra".into()),
@@ -334,6 +341,7 @@ fn reads_and_updates_claude_root_fields_only() {
     assert_eq!(settings.effort.as_deref(), Some("high"));
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "claude".into(),
             model: None,
             effort: Some("max".into()),
@@ -378,6 +386,7 @@ fn stale_revision_does_not_overwrite_source() {
 
     let error = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: Some("after".into()),
             effort: None,
@@ -413,6 +422,7 @@ fn updates_cursor_canonical_model_and_preserves_other_parameters() {
     assert_eq!(settings.effort.as_deref(), Some("high"));
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("new".into()),
             effort: None,
@@ -485,6 +495,7 @@ fn cursor_preserves_an_unlisted_current_effort_and_resets_active_selection_as_a_
 
     let preserved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("old".into()),
             effort: Some("custom".into()),
@@ -496,6 +507,7 @@ fn cursor_preserves_an_unlisted_current_effort_and_resets_active_selection_as_a_
     let revision = preserved.revision.unwrap();
     let reset = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: None,
             effort: None,
@@ -589,6 +601,7 @@ fn cursor_clearing_effort_removes_the_parameter_element() {
     let settings = store(home.path()).read("cursor").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("same".into()),
             effort: None,
@@ -630,6 +643,7 @@ fn updates_opencode_jsonc_and_preserves_comments() {
     assert_eq!(settings.model.as_deref(), Some("old"));
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: Some("new".into()),
             effort: None,
@@ -694,6 +708,7 @@ fn inserts_missing_jsonc_field_before_a_trailing_comma() {
     let settings = store(home.path()).read("opencode").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: Some("new".into()),
             effort: None,
@@ -738,6 +753,7 @@ fn opencode_jsonc_override_wins_and_revision_covers_both_documents() {
     .unwrap();
     let error = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: Some("next".into()),
             effort: None,
@@ -777,6 +793,7 @@ fn opencode_edits_lower_source_when_jsonc_only_overlays_unrelated_keys() {
     );
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: Some("next".into()),
             effort: None,
@@ -811,6 +828,7 @@ fn opencode_clear_overlay_reveals_lower_model_and_revision_tracks_both_files() {
     let settings = store(home.path()).read("opencode").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: None,
             effort: None,
@@ -838,6 +856,7 @@ fn missing_opencode_null_save_does_not_create_native_directories() {
     let settings = store(home.path()).read("opencode").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: None,
             effort: None,
@@ -852,6 +871,7 @@ fn missing_opencode_null_save_does_not_create_native_directories() {
     let settings = store(home.path()).read("opencode").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "opencode".into(),
             model: None,
             effort: None,
@@ -881,6 +901,7 @@ fn clearing_codex_setting_preserves_its_inline_comment() {
     let settings = store(home.path()).read("codex").unwrap();
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: None,
             effort: Some("high".into()),
@@ -910,6 +931,7 @@ fn read_only_native_source_is_readable_but_not_reported_writable() {
     assert!(!settings.writable);
     let error = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "claude".into(),
             model: Some("replacement".into()),
             effort: None,
@@ -1004,6 +1026,7 @@ fn malformed_source_is_reported_and_never_rewritten() {
     assert!(entry.message.is_some());
     let error = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "claude".into(),
             model: Some("replacement".into()),
             effort: None,
@@ -1021,6 +1044,7 @@ fn missing_file_save_creates_private_native_document() {
     let settings = store(home.path()).read("claude").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "claude".into(),
             model: Some("claude-new".into()),
             effort: Some("high".into()),
@@ -1094,7 +1118,7 @@ fn typed_settings_transport_uses_fixed_remote_argv_and_json_stdin() {
         herdr: false,
     };
     let actual = SshJsonTransport::new(&runner)
-        .agent_settings_get(&worker)
+        .agent_settings_get(&worker, &AgentSettingsGetRequest::default())
         .unwrap();
     assert_eq!(actual, response);
     let request = runner.request.lock().unwrap().clone().unwrap();
@@ -1104,6 +1128,47 @@ fn typed_settings_transport_uses_fixed_remote_argv_and_json_stdin() {
         HostOperation::AgentSettingsGet.command()
     );
     assert_eq!(request.stdin.as_deref(), Some(b"{}".as_slice()));
+}
+
+#[test]
+fn invalid_selected_profile_is_rejected_before_ssh_authentication() {
+    let worker = WorkerEntry {
+        name: "mini-1".into(),
+        ssh: "mini-1".into(),
+        slots: 1,
+        capabilities: Vec::new(),
+        remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
+    };
+    let runner = RecordingRunner {
+        request: Mutex::new(None),
+        stdout: Vec::new(),
+    };
+    let transport = SshJsonTransport::new(&runner);
+    let error = transport
+        .agent_settings_get(
+            &worker,
+            &AgentSettingsGetRequest {
+                env_profile: Some("../agents".into()),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SETTINGS_INVALID");
+    let error = transport
+        .agent_settings_set(
+            &worker,
+            &AgentSettingsSaveRequest {
+                agent: "cursor".into(),
+                model: None,
+                effort: None,
+                fast: None,
+                revision: "aa".into(),
+                env_profile: Some("../agents".into()),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SETTINGS_INVALID");
+    assert!(runner.request.lock().unwrap().is_none());
 }
 
 #[test]
@@ -1118,6 +1183,7 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         fast_supported: false,
         source: "native-claude".into(),
         model_catalog_source: None,
+        model_catalog_profile: None,
         revision: Some("b".repeat(64)),
         writable: true,
         message: None,
@@ -1135,6 +1201,7 @@ fn typed_settings_transport_keeps_user_values_in_json_stdin() {
         herdr: false,
     };
     let request = AgentSettingsSaveRequest {
+        env_profile: None,
         agent: "claude".into(),
         model: Some("model with spaces".into()),
         effort: Some("max".into()),
@@ -1264,6 +1331,7 @@ fn codex_missing_catalog_keeps_current_values_readable_and_saveable() {
 
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: Some("gpt-unlisted".into()),
             effort: Some("custom".into()),
@@ -1298,6 +1366,7 @@ fn codex_fast_aliases_write_fast_and_clear_known_tiers_without_erasing_unknown_t
     let settings = store(home.path()).read("codex").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: Some("gpt-5.6-luna".into()),
             effort: Some("max".into()),
@@ -1314,6 +1383,7 @@ fn codex_fast_aliases_write_fast_and_clear_known_tiers_without_erasing_unknown_t
     let settings = store(home.path()).read("codex").unwrap();
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: None,
             effort: None,
@@ -1337,6 +1407,7 @@ fn codex_fast_aliases_write_fast_and_clear_known_tiers_without_erasing_unknown_t
     assert_eq!(settings.fast, None);
     store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "codex".into(),
             model: None,
             effort: None,
@@ -1379,6 +1450,7 @@ fn cursor_catalog_reads_grok_high_fast_strings_and_synchronizes_both_parameter_a
 
     let saved = store(home.path())
         .save(&AgentSettingsSaveRequest {
+            env_profile: None,
             agent: "cursor".into(),
             model: Some("grok-4.6".into()),
             effort: Some("high".into()),
