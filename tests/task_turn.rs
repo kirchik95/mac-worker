@@ -675,6 +675,74 @@ fn keychain_unlock_failure_is_a_durable_turn_error_code() {
 }
 
 #[test]
+fn crashed_prelaunch_snapshot_does_not_block_the_next_launch() {
+    let secret = "purple-lantern-secret-qq";
+    let script = format!(
+        r#"printf '%s\n' '{{"type":"thread.started","thread_id":"session-1"}}' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"status\":\"done\",\"summary\":\"shipped {secret}\",\"questions\":[],\"files_changed\":[]}}"}}}}'"#
+    );
+    let (_temp, store, request, _cancel) = prepared_task_turn(&script);
+    let launcher = CrashAfterSnapshotLauncher {
+        store: store.clone(),
+        attempts: AtomicUsize::new(0),
+    };
+    let first = JobService::new(&store, &launcher).submit_turn(request.clone());
+    assert!(first.is_err(), "the first attempt must stop before launch");
+    let job_id = JobId::new(Uuid::from_u128(3));
+    let job_path = store.job(PROJECT_ID, WORKTREE_ID, job_id).unwrap();
+    let snapshot = fs::read(job_path.join("launched-redaction.json")).unwrap();
+    assert_eq!(snapshot, format!(r#"["{secret}"]"#).into_bytes());
+
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap_or_else(|error| panic!("relaunch failed: {error}"));
+    assert_eq!(launcher.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    let summary = response.task().summary().unwrap_or("");
+    assert!(
+        !summary.contains(secret),
+        "relaunch did not reuse the planted snapshot: {summary}"
+    );
+    assert!(
+        summary.contains("[token]"),
+        "planted secret was not redacted: {summary}"
+    );
+    assert!(
+        !job_path.join("launched-redaction.json").exists(),
+        "snapshot remains after publication"
+    );
+}
+
+struct CrashAfterSnapshotLauncher {
+    store: HostStore,
+    attempts: AtomicUsize,
+}
+
+impl SupervisorLauncher for CrashAfterSnapshotLauncher {
+    fn launch(
+        &self,
+        job_id: JobId,
+        guard: mac_worker::host_store::SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            let job_path = self.store.job(PROJECT_ID, WORKTREE_ID, job_id)?;
+            let snapshot = job_path.join("launched-redaction.json");
+            fs::write(&snapshot, br#"["purple-lantern-secret-qq"]"#)?;
+            fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
+            return Err(WorkerError::Protocol(
+                "simulated crash after launched redaction snapshot".into(),
+            ));
+        }
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(process::id())?;
+        let helper = PathBuf::from(env!("CARGO_BIN_EXE_worker"));
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(helper)
+            .run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
+#[test]
 fn authentication_failure_in_a_turn_records_an_incident_and_names_the_outcome() {
     let script = concat!(
         "printf '%s\\n' ",

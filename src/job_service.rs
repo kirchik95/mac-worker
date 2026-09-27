@@ -1464,6 +1464,7 @@ impl<'a> JobService<'a> {
             "tail.log",
             "tmp",
             "workspace",
+            crate::turn::LAUNCHED_REDACTION_FILE,
         ]
         .into_iter()
         .map(String::from)
@@ -1526,7 +1527,11 @@ impl<'a> JobService<'a> {
             && names.iter().any(|name| {
                 matches!(
                     name.as_str(),
-                    "last.md" | "prompt.md" | "result.schema.json" | "tail.log"
+                    "last.md"
+                        | "prompt.md"
+                        | "result.schema.json"
+                        | "tail.log"
+                        | crate::turn::LAUNCHED_REDACTION_FILE
                 )
             })
         {
@@ -2940,27 +2945,10 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
                 .map_err(|_| WorkerError::Protocol("final turn has a non-UTF-8 entry".into()))
         })
         .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    let expected = [
-        ".mac-worker-rooted-fs",
-        "execution.json",
-        "meta.json",
-        "prompt.md",
-        "result.schema.json",
-        "status.json",
-        "stderr.log",
-        "stdout.log",
-        "tail.log",
-        "tmp",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect::<std::collections::BTreeSet<_>>();
-    let expected_with_supervisor_log = expected
-        .iter()
-        .cloned()
-        .chain(std::iter::once(String::from("supervisor.log")))
-        .collect::<std::collections::BTreeSet<_>>();
-    if names != expected && names != expected_with_supervisor_log {
+    // A failed earlier attempt may leave `supervisor.log`, the launched
+    // redaction snapshot, both, or neither. The snapshot is written before
+    // the child starts, so a crash there must not make the retry look unsafe.
+    if !indexed_turn_prelaunch_layout(&names) {
         return Err(WorkerError::Protocol(
             "indexed prelaunch turn has an unsafe top-level layout".into(),
         ));
@@ -3002,6 +2990,28 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
         ));
     }
     Ok(())
+}
+
+fn indexed_turn_prelaunch_layout(names: &std::collections::BTreeSet<String>) -> bool {
+    let expected = [
+        ".mac-worker-rooted-fs",
+        "execution.json",
+        "meta.json",
+        "prompt.md",
+        "result.schema.json",
+        "status.json",
+        "stderr.log",
+        "stdout.log",
+        "tail.log",
+        "tmp",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<std::collections::BTreeSet<_>>();
+    let mut allowed = expected.clone();
+    allowed.insert("supervisor.log".into());
+    allowed.insert(crate::turn::LAUNCHED_REDACTION_FILE.into());
+    expected.is_subset(names) && names.is_subset(&allowed)
 }
 
 fn write_new_canonical_json<T: Serialize>(
@@ -3614,4 +3624,47 @@ fn now_millis() -> Result<u64, WorkerError> {
         .as_millis()
         .try_into()
         .map_err(|_| protocol_code("CLOCK_INVALID", "system clock is outside the range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::indexed_turn_prelaunch_layout;
+
+    fn names(extra: &[&str]) -> BTreeSet<String> {
+        [
+            ".mac-worker-rooted-fs",
+            "execution.json",
+            "meta.json",
+            "prompt.md",
+            "result.schema.json",
+            "status.json",
+            "stderr.log",
+            "stdout.log",
+            "tail.log",
+            "tmp",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(extra.iter().copied().map(str::to_owned))
+        .collect()
+    }
+
+    #[test]
+    fn indexed_turn_prelaunch_layout_allows_the_snapshot_and_supervisor_log() {
+        assert!(indexed_turn_prelaunch_layout(&names(&[])));
+        assert!(indexed_turn_prelaunch_layout(&names(&["supervisor.log"])));
+        assert!(indexed_turn_prelaunch_layout(&names(&[
+            "launched-redaction.json"
+        ])));
+        assert!(indexed_turn_prelaunch_layout(&names(&[
+            "launched-redaction.json",
+            "supervisor.log",
+        ])));
+        assert!(!indexed_turn_prelaunch_layout(&names(&["notes.txt"])));
+        let mut missing = names(&[]);
+        missing.remove("tmp");
+        assert!(!indexed_turn_prelaunch_layout(&missing));
+    }
 }

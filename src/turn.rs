@@ -1948,6 +1948,10 @@ impl EnvProfile {
             snapshot_error(format!("cannot store launched redaction snapshot: {error}"))
         })?;
         if exists {
+            // A crashed prelaunch attempt already stored the secrets this turn
+            // launched with. Reuse that file. Do not rewrite it from the
+            // profile that happens to be on disk for the retry.
+            validate_existing_launched_redaction(job)?;
             return Ok(());
         }
         let secrets = self
@@ -1974,6 +1978,17 @@ const LAUNCHED_REDACTION_MAX_BYTES: u64 = 1024 * 1024;
 
 fn snapshot_error(message: impl Into<String>) -> WorkerError {
     turn_error("REDACTION_SNAPSHOT_FAILED", message)
+}
+
+fn validate_existing_launched_redaction(job: &RootedDir) -> Result<(), WorkerError> {
+    let bytes = job
+        .read_private_regular(LAUNCHED_REDACTION_FILE, LAUNCHED_REDACTION_MAX_BYTES)
+        .map_err(|error| {
+            snapshot_error(format!("cannot read launched redaction snapshot: {error}"))
+        })?;
+    let _: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| snapshot_error("launched redaction snapshot is invalid"))?;
+    Ok(())
 }
 
 /// Removes the launch snapshot once publication will not read it again.
@@ -2284,6 +2299,34 @@ mod tests {
         .unwrap();
         let error = publication_boundary(&turn_dir).unwrap_err();
         assert_eq!(error.public_code(), "PUBLISH_FAILED");
+    }
+
+    #[test]
+    fn relaunch_reuses_a_valid_launched_redaction_snapshot() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let bytes = br#"["purple-lantern-secret-qq"]"#;
+        turn_dir
+            .write_private_atomic_no_replace(LAUNCHED_REDACTION_FILE, bytes)
+            .unwrap();
+        EnvProfile::empty()
+            .persist_launched_redaction(&turn_dir)
+            .unwrap();
+        let stored = turn_dir
+            .read_private_regular(LAUNCHED_REDACTION_FILE, LAUNCHED_REDACTION_MAX_BYTES)
+            .unwrap();
+        assert_eq!(stored, bytes);
+    }
+
+    #[test]
+    fn relaunch_rejects_an_invalid_launched_redaction_snapshot() {
+        let (_temp, turn_dir) = open_scan_dir();
+        turn_dir
+            .write_private_atomic_no_replace(LAUNCHED_REDACTION_FILE, b"not-json")
+            .unwrap();
+        let error = EnvProfile::empty()
+            .persist_launched_redaction(&turn_dir)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "REDACTION_SNAPSHOT_FAILED");
     }
 
     struct PublicationFixture {
