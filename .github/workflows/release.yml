@@ -11,6 +11,7 @@ permissions:
 jobs:
   ui:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -35,6 +36,7 @@ jobs:
   build-draft:
     needs: ui
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@v7
@@ -45,8 +47,8 @@ jobs:
       - name: Verify source and installer
         run: |
           cargo fmt --all --check
-          cargo test --locked --all-targets
           cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets --no-fail-fast
           scripts/test-install.sh
 
       - name: Build release assets
