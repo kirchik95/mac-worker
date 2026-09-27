@@ -31,7 +31,8 @@ use job::{
 };
 use job_service::JobService;
 use laptop::{
-    LaptopProcessTable, SystemLaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli,
+    InstalledBuild, LaptopProcessTable, SystemLaptopProcessTable, format_outdated_laptop_cli,
+    outdated_laptop_cli,
 };
 use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
@@ -4894,7 +4895,14 @@ fn laptop_setup_warnings(runner: &dyn ProcessRunner) -> Vec<SetupWarning> {
     let Ok(processes) = SystemLaptopProcessTable::new(runner).list() else {
         return Vec::new();
     };
-    let outdated = outdated_laptop_cli(&processes, mtime);
+    let outdated = outdated_laptop_cli(
+        &processes,
+        &InstalledBuild {
+            mtime,
+            build_id: Some(crate::build_id::BUILD_ID.to_owned()),
+            binary_sha256: crate::binary_identity::current_binary_sha256(),
+        },
+    );
     let Some(message) = format_outdated_laptop_cli(&outdated) else {
         return Vec::new();
     };

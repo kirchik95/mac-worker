@@ -2151,6 +2151,8 @@ fn doctor_warns_when_a_running_dashboard_is_older_than_the_installed_binary() {
             pid: 4242,
             started_at: UNIX_EPOCH + Duration::from_secs(10),
             args: vec!["/Users/me/.local/bin/worker".into(), "dashboard".into()],
+            build_id: None,
+            binary_sha256: None,
         }],
     };
     let paths = paths(state.path());

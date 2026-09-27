@@ -22,11 +22,24 @@ pub use crate::binary_identity::{
 };
 
 /// One row from the laptop process table. Args are `ps` argv tokens.
+///
+/// `build_id` and `binary_sha256` describe the binary the process loaded.
+/// `ps` does not provide them; callers and tests set them when they know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaptopProcess {
     pub pid: u32,
     pub started_at: SystemTime,
     pub args: Vec<String>,
+    pub build_id: Option<String>,
+    pub binary_sha256: Option<String>,
+}
+
+/// The binary currently installed for this laptop CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledBuild {
+    pub mtime: SystemTime,
+    pub build_id: Option<String>,
+    pub binary_sha256: Option<String>,
 }
 
 pub trait LaptopProcessTable: Send + Sync {
@@ -128,23 +141,57 @@ impl LaptopCliKind {
 pub struct OutdatedLaptopCli {
     pub pid: u32,
     pub kind: LaptopCliKind,
+    /// Set when build identity, not mtime, decided the process is outdated.
+    pub running_build: Option<String>,
+    pub installed_build: Option<String>,
 }
 
-/// Long-running laptop CLIs whose start time is older than the installed
-/// binary mtime. Fail-open callers treat an empty result as "no warning".
+/// Long-running laptop CLIs on an older binary.
+///
+/// When both the process and the installed binary have a SHA-256, that
+/// comparison wins. Otherwise both build ids win. Otherwise the process
+/// start time is compared with the installed file mtime. Fail-open callers
+/// treat an empty result as "no warning".
 pub fn outdated_laptop_cli(
     processes: &[LaptopProcess],
-    installed_mtime: SystemTime,
+    installed: &InstalledBuild,
 ) -> Vec<OutdatedLaptopCli> {
     let mut outdated = Vec::new();
     for process in processes {
         let Some(kind) = laptop_cli_kind(&process.args) else {
             continue;
         };
-        if process.started_at < installed_mtime {
+        let identity_mismatch = match (&process.binary_sha256, &installed.binary_sha256) {
+            (Some(running), Some(current)) => Some(running != current),
+            _ => match (&process.build_id, &installed.build_id) {
+                (Some(running), Some(current)) => Some(running != current),
+                _ => None,
+            },
+        };
+        let is_outdated = match identity_mismatch {
+            Some(mismatched) => mismatched,
+            None => process.started_at < installed.mtime,
+        };
+        if is_outdated {
+            let (running_build, installed_build) = if identity_mismatch == Some(true) {
+                (
+                    process
+                        .build_id
+                        .clone()
+                        .or_else(|| process.binary_sha256.clone()),
+                    installed
+                        .build_id
+                        .clone()
+                        .or_else(|| installed.binary_sha256.clone()),
+                )
+            } else {
+                (None, None)
+            };
             outdated.push(OutdatedLaptopCli {
                 pid: process.pid,
                 kind,
+                running_build,
+                installed_build,
             });
             if outdated.len() == 8 {
                 break;
@@ -157,6 +204,26 @@ pub fn outdated_laptop_cli(
 pub fn format_outdated_laptop_cli(outdated: &[OutdatedLaptopCli]) -> Option<String> {
     if outdated.is_empty() {
         return None;
+    }
+    if outdated.iter().any(|item| item.running_build.is_some()) {
+        return Some(
+            outdated
+                .iter()
+                .map(|item| match (item.running_build.as_deref(), item.installed_build.as_deref()) {
+                    (Some(running), Some(installed)) => format!(
+                        "{} (pid {}) is running {running}; the installed binary is {installed}; restart it",
+                        item.kind.command(),
+                        item.pid
+                    ),
+                    _ => format!(
+                        "{} (pid {}) was started before the installed binary; restart it",
+                        item.kind.command(),
+                        item.pid
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     let names = outdated
         .iter()
@@ -207,6 +274,8 @@ fn parse_ps_line(line: &str, now: SystemTime) -> Option<LaptopProcess> {
         pid,
         started_at,
         args,
+        build_id: None,
+        binary_sha256: None,
     })
 }
 
@@ -267,37 +336,73 @@ mod tests {
         );
     }
 
+    fn process(pid: u32, started_secs: u64, args: &[&str]) -> LaptopProcess {
+        LaptopProcess {
+            pid,
+            started_at: UNIX_EPOCH + Duration::from_secs(started_secs),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            build_id: None,
+            binary_sha256: None,
+        }
+    }
+
+    fn installed_at(secs: u64) -> InstalledBuild {
+        InstalledBuild {
+            mtime: UNIX_EPOCH + Duration::from_secs(secs),
+            build_id: None,
+            binary_sha256: None,
+        }
+    }
+
     #[test]
     fn outdated_cli_uses_start_time_against_binary_mtime() {
-        let installed = UNIX_EPOCH + Duration::from_secs(50);
         let processes = vec![
-            LaptopProcess {
-                pid: 11,
-                started_at: UNIX_EPOCH + Duration::from_secs(10),
-                args: vec!["/bin/worker".into(), "dashboard".into()],
-            },
-            LaptopProcess {
-                pid: 12,
-                started_at: UNIX_EPOCH + Duration::from_secs(80),
-                args: vec!["/bin/worker".into(), "dashboard".into()],
-            },
-            LaptopProcess {
-                pid: 13,
-                started_at: UNIX_EPOCH + Duration::from_secs(10),
-                args: vec!["/bin/worker".into(), "doctor".into()],
-            },
+            process(11, 10, &["/bin/worker", "dashboard"]),
+            process(12, 80, &["/bin/worker", "dashboard"]),
+            process(13, 10, &["/bin/worker", "doctor"]),
         ];
-        let outdated = outdated_laptop_cli(&processes, installed);
+        let outdated = outdated_laptop_cli(&processes, &installed_at(50));
         assert_eq!(
             outdated,
             vec![OutdatedLaptopCli {
                 pid: 11,
                 kind: LaptopCliKind::Dashboard,
+                running_build: None,
+                installed_build: None,
             }]
         );
         assert_eq!(
             format_outdated_laptop_cli(&outdated).as_deref(),
             Some("worker dashboard (pid 11) was started before the installed binary; restart it")
+        );
+    }
+
+    #[test]
+    fn build_identity_wins_over_mtime_when_both_sides_have_it() {
+        let mut started_later = process(21, 80, &["/bin/worker", "dashboard"]);
+        started_later.build_id = Some("0.1.0+old-debug".into());
+        started_later.binary_sha256 = Some("aa".repeat(32));
+        let mut same_bytes_earlier = process(22, 10, &["/bin/worker", "controller", "run"]);
+        same_bytes_earlier.binary_sha256 = Some("bb".repeat(32));
+        let mtime_only = process(23, 10, &["/bin/worker", "dashboard"]);
+        let installed = InstalledBuild {
+            mtime: UNIX_EPOCH + Duration::from_secs(50),
+            build_id: Some("0.1.0+new-debug".into()),
+            binary_sha256: Some("bb".repeat(32)),
+        };
+
+        let outdated =
+            outdated_laptop_cli(&[started_later, same_bytes_earlier, mtime_only], &installed);
+
+        assert_eq!(
+            outdated.iter().map(|item| item.pid).collect::<Vec<_>>(),
+            vec![21, 23]
+        );
+        assert_eq!(
+            format_outdated_laptop_cli(&outdated).as_deref(),
+            Some(
+                "worker dashboard (pid 21) is running 0.1.0+old-debug; the installed binary is 0.1.0+new-debug; restart it worker dashboard (pid 23) was started before the installed binary; restart it"
+            )
         );
     }
 

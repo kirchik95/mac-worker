@@ -4,7 +4,7 @@ use crate::{
     config::Config,
     error::WorkerError,
     inputs::{SelectionFailure, SelectionWarning},
-    laptop::{LaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli},
+    laptop::{InstalledBuild, LaptopProcessTable, format_outdated_laptop_cli, outdated_laptop_cli},
     paths::PathLayout,
     process::ProcessRunner,
     project::ProjectContext,
@@ -387,7 +387,12 @@ fn laptop_binary_issues(
     let Ok(processes) = processes.list() else {
         return Vec::new();
     };
-    let outdated = outdated_laptop_cli(&processes, installed_mtime);
+    let installed = InstalledBuild {
+        mtime: installed_mtime,
+        build_id: Some(crate::build_id::BUILD_ID.to_owned()),
+        binary_sha256: crate::binary_identity::current_binary_sha256(),
+    };
+    let outdated = outdated_laptop_cli(&processes, &installed);
     let Some(message) = format_outdated_laptop_cli(&outdated) else {
         return Vec::new();
     };
