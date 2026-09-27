@@ -6235,6 +6235,154 @@ fn contending_runner_stops_when_its_reservation_token_changes() {
     runner_parent_publication_contention(true);
 }
 
+struct HoldJournalAfterSpawn {
+    held: Mutex<Option<fs::File>>,
+    starts: AtomicUsize,
+}
+
+impl RunnerExecutor for HoldJournalAfterSpawn {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        let file = fs::OpenOptions::new().append(true).open(
+            paths
+                .state
+                .join("runners")
+                .join(task_id.to_string())
+                .join(format!("{turn_id}.log")),
+        )?;
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        *self.held.lock().unwrap() = Some(file);
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        InlineRunnerExecutor.start(paths, task_id, turn_id)
+    }
+}
+
+fn local_wait_handoff_deadline(after_spawn: bool) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture.state.record_runner(fixture.task_id, None).unwrap();
+    let before = fixture.state.load_task(fixture.task_id).unwrap();
+    let owner = *fixture
+        .state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .owner_opt()
+        .unwrap();
+    let executor = HoldJournalAfterSpawn {
+        held: Mutex::new(None),
+        starts: AtomicUsize::new(0),
+    };
+    if !after_spawn {
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .paths
+                    .state
+                    .join("runners")
+                    .join(fixture.task_id.to_string())
+                    .join(format!("{}.log", fixture.turn_id)),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        *executor.held.lock().unwrap() = Some(file);
+    }
+    let selected: &dyn RunnerExecutor = if after_spawn {
+        &executor
+    } else {
+        &DetachedRunnerExecutor
+    };
+    let client = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        selected,
+    );
+    thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = client.wait(
+                WaitSelector::Task(fixture.task_id),
+                Some(Duration::from_millis(150)),
+            );
+            done_tx.send(started.elapsed()).unwrap();
+            result
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        if elapsed.is_err() {
+            // Revoke the test permit before releasing the fence on RED: a
+            // failed regression must never launch a real detached child.
+            fixture
+                .state
+                .adopt_row(fixture.turn_id, ProcessIdentity::new(888_777, 99).unwrap())
+                .unwrap();
+        }
+        executor.held.lock().unwrap().take();
+        let result = waiter.join().unwrap();
+        assert!(
+            elapsed.is_ok(),
+            "handoff outlived wait budget; after_spawn={after_spawn}"
+        );
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    });
+    assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);
+    let entry = fixture.state.queue_entry(fixture.turn_id).unwrap().unwrap();
+    assert_eq!(entry.owner_opt(), Some(&owner));
+    assert!(!entry.is_cancel_requested());
+    if after_spawn {
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(entry.slot_reservation().unwrap().child(), Some(owner));
+        assert!(matches!(
+            start_runner_with_reservation(
+                &fixture.state,
+                &executor,
+                &fixture.paths,
+                fixture.task_id,
+                fixture.turn_id,
+                8,
+                false
+            )
+            .unwrap(),
+            RunnerStart::Pending
+        ));
+        assert_eq!(
+            executor.starts.load(Ordering::SeqCst),
+            1,
+            "bound child must not be spawned twice"
+        );
+    }
+    assert!(!fixture.runner.requests().iter().any(|request| {
+        request
+            .args
+            .last()
+            .is_some_and(|arg| arg == HostOperation::TaskCancel.command())
+    }));
+}
+
+#[test]
+fn local_wait_deadline_bounds_pre_spawn_journal_fence() {
+    local_wait_handoff_deadline(false);
+}
+
+#[test]
+fn local_wait_deadline_bounds_post_bind_journal_fence_without_releasing_child() {
+    local_wait_handoff_deadline(true);
+}
+
 struct DelayedProjectionRemote<'a> {
     inner: &'a AcceptedThenTerminalRunner,
     accepted: Mutex<Option<mpsc::Sender<()>>>,

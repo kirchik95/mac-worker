@@ -485,6 +485,7 @@ impl ClientStateStore {
             None,
             Arc::new(SystemProcessInspector),
             None,
+            WaitDeadline::default(),
         )
     }
 
@@ -499,6 +500,7 @@ impl ClientStateStore {
             None,
             Arc::new(SystemProcessInspector),
             None,
+            WaitDeadline::default(),
         )
     }
 
@@ -513,6 +515,7 @@ impl ClientStateStore {
             Some(point),
             Arc::new(SystemProcessInspector),
             None,
+            WaitDeadline::default(),
         )
     }
 
@@ -524,7 +527,14 @@ impl ClientStateStore {
     where
         I: ProcessInspector + 'static,
     {
-        Self::open_inner(state_root, None, None, Arc::new(inspector), None)
+        Self::open_inner(
+            state_root,
+            None,
+            None,
+            Arc::new(inspector),
+            None,
+            WaitDeadline::default(),
+        )
     }
 
     #[doc(hidden)]
@@ -538,6 +548,7 @@ impl ClientStateStore {
             None,
             Arc::new(SystemProcessInspector),
             Some(hook),
+            WaitDeadline::default(),
         )
     }
 
@@ -550,7 +561,28 @@ impl ClientStateStore {
     where
         I: ProcessInspector + 'static,
     {
-        Self::open_inner(state_root, None, None, Arc::new(inspector), Some(hook))
+        Self::open_inner(
+            state_root,
+            None,
+            None,
+            Arc::new(inspector),
+            Some(hook),
+            WaitDeadline::default(),
+        )
+    }
+
+    pub(crate) fn open_until(
+        state_root: &Path,
+        expires: Option<Instant>,
+    ) -> Result<Self, WorkerError> {
+        Self::open_inner(
+            state_root,
+            None,
+            None,
+            Arc::new(SystemProcessInspector),
+            None,
+            WaitDeadline::until(expires),
+        )
     }
 
     fn open_inner(
@@ -559,7 +591,9 @@ impl ClientStateStore {
         initial_creation_race: Option<ClientStateCreationRacePoint>,
         owner_inspector: Arc<dyn ProcessInspector>,
         concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
+        wait_deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
+        wait_deadline.remaining()?;
         let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
         let sync_counts = Arc::new(SyncCounters::default());
         let creation_race = AtomicU8::new(initial_creation_race.map_or(0, |point| point as u8));
@@ -663,8 +697,12 @@ impl ClientStateStore {
             SyncKind::Root,
             &creation_race,
         )?;
-        let _lock =
-            StateLock::acquire_with_creation_race(root.as_raw_fd(), &sync_counts, &creation_race)?;
+        let _lock = StateLock::acquire_inner(
+            root.as_raw_fd(),
+            &sync_counts,
+            Some(&creation_race),
+            wait_deadline,
+        )?;
         require_same_device(
             root.as_raw_fd(),
             &[
@@ -708,7 +746,7 @@ impl ClientStateStore {
         validate_observation_entries(observations.as_raw_fd())?;
 
         Ok(Self {
-            wait_deadline: WaitDeadline::default(),
+            wait_deadline,
             inner: Arc::new(ClientStateInner {
                 state_root: state_root.to_path_buf(),
                 root,
@@ -6328,19 +6366,6 @@ impl StateLock {
         deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
         Self::acquire_inner(root, sync_counts, None, deadline)
-    }
-
-    fn acquire_with_creation_race(
-        root: RawFd,
-        sync_counts: &SyncCounters,
-        creation_race: &AtomicU8,
-    ) -> Result<Self, WorkerError> {
-        Self::acquire_inner(
-            root,
-            sync_counts,
-            Some(creation_race),
-            WaitDeadline::default(),
-        )
     }
 
     fn acquire_inner(

@@ -75,6 +75,20 @@ pub trait RunnerExecutor: Send + Sync {
         let _ = slot_token;
         self.start(paths, task_id, turn_id)
     }
+
+    /// A local wait may end while the detached task keeps running. Executors
+    /// that wait on local fences must share that caller's absolute budget.
+    fn start_with_slot_until(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+        deadline: Option<Instant>,
+    ) -> Result<RunnerIdentity, WorkerError> {
+        crate::client_state::WaitDeadline::until(deadline).remaining()?;
+        self.start_with_slot(paths, task_id, turn_id, slot_token)
+    }
 }
 
 /// Outcome of a reserved spawn attempt. Only [`Self::Started`] ran `executor.start`.
@@ -124,9 +138,20 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         turn_id: TurnId,
         slot_token: Option<Uuid>,
     ) -> Result<RunnerIdentity, WorkerError> {
+        self.start_with_slot_until(paths, task_id, turn_id, slot_token, None)
+    }
+
+    fn start_with_slot_until(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+        deadline: Option<Instant>,
+    ) -> Result<RunnerIdentity, WorkerError> {
         // Use the same rooted, locked initialization as the child. Never follow
         // a substituted log or chmod an existing target through a pathname.
-        let store = ClientStateStore::open(&paths.state)?;
+        let store = ClientStateStore::open_until(&paths.state, deadline)?;
         drop(open_handoff_journal_for_spawn(
             &store, paths, task_id, turn_id, slot_token,
         )?);
@@ -157,6 +182,7 @@ impl RunnerExecutor for DetachedRunnerExecutor {
                 }
             });
         }
+        store.wait_deadline().remaining()?;
         let child = command.spawn().map_err(WorkerError::Io)?;
         let identity = SystemProcessInspector
             .identity_for_pid(child.id())
@@ -246,6 +272,7 @@ fn open_handoff_journal_for_spawn(
         })
         .transpose()?;
     loop {
+        store.wait_deadline().remaining()?;
         if let Some((token, reserver, owner)) = permit
             && !handoff_spawn_admitted(
                 store.queue_entry(turn_id)?.as_ref(),
@@ -273,6 +300,7 @@ fn open_handoff_journal_for_spawn(
                     ),
                     None => true,
                 };
+                store.wait_deadline().remaining()?;
                 if admitted {
                     return Ok(log);
                 }
@@ -281,7 +309,11 @@ fn open_handoff_journal_for_spawn(
             }
             None if Instant::now() < deadline => {
                 store.runner_log_contention();
-                std::thread::sleep(WAIT_POLL);
+                std::thread::sleep(
+                    store
+                        .wait_deadline()
+                        .cap(WAIT_POLL.min(deadline.saturating_duration_since(Instant::now())))?,
+                );
             }
             None => {
                 return Err(WorkerError::Io(std::io::Error::from(
@@ -2221,7 +2253,13 @@ pub fn start_runner_with_reservation(
             let expected = client_state
                 .queue_entry(turn_id)?
                 .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
-            match executor.start_with_slot(paths, task_id, turn_id, Some(token)) {
+            match executor.start_with_slot_until(
+                paths,
+                task_id,
+                turn_id,
+                Some(token),
+                client_state.wait_deadline().expires(),
+            ) {
                 Ok(identity) => {
                     let child = identity.process_identity();
                     if let Err(error) = client_state.bind_runner_slot_child(turn_id, token, child) {
@@ -2292,15 +2330,23 @@ fn open_handoff_journal_after_bind(
 ) -> Result<LogWriter, WorkerError> {
     let deadline = Instant::now() + RUNNER_HANDOFF_TIMEOUT;
     loop {
+        client_state.wait_deadline().remaining()?;
         if client_state.queue_entry(turn_id)?.as_ref() != Some(expected) {
             let _ = client_state.release_runner_slot(turn_id, token, reserver);
             return Err(task_error("TASK_BUSY", "task turn changed during handoff"));
         }
         match LogWriter::try_open(&paths.state, task_id, turn_id)? {
-            Some(log) => return Ok(log),
+            Some(log) => {
+                client_state.wait_deadline().remaining()?;
+                return Ok(log);
+            }
             None if Instant::now() < deadline => {
                 client_state.runner_log_contention();
-                std::thread::sleep(WAIT_POLL);
+                std::thread::sleep(
+                    client_state
+                        .wait_deadline()
+                        .cap(WAIT_POLL.min(deadline.saturating_duration_since(Instant::now())))?,
+                );
             }
             None => {
                 return Err(WorkerError::Io(std::io::Error::from(
