@@ -213,6 +213,94 @@ fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_
     .unwrap();
 }
 
+fn write_head_oid(store: &HostStore, head: Option<BaseOid>) {
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    let replacement = TaskStatus::new(
+        status.state(),
+        status.last_outcome().cloned(),
+        status.worker().map(str::to_owned),
+        status.session_present(),
+        head,
+        status.summary().map(str::to_owned),
+        status.questions().to_vec(),
+        status.files_changed().to_vec(),
+        status.diff_stat().map(str::to_owned),
+        status.turns().to_vec(),
+        status.updated_at_millis(),
+    )
+    .unwrap();
+    fs::write(
+        store
+            .task_dir(PROJECT_ID, task_id())
+            .unwrap()
+            .join("status.json"),
+        serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
+}
+
+fn expected_mirror_diff(mirror: &Path, base: &str, result: &str, stat: bool) -> String {
+    let mut command = Command::new("/usr/bin/git");
+    command
+        .arg("--git-dir")
+        .arg(mirror)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("diff");
+    if stat {
+        command.arg("--stat");
+    }
+    let output = command.arg(base).arg(result).output().expect("diff mirror");
+    assert!(
+        output.status.success(),
+        "mirror diff failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Publish a committed workspace change, then close the task the way a
+/// successful `--close-on done` turn does: the workspace is deleted and the
+/// mirror keeps the base and result commits.
+fn publish_and_close(store: &HostStore, base_oid: BaseOid) -> String {
+    let (request, lease) = acquire_task_lease(store);
+    prepare_task(store, base_oid);
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    fs::write(workspace.join("a.txt"), b"changed\n").unwrap();
+    let commit = git_status(
+        &workspace,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-am",
+            "result",
+        ],
+    );
+    assert!(
+        commit.status.success(),
+        "result commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let head = git(&workspace, &["rev-parse", "HEAD"]);
+    TaskStore::new(store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    idle_task_for_close(store, &request, &lease, task_id());
+    TaskStore::new(store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+    assert!(
+        store
+            .task_workspace_if_present(PROJECT_ID, task_id())
+            .unwrap()
+            .is_none()
+    );
+    head
+}
+
 #[derive(Clone)]
 struct NativeDeleteRunner {
     requests: Arc<Mutex<Vec<ProcessRequest>>>,
@@ -726,6 +814,154 @@ fn diff_uses_private_index_and_bounds_escaped_output() {
         .unwrap();
     assert!(large.truncated());
     assert!(large.text().len() <= MAX_DIFF_BYTES);
+}
+
+#[test]
+fn closed_task_diff_uses_retained_base_and_result() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    let head = publish_and_close(&store, base_oid.clone());
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let expected = expected_mirror_diff(mirror.path(), base_oid.as_str(), &head, false);
+    assert!(
+        expected.contains("+changed"),
+        "fixture diff did not include the result: {expected}"
+    );
+
+    let diff = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+    assert_eq!(diff.text(), expected);
+    assert!(!diff.truncated());
+
+    let expected_stat = expected_mirror_diff(mirror.path(), base_oid.as_str(), &head, true);
+    let stat = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+    assert_eq!(stat.text(), expected_stat);
+    assert!(stat.text().contains("a.txt"));
+
+    let head_oid: BaseOid = head.parse().unwrap();
+    write_head_oid(&store, Some(head_oid));
+    let recorded = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+    assert_eq!(recorded.text(), expected);
+
+    let removed_base = git_status(
+        mirror.path(),
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/mac-worker/bases/{}", task_id()),
+        ],
+    );
+    assert!(
+        removed_base.status.success(),
+        "base pin delete failed: {}",
+        String::from_utf8_lossy(&removed_base.stderr)
+    );
+    let unpinned_base = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+    assert_eq!(unpinned_base.text(), expected);
+}
+
+#[test]
+fn open_task_diff_reads_the_workspace_not_the_mirror() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    acquire_lease(&store);
+    prepare_task(&store, base_oid);
+    rewrite_status(&store, task_id(), TaskState::Open, 2);
+    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
+    let index = workspace.join(".git/index");
+    let before = fs::read(&index).unwrap();
+    fs::write(workspace.join("a.txt"), b"open-only\n").unwrap();
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    assert!(!git_ref_exists(
+        &mirror,
+        &format!("refs/heads/task/{}", task_id())
+    ));
+
+    let diff = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap();
+    assert!(
+        diff.text().contains("+open-only"),
+        "open diff must include the uncommitted workspace edit: {}",
+        diff.text()
+    );
+    assert!(!diff.truncated());
+    assert_eq!(fs::read(&index).unwrap(), before);
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id()).unwrap().state(),
+        TaskState::Open
+    );
+}
+
+#[test]
+fn closed_task_diff_without_retained_result_is_not_task_not_found() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    publish_and_close(&store, base_oid);
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    let deleted = git_status(
+        mirror.path(),
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/task/{}", task_id()),
+        ],
+    );
+    assert!(
+        deleted.status.success(),
+        "result pin delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(
+        store
+            .task_dir(PROJECT_ID, task_id())
+            .unwrap()
+            .join("meta.json")
+            .exists()
+    );
+
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap_err();
+    assert_ne!(error.public_code(), "TASK_NOT_FOUND");
+    assert_eq!(
+        error.public_message(),
+        "task workspace is closed and its result is no longer retained"
+    );
+}
+
+#[test]
+fn closed_task_diff_refuses_a_result_that_does_not_match_the_record() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    publish_and_close(&store, base_oid.clone());
+    write_head_oid(&store, Some(base_oid));
+
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap_err();
+    assert_ne!(error.public_code(), "TASK_NOT_FOUND");
+    assert_eq!(
+        error.public_message(),
+        "task workspace is closed and its retained commits do not match the task record"
+    );
+}
+
+#[test]
+fn missing_task_diff_stays_task_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = HostStore::open(&temp.path().join("host")).unwrap();
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_NOT_FOUND");
+    assert_eq!(
+        error.public_message(),
+        "task metadata or workspace is absent"
+    );
 }
 
 #[test]
