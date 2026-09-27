@@ -1518,32 +1518,16 @@ pub(crate) fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
     if let Some(decoded) =
         crate::error::error_from_host_category(error.error().code(), error.error().category())
     {
-        return Some(decoded);
-    }
-    let capacity_code = match error.error().code() {
-        "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),
-        "INSUFFICIENT_DISK" => Some("INSUFFICIENT_DISK"),
-        "MEMORY_PRESSURE" => Some("MEMORY_PRESSURE"),
-        "SWAP_LIMIT" => Some("SWAP_LIMIT"),
-        _ => None,
-    };
-    if let Some(code) = capacity_code {
-        // Host-control admission payloads are owned strings from the wire;
-        // they are not proven to contain only worker and capability names.
-        return Some(WorkerError::Capacity {
-            code,
-            message: error.error().message().to_owned().into(),
-            public: false,
+        return Some(match decoded {
+            // Keep admission details for internal callers, but never promote
+            // remote text to public output. The catalog still owns exit and hint.
+            WorkerError::Capacity { code, .. } => WorkerError::Capacity {
+                code,
+                message: error.error().message().to_owned().into(),
+                public: false,
+            },
+            other => other,
         });
-    }
-    // The host envelope replaces task messages with a fixed label. This code's
-    // operator text is a static sentence, so the laptop can restore it without
-    // trusting the wire string.
-    if error.error().code() == "RESULT_NOT_RETAINED" {
-        return Some(WorkerError::task(
-            "RESULT_NOT_RETAINED",
-            "task workspace is closed and its result is no longer retained",
-        ));
     }
     Some(WorkerError::Protocol(format!(
         "{}: {}",
@@ -2767,6 +2751,37 @@ mod exec_inheritance_tests {
 #[cfg(test)]
 mod host_control_error_tests {
     use super::{HostControlError, decode_host_control_error};
+
+    #[test]
+    fn catalog_capacity_errors_preserve_remote_details_privately() {
+        let planted = "/Users/alice/PLANTED_HOST_PATH";
+        for code in [
+            "CAPACITY_BUSY",
+            "INSUFFICIENT_DISK",
+            "MEMORY_PRESSURE",
+            "SWAP_LIMIT",
+            "CAPABILITY_MISSING",
+        ] {
+            for category in [None, Some("usage"), Some("capacity")] {
+                let wire = match category {
+                    Some(category) => HostControlError::with_category(code, planted, category),
+                    None => HostControlError::new(code, planted),
+                }
+                .unwrap();
+                let mut bytes = serde_json::to_vec(&wire).unwrap();
+                bytes.push(b'\n');
+                let error = decode_host_control_error(&bytes).unwrap();
+                assert!(
+                    matches!(&error, crate::error::WorkerError::Capacity { message, public: false, .. } if message == planted)
+                );
+                assert_eq!(error.public_code(), code);
+                assert_eq!(error.exit_code(), 75);
+                let diagnostic = crate::error::operator_diagnostic(&error);
+                assert!(diagnostic.contains(crate::error::hint_for(code).unwrap()));
+                assert!(!diagnostic.contains("PLANTED"));
+            }
+        }
+    }
 
     #[test]
     fn host_error_responses_still_require_canonical_bytes() {
