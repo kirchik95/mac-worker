@@ -16,7 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{inputs::RelativePath, job::MAX_LOG_CHUNK_BYTES};
+use crate::{client_state::WaitDeadline, inputs::RelativePath, job::MAX_LOG_CHUNK_BYTES};
 
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -5713,14 +5713,15 @@ impl<'a> PrivateOperation<'a> {
             // The live lock lets cleanup-evidence validation distinguish an
             // in-flight module-private operation from abandoned legacy
             // residue without ever adopting or deleting the latter.
-            cvt(unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) })?;
-            return Ok(Self {
+            let operation = Self {
                 namespace,
                 name,
                 directory,
                 identity: FileIdentity::from_stat(&opened),
                 cleaned: false,
-            });
+            };
+            WaitDeadline::current().lock_io(operation.directory.as_raw_fd(), libc::LOCK_EX)?;
+            return Ok(operation);
         }
         Err(os_error(libc::EEXIST))
     }
@@ -6431,7 +6432,7 @@ fn open_cleanup_record(
     if lock {
         // SAFETY: the descriptor is live and flock retains neither pointer nor
         // ownership. The intent lock serializes cooperating retry processes.
-        cvt(unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX) })?;
+        WaitDeadline::current().lock_io(descriptor.as_raw_fd(), libc::LOCK_EX)?;
     }
     let opened = stat_fd(descriptor.as_raw_fd())?;
     let current = stat_at(parent, name)?;
@@ -6780,11 +6781,21 @@ fn lock_cleanup_process_serialization_key(key: String) -> io::Result<CleanupProc
         Err(poisoned) => poisoned.into_inner(),
     };
     while active.contains(&key) {
-        active = match CLEANUP_PROCESS_KEYS.released.wait(active) {
-            Ok(active) => active,
-            Err(poisoned) => poisoned.into_inner(),
+        active = match WaitDeadline::current().remaining_io()? {
+            Some(remaining) => match CLEANUP_PROCESS_KEYS
+                .released
+                .wait_timeout(active, remaining)
+            {
+                Ok((active, _)) => active,
+                Err(poisoned) => poisoned.into_inner().0,
+            },
+            None => match CLEANUP_PROCESS_KEYS.released.wait(active) {
+                Ok(active) => active,
+                Err(poisoned) => poisoned.into_inner(),
+            },
         };
     }
+    WaitDeadline::current().remaining_io()?;
     active.insert(key.clone());
     Ok(CleanupProcessKeyGuard { key })
 }
@@ -6803,7 +6814,7 @@ fn with_cleanup_namespace_lock<T>(
         "namespace:{:016x}:{:016x}",
         namespace.identity.device, namespace.identity.inode
     ))?;
-    cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+    WaitDeadline::current().lock_io(namespace.directory.as_raw_fd(), libc::LOCK_EX)?;
     let result = action();
     let unlock = cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_UN) });
     match (result, unlock) {
@@ -7219,7 +7230,7 @@ fn wait_for_live_private_operation(namespace: &PrivateNamespace, name: &CStr) ->
                 || error.raw_os_error() == Some(libc::EAGAIN) => {}
         Err(error) => return Err(error),
     }
-    cvt(unsafe { libc::flock(operation.as_raw_fd(), libc::LOCK_EX) })?;
+    WaitDeadline::current().lock_io(operation.as_raw_fd(), libc::LOCK_EX)?;
     match stat_at(namespace.directory.as_raw_fd(), name) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Ok(current) if same_file(&opened, &current) => Ok(false),
@@ -8582,7 +8593,7 @@ fn open_or_create_cleanup_bootstrap<'a>(
         // SAFETY: the namespace descriptor is live. This lock serializes the
         // same-key scan/create step between cooperating retriers. It is
         // released before waiting for the operation lock.
-        cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+        WaitDeadline::current().lock_io(namespace.directory.as_raw_fd(), libc::LOCK_EX)?;
         let initial = (|| {
             if cleanup_optional_stat(namespace.directory.as_raw_fd(), &intent_name)?.is_some() {
                 return Ok(None);
@@ -8650,8 +8661,8 @@ fn open_or_create_cleanup_bootstrap<'a>(
             injected_cleanup_bootstrap_result()?;
         }
         // SAFETY: no namespace lock is held while waiting for the operation.
-        cvt(unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) })?;
-        cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+        WaitDeadline::current().lock_io(directory.as_raw_fd(), libc::LOCK_EX)?;
+        WaitDeadline::current().lock_io(namespace.directory.as_raw_fd(), libc::LOCK_EX)?;
         let handoff = (|| {
             if cleanup_optional_stat(namespace.directory.as_raw_fd(), &intent_name)?.is_some() {
                 return Ok(None);
@@ -9977,7 +9988,7 @@ fn remove_empty_cleanup_operation(
     namespace: &PrivateNamespace,
     operation: &mut PrivateOperation<'_>,
 ) -> io::Result<()> {
-    cvt(unsafe { libc::flock(namespace.directory.as_raw_fd(), libc::LOCK_EX) })?;
+    WaitDeadline::current().lock_io(namespace.directory.as_raw_fd(), libc::LOCK_EX)?;
     let removal = operation
         .remove_empty_owned()
         .and_then(|()| cvt(unsafe { libc::fsync(namespace.directory.as_raw_fd()) }));
@@ -11951,6 +11962,73 @@ mod tests {
         unsupported_rename_no_replace,
     };
     use crate::inputs::RelativePath;
+
+    fn wait_deadline_cleanup_lock(same_process: bool) {
+        use crate::client_state::WaitDeadline;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = tempfile::tempdir().unwrap();
+        let physical = fixture.path().canonicalize().unwrap();
+        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = RootedDir::open(&physical).unwrap();
+        let metadata = super::stat_fd(root.root.as_raw_fd()).unwrap();
+        let namespace = PrivateNamespace::open_or_create_at(&root.root, metadata.st_dev).unwrap();
+        let key = format!(
+            "namespace:{:016x}:{:016x}",
+            namespace.identity.device, namespace.identity.inode
+        );
+        let process_guard =
+            same_process.then(|| super::lock_cleanup_process_serialization_key(key).unwrap());
+        let file_guard = (!same_process).then(|| {
+            let file = fs::File::open(physical.join(".mac-worker-rooted-fs")).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            file
+        });
+        let continued = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let namespace = &namespace;
+            let continued = &continued;
+            let waiter = scope.spawn(move || {
+                let started = std::time::Instant::now();
+                let result = WaitDeadline::new(Some(Duration::from_millis(150))).in_scope(|| {
+                    super::with_cleanup_namespace_lock(namespace, || {
+                        continued.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                });
+                done_tx.send(started.elapsed()).unwrap();
+                result
+            });
+            let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+            drop(process_guard);
+            drop(file_guard);
+            let result = waiter.join().unwrap();
+            assert!(
+                elapsed.is_ok(),
+                "cleanup lock exceeded wait budget; same_process={same_process}"
+            );
+            assert!(elapsed.unwrap() < Duration::from_secs(1));
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            assert!(
+                !continued.load(Ordering::SeqCst),
+                "expired recovery must not continue"
+            );
+        });
+        super::with_cleanup_namespace_lock(&namespace, || Ok(())).unwrap();
+    }
+
+    #[test]
+    fn wait_deadline_bounds_cleanup_namespace_lock() {
+        wait_deadline_cleanup_lock(false);
+    }
+
+    #[test]
+    fn wait_deadline_bounds_cleanup_process_key() {
+        wait_deadline_cleanup_lock(true);
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum UnsafePrivateReadReplacement {

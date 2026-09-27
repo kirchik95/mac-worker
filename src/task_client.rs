@@ -4039,16 +4039,18 @@ impl<'a> TaskClient<'a> {
         let state = self.client_state.with_wait_deadline(deadline);
         let client = TaskClient::new(&runner, self.config, self.paths, &state, self.executor)
             .with_herdr_notifier(self.herdr_notifier.clone());
-        loop {
-            deadline.remaining()?;
-            let snapshot = client.wait_poll(selector);
-            deadline.remaining()?;
-            let snapshot = snapshot?;
-            if snapshot.quiescent() {
-                return Ok(WaitReport::new(snapshot.task_ids, snapshot.exit_code));
+        deadline.in_scope(|| {
+            loop {
+                deadline.remaining()?;
+                let snapshot = client.wait_poll(selector);
+                deadline.remaining()?;
+                let snapshot = snapshot?;
+                if snapshot.quiescent() {
+                    return Ok(WaitReport::new(snapshot.task_ids, snapshot.exit_code));
+                }
+                std::thread::sleep(deadline.poll_delay()?);
             }
-            std::thread::sleep(deadline.poll_delay()?);
-        }
+        })
     }
 
     /// One selected-ID reconcile plus DAG-aware quiescence. Controller wait

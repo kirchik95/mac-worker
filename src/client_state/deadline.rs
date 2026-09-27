@@ -1,4 +1,6 @@
 use std::{
+    cell::Cell,
+    io,
     os::fd::RawFd,
     time::{Duration, Instant},
 };
@@ -11,7 +13,37 @@ pub(crate) struct WaitDeadline {
     expires: Option<Instant>,
 }
 
+thread_local! {
+    // Filesystem cleanup and Git retries are synchronous and shared with
+    // non-wait callers. Scope the same budget through those lower helpers
+    // without changing their ownership or recovery APIs.
+    static CURRENT: Cell<WaitDeadline> = const { Cell::new(WaitDeadline { expires: None }) };
+}
+
+struct RestoreDeadline(WaitDeadline);
+
+impl Drop for RestoreDeadline {
+    fn drop(&mut self) {
+        CURRENT.set(self.0);
+    }
+}
+
 impl WaitDeadline {
+    pub(crate) fn current() -> Self {
+        CURRENT.get()
+    }
+
+    pub(crate) fn in_scope<T>(self, action: impl FnOnce() -> T) -> T {
+        let previous = Self::current();
+        let expires = match (self.expires, previous.expires) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        let _restore = RestoreDeadline(previous);
+        CURRENT.set(Self::until(expires));
+        action()
+    }
+
     pub(crate) fn new(timeout: Option<Duration>) -> Self {
         Self::until(timeout.and_then(|timeout| Instant::now().checked_add(timeout)))
     }
@@ -39,6 +71,21 @@ impl WaitDeadline {
         self.remaining_at(Instant::now())
     }
 
+    pub(crate) fn remaining_io(self) -> io::Result<Option<Duration>> {
+        self.remaining().map_err(Self::io_error)
+    }
+
+    pub(crate) fn lock_io(self, fd: RawFd, operation: libc::c_int) -> io::Result<()> {
+        self.lock(fd, operation).map_err(Self::io_error)
+    }
+
+    fn io_error(error: WorkerError) -> io::Error {
+        match error {
+            WorkerError::Io(error) => error,
+            error => io::Error::new(io::ErrorKind::TimedOut, error),
+        }
+    }
+
     pub(crate) fn cap(self, maximum: Duration) -> Result<Duration, WorkerError> {
         Ok(self
             .remaining()?
@@ -60,7 +107,12 @@ impl WaitDeadline {
             self.remaining()?;
             match super::cvt(unsafe { libc::flock(fd, operation | libc::LOCK_NB) }) {
                 Ok(()) => {
-                    self.remaining()?;
+                    if let Err(error) = self.remaining() {
+                        // In particular, namespace descriptors can outlive a
+                        // failed acquisition; never leave an expired lock held.
+                        let _ = super::cvt(unsafe { libc::flock(fd, libc::LOCK_UN) });
+                        return Err(error);
+                    }
                     return Ok(());
                 }
                 Err(error) if super::lock_would_block(&error) => {

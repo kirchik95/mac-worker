@@ -672,7 +672,18 @@ fn local_wait_held_lock(relative_lock: &str) {
             .unwrap(),
         )
         .unwrap();
-    let held = fs::File::open(paths.state.join(relative_lock)).unwrap();
+    let lock_path = paths.state.join(relative_lock);
+    let private_operation = relative_lock.starts_with("tasks/");
+    if private_operation {
+        fs::create_dir_all(&lock_path).unwrap();
+        fs::set_permissions(
+            lock_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let held = fs::File::open(&lock_path).unwrap();
     assert_eq!(
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
@@ -682,6 +693,7 @@ fn local_wait_held_lock(relative_lock: &str) {
     let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
     std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let client = &client;
         let waiter = scope.spawn(move || {
             let started = Instant::now();
             let result = client.wait(
@@ -693,6 +705,11 @@ fn local_wait_held_lock(relative_lock: &str) {
         });
         let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
         // Always release and join before asserting so the RED run cannot hang.
+        if private_operation {
+            // A live private operation removes its name before releasing its lock.
+            assert!(lock_path.exists());
+            fs::remove_dir(&lock_path).unwrap();
+        }
         drop(held);
         let result = waiter.join().unwrap();
         assert!(
@@ -703,8 +720,14 @@ fn local_wait_held_lock(relative_lock: &str) {
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(store.load_task(task_id).unwrap(), record);
-    assert_eq!(store.queue_entry(turn_id).unwrap(), Some(entry));
+    assert_eq!(store.queue_entry(turn_id).unwrap(), Some(entry.clone()));
     assert_eq!(*remote.status.lock().unwrap(), *record.status());
+    if private_operation {
+        // The next selected recovery completes once the live operation finishes.
+        client.reconcile_runners().unwrap();
+        assert_eq!(store.load_task(task_id).unwrap(), record);
+        assert_eq!(store.queue_entry(turn_id).unwrap(), Some(entry));
+    }
 }
 
 #[test]
@@ -720,6 +743,14 @@ fn local_wait_deadline_bounds_state_marker_lock() {
 #[test]
 fn local_wait_deadline_bounds_queue_marker_lock() {
     local_wait_held_lock("queue/lock");
+}
+
+#[test]
+fn local_wait_deadline_bounds_live_filesystem_recovery_operation() {
+    local_wait_held_lock(&format!(
+        "tasks/.mac-worker-rooted-fs/operation-{}",
+        Uuid::new_v4()
+    ));
 }
 
 fn retrying_delivery(turn: JobId, head: BaseOid) -> OriginDelivery {

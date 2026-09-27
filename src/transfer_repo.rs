@@ -2741,6 +2741,7 @@ pub(crate) fn retry_result_ref_update(
 ) -> Result<ProcessResult, WorkerError> {
     const ATTEMPTS: usize = 3;
     for attempt in 0..ATTEMPTS {
+        WaitDeadline::current().remaining()?;
         let result = operation()?;
         if result.status.success() {
             return Ok(result);
@@ -2754,7 +2755,7 @@ pub(crate) fn retry_result_ref_update(
             return Err(git_error(failure_code, "result Git command failed"));
         }
         if attempt + 1 < ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(WaitDeadline::current().cap(Duration::from_millis(25))?);
         }
     }
     Err(git_error(
@@ -3466,6 +3467,31 @@ fn task_config(message: impl Into<std::borrow::Cow<'static, str>>) -> WorkerErro
 mod tests {
     use super::*;
     use crate::process::SystemProcessRunner;
+
+    #[test]
+    fn wait_deadline_bounds_result_ref_retry_delay() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut attempts = 0;
+        let error = WaitDeadline::new(Some(Duration::from_millis(5))).in_scope(|| {
+            retry_result_ref_update(
+                || {
+                    attempts += 1;
+                    Ok(ProcessResult {
+                        status: std::process::ExitStatus::from_raw(1 << 8),
+                        stdout: vec![],
+                        stderr: b"cannot lock ref: .lock file exists".to_vec(),
+                    })
+                },
+                "RESULT_FETCH_FAILED",
+            )
+            .unwrap_err()
+        });
+        assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+        assert_eq!(
+            attempts, 1,
+            "no Git retry may start after the budget expires"
+        );
+    }
 
     fn user_repository(root: &Path) -> PathBuf {
         let user = root.join("user");
