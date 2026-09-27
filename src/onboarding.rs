@@ -351,6 +351,18 @@ fn install_guide(agent: &str) -> &'static str {
     }
 }
 
+fn login_command(agent: &str) -> &'static str {
+    match agent {
+        "codex" => "codex login --device-auth (or codex login in a desktop session)",
+        "cursor" => {
+            "cursor-agent login; see the environment-profile guide for headless Keychain access"
+        }
+        "opencode" => "opencode auth login",
+        "claude" => "claude auth login; see the environment-profile guide if using an API key",
+        _ => unreachable!("validated agent"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::install_guide;
@@ -361,17 +373,5 @@ mod tests {
         assert!(guide.contains(r#"npm install -g --prefix "$HOME/.local" @openai/codex"#));
         assert!(!guide.contains("brew install --cask"));
         assert!(guide.contains("https://developers.openai.com/codex/cli/"));
-    }
-}
-
-fn login_command(agent: &str) -> &'static str {
-    match agent {
-        "codex" => "codex login --device-auth (or codex login in a desktop session)",
-        "cursor" => {
-            "cursor-agent login; see the environment-profile guide for headless Keychain access"
-        }
-        "opencode" => "opencode auth login",
-        "claude" => "claude auth login; see the environment-profile guide if using an API key",
-        _ => unreachable!("validated agent"),
     }
 }
