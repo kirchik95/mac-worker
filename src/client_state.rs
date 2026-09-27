@@ -196,6 +196,7 @@ pub enum ClientStateConcurrencyPoint {
     RunnerLogContention,
     RunnerSlotReservation,
     AfterTaskFetchLoad,
+    BeforeTaskMutation,
 }
 
 /// Ordinary task updates may skip a durable exchange when the complete
@@ -2179,8 +2180,10 @@ impl ClientStateStore {
     #[doc(hidden)]
     pub fn clear_submission_intent(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionIntentClear);
-        let result = self.update_task_before_final_sync(
-            replacement,
+        let result = self.mutate_task_before_final_sync(
+            replacement.meta().task_id(),
+            replacement.status().turns().last().map(TurnSummary::turn_id),
+            LocalTaskRecord::without_submission_intent,
             || {
                 if self.take_fault(
                     ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
@@ -2201,7 +2204,7 @@ impl ClientStateStore {
                 ClientStateConcurrencyPoint::SubmissionIntentClearResultUncertain,
             );
         }
-        result
+        result.map(|_| ())
     }
 
     #[doc(hidden)]
@@ -2674,21 +2677,72 @@ impl ClientStateStore {
         }
     }
 
-    pub fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
-        self.update_task_before_final_sync(replacement, || Ok(()), IdenticalTaskWrite::Skip)
+    #[cfg(test)]
+    pub(crate) fn update_task(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        let current = self.load_task(replacement.meta().task_id())?;
+        if self.update_task_if_current(&current, replacement)? {
+            Ok(())
+        } else {
+            Err(queue_error(
+                "TASK_STALE",
+                "task fixture changed concurrently",
+            ))
+        }
     }
 
-    fn update_task_before_final_sync<F>(
+    /// Apply a narrow change to the freshly read task under the state lock.
+    /// `None` fences a task with no recorded turn; it is not an unfenced write.
+    /// The closure must not perform Git, SSH, or other blocking I/O.
+    pub fn mutate_task<F>(
         &self,
-        replacement: LocalTaskRecord,
-        before_final_sync: F,
-        identical: IdenticalTaskWrite,
-    ) -> Result<(), WorkerError>
+        task_id: TaskId,
+        expected_turn: Option<TurnId>,
+        mutate: F,
+    ) -> Result<LocalTaskRecord, WorkerError>
     where
-        F: FnOnce() -> io::Result<()>,
+        F: FnOnce(&LocalTaskRecord) -> Result<LocalTaskRecord, WorkerError>,
     {
+        self.mutate_task_before_final_sync(
+            task_id,
+            expected_turn,
+            mutate,
+            || Ok(()),
+            IdenticalTaskWrite::Skip,
+        )
+    }
+
+    fn mutate_task_before_final_sync<F, S>(
+        &self,
+        task_id: TaskId,
+        expected_turn: Option<TurnId>,
+        mutate: F,
+        before_final_sync: S,
+        identical: IdenticalTaskWrite,
+    ) -> Result<LocalTaskRecord, WorkerError>
+    where
+        F: FnOnce(&LocalTaskRecord) -> Result<LocalTaskRecord, WorkerError>,
+        S: FnOnce() -> io::Result<()>,
+    {
+        self.reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
         let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
-        self.update_task_locked_before_final_sync(replacement, before_final_sync, identical)
+        let current = self.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) != expected_turn {
+            return Err(queue_error(
+                "TASK_STALE",
+                "task turn changed before mutation",
+            ));
+        }
+        let replacement = mutate(&current)?;
+        if replacement.meta().task_id() != task_id {
+            return Err(invalid_state("task mutation changed task identity"));
+        }
+        self.replace_task_locked_if_current(
+            replacement.clone(),
+            before_final_sync,
+            Some(&current),
+            identical,
+        )?;
+        Ok(replacement)
     }
 
     /// Publish a remote projection only if the complete task snapshot used by
@@ -2970,9 +3024,11 @@ impl ClientStateStore {
         runner: Option<RunnerIdentity>,
     ) -> Result<LocalTaskRecord, WorkerError> {
         let record = self.load_task(task_id)?;
-        let replacement = record.with_runner(runner)?;
-        self.update_task(replacement.clone())?;
-        Ok(replacement)
+        self.mutate_task(
+            task_id,
+            record.status().turns().last().map(TurnSummary::turn_id),
+            |current| current.with_runner(runner),
+        )
     }
 
     pub fn runner_liveness(&self, task_id: TaskId) -> Result<Option<RunnerState>, WorkerError> {

@@ -4638,7 +4638,11 @@ impl<'a> TaskClient<'a> {
             TaskState::Active => cancelled_followup_status(record.status())?,
             _ => record.status().clone(),
         };
-        self.client_state.update_task(record.with_status(status)?)?;
+        self.client_state.mutate_task(
+            task,
+            record.status().turns().last().map(TurnSummary::turn_id),
+            |current| current.with_status(status),
+        )?;
         let outcome = if record.abandon_code() == Some("RUNNER_HANDOFF_FAILED") {
             TaskOutcome::failed("RUNNER_HANDOFF_FAILED")
         } else {
@@ -4678,19 +4682,25 @@ impl<'a> TaskClient<'a> {
         if record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE) {
             return Ok(record.clone());
         }
-        let status = abandoned_status(record.status(), SUBMISSION_ROLLBACK_INCOMPLETE)?;
-        let pending = record
-            .clone()
-            .with_status(status)?
-            .with_abandon_code(Some(SUBMISSION_ROLLBACK_INCOMPLETE.to_owned()))?
-            .with_submission_rollback_turn_id(turn_id)?;
         // Do not begin compensation until the durable recovery marker exists.
         // A transient replacement race is safe to retry here; if it persists,
         // this returns with the original complete submission untouched.
-        if self.client_state.update_task(pending.clone()).is_err() {
-            self.client_state.update_task(pending.clone())?;
-        }
-        Ok(pending)
+        let mark = || {
+            self.client_state.mutate_task(
+                record.meta().task_id(),
+                record.status().turns().last().map(TurnSummary::turn_id),
+                |current| {
+                    current
+                        .with_status(abandoned_status(
+                            current.status(),
+                            SUBMISSION_ROLLBACK_INCOMPLETE,
+                        )?)?
+                        .with_abandon_code(Some(SUBMISSION_ROLLBACK_INCOMPLETE.to_owned()))?
+                        .with_submission_rollback_turn_id(turn_id)
+                },
+            )
+        };
+        mark().or_else(|_| mark())
     }
 
     fn complete_submission_rollback(
@@ -5153,10 +5163,15 @@ impl<'a> TaskClient<'a> {
             };
             let record = self.client_state.load_task(task_id)?;
             let status = abandoned_status(record.status(), "RUNNER_HANDOFF_FAILED")?;
-            let record = record
-                .with_status(status)?
-                .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".into()))?;
-            self.client_state.update_task(record)?;
+            self.client_state.mutate_task(
+                task_id,
+                record.status().turns().last().map(TurnSummary::turn_id),
+                |current| {
+                    current
+                        .with_status(status)?
+                        .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".into()))
+                },
+            )?;
             log.finish_local(
                 task_id,
                 turn_id,

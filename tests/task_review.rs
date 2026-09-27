@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     ffi::OsStr,
     os::unix::process::ExitStatusExt,
@@ -545,7 +549,7 @@ fn fetched_head_update_preserves_concurrent_close_intent() {
     let fenced = record
         .with_close_intent(TaskCloseIntent::from_record(&record, false).unwrap())
         .unwrap();
-    harness.store.update_task(fenced).unwrap();
+    harness.store.replace_task_fixture(fenced).unwrap();
 
     assert!(
         harness
@@ -571,7 +575,7 @@ fn fetched_head_update_preserves_concurrent_closed_record() {
             record.status().turns().to_vec(),
         ))
         .unwrap();
-    harness.store.update_task(closed).unwrap();
+    harness.store.replace_task_fixture(closed).unwrap();
 
     assert!(
         harness
@@ -603,7 +607,7 @@ fn fetched_head_update_skips_a_newer_turn() {
     let newer = record
         .with_status(status_clone_with(record.status(), TaskState::Open, turns))
         .unwrap();
-    harness.store.update_task(newer).unwrap();
+    harness.store.replace_task_fixture(newer).unwrap();
 
     assert!(
         !harness
@@ -636,7 +640,7 @@ fn fetched_head_update_interleaves_with_close_intent_publish() {
             .unwrap();
         thread::spawn(move || {
             barrier.wait();
-            store.update_task(fenced).unwrap();
+            store.replace_task_fixture(fenced).unwrap();
             barrier.wait();
         })
     };
@@ -662,7 +666,7 @@ fn cli_status_skips_remote_closed_overlay_while_close_intent_is_set() {
     let fenced = record
         .with_close_intent(TaskCloseIntent::from_record(&record, false).unwrap())
         .unwrap();
-    harness.store.update_task(fenced).unwrap();
+    harness.store.replace_task_fixture(fenced).unwrap();
     let remote = TaskRemoteRunner::new(status_clone_with(
         record.status(),
         TaskState::Closed,
@@ -705,7 +709,7 @@ fn cli_status_keeps_log_drain_unavailable_instead_of_remote_closed() {
         .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))
         .unwrap();
     assert!(!remote_status_refresh_allowed(&drained));
-    harness.store.update_task(drained).unwrap();
+    harness.store.replace_task_fixture(drained).unwrap();
     let remote = TaskRemoteRunner::new(status_clone_with(
         record.status(),
         TaskState::Closed,

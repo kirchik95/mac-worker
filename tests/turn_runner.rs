@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     ffi::OsStr,
     fs,
@@ -487,7 +491,7 @@ fn persist_independent_terminal_status(fixture: &AcceptedThenTerminalFixture) {
     let record = fixture.state.load_task(fixture.task_id).unwrap();
     fixture
         .state
-        .update_task(
+        .replace_task_fixture(
             record
                 .with_status(terminal)
                 .unwrap()
@@ -552,7 +556,7 @@ fn persist_local_open_success(fixture: &AcceptedThenTerminalFixture) {
     .unwrap();
     fixture
         .state
-        .update_task(record.with_status(status).unwrap())
+        .replace_task_fixture(record.with_status(status).unwrap())
         .unwrap();
 }
 
@@ -629,7 +633,7 @@ fn plant_undrainable_follow_up_with_prior_fetched_head(
     .unwrap();
     fixture
         .state
-        .update_task(
+        .replace_task_fixture(
             record
                 .with_status(status)
                 .unwrap()
@@ -1897,7 +1901,7 @@ fn recovery_imports_the_result_after_a_crash_between_terminal_persist_and_fetch(
     let record = fixture.state.load_task(fixture.task_id).unwrap();
     fixture
         .state
-        .update_task(record.with_fetched_head(Some(earlier.clone())).unwrap())
+        .replace_task_fixture(record.with_fetched_head(Some(earlier.clone())).unwrap())
         .unwrap();
     let transfer = transfer_for_fixture(&fixture);
     assert!(transfer.has_ref(&base_pin_name(&fixture)));
@@ -5264,7 +5268,7 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
     )
     .unwrap();
     state
-        .update_task(record.with_status(status.clone()).unwrap())
+        .replace_task_fixture(record.with_status(status.clone()).unwrap())
         .unwrap();
     let remote = RefreshFenceRemote {
         inner: &fixture.runner,

@@ -497,9 +497,12 @@ impl<'a> TurnRunner<'a> {
             .text(&error.to_string(), EARLY_EXIT_MESSAGE_LIMIT);
         if let Some(receipt) = error.failure_receipt()
             && let Ok(record) = self.client_state.load_task(task_id)
-            && let Ok(updated) = record.with_failure_receipt(Some(receipt))
         {
-            let _ = self.client_state.update_task(updated);
+            let _ = self.client_state.mutate_task(
+                task_id,
+                record.status().turns().last().map(TurnSummary::turn_id),
+                |current| current.with_failure_receipt(Some(receipt)),
+            );
         }
         log.append_bytes(
             early_exit_diagnostic_line(
@@ -580,10 +583,14 @@ impl<'a> TurnRunner<'a> {
             record.status().turns().to_vec(),
             now_millis()?,
         )?;
-        self.client_state.update_task(
-            record
-                .with_status(status)?
-                .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))?,
+        self.client_state.mutate_task(
+            task_id,
+            record.status().turns().last().map(TurnSummary::turn_id),
+            |current| {
+                current
+                    .with_status(status)?
+                    .with_abandon_code(Some("RUNNER_HANDOFF_FAILED".to_owned()))
+            },
         )?;
         log.finish_local(
             task_id,
@@ -1353,13 +1360,12 @@ impl<'a> TurnRunner<'a> {
         } else {
             None
         };
-        let record = self.client_state.load_task(task_id)?;
-        let record = if let Some(head) = fetched {
-            record.with_fetched_head(Some(head))?
-        } else {
-            record
-        };
-        self.client_state.update_task(record)?;
+        if let Some(head) = fetched {
+            self.client_state
+                .mutate_task(task_id, Some(turn_id), |current| {
+                    current.with_fetched_head(Some(head))
+                })?;
+        }
         self.persist_host_auto_close(worker, task_id)?;
         let outcome = terminal
             .last_outcome()
@@ -1403,9 +1409,10 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<TurnOutcomeReport, WorkerError> {
         let outcome = TaskOutcome::failed(failure_code);
         let status = publication_failure_status(&terminal, outcome.clone(), now_millis()?)?;
-        let record = self.client_state.load_task(task_id)?;
         self.client_state
-            .update_task(record.with_status(status.clone())?)?;
+            .mutate_task(task_id, Some(turn_id), |current| {
+                current.with_status(status.clone())
+            })?;
         let event = serde_json::json!({
             "type": "turn_terminal",
             "protocol_version": crate::protocol::PROTOCOL_VERSION,
@@ -1621,11 +1628,17 @@ impl<'a> TurnRunner<'a> {
     fn persist_status(&self, task_id: TaskId, status: TaskStatus) -> Result<(), WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         let observed = status.updated_at_millis();
-        self.client_state.update_task(
-            record
-                .with_status(status)?
-                .with_status_observed_at(Some(observed))?,
-        )
+        self.client_state
+            .mutate_task(
+                task_id,
+                record.status().turns().last().map(TurnSummary::turn_id),
+                |current| {
+                    current
+                        .with_status(status)?
+                        .with_status_observed_at(Some(observed))
+                },
+            )
+            .map(|_| ())
     }
 
     /// JOB_NOT_FOUND / TASK_NOT_FOUND after acceptance means remaining
@@ -1745,10 +1758,14 @@ impl<'a> TurnRunner<'a> {
             record.status().turns().to_vec(),
             now_millis()?,
         )?;
-        self.client_state.update_task(
-            record
-                .with_status(status)?
-                .with_abandon_code(Some("CAPACITY_BUSY".into()))?,
+        self.client_state.mutate_task(
+            task_id,
+            record.status().turns().last().map(TurnSummary::turn_id),
+            |current| {
+                current
+                    .with_status(status)?
+                    .with_abandon_code(Some("CAPACITY_BUSY".into()))
+            },
         )?;
         let workers = self
             .config
@@ -1828,10 +1845,14 @@ impl<'a> TurnRunner<'a> {
             )?
         };
         let abandoned = record.status().state() != TaskState::Active;
-        self.client_state.update_task(
-            record
-                .with_status(status)?
-                .with_abandon_code(abandoned.then_some("CANCELLED".to_owned()))?,
+        self.client_state.mutate_task(
+            task_id,
+            record.status().turns().last().map(TurnSummary::turn_id),
+            |current| {
+                current
+                    .with_status(status)?
+                    .with_abandon_code(abandoned.then_some("CANCELLED".to_owned()))
+            },
         )?;
         log.finish_local(task_id, turn_id, TaskOutcome::Cancelled)?;
         if let Ok(project) = self.load_project_for_record(record)

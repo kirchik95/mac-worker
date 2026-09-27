@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -1366,7 +1370,7 @@ fn bump_rollback_sidecars(fixture: &FrozenDagFixture, observed_at: u64) {
         .unwrap()
         .with_runner(Some(RunnerIdentity::new(owner(99))))
         .unwrap();
-    fixture.store.update_task(bumped).unwrap();
+    fixture.store.replace_task_fixture(bumped).unwrap();
 }
 
 struct RollbackRecoverBarrier {
@@ -1802,7 +1806,7 @@ fn plant_closed_done_import(
     )
     .unwrap();
     store
-        .update_task(
+        .replace_task_fixture(
             record
                 .with_status(status)
                 .unwrap()
@@ -1859,7 +1863,7 @@ fn plant_parent_status(
     )
     .unwrap();
     store
-        .update_task(
+        .replace_task_fixture(
             record
                 .with_status(status)
                 .unwrap()

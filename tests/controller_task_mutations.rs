@@ -4,6 +4,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     ffi::OsStr,
     os::unix::process::ExitStatusExt,
@@ -308,7 +312,7 @@ fn bump_updated_at(store: &ClientStateStore, record: &LocalTaskRecord) -> LocalT
     .copying_reported_checks(record.status())
     .unwrap();
     let next = record.with_status(status).unwrap();
-    store.update_task(next.clone()).unwrap();
+    store.replace_task_fixture(next.clone()).unwrap();
     next
 }
 
@@ -757,7 +761,7 @@ fn assert_stale_close_is_settled(already_closed: bool) {
         ("TASK_REVISION_CONFLICT", "task changed before close")
     };
     let changed: LocalTaskRecord = serde_json::from_value(changed).unwrap();
-    harness.store.update_task(changed.clone()).unwrap();
+    harness.store.replace_task_fixture(changed.clone()).unwrap();
 
     let error = journal
         .handle_with(&envelope, &handler, ControllerFault::None)

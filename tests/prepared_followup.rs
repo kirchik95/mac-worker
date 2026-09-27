@@ -7,6 +7,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     ffi::OsStr,
     os::unix::process::ExitStatusExt,
@@ -338,7 +342,7 @@ fn emulate_completion(
         .unwrap()
         .with_runner(None)
         .unwrap();
-    store.update_task(record.clone()).unwrap();
+    store.replace_task_fixture(record.clone()).unwrap();
     record
 }
 
@@ -562,7 +566,7 @@ fn replay_after_a_later_turn_conflicts() {
         .unwrap();
         record = record.with_status(status).unwrap();
         record = record.with_runner(None).unwrap();
-        harness.store.update_task(record.clone()).unwrap();
+        harness.store.replace_task_fixture(record.clone()).unwrap();
         let entry = harness
             .store
             .queue_entry_for_task_turn(first.task_id())
@@ -684,7 +688,7 @@ fn resume_preserves_independent_sidecars() {
         .unwrap()
         .with_fetched_head(Some(fetched.clone()))
         .unwrap();
-    harness.store.update_task(updated).unwrap();
+    harness.store.replace_task_fixture(updated).unwrap();
 
     let report = harness
         .client(&runner)
@@ -959,7 +963,7 @@ fn cancel_closed_task_conflicts_for_stale_snapshot_and_reports_fresh() {
     )
     .unwrap();
     let closed = live.with_status(closed_status).unwrap();
-    harness.store.update_task(closed.clone()).unwrap();
+    harness.store.replace_task_fixture(closed.clone()).unwrap();
 
     // Stale pre-close snapshot on a closed task: conflict, never a loose
     // success presenting the closed task as the cancellation.
@@ -1052,7 +1056,7 @@ fn cancel_with_same_turn_sidecar_drift_conflicts() {
     .unwrap();
     harness
         .store
-        .update_task(snapshot.with_status(drifted).unwrap())
+        .replace_task_fixture(snapshot.with_status(drifted).unwrap())
         .unwrap();
 
     let error = harness
@@ -1279,7 +1283,7 @@ fn sidecar_only_drift_still_says_fresh_and_keeps_binding() {
         .unwrap();
     harness
         .store
-        .update_task(
+        .replace_task_fixture(
             snapshot
                 .with_status(checked)
                 .unwrap()
@@ -1552,7 +1556,7 @@ impl<'a> LateCancelRemote<'a> {
         .copying_reported_checks(record.status())
         .unwrap();
         self.store
-            .update_task(record.with_status(status).unwrap())
+            .replace_task_fixture(record.with_status(status).unwrap())
             .unwrap();
     }
 }
@@ -1719,7 +1723,7 @@ fn already_cancelled_same_turn_converges_without_host_call() {
     harness.store.remove_queued(row.job_id()).unwrap();
     harness
         .store
-        .update_task(
+        .replace_task_fixture(
             snapshot
                 .with_status(cancelled_for_turn(&snapshot, 25_010))
                 .unwrap(),

@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     ffi::OsStr,
     io::{Read, Write},
@@ -357,7 +361,7 @@ fn complete_extra_turn(store: &ClientStateStore, task_id: TaskId) {
     .copying_reported_checks(current.status())
     .unwrap();
     store
-        .update_task(current.with_status(status).unwrap())
+        .replace_task_fixture(current.with_status(status).unwrap())
         .unwrap();
 }
 

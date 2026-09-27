@@ -1,3 +1,7 @@
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::sync::{Arc, Barrier};
 
 use mac_worker::{
@@ -321,7 +325,7 @@ fn incomplete_or_cancelled_head_does_not_hide_an_executable_parked_task() {
                 .unwrap()
                 .with_submission_intent_turn_id(turn(2))
                 .unwrap();
-            fixture.store.update_task(record).unwrap();
+            fixture.store.replace_task_fixture(record).unwrap();
         } else {
             fixture.store.request_queue_cancel(turn(2), 100).unwrap();
         }

@@ -1,3 +1,7 @@
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -488,7 +492,7 @@ fn closed_task_with_pending_delivery_shows_remote_delivered_without_reopening() 
     .unwrap();
     harness
         .state
-        .update_task(record.with_delivery(Some(pending.clone())).unwrap())
+        .replace_task_fixture(record.with_delivery(Some(pending.clone())).unwrap())
         .unwrap();
     let delivered = OriginDelivery::new(
         turn,
@@ -578,7 +582,7 @@ fn closed_task_with_pending_delivery_stays_visible_when_the_host_is_unreachable(
     .unwrap();
     harness
         .state
-        .update_task(record.with_delivery(Some(pending.clone())).unwrap())
+        .replace_task_fixture(record.with_delivery(Some(pending.clone())).unwrap())
         .unwrap();
     harness
         .remote
@@ -673,7 +677,7 @@ fn task_detail_waits_for_a_pre_exchange_replacement_writer() {
 
     thread::scope(|scope| {
         let writer_state = Arc::clone(&harness.state);
-        let writer = scope.spawn(move || writer_state.update_task(replacement));
+        let writer = scope.spawn(move || writer_state.replace_task_fixture(replacement));
         writer_entered_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
@@ -762,7 +766,7 @@ impl DashboardTaskHarness {
         let intent = mac_worker::task::TaskCloseIntent::from_record(&record, false).unwrap();
         harness
             .state
-            .update_task(record.with_close_intent(intent).unwrap())
+            .replace_task_fixture(record.with_close_intent(intent).unwrap())
             .unwrap();
         harness
     }
@@ -778,7 +782,7 @@ impl DashboardTaskHarness {
         let record = harness.state.load_task(harness.task_id).unwrap();
         harness
             .state
-            .update_task(
+            .replace_task_fixture(
                 record
                     .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))
                     .unwrap(),

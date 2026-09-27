@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     fs,
     os::unix::fs::MetadataExt,
@@ -646,7 +650,7 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
 
     thread::scope(|scope| {
         let writer_state = Arc::clone(&state);
-        let writer = scope.spawn(move || writer_state.update_task(replacement.clone()));
+        let writer = scope.spawn(move || writer_state.replace_task_fixture(replacement.clone()));
         writer_entered_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
@@ -715,7 +719,7 @@ fn task_enumeration_does_not_recover_replacement_residue() {
     state.create_task(original).unwrap();
 
     state.inject_task_replacement_after_exchange_failure_once();
-    assert!(state.update_task(replacement.clone()).is_err());
+    assert!(state.replace_task_fixture(replacement.clone()).is_err());
 
     let residue_before = fs::read_dir(paths.state.join("tasks"))
         .unwrap()
@@ -734,7 +738,7 @@ fn task_enumeration_does_not_recover_replacement_residue() {
     assert_eq!(residue_after, residue_before);
 
     state
-        .update_task(
+        .replace_task_fixture(
             replacement
                 .with_status_observed_at(Some(1_700_000_000_001))
                 .unwrap(),
@@ -1307,7 +1311,7 @@ fn unchanged_complete_task_record_keeps_the_underlying_file_identity() {
     let path = task_record_path(&paths.state, &record);
     let before = regular_file_identity(&path);
 
-    state.update_task(record.clone()).unwrap();
+    state.replace_task_fixture(record.clone()).unwrap();
 
     assert_eq!(regular_file_identity(&path), before);
     assert_eq!(state.load_task(record.meta().task_id()).unwrap(), record);
@@ -1324,7 +1328,7 @@ fn changed_task_status_and_ownership_are_persisted() {
     let created = regular_file_identity(&path);
 
     let status_changed = original.clone().with_status(active_status()).unwrap();
-    state.update_task(status_changed.clone()).unwrap();
+    state.replace_task_fixture(status_changed.clone()).unwrap();
     let after_status = regular_file_identity(&path);
     assert_ne!(after_status.1, created.1);
     assert_eq!(
@@ -1333,7 +1337,9 @@ fn changed_task_status_and_ownership_are_persisted() {
     );
 
     let ownership_changed = status_changed.with_runner(None).unwrap();
-    state.update_task(ownership_changed.clone()).unwrap();
+    state
+        .replace_task_fixture(ownership_changed.clone())
+        .unwrap();
     let after_owner = regular_file_identity(&path);
     assert_ne!(after_owner.1, after_status.1);
     assert_eq!(
@@ -1352,7 +1358,7 @@ fn corrupt_and_unsafe_task_records_still_fail_before_a_no_op_skip() {
     let path = task_record_path(&paths.state, &record);
 
     fs::write(&path, b"{not-canonical").unwrap();
-    let corrupt = state.update_task(record.clone()).unwrap_err();
+    let corrupt = state.replace_task_fixture(record.clone()).unwrap_err();
     assert!(
         corrupt.to_string().contains("task record is corrupt"),
         "{corrupt}"
@@ -1374,7 +1380,7 @@ fn corrupt_and_unsafe_task_records_still_fail_before_a_no_op_skip() {
     )
     .unwrap();
     fs::write(&path, foreign.canonical_bytes().unwrap()).unwrap();
-    let identity = state.update_task(record.clone()).unwrap_err();
+    let identity = state.replace_task_fixture(record.clone()).unwrap_err();
     assert!(
         identity
             .to_string()
@@ -1384,7 +1390,7 @@ fn corrupt_and_unsafe_task_records_still_fail_before_a_no_op_skip() {
 
     fs::remove_file(&path).unwrap();
     std::os::unix::fs::symlink("/tmp/mac-worker-task-outside", &path).unwrap();
-    let unsafe_record = state.update_task(record).unwrap_err();
+    let unsafe_record = state.replace_task_fixture(record).unwrap_err();
     assert!(
         matches!(unsafe_record, WorkerError::Io(_)),
         "{unsafe_record}"
@@ -1401,7 +1407,7 @@ fn identical_update_still_recovers_task_replacement_residue() {
     state.create_task(original).unwrap();
 
     state.inject_task_replacement_after_exchange_failure_once();
-    assert!(state.update_task(replacement.clone()).is_err());
+    assert!(state.replace_task_fixture(replacement.clone()).is_err());
     assert_eq!(
         fs::read_dir(paths.state.join("tasks"))
             .unwrap()
@@ -1413,7 +1419,7 @@ fn identical_update_still_recovers_task_replacement_residue() {
 
     let path = task_record_path(&paths.state, &replacement);
     let before = regular_file_identity(&path);
-    state.update_task(replacement.clone()).unwrap();
+    state.replace_task_fixture(replacement.clone()).unwrap();
     assert_eq!(
         state.load_task(replacement.meta().task_id()).unwrap(),
         replacement

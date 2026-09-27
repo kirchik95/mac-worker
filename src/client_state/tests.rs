@@ -158,6 +158,134 @@ fn matching_cas_still_persists_a_changed_runner() {
     );
 }
 
+struct MutationGate {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ClientStateConcurrencyHook for MutationGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::BeforeTaskMutation
+            && let Some(entered) = self.entered.lock().unwrap().take()
+        {
+            entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn runner_mutation_preserves_concurrent_fetched_head_and_deliveries() {
+    let (_dir, store, state_path) = open_store();
+    let original = sample_record();
+    let task_id = original.meta().task_id();
+    let turn_id = original.status().turns().last().unwrap().turn_id();
+    store.create_task(original.clone()).unwrap();
+    let head: BaseOid = "cccccccccccccccccccccccccccccccccccccccc".parse().unwrap();
+    let delivery = crate::task::OriginDelivery::new(
+        turn_id,
+        crate::task::DeliveryState::Delivered,
+        head.clone(),
+        "https://example.test/repo.git".into(),
+        "refs/heads/result".into(),
+        1,
+        0,
+        None,
+        None,
+        10,
+        20,
+    )
+    .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let writer = ClientStateStore::open_with_concurrency_hook(
+        &state_path,
+        Arc::new(MutationGate {
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(resume_rx),
+        }),
+    )
+    .unwrap();
+
+    std::thread::scope(|scope| {
+        let mutation = scope.spawn(|| writer.record_runner(task_id, None));
+        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(
+            store
+                .update_fetched_head_for_current_turn(&original, head.clone())
+                .unwrap()
+        );
+        let current = store.load_task(task_id).unwrap();
+        assert!(
+            store
+                .update_task_if_current(
+                    &current,
+                    current.with_delivery(Some(delivery.clone())).unwrap()
+                )
+                .unwrap()
+        );
+        resume_tx.send(()).unwrap();
+        mutation.join().unwrap().unwrap();
+    });
+    let current = store.load_task(task_id).unwrap();
+    assert!(current.runner().is_none());
+    assert_eq!(current.fetched_head(), Some(&head));
+    assert_eq!(current.deliveries(), &[delivery]);
+}
+
+#[test]
+fn runner_mutation_rejects_a_concurrently_replaced_turn() {
+    let (_dir, store, state_path) = open_store();
+    let original = sample_record();
+    let task_id = original.meta().task_id();
+    store.create_task(original.clone()).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let writer = ClientStateStore::open_with_concurrency_hook(
+        &state_path,
+        Arc::new(MutationGate {
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(resume_rx),
+        }),
+    )
+    .unwrap();
+    let new_turn = TurnId::generate();
+    let status = TaskStatus::new(
+        TaskState::Queued,
+        None,
+        None,
+        false,
+        None,
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![TurnSummary::new(
+            1, new_turn, None, None, None, false, None, None,
+        )],
+        1_700_000_000_001,
+    )
+    .unwrap();
+    let next = original.with_status(status).unwrap();
+    let result = std::thread::scope(|scope| {
+        let mutation = scope.spawn(|| writer.record_runner(task_id, None));
+        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(
+            store
+                .update_task_if_current(&original, next.clone())
+                .unwrap()
+        );
+        resume_tx.send(()).unwrap();
+        mutation.join().unwrap()
+    });
+    assert_eq!(result.unwrap_err().public_code(), "TASK_STALE");
+    assert_eq!(store.load_task(task_id).unwrap(), next);
+}
+
 struct ScriptedInspector {
     sequence: std::sync::Mutex<std::collections::VecDeque<ProcessObservation>>,
     exhausted: ProcessObservation,

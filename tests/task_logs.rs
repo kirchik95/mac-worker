@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -174,7 +178,7 @@ impl Fixture {
         )
         .unwrap();
         self.store
-            .update_task(record.with_status(status).unwrap())
+            .replace_task_fixture(record.with_status(status).unwrap())
             .unwrap();
         checkpoint(self, turn_id, Some(outcome));
     }

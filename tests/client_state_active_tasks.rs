@@ -1,3 +1,7 @@
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     fs::{self, OpenOptions},
     os::fd::AsRawFd,
@@ -392,7 +396,7 @@ fn quiescent_update_retires_and_stale_cas_cannot_drop_an_active_winner() {
     let original = record_with_id(8, TaskState::Queued, true);
     store.create_task(original.clone()).unwrap();
     let winner = original.clone().with_runner(None).unwrap();
-    store.update_task(winner.clone()).unwrap();
+    store.replace_task_fixture(winner.clone()).unwrap();
     assert_eq!(select_all(&store).selected, vec![winner.meta().task_id()]);
 
     let quiescent = record_with_id(8, TaskState::Closed, false);
@@ -416,7 +420,7 @@ fn quiescent_update_retires_and_stale_cas_cannot_drop_an_active_winner() {
     );
 
     store
-        .update_task(record_with_id(8, TaskState::Closed, false))
+        .replace_task_fixture(record_with_id(8, TaskState::Closed, false))
         .unwrap();
     assert!(select_all(&store).selected.is_empty());
 }
@@ -513,7 +517,7 @@ fn quiescent_publish_crash_before_retire_leaves_index_until_heal() {
     store.create_task(live.clone()).unwrap();
     store.inject_write_failure_once(ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire);
     store
-        .update_task(record_with_id(13, TaskState::Closed, false))
+        .replace_task_fixture(record_with_id(13, TaskState::Closed, false))
         .unwrap_err();
     assert!(receipt_path(&state_path, live.meta().task_id()).exists());
     let leftover = select_all(&store);

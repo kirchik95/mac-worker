@@ -1,6 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::OsStr,
@@ -3261,7 +3265,7 @@ fn publish_retry_reloads_and_merges_when_the_local_record_changes() {
     remote.set_on_outbox_retry(move || {
         let current = store_for_hook.load_task(task_id).unwrap();
         store_for_hook
-            .update_task(current.with_status_observed_at(Some(99)).unwrap())
+            .replace_task_fixture(current.with_status_observed_at(Some(99)).unwrap())
             .unwrap();
     });
     let config = task_config();
