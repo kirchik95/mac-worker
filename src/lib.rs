@@ -223,15 +223,24 @@ fn execute_with_context(
             )
             .map(CommandOutput::Init)
         }
-        Command::Setup { hosts } => {
+        Command::Setup { hosts, allow_debug } => {
             let config = load_config(cli.config, runtime)?;
             config.require_local_inventory()?;
             let selected = select_workers(&config, &hosts)?;
             let current_exe = std::env::current_exe()?;
-            let workers = selected
-                .into_iter()
-                .map(|worker| Installer::new(runner).install(&current_exe, &worker))
-                .collect();
+            let workers = match install::prepare_candidate(runner, &current_exe, allow_debug) {
+                Ok(candidate) => selected
+                    .into_iter()
+                    .map(|worker| Installer::new(runner).install_candidate(&candidate, &worker))
+                    .collect(),
+                Err(error) if error.debug_refused => {
+                    return Err(WorkerError::Config(error.message));
+                }
+                Err(error) => selected
+                    .into_iter()
+                    .map(|worker| install::host_preflight_failure(&worker, &error))
+                    .collect(),
+            };
             Ok(CommandOutput::Setup(SetupReport {
                 protocol_version: PROTOCOL_VERSION,
                 workers,

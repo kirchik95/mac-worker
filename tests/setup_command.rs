@@ -18,7 +18,7 @@ use mac_worker::{
     config::WorkerEntry,
     error::{ProcessError, WorkerError},
     execute_with,
-    install::Installer,
+    install::{Installer, prepare_candidate},
     output::CommandOutput,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
@@ -330,12 +330,19 @@ fn setup_warms_the_promoted_helper_with_version_before_the_verification_probe() 
 }
 
 fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
+    let digest = mac_worker::binary_identity::sha256_hex(
+        &fs::read(std::env::current_exe().unwrap()).unwrap(),
+    );
     String::from_utf8(expected.to_vec())
         .unwrap()
         .replacen(
             "\"protocol_version\":1",
             &format!("\"protocol_version\":{PROTOCOL_VERSION}"),
             1,
+        )
+        .replace(
+            "\"warnings\":[]}",
+            &format!("\"warnings\":[],\"binary_sha256\":\"{digest}\"}}"),
         )
         .into_bytes()
 }
@@ -628,7 +635,10 @@ fn run_executable_setup(
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -951,6 +961,51 @@ fn generated_setup_phases_complete_and_cleanup_only_owned_evidence() {
             .join(".local/share/mac-worker/setup/.install-lock")
             .exists()
     );
+}
+
+#[test]
+fn successful_install_keeps_one_verified_previous_helper() {
+    // The previous helper used to be deleted with the transaction, so a bad
+    // promotion left nothing to copy back.
+    let commands = generated_setup_commands();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir(&home).unwrap();
+    assert!(
+        run_remote_command(&commands.acquire, &home)
+            .status
+            .success()
+    );
+    let transaction = home
+        .join(".local/share/mac-worker/setup")
+        .join(INSTALLATION_ID);
+    let active = home.join(".local/bin/worker");
+    let retained = home.join(".local/bin/worker.previous");
+    fs::write(&active, b"previous worker").unwrap();
+    fs::write(transaction.join("worker.new"), CANDIDATE_BYTES).unwrap();
+    assert!(run_remote_command(&commands.digest, &home).status.success());
+    assert!(
+        run_remote_command(&commands.prepare, &home)
+            .status
+            .success()
+    );
+    assert!(
+        run_remote_command(&commands.promotion, &home)
+            .status
+            .success()
+    );
+    fs::write(&retained, b"stale older helper").unwrap();
+
+    assert!(
+        run_remote_command(&commands.success_cleanup, &home)
+            .status
+            .success()
+    );
+
+    assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
+    assert_eq!(fs::read(&retained).unwrap(), b"previous worker");
+    assert!(!transaction.exists());
+    assert!(!home.join(".local/bin/worker.previous.new").exists());
 }
 
 #[test]
@@ -1871,17 +1926,20 @@ fn setup_dispatch_keeps_processing_inventory_names_after_a_host_failure() {
         "version = 1\n[[workers]]\nname = \"first\"\nssh = \"mac1\"\nslots = 1\n[[workers]]\nname = \"second\"\nssh = \"mac2\"\nslots = 1\n",
     )
     .unwrap();
+    let mut second_host = success_results();
+    let _ = second_host.remove(0);
     let mut results = vec![
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(75, b"", b"lock busy")),
     ];
-    results.extend(success_results());
+    results.extend(second_host);
     let runner = RecordingRunner::returning_results(results);
     let cli = Cli {
         config: Some(config_path),
         json: true,
         command: Command::Setup {
             hosts: vec!["first".into(), "second".into()],
+            allow_debug: false,
         },
     };
 
@@ -1912,7 +1970,10 @@ fn setup_selection_uses_inventory_names_and_empty_means_all() {
         Cli {
             config: Some(config_path.clone()),
             json: false,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
     )
@@ -1936,6 +1997,7 @@ fn setup_selection_uses_inventory_names_and_empty_means_all() {
             json: false,
             command: Command::Setup {
                 hosts: vec!["mac1".into()],
+                allow_debug: false,
             },
         },
         &empty_runner,
@@ -2233,7 +2295,10 @@ fn executable_setup_all_success_renders_complete_report_and_exits_zero() {
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2261,7 +2326,6 @@ fn executable_setup_all_failed_renders_every_host_and_exits_unavailable() {
     let runner = RecordingRunner::returning(vec![
         result(0, valid_probe_json(), b""),
         result(75, b"", b"lock busy"),
-        result(0, valid_probe_json(), b""),
         result(75, b"", b"lock busy"),
     ]);
     let mut stdout = Vec::new();
@@ -2271,7 +2335,10 @@ fn executable_setup_all_failed_renders_every_host_and_exits_unavailable() {
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2313,7 +2380,10 @@ fn executable_setup_integrity_failure_renders_report_then_exits_infrastructure()
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2352,7 +2422,10 @@ fn executable_setup_local_io_failure_renders_report_then_exits_io() {
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2536,7 +2609,10 @@ fn executable_setup_upload_io_renders_transfer_report_cleans_up_and_exits_io() {
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2580,7 +2656,10 @@ fn executable_setup_upload_nonzero_renders_transfer_report_cleans_up_and_exits_u
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2614,12 +2693,10 @@ fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category()
     let runner = RecordingRunner::returning_results(vec![
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(75, b"", b"lock busy")),
-        Ok(result(0, valid_probe_json(), b"")),
         Ok(result(0, b"", b"")),
         Ok(result(0, b"", b"")),
         Ok(result(0, b"mismatch\n", b"")),
         Ok(result(0, b"", b"")),
-        Ok(result(0, valid_probe_json(), b"")),
         Err(WorkerError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "cannot read acquisition result",
@@ -2632,7 +2709,10 @@ fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category()
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2665,11 +2745,13 @@ fn executable_setup_partial_failure_renders_success_and_failure_then_exits_unava
         "version = 1\n[[workers]]\nname = \"first\"\nssh = \"mac1\"\nslots = 1\n[[workers]]\nname = \"second\"\nssh = \"mac2\"\nslots = 1\n",
     )
     .unwrap();
+    let mut second_host = success_results();
+    let _ = second_host.remove(0);
     let mut results = vec![
         Ok(result(0, valid_probe_json(), b"")),
         Ok(result(75, b"", b"lock busy")),
     ];
-    results.extend(success_results());
+    results.extend(second_host);
     let runner = RecordingRunner::returning_results(results);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -2678,7 +2760,10 @@ fn executable_setup_partial_failure_renders_success_and_failure_then_exits_unava
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut stdout,
@@ -2719,7 +2804,10 @@ fn successful_output_broken_pipe_is_typed_io_and_maps_to_exit_74() {
         Cli {
             config: Some(config_path),
             json: true,
-            command: Command::Setup { hosts: Vec::new() },
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
         },
         &runner,
         &mut BrokenWriter,
@@ -2953,4 +3041,101 @@ fn setup_human_and_json_output_surface_an_outdated_laptop_binary_warning() {
     let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
     assert_eq!(json["warnings"][0]["code"], "LAPTOP_BINARY_OUTDATED");
     assert_eq!(json["warnings"][0]["message"], message);
+}
+
+#[test]
+fn setup_reads_the_candidate_once_and_installs_identical_bytes_on_every_host() {
+    let (directory, current_exe) = executable_fixture();
+    let per_host = || {
+        let mut results = success_results();
+        let _ = results.remove(0);
+        results
+    };
+    let mut results = vec![Ok(result(0, valid_probe_json(), b""))];
+    results.extend(per_host());
+    results.extend(per_host());
+    let inner = RecordingRunner::returning_results(results);
+    let runner = CandidateMutatingRunner {
+        inner: inner.clone(),
+        candidate: current_exe.clone(),
+    };
+    let candidate = prepare_candidate(&runner, &current_exe, false).unwrap();
+    let hosts = [
+        worker(),
+        WorkerEntry {
+            name: "mini-2".into(),
+            ssh: "mac2".into(),
+            ..worker()
+        },
+    ];
+    let mut installed = Vec::new();
+    for host in &hosts {
+        let installer =
+            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+        installed.push(installer.install_candidate(&candidate, host));
+    }
+
+    assert!(installed.iter().all(|host| host.installed), "{installed:?}");
+    assert!(
+        installed
+            .iter()
+            .all(|host| host.binary_sha256.as_deref() == Some(CANDIDATE_DIGEST)),
+        "{installed:?}"
+    );
+    let requests = inner.requests();
+    let probes = requests
+        .iter()
+        .filter(|request| {
+            request.program == current_exe.as_os_str()
+                && request.args == [OsString::from("host"), OsString::from("probe")]
+        })
+        .count();
+    assert_eq!(probes, 1);
+    let uploads = requests
+        .iter()
+        .filter(|request| request.stdin.as_deref() == Some(CANDIDATE_BYTES))
+        .count();
+    assert_eq!(uploads, 2);
+    assert_eq!(
+        fs::read(&current_exe).unwrap(),
+        b"candidate changed after preflight read"
+    );
+    let _ = directory;
+}
+
+#[test]
+fn setup_refuses_a_debug_candidate_unless_allow_debug_is_set() {
+    let (_directory, current_exe) = executable_fixture();
+    let debug_probe = debug_probe_json();
+    let refused = RecordingRunner::returning_results(vec![Ok(result(0, debug_probe.clone(), b""))]);
+    let error = prepare_candidate(&refused, &current_exe, false).unwrap_err();
+    assert!(error.debug_refused);
+    assert!(error.message.contains("--allow-debug"), "{}", error.message);
+    assert!(
+        refused
+            .requests()
+            .iter()
+            .all(|request| request.program != "/usr/bin/ssh")
+    );
+
+    let mut allowed_results = success_results();
+    allowed_results[0] = Ok(result(0, debug_probe, b""));
+    let allowed = RecordingRunner::returning_results(allowed_results);
+    let candidate = prepare_candidate(&allowed, &current_exe, true).unwrap();
+    let installer =
+        Installer::with_installation_id(&allowed, Uuid::parse_str(INSTALLATION_ID).unwrap());
+    let installed = installer.install_candidate(&candidate, &worker());
+    assert!(installed.installed, "{installed:?}");
+    assert_eq!(
+        installed.build_id.as_deref(),
+        Some("0.1.0+0123456789ab-debug")
+    );
+    assert_eq!(installed.binary_sha256.as_deref(), Some(CANDIDATE_DIGEST));
+}
+
+fn debug_probe_json() -> Vec<u8> {
+    let mut probe: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+    probe["build_id"] = serde_json::json!("0.1.0+0123456789ab-debug");
+    probe["binary_sha256"] = serde_json::json!(CANDIDATE_DIGEST);
+    serde_json::to_vec(&probe).unwrap()
 }

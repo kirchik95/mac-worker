@@ -37,19 +37,31 @@ impl<'a> Installer<'a> {
     }
 
     pub fn install(&self, current_exe: &Path, worker: &WorkerEntry) -> SetupHostResult {
-        let candidate = match self.preflight(current_exe) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                return failed(
-                    worker,
-                    "LOCAL_BINARY_INVALID",
-                    error.message,
-                    error.failure_kind,
-                    Vec::new(),
-                );
-            }
-        };
-        let CandidatePayload { bytes, digest } = candidate;
+        match prepare_candidate(self.runner, current_exe, true) {
+            Ok(candidate) => self.install_candidate(&candidate, worker),
+            Err(error) => host_preflight_failure(worker, &error),
+        }
+    }
+
+    /// Install `candidate` bytes that were read once for this invocation.
+    pub fn install_candidate(
+        &self,
+        candidate: &InstallCandidate,
+        worker: &WorkerEntry,
+    ) -> SetupHostResult {
+        let mut result = self.install_verified(candidate, worker);
+        result.build_id = candidate.build_id.clone();
+        result.binary_sha256 = Some(candidate.digest.clone());
+        result
+    }
+
+    fn install_verified(
+        &self,
+        candidate: &InstallCandidate,
+        worker: &WorkerEntry,
+    ) -> SetupHostResult {
+        let bytes = candidate.bytes.clone();
+        let digest = candidate.digest.clone();
         let id = self.installation_id.simple().to_string();
 
         let acquire = match ssh_request(worker, acquire_command(&id), control_policy()) {
@@ -432,75 +444,6 @@ impl<'a> Installer<'a> {
         }
     }
 
-    fn preflight(&self, current_exe: &Path) -> Result<CandidatePayload, PreflightError> {
-        let metadata = current_exe.metadata().map_err(|error| PreflightError {
-            message: format!(
-                "failed to inspect candidate executable {}: {error}",
-                current_exe.display()
-            ),
-            failure_kind: SetupFailureKind::Io,
-        })?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err(PreflightError {
-                message: format!(
-                    "candidate executable {} is not a regular executable file",
-                    current_exe.display()
-                ),
-                failure_kind: SetupFailureKind::Infrastructure,
-            });
-        }
-
-        let bytes = fs::read(current_exe).map_err(|error| PreflightError {
-            message: format!(
-                "failed to read candidate executable {}: {error}",
-                current_exe.display()
-            ),
-            failure_kind: SetupFailureKind::Io,
-        })?;
-        let digest = sha256_bytes(&bytes);
-        let result = self
-            .runner
-            .run(&ProcessRequest {
-                program: current_exe.as_os_str().into(),
-                args: vec!["host".into(), "probe".into()],
-                environment: Vec::new(),
-                environment_remove: Vec::new(),
-                stdin: None,
-                policy: probe_policy(),
-                isolate_parent_environment: false,
-            })
-            .map_err(|error| PreflightError {
-                failure_kind: if matches!(error, crate::error::WorkerError::Io(_)) {
-                    SetupFailureKind::Io
-                } else {
-                    SetupFailureKind::Infrastructure
-                },
-                message: format!("failed to launch candidate executable: {error}"),
-            })?;
-        if !result.status.success() {
-            return Err(PreflightError {
-                message: process_failure("candidate executable probe", &result),
-                failure_kind: SetupFailureKind::Infrastructure,
-            });
-        }
-        let probe: ProbeResponse =
-            serde_json::from_slice(&result.stdout).map_err(|error| PreflightError {
-                message: format!("candidate executable returned an invalid probe: {error}"),
-                failure_kind: SetupFailureKind::Infrastructure,
-            })?;
-        if probe.protocol_version != PROTOCOL_VERSION {
-            return Err(PreflightError {
-                message: format!(
-                    "candidate protocol version {} does not match required version {PROTOCOL_VERSION}",
-                    probe.protocol_version
-                ),
-                failure_kind: SetupFailureKind::Infrastructure,
-            });
-        }
-
-        Ok(CandidatePayload { bytes, digest })
-    }
-
     fn reconcile(&self, worker: &WorkerEntry, id: &str, digest: &str) -> Reconciliation {
         let request =
             match ssh_request(worker, reconciliation_command(id, digest), control_policy()) {
@@ -685,14 +628,137 @@ struct ProcessFailure {
     kind: SetupFailureKind,
 }
 
-struct PreflightError {
-    message: String,
-    failure_kind: SetupFailureKind,
+/// Bytes of one setup candidate, read once and reused for every host.
+#[derive(Debug)]
+pub struct InstallCandidate {
+    bytes: Vec<u8>,
+    pub digest: String,
+    pub build_id: Option<String>,
 }
 
-struct CandidatePayload {
-    bytes: Vec<u8>,
-    digest: String,
+#[derive(Debug)]
+pub struct CandidateError {
+    pub message: String,
+    pub failure_kind: SetupFailureKind,
+    pub debug_refused: bool,
+}
+
+fn candidate_error(message: impl Into<String>, failure_kind: SetupFailureKind) -> CandidateError {
+    CandidateError {
+        message: message.into(),
+        failure_kind,
+        debug_refused: false,
+    }
+}
+
+/// Read and probe `current_exe` once. A debug build is refused unless
+/// `allow_debug` is set.
+pub fn prepare_candidate(
+    runner: &dyn ProcessRunner,
+    current_exe: &Path,
+    allow_debug: bool,
+) -> Result<InstallCandidate, CandidateError> {
+    let metadata = current_exe.metadata().map_err(|error| {
+        candidate_error(
+            format!(
+                "failed to inspect candidate executable {}: {error}",
+                current_exe.display()
+            ),
+            SetupFailureKind::Io,
+        )
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(candidate_error(
+            format!(
+                "candidate executable {} is not a regular executable file",
+                current_exe.display()
+            ),
+            SetupFailureKind::Infrastructure,
+        ));
+    }
+
+    let bytes = fs::read(current_exe).map_err(|error| {
+        candidate_error(
+            format!(
+                "failed to read candidate executable {}: {error}",
+                current_exe.display()
+            ),
+            SetupFailureKind::Io,
+        )
+    })?;
+    let digest = sha256_bytes(&bytes);
+    let result = runner
+        .run(&ProcessRequest {
+            program: current_exe.as_os_str().into(),
+            args: vec!["host".into(), "probe".into()],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy: probe_policy(),
+            isolate_parent_environment: false,
+        })
+        .map_err(|error| {
+            candidate_error(
+                format!("failed to launch candidate executable: {error}"),
+                if matches!(error, crate::error::WorkerError::Io(_)) {
+                    SetupFailureKind::Io
+                } else {
+                    SetupFailureKind::Infrastructure
+                },
+            )
+        })?;
+    if !result.status.success() {
+        return Err(candidate_error(
+            process_failure("candidate executable probe", &result),
+            SetupFailureKind::Infrastructure,
+        ));
+    }
+    let probe: ProbeResponse = serde_json::from_slice(&result.stdout).map_err(|error| {
+        candidate_error(
+            format!("candidate executable returned an invalid probe: {error}"),
+            SetupFailureKind::Infrastructure,
+        )
+    })?;
+    if probe.protocol_version != PROTOCOL_VERSION {
+        return Err(candidate_error(
+            format!(
+                "candidate protocol version {} does not match required version {PROTOCOL_VERSION}",
+                probe.protocol_version
+            ),
+            SetupFailureKind::Infrastructure,
+        ));
+    }
+    if !allow_debug
+        && probe
+            .build_id
+            .as_deref()
+            .is_some_and(crate::build_id::is_debug_build_id)
+    {
+        let build_id = probe.build_id.unwrap_or_else(|| "unknown".into());
+        return Err(CandidateError {
+            message: format!(
+                "refusing to install debug build {build_id}; rerun with --allow-debug"
+            ),
+            failure_kind: SetupFailureKind::Infrastructure,
+            debug_refused: true,
+        });
+    }
+
+    Ok(InstallCandidate {
+        bytes,
+        digest,
+        build_id: probe.build_id,
+    })
+}
+
+pub fn host_preflight_failure(worker: &WorkerEntry, error: &CandidateError) -> SetupHostResult {
+    failed(
+        worker,
+        "LOCAL_BINARY_INVALID",
+        error.message.clone(),
+        error.failure_kind,
+        Vec::new(),
+    )
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -1103,7 +1169,29 @@ verify_cleanup_state || exit 77
 /bin/rm -f "$owner_path"
 /bin/rmdir "$lock_dir""#;
 
-const SUCCESS_CLEANUP_BODY: &str = r#"verify_success_cleanup_state() {
+const SUCCESS_CLEANUP_BODY: &str = r#"retain_previous_helper() {
+    [ -f "$transaction/worker.previous" ] || return 0
+    read_canonical_hex "$transaction/previous.sha256" 64 || return 1
+    retained_digest=$canonical_hex
+    digest_regular_file "$transaction/worker.previous" || return 1
+    [ "$canonical_digest" = "$retained_digest" ] || return 1
+    retained="$bin_root/worker.previous"
+    staging="$bin_root/worker.previous.new"
+    [ ! -L "$staging" ] || return 1
+    [ ! -e "$staging" ] || return 1
+    [ ! -L "$retained" ] || return 1
+    if [ -e "$retained" ]; then
+        [ -f "$retained" ] || return 1
+    fi
+    /bin/cp -p "$transaction/worker.previous" "$staging" || return 1
+    digest_regular_file "$staging" || return 1
+    [ "$canonical_digest" = "$retained_digest" ] || return 1
+    /bin/mv -f "$staging" "$retained" || return 1
+    [ ! -L "$retained" ] && [ -f "$retained" ] || return 1
+    digest_regular_file "$retained" || return 1
+    [ "$canonical_digest" = "$retained_digest" ] || return 1
+}
+verify_success_cleanup_state() {
     require_exact_file "$transaction/state" promoted 8 || return 1
     require_absent "$transaction/worker.new" || return 1
     read_canonical_hex "$transaction/candidate.sha256" 64 || return 1
@@ -1125,6 +1213,7 @@ resolve_locked_context || exit 76
 verify_success_cleanup_state || exit 77
 resolve_locked_context || exit 76
 verify_success_cleanup_state || exit 77
+retain_previous_helper || exit 77
 /bin/rm -f "$transaction/worker.new" "$transaction/worker.previous" \
     "$transaction/candidate.sha256" "$transaction/previous.sha256" \
     "$transaction/no-previous" "$transaction/state"

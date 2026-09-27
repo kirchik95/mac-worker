@@ -44,6 +44,9 @@ pub enum Command {
     Setup {
         /// Inventory names, as shown by `worker workers`
         hosts: Vec<String>,
+        /// Install a debug build. Setup refuses debug binaries unless this is set.
+        #[arg(long)]
+        allow_debug: bool,
     },
     #[command(about = "Check a Git project and compatible workers before running a job")]
     Doctor {
