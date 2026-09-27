@@ -34,6 +34,11 @@ const MAX_GC_REF_BYTES: usize = 1024 * 1024;
 const GC_GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GC_GIT_DEADLINE: Duration = Duration::from_secs(30);
 const GC_GIT_PROGRAM: &str = "/usr/bin/git";
+/// Explicit two-week grace, matching Git's default `gc.pruneExpire`.
+/// `--prune=now` can delete objects a concurrent receive-pack or publication
+/// fetch has written but not yet referenced. A mirror-local `gc.pruneExpire`
+/// cannot shorten this.
+const GC_PRUNE_EXPIRE: &str = "--prune=2.weeks.ago";
 const GC_REASON_LEGACY_PROTOCOL: &str = "legacy protocol";
 const GC_REASON_UNREADABLE_RECORD: &str = "unreadable record";
 const GC_REASON_INCONSISTENT_RECORD: &str = "inconsistent record";
@@ -328,13 +333,33 @@ impl<'a> HostGc<'a> {
             });
             let mut applied = Vec::new();
             if request.apply() {
+                let mut mirrors_pending_gc = BTreeSet::new();
+                let mut apply_error = None;
                 for candidate in &candidates {
-                    if self.apply_candidate(candidate, &inventory, request, &mut warnings)? {
-                        applied.push(candidate.clone());
+                    match self.apply_candidate(
+                        candidate,
+                        &inventory,
+                        request,
+                        &mut warnings,
+                        &mut mirrors_pending_gc,
+                    ) {
+                        Ok(true) => applied.push(candidate.clone()),
+                        Ok(false) => {}
+                        Err(error) => {
+                            apply_error = Some(error);
+                            break;
+                        }
                     }
                 }
-                if inventory.herdr_reported {
+                // One maintenance pass per mirror, after every candidate that
+                // deleted refs in this pass. A later candidate error still
+                // maintains mirrors already mutated.
+                self.maintain_mirrors(&mirrors_pending_gc, &mut warnings);
+                if apply_error.is_none() && inventory.herdr_reported {
                     sweep_herdr_tabs(&inventory.task_ids);
+                }
+                if let Some(error) = apply_error {
+                    return Err(error);
                 }
             }
             Ok(GcReport::new(
@@ -945,6 +970,7 @@ impl<'a> HostGc<'a> {
         inventory: &GcInventory,
         request: &GcRequest,
         warnings: &mut Vec<String>,
+        mirrors_pending_gc: &mut BTreeSet<String>,
     ) -> Result<bool, WorkerError> {
         match candidate.kind() {
             "task" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
@@ -1009,7 +1035,7 @@ impl<'a> HostGc<'a> {
                     .remove_owned_child_committed(&parent, &task_id.to_string())?;
                 Ok(true)
             }
-            "branch" => self.apply_branch(candidate, inventory, request, warnings),
+            "branch" => self.apply_branch(candidate, inventory, request, mirrors_pending_gc),
             "job" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
                 push_record_warning(
                     warnings,
@@ -1020,7 +1046,7 @@ impl<'a> HostGc<'a> {
                 Ok(false)
             }
             "job" => self.apply_job(candidate, request, warnings),
-            "mirror" => self.apply_mirror(candidate, inventory, request),
+            "mirror" => self.apply_mirror(candidate, inventory, request, mirrors_pending_gc),
             _ => Err(gc_protocol(
                 "GC_CANDIDATE_INVALID",
                 "GC response contains an unsupported candidate",
@@ -1033,7 +1059,7 @@ impl<'a> HostGc<'a> {
         candidate: &GcCandidate,
         inventory: &GcInventory,
         request: &GcRequest,
-        warnings: &mut Vec<String>,
+        mirrors_pending_gc: &mut BTreeSet<String>,
     ) -> Result<bool, WorkerError> {
         let (project, task_id) = parse_task_identifier(candidate.identifier())?;
         if let Some(snapshot) = inventory.tasks.get(candidate.identifier())
@@ -1077,8 +1103,8 @@ impl<'a> HostGc<'a> {
                 removed = true;
             }
         }
-        if removed && git_gc(self.runner, mirror.path()).is_err() {
-            push_warning(warnings, "git gc was not completed for a retained mirror");
+        if removed {
+            mirrors_pending_gc.insert(project.to_owned());
         }
         Ok(removed)
     }
@@ -1155,6 +1181,7 @@ impl<'a> HostGc<'a> {
         candidate: &GcCandidate,
         inventory: &GcInventory,
         request: &GcRequest,
+        mirrors_pending_gc: &mut BTreeSet<String>,
     ) -> Result<bool, WorkerError> {
         let project = candidate.identifier();
         if inventory.task_projects.contains(project)
@@ -1181,7 +1208,24 @@ impl<'a> HostGc<'a> {
             return Ok(false);
         }
         self.store.remove_owned_child_committed(&repos, &name)?;
+        mirrors_pending_gc.remove(project);
         Ok(true)
+    }
+
+    fn maintain_mirrors(&self, projects: &BTreeSet<String>, warnings: &mut Vec<String>) {
+        for project in projects {
+            let mirror = match self.store.mirror_if_present(project) {
+                Ok(Some(mirror)) => mirror,
+                Ok(None) => continue,
+                Err(_) => {
+                    push_warning(warnings, "git gc was not completed for a retained mirror");
+                    continue;
+                }
+            };
+            if git_gc(self.runner, mirror.path()).is_err() {
+                push_warning(warnings, "git gc was not completed for a retained mirror");
+            }
+        }
     }
 }
 
@@ -1533,7 +1577,7 @@ fn delete_git_ref(
 }
 
 fn git_gc(runner: &dyn ProcessRunner, path: &Path) -> Result<(), WorkerError> {
-    let result = run_git(runner, path, ["gc", "--prune=now", "--quiet"])?;
+    let result = run_git(runner, path, ["gc", GC_PRUNE_EXPIRE, "--quiet"])?;
     if result.status.success() {
         Ok(())
     } else {

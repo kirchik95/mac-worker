@@ -445,7 +445,7 @@ Errors from an already-started close, including transport failures after retaini
 - Your working tree is never modified. Results arrive as remote-tracking refs; merging is your decision.
 - You own SDKs, tools, auth, and secrets. Optional `[setup]` does not install arbitrary packages.
 - Agent-reported checks are not independent verification. Review summary, diff, and fetch ref before you accept.
-- Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`.
+- Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`. Unreachable objects in a mirror stay for two weeks, so a pass does not delete objects another task is still writing.
 - The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
 - `worker task reconcile` repairs task ownership after a laptop reboot (or on the controller host when enabled). It waits 750 ms to confirm an `Absent` owner in that same invocation; a still-unverifiable owner is not treated as dead. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
 - The laptop owns the queue unless you opt in to a remote controller (`[controller] enabled = true`). That mode is off by default. Setup: [Remote controller](#remote-controller).
