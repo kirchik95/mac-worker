@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::{AgentKind, PermissionPolicy, Question, ReportedCheckStatus},
+    agent::{AgentKind, Question, ReportedCheckStatus},
     job::QueueState,
     redaction::RedactionBoundary,
     scheduler::QueueBlockingReason,
@@ -535,7 +535,7 @@ fn task_list_row(
             .meta()
             .effort()
             .map(|effort| boundary.text(effort, 256)),
-        permissions: Some(permission_name(record.meta().policy()).to_owned()),
+        permissions: Some(record.meta().permission_label()),
         env_profile: record
             .meta()
             .env_profile()
@@ -688,13 +688,6 @@ fn agent_name(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Cursor => "cursor",
         AgentKind::Opencode => "opencode",
-    }
-}
-
-fn permission_name(policy: PermissionPolicy) -> &'static str {
-    match policy {
-        PermissionPolicy::Workspace => "workspace",
-        PermissionPolicy::Unattended => "unattended",
     }
 }
 

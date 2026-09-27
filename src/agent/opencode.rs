@@ -5,8 +5,8 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthProbe, AuthProbeResult,
     StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary, combined_output,
-    json_i32, parse_json_line, require_session_ref, resolve_last_structured_result, strip_ansi,
-    validate_params,
+    json_i32, parse_json_line, require_permission, require_session_ref,
+    resolve_last_structured_result, strip_ansi, validate_params,
 };
 
 pub(super) struct OpencodeAdapter;
@@ -26,11 +26,12 @@ impl AgentAdapter for OpencodeAdapter {
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         Ok(argv_pointer_launch(
             self.binary(),
             opencode_args(params.model.as_deref(), None),
             Vec::new(),
-            params.policy,
+            permission.fallback,
         ))
     }
 
@@ -40,12 +41,13 @@ impl AgentAdapter for OpencodeAdapter {
         session_ref: &str,
     ) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let session_ref = require_session_ref(session_ref)?;
         Ok(argv_pointer_launch(
             self.binary(),
             opencode_args(params.model.as_deref(), Some(session_ref)),
             Vec::new(),
-            params.policy,
+            permission.fallback,
         ))
     }
 

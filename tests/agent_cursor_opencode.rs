@@ -782,6 +782,7 @@ fn cursor_workspace_policy_records_permission_fallback() {
                 policy: PermissionPolicy::Workspace,
                 limits: mac_worker::agent::TurnLimits::new(45 * 60 * 1000, None, None).unwrap(),
                 session_seed: uuid::Uuid::from_u128(1),
+                allow_permission_fallback: true,
             },
             "chat0001",
         )

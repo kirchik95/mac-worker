@@ -69,6 +69,17 @@ impl ProjectPreparationError {
     }
 }
 
+/// A frozen permission string has no separate opt-in bit. `workspace` for an
+/// agent without a sandbox was only frozen after an explicit
+/// `[task.permission_fallback]` opt-in, so reconstruct that opt-in here.
+fn inferred_permission_fallback(agent: &str, permission: &str) -> BTreeMap<String, bool> {
+    let mut fallback = BTreeMap::new();
+    if permission == "workspace" && agent != "codex" {
+        fallback.insert(agent.to_owned(), true);
+    }
+    fallback
+}
+
 impl ProjectState {
     pub fn load(
         runner: &dyn ProcessRunner,
@@ -173,6 +184,7 @@ impl ProjectState {
                 timeout,
                 max_followups: prepared.limits.max_followups,
                 permissions,
+                permission_fallback: inferred_permission_fallback(agent, permission),
             },
             setup: None,
         }
@@ -207,6 +219,7 @@ impl ProjectState {
                 timeout: Duration::from_millis(spec.timeout_millis),
                 max_followups: spec.max_followups,
                 permissions,
+                permission_fallback: inferred_permission_fallback(&spec.agent, &spec.permissions),
             },
             setup: None,
         }

@@ -993,6 +993,10 @@ impl<'a> TurnRunner<'a> {
             turn_id.as_uuid(),
             resume,
         )?;
+        let turn = match initial_record.meta().effective_policy() {
+            Some(effective) => turn.with_effective_policy(effective)?,
+            None => turn,
+        };
         let params = TurnParams {
             kind: turn.agent(),
             model: turn.model().map(str::to_owned),
@@ -1000,6 +1004,7 @@ impl<'a> TurnRunner<'a> {
             policy: turn.policy(),
             limits: turn_limits,
             session_seed: turn.session_seed(),
+            allow_permission_fallback: turn.effective_policy().is_some(),
         };
         let adapter = adapter_for(turn.agent());
         let remote = RemoteJobClient::new(self.runner);

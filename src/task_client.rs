@@ -469,6 +469,7 @@ pub struct TaskResultReport {
     deliveries: Vec<OriginDelivery>,
     freshness: TaskFreshness,
     observed_at_millis: Option<u64>,
+    warnings: Vec<String>,
 }
 
 impl TaskResultReport {
@@ -508,6 +509,10 @@ impl TaskResultReport {
         self.observed_at_millis
     }
 
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     pub(crate) fn from_controller(
         task_id: TaskId,
         status: TaskStatus,
@@ -525,6 +530,7 @@ impl TaskResultReport {
             deliveries,
             freshness: TaskFreshness::Current,
             observed_at_millis: None,
+            warnings: Vec::new(),
         }
     }
 }
@@ -1636,6 +1642,19 @@ impl<'a> TaskClient<'a> {
                     prompt: request.prompt.clone(),
                     created_at_millis: created_at,
                 })?;
+                let resolved = crate::agent::resolve_permission(
+                    request.agent,
+                    policy,
+                    settings
+                        .task
+                        .allows_permission_fallback(request.agent.as_str()),
+                )
+                .map_err(|error| task_error("TASK_CONFIG_INVALID", error.to_string()))?;
+                let meta = if resolved.fallback {
+                    meta.with_effective_policy(resolved.effective)?
+                } else {
+                    meta
+                };
                 let status = TaskStatus::new(
                     TaskState::Queued,
                     None,
@@ -2435,6 +2454,7 @@ impl<'a> TaskClient<'a> {
             deliveries: observed.record.deliveries().to_vec(),
             freshness: observed.freshness,
             observed_at_millis: observed.observed_at_millis(),
+            warnings: permission_warnings(record.meta()),
         })
     }
 
@@ -3810,7 +3830,7 @@ impl<'a> TaskClient<'a> {
             task_id: record.meta().task_id(),
             run_id: record.meta().run_id(),
             status: record.status().clone(),
-            warnings: Vec::new(),
+            warnings: permission_warnings(record.meta()),
             events: Vec::new(),
             runner: self.client_state.runner_liveness(record.meta().task_id())?,
             exit_code: None,
@@ -5152,7 +5172,7 @@ impl<'a> TaskClient<'a> {
             task_id,
             run_id: record.meta().run_id(),
             status: record.status().clone(),
-            warnings: Vec::new(),
+            warnings: permission_warnings(record.meta()),
             events: Vec::new(),
             runner: self.client_state.runner_liveness(task_id)?,
             exit_code: None,
@@ -5170,7 +5190,7 @@ impl<'a> TaskClient<'a> {
             task_id: observed.record.meta().task_id(),
             run_id: observed.record.meta().run_id(),
             status: observed.record.status().clone(),
-            warnings: Vec::new(),
+            warnings: permission_warnings(observed.record.meta()),
             events: Vec::new(),
             runner: self
                 .client_state
@@ -5901,8 +5921,14 @@ fn permission_policy(settings: &TaskSettings, agent: AgentKind) -> PermissionPol
         .map(String::as_str)
     {
         Some("unattended") => PermissionPolicy::Unattended,
-        _ => PermissionPolicy::Workspace,
+        Some("workspace") => PermissionPolicy::Workspace,
+        _ if crate::agent::agent_supports_workspace(agent) => PermissionPolicy::Workspace,
+        _ => PermissionPolicy::Unattended,
     }
+}
+
+fn permission_warnings(meta: &TaskMeta) -> Vec<String> {
+    meta.permission_warning().into_iter().collect()
 }
 
 pub(crate) fn batch_has_dag_edges(defaults: &BatchDefaults, tasks: &[BatchTask]) -> bool {

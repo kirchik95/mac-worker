@@ -956,3 +956,60 @@ prompt = "fix login"
         "human output must state the enforced rule: {text}"
     );
 }
+
+#[test]
+fn workspace_permission_for_agents_without_a_sandbox_is_rejected() {
+    for agent in ["claude", "cursor", "opencode"] {
+        let repo = GitRepo::init();
+        repo.write(
+            ".worker.toml",
+            format!("[task.permissions]\n{agent} = \"workspace\"\n").as_bytes(),
+        );
+        let error = ProjectSettings::load(repo.root(), &[]).unwrap_err();
+        assert_eq!(error.public_code(), "TASK_CONFIG_INVALID", "{agent}");
+        let message = error.to_string();
+        assert!(
+            message.contains(agent) && message.contains("permission_fallback"),
+            "{agent}: {message}"
+        );
+    }
+}
+
+#[test]
+fn partial_permission_map_keeps_documented_defaults_for_omitted_agents() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"[task.permissions]\ncodex = \"unattended\"\n",
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.permissions["codex"], "unattended");
+    assert_eq!(settings.task.permissions["claude"], "unattended");
+    assert_eq!(settings.task.permissions["cursor"], "unattended");
+    assert_eq!(settings.task.permissions["opencode"], "unattended");
+}
+
+#[test]
+fn workspace_permission_is_accepted_with_an_explicit_fallback_opt_in() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"[task.permissions]\nclaude = \"workspace\"\n\n[task.permission_fallback]\nclaude = true\n",
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.permissions["claude"], "workspace");
+    assert!(settings.task.allows_permission_fallback("claude"));
+    assert!(!settings.task.allows_permission_fallback("cursor"));
+}
+
+#[test]
+fn codex_workspace_permission_does_not_need_a_fallback_opt_in() {
+    let repo = GitRepo::init();
+    repo.write(
+        ".worker.toml",
+        b"[task.permissions]\ncodex = \"workspace\"\n",
+    );
+    let settings = ProjectSettings::load(repo.root(), &[]).unwrap();
+    assert_eq!(settings.task.permissions["codex"], "workspace");
+    assert_eq!(settings.task.permissions["claude"], "unattended");
+}

@@ -19,6 +19,7 @@ fn params(policy: PermissionPolicy) -> TurnParams {
         policy,
         limits: TurnLimits::new(DEFAULT_TIMEOUT_MILLIS, None, None).unwrap(),
         session_seed: Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001),
+        allow_permission_fallback: false,
     }
 }
 
@@ -223,8 +224,11 @@ fn claude_first_turn_binds_generated_session_budget_and_turns() {
 
 #[test]
 fn claude_workspace_policy_falls_back_to_unattended() {
+    let mut requested = params(PermissionPolicy::Workspace);
+    requested.kind = AgentKind::Claude;
+    requested.allow_permission_fallback = true;
     let launch = adapter_for(AgentKind::Claude)
-        .first_turn(&params(PermissionPolicy::Workspace))
+        .first_turn(&requested)
         .unwrap();
     assert!(launch.permission_fallback());
     assert!(
@@ -793,8 +797,10 @@ fn cursor_first_turn_uses_argv_pointer_trust_and_force() {
 
 #[test]
 fn cursor_workspace_policy_falls_back_to_unattended() {
+    let mut requested = cursor_params(PermissionPolicy::Workspace);
+    requested.allow_permission_fallback = true;
     let launch = adapter_for(AgentKind::Cursor)
-        .first_turn(&cursor_params(PermissionPolicy::Workspace))
+        .first_turn(&requested)
         .unwrap();
     assert!(launch.permission_fallback());
     assert!(launch.args().contains(&"--force".into()));
@@ -893,11 +899,36 @@ fn opencode_first_turn_uses_argv_pointer_and_auto() {
 
 #[test]
 fn opencode_workspace_policy_falls_back_to_unattended() {
+    let mut requested = opencode_params(PermissionPolicy::Workspace);
+    requested.allow_permission_fallback = true;
     let launch = adapter_for(AgentKind::Opencode)
-        .first_turn(&opencode_params(PermissionPolicy::Workspace))
+        .first_turn(&requested)
         .unwrap();
     assert!(launch.permission_fallback());
     assert!(launch.args().contains(&"--auto".into()));
+}
+
+#[test]
+fn unsandboxed_agents_reject_workspace_without_an_explicit_fallback() {
+    for kind in [AgentKind::Claude, AgentKind::Cursor, AgentKind::Opencode] {
+        let mut requested = params(PermissionPolicy::Workspace);
+        requested.kind = kind;
+        let error = adapter_for(kind)
+            .first_turn(&requested)
+            .expect_err("workspace without opt-in must not launch");
+        let message = error.to_string();
+        assert!(
+            message.contains("sandbox") && message.contains("permission_fallback"),
+            "{kind:?}: {message}"
+        );
+        let resume = adapter_for(kind)
+            .resume_turn(&requested, "session-ref")
+            .expect_err("resume must reject workspace without opt-in");
+        assert!(
+            resume.to_string().contains("permission_fallback"),
+            "{kind:?}: {resume}"
+        );
+    }
 }
 
 #[test]

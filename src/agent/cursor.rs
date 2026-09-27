@@ -6,8 +6,8 @@ use crate::process::ProcessResult;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthFailureSignature, AuthProbe,
     AuthProbeResult, StructuredResult, TurnLaunch, TurnParams, argv_pointer_launch, bound_summary,
-    combined_output, parse_json_line, require_session_ref, resolve_last_structured_result,
-    strip_ansi, validate_params,
+    combined_output, parse_json_line, require_permission, require_session_ref,
+    resolve_last_structured_result, strip_ansi, validate_params,
 };
 
 const AUTH_FAILURE_SIGNATURES: &[AuthFailureSignature] = &[AuthFailureSignature::Contains(
@@ -40,11 +40,12 @@ impl AgentAdapter for CursorAdapter {
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         Ok(argv_pointer_launch(
             self.binary(),
             cursor_args(params.model.as_deref(), &params.session_seed.to_string()),
             ENV_NAMES.to_vec(),
-            params.policy,
+            permission.fallback,
         ))
     }
 
@@ -54,12 +55,13 @@ impl AgentAdapter for CursorAdapter {
         session_ref: &str,
     ) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let session_ref = require_session_ref(session_ref)?;
         Ok(argv_pointer_launch(
             self.binary(),
             cursor_args(params.model.as_deref(), session_ref),
             ENV_NAMES.to_vec(),
-            params.policy,
+            permission.fallback,
         ))
     }
 

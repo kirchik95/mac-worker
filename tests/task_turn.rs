@@ -1521,6 +1521,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
         policy: resume_turn.policy(),
         limits: resume_turn.limits().clone(),
         session_seed: resume_turn.session_seed(),
+        allow_permission_fallback: false,
     };
     let launch = adapter_for(AgentKind::Codex)
         .resume_turn(&params, "session-resume")

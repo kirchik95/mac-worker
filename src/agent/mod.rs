@@ -125,6 +125,59 @@ pub enum PermissionPolicy {
     Unattended,
 }
 
+impl PermissionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Unattended => "unattended",
+        }
+    }
+}
+
+/// Codex is the only adapter with a workspace-write sandbox. The others have
+/// no setting between "ask" and full bypass, so a requested `workspace`
+/// permission is either rejected or an explicit fallback to `unattended`.
+pub fn agent_supports_workspace(agent: AgentKind) -> bool {
+    matches!(agent, AgentKind::Codex)
+}
+
+/// Requested permission and the policy the adapter will actually launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPermission {
+    pub requested: PermissionPolicy,
+    pub effective: PermissionPolicy,
+    pub fallback: bool,
+}
+
+pub fn resolve_permission(
+    agent: AgentKind,
+    requested: PermissionPolicy,
+    allow_fallback: bool,
+) -> Result<ResolvedPermission, AdapterError> {
+    if agent_supports_workspace(agent) || requested == PermissionPolicy::Unattended {
+        return Ok(ResolvedPermission {
+            requested,
+            effective: requested,
+            fallback: false,
+        });
+    }
+    if !allow_fallback {
+        return Err(AdapterError::new(format!(
+            "{agent} has no workspace sandbox, so a requested workspace permission would run unattended. Set permissions.{agent} to \"unattended\", or opt in with [task.permission_fallback] {agent} = true",
+            agent = agent.as_str(),
+        )));
+    }
+    Ok(ResolvedPermission {
+        requested,
+        effective: PermissionPolicy::Unattended,
+        fallback: true,
+    })
+}
+
+pub(super) fn require_permission(params: &TurnParams) -> Result<ResolvedPermission, AdapterError> {
+    resolve_permission(params.kind, params.policy, params.allow_permission_fallback)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDelivery {
     Stdin,
@@ -184,6 +237,9 @@ pub struct TurnParams {
     pub policy: PermissionPolicy,
     pub limits: TurnLimits,
     pub session_seed: uuid::Uuid,
+    /// When true, an agent without a workspace sandbox may launch the
+    /// requested `workspace` policy as `unattended` and record the fallback.
+    pub allow_permission_fallback: bool,
 }
 
 /// Reasoning effort is interpolated into agent configuration arguments, so it
@@ -970,7 +1026,7 @@ fn argv_pointer_launch(
     program: impl Into<String>,
     mut args: Vec<String>,
     env_names: Vec<&'static str>,
-    policy: PermissionPolicy,
+    permission_fallback: bool,
 ) -> TurnLaunch {
     args.push(PROMPT_POINTER.to_string());
     TurnLaunch::new(
@@ -978,7 +1034,7 @@ fn argv_pointer_launch(
         args,
         PromptDelivery::ArgvPointer,
         env_names,
-        policy == PermissionPolicy::Workspace,
+        permission_fallback,
     )
 }
 

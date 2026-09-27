@@ -51,6 +51,46 @@ fn task_meta(source: TaskSource, publish: Vec<PublishMode>) -> TaskMeta {
 }
 
 #[test]
+fn effective_permission_is_recorded_only_when_it_differs_from_the_request() {
+    let requested = task_meta(
+        TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        vec![PublishMode::Fetch],
+    );
+    let wire = serde_json::to_value(&requested).unwrap();
+    assert!(wire.get("effective_policy").is_none());
+    assert_eq!(requested.permission_label(), "workspace");
+    assert!(requested.permission_warning().is_none());
+
+    let mut claude = serde_json::to_value(&requested).unwrap();
+    claude["agent"] = serde_json::json!("claude");
+    claude["policy"] = serde_json::json!("workspace");
+    let meta: TaskMeta = serde_json::from_value(claude).unwrap();
+    let recorded = meta
+        .with_effective_policy(PermissionPolicy::Unattended)
+        .unwrap();
+    let stored = serde_json::to_value(&recorded).unwrap();
+    assert_eq!(stored["policy"], "workspace");
+    assert_eq!(stored["effective_policy"], "unattended");
+    assert_eq!(
+        recorded.permission_label(),
+        "workspace (effective: unattended)"
+    );
+    let warning = recorded.permission_warning().unwrap();
+    assert!(
+        warning.contains("workspace") && warning.contains("unattended"),
+        "{warning}"
+    );
+    let round_trip: TaskMeta = serde_json::from_value(stored).unwrap();
+    assert_eq!(
+        round_trip.effective_policy(),
+        Some(PermissionPolicy::Unattended)
+    );
+}
+
+#[test]
 fn origin_source_and_push_are_recorded_as_one_canonical_scope() {
     let origin = task_meta(
         TaskSource::Origin {

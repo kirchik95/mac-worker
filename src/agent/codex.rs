@@ -3,7 +3,8 @@ use serde_json::Value;
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentKind, AuthFailureSignature, PermissionPolicy,
     PromptDelivery, StructuredResult, TurnLaunch, TurnParams, bound_summary, json_i32,
-    parse_json_line, require_session_ref, resolve_structured_result, validate_params,
+    parse_json_line, require_permission, require_session_ref, resolve_structured_result,
+    validate_params,
 };
 
 const AUTH_FAILURE_SIGNATURES: &[AuthFailureSignature] = &[
@@ -32,6 +33,7 @@ impl AgentAdapter for CodexAdapter {
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let mut args = vec![
             "exec".into(),
             "--json".into(),
@@ -42,14 +44,14 @@ impl AgentAdapter for CodexAdapter {
         ];
         push_model(&mut args, params);
         push_effort(&mut args, params);
-        push_first_turn_policy(&mut args, params.policy);
+        push_first_turn_policy(&mut args, permission.effective);
         args.push("-".into());
         Ok(TurnLaunch::new(
             self.binary(),
             args,
             PromptDelivery::Stdin,
             Vec::new(),
-            false,
+            permission.fallback,
         ))
     }
 
@@ -59,6 +61,7 @@ impl AgentAdapter for CodexAdapter {
         session_ref: &str,
     ) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let session_ref = require_session_ref(session_ref)?;
         let mut args = vec![
             "exec".into(),
@@ -72,14 +75,14 @@ impl AgentAdapter for CodexAdapter {
         ];
         push_model(&mut args, params);
         push_effort(&mut args, params);
-        push_resume_policy(&mut args, params.policy);
+        push_resume_policy(&mut args, permission.effective);
         args.push("-".into());
         Ok(TurnLaunch::new(
             self.binary(),
             args,
             PromptDelivery::Stdin,
             Vec::new(),
-            false,
+            permission.fallback,
         ))
     }
 

@@ -48,6 +48,16 @@ pub struct TaskSettings {
     pub timeout: Duration,
     pub max_followups: u32,
     pub permissions: BTreeMap<String, String>,
+    pub permission_fallback: BTreeMap<String, bool>,
+}
+
+impl TaskSettings {
+    pub fn allows_permission_fallback(&self, agent: &str) -> bool {
+        self.permission_fallback
+            .get(agent)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +165,8 @@ struct RawTaskSettings {
     max_followups: u32,
     #[serde(default = "default_task_permissions")]
     permissions: BTreeMap<String, String>,
+    #[serde(default)]
+    permission_fallback: BTreeMap<String, bool>,
 }
 
 impl Default for RawTaskSettings {
@@ -169,6 +181,7 @@ impl Default for RawTaskSettings {
             timeout: default_task_timeout(),
             max_followups: default_task_max_followups(),
             permissions: default_task_permissions(),
+            permission_fallback: BTreeMap::new(),
         }
     }
 }
@@ -475,12 +488,34 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
             "task max_followups must be at most 100 (TASK_CONFIG_INVALID)",
         ));
     }
-    for (agent, policy) in &raw.permissions {
-        validate_task_text(agent, "task permission agent")?;
+    let mut permissions = default_task_permissions();
+    for (agent, policy) in raw.permissions {
+        validate_task_text(&agent, "task permission agent")?;
         if !matches!(policy.as_str(), "workspace" | "unattended") {
             return Err(task_config(
                 "task permission must be workspace or unattended (TASK_CONFIG_INVALID)",
             ));
+        }
+        permissions.insert(agent, policy);
+    }
+    let mut permission_fallback = BTreeMap::new();
+    for (agent, enabled) in raw.permission_fallback {
+        validate_task_text(&agent, "task permission fallback agent")?;
+        if !known_task_agent(&agent) {
+            return Err(task_config(format!(
+                "task permission_fallback agent {agent} is unknown (TASK_CONFIG_INVALID)"
+            )));
+        }
+        permission_fallback.insert(agent, enabled);
+    }
+    for (agent, policy) in &permissions {
+        if policy == "workspace" && !agent_has_workspace_sandbox(agent) {
+            let opted_in = permission_fallback.get(agent).copied().unwrap_or(false);
+            if !opted_in {
+                return Err(task_config(format!(
+                    "task permission {agent} = \"workspace\" has no workspace sandbox, so it would run unattended. Set permissions.{agent} to \"unattended\", or opt in with [task.permission_fallback] {agent} = true (TASK_CONFIG_INVALID)"
+                )));
+            }
         }
     }
     Ok(TaskSettings {
@@ -492,8 +527,17 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
         default_agent: raw.default_agent,
         timeout,
         max_followups: raw.max_followups,
-        permissions: raw.permissions,
+        permissions,
+        permission_fallback,
     })
+}
+
+fn known_task_agent(agent: &str) -> bool {
+    matches!(agent, "codex" | "claude" | "cursor" | "opencode")
+}
+
+fn agent_has_workspace_sandbox(agent: &str) -> bool {
+    agent == "codex"
 }
 
 fn validate_task_text(value: &str, field: &str) -> Result<(), WorkerError> {

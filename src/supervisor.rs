@@ -2197,6 +2197,19 @@ impl<'a> Supervisor<'a> {
             },
             None => EnvProfile::empty(),
         };
+        if let Err(error) = profile.persist_launched_redaction(job) {
+            return self.finish_turn_prelaunch_failure(
+                lease,
+                job,
+                guard,
+                &meta,
+                &section,
+                status_bytes,
+                status,
+                "ENV_PROFILE_PERMISSIONS",
+                error,
+            );
+        }
         let task_workspace = match self
             .store
             .open_task_workspace(section.project_id(), section.turn().task_id())

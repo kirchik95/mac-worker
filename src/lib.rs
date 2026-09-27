@@ -1765,6 +1765,9 @@ pub(crate) fn write_task_result_report(
                 value["observed_at_millis"] = serde_json::json!(observed_at);
             }
         }
+        if !report.warnings().is_empty() {
+            value["warnings"] = serde_json::json!(report.warnings());
+        }
         write_json_line(stdout, &value)
     } else {
         writeln!(
@@ -1773,6 +1776,9 @@ pub(crate) fn write_task_result_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        for warning in report.warnings() {
+            writeln!(stdout, "warning: {warning}")?;
+        }
         if let Some(summary) = report.status().summary() {
             writeln!(stdout, "summary: {summary}")?;
         }

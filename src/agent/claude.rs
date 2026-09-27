@@ -1,9 +1,9 @@
 use serde_json::Value;
 
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentKind, PermissionPolicy, PromptDelivery,
-    RESULT_SCHEMA_JSON, StructuredResult, TurnLaunch, TurnParams, bound_summary, format_usd_cents,
-    parse_json_line, require_session_ref, resolve_structured_result, validate_params,
+    AdapterError, AgentAdapter, AgentEvent, AgentKind, PromptDelivery, RESULT_SCHEMA_JSON,
+    StructuredResult, TurnLaunch, TurnParams, bound_summary, format_usd_cents, parse_json_line,
+    require_permission, require_session_ref, resolve_structured_result, validate_params,
 };
 
 const ENV_NAMES: [&str; 2] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"];
@@ -21,6 +21,7 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn first_turn(&self, params: &TurnParams) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let mut args = vec![
             "-p".into(),
             "--output-format".into(),
@@ -37,7 +38,7 @@ impl AgentAdapter for ClaudeAdapter {
             args,
             PromptDelivery::Stdin,
             ENV_NAMES.to_vec(),
-            params.policy == PermissionPolicy::Workspace,
+            permission.fallback,
         ))
     }
 
@@ -47,6 +48,7 @@ impl AgentAdapter for ClaudeAdapter {
         session_ref: &str,
     ) -> Result<TurnLaunch, AdapterError> {
         validate_params(params)?;
+        let permission = require_permission(params)?;
         let session_ref = require_session_ref(session_ref)?;
         let mut args = vec![
             "-p".into(),
@@ -64,7 +66,7 @@ impl AgentAdapter for ClaudeAdapter {
             args,
             PromptDelivery::Stdin,
             ENV_NAMES.to_vec(),
-            params.policy == PermissionPolicy::Workspace,
+            permission.fallback,
         ))
     }
 

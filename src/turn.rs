@@ -56,6 +56,7 @@ pub struct TurnMaterial {
     model: Option<String>,
     effort: Option<String>,
     policy: PermissionPolicy,
+    effective_policy: Option<PermissionPolicy>,
     limits: TurnLimits,
     base_oid: BaseOid,
     prompt_sha256: String,
@@ -87,6 +88,7 @@ impl TurnMaterial {
             model,
             effort,
             policy,
+            effective_policy: None,
             limits,
             base_oid,
             prompt_sha256,
@@ -195,6 +197,19 @@ impl TurnMaterial {
         self.policy
     }
 
+    pub fn effective_policy(&self) -> Option<PermissionPolicy> {
+        self.effective_policy
+    }
+
+    pub fn with_effective_policy(
+        mut self,
+        effective: PermissionPolicy,
+    ) -> Result<Self, WorkerError> {
+        self.effective_policy = (effective != self.policy).then_some(effective);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn limits(&self) -> &TurnLimits {
         &self.limits
     }
@@ -256,8 +271,10 @@ impl serde::Serialize for TurnMaterial {
         self.validate().map_err(serde::ser::Error::custom)?;
         // Omitted when unset so a turn without an effort keeps the canonical
         // bytes, and therefore the digest, it had before the field existed.
-        let mut record =
-            serializer.serialize_struct("TurnMaterial", 11 + usize::from(self.effort.is_some()))?;
+        let mut record = serializer.serialize_struct(
+            "TurnMaterial",
+            11 + usize::from(self.effort.is_some()) + usize::from(self.effective_policy.is_some()),
+        )?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("turn_number", &self.turn_number)?;
         record.serialize_field("agent", &agent_name(self.agent))?;
@@ -266,6 +283,9 @@ impl serde::Serialize for TurnMaterial {
             record.serialize_field("effort", &self.effort)?;
         }
         record.serialize_field("policy", &policy_name(self.policy))?;
+        if let Some(effective) = self.effective_policy {
+            record.serialize_field("effective_policy", &policy_name(effective))?;
+        }
         record.serialize_field("limits", &TurnLimitsWire::from(&self.limits))?;
         record.serialize_field("base_oid", &self.base_oid)?;
         record.serialize_field("prompt_sha256", &self.prompt_sha256)?;
@@ -288,6 +308,8 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             #[serde(default)]
             effort: Option<String>,
             policy: String,
+            #[serde(default)]
+            effective_policy: Option<String>,
             limits: TurnLimitsWire,
             base_oid: BaseOid,
             prompt_sha256: String,
@@ -298,7 +320,7 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
         let wire = Wire::deserialize(deserializer)?;
         let session_seed = Uuid::parse_str(&wire.session_seed)
             .map_err(|_| D::Error::custom("session seed is invalid"))?;
-        Self::new(
+        let material = Self::new(
             wire.task_id,
             wire.turn_number,
             parse_agent(&wire.agent).map_err(D::Error::custom)?,
@@ -312,7 +334,13 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             session_seed,
             wire.resume,
         )
-        .map_err(D::Error::custom)
+        .map_err(D::Error::custom)?;
+        match wire.effective_policy {
+            Some(effective) => material
+                .with_effective_policy(parse_policy(&effective).map_err(D::Error::custom)?)
+                .map_err(D::Error::custom),
+            None => Ok(material),
+        }
     }
 }
 
@@ -1076,10 +1104,13 @@ impl<'a> TurnPublisher<'a> {
                 outbox.commit_intent(commit)?;
             }
         }
-        let boundary = RedactionBoundary::from_env();
+        let boundary = publication_boundary(turn_dir)?;
         let summary = nonempty(&boundary.summary(structured.summary()));
         let questions = boundary.questions(structured.questions());
         let agent_files_changed = boundary.changed_files(structured.files_changed());
+        let files_changed = boundary.changed_files(files_changed);
+        let diff_stat = diff_stat.map(|stat| boundary.diff_stat(&stat));
+        let reported_checks = boundary.reported_checks(structured.checks().to_vec());
         TaskStore::new(self.store, self.runner).finish_turn(
             meta.project_id(),
             meta.task_id(),
@@ -1097,7 +1128,7 @@ impl<'a> TurnPublisher<'a> {
                 files_changed.clone()
             },
             diff_stat.clone(),
-            structured.checks().to_vec(),
+            reported_checks,
             false,
         )?;
         let _ = session;
@@ -1892,6 +1923,54 @@ impl EnvProfile {
             .collect::<Vec<_>>();
         RedactionBoundary::new(home).with_secrets(secrets)
     }
+
+    /// Writes the secrets this launch actually loaded. Publication reads this
+    /// file instead of the profile that happens to be on disk later.
+    pub(crate) fn persist_launched_redaction(&self, job: &RootedDir) -> Result<(), WorkerError> {
+        if job.entry_exists(LAUNCHED_REDACTION_FILE)? {
+            return Ok(());
+        }
+        let secrets = self
+            .all_entries()
+            .into_iter()
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&secrets).map_err(|error| {
+            turn_error(
+                "ENV_PROFILE_INVALID",
+                format!("cannot encode launched redaction snapshot: {error}"),
+            )
+        })?;
+        job.write_private_atomic_no_replace(LAUNCHED_REDACTION_FILE, &bytes)
+            .map_err(|error| {
+                turn_error(
+                    "ENV_PROFILE_PERMISSIONS",
+                    format!("cannot store launched redaction snapshot: {error}"),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+const LAUNCHED_REDACTION_FILE: &str = "launched-redaction.json";
+const LAUNCHED_REDACTION_MAX_BYTES: u64 = 1024 * 1024;
+
+fn publication_boundary(turn_dir: &RootedDir) -> Result<RedactionBoundary, WorkerError> {
+    if !turn_dir.entry_exists(LAUNCHED_REDACTION_FILE)? {
+        return Ok(RedactionBoundary::from_env());
+    }
+    let bytes = turn_dir
+        .read_private_regular(LAUNCHED_REDACTION_FILE, LAUNCHED_REDACTION_MAX_BYTES)
+        .map_err(|error| {
+            turn_error(
+                "PUBLISH_FAILED",
+                format!("cannot read launched redaction snapshot: {error}"),
+            )
+        })?;
+    let secrets: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|_| turn_error("PUBLISH_FAILED", "launched redaction snapshot is invalid"))?;
+    Ok(RedactionBoundary::from_env().with_secrets(secrets))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2105,6 +2184,73 @@ mod tests {
 
     fn write_stdout(turn_dir: &RootedDir, bytes: &[u8]) {
         RootedDir::write_private_atomic_no_replace(turn_dir, "stdout.log", bytes).unwrap();
+    }
+
+    #[test]
+    fn publication_redacts_the_launched_snapshot_and_keeps_a_rotated_secret() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let secret = "purple-lantern-secret-qq";
+        let decoy = "rotated-lantern-secret-zz";
+        RootedDir::write_private_atomic_no_replace(
+            &turn_dir,
+            "launched-redaction.json",
+            &serde_json::to_vec(&vec![secret]).unwrap(),
+        )
+        .unwrap();
+        RootedDir::write_private_atomic_no_replace(&turn_dir, "rotated.env", decoy.as_bytes())
+            .unwrap();
+
+        let boundary = publication_boundary(&turn_dir).unwrap();
+        let summary = boundary.summary(&format!("saw {secret} and {decoy}"));
+        let questions = boundary.questions([crate::agent::Question::open(format!(
+            "ask {secret} {decoy}"
+        ))]);
+        let files = boundary.changed_files([format!("src/{secret}.rs"), format!("src/{decoy}.rs")]);
+        let diff_stat = boundary.diff_stat(&format!("{secret} {decoy}"));
+        let checks = boundary.reported_checks([crate::agent::ReportedCheck::new(
+            format!("check {secret}"),
+            format!("echo {decoy}"),
+            crate::agent::ReportedCheckStatus::Pass,
+            format!("detail {secret} {decoy}"),
+        )]);
+        let status = crate::task::TaskStatus::new(
+            crate::task::TaskState::Open,
+            None,
+            None,
+            false,
+            None,
+            Some(summary),
+            questions,
+            files,
+            Some(diff_stat),
+            Vec::new(),
+            1,
+        )
+        .unwrap()
+        .with_reported_checks(checks)
+        .unwrap();
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(
+            !encoded.contains(secret),
+            "launched secret leaked into status: {encoded}"
+        );
+        assert!(
+            encoded.contains(decoy),
+            "rotated secret must stay visible: {encoded}"
+        );
+    }
+
+    #[test]
+    fn publication_refuses_a_corrupt_launched_redaction_snapshot() {
+        let (_temp, turn_dir) = open_scan_dir();
+        RootedDir::write_private_atomic_no_replace(
+            &turn_dir,
+            "launched-redaction.json",
+            b"not-json",
+        )
+        .unwrap();
+        let error = publication_boundary(&turn_dir).unwrap_err();
+        assert_eq!(error.public_code(), "PUBLISH_FAILED");
     }
 
     fn codex_session_line() -> &'static str {

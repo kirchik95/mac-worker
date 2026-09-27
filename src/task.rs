@@ -731,6 +731,7 @@ pub struct TaskMeta {
     model: Option<String>,
     effort: Option<String>,
     policy: PermissionPolicy,
+    effective_policy: Option<PermissionPolicy>,
     source: TaskSource,
     publish: Vec<PublishMode>,
     publish_branch: Option<BranchName>,
@@ -759,6 +760,7 @@ impl TaskMeta {
             model: input.model,
             effort: input.effort,
             policy: input.policy,
+            effective_policy: None,
             source: input.source,
             publish: input.publish,
             publish_branch: input.publish_branch,
@@ -838,6 +840,43 @@ impl TaskMeta {
 
     pub fn policy(&self) -> PermissionPolicy {
         self.policy
+    }
+
+    /// The policy the adapter launched, when it differs from [`Self::policy`].
+    /// Absent on older records and whenever the requested policy was launched
+    /// as itself.
+    pub fn effective_policy(&self) -> Option<PermissionPolicy> {
+        self.effective_policy
+    }
+
+    pub fn with_effective_policy(
+        mut self,
+        effective: PermissionPolicy,
+    ) -> Result<Self, WorkerError> {
+        self.effective_policy = (effective != self.policy).then_some(effective);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn permission_label(&self) -> String {
+        match self.effective_policy {
+            Some(effective) => format!(
+                "{} (effective: {})",
+                self.policy.as_str(),
+                effective.as_str()
+            ),
+            None => self.policy.as_str().to_owned(),
+        }
+    }
+
+    pub fn permission_warning(&self) -> Option<String> {
+        let effective = self.effective_policy?;
+        Some(format!(
+            "requested {} permission for {} has no workspace sandbox; effective permission is {}",
+            self.policy.as_str(),
+            self.agent.as_str(),
+            effective.as_str(),
+        ))
     }
 
     pub fn limits(&self) -> &TaskLimits {
@@ -951,8 +990,10 @@ impl Serialize for TaskMeta {
         self.validate().map_err(ser::Error::custom)?;
         // `effort` is omitted when unset so a record written before it existed
         // re-serializes byte for byte and keeps its canonical bytes.
-        let mut record =
-            serializer.serialize_struct("TaskMeta", 17 + usize::from(self.effort.is_some()))?;
+        let mut record = serializer.serialize_struct(
+            "TaskMeta",
+            17 + usize::from(self.effort.is_some()) + usize::from(self.effective_policy.is_some()),
+        )?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("project_id", &self.project_id)?;
@@ -963,6 +1004,9 @@ impl Serialize for TaskMeta {
             record.serialize_field("effort", &self.effort)?;
         }
         record.serialize_field("policy", &PermissionPolicyWire::from(self.policy))?;
+        if let Some(effective) = self.effective_policy {
+            record.serialize_field("effective_policy", &PermissionPolicyWire::from(effective))?;
+        }
         record.serialize_field("source", &self.source)?;
         record.serialize_field("publish", &self.publish)?;
         record.serialize_field("publish_branch", &self.publish_branch)?;
@@ -991,6 +1035,8 @@ impl<'de> Deserialize<'de> for TaskMeta {
             #[serde(default)]
             effort: Option<String>,
             policy: PermissionPolicyWire,
+            #[serde(default)]
+            effective_policy: Option<PermissionPolicyWire>,
             source: TaskSource,
             publish: Vec<PublishMode>,
             publish_branch: Option<BranchName>,
@@ -1012,6 +1058,7 @@ impl<'de> Deserialize<'de> for TaskMeta {
             model: wire.model,
             effort: wire.effort,
             policy: wire.policy.into(),
+            effective_policy: None,
             source: wire.source,
             publish: wire.publish,
             publish_branch: wire.publish_branch,
@@ -1024,7 +1071,12 @@ impl<'de> Deserialize<'de> for TaskMeta {
             created_at_millis: wire.created_at_millis,
         };
         meta.validate().map_err(de::Error::custom)?;
-        Ok(meta)
+        match wire.effective_policy {
+            Some(effective) => meta
+                .with_effective_policy(effective.into())
+                .map_err(de::Error::custom),
+            None => Ok(meta),
+        }
     }
 }
 

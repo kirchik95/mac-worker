@@ -69,6 +69,7 @@ fn settings_including(patterns: &[&str]) -> ProjectSettings {
             timeout: Duration::from_secs(45 * 60),
             max_followups: 10,
             permissions: std::collections::BTreeMap::new(),
+            permission_fallback: std::collections::BTreeMap::new(),
         },
         setup: None,
     }
