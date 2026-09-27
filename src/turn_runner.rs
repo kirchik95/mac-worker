@@ -1349,13 +1349,18 @@ impl<'a> TurnRunner<'a> {
     ) -> Result<TurnOutcomeReport, WorkerError> {
         self.persist_status(task_id, terminal.clone())?;
         let fetched = if matches!(terminal.state(), TaskState::Open | TaskState::Closed) {
-            if let Err(_error) = GitTransport::new(self.runner).fetch_result(
+            let import = transfer.result_import(task_id)?;
+            if let Err(error) = GitTransport::new(self.runner).fetch_result(
                 worker,
                 self.client_state.client_id(),
                 initial_record.meta().project_id(),
                 task_id,
                 transfer.path(),
             ) {
+                if error.public_code() == "RESULT_REF_BUSY" {
+                    return Err(error);
+                }
+                drop(import);
                 return self.finish_publication_failure(
                     task_id,
                     turn_id,
@@ -1367,14 +1372,17 @@ impl<'a> TurnRunner<'a> {
                     follow,
                 );
             }
-            match transfer.import_result(
+            match import.import_result(
                 self.runner,
                 &project.context.common_dir,
                 worker.name.as_str(),
-                task_id,
             ) {
                 Ok(receipt) => Some(receipt.head().clone()),
-                Err(_error) => {
+                Err(error) => {
+                    if error.public_code() == "RESULT_REF_BUSY" {
+                        return Err(error);
+                    }
+                    drop(import);
                     return self.finish_publication_failure(
                         task_id,
                         turn_id,
@@ -2078,6 +2086,7 @@ fn try_import_completed_result(
         .worker()
         .or_else(|| record.pinned_worker())?;
     let worker = config.worker(worker_name)?;
+    let import = transfer.result_import(task_id).ok()?;
     GitTransport::new(runner)
         .fetch_result(
             worker,
@@ -2088,13 +2097,8 @@ fn try_import_completed_result(
         )
         .ok()
         .and_then(|_| {
-            transfer
-                .import_result(
-                    runner,
-                    &project.context.common_dir,
-                    worker.name.as_str(),
-                    task_id,
-                )
+            import
+                .import_result(runner, &project.context.common_dir, worker.name.as_str())
                 .ok()
                 .map(|receipt| receipt.head().clone())
         })

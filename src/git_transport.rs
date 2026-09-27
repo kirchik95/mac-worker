@@ -472,10 +472,10 @@ impl<'a> GitTransport<'a> {
                 format!("+refs/heads/task/{task_id}:{local_ref}").into(),
             ],
         );
-        let result = self.runner.run(&request).map_err(map_fetch_failure)?;
-        if !result.status.success() {
-            return Err(git_error("RESULT_FETCH_FAILED", "result fetch failed"));
-        }
+        crate::transfer_repo::retry_result_ref_update(
+            || self.runner.run(&request).map_err(map_fetch_failure),
+            "RESULT_FETCH_FAILED",
+        )?;
         let head = read_ref_head(self.runner, transfer_repo, &local_ref)?;
         Ok(ImportReceipt::new(head, local_ref))
     }

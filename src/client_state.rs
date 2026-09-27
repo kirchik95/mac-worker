@@ -91,6 +91,25 @@ pub const RUNNER_ABSENCE_CONFIRMATION: Duration = Duration::from_millis(750);
 /// `task list` shows `RUNNER_UNVERIFIABLE` only after this long without proof.
 pub const RUNNER_UNVERIFIABLE_AFTER: Duration = Duration::from_secs(30);
 
+pub(crate) const TASK_CLOSE_IN_PROGRESS: &str = "task close is in progress";
+
+pub(crate) fn task_operator_busy_reason(
+    record: &LocalTaskRecord,
+    entry: Option<&QueueEntry>,
+) -> Option<&'static str> {
+    if record.close_intent().is_some() {
+        Some(TASK_CLOSE_IN_PROGRESS)
+    } else if record.status().state() == crate::task::TaskState::Active {
+        Some("task has an active turn")
+    } else if entry.is_some_and(|entry| matches!(entry.state(), QueueState::Dispatching { .. })) {
+        Some("task turn is being dispatched")
+    } else if record.runner().is_some() {
+        Some("task runner is still finishing")
+    } else {
+        None
+    }
+}
+
 /// Liveness of a runner identity (pid + start identity).
 ///
 /// Absence of evidence is not death. Restart, adopt, or finalize only on
@@ -2823,6 +2842,39 @@ impl ClientStateStore {
         let replacement = current.with_fetched_head(Some(head))?;
         self.update_task_locked_before_final_sync(replacement, || Ok(()), IdenticalTaskWrite::Skip)
             .map(|()| true)
+    }
+
+    /// Called while the per-task result lock is held. Read the generation,
+    /// busy state, and queue together; never carry Git/SSH under StateLock.
+    pub(crate) fn fence_task_fetch(
+        &self,
+        expected: &LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let task_id = expected.meta().task_id();
+        let current = self.load_task(task_id)?;
+        if !same_result_turn(&current, expected) {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "task turn changed before fetch",
+            ));
+        }
+        if current.status().state() == crate::task::TaskState::Abandoned {
+            return Err(WorkerError::task(
+                "TASK_CLOSED",
+                "discarded tasks cannot be fetched",
+            ));
+        }
+        let turns = self.turn_ids_for_task(task_id)?;
+        let (snapshot, _) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let entry = snapshot.entries().iter().find(|entry| {
+            entry.kind() == QueueEntryKind::TaskTurn && turns.contains(&entry.job_id())
+        });
+        if let Some(reason) = task_operator_busy_reason(&current, entry) {
+            return Err(WorkerError::task("TASK_BUSY", reason));
+        }
+        Ok(current)
     }
 
     fn replace_task_locked_if_current<F>(

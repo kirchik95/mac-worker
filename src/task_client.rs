@@ -61,7 +61,7 @@ const TASK_CAPABILITY_PREFIX: &str = "agent:";
 const DEFAULT_GIT_NAME: &str = "mac-worker";
 const DEFAULT_GIT_EMAIL: &str = "mac-worker@localhost";
 const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
-const CLOSE_IN_PROGRESS: &str = "task close is in progress";
+const CLOSE_IN_PROGRESS: &str = crate::client_state::TASK_CLOSE_IN_PROGRESS;
 const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
 const PUBLISH_RETRY_MERGE_ATTEMPTS: usize = 3;
 const PUBLISH_RETRY_LOCAL_UPDATE_WARNING: &str = "origin retry was accepted on the worker, but the laptop record could not be updated with the returned deliveries";
@@ -2362,10 +2362,17 @@ impl<'a> TaskClient<'a> {
                 "discarded tasks cannot be fetched",
             ));
         }
-        let worker = task_worker(self.config, record.status())?;
+        if let Some(reason) = self.operator_busy_reason(task_id, &record)? {
+            return Err(task_error("TASK_BUSY", reason));
+        }
         let project = self.load_project_for_record(&record)?;
         let transfer =
             crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())?;
+        let import = transfer
+            .try_result_import(task_id)?
+            .ok_or_else(|| task_error("TASK_BUSY", "task result import is already in progress"))?;
+        let record = self.client_state.fence_task_fetch(&record)?;
+        let worker = task_worker(self.config, record.status())?;
         let _remote_receipt = GitTransport::new(self.runner).fetch_result(
             worker,
             self.client_state.client_id(),
@@ -2373,11 +2380,10 @@ impl<'a> TaskClient<'a> {
             task_id,
             transfer.path(),
         )?;
-        let imported = transfer.import_result(
+        let imported = import.import_result(
             self.runner,
             &project.context.common_dir,
             worker.name.as_str(),
-            task_id,
         )?;
         let _ = self
             .client_state
@@ -2891,7 +2897,17 @@ impl<'a> TaskClient<'a> {
                 .iter()
                 .any(|turn| turn.turn_id() == turn_id && turn.terminal().is_some())
             {
-                continue;
+                // Agent completion precedes log drain and result import. A
+                // retryable import error must still get a replacement runner.
+                let unfinished_acceptance = crate::runner_log::snapshot(
+                    &self.paths.state,
+                    record.meta().task_id(),
+                    turn_id,
+                )?
+                .is_some_and(|snapshot| snapshot.accepted && snapshot.completion.is_none());
+                if !unfinished_acceptance {
+                    continue;
+                }
             }
             if matches!(entry.state(), QueueState::Parked) {
                 continue;
@@ -5258,21 +5274,11 @@ impl<'a> TaskClient<'a> {
         task_id: TaskId,
         record: &LocalTaskRecord,
     ) -> Result<Option<&'static str>, WorkerError> {
-        if record.close_intent().is_some() {
-            return Ok(Some(CLOSE_IN_PROGRESS));
-        }
-        if record.status().state() == TaskState::Active {
-            return Ok(Some("task has an active turn"));
-        }
-        if let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)?
-            && matches!(entry.state(), QueueState::Dispatching { .. })
-        {
-            return Ok(Some("task turn is being dispatched"));
-        }
-        if record.runner().is_some() {
-            return Ok(Some("task runner is still finishing"));
-        }
-        Ok(None)
+        let entry = self.client_state.queue_entry_for_task_turn(task_id)?;
+        Ok(crate::client_state::task_operator_busy_reason(
+            record,
+            entry.as_ref(),
+        ))
     }
 
     fn tasks_are_quiescent(&self, records: &[LocalTaskRecord]) -> Result<bool, WorkerError> {

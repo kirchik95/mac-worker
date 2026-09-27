@@ -3865,6 +3865,369 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
 }
 
 #[test]
+fn operator_fetch_refuses_an_active_turn() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.fail_stderr_once.store(true, Ordering::SeqCst);
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    let before = result_fetch_count(&fixture.runner);
+    let error = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .fetch(fixture.task_id)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(result_fetch_count(&fixture.runner), before);
+}
+
+#[test]
+fn operator_fetch_refuses_a_terminal_turn_still_being_drained() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = AcceptedThenTerminalFixture::new();
+    let remote = ReplayableLogsRunner::new(&fixture.runner);
+    remote.fail_stderr_once.store(true, Ordering::SeqCst);
+    TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    persist_independent_terminal_status(&fixture);
+    let before = result_fetch_count(&fixture.runner);
+    let error = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .fetch(fixture.task_id)
+    .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(result_fetch_count(&fixture.runner), before);
+}
+
+struct RefLockContention<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    failures_left: AtomicUsize,
+    attempts: AtomicUsize,
+    remote_fetch: bool,
+}
+
+struct FetchLoadGate {
+    entered: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+
+struct BlockingResultFetch<'a> {
+    inner: &'a AcceptedThenTerminalRunner,
+    entered: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+    first: AtomicBool,
+}
+
+impl ProcessRunner for BlockingResultFetch<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git")
+            && request
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with("--upload-pack="))
+            && self.first.swap(false, Ordering::SeqCst)
+        {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+        self.inner.run(request)
+    }
+}
+
+#[test]
+fn operator_fetch_serializes_result_updates_for_the_same_task() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture.run(&mut Vec::new()).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let remote = BlockingResultFetch {
+        inner: &fixture.runner,
+        entered: entered_tx,
+        resume: Mutex::new(resume_rx),
+        first: AtomicBool::new(true),
+    };
+    let client = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    );
+    let second = thread::scope(|scope| {
+        let first = scope.spawn(|| client.fetch(fixture.task_id));
+        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let second = client.fetch(fixture.task_id);
+        resume_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second
+    });
+    assert_eq!(second.unwrap_err().public_code(), "TASK_BUSY");
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+}
+
+impl ClientStateConcurrencyHook for FetchLoadGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::AfterTaskFetchLoad {
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn operator_fetch_fences_a_turn_replaced_after_its_initial_read() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture.run(&mut Vec::new()).unwrap();
+    let original = fixture.state.load_task(fixture.task_id).unwrap();
+    let mut turns = original.status().turns().to_vec();
+    turns.push(TurnSummary::new(
+        2,
+        TurnId::generate(),
+        Some(TurnTerminal::Succeeded),
+        Some(TaskOutcome::Done),
+        Some(true),
+        false,
+        Some(3),
+        Some(4),
+    ));
+    let next = original
+        .with_status(
+            TaskStatus::new(
+                TaskState::Open,
+                Some(TaskOutcome::Done),
+                Some("mini-1".into()),
+                true,
+                original.status().head_oid().cloned(),
+                None,
+                vec![],
+                vec![],
+                None,
+                turns,
+                original.status().updated_at_millis() + 1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let store = ClientStateStore::open_with_concurrency_hook(
+        &fixture.paths.state,
+        Arc::new(FetchLoadGate {
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        }),
+    )
+    .unwrap();
+    let before = result_fetch_count(&fixture.runner);
+    let result = thread::scope(|scope| {
+        let fetch = scope.spawn(|| {
+            TaskClient::new(
+                &fixture.runner,
+                &fixture.config,
+                &fixture.paths,
+                &store,
+                &fixture.executor,
+            )
+            .fetch(fixture.task_id)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(
+            fixture
+                .state
+                .update_task_if_current(&original, next.clone())
+                .unwrap()
+        );
+        resume_tx.send(()).unwrap();
+        fetch.join().unwrap()
+    });
+    assert_eq!(result.unwrap_err().public_code(), "TASK_REVISION_CONFLICT");
+    assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), next);
+    assert_eq!(result_fetch_count(&fixture.runner), before);
+}
+
+impl ProcessRunner for RefLockContention<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let is_fetch = request.program == OsStr::new("/usr/bin/git")
+            && request.args.iter().any(|arg| arg == "fetch");
+        let is_remote = request
+            .args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--upload-pack="));
+        if is_fetch && is_remote == self.remote_fetch {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Ok(ProcessResult { status: ExitStatus::from_raw(1 << 8), stdout: vec![],
+                    stderr: b"error: cannot lock ref 'refs/remotes/mac-worker/mini-1/task/test': Unable to create 'task/test.lock': File exists.".to_vec() });
+            }
+        }
+        self.inner.run(request)
+    }
+}
+
+#[test]
+fn runner_retries_result_ref_contention_without_changing_the_agent_outcome() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for remote_fetch in [false, true] {
+        let fixture = AcceptedThenTerminalFixture::new();
+        let remote = RefLockContention {
+            inner: &fixture.runner,
+            failures_left: AtomicUsize::new(1),
+            attempts: AtomicUsize::new(0),
+            remote_fetch,
+        };
+        let report = TurnRunner::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .run(fixture.task_id, fixture.turn_id, None)
+        .unwrap();
+        assert_eq!(report.status().last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(report.exit_code(), 0);
+        assert_eq!(remote.attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            fixture
+                .state
+                .load_task(fixture.task_id)
+                .unwrap()
+                .fetched_head()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn exhausted_result_ref_contention_preserves_the_known_outcome_and_recovery_row() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for remote_fetch in [false, true] {
+        let fixture = AcceptedThenTerminalFixture::new();
+        let remote = RefLockContention {
+            inner: &fixture.runner,
+            failures_left: AtomicUsize::new(usize::MAX),
+            attempts: AtomicUsize::new(0),
+            remote_fetch,
+        };
+        let result = TurnRunner::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .run(fixture.task_id, fixture.turn_id, None);
+        assert_eq!(
+            fixture
+                .state
+                .load_task(fixture.task_id)
+                .unwrap()
+                .status()
+                .last_outcome(),
+            Some(&TaskOutcome::Done)
+        );
+        assert_eq!(result.unwrap_err().public_code(), "RESULT_REF_BUSY");
+        assert!(
+            (2..=5).contains(&remote.attempts.load(Ordering::SeqCst)),
+            "retries must be bounded"
+        );
+        assert!(
+            fixture
+                .state
+                .queue_entry(fixture.turn_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+        remote.failures_left.store(0, Ordering::SeqCst);
+        let reconciled = TaskClient::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .operator_reconcile()
+        .unwrap();
+        assert_eq!(
+            reconciled.started_runners(),
+            1,
+            "an unfinished import must be restartable even with a terminal task projection"
+        );
+        TurnRunner::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .run(fixture.task_id, fixture.turn_id, None)
+        .unwrap();
+        assert!(
+            fixture
+                .state
+                .load_task(fixture.task_id)
+                .unwrap()
+                .fetched_head()
+                .is_some()
+        );
+        assert!(
+            fixture
+                .state
+                .queue_entry(fixture.turn_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn close_succeeds_immediately_after_wait_returns() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();

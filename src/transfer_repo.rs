@@ -170,6 +170,25 @@ pub struct TransferRepo {
     _repo_lock: Arc<File>,
 }
 
+/// Excludes other publishers of one task's transfer and user result refs.
+pub struct ResultImport<'a> {
+    repo: &'a TransferRepo,
+    task_id: TaskId,
+    _lock: Arc<File>,
+}
+
+impl ResultImport<'_> {
+    pub fn import_result(
+        &self,
+        runner: &dyn ProcessRunner,
+        user_common_dir: &Path,
+        worker: &str,
+    ) -> Result<ImportReceipt, WorkerError> {
+        self.repo
+            .import_result_locked(runner, user_common_dir, worker, self.task_id)
+    }
+}
+
 impl fmt::Debug for TransferRepo {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -387,9 +406,10 @@ fn push_warning(warnings: &mut Vec<String>, warning: &str) {
 }
 
 /// Every user of a transfer repository holds its lock shared for the
-/// lifetime of the handle.  Users never exclude each other: indexes, base
-/// refs, and result refs are per task, objects are content addressed, and
-/// automatic maintenance is off.  The lock exists so that transfer GC, which
+/// lifetime of the handle. Different tasks do not exclude each other: indexes
+/// and refs are per task, objects are content addressed, and automatic
+/// maintenance is off. Result publishers for the same task also hold a
+/// ResultImport lock. The shared repository lock exists so transfer GC, which
 /// takes it exclusively, can never delete a repository with a live handle.
 fn lock_transfer_repo_shared(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
     flock_transfer_file(parent, &format!("{repo_id}.lock"), libc::LOCK_SH)
@@ -1541,6 +1561,51 @@ impl TransferRepo {
         worker: &str,
         task_id: TaskId,
     ) -> Result<ImportReceipt, WorkerError> {
+        self.result_import(task_id)?
+            .import_result(runner, user_common_dir, worker)
+    }
+
+    pub fn result_import(&self, task_id: TaskId) -> Result<ResultImport<'_>, WorkerError> {
+        self.lock_result_import(task_id, false)?
+            .ok_or_else(|| git_error("RESULT_REF_BUSY", "task result import is busy"))
+    }
+
+    pub fn try_result_import(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<ResultImport<'_>>, WorkerError> {
+        self.lock_result_import(task_id, true)
+    }
+
+    fn lock_result_import(
+        &self,
+        task_id: TaskId,
+        nonblocking: bool,
+    ) -> Result<Option<ResultImport<'_>>, WorkerError> {
+        let root = RootedDir::open(&self.path)?;
+        let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        match flock_transfer_file(&root, &format!("mac-worker-result-{task_id}.lock"), mode) {
+            Ok(lock) => Ok(Some(ResultImport {
+                repo: self,
+                task_id,
+                _lock: lock,
+            })),
+            Err(WorkerError::Io(error))
+                if nonblocking && error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn import_result_locked(
+        &self,
+        runner: &dyn ProcessRunner,
+        user_common_dir: &Path,
+        worker: &str,
+        task_id: TaskId,
+    ) -> Result<ImportReceipt, WorkerError> {
         // Physical binding applies only to ordinary user transfers. A
         // logical controller cache (user_alternates == false) carries a
         // project/worktree hash identity, never a physical repository id,
@@ -1559,20 +1624,25 @@ impl TransferRepo {
         }
         let local_ref = format!("refs/remotes/mac-worker/{worker}/task/{task_id}");
         let source = format!("+refs/mac-worker/results/{task_id}:{local_ref}");
-        user_git(
-            runner,
-            user_common_dir,
-            &[
-                OsString::from("-c"),
-                OsString::from("gc.auto=0"),
-                OsString::from("-c"),
-                OsString::from("core.logAllRefUpdates=false"),
-                OsString::from("fetch"),
-                OsString::from("--no-write-fetch-head"),
-                self.path.as_os_str().to_os_string(),
-                OsString::from(source),
-            ],
-            false,
+        retry_result_ref_update(
+            || {
+                user_git(
+                    runner,
+                    user_common_dir,
+                    &[
+                        OsString::from("-c"),
+                        OsString::from("gc.auto=0"),
+                        OsString::from("-c"),
+                        OsString::from("core.logAllRefUpdates=false"),
+                        OsString::from("fetch"),
+                        OsString::from("--no-write-fetch-head"),
+                        self.path.as_os_str().to_os_string(),
+                        OsString::from(source.as_str()),
+                    ],
+                    true,
+                )
+            },
+            "BASE_UNAVAILABLE",
         )?;
         let head = parse_oid(&user_git(
             runner,
@@ -1598,6 +1668,7 @@ impl TransferRepo {
         source_ref: &str,
         expected_oid: &BaseOid,
     ) -> Result<ImportReceipt, WorkerError> {
+        let _import = self.result_import(task_id)?;
         if self.user_alternates && repo_id_for(user_common_dir)? != self.repo_id {
             return Err(git_error(
                 "BASE_UNAVAILABLE",
@@ -2565,6 +2636,37 @@ fn user_git(
             "a user-repository Git command failed",
         ))
     }
+}
+
+/// Git's ref locks are external to our task lock (manual Git and other
+/// processes can hold them). Retry only recognizable lock contention and
+/// retain a distinct retryable error if it outlives the bounded retry.
+pub(crate) fn retry_result_ref_update(
+    mut operation: impl FnMut() -> Result<ProcessResult, WorkerError>,
+    failure_code: &'static str,
+) -> Result<ProcessResult, WorkerError> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        let result = operation()?;
+        if result.status.success() {
+            return Ok(result);
+        }
+        let message = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
+        let contention = (message.contains(".lock") && message.contains("file exists"))
+            || (message.contains("cannot lock ref")
+                && message.contains("is at ")
+                && message.contains("but expected"));
+        if !contention {
+            return Err(git_error(failure_code, "result Git command failed"));
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    Err(git_error(
+        "RESULT_REF_BUSY",
+        "result ref is temporarily locked",
+    ))
 }
 
 fn run_system_git(
