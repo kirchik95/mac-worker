@@ -2508,10 +2508,50 @@ fn render_workers_refresh_json(inspection: &WorkersInspection) -> Result<String,
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GcHostStatus {
+    Success,
+    Error,
+    Unknown,
+}
+
 #[derive(Debug, Serialize)]
 struct GcWorkerReport {
     worker: String,
-    report: GcReport,
+    status: GcHostStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<GcReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+}
+
+impl GcWorkerReport {
+    fn success(worker: String, report: GcReport) -> Self {
+        Self {
+            worker,
+            status: GcHostStatus::Success,
+            report: Some(report),
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    fn failed(worker: String, error: &WorkerError) -> Self {
+        let status = match error {
+            WorkerError::Transport { code, .. } if *code == "SSH_TIMEOUT" => GcHostStatus::Unknown,
+            _ => GcHostStatus::Error,
+        };
+        Self {
+            worker,
+            status,
+            report: None,
+            error_code: Some(error.public_code()),
+            error_message: Some(error.public_message()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2543,7 +2583,7 @@ fn run_gc_command(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    let result = (|| -> Result<GcFleetReport, WorkerError> {
+    let result = (|| -> Result<(GcFleetReport, u8), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         let config = Config::load(&paths.config)?;
         config.require_local_inventory()?;
@@ -2559,31 +2599,40 @@ fn run_gc_command(
         };
         let remote = RemoteJobClient::new(runner);
         let request = GcRequest::new(apply, now);
-        let workers = config
-            .workers
-            .iter()
-            .map(|worker| {
-                Ok(GcWorkerReport {
-                    worker: worker.name.clone(),
-                    report: remote.gc(worker, &request)?,
-                })
-            })
-            .collect::<Result<Vec<_>, WorkerError>>()?;
-        Ok(GcFleetReport {
-            protocol_version: PROTOCOL_VERSION,
-            apply,
-            workers,
-            transfer,
-        })
+        let mut workers = Vec::with_capacity(config.workers.len());
+        let mut aggregate_exit = 0u8;
+        for worker in &config.workers {
+            match remote.gc(worker, &request) {
+                Ok(report) => workers.push(GcWorkerReport::success(worker.name.clone(), report)),
+                Err(error) => {
+                    if aggregate_exit == 0 {
+                        aggregate_exit = match error.exit_code() {
+                            0 => crate::error::ExitKind::Unavailable as u8,
+                            code => code,
+                        };
+                    }
+                    workers.push(GcWorkerReport::failed(worker.name.clone(), &error));
+                }
+            }
+        }
+        Ok((
+            GcFleetReport {
+                protocol_version: PROTOCOL_VERSION,
+                apply,
+                workers,
+                transfer,
+            },
+            aggregate_exit,
+        ))
     })();
 
     match result {
-        Ok(report) if json => match write_json_line(stdout, &report) {
-            Ok(()) => 0,
+        Ok((report, exit)) if json => match write_json_line(stdout, &report) {
+            Ok(()) => exit,
             Err(error) => error.exit_code(),
         },
-        Ok(report) => match write_gc_human(&report, stdout) {
-            Ok(()) => 0,
+        Ok((report, exit)) => match write_gc_human(&report, stdout) {
+            Ok(()) => exit,
             Err(error) => error.exit_code(),
         },
         Err(error) if json => match write_json_error_event(stdout, &error) {
@@ -2604,24 +2653,70 @@ fn write_gc_human(report: &GcFleetReport, stdout: &mut dyn Write) -> Result<(), 
         if report.apply { "apply" } else { "preview" }
     )?;
     for worker in &report.workers {
-        write_gc_report_human(&worker.report, &format!("worker {}", worker.worker), stdout)?;
+        match worker.status {
+            GcHostStatus::Success => {
+                let Some(host_report) = &worker.report else {
+                    return Err(WorkerError::Protocol(
+                        "GC_RESPONSE_INVALID: successful host gc report is missing".into(),
+                    ));
+                };
+                write_gc_report_human(
+                    host_report,
+                    &format!("worker {}", worker.worker),
+                    Some("success"),
+                    stdout,
+                )?;
+            }
+            GcHostStatus::Error | GcHostStatus::Unknown => {
+                write_gc_host_failure(worker, stdout)?;
+            }
+        }
     }
-    write_gc_report_human(&report.transfer, "transfer", stdout)?;
+    write_gc_report_human(&report.transfer, "transfer", None, stdout)?;
     stdout.flush()?;
+    Ok(())
+}
+
+fn write_gc_host_failure(
+    worker: &GcWorkerReport,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    let status = match worker.status {
+        GcHostStatus::Error => "error",
+        GcHostStatus::Unknown => "unknown",
+        GcHostStatus::Success => "success",
+    };
+    writeln!(
+        stdout,
+        "  worker {}: {status} {}: {}",
+        worker.worker,
+        worker.error_code.as_deref().unwrap_or("GC_HOST_FAILED"),
+        worker.error_message.as_deref().unwrap_or("host gc failed"),
+    )?;
     Ok(())
 }
 
 fn write_gc_report_human(
     report: &GcReport,
     label: &str,
+    status: Option<&str>,
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
-    writeln!(
-        stdout,
-        "  {label}: {} candidate(s), {} applied",
-        report.candidates().len(),
-        report.applied().len()
-    )?;
+    if let Some(status) = status {
+        writeln!(
+            stdout,
+            "  {label}: {status}, {} candidate(s), {} applied",
+            report.candidates().len(),
+            report.applied().len()
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "  {label}: {} candidate(s), {} applied",
+            report.candidates().len(),
+            report.applied().len()
+        )?;
+    }
     for candidate in report.candidates() {
         writeln!(
             stdout,
