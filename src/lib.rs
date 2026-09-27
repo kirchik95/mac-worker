@@ -3717,11 +3717,13 @@ fn run_host_refresh_facts(
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        let (_, collected) = ProbeCollector::refresh_facts_at_with_options(
+        let budget = crate::agent_facts::facts_refresh_budget_from_env();
+        let (_, collected) = ProbeCollector::refresh_facts_at_with_budget(
             &paths.host_state_root(),
             &runtime.home,
             runner,
             clear_auth_incidents,
+            budget,
         )?;
         if timing {
             collected.write_to(stderr);

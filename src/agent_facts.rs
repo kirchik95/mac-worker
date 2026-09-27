@@ -19,7 +19,9 @@ use crate::{
     account_launch::{account_environment_scaffold, account_login_shell_request},
     agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
     error::{ProcessError, WorkerError},
-    herdr::{HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE},
+    herdr::{
+        CONNECT_DEADLINE, HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE,
+    },
     herdr_reporter::DISPLAY_AGENT,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
@@ -34,6 +36,17 @@ pub const TURN_AUTH_FAILURE_REASON_PREFIX: &str = "auth failed in a turn at ";
 const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
 /// Bound on each locate, version, and auth probe during facts collection.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(2);
+/// Kept below the 30s facts-refresh SSH deadline.
+pub const FACTS_REFRESH_MARGIN: Duration = Duration::from_secs(5);
+/// Used when the caller does not name a shorter or longer budget.
+pub const DEFAULT_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(25);
+/// Installer SSH allows 120s; collection stops a few seconds earlier.
+pub const MAX_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(115);
+/// Remote shell assignment read by `host refresh-facts`. Absent means
+/// [`DEFAULT_FACTS_REFRESH_BUDGET`].
+pub const FACTS_BUDGET_ENV: &str = "MAC_WORKER_FACTS_BUDGET_MS";
+/// Shown as `unknown (facts refresh budget exhausted)`.
+pub const FACTS_REFRESH_BUDGET_REASON: &str = "facts refresh budget exhausted";
 const MAX_TEXT_BYTES: usize = 128;
 const HERDR_BINARY: &str = "herdr";
 /// The herdr version is bounded tighter than agent text (see [`HerdrFacts`]).
@@ -126,6 +139,7 @@ impl<'de> Deserialize<'de> for AgentAuth {
 
 fn known_auth_reason(value: &str) -> Option<&'static str> {
     match value {
+        FACTS_REFRESH_BUDGET_REASON => Some(FACTS_REFRESH_BUDGET_REASON),
         crate::keychain::UNLOCK_FAILED_REASON => Some(crate::keychain::UNLOCK_FAILED_REASON),
         crate::keychain::KEYCHAIN_LOCKED_REASON => Some(crate::keychain::KEYCHAIN_LOCKED_REASON),
         crate::agent::LOGIN_UNVERIFIED_REASON => Some(crate::agent::LOGIN_UNVERIFIED_REASON),
@@ -838,6 +852,18 @@ impl FactsTiming {
         run: impl FnOnce() -> ProbeRun<T>,
     ) -> T {
         self.probe_with_result(agent, profile, step, deadline, |_| None, run)
+            .value
+    }
+
+    fn probe_run<T>(
+        &mut self,
+        agent: Option<&str>,
+        profile: Option<&str>,
+        step: &str,
+        deadline: Duration,
+        run: impl FnOnce() -> ProbeRun<T>,
+    ) -> ProbeRun<T> {
+        self.probe_with_result(agent, profile, step, deadline, |_| None, run)
     }
 
     fn probe_with_result<T>(
@@ -848,23 +874,23 @@ impl FactsTiming {
         deadline: Duration,
         result_of: impl FnOnce(&T) -> Option<&'static str>,
         run: impl FnOnce() -> ProbeRun<T>,
-    ) -> T {
+    ) -> ProbeRun<T> {
         let started = Instant::now();
-        let ProbeRun {
-            value,
-            hit_deadline,
-        } = run();
+        let run_result = run();
         let elapsed = started.elapsed();
         self.steps.push(TimingStep::new(
             agent,
             profile,
             step,
             elapsed,
-            result_of(&value),
+            result_of(&run_result.value),
             Some(deadline),
-            hit_deadline || elapsed >= deadline,
+            run_result.hit_deadline || elapsed >= deadline,
         ));
-        value
+        ProbeRun {
+            value: run_result.value,
+            hit_deadline: run_result.hit_deadline || elapsed >= deadline,
+        }
     }
 
     fn finish_total(&mut self) {
@@ -944,6 +970,88 @@ impl<T> ProbeRun<T> {
     }
 }
 
+/// Monotonic clock for one facts collection. Production follows wall time;
+/// tests advance a shared clock from the fake process runner.
+pub trait FactsClock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+/// Wall clock origin captured when a collection starts.
+pub struct SystemFactsClock {
+    origin: Instant,
+}
+
+impl SystemFactsClock {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemFactsClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FactsClock for SystemFactsClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+struct FactsBudget<'a> {
+    limit: Duration,
+    clock: &'a dyn FactsClock,
+}
+
+impl<'a> FactsBudget<'a> {
+    fn new(limit: Duration, clock: &'a dyn FactsClock) -> Self {
+        Self { limit, clock }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.clock.now() >= self.limit
+    }
+
+    /// Time left for the next step, capped by that step's own limit.
+    /// `None` when the collection budget is already spent.
+    fn allowance(&self, cap: Duration) -> Option<Duration> {
+        let remaining = self.limit.saturating_sub(self.clock.now());
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(cap.min(remaining))
+        }
+    }
+}
+
+/// Caller deadline for `host refresh-facts`, clamped so a huge value cannot
+/// outrun the installer SSH allowance. Missing or unreadable values use the
+/// default that fits under the 30s refresh transport.
+pub fn facts_refresh_budget_from_env() -> Duration {
+    match std::env::var(FACTS_BUDGET_ENV) {
+        Ok(text) => match text.parse::<u64>() {
+            Ok(millis) => Duration::from_millis(millis).min(MAX_FACTS_REFRESH_BUDGET),
+            Err(_) => DEFAULT_FACTS_REFRESH_BUDGET,
+        },
+        Err(_) => DEFAULT_FACTS_REFRESH_BUDGET,
+    }
+}
+
+fn budget_exhausted_auth() -> AgentAuth {
+    AgentAuth::UnknownWithReason(FACTS_REFRESH_BUDGET_REASON)
+}
+
+fn auth_after_budget(auth: AgentAuth, budget: &FactsBudget<'_>) -> AgentAuth {
+    if budget.exhausted() && matches!(auth, AgentAuth::Unknown) {
+        budget_exhausted_auth()
+    } else {
+        auth
+    }
+}
+
 fn is_deadline_error(error: &WorkerError) -> bool {
     matches!(
         error,
@@ -973,6 +1081,32 @@ where
     P: ProfileInput,
 {
     collect_agent_facts_at_with_timing(runner, account_home, profiles, current_time_millis())
+}
+
+/// Collect facts under an explicit budget and clock. The collection stops
+/// when the clock reaches `budget` and records
+/// [`FACTS_REFRESH_BUDGET_REASON`] for agents it did not finish.
+pub fn collect_agent_facts_at_with_budget<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    budget: Duration,
+    clock: &dyn FactsClock,
+) -> (AgentFacts, FactsTiming)
+where
+    P: ProfileInput,
+{
+    let budget = FactsBudget::new(budget, clock);
+    let (facts, timing, _) = collect_agent_facts_budgeted(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        None,
+        &budget,
+    );
+    (facts, timing)
 }
 
 /// Deterministic-time variant used by local tests and cache callers.
@@ -1051,16 +1185,20 @@ pub(crate) fn collect_agent_facts_at_host_with_overlay<P>(
     profiles: &[P],
     collected_at_millis: u64,
     host_state_root: &Path,
+    budget: Duration,
 ) -> (AgentFacts, FactsTiming, Result<(), WorkerError>)
 where
     P: ProfileInput,
 {
-    collect_agent_facts_with_optional_host(
+    let clock = SystemFactsClock::new();
+    let budget = FactsBudget::new(budget, &clock);
+    collect_agent_facts_budgeted(
         runner,
         account_home,
         profiles,
         collected_at_millis,
         Some(host_state_root),
+        &budget,
     )
 }
 
@@ -1074,6 +1212,29 @@ fn collect_agent_facts_with_optional_host<P>(
 where
     P: ProfileInput,
 {
+    let clock = SystemFactsClock::new();
+    let budget = FactsBudget::new(DEFAULT_FACTS_REFRESH_BUDGET, &clock);
+    collect_agent_facts_budgeted(
+        runner,
+        account_home,
+        profiles,
+        collected_at_millis,
+        host_state_root,
+        &budget,
+    )
+}
+
+fn collect_agent_facts_budgeted<P>(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    profiles: &[P],
+    collected_at_millis: u64,
+    host_state_root: Option<&Path>,
+    budget: &FactsBudget<'_>,
+) -> (AgentFacts, FactsTiming, Result<(), WorkerError>)
+where
+    P: ProfileInput,
+{
     let mut timing = FactsTiming::new();
     let mut facts = collect_agent_facts_into(
         runner,
@@ -1081,6 +1242,7 @@ where
         profiles,
         collected_at_millis,
         &mut timing,
+        budget,
     );
     let overlay = if let Some(host_state_root) = host_state_root {
         match crate::auth_incidents::merge_into_facts(
@@ -1108,6 +1270,7 @@ fn collect_agent_facts_into<P>(
     profiles: &[P],
     collected_at_millis: u64,
     timing: &mut FactsTiming,
+    budget: &FactsBudget<'_>,
 ) -> AgentFacts
 where
     P: ProfileInput,
@@ -1122,6 +1285,7 @@ where
         })
         .collect::<Vec<_>>();
 
+    let mut unlocks = KeychainUnlocks::default();
     let mut agents = Vec::new();
     for kind in [
         AgentKind::Codex,
@@ -1130,30 +1294,57 @@ where
         AgentKind::Opencode,
     ] {
         let name = agent_name(kind);
+        if budget.exhausted() {
+            agents.push(unfinished_agent(name, &env_profiles));
+            continue;
+        }
         let adapter = adapter_for(kind);
         let binary = adapter.binary();
         let auth_probe = adapter.auth_probe();
-        let LocateVersion {
-            available: base_available,
-            version,
-        } = timing.probe(
+        let Some(locate_allowance) = budget.allowance(PROBE_DEADLINE) else {
+            agents.push(unfinished_agent(name, &env_profiles));
+            continue;
+        };
+        let located = timing.probe_run(
             Some(name),
             Some("-"),
             "locate+version",
-            PROBE_DEADLINE,
-            || run_locate_and_version(runner, account_home, binary, &[]),
+            locate_allowance,
+            || run_locate_and_version(runner, account_home, binary, &[], locate_allowance),
         );
-        let auth = if base_available {
-            timing.probe_with_result(
-                Some(name),
-                Some("-"),
-                "auth",
-                PROBE_DEADLINE,
-                |auth: &AgentAuth| Some(auth.as_str()),
-                || run_auth_in_shell(runner, account_home, binary, &auth_probe, &[]),
+        let base_available = located.value.available;
+        let version = located.value.version;
+        if !base_available && located.hit_deadline && budget.exhausted() {
+            agents.push(unfinished_agent(name, &env_profiles));
+            continue;
+        }
+        let auth = if !base_available {
+            AgentAuth::Unknown
+        } else if let Some(auth_allowance) = budget.allowance(PROBE_DEADLINE) {
+            auth_after_budget(
+                timing
+                    .probe_with_result(
+                        Some(name),
+                        Some("-"),
+                        "auth",
+                        auth_allowance,
+                        |auth: &AgentAuth| Some(auth.as_str()),
+                        || {
+                            run_auth_in_shell(
+                                runner,
+                                account_home,
+                                binary,
+                                &auth_probe,
+                                &[],
+                                auth_allowance,
+                            )
+                        },
+                    )
+                    .value,
+                budget,
             )
         } else {
-            AgentAuth::Unknown
+            budget_exhausted_auth()
         };
         let mut auth_by_profile = Vec::new();
         let mut any_profile_binary = false;
@@ -1162,6 +1353,10 @@ where
             .filter(|profile| profile.profile_is_secure())
         {
             let profile_name = profile.profile_name();
+            if budget.exhausted() {
+                auth_by_profile.push((profile_name.to_owned(), budget_exhausted_auth()));
+                continue;
+            }
             let entries = profile.profile_entries();
             let available = resolve_profile_binary(
                 runner,
@@ -1172,6 +1367,7 @@ where
                 &entries,
                 base_available,
                 timing,
+                budget,
             );
             any_profile_binary |= available;
             let auth = probe_profile_auth(
@@ -1185,6 +1381,8 @@ where
                 profile.keychain_config(),
                 available,
                 timing,
+                budget,
+                &mut unlocks,
             );
             auth_by_profile.push((profile_name.to_owned(), auth));
         }
@@ -1199,14 +1397,56 @@ where
         });
     }
 
+    let git_identity = if budget.exhausted() {
+        false
+    } else {
+        collect_git_identity(runner, account_home, budget)
+    };
+    let herdr = if budget.exhausted() {
+        None
+    } else {
+        Some(collect_herdr_facts(runner, account_home, timing, budget))
+    };
+    let origin_https_helpers = if budget.exhausted() {
+        OriginHttpsHelpers::default()
+    } else {
+        collect_origin_https_helpers(runner, account_home, budget)
+    };
+
     AgentFacts {
         agents,
         env_profiles,
-        git_identity: collect_git_identity(runner, account_home),
+        git_identity,
         collected_at_millis,
-        herdr: Some(collect_herdr_facts(runner, account_home, timing)),
-        origin_https_helpers: collect_origin_https_helpers(runner, account_home),
+        herdr,
+        origin_https_helpers,
     }
+}
+
+fn unfinished_agent(name: &str, profiles: &[ProfileProbe]) -> AgentProbe {
+    let auth = budget_exhausted_auth();
+    AgentProbe {
+        name: name.to_owned(),
+        version: None,
+        auth,
+        auth_by_profile: profiles
+            .iter()
+            .filter(|profile| profile.secure)
+            .map(|profile| (profile.name.clone(), auth))
+            .collect(),
+    }
+}
+
+#[derive(Default)]
+struct KeychainUnlocks {
+    by_path: BTreeMap<PathBuf, UnlockOutcome>,
+}
+
+#[derive(Clone, Copy)]
+enum UnlockOutcome {
+    Unlocked,
+    Failed,
+    Budget,
 }
 
 /// Whether the account's herdr can show turns: a `herdr` binary on the login
@@ -1220,17 +1460,29 @@ fn collect_herdr_facts(
     runner: &dyn ProcessRunner,
     account_home: &Path,
     timing: &mut FactsTiming,
+    budget: &FactsBudget<'_>,
 ) -> HerdrFacts {
+    let Some(locate_allowance) = budget.allowance(PROBE_DEADLINE) else {
+        return HerdrFacts {
+            state: HerdrFactState::NoResponse,
+            version: None,
+            interactive_agents: None,
+        };
+    };
     let LocateVersion { available, version } = timing.probe(
         Some("herdr"),
         Some("-"),
         "locate+version",
-        PROBE_DEADLINE,
-        || herdr_locate_and_version(runner, account_home),
+        locate_allowance,
+        || herdr_locate_and_version(runner, account_home, locate_allowance),
     );
     if !available {
         return HerdrFacts {
-            state: HerdrFactState::NotInstalled,
+            state: if budget.exhausted() {
+                HerdrFactState::NoResponse
+            } else {
+                HerdrFactState::NotInstalled
+            },
             version: None,
             interactive_agents: None,
         };
@@ -1243,13 +1495,17 @@ fn collect_herdr_facts(
             interactive_agents: None,
         };
     }
-    let client = HerdrClient::new(socket);
-    let state = timing.probe(
-        None,
-        None,
-        "herdr-ping",
-        RESPONSE_DEADLINE,
-        || match client.ping() {
+    let Some(ping_allowance) = budget.allowance(RESPONSE_DEADLINE) else {
+        return HerdrFacts {
+            state: HerdrFactState::NoResponse,
+            version,
+            interactive_agents: None,
+        };
+    };
+    let client =
+        HerdrClient::with_deadlines(socket, CONNECT_DEADLINE.min(ping_allowance), ping_allowance);
+    let state = timing.probe(None, None, "herdr-ping", ping_allowance, || {
+        match client.ping() {
             Ok(()) => ProbeRun::ok(HerdrFactState::Available),
             Err(HerdrError::Absent) => ProbeRun::ok(HerdrFactState::NoSocket),
             Err(HerdrError::Timeout) => ProbeRun {
@@ -1257,14 +1513,26 @@ fn collect_herdr_facts(
                 hit_deadline: true,
             },
             Err(_) => ProbeRun::ok(HerdrFactState::NoResponse),
-        },
-    );
+        }
+    });
     let interactive_agents = if state == HerdrFactState::Available {
+        let Some(list_allowance) = budget.allowance(RESPONSE_DEADLINE) else {
+            return HerdrFacts {
+                state,
+                version,
+                interactive_agents: None,
+            };
+        };
+        let client = HerdrClient::with_deadlines(
+            client.socket().clone(),
+            CONNECT_DEADLINE.min(list_allowance),
+            list_allowance,
+        );
         timing.probe(
             None,
             None,
             "herdr-agents",
-            RESPONSE_DEADLINE,
+            list_allowance,
             || match client.agent_list() {
                 Ok(listed) => ProbeRun::ok(count_interactive_agents(&listed)),
                 Err(HerdrError::Timeout) => ProbeRun {
@@ -1305,17 +1573,21 @@ fn resolve_profile_binary(
     entries: &[(OsString, OsString)],
     base_available: bool,
     timing: &mut FactsTiming,
+    budget: &FactsBudget<'_>,
 ) -> bool {
     if !profile_can_change_binary_resolution(entries) {
         return base_available;
     }
+    let Some(allowance) = budget.allowance(PROBE_DEADLINE) else {
+        return false;
+    };
     timing
         .probe(
             Some(agent),
             Some(profile_name),
             "locate+version",
-            PROBE_DEADLINE,
-            || run_locate_and_version(runner, account_home, binary, entries),
+            allowance,
+            || run_locate_and_version(runner, account_home, binary, entries, allowance),
         )
         .available
 }
@@ -1332,41 +1604,98 @@ fn probe_profile_auth(
     keychain: Option<crate::keychain::KeychainUnlockConfig>,
     available: bool,
     timing: &mut FactsTiming,
+    budget: &FactsBudget<'_>,
+    unlocks: &mut KeychainUnlocks,
 ) -> AgentAuth {
     if !available {
-        return AgentAuth::Unknown;
+        return if budget.exhausted() {
+            budget_exhausted_auth()
+        } else {
+            AgentAuth::Unknown
+        };
     }
-    match keychain {
-        Some(config) => {
-            let unlocked = timing.probe(
+    if let Some(config) = keychain {
+        match cached_or_unlock(
+            runner,
+            agent,
+            profile_name,
+            &config,
+            timing,
+            budget,
+            unlocks,
+        ) {
+            UnlockOutcome::Failed => {
+                return AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON);
+            }
+            UnlockOutcome::Budget => return budget_exhausted_auth(),
+            UnlockOutcome::Unlocked => {}
+        }
+    }
+    let Some(auth_allowance) = budget.allowance(PROBE_DEADLINE) else {
+        return budget_exhausted_auth();
+    };
+    auth_after_budget(
+        timing
+            .probe_with_result(
                 Some(agent),
                 Some(profile_name),
-                "keychain-unlock",
-                crate::keychain::UNLOCK_TIMEOUT,
-                || unlock_for_probe(runner, &config),
-            );
-            if unlocked {
-                timing.probe_with_result(
-                    Some(agent),
-                    Some(profile_name),
-                    "auth",
-                    PROBE_DEADLINE,
-                    |auth: &AgentAuth| Some(auth.as_str()),
-                    || run_auth_in_shell(runner, account_home, binary, auth_probe, entries),
-                )
-            } else {
-                AgentAuth::UnknownWithReason(crate::keychain::UNLOCK_FAILED_REASON)
-            }
-        }
-        None => timing.probe_with_result(
-            Some(agent),
-            Some(profile_name),
-            "auth",
-            PROBE_DEADLINE,
-            |auth: &AgentAuth| Some(auth.as_str()),
-            || run_auth_in_shell(runner, account_home, binary, auth_probe, entries),
-        ),
+                "auth",
+                auth_allowance,
+                |auth: &AgentAuth| Some(auth.as_str()),
+                || {
+                    run_auth_in_shell(
+                        runner,
+                        account_home,
+                        binary,
+                        auth_probe,
+                        entries,
+                        auth_allowance,
+                    )
+                },
+            )
+            .value,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_or_unlock(
+    runner: &dyn ProcessRunner,
+    agent: &str,
+    profile_name: &str,
+    config: &crate::keychain::KeychainUnlockConfig,
+    timing: &mut FactsTiming,
+    budget: &FactsBudget<'_>,
+    unlocks: &mut KeychainUnlocks,
+) -> UnlockOutcome {
+    let path = config.path().to_path_buf();
+    if let Some(outcome) = unlocks.by_path.get(&path) {
+        return match outcome {
+            UnlockOutcome::Unlocked => UnlockOutcome::Unlocked,
+            UnlockOutcome::Failed => UnlockOutcome::Failed,
+            UnlockOutcome::Budget => UnlockOutcome::Budget,
+        };
     }
+    let Some(allowance) = budget.allowance(crate::keychain::UNLOCK_TIMEOUT) else {
+        unlocks.by_path.insert(path, UnlockOutcome::Budget);
+        return UnlockOutcome::Budget;
+    };
+    let unlocked = timing.probe_run(
+        Some(agent),
+        Some(profile_name),
+        "keychain-unlock",
+        allowance,
+        || unlock_for_probe(runner, config, allowance),
+    );
+    let outcome = if unlocked.value {
+        UnlockOutcome::Unlocked
+    } else if unlocked.hit_deadline && budget.exhausted() {
+        UnlockOutcome::Budget
+    } else {
+        UnlockOutcome::Failed
+    };
+    unlocks.by_path.insert(path, outcome);
+    outcome
 }
 
 /// Whether a profile's entries can change which binary `command -v` finds.
@@ -1380,6 +1709,7 @@ fn profile_can_change_binary_resolution(entries: &[(OsString, OsString)]) -> boo
 fn herdr_locate_and_version(
     runner: &dyn ProcessRunner,
     account_home: &Path,
+    deadline: Duration,
 ) -> ProbeRun<LocateVersion> {
     run_locate_and_version_script(
         runner,
@@ -1388,6 +1718,7 @@ fn herdr_locate_and_version(
         &[],
         HERDR_PATH_EXTENSION,
         HERDR_VERSION_MAX_BYTES,
+        deadline,
     )
 }
 
@@ -1412,6 +1743,7 @@ fn run_locate_and_version(
     account_home: &Path,
     binary: &str,
     profile_entries: &[(OsString, OsString)],
+    deadline: Duration,
 ) -> ProbeRun<LocateVersion> {
     run_locate_and_version_script(
         runner,
@@ -1420,6 +1752,7 @@ fn run_locate_and_version(
         profile_entries,
         "",
         MAX_TEXT_BYTES,
+        deadline,
     )
 }
 
@@ -1430,6 +1763,7 @@ fn run_locate_and_version_script(
     profile_entries: &[(OsString, OsString)],
     path_extension: &str,
     version_max_bytes: usize,
+    deadline: Duration,
 ) -> ProbeRun<LocateVersion> {
     let Ok(version_exec) = render_prebind_shell(&[binary.to_owned(), "--version".to_owned()])
     else {
@@ -1441,8 +1775,12 @@ fn run_locate_and_version_script(
     let shell = format!(
         "{path_extension}command -v {binary} && printf '%s\\n' '{LOCATE_VERSION_SEPARATOR}' && {version_exec}"
     );
-    let request =
-        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
+    let request = account_login_shell_request(
+        account_home,
+        profile_entries,
+        &shell,
+        probe_policy(deadline),
+    );
     match runner.run(&request) {
         Ok(result) => ProbeRun::ok(parse_locate_and_version(
             &result.stdout,
@@ -1503,14 +1841,19 @@ fn run_auth_in_shell(
     binary: &str,
     probe: &AuthProbe,
     profile_entries: &[(OsString, OsString)],
+    deadline: Duration,
 ) -> ProbeRun<AgentAuth> {
     let mut argv = vec![binary.to_owned()];
     argv.extend(probe.args().iter().map(|arg| (*arg).to_owned()));
     let Ok(shell) = render_prebind_shell(&argv) else {
         return ProbeRun::ok(AgentAuth::Unknown);
     };
-    let request =
-        account_login_shell_request(account_home, profile_entries, &shell, probe_policy());
+    let request = account_login_shell_request(
+        account_home,
+        profile_entries,
+        &shell,
+        probe_policy(deadline),
+    );
     match runner.run(&request) {
         Ok(result) => ProbeRun::ok(classify_auth_result(probe, &result)),
         Err(error) => ProbeRun {
@@ -1539,24 +1882,26 @@ fn classify_auth_result(probe: &AuthProbe, result: &ProcessResult) -> AgentAuth 
     }
 }
 
-fn probe_policy() -> ProcessPolicy {
+fn probe_policy(deadline: Duration) -> ProcessPolicy {
     ProcessPolicy {
         stdout_limit: PROBE_OUTPUT_LIMIT,
         stderr_limit: PROBE_OUTPUT_LIMIT,
-        deadline: PROBE_DEADLINE,
+        deadline,
     }
 }
 
 fn unlock_for_probe(
     runner: &dyn ProcessRunner,
     config: &crate::keychain::KeychainUnlockConfig,
+    deadline: Duration,
 ) -> ProbeRun<bool> {
     #[cfg(target_os = "macos")]
     {
-        match crate::keychain::unlock_keychain(
+        match crate::keychain::unlock_keychain_within(
             runner,
             config,
             &crate::redaction::RedactionBoundary::from_env(),
+            deadline,
         ) {
             Ok(()) => ProbeRun::ok(true),
             Err(error) => ProbeRun {
@@ -1567,7 +1912,7 @@ fn unlock_for_probe(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (runner, config);
+        let _ = (runner, config, deadline);
         ProbeRun::ok(false)
     }
 }
@@ -1632,13 +1977,20 @@ fn truncate_text_to(value: &str, limit: usize) -> String {
     value[..end].to_owned()
 }
 
-fn collect_git_identity(runner: &dyn ProcessRunner, account_home: &Path) -> bool {
+fn collect_git_identity(
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+    budget: &FactsBudget<'_>,
+) -> bool {
     ["user.name", "user.email"].into_iter().all(|key| {
+        let Some(allowance) = budget.allowance(PROBE_DEADLINE) else {
+            return false;
+        };
         let request = account_login_shell_request(
             account_home,
             &[],
             &format!("git config --global --get {key}"),
-            probe_policy(),
+            probe_policy(allowance),
         );
         let Ok(result) = runner.run(&request) else {
             return false;
@@ -1651,17 +2003,25 @@ fn collect_git_identity(runner: &dyn ProcessRunner, account_home: &Path) -> bool
 fn collect_origin_https_helpers(
     runner: &dyn ProcessRunner,
     account_home: &Path,
+    budget: &FactsBudget<'_>,
 ) -> OriginHttpsHelpers {
     let mut helpers = OriginHttpsHelpers::default();
+    let Some(generic_allowance) = budget.allowance(PROBE_DEADLINE) else {
+        return helpers;
+    };
     if let Some(result) = run_account_git_config(
         runner,
         account_home,
         &["config", "--global", "--get-all", "credential.helper"],
+        generic_allowance,
     ) && result.status.success()
         && !result.stdout.is_empty()
     {
         helpers.generic = true;
     }
+    let Some(host_allowance) = budget.allowance(PROBE_DEADLINE) else {
+        return helpers;
+    };
     let Some(result) = run_account_git_config(
         runner,
         account_home,
@@ -1671,6 +2031,7 @@ fn collect_origin_https_helpers(
             "--get-regexp",
             r"^credential\..*\.helper$",
         ],
+        host_allowance,
     ) else {
         return helpers;
     };
@@ -1696,6 +2057,7 @@ fn run_account_git_config(
     runner: &dyn ProcessRunner,
     account_home: &Path,
     args: &[&str],
+    deadline: Duration,
 ) -> Option<ProcessResult> {
     let mut environment = account_environment_scaffold(account_home);
     environment.push((OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")));
@@ -1711,7 +2073,7 @@ fn run_account_git_config(
             OsString::from("GIT_CONFIG_PARAMETERS"),
         ],
         stdin: None,
-        policy: probe_policy(),
+        policy: probe_policy(deadline),
         isolate_parent_environment: true,
     };
     runner.run(&request).ok()
@@ -1901,6 +2263,10 @@ mod intern_tests {
         assert!(
             known_auth_reason(crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON).is_some()
         );
+        assert_eq!(
+            known_auth_reason(FACTS_REFRESH_BUDGET_REASON),
+            Some(FACTS_REFRESH_BUDGET_REASON)
+        );
     }
 }
 
@@ -1910,17 +2276,26 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{collect_git_identity, collect_origin_https_helpers};
+    use super::{
+        DEFAULT_FACTS_REFRESH_BUDGET, FactsBudget, SystemFactsClock, collect_git_identity,
+        collect_origin_https_helpers,
+    };
     use crate::process::SystemProcessRunner;
+
+    fn generous_budget(clock: &SystemFactsClock) -> FactsBudget<'_> {
+        FactsBudget::new(DEFAULT_FACTS_REFRESH_BUDGET, clock)
+    }
 
     #[test]
     fn collect_git_identity_uses_account_home_not_ambient_home() {
+        let clock = SystemFactsClock::new();
+        let budget = generous_budget(&clock);
         let temp = tempdir().unwrap();
         let empty_account = temp.path().join("empty-account");
         fs::create_dir_all(&empty_account).unwrap();
         fs::set_permissions(&empty_account, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
-            !collect_git_identity(&SystemProcessRunner, &empty_account),
+            !collect_git_identity(&SystemProcessRunner, &empty_account, &budget),
             "empty account HOME must not inherit the developer's git identity"
         );
 
@@ -1933,18 +2308,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            collect_git_identity(&SystemProcessRunner, &configured),
+            collect_git_identity(&SystemProcessRunner, &configured, &budget),
             "account .gitconfig name+email must count as a configured identity"
         );
     }
 
     #[test]
     fn collect_origin_https_helpers_reports_boolean_presence_without_helper_text() {
+        let clock = SystemFactsClock::new();
+        let budget = generous_budget(&clock);
         let temp = tempdir().unwrap();
         let empty_account = temp.path().join("empty-account");
         fs::create_dir_all(&empty_account).unwrap();
         fs::set_permissions(&empty_account, fs::Permissions::from_mode(0o700)).unwrap();
-        let empty = collect_origin_https_helpers(&SystemProcessRunner, &empty_account);
+        let empty = collect_origin_https_helpers(&SystemProcessRunner, &empty_account, &budget);
         assert!(
             empty.is_empty(),
             "empty account HOME must not inherit the developer's helpers"
@@ -1958,7 +2335,7 @@ mod tests {
             "[credential]\n    helper = osxkeychain\n[credential \"https://github.com\"]\n    helper = !/usr/bin/gh auth git-credential\n",
         )
         .unwrap();
-        let helpers = collect_origin_https_helpers(&SystemProcessRunner, &configured);
+        let helpers = collect_origin_https_helpers(&SystemProcessRunner, &configured, &budget);
         assert!(helpers.generic);
         assert_eq!(helpers.hosts.get("github.com").copied(), Some(true));
         let json = serde_json::to_string(&helpers).unwrap();

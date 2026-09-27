@@ -68,6 +68,28 @@ pub fn unlock_keychain(
     config: &KeychainUnlockConfig,
     boundary: &RedactionBoundary,
 ) -> Result<(), WorkerError> {
+    match unlock_keychain_within(runner, config, boundary, UNLOCK_TIMEOUT) {
+        Err(WorkerError::Process(_)) => Err(WorkerError::Protocol(format!(
+            "KEYCHAIN_UNLOCK_FAILED: {UNLOCK_FAILED_REASON}"
+        ))),
+        other => other,
+    }
+}
+
+/// Like [`unlock_keychain`], but the process deadline is `deadline` capped by
+/// [`UNLOCK_TIMEOUT`]. A zero deadline fails without starting `security`.
+pub fn unlock_keychain_within(
+    runner: &dyn ProcessRunner,
+    config: &KeychainUnlockConfig,
+    boundary: &RedactionBoundary,
+    deadline: Duration,
+) -> Result<(), WorkerError> {
+    let deadline = deadline.min(UNLOCK_TIMEOUT);
+    if deadline.is_zero() {
+        return Err(WorkerError::Process(
+            crate::error::ProcessError::DeadlineExceeded { deadline },
+        ));
+    }
     let boundary = boundary.clone().with_secrets([
         config.password().to_string_lossy().into_owned(),
         config.path().to_string_lossy().into_owned(),
@@ -84,13 +106,18 @@ pub fn unlock_keychain(
         policy: ProcessPolicy {
             stdout_limit: UNLOCK_OUTPUT_LIMIT,
             stderr_limit: UNLOCK_OUTPUT_LIMIT,
-            deadline: UNLOCK_TIMEOUT,
+            deadline,
         },
         isolate_parent_environment: false,
     };
     let result = match runner.run_in_new_session(&request) {
         Ok(result) if result.status.success() => return Ok(()),
         Ok(result) => Some(result),
+        Err(WorkerError::Process(crate::error::ProcessError::DeadlineExceeded { deadline })) => {
+            return Err(WorkerError::Process(
+                crate::error::ProcessError::DeadlineExceeded { deadline },
+            ));
+        }
         Err(_) => None,
     };
     let first_line = result

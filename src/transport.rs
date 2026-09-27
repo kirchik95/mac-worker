@@ -45,6 +45,22 @@ const REFRESH_FACTS_POLICY: ProcessPolicy = ProcessPolicy {
     deadline: Duration::from_secs(30),
 };
 
+/// Prefix a non-default collection budget. The 30s SSH deadline leaves the
+/// historical command unchanged so existing exact-match checks keep passing.
+fn facts_refresh_remote_command(base: &str, deadline: Duration) -> String {
+    let ssh_deadline = deadline.min(REFRESH_FACTS_POLICY.deadline);
+    let budget = ssh_deadline.saturating_sub(crate::agent_facts::FACTS_REFRESH_MARGIN);
+    if budget == crate::agent_facts::DEFAULT_FACTS_REFRESH_BUDGET {
+        base.to_owned()
+    } else {
+        format!(
+            "{}={} {base}",
+            crate::agent_facts::FACTS_BUDGET_ENV,
+            budget.as_millis()
+        )
+    }
+}
+
 #[doc(hidden)]
 pub trait ProbeClock: Send + Sync {
     fn now(&self) -> Duration;
@@ -264,12 +280,15 @@ impl<R: ProcessRunner> SshTransport<R> {
                 message: "worker fact refresh failed".into(),
             });
         }
-        let command = if clear_auth_incidents {
-            HostOperation::RefreshFactsClear.command()
-        } else {
-            HostOperation::RefreshFacts.command()
-        };
-        let request = ssh_request(worker, command.into(), policy)?;
+        let command = facts_refresh_remote_command(
+            if clear_auth_incidents {
+                HostOperation::RefreshFactsClear.command()
+            } else {
+                HostOperation::RefreshFacts.command()
+            },
+            policy.deadline,
+        );
+        let request = ssh_request(worker, command, policy)?;
         let result = self
             .runner
             .run(&request)
@@ -1026,5 +1045,39 @@ mod tests {
         .unwrap();
         assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
         assert_eq!(request.args[request.args.len() - 2], "mac1");
+    }
+
+    #[test]
+    fn default_refresh_deadline_keeps_the_historical_command() {
+        let command = facts_refresh_remote_command(
+            HostOperation::RefreshFacts.command(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(command, HostOperation::RefreshFacts.command());
+    }
+
+    #[test]
+    fn short_refresh_deadline_prefixes_the_collection_budget() {
+        let command = facts_refresh_remote_command(
+            HostOperation::RefreshFacts.command(),
+            Duration::from_secs(10),
+        );
+        assert!(
+            command.starts_with("MAC_WORKER_FACTS_BUDGET_MS=5000 "),
+            "{command}"
+        );
+        assert!(command.contains("host refresh-facts"), "{command}");
+        let cleared = facts_refresh_remote_command(
+            HostOperation::RefreshFactsClear.command(),
+            Duration::from_secs(10),
+        );
+        assert!(
+            cleared.starts_with("MAC_WORKER_FACTS_BUDGET_MS=5000 "),
+            "{cleared}"
+        );
+        assert!(
+            cleared.contains("host refresh-facts --clear-auth-incidents"),
+            "{cleared}"
+        );
     }
 }

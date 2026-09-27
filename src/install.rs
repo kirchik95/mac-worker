@@ -1112,7 +1112,8 @@ read_canonical_hex "$transaction/candidate.sha256" 64 || exit 77
 digest_regular_file "$worker_path" || exit 77
 [ "$canonical_digest" = "$expected_digest" ] || exit 77
 "$worker_path" host migrate-layout || exit 77
-"$worker_path" host refresh-facts"#;
+# 115s is the installer SSH allowance (120s) minus the facts-refresh margin.
+MAC_WORKER_FACTS_BUDGET_MS=115000 "$worker_path" host refresh-facts"#;
 
 const OUTBOX_WAKE_BODY: &str = r#"set -eu
 LC_ALL=C

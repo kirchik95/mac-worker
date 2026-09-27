@@ -11,7 +11,7 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::{
     agent_facts::{
         AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming,
-        collect_agent_facts_at_host_with_overlay,
+        collect_agent_facts_at_host_with_overlay, facts_refresh_budget_from_env,
     },
     auth_incidents,
     error::WorkerError,
@@ -233,14 +233,40 @@ impl ProbeCollector {
         runner: &dyn ProcessRunner,
         clear_auth_incidents: bool,
     ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
+        Self::refresh_facts_at_with_budget(
+            host_state_root,
+            home,
+            runner,
+            clear_auth_incidents,
+            facts_refresh_budget_from_env(),
+        )
+    }
+
+    /// Like [`Self::refresh_facts_at_with_options`], with an explicit collection
+    /// budget. The host reads `MAC_WORKER_FACTS_BUDGET_MS` through
+    /// [`facts_refresh_budget_from_env`] so a short SSH deadline can shrink
+    /// the work without changing the process environment from library code.
+    pub fn refresh_facts_at_with_budget(
+        host_state_root: &Path,
+        home: &Path,
+        runner: &dyn ProcessRunner,
+        clear_auth_incidents: bool,
+        budget: Duration,
+    ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
         HostStore::open(host_state_root)?;
         if clear_auth_incidents {
             auth_incidents::clear_all(host_state_root)?;
         }
         let profiles = load_env_profiles(home)?;
         let now = current_time_millis();
-        let (facts, timing, overlay) =
-            collect_agent_facts_at_host_with_overlay(runner, home, &profiles, now, host_state_root);
+        let (facts, timing, overlay) = collect_agent_facts_at_host_with_overlay(
+            runner,
+            home,
+            &profiles,
+            now,
+            host_state_root,
+            budget,
+        );
         write_cached_facts(host_state_root, &facts)?;
         overlay?;
         Ok((facts, timing))
