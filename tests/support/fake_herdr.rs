@@ -10,7 +10,7 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -18,6 +18,48 @@ use std::{
 };
 
 use serde_json::{Value, json};
+
+/// Gate a reply until the test releases it. The server signals `entered`
+/// when the request has been recorded, then waits. Drop releases waiters.
+pub struct Hold {
+    entered: Mutex<bool>,
+    go: Mutex<bool>,
+    entered_cv: Condvar,
+    go_cv: Condvar,
+}
+
+impl Hold {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Mutex::new(false),
+            go: Mutex::new(false),
+            entered_cv: Condvar::new(),
+            go_cv: Condvar::new(),
+        })
+    }
+
+    /// `true` once a request has entered this gate.
+    pub fn wait_entered(&self, timeout: Duration) -> bool {
+        let guard = self.entered.lock().expect("hold entered lock");
+        let (guard, _) = self
+            .entered_cv
+            .wait_timeout_while(guard, timeout, |entered| !*entered)
+            .expect("hold entered wait");
+        *guard
+    }
+
+    pub fn release(&self) {
+        let mut go = self.go.lock().expect("hold go lock");
+        *go = true;
+        self.go_cv.notify_all();
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 /// How the fake answers the next request of a method.
 pub enum Reply {
@@ -31,7 +73,11 @@ pub enum Reply {
     Stall(Duration, Value),
     /// Never answers; holds the connection open for ten seconds.
     Silence,
+    /// Signals the gate, waits until [`Hold::release`], then answers.
+    Hold(Arc<Hold>, Value),
 }
+
+type RequestHook = Arc<dyn Fn(&Value) + Send + Sync>;
 
 type Replies = Arc<Mutex<HashMap<String, VecDeque<Reply>>>>;
 
@@ -40,6 +86,7 @@ pub struct FakeHerdr {
     requests: Arc<Mutex<Vec<Value>>>,
     replies: Replies,
     closed_after_reply: Arc<Mutex<Vec<bool>>>,
+    on_request: Arc<Mutex<Option<RequestHook>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -60,11 +107,13 @@ impl FakeHerdr {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let replies: Replies = Arc::new(Mutex::new(HashMap::new()));
         let closed_after_reply = Arc::new(Mutex::new(Vec::new()));
+        let on_request = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         {
             let requests = Arc::clone(&requests);
             let replies = Arc::clone(&replies);
             let closed_after_reply = Arc::clone(&closed_after_reply);
+            let on_request = Arc::clone(&on_request);
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
@@ -73,8 +122,15 @@ impl FakeHerdr {
                             let requests = Arc::clone(&requests);
                             let replies = Arc::clone(&replies);
                             let closed_after_reply = Arc::clone(&closed_after_reply);
+                            let on_request = Arc::clone(&on_request);
                             thread::spawn(move || {
-                                serve_one(stream, &requests, &replies, &closed_after_reply)
+                                serve_one(
+                                    stream,
+                                    &requests,
+                                    &replies,
+                                    &closed_after_reply,
+                                    &on_request,
+                                )
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -90,8 +146,15 @@ impl FakeHerdr {
             requests,
             replies,
             closed_after_reply,
+            on_request,
             stop,
         }
+    }
+
+    /// Called after a request is recorded and before its reply is sent.
+    /// Tests advance a manual clock here so a budget expires without sleeping.
+    pub fn on_request(&self, hook: impl Fn(&Value) + Send + Sync + 'static) {
+        *self.on_request.lock().expect("on_request lock") = Some(Arc::new(hook));
     }
 
     pub fn path(&self) -> &Path {
@@ -141,6 +204,7 @@ fn serve_one(
     requests: &Mutex<Vec<Value>>,
     replies: &Replies,
     closed_after_reply: &Mutex<Vec<bool>>,
+    on_request: &Mutex<Option<RequestHook>>,
 ) {
     // A socket accepted from a non-blocking listener inherits that mode on
     // macOS; the per-connection reads below must block up to their timeout.
@@ -153,6 +217,9 @@ fn serve_one(
     }
     let request: Value = serde_json::from_str(line.trim_end()).unwrap_or(Value::Null);
     requests.lock().unwrap().push(request.clone());
+    if let Some(hook) = on_request.lock().expect("on_request lock").clone() {
+        hook(&request);
+    }
     let method = request
         .get("method")
         .and_then(Value::as_str)
@@ -178,6 +245,16 @@ fn serve_one(
         Reply::Silence => {
             thread::sleep(Duration::from_secs(10));
             None
+        }
+        Reply::Hold(hold, value) => {
+            {
+                let mut entered = hold.entered.lock().expect("hold entered lock");
+                *entered = true;
+                hold.entered_cv.notify_all();
+            }
+            let go = hold.go.lock().expect("hold go lock");
+            let _go = hold.go_cv.wait_while(go, |go| !*go).expect("hold go wait");
+            Some(json!({ "id": id, "result": value }))
         }
     };
     if let Some(answer) = answer {

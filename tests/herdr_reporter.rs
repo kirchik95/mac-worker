@@ -1,15 +1,19 @@
 #[path = "support/fake_herdr.rs"]
 mod fake_herdr;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use fake_herdr::{FakeHerdr, Reply};
 use mac_worker::{
     agent::{AgentKind, Question},
-    herdr::{HerdrClient, HerdrSocket},
+    herdr::{HerdrClient, HerdrError, HerdrSocket},
     herdr_reporter::{
-        DISPLAY_AGENT, FOLLOW_TURN_COMMAND, HerdrReporter, START_BUDGET, TurnIdentity,
-        WORKSPACE_LABEL, short_task_id, task_label_prefix, terminal_report, title_line, turn_label,
+        CLOSE_BUDGET, DISPLAY_AGENT, FOLLOW_TURN_COMMAND, HerdrClock, HerdrReporter,
+        MAX_TABS_PER_PASS, START_BUDGET, TurnIdentity, WORKSPACE_LABEL, short_task_id,
+        task_label_prefix, terminal_report, title_line, turn_label,
     },
     task::{HerdrTurnState, TaskId, TaskOutcome},
 };
@@ -560,4 +564,78 @@ fn nothing_that_crosses_the_socket_is_a_path_a_prompt_or_a_secret() {
             "the only tilde is the helper command: {text}"
         );
     }
+}
+
+struct ManualClock {
+    now: Mutex<Duration>,
+}
+
+impl HerdrClock for ManualClock {
+    fn now(&self) -> Duration {
+        *self.now.lock().expect("manual herdr clock")
+    }
+}
+
+#[test]
+fn close_stops_when_the_budget_is_spent() {
+    let home = tempfile::tempdir().unwrap();
+    let server = FakeHerdr::start_in_home(home.path());
+    let clock = Arc::new(ManualClock {
+        now: Mutex::new(Duration::ZERO),
+    });
+    server.on_request({
+        let clock = Arc::clone(&clock);
+        move |_| {
+            *clock.now.lock().expect("manual herdr clock") += Duration::from_secs(3);
+        }
+    });
+    server.reply("workspace.list", workspace_list(true));
+    server.reply(
+        "tab.list",
+        tab_list(&[
+            ("w3:t1", "1"),
+            ("w3:t2", "task 3714ccefb795 · turn 1"),
+            ("w3:t3", "task 3714ccefb795 · turn 2"),
+        ]),
+    );
+    let reporter = HerdrReporter::with_clock(
+        HerdrClient::new(HerdrSocket::at(server.path())),
+        clock.clone(),
+    );
+    let error = reporter.close(task_id()).unwrap_err();
+    assert!(matches!(error, HerdrError::Timeout), "{error}");
+    assert!(
+        server.requests_for("tab.close").is_empty(),
+        "{:?}",
+        server.requests()
+    );
+    assert!(clock.now() >= CLOSE_BUDGET);
+}
+
+#[test]
+fn close_stops_after_the_tab_cap() {
+    let home = tempfile::tempdir().unwrap();
+    let server = FakeHerdr::start_in_home(home.path());
+    let tabs = (0..20)
+        .map(|index| {
+            (
+                format!("w3:t{index}"),
+                format!("task 3714ccefb795 · turn {index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    server.reply("workspace.list", workspace_list(true));
+    server.reply(
+        "tab.list",
+        Reply::Result(json!({
+            "type": "tab_list",
+            "tabs": tabs
+                .iter()
+                .map(|(id, label)| json!({ "tab_id": id, "label": label, "workspace_id": "w3" }))
+                .collect::<Vec<_>>()
+        })),
+    );
+    let error = reporter(&server).close(task_id()).unwrap_err();
+    assert!(matches!(error, HerdrError::Timeout), "{error}");
+    assert_eq!(server.requests_for("tab.close").len(), MAX_TABS_PER_PASS);
 }
