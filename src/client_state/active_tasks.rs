@@ -101,7 +101,7 @@ struct ActiveTaskBootstrapReceipt {
 
 impl ClientStateStore {
     pub fn bootstrap_active_task_index(&self) -> Result<ActiveTaskBootstrapReport, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let index = self.active_tasks_dir()?;
         if index
             .entry_exists(BOOTSTRAP_FILE)
@@ -182,7 +182,7 @@ impl ClientStateStore {
         config: &ActiveTaskConfig,
     ) -> Result<ActiveTaskSelection, WorkerError> {
         let bound = config.max_tasks_per_tick.max(1);
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let index = self.active_tasks_dir()?;
         let sorted = list_active_index_names(&index)?;
         let last = read_cursor(&index)?;
@@ -258,7 +258,7 @@ impl ClientStateStore {
         config: &ActiveTaskConfig,
     ) -> Result<ActiveTaskRefreshReport, WorkerError> {
         let bound = config.max_tasks_per_tick.max(1);
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let mut unique = Vec::new();
         let mut seen = HashSet::new();
         for task_id in task_ids {

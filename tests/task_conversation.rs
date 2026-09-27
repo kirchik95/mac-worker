@@ -10,6 +10,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Write,
+    os::fd::AsRawFd,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::PathBuf,
     process::ExitStatus,
@@ -17,7 +18,7 @@ use std::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mac_worker::{
@@ -631,6 +632,94 @@ fn local_wait_passes_remaining_timeout_into_remote_observations() {
             .exit_code(),
         0
     );
+}
+
+fn local_wait_held_lock(relative_lock: &str) {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
+    let task_id = TaskId::generate();
+    let turn_id = JobId::generate();
+    let owner = ProcessIdentity::new(777_111, 777_111_007).unwrap();
+    let record = task_record(
+        task_id,
+        turn_id,
+        TaskState::Active,
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        "mini-1",
+        Some(owner),
+    );
+    store.create_task(record.clone()).unwrap();
+    store
+        .write_turn_prompt(task_id, turn_id, "keep working")
+        .unwrap();
+    let entry = store
+        .enqueue(
+            QueueEntry::new(
+                turn_id,
+                store.client_id(),
+                PROJECT_ID.into(),
+                WORKTREE_ID.into(),
+                CommandSummary::argv(1).unwrap(),
+                vec![],
+                WorkerPreference::Automatic,
+                QueueEntryKind::TaskTurn,
+                None,
+                owner,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let held = fs::File::open(paths.state.join(relative_lock)).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let remote = TaskRemoteRunner::new(record.status().clone());
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = client.wait(
+                WaitSelector::Task(task_id),
+                Some(Duration::from_millis(150)),
+            );
+            done_tx.send(started.elapsed()).unwrap();
+            result
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        // Always release and join before asserting so the RED run cannot hang.
+        drop(held);
+        let result = waiter.join().unwrap();
+        assert!(
+            elapsed.is_ok(),
+            "wait exceeded its budget while {relative_lock:?} stayed locked"
+        );
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    });
+    assert_eq!(store.load_task(task_id).unwrap(), record);
+    assert_eq!(store.queue_entry(turn_id).unwrap(), Some(entry));
+    assert_eq!(*remote.status.lock().unwrap(), *record.status());
+}
+
+#[test]
+fn local_wait_deadline_bounds_authoritative_state_lock() {
+    local_wait_held_lock(".");
+}
+
+#[test]
+fn local_wait_deadline_bounds_state_marker_lock() {
+    local_wait_held_lock("jobs.lock");
+}
+
+#[test]
+fn local_wait_deadline_bounds_queue_marker_lock() {
+    local_wait_held_lock("queue/lock");
 }
 
 fn retrying_delivery(turn: JobId, head: BaseOid) -> OriginDelivery {

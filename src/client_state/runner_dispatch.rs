@@ -29,11 +29,7 @@ impl ClientStateStore {
                 ));
             }
         }
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let source_index = snapshot

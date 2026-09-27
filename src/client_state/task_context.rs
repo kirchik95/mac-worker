@@ -1,10 +1,7 @@
 use std::{
     ffi::OsString,
     fs, io,
-    os::{
-        fd::AsRawFd,
-        unix::ffi::{OsStrExt, OsStringExt},
-    },
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -12,8 +9,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ClientStateStore, StateLock, canonical_json_bytes, invalid_state, parse_canonical_json,
-    queue_error, relative_path,
+    ClientStateStore, canonical_json_bytes, invalid_state, parse_canonical_json, queue_error,
+    relative_path,
 };
 use crate::{
     error::WorkerError,
@@ -78,7 +75,7 @@ impl ClientStateStore {
         record: &LocalTaskRecord,
         project_path: &Path,
     ) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.write_task_project_path_locked(record, project_path)
     }
 

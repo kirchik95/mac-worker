@@ -20,6 +20,8 @@ use std::{
 use uuid::Uuid;
 
 mod active_tasks;
+mod deadline;
+pub(crate) use deadline::WaitDeadline;
 mod runner_dispatch;
 mod task_context;
 
@@ -245,6 +247,7 @@ pub struct ClientStateSyncCounts {
 #[derive(Clone)]
 pub struct ClientStateStore {
     inner: Arc<ClientStateInner>,
+    wait_deadline: WaitDeadline,
 }
 
 pub(crate) enum ConditionalStatusUpdate {
@@ -446,6 +449,35 @@ struct SyncCounters {
 }
 
 impl ClientStateStore {
+    /// A per-caller budget; cloning does not change concurrent users of the store.
+    pub(crate) fn with_wait_deadline(&self, wait_deadline: WaitDeadline) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            wait_deadline,
+        }
+    }
+
+    pub(crate) fn wait_deadline(&self) -> WaitDeadline {
+        self.wait_deadline
+    }
+
+    fn acquire_state_lock(&self) -> Result<StateLock, WorkerError> {
+        StateLock::acquire(
+            self.inner.root.as_raw_fd(),
+            &self.inner.sync_counts,
+            self.wait_deadline,
+        )
+    }
+
+    fn acquire_queue_lock(&self) -> Result<QueueLock, WorkerError> {
+        QueueLock::acquire(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+            self.wait_deadline,
+        )
+    }
+
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
@@ -676,6 +708,7 @@ impl ClientStateStore {
         validate_observation_entries(observations.as_raw_fd())?;
 
         Ok(Self {
+            wait_deadline: WaitDeadline::default(),
             inner: Arc::new(ClientStateInner {
                 state_root: state_root.to_path_buf(),
                 root,
@@ -976,11 +1009,7 @@ impl ClientStateStore {
                 "runner slot token is no longer current",
             ));
         }
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         {
@@ -1048,11 +1077,7 @@ impl ClientStateStore {
     }
 
     pub fn live_runner_slot_count(&self) -> Result<usize, WorkerError> {
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let tasks = self.occupancy_task_records_locked()?;
@@ -1179,11 +1204,7 @@ impl ClientStateStore {
     }
 
     pub fn queue_snapshot(&self) -> Result<QueueSnapshot, WorkerError> {
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
         Ok(snapshot)
@@ -1196,11 +1217,7 @@ impl ClientStateStore {
         &self,
         config: &Config,
     ) -> Result<Vec<QueueRowWithBlockingReason>, WorkerError> {
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let now_millis = advisory_now_millis();
@@ -1903,7 +1920,7 @@ impl ClientStateStore {
             worker: worker.to_owned(),
             observed_at_millis,
         };
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         read_worktree_affinity_optional(
             self.inner.affinity_worktrees.as_raw_fd(),
             &worktree_affinity_name(project_id, worktree_id)?,
@@ -1933,7 +1950,7 @@ impl ClientStateStore {
     ) -> Result<AffinityHints, WorkerError> {
         validate_affinity_key(project_id, "project ID")?;
         validate_affinity_key(worktree_id, "worktree ID")?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.affinity_hints_locked(project_id, worktree_id)
     }
 
@@ -1982,7 +1999,7 @@ impl ClientStateStore {
         validate_state_worker_name(worker)?;
         let project_name = project_affinity_name(project_id)?;
         let worktree_name = worktree_affinity_name(project_id, worktree_id)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let project = read_project_affinity_optional(
             self.inner.affinity_projects.as_raw_fd(),
             &project_name,
@@ -2032,7 +2049,7 @@ impl ClientStateStore {
     {
         validate_state_worker_name(worker)?;
         let cached = {
-            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            let _lock = self.acquire_state_lock()?;
             read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
                 .map(|observation| cached_admission(observation, now_millis))
                 .transpose()?
@@ -2045,7 +2062,7 @@ impl ClientStateStore {
         }
 
         let marker = {
-            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            let _lock = self.acquire_state_lock()?;
             open_or_create_refresh_marker(
                 self.inner.observations.as_raw_fd(),
                 worker,
@@ -2059,16 +2076,15 @@ impl ClientStateStore {
             }
             RefreshAcquire::Busy => {
                 let marker = {
-                    let _lock =
-                        StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+                    let _lock = self.acquire_state_lock()?;
                     open_refresh_marker(self.inner.observations.as_raw_fd(), worker)?
                 };
-                RefreshLock::acquire(marker)?
+                RefreshLock::acquire(marker, self.wait_deadline)?
             }
         };
 
         let current = {
-            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            let _lock = self.acquire_state_lock()?;
             read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
                 .map(|observation| cached_admission(observation, now_millis))
                 .transpose()?
@@ -2109,7 +2125,7 @@ impl ClientStateStore {
         let worker = observation.worker_name();
         validate_state_worker_name(worker)?;
         let bytes = canonical_json_bytes(&observation, "admission observation")?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         if let Some(existing) =
             read_observation_optional(self.inner.observations.as_raw_fd(), worker)?
             && existing.observed_at_millis() > observation.observed_at_millis()
@@ -2124,7 +2140,7 @@ impl ClientStateStore {
     /// this call; a local release does not age the row on its own.
     pub fn invalidate_admission_observation(&self, worker: &str) -> Result<(), WorkerError> {
         validate_state_worker_name(worker)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let name = observation_record_name(worker)?;
         match unlink_at(self.inner.observations.as_raw_fd(), &name, 0) {
             Ok(()) => {}
@@ -2139,7 +2155,7 @@ impl ClientStateStore {
         worker: &str,
     ) -> Result<Option<AdmissionObservation>, WorkerError> {
         validate_state_worker_name(worker)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         read_observation_optional(self.inner.observations.as_raw_fd(), worker)
     }
 
@@ -2160,7 +2176,7 @@ impl ClientStateStore {
             ));
         }
         let bytes = canonical_json_bytes(&incoming, "admission observation")?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.reach_concurrency_point(ClientStateConcurrencyPoint::ObservationRefreshPublication);
         let existing = read_observation_optional(self.inner.observations.as_raw_fd(), worker)?;
         if existing.as_ref() != expected {
@@ -2182,7 +2198,7 @@ impl ClientStateStore {
     ) -> Result<Option<ObservationRefreshGuard>, WorkerError> {
         validate_state_worker_name(worker)?;
         let marker = {
-            let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+            let _lock = self.acquire_state_lock()?;
             open_or_create_refresh_marker(
                 self.inner.observations.as_raw_fd(),
                 worker,
@@ -2196,11 +2212,7 @@ impl ClientStateStore {
     where
         F: FnOnce(&mut QueueSnapshot) -> Result<(R, bool), WorkerError>,
     {
-        let _lock = QueueLock::acquire(
-            self.inner.root.as_raw_fd(),
-            self.inner.queue.as_raw_fd(),
-            &self.inner.sync_counts,
-        )?;
+        let _lock = self.acquire_queue_lock()?;
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let (result, changed) = update(&mut snapshot)?;
@@ -2422,7 +2434,7 @@ impl ClientStateStore {
         &self,
         job_id: JobId,
     ) -> Result<Option<LocalJobRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let name = job_file_name(job_id)?;
         let Some(record) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? else {
             return Ok(None);
@@ -2449,7 +2461,7 @@ impl ClientStateStore {
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
         record.validate()?;
         self.require_local_client(&record)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let name = job_file_name(record.meta().job_id())?;
 
         if let Some(existing) = read_job_optional(self.inner.jobs.as_raw_fd(), &name)? {
@@ -2635,7 +2647,7 @@ impl ClientStateStore {
     }
 
     pub fn list_jobs(&self) -> Result<Vec<LocalJobRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let mut entries = directory_entries(self.inner.jobs.as_raw_fd())?;
         entries.sort();
         entries
@@ -2665,7 +2677,7 @@ impl ClientStateStore {
     pub fn create_task(&self, record: LocalTaskRecord) -> Result<(), WorkerError> {
         let task_id = record.meta().task_id();
         let bytes = task_record_bytes(&record)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let tasks = self.tasks_dir()?;
         let name = task_file_name(task_id)?;
         if tasks.entry_exists(&name).map_err(WorkerError::Io)? {
@@ -2709,7 +2721,7 @@ impl ClientStateStore {
         &self,
         task_id: TaskId,
     ) -> Result<Option<LocalTaskRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let tasks = self.tasks_dir()?;
         let name = task_file_name(task_id)?;
         match read_task_from_dir(&tasks, &name, task_id) {
@@ -2766,7 +2778,7 @@ impl ClientStateStore {
         S: FnOnce() -> io::Result<()>,
     {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let current = self.load_task(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) != expected_turn {
             return Err(queue_error(
@@ -2800,7 +2812,7 @@ impl ClientStateStore {
                 "conditional task update changed task identity",
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.replace_task_locked_if_current(
             replacement,
             || Ok(()),
@@ -2832,7 +2844,7 @@ impl ClientStateStore {
         head: BaseOid,
     ) -> Result<bool, WorkerError> {
         let task_id = fetched_for.meta().task_id();
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let tasks = self.tasks_dir()?;
         let name = task_file_name(task_id)?;
         let current = read_task_from_dir(&tasks, &name, task_id)?;
@@ -2850,7 +2862,7 @@ impl ClientStateStore {
         &self,
         expected: &LocalTaskRecord,
     ) -> Result<LocalTaskRecord, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let task_id = expected.meta().task_id();
         let current = self.load_task(task_id)?;
         if !same_result_turn(&current, expected) {
@@ -2963,7 +2975,7 @@ impl ClientStateStore {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<LocalTaskRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.list_tasks_locked()
     }
 
@@ -3037,7 +3049,7 @@ impl ClientStateStore {
     /// Validates and recovers replacement residue, then removes the durable
     /// record after the caller has retired its prompt tree and queue row.
     pub fn remove_task_submission_record(&self, task_id: TaskId) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let tasks = self.tasks_dir()?;
         let names = tasks.list_names().map_err(WorkerError::Io)?;
         self.recover_task_replacement_residue(&tasks, &names)?;
@@ -3070,7 +3082,7 @@ impl ClientStateStore {
                 ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval,
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let after_durable_turn_tree_retirement = || {
             if self.take_submission_rollback_cleanup_fault(
@@ -3247,7 +3259,7 @@ impl ClientStateStore {
     pub fn create_run(&self, record: RunRecord) -> Result<(), WorkerError> {
         let run_id = record.run_id();
         let bytes = run_record_bytes(&record)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let names = runs.list_names().map_err(WorkerError::Io)?;
         self.recover_run_replacement_residue(&runs, &names)?;
@@ -3302,7 +3314,7 @@ impl ClientStateStore {
         let run_id = record.run_id();
         let run_bytes = run_record_bytes(&record)?;
         let dag_bytes = dag_record_bytes(&dag)?;
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let dags = self.dags_dir()?;
         self.recover_keyed_replacement_residue(&runs)?;
@@ -3354,7 +3366,7 @@ impl ClientStateStore {
     }
 
     pub fn load_run_dag(&self, run_id: RunId) -> Result<Option<DagRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.load_run_dag_locked(run_id)
     }
 
@@ -3386,7 +3398,7 @@ impl ClientStateStore {
     }
 
     pub fn list_run_dags(&self) -> Result<Vec<DagRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let dags = self.dags_dir()?;
         let mut names = dags.list_names().map_err(WorkerError::Io)?;
         names.retain(|name| {
@@ -3406,17 +3418,17 @@ impl ClientStateStore {
     }
 
     pub fn list_pending_dags(&self) -> Result<Vec<DagRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.list_pending_dags_locked()
     }
 
     pub fn list_pending_run_ids(&self) -> Result<Vec<RunId>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         self.list_pending_index_ids_locked()
     }
 
     pub fn retire_pending_dag_if_quiescent(&self, run_id: RunId) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let Some(dag) = self.load_run_dag_locked(run_id)? else {
             return Ok(());
         };
@@ -3432,7 +3444,7 @@ impl ClientStateStore {
         caller: ProcessIdentity,
         now_millis: u64,
     ) -> Result<Option<DagClaim>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let dags = self.dags_dir()?;
         self.recover_keyed_replacement_residue(&runs)?;
@@ -3556,7 +3568,7 @@ impl ClientStateStore {
         batch_id: &str,
         task_id: TaskId,
     ) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let dags = self.dags_dir()?;
         let mut dag = self
             .load_run_dag_locked(run_id)?
@@ -3601,7 +3613,7 @@ impl ClientStateStore {
                 "DAG bind pin_ref must be the canonical TransferRepo pin",
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let dags = self.dags_dir()?;
         let mut dag = self
             .load_run_dag_locked(run_id)?
@@ -3643,7 +3655,7 @@ impl ClientStateStore {
         if self.take_fault(ClientStateWritePoint::BeforeRunLoad) {
             return Err(injected_failure(ClientStateWritePoint::BeforeRunLoad));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let name = run_file_name(run_id)?;
         read_run_from_dir(&runs, &name, run_id)
@@ -3678,7 +3690,7 @@ impl ClientStateStore {
     }
 
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let mut names = runs.list_names().map_err(WorkerError::Io)?;
         // Replacement residue is a crash artifact. Enumeration is a
@@ -3707,7 +3719,7 @@ impl ClientStateStore {
     /// Completes filesystem replacement recovery for mutating command paths.
     /// Read-only enumeration deliberately does not call this method.
     pub(crate) fn recover_replacement_residue(&self) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
 
         let tasks = self.tasks_dir()?;
         let task_names = tasks.list_names().map_err(WorkerError::Io)?;
@@ -3728,7 +3740,7 @@ impl ClientStateStore {
     /// Selected ticks skip the historical tasks/runs/dags sweep. Recover
     /// leftover task replacement files only when residue is already present.
     pub(crate) fn recover_task_replacement_residue_if_present(&self) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let tasks = self.tasks_dir()?;
         if !tasks
             .has_private_cleanup_residue()
@@ -3956,7 +3968,7 @@ impl ClientStateStore {
         run_id: RunId,
         branch: BranchName,
     ) -> Result<RunRecord, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let names = runs.list_names().map_err(WorkerError::Io)?;
         self.recover_run_replacement_residue(&runs, &names)?;
@@ -3980,7 +3992,7 @@ impl ClientStateStore {
         task_id: TaskId,
         branch: BranchName,
     ) -> Result<RunRecord, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let names = runs.list_names().map_err(WorkerError::Io)?;
         self.recover_run_replacement_residue(&runs, &names)?;
@@ -4008,7 +4020,7 @@ impl ClientStateStore {
                 ClientStateWritePoint::BeforeRunPublishBranchRelease,
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let names = runs.list_names().map_err(WorkerError::Io)?;
         self.recover_run_replacement_residue(&runs, &names)?;
@@ -4040,7 +4052,7 @@ impl ClientStateStore {
                 ClientStateWritePoint::BeforeRunPublishBranchRelease,
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runs = self.runs_dir()?;
         let names = runs.list_names().map_err(WorkerError::Io)?;
         self.recover_run_replacement_residue(&runs, &names)?;
@@ -4305,7 +4317,7 @@ impl ClientStateStore {
                 "task prompt is too large",
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let task_dir = turns
             .open_child_directory(&relative_path(&task_id.to_string())?, true)
@@ -4356,7 +4368,7 @@ impl ClientStateStore {
                 "prepared follow-up binding is invalid",
             ));
         }
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let task_dir = turns
             .open_child_directory(&relative_path(&task_id.to_string())?, true)
@@ -4394,7 +4406,7 @@ impl ClientStateStore {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let task_dir = turns
             .open_child_directory(&relative_path(&task_id.to_string())?, false)
@@ -4428,7 +4440,7 @@ impl ClientStateStore {
     }
 
     pub fn remove_turn_prompt(&self, task_id: TaskId, turn_id: TurnId) -> Result<(), WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let task_dir = turns
             .open_child_directory(&relative_path(&task_id.to_string())?, false)
@@ -4444,7 +4456,7 @@ impl ClientStateStore {
     }
 
     pub fn open_runner_log(&self, task_id: TaskId, turn_id: TurnId) -> Result<File, WorkerError> {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let runners = self.runners_dir()?;
         let task_dir = runners
             .open_child_directory(&relative_path(&task_id.to_string())?, true)
@@ -4841,7 +4853,7 @@ impl ClientStateStore {
     where
         F: FnOnce(&LocalJobRecord) -> Result<Option<LocalJobRecord>, WorkerError>,
     {
-        let _lock = StateLock::acquire(self.inner.root.as_raw_fd(), &self.inner.sync_counts)?;
+        let _lock = self.acquire_state_lock()?;
         let name = job_file_name(job_id)?;
         let (existing, identity) = read_job_with_identity(self.inner.jobs.as_raw_fd(), &name)?;
         if existing.meta().job_id() != job_id {
@@ -4934,11 +4946,16 @@ struct QueueLock {
 }
 
 impl QueueLock {
-    fn acquire(root: RawFd, queue: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
-        let state = StateLock::acquire(root, sync_counts)?;
+    fn acquire(
+        root: RawFd,
+        queue: RawFd,
+        sync_counts: &SyncCounters,
+        deadline: WaitDeadline,
+    ) -> Result<Self, WorkerError> {
+        let state = StateLock::acquire(root, sync_counts, deadline)?;
         let marker = open_regular_at(queue, QUEUE_LOCK_NAME)?;
         require_owned_regular(marker.as_raw_fd(), 0)?;
-        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+        deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
         Ok(Self {
             _state: state,
             marker,
@@ -4970,8 +4987,8 @@ impl RefreshLock {
         }
     }
 
-    fn acquire(marker: OwnedFd) -> Result<Self, WorkerError> {
-        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+    fn acquire(marker: OwnedFd, deadline: WaitDeadline) -> Result<Self, WorkerError> {
+        deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
         Ok(Self { marker })
     }
 }
@@ -6305,8 +6322,12 @@ struct StateLock {
 }
 
 impl StateLock {
-    fn acquire(root: RawFd, sync_counts: &SyncCounters) -> Result<Self, WorkerError> {
-        Self::acquire_inner(root, sync_counts, None)
+    fn acquire(
+        root: RawFd,
+        sync_counts: &SyncCounters,
+        deadline: WaitDeadline,
+    ) -> Result<Self, WorkerError> {
+        Self::acquire_inner(root, sync_counts, None, deadline)
     }
 
     fn acquire_with_creation_race(
@@ -6314,14 +6335,21 @@ impl StateLock {
         sync_counts: &SyncCounters,
         creation_race: &AtomicU8,
     ) -> Result<Self, WorkerError> {
-        Self::acquire_inner(root, sync_counts, Some(creation_race))
+        Self::acquire_inner(
+            root,
+            sync_counts,
+            Some(creation_race),
+            WaitDeadline::default(),
+        )
     }
 
     fn acquire_inner(
         root: RawFd,
         sync_counts: &SyncCounters,
         creation_race: Option<&AtomicU8>,
+        deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
+        deadline.remaining()?;
         let authoritative = open_directory_at(root, c".")?;
         let anchored_identity = FileIdentity::from_stat(stat_fd(root)?);
         let lock_identity = FileIdentity::from_stat(stat_fd(authoritative.as_raw_fd())?);
@@ -6336,10 +6364,11 @@ impl StateLock {
             Ok(()) => {}
             Err(error) if lock_would_block(&error) => {
                 notify_lock_contention(root)?;
-                cvt(unsafe { libc::flock(authoritative.as_raw_fd(), libc::LOCK_EX) })?;
+                deadline.lock(authoritative.as_raw_fd(), libc::LOCK_EX)?;
             }
             Err(error) => return Err(WorkerError::Io(error)),
         }
+        deadline.remaining()?;
 
         let (marker, outcome) = open_lock_file_with_creation(root, creation_race)?;
         if outcome != CreationOutcome::Existing {
@@ -6350,7 +6379,7 @@ impl StateLock {
                 .concurrent_loser_parents
                 .fetch_add(1, Ordering::SeqCst);
         }
-        cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX) })?;
+        deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
         Ok(Self {
             authoritative,
             marker,

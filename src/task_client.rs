@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Condvar, Mutex, OnceLock},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -66,42 +66,7 @@ const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
 const PUBLISH_RETRY_MERGE_ATTEMPTS: usize = 3;
 const PUBLISH_RETRY_LOCAL_UPDATE_WARNING: &str = "origin retry was accepted on the worker, but the laptop record could not be updated with the returned deliveries";
 
-pub(crate) struct WaitDeadline {
-    started: Instant,
-    timeout: Option<Duration>,
-}
-
-impl WaitDeadline {
-    pub(crate) fn new(timeout: Option<Duration>) -> Self {
-        Self {
-            started: Instant::now(),
-            timeout,
-        }
-    }
-
-    fn remaining_at(&self, now: Instant) -> Result<Option<Duration>, WorkerError> {
-        let elapsed = now.saturating_duration_since(self.started);
-        match self.timeout {
-            Some(timeout) if elapsed >= timeout => Err(task_error(
-                "WAIT_TIMEOUT",
-                "task wait timed out without cancelling the task",
-            )),
-            Some(timeout) => Ok(Some(timeout - elapsed)),
-            None => Ok(None),
-        }
-    }
-
-    pub(crate) fn remaining(&self) -> Result<Option<Duration>, WorkerError> {
-        self.remaining_at(Instant::now())
-    }
-
-    pub(crate) fn poll_delay(&self) -> Result<Duration, WorkerError> {
-        let poll = WAIT_POLL.min(WAIT_MAX_POLL);
-        Ok(self
-            .remaining()?
-            .map_or(poll, |remaining| poll.min(remaining)))
-    }
-}
+pub(crate) use crate::client_state::WaitDeadline;
 
 /// Bound each blocking process in a wait poll by the same remaining budget.
 /// Delegation preserves session and interruptible process semantics.
@@ -132,14 +97,18 @@ impl ProcessRunner for WaitDeadlineRunner<'_> {
         &self,
         request: &crate::process::ProcessRequest,
     ) -> Result<crate::process::ProcessResult, WorkerError> {
-        self.runner.run(&self.bounded(request)?)
+        let result = self.runner.run(&self.bounded(request)?);
+        self.deadline.remaining()?;
+        result
     }
 
     fn run_in_new_session(
         &self,
         request: &crate::process::ProcessRequest,
     ) -> Result<crate::process::ProcessResult, WorkerError> {
-        self.runner.run_in_new_session(&self.bounded(request)?)
+        let result = self.runner.run_in_new_session(&self.bounded(request)?);
+        self.deadline.remaining()?;
+        result
     }
 
     fn run_interruptible(
@@ -147,8 +116,11 @@ impl ProcessRunner for WaitDeadlineRunner<'_> {
         request: &crate::process::ProcessRequest,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<crate::process::ProcessResult, WorkerError> {
-        self.runner
-            .run_interruptible(&self.bounded(request)?, should_stop)
+        let result = self
+            .runner
+            .run_interruptible(&self.bounded(request)?, should_stop);
+        self.deadline.remaining()?;
+        result
     }
 }
 
@@ -201,7 +173,6 @@ pub(crate) fn validate_close_target(
     Ok(())
 }
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(100);
-pub(crate) const WAIT_MAX_POLL: Duration = Duration::from_secs(1);
 
 pub(crate) enum FrozenSubmit<'a> {
     Dag(&'a DagNode),
@@ -4032,14 +4003,9 @@ impl<'a> TaskClient<'a> {
     ) -> Result<WaitReport, WorkerError> {
         let deadline = WaitDeadline::new(timeout);
         let runner = WaitDeadlineRunner::new(self.runner, &deadline);
-        let client = TaskClient::new(
-            &runner,
-            self.config,
-            self.paths,
-            self.client_state,
-            self.executor,
-        )
-        .with_herdr_notifier(self.herdr_notifier.clone());
+        let state = self.client_state.with_wait_deadline(deadline);
+        let client = TaskClient::new(&runner, self.config, self.paths, &state, self.executor)
+            .with_herdr_notifier(self.herdr_notifier.clone());
         loop {
             deadline.remaining()?;
             let snapshot = client.wait_poll(selector);
@@ -4057,6 +4023,7 @@ impl<'a> TaskClient<'a> {
     /// whole wait. Re-resolves run task IDs after reconcile. Does not reset
     /// the 00ce replacement budget.
     pub(crate) fn wait_poll(&self, selector: WaitSelector) -> Result<WaitSnapshot, WorkerError> {
+        self.client_state.wait_deadline().remaining()?;
         let waited = match selector {
             WaitSelector::Task(task_id) => vec![task_id],
             WaitSelector::Run(run_id) => self.client_state.load_run(run_id)?.task_ids().to_vec(),
@@ -6528,10 +6495,7 @@ mod tests {
     fn wait_deadline_ignores_forward_and_backward_wall_clock_observations() {
         let monotonic = std::time::Instant::now();
         let wall = UNIX_EPOCH + Duration::from_secs(10_000);
-        let deadline = WaitDeadline {
-            started: monotonic,
-            timeout: Some(Duration::from_secs(10)),
-        };
+        let deadline = WaitDeadline::until(Some(monotonic + Duration::from_secs(10)));
         for (mono_now, wall_now, expected) in [
             (
                 monotonic,
