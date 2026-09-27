@@ -6979,6 +6979,7 @@ fn a_runner_that_fails_after_acceptance_appends_a_distinct_diagnostic_that_task_
                 "offsets": [0, 0],
                 "len": body.len() as u64,
                 "accepted": true,
+                "assignment": {"worker": "mini-1", "job_id": fixture.turn_id},
                 "completion": null
             },
             "pending": null
