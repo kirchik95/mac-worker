@@ -283,12 +283,32 @@ fn worker_issues(
         }
     }
     if eligible_worker_count == 0 {
-        issues.push(issue(
-            IssueSeverity::Blocker,
-            "NO_ELIGIBLE_WORKER",
-            "no configured worker is ready with every required capability",
-            Vec::new(),
-        ));
+        // A fleet that is only busy is capacity, not a bad invocation. An
+        // empty inventory is not "all busy": it stays NO_ELIGIBLE_WORKER.
+        let only_busy = !workers.is_empty()
+            && workers.iter().all(|worker| {
+                worker.status == HealthStatus::Ready
+                    && worker.missing_capabilities.is_empty()
+                    && worker
+                        .probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.slot_state == crate::lease::SlotState::Busy)
+            });
+        if only_busy {
+            issues.push(issue(
+                IssueSeverity::Blocker,
+                "CAPACITY_BUSY",
+                "every configured worker is healthy but its heavy slot is busy",
+                Vec::new(),
+            ));
+        } else {
+            issues.push(issue(
+                IssueSeverity::Blocker,
+                "NO_ELIGIBLE_WORKER",
+                "no configured worker is ready with every required capability",
+                Vec::new(),
+            ));
+        }
     }
     issues
 }

@@ -802,6 +802,35 @@ fn doctor_aggregate_exit_uses_ready_usage_and_snapshot_integrity_categories() {
         CommandOutput::Doctor(blocked_output_report("SNAPSHOT_CHANGED")).aggregate_exit_kind(),
         Some(ExitKind::Infrastructure)
     );
+    assert_eq!(
+        CommandOutput::Doctor(blocked_output_report("CAPACITY_BUSY")).aggregate_exit_kind(),
+        Some(ExitKind::Capacity)
+    );
+    let mut mixed = blocked_output_report("CAPACITY_BUSY");
+    mixed.issues.push(DoctorIssue {
+        severity: IssueSeverity::Blocker,
+        code: "NO_ELIGIBLE_WORKER".into(),
+        message: "no configured worker is ready".into(),
+        paths: Vec::new(),
+    });
+    assert_eq!(
+        CommandOutput::Doctor(mixed).aggregate_exit_kind(),
+        Some(ExitKind::Usage)
+    );
+    let mut snapshot_and_capacity = blocked_output_report("SNAPSHOT_CHANGED");
+    snapshot_and_capacity.issues.insert(
+        0,
+        DoctorIssue {
+            severity: IssueSeverity::Blocker,
+            code: "CAPACITY_BUSY".into(),
+            message: "every configured worker is busy".into(),
+            paths: Vec::new(),
+        },
+    );
+    assert_eq!(
+        CommandOutput::Doctor(snapshot_and_capacity).aggregate_exit_kind(),
+        Some(ExitKind::Infrastructure)
+    );
 }
 
 #[test]
@@ -1114,15 +1143,49 @@ fn busy_worker_is_healthy_but_not_immediately_eligible() {
         report.workers[0].probe.as_ref().unwrap().slot_state,
         SlotState::Busy
     );
+    assert!(report.issues.iter().any(|issue| {
+        issue.severity == IssueSeverity::Blocker && issue.code == "CAPACITY_BUSY"
+    }));
     assert!(
-        report
+        !report
             .issues
             .iter()
             .any(|issue| issue.code == "NO_ELIGIBLE_WORKER")
     );
-    let human = CommandOutput::Doctor(report).render_human();
+    let human = CommandOutput::Doctor(report.clone()).render_human();
     assert!(human.contains("mini-1: busy"));
     assert!(human.contains("slot: busy"));
+    assert_eq!(
+        CommandOutput::Doctor(report).aggregate_exit_kind(),
+        Some(ExitKind::Capacity)
+    );
+}
+
+#[test]
+fn mixed_busy_and_offline_workers_remain_a_usage_error() {
+    let repo = GitRepo::init();
+    repo.write("README.md", b"tracked\n");
+    repo.commit_all("mixed busy fixture");
+    let state = tempfile::tempdir().unwrap();
+    let config = config(vec![
+        worker("mini-1", "mac1", &["darwin-arm64"]),
+        worker("mini-2", "mac2", &["darwin-arm64"]),
+    ]);
+    let runner = DoctorRunner::new(vec![busy_probe(&["darwin-arm64"]), offline_probe()]);
+
+    let report = inspect(&repo, state.path(), &config, &runner).unwrap();
+
+    assert!(!report.ready);
+    assert!(report.issues.iter().any(|issue| {
+        issue.severity == IssueSeverity::Blocker && issue.code == "NO_ELIGIBLE_WORKER"
+    }));
+    assert!(!report.issues.iter().any(|issue| {
+        issue.severity == IssueSeverity::Blocker && issue.code == "CAPACITY_BUSY"
+    }));
+    assert_eq!(
+        CommandOutput::Doctor(report).aggregate_exit_kind(),
+        Some(ExitKind::Usage)
+    );
 }
 
 #[test]

@@ -168,9 +168,25 @@ impl CommandOutput {
             {
                 Some(crate::error::ExitKind::Infrastructure)
             }
+            Self::Doctor(report) if doctor_blockers_are_only_capacity(report) => {
+                Some(crate::error::ExitKind::Capacity)
+            }
             Self::Doctor(_) => Some(crate::error::ExitKind::Usage),
             _ => None,
         }
+    }
+}
+
+fn doctor_blockers_are_only_capacity(report: &crate::protocol::DoctorReport) -> bool {
+    let mut blockers = report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == crate::protocol::IssueSeverity::Blocker);
+    match blockers.next() {
+        Some(issue) if issue.code == "CAPACITY_BUSY" => {
+            blockers.all(|issue| issue.code == "CAPACITY_BUSY")
+        }
+        _ => false,
     }
 }
 
