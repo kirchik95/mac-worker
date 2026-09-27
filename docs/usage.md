@@ -511,6 +511,8 @@ worker doctor --project .                   # validate a project before its firs
 
 The process exit status is one of the categories below. Codes in the laptop's catalog keep the same status and hint locally, over SSH, and through the controller, whether or not the helper sends a category. A hint is a fixed next step: it never includes a path or text taken from a remote message. For an unknown code, a valid category from a future helper determines the status; without one, the previous mapping applies. Current helpers omit the category field to remain compatible with older laptops.
 
+JSON error events keep a plain public `message`. Human-readable diagnostics on stderr put the hint on a separate line.
+
 | Exit | Meaning |
 |---|---|
 | 0 | The command finished |

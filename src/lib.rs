@@ -694,7 +694,7 @@ fn write_json_error_event(stdout: &mut dyn Write, error: &WorkerError) -> Result
     let event = JsonEvent::Error {
         protocol_version: PROTOCOL_VERSION,
         code: error.public_code(),
-        message: crate::error::operator_json_message(error),
+        message: error.public_message(),
     };
     let mut encoded = serde_json::to_vec(&event)
         .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
@@ -5453,10 +5453,9 @@ mod tests {
         match event {
             crate::job::JsonEvent::Error { code, message, .. } => {
                 assert_eq!(code, "CAPACITY_BUSY");
-                let hint = crate::error::hint_for("CAPACITY_BUSY").unwrap();
                 assert_eq!(
                     message,
-                    format!("no eligible worker currently has an available heavy slot. {hint}")
+                    "no eligible worker currently has an available heavy slot"
                 );
             }
             other => panic!("expected a JSON error event, got {other:?}"),
@@ -5475,13 +5474,47 @@ mod tests {
         match event {
             crate::job::JsonEvent::Error { code, message, .. } => {
                 assert_eq!(code, "CAPACITY_BUSY");
-                let hint = crate::error::hint_for("CAPACITY_BUSY").unwrap();
-                assert_eq!(message, format!("capacity error. {hint}"));
+                assert_eq!(message, "capacity error");
             }
             other => panic!("expected a JSON error event, got {other:?}"),
         }
         let text = String::from_utf8(stdout).unwrap();
         assert!(!text.contains(planted_path));
+    }
+
+    #[test]
+    fn json_error_events_keep_plain_messages_while_stderr_keeps_hints() {
+        for error in [
+            WorkerError::Transport {
+                code: "SSH_UNAVAILABLE",
+                message: "/Users/alice/PLANTED_HOST_PATH".into(),
+            },
+            WorkerError::Config("CONFIG_MISSING: /Users/alice/PLANTED_CONFIG_PATH".into()),
+            WorkerError::task("TASK_BUSY", "task turn is being dispatched"),
+        ] {
+            let mut stdout = Vec::new();
+            super::write_json_error_event(&mut stdout, &error).unwrap();
+            let event: crate::job::JsonEvent = serde_json::from_slice(&stdout).unwrap();
+            match event {
+                crate::job::JsonEvent::Error { code, message, .. } => {
+                    assert_eq!(code, error.public_code());
+                    assert_eq!(message, error.public_message());
+                }
+                other => panic!("expected a JSON error event, got {other:?}"),
+            }
+            let mut stderr = Vec::new();
+            super::write_public_diagnostic(&mut stderr, &error);
+            let hint = crate::error::hint_for(&error.public_code()).unwrap();
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                format!(
+                    "{}: {}\n{hint}\n",
+                    error.public_code(),
+                    error.public_message()
+                )
+            );
+            assert!(!String::from_utf8(stdout).unwrap().contains("PLANTED"));
+        }
     }
 
     #[test]

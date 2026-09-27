@@ -581,15 +581,6 @@ pub(crate) fn operator_diagnostic(error: &WorkerError) -> String {
     text
 }
 
-pub(crate) fn operator_json_message(error: &WorkerError) -> String {
-    match hint_for(&error.public_code()) {
-        Some(hint) if !error.public_message().contains(hint) => {
-            format!("{}. {hint}", error.public_message())
-        }
-        _ => error.public_message(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ExitKind, WorkerError};
