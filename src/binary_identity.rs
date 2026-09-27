@@ -1,16 +1,19 @@
 //! Started-versus-installed identity for a long-running `worker` process.
 //!
 //! Compared against the file currently at that path (inode, size, mtime).
-//! A replaced install changes at least one of those without needing a
-//! build-id in the binary. Host outbox watchers and the laptop dashboard
-//! share this check.
+//! A replaced install changes at least one of those. The running executable's
+//! SHA-256 is computed once per process and cached for probes and skew checks.
+//! Host outbox watchers and the laptop dashboard share the inode check.
 
 use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::UNIX_EPOCH,
 };
+
+use sha2::{Digest, Sha256};
 
 use serde::{Deserialize, Serialize};
 
@@ -98,10 +101,46 @@ impl BinaryIdentitySource for FixedBinaryIdentitySource {
     }
 }
 
+/// SHA-256 of the running executable, computed once per process.
+///
+/// `None` when the executable path cannot be read. Callers treat that as
+/// "identity unknown", not as a mismatch.
+pub fn current_binary_sha256() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let path = std::env::current_exe().ok()?;
+            let bytes = fs::read(path).ok()?;
+            Some(sha256_hex(&bytes))
+        })
+        .clone()
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 /// True when both identities are known and they differ.
 pub fn binary_is_outdated(source: &dyn BinaryIdentitySource) -> bool {
     match (source.started(), source.installed()) {
         (Some(started), Some(installed)) => started != installed,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{current_binary_sha256, sha256_hex};
+
+    #[test]
+    fn current_binary_sha256_matches_the_executable_and_stays_cached() {
+        let path = std::env::current_exe().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = sha256_hex(&bytes);
+        assert_eq!(current_binary_sha256().as_deref(), Some(expected.as_str()));
+        assert_eq!(current_binary_sha256().as_deref(), Some(expected.as_str()));
+        assert_eq!(expected.len(), 64);
     }
 }
