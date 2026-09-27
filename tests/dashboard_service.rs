@@ -1602,6 +1602,8 @@ fn worker_with_facts(collected_at_millis: u64, facts_age_millis: u64) -> ProbeWo
             facts_age_millis: Some(facts_age_millis),
             configured_slots: 0,
             busy_slots: 0,
+            build_id: None,
+            binary_sha256: None,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

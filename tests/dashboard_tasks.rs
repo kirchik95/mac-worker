@@ -1250,6 +1250,8 @@ fn probe(slot_state: SlotState, active_turn: Option<TurnId>) -> ProbeResponse {
         facts_age_millis: None,
         configured_slots: 0,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     }
 }
 

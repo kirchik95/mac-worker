@@ -975,6 +975,8 @@ mod tests {
             facts_age_millis: facts_age,
             configured_slots: 0,
             busy_slots: 0,
+            build_id: None,
+            binary_sha256: None,
         };
         serde_json::to_vec(&probe).unwrap()
     }

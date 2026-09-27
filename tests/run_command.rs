@@ -2611,6 +2611,8 @@ fn ready_probe() -> ProbeResponse {
         facts_age_millis: None,
         configured_slots: 0,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     }
 }
 

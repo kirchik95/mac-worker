@@ -302,6 +302,8 @@ impl ProcessRunner for CompletingHost {
                 facts_age_millis: Some(0),
                 configured_slots: 0,
                 busy_slots: 0,
+                build_id: None,
+                binary_sha256: None,
             }),
             value if value == HostOperation::LeaseAcquire.command() => {
                 let acquire: LeaseAcquireRequest = decode_request(request)?;

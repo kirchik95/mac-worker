@@ -262,6 +262,8 @@ fn health_with_facts(facts: AgentFacts) -> WorkerHealth {
             facts_age_millis: Some(0),
             configured_slots: 0,
             busy_slots: 0,
+            build_id: None,
+            binary_sha256: None,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

@@ -334,6 +334,8 @@ impl ProcessRunner for ProductionLeaseRunner {
                     facts_age_millis: None,
                     configured_slots: occupancy.configured_slots,
                     busy_slots: occupancy.busy_slots,
+                    build_id: None,
+                    binary_sha256: None,
                 })
             }
             value if value == HostOperation::LeaseAcquire.command() => {

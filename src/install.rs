@@ -427,6 +427,8 @@ impl<'a> Installer<'a> {
             failure_kind: None,
             warnings,
             outbox,
+            build_id: None,
+            binary_sha256: None,
         }
     }
 
@@ -1418,5 +1420,7 @@ fn failed(
         failure_kind: Some(failure_kind),
         warnings,
         outbox: None,
+        build_id: None,
+        binary_sha256: None,
     }
 }

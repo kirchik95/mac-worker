@@ -202,6 +202,8 @@ fn probe_bytes() -> Vec<u8> {
         facts_age_millis: None,
         configured_slots: 0,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     })
     .unwrap()
 }
@@ -250,6 +252,8 @@ fn raw_health_without_origin() -> WorkerHealth {
             facts_age_millis: None,
             configured_slots: 0,
             busy_slots: 0,
+            build_id: None,
+            binary_sha256: None,
         }),
         missing_capabilities: Vec::new(),
         error_code: None,

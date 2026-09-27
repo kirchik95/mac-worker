@@ -2266,6 +2266,8 @@ fn ready_host_probe() -> ProbeResponse {
         facts_age_millis: Some(0),
         configured_slots: 1,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     }
 }
 

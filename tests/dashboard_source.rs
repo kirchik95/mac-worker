@@ -760,6 +760,8 @@ fn ready_report(active_job_id: JobId) -> WorkersReport {
                 facts_age_millis: None,
                 configured_slots: 0,
                 busy_slots: 0,
+                build_id: None,
+                binary_sha256: None,
             }),
             missing_capabilities: vec!["docker".into()],
             error_code: None,

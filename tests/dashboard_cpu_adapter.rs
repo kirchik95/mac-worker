@@ -201,6 +201,8 @@ fn probe_with_counters(total_ticks: u64, idle_ticks: u64) -> ProbeResponse {
         facts_age_millis: None,
         configured_slots: 0,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     }
 }
 

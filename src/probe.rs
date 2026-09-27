@@ -315,6 +315,8 @@ impl ProbeCollector {
             facts_age_millis: None,
             configured_slots: 0,
             busy_slots: 0,
+            build_id: Some(crate::build_id::BUILD_ID.to_owned()),
+            binary_sha256: crate::binary_identity::current_binary_sha256(),
         })
     }
 }
@@ -1030,6 +1032,8 @@ mod tests {
                 facts_age_millis: None,
                 configured_slots: 0,
                 busy_slots: 0,
+                build_id: Some(crate::build_id::BUILD_ID.to_owned()),
+                binary_sha256: crate::binary_identity::current_binary_sha256(),
             }
         );
     }

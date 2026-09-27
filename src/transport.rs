@@ -656,6 +656,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
         facts_age_millis: legacy.facts_age_millis,
         configured_slots: 0,
         busy_slots: 0,
+        build_id: None,
+        binary_sha256: None,
     };
     match serde_json::from_str::<ProbeResponse>(response) {
         Ok(probe) => Ok(probe),
@@ -681,6 +683,8 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
                     facts_age_millis: None,
                     configured_slots: 0,
                     busy_slots: 0,
+                    build_id: None,
+                    binary_sha256: None,
                 }),
                 Err(_) => Err(full_error),
             },

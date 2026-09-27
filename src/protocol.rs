@@ -68,6 +68,13 @@ pub struct ProbeResponse {
     pub configured_slots: u8,
     #[serde(default)]
     pub busy_slots: u8,
+    /// `<version>+<sha>[.dirty]-<debug|release>` of the helper that answered.
+    /// Absent on helpers built before build identity was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    /// SHA-256 of that helper executable. Absent on older helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
 }
 
 impl ProbeResponse {
@@ -203,6 +210,12 @@ pub struct SetupHostResult {
     /// their existing shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<String>,
+    /// Build id of the candidate installed on this host. Omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    /// SHA-256 of the candidate bytes sent to this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +314,8 @@ mod tests {
                 facts_age_millis: None,
                 configured_slots: 0,
                 busy_slots: 0,
+                build_id: None,
+                binary_sha256: None,
             }
         }
 
@@ -349,6 +364,28 @@ mod tests {
             "unexpected": true,
         });
         assert!(serde_json::from_value::<ProbeResponse>(invalid).is_err());
+    }
+
+    #[test]
+    fn probe_build_identity_round_trips_and_old_probes_omit_it() {
+        let mut response = ProbeResponse::fixture();
+        response.build_id = Some("0.1.0+0123456789ab-release".into());
+        response.binary_sha256 = Some("ab".repeat(32));
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["build_id"], "0.1.0+0123456789ab-release");
+        assert_eq!(encoded["binary_sha256"], "ab".repeat(32));
+        let decoded: ProbeResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, response);
+
+        let mut legacy = serde_json::to_value(ProbeResponse::fixture()).unwrap();
+        assert!(legacy.get("build_id").is_none());
+        assert!(legacy.get("binary_sha256").is_none());
+        legacy.as_object_mut().unwrap().remove("build_id");
+        legacy.as_object_mut().unwrap().remove("binary_sha256");
+        let decoded: ProbeResponse = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.build_id, None);
+        assert_eq!(decoded.binary_sha256, None);
+        assert_eq!(decoded.hostname, "mini-1.local");
     }
 
     #[test]
@@ -408,6 +445,8 @@ mod tests {
                 failure_kind: None,
                 warnings: Vec::new(),
                 outbox: None,
+                build_id: None,
+                binary_sha256: None,
             }],
             warnings: Vec::new(),
         };

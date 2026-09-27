@@ -1982,6 +1982,8 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 failure_kind: None,
                 warnings: Vec::new(),
                 outbox: None,
+                build_id: None,
+                binary_sha256: None,
             },
             SetupHostResult {
                 name: "mini-2".into(),
@@ -1993,6 +1995,8 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 failure_kind: Some(SetupFailureKind::Infrastructure),
                 warnings: Vec::new(),
                 outbox: None,
+                build_id: None,
+                binary_sha256: None,
             },
         ],
         warnings: Vec::new(),
@@ -2097,6 +2101,8 @@ fn setup_wakes_the_outbox_after_a_successful_install_and_renders_the_outcome() {
                 message: "outbox wake failed with exit 70".into(),
             }],
             outbox: Some("failed OUTBOX_WAKE_FAILED".into()),
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: Vec::new(),
     });
@@ -2130,6 +2136,8 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
                 message: "lock release failed".into(),
             }],
             outbox: None,
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: Vec::new(),
     });
@@ -2159,6 +2167,8 @@ fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
                 message: "process exceeded its 90s execution deadline".into(),
             }],
             outbox: None,
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: Vec::new(),
     });
@@ -2190,6 +2200,8 @@ fn setup_human_output_surfaces_facts_refresh_warning_after_verified_success() {
                         .into(),
             }],
             outbox: None,
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: Vec::new(),
     });
@@ -2888,6 +2900,8 @@ fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
             failure_kind: None,
             warnings: vec![herdr_unavailable_warning()],
             outbox: None,
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: Vec::new(),
     });
@@ -2921,6 +2935,8 @@ fn setup_human_and_json_output_surface_an_outdated_laptop_binary_warning() {
             failure_kind: None,
             warnings: Vec::new(),
             outbox: None,
+            build_id: None,
+            binary_sha256: None,
         }],
         warnings: vec![SetupWarning {
             code: SetupWarningCode::LaptopBinaryOutdated,
