@@ -7,7 +7,7 @@ use crate::{job::JobId, task::TaskId};
 #[derive(Debug, Parser)]
 #[command(
     name = "worker",
-    version,
+    version = crate::build_id::BUILD_ID,
     about = "Run trusted development jobs on macOS workers"
 )]
 pub struct Cli {

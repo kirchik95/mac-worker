@@ -71,6 +71,7 @@ pub mod agent_facts;
 pub mod agent_settings;
 pub mod auth_incidents;
 pub mod binary_identity;
+pub mod build_id;
 pub mod cli;
 pub mod client_state;
 pub mod config;
