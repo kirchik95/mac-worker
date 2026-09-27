@@ -10335,8 +10335,7 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
                     } => {
                         assert_eq!(*protocol_version, PROTOCOL_VERSION);
                         assert_eq!(code, "CONFIG_MISSING");
-                        let hint = mac_worker::error::hint_for("CONFIG_MISSING").unwrap();
-                        assert_eq!(message, &format!("configuration error. {hint}"));
+                        assert_eq!(message, "configuration error");
                     }
                     other => panic!("JSON run/logs must emit JsonEvent::Error, got {other:?}"),
                 }
