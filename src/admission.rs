@@ -618,6 +618,7 @@ mod tests {
     struct ScriptedRunner {
         probes: Mutex<Vec<String>>,
         refreshes: Mutex<Vec<String>>,
+        refresh_commands: Mutex<Vec<String>>,
         probe_deadlines: Mutex<Vec<Duration>>,
         refresh_deadlines: Mutex<Vec<Duration>>,
         delay: Mutex<HashMap<String, Duration>>,
@@ -642,6 +643,7 @@ mod tests {
             Self {
                 probes: Mutex::new(Vec::new()),
                 refreshes: Mutex::new(Vec::new()),
+                refresh_commands: Mutex::new(Vec::new()),
                 probe_deadlines: Mutex::new(Vec::new()),
                 refresh_deadlines: Mutex::new(Vec::new()),
                 delay: Mutex::new(HashMap::new()),
@@ -761,6 +763,10 @@ mod tests {
             let _guard = InFlightGuard(&self.in_flight);
             if is_refresh(request) {
                 self.refreshes.lock().unwrap().push(ssh.clone());
+                self.refresh_commands
+                    .lock()
+                    .unwrap()
+                    .push(request.args.last().unwrap().to_str().unwrap().to_owned());
                 self.refresh_deadlines
                     .lock()
                     .unwrap()
@@ -900,7 +906,64 @@ mod tests {
         request
             .args
             .last()
-            .is_some_and(|argument| argument == HostOperation::RefreshFacts.command())
+            .and_then(|argument| argument.to_str())
+            .is_some_and(|argument| {
+                let command = HostOperation::RefreshFacts.command();
+                argument == command
+                    || argument
+                        .strip_prefix("MAC_WORKER_FACTS_BUDGET_MS=")
+                        .and_then(|prefixed| prefixed.split_once(' '))
+                        .is_some_and(|(budget, rest)| {
+                            !budget.is_empty()
+                                && budget.bytes().all(|byte| byte.is_ascii_digit())
+                                && rest == command
+                        })
+            })
+    }
+
+    #[test]
+    fn fake_refresh_recognizes_only_bare_or_decimal_budget_commands() {
+        let command = HostOperation::RefreshFacts.command().to_owned();
+        let mut request = crate::transport::ssh_request(
+            &worker("mini-1", "mac1"),
+            command.clone(),
+            crate::process::ProcessPolicy {
+                stdout_limit: 1024,
+                stderr_limit: 1024,
+                deadline: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        for (argument, expected) in [
+            (command.clone(), true),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=5000 {command}"), true),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=0 {command}"), true),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=00123 {command}"), true),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS= {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=-1 {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=+1 {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=1.5 {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=١ {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=1\t{command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=1  {command}"), false),
+            (format!("MAC_WORKER_FACTS_BUDGET_MS=1 {command} "), false),
+            (
+                format!("OTHER=1 MAC_WORKER_FACTS_BUDGET_MS=1 {command}"),
+                false,
+            ),
+            (
+                format!("MAC_WORKER_FACTS_BUDGET_MS=1 {command} --clear-auth-incidents"),
+                false,
+            ),
+            (
+                format!("MAC_WORKER_FACTS_BUDGET_MS=1 {command}; true"),
+                false,
+            ),
+            ("worker probe".to_owned(), false),
+        ] {
+            *request.args.last_mut().unwrap() = argument.clone().into();
+            assert_eq!(is_refresh(&request), expected, "{argument:?}");
+        }
     }
 
     fn success(stdout: Vec<u8>) -> ProcessResult {
@@ -1161,6 +1224,18 @@ mod tests {
         assert_eq!(runner.refreshes.lock().unwrap().len(), 1);
         assert_eq!(runner.probes.lock().unwrap().len(), 2);
         let refresh_deadline = runner.refresh_deadlines.lock().unwrap()[0];
+        let refresh_commands = runner.refresh_commands.lock().unwrap();
+        let refresh_command = &refresh_commands[0];
+        let budget = refresh_command
+            .strip_prefix("MAC_WORKER_FACTS_BUDGET_MS=")
+            .and_then(|command| {
+                command.strip_suffix(&format!(" {}", HostOperation::RefreshFacts.command()))
+            })
+            .expect("a short admission deadline must send a facts budget prefix")
+            .parse::<u128>()
+            .expect("the facts budget must be decimal milliseconds");
+        // The SSH safety margin can consume the entire collection budget.
+        assert!(budget <= refresh_deadline.as_millis(), "{refresh_command}");
         assert!(
             refresh_deadline > Duration::ZERO && refresh_deadline <= remaining,
             "refresh must clamp to remaining round time, not burn the 30s cap; got {refresh_deadline:?}"
