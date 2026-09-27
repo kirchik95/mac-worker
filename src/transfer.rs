@@ -1528,6 +1528,15 @@ fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
             public: false,
         });
     }
+    // The host envelope replaces task messages with a fixed label. This code's
+    // operator text is a static sentence, so the laptop can restore it without
+    // trusting the wire string.
+    if error.error().code() == "RESULT_NOT_RETAINED" {
+        return Some(WorkerError::task(
+            "RESULT_NOT_RETAINED",
+            "task workspace is closed and its result is no longer retained",
+        ));
+    }
     Some(WorkerError::Protocol(format!(
         "{}: {}",
         error.error().code(),
@@ -2744,5 +2753,25 @@ mod exec_inheritance_tests {
             .receive(&identity, &stock_server_args(), &SignalTerm)
             .unwrap_err();
         assert!(matches!(error, WorkerError::CommandExit { code: 143 }));
+    }
+}
+
+#[cfg(test)]
+mod host_control_error_tests {
+    use super::{HostControlError, decode_host_control_error};
+
+    #[test]
+    fn retained_result_error_keeps_its_static_message() {
+        let planted = "/tmp/not-a-public-result-path";
+        let error = HostControlError::new("RESULT_NOT_RETAINED", planted).unwrap();
+        let mut bytes = serde_json::to_vec(&error).unwrap();
+        bytes.push(b'\n');
+        let decoded = decode_host_control_error(&bytes).unwrap();
+        assert_eq!(decoded.public_code(), "RESULT_NOT_RETAINED");
+        assert_eq!(
+            decoded.public_message(),
+            "task workspace is closed and its result is no longer retained"
+        );
+        assert!(!decoded.public_message().contains(planted));
     }
 }
