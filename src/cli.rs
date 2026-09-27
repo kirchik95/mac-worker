@@ -299,6 +299,8 @@ pub enum SkillsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ControllerCommand {
+    #[command(about = "Read controller health on this host (use --json for details)")]
+    Status,
     #[command(about = "Hold the controller leader lock and resume durable requests")]
     Run,
 }

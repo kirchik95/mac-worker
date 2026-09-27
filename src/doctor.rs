@@ -49,7 +49,26 @@ impl DoctorService<'_> {
         let after_probes =
             ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
         let eligible_worker_count = workers.iter().filter(|worker| is_eligible(worker)).count();
-        let mut issues = worker_issues(&mut workers, eligible_worker_count, self.config);
+        // Controller health is an additive read, also available on laptops
+        // whose execution inventory lives entirely on the controller host.
+        let controller = self.config.controller.enabled.then(|| {
+            crate::controller::health_read::fetch_controller_health(self.runner, &self.config.controller)
+        });
+        let controller_only = controller.is_some() && self.config.workers.is_empty();
+        let mut issues = if controller_only {
+            Vec::new()
+        } else {
+            worker_issues(&mut workers, eligible_worker_count, self.config)
+        };
+        issues.extend(controller_issues(controller.as_ref()));
+        let eligible_worker_count = if controller_only {
+            usize::from(controller.as_ref().is_some_and(|status| matches!(status.state,
+                crate::controller::health_read::HealthState::Healthy
+                | crate::controller::health_read::HealthState::Running
+                | crate::controller::health_read::HealthState::Degraded)))
+        } else {
+            eligible_worker_count
+        };
         issues.extend(laptop_binary_issues(
             self.laptop_processes,
             self.installed_binary_mtime,
@@ -63,6 +82,7 @@ impl DoctorService<'_> {
                 workers,
                 issues,
                 eligible_worker_count,
+                controller,
             ));
         }
 
@@ -112,6 +132,7 @@ impl DoctorService<'_> {
             workers,
             issues,
             eligible_worker_count,
+            controller,
         ))
     }
 }
@@ -122,6 +143,7 @@ fn doctor_report(
     workers: Vec<WorkerHealth>,
     issues: Vec<DoctorIssue>,
     eligible_worker_count: usize,
+    controller: Option<crate::controller::health_read::ControllerHealthStatus>,
 ) -> DoctorReport {
     let ready = snapshot.is_some()
         && eligible_worker_count > 0
@@ -130,6 +152,7 @@ fn doctor_report(
             .any(|issue| issue.severity == IssueSeverity::Blocker);
     DoctorReport {
         version: DOCTOR_REPORT_VERSION,
+        controller,
         ready,
         project: doctor_project(&state.context),
         requirements: state.requirements.clone(),
@@ -137,6 +160,24 @@ fn doctor_report(
         workers,
         issues,
     }
+}
+
+// Controller section. Keep remote diagnostics independent of local worker probes;
+// no error text from SSH or stored requests is copied into doctor output.
+fn controller_issues(
+    status: Option<&crate::controller::health_read::ControllerHealthStatus>,
+) -> Vec<DoctorIssue> {
+    use crate::controller::health_read::HealthState;
+    let Some(status) = status else { return Vec::new(); };
+    let (severity, code) = match status.state {
+        HealthState::Healthy | HealthState::Running => return Vec::new(),
+        HealthState::Degraded => (IssueSeverity::Warning, "CONTROLLER_HEALTH_DEGRADED"),
+        HealthState::Unsupported => (IssueSeverity::Warning, "CONTROLLER_HEALTH_UNSUPPORTED"),
+        HealthState::Stale => (IssueSeverity::Blocker, "CONTROLLER_HEALTH_STALE"),
+        HealthState::Unknown => (IssueSeverity::Blocker, "CONTROLLER_HEALTH_UNKNOWN"),
+        HealthState::Unavailable => (IssueSeverity::Blocker, "CONTROLLER_UNAVAILABLE"),
+    };
+    vec![issue(severity, code, &status.summary(), Vec::new())]
 }
 
 fn local_state_changed_issue() -> DoctorIssue {

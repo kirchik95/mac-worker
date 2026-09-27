@@ -418,6 +418,7 @@ fn assert_no_doctor_snapshot(cache: &Path) {
 
 fn ready_output_report() -> DoctorReport {
     DoctorReport {
+        controller: None,
         version: 1,
         ready: true,
         project: DoctorProject {
@@ -482,6 +483,7 @@ fn ready_output_report() -> DoctorReport {
 
 fn blocked_output_report(code: &str) -> DoctorReport {
     DoctorReport {
+        controller: None,
         version: 1,
         ready: false,
         project: DoctorProject {

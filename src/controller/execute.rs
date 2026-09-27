@@ -538,7 +538,9 @@ pub fn serve_rpc_with_runtime(
 ) -> Result<(), WorkerError> {
     let payload = crate::controller::protocol::read_frame(stdin)?;
     let request = crate::controller::protocol::parse_request(&payload)?;
-    let frame = if is_read_command(request.command()) {
+    let frame = if request.command() == "controller.health" {
+        crate::controller::health_read::serve_health_read(&request, &paths.controller_state_root())?
+    } else if is_read_command(request.command()) {
         let client_state = ClientStateStore::open(&paths.state)?;
         let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
         serve_read_command(&request, &client)?

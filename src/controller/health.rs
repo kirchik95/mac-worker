@@ -201,7 +201,7 @@ impl ControllerHealth {
         increment_failure(&mut self.last_tick_failures, code, now);
     }
 
-    fn validate(&self) -> Result<(), WorkerError> {
+    pub(crate) fn validate(&self) -> Result<(), WorkerError> {
         self.leader.validate()?;
         if self.version != 1
             || self.binary_version.len() > 64

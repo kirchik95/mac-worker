@@ -149,6 +149,8 @@ pub struct WorkersReport {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<crate::controller::health_read::ControllerHealthStatus>,
     pub version: u32,
     pub ready: bool,
     pub project: DoctorProject,

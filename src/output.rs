@@ -158,6 +158,9 @@ fn render_doctor_report(report: &crate::protocol::DoctorReport) -> String {
         "doctor: {}",
         if report.ready { "ready" } else { "blocked" }
     )];
+    if let Some(controller) = &report.controller {
+        lines.push(controller.summary());
+    }
     lines.push(format!("project: {}", report.project.display_name));
     lines.push(format!(
         "  project id: {}",

@@ -239,7 +239,9 @@ fn execute_with_context(
         Command::Doctor { project, includes } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
-            config.require_local_inventory()?;
+            if !config.controller.enabled {
+                config.require_local_inventory()?;
+            }
             let project = match project {
                 Some(project) => project,
                 None => runtime.current_dir()?,
@@ -747,13 +749,8 @@ pub fn run_with_stdio_in_context(
     if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
         return run_task_command(cli, runner, runtime, stdout, stderr);
     }
-    if matches!(
-        &cli.command,
-        Command::Controller {
-            command: ControllerCommand::Run
-        }
-    ) {
-        return run_controller_command(cli.config, runtime, runner, stdout, stderr);
+    if let Command::Controller { command } = cli.command {
+        return run_controller_command(command, cli.json, cli.config, runtime, runner, stdout, stderr);
     }
     run_with_rsync_executor_in_context(
         cli,
@@ -900,6 +897,8 @@ async fn run_local_dashboard(
 }
 
 fn run_controller_command(
+    command: ControllerCommand,
+    json: bool,
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
     runner: &dyn ProcessRunner,
@@ -908,6 +907,18 @@ fn run_controller_command(
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
+        if matches!(command, ControllerCommand::Status) {
+            let status = crate::controller::health_read::read_health_status(&paths.controller_state_root())
+                .unwrap_or_else(|error| crate::controller::health_read::ControllerHealthStatus::unavailable(&error));
+            if json {
+                serde_json::to_writer(&mut *stdout, &status).map_err(std::io::Error::other)?;
+                writeln!(stdout)?;
+            } else {
+                writeln!(stdout, "{}", status.summary())?;
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
         let config = load_controller_process_config(&paths)?;
         let state_root = paths.controller_state_root();
         let _leader = crate::controller::ControllerLeader::acquire(&state_root)?;
