@@ -341,11 +341,26 @@ pub fn initialize(
 
 fn install_guide(agent: &str) -> &'static str {
     match agent {
-        "codex" => "brew install --cask codex (https://developers.openai.com/codex/cli/)",
+        "codex" => {
+            "npm install -g --prefix \"$HOME/.local\" @openai/codex (https://developers.openai.com/codex/cli/)"
+        }
         "cursor" => "https://cursor.com/docs/cli/installation",
         "opencode" => "https://opencode.ai/docs/",
         "claude" => "https://code.claude.com/docs/en/setup",
         _ => unreachable!("validated agent"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_guide;
+
+    #[test]
+    fn codex_install_guide_uses_the_npm_prefix_install() {
+        let guide = install_guide("codex");
+        assert!(guide.contains(r#"npm install -g --prefix "$HOME/.local" @openai/codex"#));
+        assert!(!guide.contains("brew install --cask"));
+        assert!(guide.contains("https://developers.openai.com/codex/cli/"));
     }
 }
 
