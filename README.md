@@ -61,7 +61,7 @@ worker task diff <task-id> --stat
 worker task fetch <task-id>
 ```
 
-`fetch` prints the Git ref to review. Your current working tree stays unchanged; you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
+`result` prints the outcome and summary. `diff --stat` compares the task's base commit with its published result. A successful turn uses the default close policy and removes the worker workspace; `diff` still works from the base and result commits kept in that worker's project mirror. If collection has already dropped those commits, `diff` fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`. `fetch` prints the Git ref to review. Your current working tree stays unchanged; you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
 
 ## Daily use
 

@@ -111,7 +111,7 @@ In a Git repository with at least one commit:
 Send this task to the pool: create SETUP_CHECK.md containing mac-worker works. Wait for the result and show me the branch.
 ```
 
-Expect a task ID, the outcome and summary, `worker task diff` / the card’s file list, and a result ref from `worker task fetch` when a branch was published. Agent-reported checks in the result are what the worker agent claimed, not independent verification — review the diff and ref yourself before you merge. Your current working tree stays unchanged. You can ask the same agent to follow up if the task needs input (`worker task say`). Confirm both skills are loaded before you dispatch.
+Expect a task ID, the outcome and summary, `worker task diff` / the card’s file list, and a result ref from `worker task fetch` when a branch was published. After the default close, that diff is the base commit compared with the result commit retained in the worker project mirror; the task workspace has already been removed. Agent-reported checks in the result are what the worker agent claimed, not independent verification — review the diff and ref yourself before you merge. Your current working tree stays unchanged. You can ask the same agent to follow up if the task needs input (`worker task say`). Confirm both skills are loaded before you dispatch.
 
 #### Manual CLI
 
@@ -126,10 +126,11 @@ The command prints a task ID. Substitute it for `<task-id>` below:
 
 ```bash
 worker task result <task-id>
+worker task diff <task-id> --stat
 worker task fetch <task-id>
 ```
 
-`result` shows the outcome, summary, and any agent-reported checks. `worker task diff <task-id> --stat` lists the published change. `fetch` prints the remote-tracking ref (`refs/remotes/mac-worker/…/task/<id>`) to inspect with `git show` or `git diff` — that ref is the current-turn import proof on the laptop. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
+`result` shows the outcome, summary, and any agent-reported checks. `worker task diff <task-id> --stat` lists the published change. Default `--close-on done` closes the task after a `done` turn and deletes the worker workspace; `diff` is then the base commit compared with the result commit retained in the worker project mirror. If those commits have been collected, the error is `RESULT_NOT_RETAINED` (`task workspace is closed and its result is no longer retained`). `fetch` prints the remote-tracking ref (`refs/remotes/mac-worker/…/task/<id>`) to inspect with `git show` or `git diff` — that ref is the current-turn import proof on the laptop. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
 
 Submit starts from HEAD by default. Pass `--base <ref>` to use another commit. Uncommitted edits stay on your laptop. To send tracked worktree changes as a temporary base:
 
@@ -156,7 +157,7 @@ To submit and return after admission, omit `--wait`. This still allows the task 
 
 `worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
 
-Default `--close-on done` closes the task after an agent `done` turn. That is not human acceptance. For a review loop, submit with `--close-on never`, inspect summary/diff/ref, then `worker task close <id>` to accept or `worker task say` to follow up. `close --discard` drops the session.
+Default `--close-on done` closes the task after an agent `done` turn and removes the worker workspace. `worker task diff <task-id> --stat` still lists the change from the retained base and result commits on that worker. That is not human acceptance. For a review loop, submit with `--close-on never`, inspect summary/diff/ref while the workspace is still open, then `worker task close <id>` to accept or `worker task say` to follow up. `close --discard` drops the session and those retained commits.
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 

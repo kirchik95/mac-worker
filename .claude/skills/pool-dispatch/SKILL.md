@@ -85,6 +85,8 @@ worker task status <id>
 worker task diff <id> --stat
 ```
 
+`diff --stat` still works after the default auto-close. The worker has removed the task workspace; the diff compares the retained base commit with the result commit in the worker project mirror. If those commits have been collected, the command fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`.
+
 List exactly the tasks waiting on an answer:
 
 ```text
@@ -153,7 +155,7 @@ A finished task owes exactly one decision after `fetch`: a follow-up with `say` 
 - Keep tasks independent. Do not use one task's workspace as another task's workspace.
 - Never write a message into a running agent. Conversation is `say` between turns only.
 - Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn; on Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
-- A task with the default `--close-on done` closes itself after a `done` turn. `close --discard` also deletes the agent's session on the worker.
+- A task with the default `--close-on done` closes itself after a `done` turn and the worker deletes the task workspace. `worker task diff` then reads the retained base and result commits in the worker project mirror. `close --discard` also deletes the agent's session on the worker and drops those commits.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
 - Never restart, resubmit, or repair a turn on an unverifiable observation. Restart only on positive proof the runner or the worker job exited; otherwise keep waiting or inspect.
 - Verify the installed grammar before every dispatch: `worker skills get pool-dispatch --grammar-only` and `worker task submit --help` are the source of truth, not this file.
@@ -168,7 +170,7 @@ CLI exit codes keep v1 semantics. New stable codes sit in the v1 classes plus tw
 - `git` (new): `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`. After origin credentials are repaired, re-drive a terminal failed delivery with `worker task publish-retry <task_id>` instead of resubmitting.
 - `infrastructure`: `HOST_LAYOUT_OUTDATED`, reported by the probe as unavailable until `worker setup` migrates the worker.
 - `agent` (new): `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
-- `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
+- `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, `RESULT_NOT_RETAINED` (closed task whose mirror commits are gone: `task workspace is closed and its result is no longer retained`), and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
 
 CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70` protocol or infrastructure, `74` local I/O, `75` capacity. Commands that end with a turn map the turn's outcome as follows:
 

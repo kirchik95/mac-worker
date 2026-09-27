@@ -72,7 +72,7 @@ If a worker job or its logs vanish after acceptance, the task outcome is `failed
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.
 
-`worker task result` / `status --json` show the outcome, summary, and any **agent-reported** checks (`reported_checks` on protocol 7). Those checks are claims from the worker agent, not independent verification. `worker task diff <id> --stat` lists the published change. `worker task fetch <id>` prints the remote-tracking ref (`refs/remotes/mac-worker/<worker>/task/<id>`) — the current-turn import proof on the laptop. Your working tree stays unchanged.
+`worker task result` / `status --json` show the outcome, summary, and any **agent-reported** checks (`reported_checks` on protocol 7). Those checks are claims from the worker agent, not independent verification. `worker task diff <id> --stat` lists the published change. While the task is open, that diff is the workspace, including uncommitted files. After `--close-on done` removes the workspace, `diff` uses the base and result commits retained in the worker project mirror. If those commits have been collected, the error is `RESULT_NOT_RETAINED` (`task workspace is closed and its result is no longer retained`). `worker task fetch <id>` prints the remote-tracking ref (`refs/remotes/mac-worker/<worker>/task/<id>`) — the current-turn import proof on the laptop. Your working tree stays unchanged.
 
 ### Review and close
 
@@ -88,6 +88,8 @@ worker task close <id>            # human accept
 # or: worker task say <id> --message-file followup.md --wait
 # or: worker task close <id> --discard
 ```
+
+`worker task diff <id> --stat` in that loop reads the open workspace. The same command after `worker task close <id>` reads the retained mirror commits described above. `close --discard` removes those commits.
 
 Public CLI `say` / `close` have no revision flags. Wait first. Dashboard reply/accept are the same operations with a current-card check ([Dashboard](#dashboard)).
 

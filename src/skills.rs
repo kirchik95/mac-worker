@@ -243,6 +243,10 @@ mod tests {
             output.starts_with(POOL_DISPATCH_KERNEL),
             "skills get must start with the embedded kernel"
         );
+        assert!(
+            output.contains("task workspace is closed and its result is no longer retained"),
+            "skills get must explain a closed diff whose result was collected"
+        );
         let generated = &output[POOL_DISPATCH_KERNEL.len()..];
         assert!(
             generated.contains("## Grammar"),
