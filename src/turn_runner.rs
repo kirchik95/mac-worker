@@ -2301,7 +2301,11 @@ pub fn start_runner_with_reservation(
                     }
                 }
                 Err(error) => {
-                    let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                    if error.public_code() == "WAIT_TIMEOUT" {
+                        let _ = client_state.try_release_runner_slot(turn_id, token, reserver);
+                    } else {
+                        let _ = client_state.release_runner_slot(turn_id, token, reserver);
+                    }
                     Err(error)
                 }
             }

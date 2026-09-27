@@ -525,3 +525,41 @@ fn admission_observation_reuses_fresh_idle_occupancy() {
     );
     assert_eq!(cached.observation().slot(), CandidateSlot::Idle);
 }
+#[test]
+fn wait_deadline_bounds_admission_refresh_lock() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        super::ClientStateStore::open(&root.path().canonicalize().unwrap().join("state")).unwrap();
+    let held = store
+        .acquire_observation_refresh("mini-1", Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let waiting =
+        store.with_wait_deadline(super::WaitDeadline::new(Some(Duration::from_millis(150))));
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = waiting
+                .acquire_observation_refresh("mini-1", Instant::now() + Duration::from_secs(5));
+            done_tx.send(started.elapsed()).unwrap();
+            result.map(|guard| guard.is_some())
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        let result = waiter.join().unwrap();
+        assert!(
+            elapsed.is_ok(),
+            "admission refresh lock outlived the caller's wait deadline"
+        );
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    });
+    assert!(
+        store
+            .acquire_observation_refresh("mini-1", Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .is_some()
+    );
+}

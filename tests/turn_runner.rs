@@ -6364,6 +6364,23 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             1,
             "bound child must not be spawned twice"
         );
+    } else {
+        assert!(
+            matches!(
+                start_runner_with_reservation(
+                    &fixture.state,
+                    &InlineRunnerExecutor,
+                    &fixture.paths,
+                    fixture.task_id,
+                    fixture.turn_id,
+                    8,
+                    false,
+                )
+                .unwrap(),
+                RunnerStart::Started(_)
+            ),
+            "an unstarted timed-out handoff must remain retryable by this process"
+        );
     }
     assert!(!fixture.runner.requests().iter().any(|request| {
         request

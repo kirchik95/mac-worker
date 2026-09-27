@@ -702,6 +702,7 @@ impl ClientStateStore {
             &sync_counts,
             Some(&creation_race),
             wait_deadline,
+            libc::LOCK_EX,
         )?;
         require_same_device(
             root.as_raw_fd(),
@@ -932,8 +933,36 @@ impl ClientStateStore {
         token: Uuid,
         reserver: ProcessIdentity,
     ) -> Result<QueueEntry, WorkerError> {
+        let _lock = self.acquire_queue_lock()?;
+        self.release_runner_slot_locked(job_id, token, reserver)
+    }
+
+    /// A pre-spawn timeout may release only its own still-childless permit.
+    /// Try once without extending the expired caller's lock-wait budget.
+    pub(crate) fn try_release_runner_slot(
+        &self,
+        job_id: JobId,
+        token: Uuid,
+        reserver: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
+        let _lock = QueueLock::acquire_inner(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+            WaitDeadline::default(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )?;
+        self.release_runner_slot_locked(job_id, token, reserver)
+    }
+
+    fn release_runner_slot_locked(
+        &self,
+        job_id: JobId,
+        token: Uuid,
+        reserver: ProcessIdentity,
+    ) -> Result<QueueEntry, WorkerError> {
         reserver.validate()?;
-        self.update_queue(|snapshot| {
+        self.update_queue_locked(|snapshot| {
             let entry = find_queue_entry_mut(snapshot, job_id)?;
             match entry.slot_reservation() {
                 Some(reservation)
@@ -2243,7 +2272,13 @@ impl ClientStateStore {
                 &self.inner.sync_counts,
             )?
         };
-        ObservationRefreshGuard::poll_until(marker, deadline)
+        let deadline = self
+            .wait_deadline
+            .expires()
+            .map_or(deadline, |wait| wait.min(deadline));
+        let result = ObservationRefreshGuard::poll_until(marker, deadline);
+        self.wait_deadline.remaining()?;
+        result
     }
 
     fn update_queue<R, F>(&self, update: F) -> Result<R, WorkerError>
@@ -2251,6 +2286,13 @@ impl ClientStateStore {
         F: FnOnce(&mut QueueSnapshot) -> Result<(R, bool), WorkerError>,
     {
         let _lock = self.acquire_queue_lock()?;
+        self.update_queue_locked(update)
+    }
+
+    fn update_queue_locked<R, F>(&self, update: F) -> Result<R, WorkerError>
+    where
+        F: FnOnce(&mut QueueSnapshot) -> Result<(R, bool), WorkerError>,
+    {
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let (result, changed) = update(&mut snapshot)?;
@@ -4990,10 +5032,20 @@ impl QueueLock {
         sync_counts: &SyncCounters,
         deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
-        let state = StateLock::acquire(root, sync_counts, deadline)?;
+        Self::acquire_inner(root, queue, sync_counts, deadline, libc::LOCK_EX)
+    }
+
+    fn acquire_inner(
+        root: RawFd,
+        queue: RawFd,
+        sync_counts: &SyncCounters,
+        deadline: WaitDeadline,
+        operation: libc::c_int,
+    ) -> Result<Self, WorkerError> {
+        let state = StateLock::acquire_inner(root, sync_counts, None, deadline, operation)?;
         let marker = open_regular_at(queue, QUEUE_LOCK_NAME)?;
         require_owned_regular(marker.as_raw_fd(), 0)?;
-        deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
+        deadline.lock(marker.as_raw_fd(), operation)?;
         Ok(Self {
             _state: state,
             marker,
@@ -5054,7 +5106,10 @@ impl ObservationRefreshGuard {
                     if Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 Err(error) => return Err(WorkerError::Io(error)),
             }
@@ -6365,7 +6420,7 @@ impl StateLock {
         sync_counts: &SyncCounters,
         deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
-        Self::acquire_inner(root, sync_counts, None, deadline)
+        Self::acquire_inner(root, sync_counts, None, deadline, libc::LOCK_EX)
     }
 
     fn acquire_inner(
@@ -6373,6 +6428,7 @@ impl StateLock {
         sync_counts: &SyncCounters,
         creation_race: Option<&AtomicU8>,
         deadline: WaitDeadline,
+        operation: libc::c_int,
     ) -> Result<Self, WorkerError> {
         deadline.remaining()?;
         let authoritative = open_directory_at(root, c".")?;
@@ -6389,7 +6445,10 @@ impl StateLock {
             Ok(()) => {}
             Err(error) if lock_would_block(&error) => {
                 notify_lock_contention(root)?;
-                deadline.lock(authoritative.as_raw_fd(), libc::LOCK_EX)?;
+                if operation & libc::LOCK_NB != 0 {
+                    return Err(WorkerError::Io(error));
+                }
+                deadline.lock(authoritative.as_raw_fd(), operation)?;
             }
             Err(error) => return Err(WorkerError::Io(error)),
         }
@@ -6404,7 +6463,7 @@ impl StateLock {
                 .concurrent_loser_parents
                 .fetch_add(1, Ordering::SeqCst);
         }
-        deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
+        deadline.lock(marker.as_raw_fd(), operation)?;
         Ok(Self {
             authoritative,
             marker,
