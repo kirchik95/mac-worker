@@ -2517,20 +2517,7 @@ fn queue_error(code: &'static str, message: impl Into<String>) -> WorkerError {
 }
 
 fn turn_exit_code(outcome: &TaskOutcome) -> u8 {
-    match outcome {
-        TaskOutcome::Done | TaskOutcome::NeedsInput | TaskOutcome::Unknown => 0,
-        TaskOutcome::Failed { reason } => match reason.as_str() {
-            "PUBLISH_FAILED" | "RESULT_FETCH_FAILED" | "RESULT_UNPARSEABLE" => 70,
-            _ => reason
-                .strip_prefix("agent exited ")
-                .and_then(|code| code.parse::<u8>().ok())
-                .unwrap_or(1),
-        },
-        TaskOutcome::Blocked
-        | TaskOutcome::Cancelled
-        | TaskOutcome::TimedOut
-        | TaskOutcome::Lost => 1,
-    }
+    crate::task::classify_task_outcome(outcome).runner
 }
 
 fn publication_failure_status(
@@ -2924,6 +2911,13 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         );
         assert_eq!(turn_exit_code(&TaskOutcome::Blocked), 1);
         assert_eq!(turn_exit_code(&TaskOutcome::Done), 0);
+    }
+
+    #[test]
+    fn unknown_outcome_is_an_infrastructure_exit_while_needs_input_stays_successful() {
+        assert_eq!(turn_exit_code(&TaskOutcome::Unknown), 70);
+        assert_eq!(turn_exit_code(&TaskOutcome::NeedsInput), 0);
+        assert_eq!(turn_exit_code(&TaskOutcome::failed("agent exited 0")), 1);
     }
 
     struct JournalContentionHook {

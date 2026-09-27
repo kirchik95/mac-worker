@@ -449,15 +449,10 @@ pub fn parent_gate(record: &LocalTaskRecord) -> ParentGate {
         },
         TaskState::Queued | TaskState::Active => ParentGate::Waiting,
         TaskState::Open => match record.status().last_outcome() {
-            Some(TaskOutcome::NeedsInput) | Some(TaskOutcome::Done) | None => ParentGate::Waiting,
-            Some(
-                TaskOutcome::Failed { .. }
-                | TaskOutcome::Blocked
-                | TaskOutcome::Cancelled
-                | TaskOutcome::TimedOut
-                | TaskOutcome::Lost
-                | TaskOutcome::Unknown,
-            ) => ParentGate::Failed,
+            Some(outcome) if crate::task::classify_task_outcome(outcome).aggregate != 0 => {
+                ParentGate::Failed
+            }
+            _ => ParentGate::Waiting,
         },
     }
 }
@@ -900,10 +895,12 @@ mod tests {
         let open_blocked = fixture_record(TaskState::Open, Some(TaskOutcome::Blocked));
         let open_needs = fixture_record(TaskState::Open, Some(TaskOutcome::NeedsInput));
         let open_done = fixture_record(TaskState::Open, Some(TaskOutcome::Done));
+        let open_unknown = fixture_record(TaskState::Open, Some(TaskOutcome::Unknown));
         assert_eq!(parent_gate(&open_failed), ParentGate::Failed);
         assert_eq!(parent_gate(&open_blocked), ParentGate::Failed);
         assert_eq!(parent_gate(&open_needs), ParentGate::Waiting);
         assert_eq!(parent_gate(&open_done), ParentGate::Waiting);
+        assert_eq!(parent_gate(&open_unknown), ParentGate::Failed);
         assert_eq!(
             parent_gate(&fixture_record(TaskState::Abandoned, None)),
             ParentGate::Failed

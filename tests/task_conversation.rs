@@ -513,6 +513,85 @@ fn closed_push_task_record(
     .unwrap()
 }
 
+#[test]
+fn task_and_run_wait_classify_unknown_as_nonzero_and_keep_needs_input_semantics() {
+    for (outcome, expected) in [
+        (TaskOutcome::Unknown, 70),
+        (TaskOutcome::NeedsInput, 0),
+        (TaskOutcome::Done, 0),
+        (TaskOutcome::failed("agent exited 17"), 1),
+    ] {
+        let state_root = tempfile::tempdir().unwrap();
+        let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let task_id = TaskId::generate();
+        let turn_id = JobId::generate();
+        let record = task_record(
+            task_id,
+            turn_id,
+            TaskState::Closed,
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            "mini-1",
+            None,
+        );
+        let status = TaskStatus::new(
+            TaskState::Closed,
+            Some(outcome.clone()),
+            Some("mini-1".into()),
+            true,
+            record.status().head_oid().cloned(),
+            None,
+            vec![],
+            vec![],
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn_id,
+                Some(TurnTerminal::Succeeded),
+                Some(outcome),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        let remote = TaskRemoteRunner::new(status.clone());
+        store
+            .create_task(record.with_status(status).unwrap())
+            .unwrap();
+        let run_id = TaskRunId::generate();
+        let done_id = TaskId::generate();
+        store
+            .create_task(task_record(
+                done_id,
+                JobId::generate(),
+                TaskState::Closed,
+                PROJECT_ID.into(),
+                WORKTREE_ID.into(),
+                "mini-1",
+                None,
+            ))
+            .unwrap();
+        store
+            .create_run(RunRecord::new(run_id, None, vec![done_id, task_id], 1, 1).unwrap())
+            .unwrap();
+        let config = task_config();
+        let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+        for selector in [WaitSelector::Task(task_id), WaitSelector::Run(run_id)] {
+            assert_eq!(
+                client
+                    .wait(selector, Some(Duration::from_secs(1)))
+                    .unwrap()
+                    .exit_code(),
+                expected
+            );
+        }
+    }
+}
+
 fn retrying_delivery(turn: JobId, head: BaseOid) -> OriginDelivery {
     OriginDelivery::new(
         turn,

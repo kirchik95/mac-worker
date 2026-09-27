@@ -326,6 +326,37 @@ pub enum TaskOutcome {
     Lost,
 }
 
+pub(crate) struct TaskOutcomeExit {
+    pub runner: u8,
+    pub aggregate: u8,
+}
+
+/// Attached turns retain agent exit codes; waits aggregate ordinary failures
+/// as 1. An unclassified result is infrastructure failure in both paths.
+pub(crate) fn classify_task_outcome(outcome: &TaskOutcome) -> TaskOutcomeExit {
+    let infrastructure = crate::error::ExitKind::Infrastructure as u8;
+    let (runner, aggregate) = match outcome {
+        TaskOutcome::Done | TaskOutcome::NeedsInput => (0, 0),
+        TaskOutcome::Unknown => (infrastructure, infrastructure),
+        TaskOutcome::Failed { reason } => {
+            let code = match reason.as_str() {
+                "PUBLISH_FAILED" | "RESULT_FETCH_FAILED" | "RESULT_UNPARSEABLE" => infrastructure,
+                _ => reason
+                    .strip_prefix("agent exited ")
+                    .and_then(|code| code.parse::<u8>().ok())
+                    .filter(|code| *code != 0)
+                    .unwrap_or(1),
+            };
+            (code, 1)
+        }
+        TaskOutcome::Blocked
+        | TaskOutcome::Cancelled
+        | TaskOutcome::TimedOut
+        | TaskOutcome::Lost => (1, 1),
+    };
+    TaskOutcomeExit { runner, aggregate }
+}
+
 impl TaskOutcome {
     pub fn from_turn(terminal: TurnTerminal, outcome: Option<AgentOutcome>) -> Self {
         match (terminal, outcome) {

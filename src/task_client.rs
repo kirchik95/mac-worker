@@ -3964,20 +3964,13 @@ impl<'a> TaskClient<'a> {
             .map(|task_id| self.client_state.load_task(*task_id))
             .collect::<Result<Vec<_>, _>>()?;
         let quiescent = !dag_pending && self.tasks_are_quiescent(&records)?;
-        let exit_code = if quiescent
-            && records.iter().any(|record| {
-                matches!(
-                    record.status().last_outcome(),
-                    Some(
-                        TaskOutcome::Blocked
-                            | TaskOutcome::Failed { .. }
-                            | TaskOutcome::Cancelled
-                            | TaskOutcome::TimedOut
-                            | TaskOutcome::Lost
-                    )
-                )
-            }) {
-            1
+        let exit_code = if quiescent {
+            records
+                .iter()
+                .filter_map(|record| record.status().last_outcome())
+                .map(|outcome| crate::task::classify_task_outcome(outcome).aggregate)
+                .max()
+                .unwrap_or(0)
         } else {
             0
         };
