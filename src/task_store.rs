@@ -622,6 +622,16 @@ pub struct TaskCloseResponse {
     deliveries: Vec<OriginDelivery>,
 }
 
+/// Filesystem result of a retention close, plus the task whose herdr tabs
+/// should be removed after the caller drops the installation lock.
+pub(crate) struct RetentionClose {
+    /// Status written before herdr runs. Callers that only need the task id
+    /// still receive it so a later reader can see the committed close.
+    #[allow(dead_code)]
+    pub status: TaskStatus,
+    pub herdr_task: Option<TaskId>,
+}
+
 impl TaskCloseResponse {
     pub fn new(status: TaskStatus) -> Self {
         Self {
@@ -946,9 +956,17 @@ impl<'a> TaskStore<'a> {
         request.validate()?;
         // capacity (installation) then session — never reverse. GC holds
         // installation then session; acquire never takes session.
-        let _capacity = self.store.capacity_lock()?;
-        let _session_lock = self.store.session_lock()?;
-        self.close_locked(request, None)
+        // Herdr runs only after both guards drop: a hung sidebar must not
+        // stall admission or another close.
+        let (response, herdr_task) = {
+            let _capacity = self.store.capacity_lock()?;
+            let _session_lock = self.store.session_lock()?;
+            self.close_locked(request, None)?
+        };
+        if let Some(task_id) = herdr_task {
+            close_herdr_tabs(task_id);
+        }
+        Ok(response)
     }
 
     /// Close after this turn's result is already durable. Public `close`
@@ -964,16 +982,22 @@ impl<'a> TaskStore<'a> {
         if request.discard() {
             return Err(task_error("TASK_BUSY", "own-terminal close cannot discard"));
         }
-        let _capacity = self.store.capacity_lock()?;
-        let _session_lock = self.store.session_lock()?;
-        self.close_locked(request, Some(own_job))
+        let (response, herdr_task) = {
+            let _capacity = self.store.capacity_lock()?;
+            let _session_lock = self.store.session_lock()?;
+            self.close_locked(request, Some(own_job))?
+        };
+        if let Some(task_id) = herdr_task {
+            close_herdr_tabs(task_id);
+        }
+        Ok(response)
     }
 
     fn close_locked(
         &self,
         request: &TaskCloseRequest,
         own_job: Option<JobId>,
-    ) -> Result<TaskCloseResponse, WorkerError> {
+    ) -> Result<(TaskCloseResponse, Option<TaskId>), WorkerError> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
         if status.state() == TaskState::Active {
@@ -1025,10 +1049,6 @@ impl<'a> TaskStore<'a> {
             self.store
                 .remove_owned_child_committed(&task, "workspace")?;
         }
-        if reported_to_herdr {
-            close_herdr_tabs(request.task_id());
-        }
-
         let mut warnings = Vec::new();
         if let Some(mirror) = mirror {
             self.delete_ref(&mirror, &format!("refs/heads/task/{}", request.task_id()))?;
@@ -1046,7 +1066,11 @@ impl<'a> TaskStore<'a> {
         task.sync_root()?;
         let deliveries = OriginOutbox::new(self.store, self.runner)
             .deliveries(request.project_id(), request.task_id())?;
-        Ok(TaskCloseResponse::with_warnings(status, warnings).with_deliveries(deliveries))
+        let herdr_task = reported_to_herdr.then_some(request.task_id());
+        Ok((
+            TaskCloseResponse::with_warnings(status, warnings).with_deliveries(deliveries),
+            herdr_task,
+        ))
     }
 
     fn live_foreign_task_scope(
@@ -1073,7 +1097,7 @@ impl<'a> TaskStore<'a> {
         project_id: &str,
         task_id: TaskId,
         now_millis: u64,
-    ) -> Result<Option<TaskStatus>, WorkerError> {
+    ) -> Result<Option<RetentionClose>, WorkerError> {
         validate_project_id(project_id)?;
         // GC already holds the installation lock for collect+apply, which
         // serializes acquire. Do not re-enter capacity_lock: it would open a
@@ -1111,10 +1135,10 @@ impl<'a> TaskStore<'a> {
                 .remove_owned_child_committed(&task, "workspace")?;
         }
         task.sync_root()?;
-        if reported_to_herdr {
-            close_herdr_tabs(task_id);
-        }
-        Ok(Some(next))
+        Ok(Some(RetentionClose {
+            status: next,
+            herdr_task: reported_to_herdr.then_some(task_id),
+        }))
     }
 
     pub fn publish_branch_into_mirror(

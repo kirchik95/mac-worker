@@ -276,6 +276,38 @@ impl HerdrClient {
         &self.socket
     }
 
+    /// One request whose connect and response waits cannot exceed `budget`.
+    /// A spent budget fails as [`HerdrError::Timeout`] without connecting, so a
+    /// series of tab operations can stop before the next socket call.
+    pub fn request_within(
+        &self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, HerdrError> {
+        if budget.is_zero() {
+            return Err(HerdrError::Timeout);
+        }
+        Self {
+            socket: self.socket.clone(),
+            connect_deadline: self.connect_deadline.min(budget),
+            response_deadline: self.response_deadline.min(budget),
+        }
+        .request(method, params)
+    }
+
+    fn request_limited(
+        &self,
+        method: &str,
+        params: Value,
+        budget: Option<Duration>,
+    ) -> Result<Value, HerdrError> {
+        match budget {
+            Some(budget) => self.request_within(method, params, budget),
+            None => self.request(method, params),
+        }
+    }
+
     /// Send one request and return its `result`.
     pub fn request(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
         let id = next_request_id();
@@ -349,7 +381,18 @@ impl HerdrClient {
     }
 
     pub fn workspace_list(&self) -> Result<Vec<Workspace>, HerdrError> {
-        let result = self.request("workspace.list", json!({}))?;
+        self.workspace_list_limited(None)
+    }
+
+    pub fn workspace_list_within(&self, budget: Duration) -> Result<Vec<Workspace>, HerdrError> {
+        self.workspace_list_limited(Some(budget))
+    }
+
+    fn workspace_list_limited(
+        &self,
+        budget: Option<Duration>,
+    ) -> Result<Vec<Workspace>, HerdrError> {
+        let result = self.request_limited("workspace.list", json!({}), budget)?;
         let workspaces = array_at(&result, "workspaces")?;
         workspaces
             .iter()
@@ -381,7 +424,24 @@ impl HerdrClient {
     }
 
     pub fn tab_list(&self, workspace_id: &str) -> Result<Vec<Tab>, HerdrError> {
-        let result = self.request("tab.list", json!({ "workspace_id": workspace_id }))?;
+        self.tab_list_limited(workspace_id, None)
+    }
+
+    pub fn tab_list_within(
+        &self,
+        workspace_id: &str,
+        budget: Duration,
+    ) -> Result<Vec<Tab>, HerdrError> {
+        self.tab_list_limited(workspace_id, Some(budget))
+    }
+
+    fn tab_list_limited(
+        &self,
+        workspace_id: &str,
+        budget: Option<Duration>,
+    ) -> Result<Vec<Tab>, HerdrError> {
+        let result =
+            self.request_limited("tab.list", json!({ "workspace_id": workspace_id }), budget)?;
         array_at(&result, "tabs")?
             .iter()
             .map(|tab| {
@@ -418,14 +478,42 @@ impl HerdrClient {
     }
 
     pub fn tab_close(&self, tab_id: &str) -> Result<(), HerdrError> {
-        self.request("tab.close", json!({ "tab_id": tab_id }))
+        self.tab_close_limited(tab_id, None)
+    }
+
+    pub fn tab_close_within(&self, tab_id: &str, budget: Duration) -> Result<(), HerdrError> {
+        self.tab_close_limited(tab_id, Some(budget))
+    }
+
+    fn tab_close_limited(&self, tab_id: &str, budget: Option<Duration>) -> Result<(), HerdrError> {
+        self.request_limited("tab.close", json!({ "tab_id": tab_id }), budget)
             .map(|_| ())
     }
 
     /// Close a whole workspace with every tab in it.
     pub fn workspace_close(&self, workspace_id: &str) -> Result<(), HerdrError> {
-        self.request("workspace.close", json!({ "workspace_id": workspace_id }))
-            .map(|_| ())
+        self.workspace_close_limited(workspace_id, None)
+    }
+
+    pub fn workspace_close_within(
+        &self,
+        workspace_id: &str,
+        budget: Duration,
+    ) -> Result<(), HerdrError> {
+        self.workspace_close_limited(workspace_id, Some(budget))
+    }
+
+    fn workspace_close_limited(
+        &self,
+        workspace_id: &str,
+        budget: Option<Duration>,
+    ) -> Result<(), HerdrError> {
+        self.request_limited(
+            "workspace.close",
+            json!({ "workspace_id": workspace_id }),
+            budget,
+        )
+        .map(|_| ())
     }
 
     pub fn pane_process_info(&self, pane_id: &str) -> Result<ProcessInfo, HerdrError> {

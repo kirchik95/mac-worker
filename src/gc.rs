@@ -323,7 +323,7 @@ impl<'a> HostGc<'a> {
 
     pub fn run(&self, request: &GcRequest) -> Result<GcReport, WorkerError> {
         request.validate()?;
-        self.store.with_gc_lock(|| {
+        let locked = self.store.with_gc_lock(|| {
             let (inventory, mut candidates, mut warnings) = self.collect(request)?;
             candidates.sort_by(|left, right| {
                 candidate_rank(left)
@@ -332,9 +332,10 @@ impl<'a> HostGc<'a> {
                     .then_with(|| left.reason.cmp(&right.reason))
             });
             let mut applied = Vec::new();
+            let mut herdr_closed = BTreeSet::new();
+            let mut apply_error = None;
             if request.apply() {
                 let mut mirrors_pending_gc = BTreeSet::new();
-                let mut apply_error = None;
                 for candidate in &candidates {
                     match self.apply_candidate(
                         candidate,
@@ -342,6 +343,7 @@ impl<'a> HostGc<'a> {
                         request,
                         &mut warnings,
                         &mut mirrors_pending_gc,
+                        &mut herdr_closed,
                     ) {
                         Ok(true) => applied.push(candidate.clone()),
                         Ok(false) => {}
@@ -355,20 +357,35 @@ impl<'a> HostGc<'a> {
                 // deleted refs in this pass. A later candidate error still
                 // maintains mirrors already mutated.
                 self.maintain_mirrors(&mirrors_pending_gc, &mut warnings);
-                if apply_error.is_none() && inventory.herdr_reported {
-                    sweep_herdr_tabs(&inventory.task_ids);
-                }
-                if let Some(error) = apply_error {
-                    return Err(error);
-                }
             }
-            Ok(GcReport::new(
-                request.apply(),
-                candidates,
-                applied,
-                warnings,
-            ))
-        })
+            // Retention closes that already committed their filesystem update
+            // still drop herdr tabs after this lock, even when a later
+            // candidate fails. The orphan sweep runs only when the pass
+            // itself succeeded, matching the previous gate.
+            let sweep_orphans =
+                request.apply() && apply_error.is_none() && inventory.herdr_reported;
+            let herdr = if sweep_orphans || !herdr_closed.is_empty() {
+                Some(HerdrSweep {
+                    live: inventory.task_ids,
+                    closed: herdr_closed,
+                    sweep_orphans,
+                })
+            } else {
+                None
+            };
+            Ok(LockedGc {
+                report: GcReport::new(request.apply(), candidates, applied, warnings),
+                herdr,
+                apply_error,
+            })
+        })?;
+        if let Some(herdr) = locked.herdr {
+            sweep_herdr_tabs(&herdr);
+        }
+        match locked.apply_error {
+            Some(error) => Err(error),
+            None => Ok(locked.report),
+        }
     }
 
     fn collect(
@@ -971,6 +988,7 @@ impl<'a> HostGc<'a> {
         request: &GcRequest,
         warnings: &mut Vec<String>,
         mirrors_pending_gc: &mut BTreeSet<String>,
+        herdr_closed: &mut BTreeSet<String>,
     ) -> Result<bool, WorkerError> {
         match candidate.kind() {
             "task" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
@@ -987,9 +1005,19 @@ impl<'a> HostGc<'a> {
                 if self.task_id_has_active_work(project, task_id, request.now_millis())? {
                     return Ok(false);
                 }
-                Ok(TaskStore::new(self.store, self.runner)
-                    .close_for_retention(project, task_id, request.now_millis())?
-                    .is_some())
+                match TaskStore::new(self.store, self.runner).close_for_retention(
+                    project,
+                    task_id,
+                    request.now_millis(),
+                )? {
+                    Some(closed) => {
+                        if let Some(task_id) = closed.herdr_task {
+                            herdr_closed.insert(task_id.to_string());
+                        }
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
             }
             "task" if candidate.reason() == "task metadata retention" => {
                 let (project, task_id) = parse_task_identifier(candidate.identifier())?;
@@ -1653,13 +1681,45 @@ fn relative(path: &str) -> Result<RelativePath, WorkerError> {
     RelativePath::parse(path.as_bytes()).map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
-/// Best effort: close herdr tabs whose task directory is gone.  Tabs of
-/// tasks that still exist are left alone; `task close` removes those.
-fn sweep_herdr_tabs(task_ids: &BTreeSet<String>) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+struct LockedGc {
+    report: GcReport,
+    herdr: Option<HerdrSweep>,
+    apply_error: Option<WorkerError>,
+}
+
+struct HerdrSweep {
+    /// Task directories that still exist after the locked pass.
+    live: BTreeSet<String>,
+    /// Tasks closed for retention in this pass. Their directories remain, so
+    /// the orphan sweep must treat them as gone or their tabs stay up.
+    closed: BTreeSet<String>,
+    /// Orphan sweep runs only when the apply pass itself succeeded.
+    sweep_orphans: bool,
+}
+
+/// Best effort, after the installation lock is released. A failure never
+/// changes the gc report. When the pass failed, only tabs of retention
+/// closes that already committed are removed.
+fn sweep_herdr_tabs(sweep: &HerdrSweep) {
+    let Some(home) = crate::task_store::herdr_account_home() else {
         return;
     };
-    let live = |short: &str| task_ids.iter().any(|task_id| task_id.starts_with(short));
-    let _ = crate::herdr_reporter::HerdrReporter::for_home(std::path::Path::new(&home))
-        .sweep_orphans(&live);
+    let reporter = crate::herdr_reporter::HerdrReporter::for_home(home.as_path());
+    if sweep.sweep_orphans {
+        let live = |short: &str| {
+            sweep.live.iter().any(|task_id| task_id.starts_with(short))
+                && !sweep
+                    .closed
+                    .iter()
+                    .any(|task_id| task_id.starts_with(short))
+        };
+        let _ = reporter.sweep_orphans(&live);
+        return;
+    }
+    for raw in &sweep.closed {
+        let Ok(task_id) = raw.parse::<TaskId>() else {
+            continue;
+        };
+        let _ = reporter.close(task_id);
+    }
 }

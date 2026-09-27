@@ -20,7 +20,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -42,6 +42,9 @@ pub const FOLLOW_TURN_COMMAND: &str = "exec ~/.local/bin/worker host follow-turn
 pub const START_BUDGET: Duration = Duration::from_secs(10);
 pub const TERMINAL_BUDGET: Duration = Duration::from_secs(5);
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(5);
+/// Tabs closed or inspected in one `close` or orphan sweep. A later pass
+/// continues; one pass must not walk an unbounded sidebar.
+pub const MAX_TABS_PER_PASS: usize = 16;
 /// How long a fresh pane gets to reach its shell prompt before the log
 /// follower is typed into it.
 pub const SHELL_SETTLE: Duration = Duration::from_secs(5);
@@ -212,30 +215,72 @@ fn tokens(turn: &TurnIdentity, outcome: &str) -> BTreeMap<String, String> {
     tokens
 }
 
-struct Budget {
-    deadline: Instant,
+/// Monotonic time for herdr budgets. Production uses wall time; tests advance
+/// a manual clock when a fake herdr accepts a request.
+pub trait HerdrClock: Send + Sync {
+    fn now(&self) -> Duration;
 }
 
-impl Budget {
-    fn new(total: Duration) -> Self {
+struct SystemHerdrClock {
+    origin: Instant,
+}
+
+impl SystemHerdrClock {
+    fn new() -> Self {
         Self {
-            deadline: Instant::now() + total,
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl HerdrClock for SystemHerdrClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
+
+struct Budget<'a> {
+    limit: Duration,
+    origin: Duration,
+    clock: &'a dyn HerdrClock,
+}
+
+impl<'a> Budget<'a> {
+    fn start(limit: Duration, clock: &'a dyn HerdrClock) -> Self {
+        Self {
+            limit,
+            origin: clock.now(),
+            clock,
         }
     }
 
+    fn elapsed(&self) -> Duration {
+        self.clock.now().saturating_sub(self.origin)
+    }
+
     fn exhausted(&self) -> bool {
-        Instant::now() >= self.deadline
+        self.elapsed() >= self.limit
     }
 
     fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.limit.saturating_sub(self.elapsed())
     }
 }
 
 /// The reporter for one worker account's herdr.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HerdrReporter {
     client: HerdrClient,
+    clock: Arc<dyn HerdrClock>,
+}
+
+impl std::fmt::Debug for HerdrReporter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HerdrReporter")
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HerdrReporter {
@@ -245,21 +290,30 @@ impl HerdrReporter {
     }
 
     pub fn with_client(client: HerdrClient) -> Self {
-        Self { client }
+        Self::with_clock(client, Arc::new(SystemHerdrClock::new()))
+    }
+
+    /// Same client, with a clock tests can advance without sleeping.
+    pub fn with_clock(client: HerdrClient, clock: Arc<dyn HerdrClock>) -> Self {
+        Self { client, clock }
+    }
+
+    fn budget(&self, limit: Duration) -> Budget<'_> {
+        Budget::start(limit, self.clock.as_ref())
     }
 
     /// Open the turn's tab, arm its pane with the log follower, and report
     /// `working`.  Runs after the durable `Running` handoff, never under the
     /// supervisor guard.
     pub fn start(&self, turn: &TurnIdentity) -> Reported {
-        let budget = Budget::new(START_BUDGET);
+        let budget = self.budget(START_BUDGET);
         match self.start_inner(turn, &budget) {
             Ok(pane_id) => Reported::attached(pane_id),
             Err(error) => Reported::unavailable(&error),
         }
     }
 
-    fn start_inner(&self, turn: &TurnIdentity, budget: &Budget) -> Result<String, HerdrError> {
+    fn start_inner(&self, turn: &TurnIdentity, budget: &Budget<'_>) -> Result<String, HerdrError> {
         let workspace_id = self.ensure_workspace()?;
         self.sweep_task(&workspace_id, turn.task_id)?;
         let pane_id = self.open_turn_tab(&workspace_id, turn, budget)?;
@@ -283,7 +337,7 @@ impl HerdrReporter {
         summary: Option<&str>,
         questions: &[Question],
     ) -> Reported {
-        let budget = Budget::new(TERMINAL_BUDGET);
+        let budget = self.budget(TERMINAL_BUDGET);
         match self.terminal_inner(turn, pane_id, outcome, summary, questions, &budget) {
             Ok(pane_id) => Reported::attached(pane_id),
             Err(error) => Reported::unavailable(&error),
@@ -297,7 +351,7 @@ impl HerdrReporter {
         outcome: &TaskOutcome,
         summary: Option<&str>,
         questions: &[Question],
-        budget: &Budget,
+        budget: &Budget<'_>,
     ) -> Result<String, HerdrError> {
         let pane_id = match pane_id {
             Some(pane_id) if self.client.pane_process_info(pane_id).is_ok() => pane_id.to_owned(),
@@ -316,40 +370,61 @@ impl HerdrReporter {
     /// leaves the workspace with nothing but its own first tab, the
     /// workspace goes too.
     pub fn close(&self, task_id: TaskId) -> Result<(), HerdrError> {
-        let _budget = Budget::new(CLOSE_BUDGET);
-        let Some(workspace_id) = self.find_workspace()? else {
+        let budget = self.budget(CLOSE_BUDGET);
+        let Some(workspace_id) = self.find_workspace_within(&budget)? else {
             return Ok(());
         };
-        self.sweep_task(&workspace_id, task_id)?;
-        self.close_workspace_when_spare(&workspace_id)
+        let prefix = task_label_prefix(task_id);
+        self.close_matching_tabs(&workspace_id, &budget, |label| label.starts_with(&prefix))?;
+        self.close_workspace_when_spare(&workspace_id, &budget)
     }
 
     /// Remove tabs whose task no longer exists or is no longer open; `live`
     /// answers for the twelve-digit task id a label carries.
     pub fn sweep_orphans(&self, live: &dyn Fn(&str) -> bool) -> Result<usize, HerdrError> {
-        let _budget = Budget::new(CLOSE_BUDGET);
-        let Some(workspace_id) = self.find_workspace()? else {
+        let budget = self.budget(CLOSE_BUDGET);
+        let Some(workspace_id) = self.find_workspace_within(&budget)? else {
             return Ok(0);
         };
-        let mut closed = 0;
-        for tab in self.client.tab_list(&workspace_id)? {
-            let Some(short) = tab
-                .label
-                .as_deref()
-                .and_then(|label| label.strip_prefix("task "))
+        let closed = self.close_matching_tabs(&workspace_id, &budget, |label| {
+            let Some(short) = label
+                .strip_prefix("task ")
                 .and_then(|rest| rest.split(' ').next())
             else {
+                return false;
+            };
+            short.len() == 12 && short.bytes().all(|byte| byte.is_ascii_hexdigit()) && !live(short)
+        })?;
+        self.close_workspace_when_spare(&workspace_id, &budget)?;
+        Ok(closed)
+    }
+
+    /// Close matching tabs until the budget or [`MAX_TABS_PER_PASS`] is spent.
+    /// Each RPC receives only the time still left.
+    fn close_matching_tabs(
+        &self,
+        workspace_id: &str,
+        budget: &Budget<'_>,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<usize, HerdrError> {
+        let tabs = self
+            .client
+            .tab_list_within(workspace_id, budget.remaining())?;
+        let mut closed = 0usize;
+        for tab in tabs {
+            let Some(label) = tab.label.as_deref() else {
                 continue;
             };
-            if short.len() == 12
-                && short.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && !live(short)
-            {
-                self.client.tab_close(&tab.tab_id)?;
-                closed += 1;
+            if !matches(label) {
+                continue;
             }
+            if closed >= MAX_TABS_PER_PASS || budget.exhausted() {
+                return Err(HerdrError::Timeout);
+            }
+            self.client
+                .tab_close_within(&tab.tab_id, budget.remaining())?;
+            closed += 1;
         }
-        self.close_workspace_when_spare(&workspace_id)?;
         Ok(closed)
     }
 
@@ -357,17 +432,42 @@ impl HerdrReporter {
     /// is either: a single remaining tab is the one herdr opened with the
     /// workspace.  A second tab means the operator is using the workspace;
     /// it stays.
-    fn close_workspace_when_spare(&self, workspace_id: &str) -> Result<(), HerdrError> {
-        let tabs = self.client.tab_list(workspace_id)?;
+    fn close_workspace_when_spare(
+        &self,
+        workspace_id: &str,
+        budget: &Budget<'_>,
+    ) -> Result<(), HerdrError> {
+        if budget.exhausted() {
+            return Err(HerdrError::Timeout);
+        }
+        let tabs = self
+            .client
+            .tab_list_within(workspace_id, budget.remaining())?;
         let has_task_tab = tabs.iter().any(|tab| {
             tab.label
                 .as_deref()
                 .is_some_and(|label| label.starts_with("task "))
         });
         if !has_task_tab && tabs.len() <= 1 {
-            self.client.workspace_close(workspace_id)?;
+            if budget.exhausted() {
+                return Err(HerdrError::Timeout);
+            }
+            self.client
+                .workspace_close_within(workspace_id, budget.remaining())?;
         }
         Ok(())
+    }
+
+    fn find_workspace_within(&self, budget: &Budget<'_>) -> Result<Option<String>, HerdrError> {
+        if budget.exhausted() {
+            return Err(HerdrError::Timeout);
+        }
+        Ok(self
+            .client
+            .workspace_list_within(budget.remaining())?
+            .into_iter()
+            .find(|workspace| workspace.label.as_deref() == Some(WORKSPACE_LABEL))
+            .map(|workspace| workspace.workspace_id))
     }
 
     fn find_workspace(&self) -> Result<Option<String>, HerdrError> {
@@ -407,7 +507,7 @@ impl HerdrReporter {
         &self,
         workspace_id: &str,
         turn: &TurnIdentity,
-        budget: &Budget,
+        budget: &Budget<'_>,
     ) -> Result<String, HerdrError> {
         let created = self.client.tab_create(
             workspace_id,
@@ -421,15 +521,16 @@ impl HerdrReporter {
     /// Wait for the pane's shell to settle, then type the log follower.  A
     /// shell that never settles leaves a plain shell in the pane; the state
     /// reports still go through.
-    fn arm_pane(&self, pane_id: &str, turn: &TurnIdentity, budget: &Budget) {
-        let settle = Instant::now() + SHELL_SETTLE.min(budget.remaining());
+    fn arm_pane(&self, pane_id: &str, turn: &TurnIdentity, budget: &Budget<'_>) {
+        let settle_for = SHELL_SETTLE.min(budget.remaining());
+        let settle_started = budget.elapsed();
         loop {
             match self.client.pane_process_info(pane_id) {
                 Ok(info) if info.is_idle_shell() => break,
                 Ok(_) | Err(HerdrError::Server { .. }) => {}
                 Err(_) => return,
             }
-            if Instant::now() >= settle || budget.exhausted() {
+            if budget.elapsed().saturating_sub(settle_started) >= settle_for || budget.exhausted() {
                 return;
             }
             thread::sleep(SHELL_POLL);
