@@ -6014,10 +6014,10 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
         });
         contended_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("runner claimed and encountered refresh fence");
+            .expect("runner encountered refresh fence before admission");
         assert!(matches!(
             state.queue_entry(fixture.turn_id).unwrap().unwrap().state(),
-            mac_worker::job::QueueState::Dispatching { .. }
+            mac_worker::job::QueueState::Waiting { .. }
         ));
         release_refresh.release();
         refresh.join().unwrap().unwrap();
@@ -6115,6 +6115,124 @@ fn contending_runner_stops_when_its_owner_changes() {
 #[test]
 fn contending_runner_cannot_mutate_a_replacement_turn() {
     runner_refresh_contention(Some(true));
+}
+
+fn runner_parent_publication_contention(revoke_token: bool) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let (contended_tx, contended_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let state = ClientStateStore::open_with_concurrency_hook(
+        &fixture.paths.state,
+        Arc::new(ContentionHook {
+            entered: Mutex::new(Some(contended_tx)),
+            resume: Mutex::new(release_rx),
+        }),
+    )
+    .unwrap();
+    let owner = *state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .owner_opt()
+        .unwrap();
+    state.record_runner(fixture.task_id, None).unwrap();
+    let mac_worker::client_state::RunnerSlotDecision::Acquired { token } = state
+        .reserve_runner_slot(fixture.turn_id, owner, 8, false)
+        .unwrap()
+    else {
+        panic!("expected reserved child slot");
+    };
+    let held = fs::OpenOptions::new()
+        .append(true)
+        .open(
+            fixture
+                .paths
+                .state
+                .join("runners")
+                .join(fixture.task_id.to_string())
+                .join(format!("{}.log", fixture.turn_id)),
+        )
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    if !revoke_token {
+        state
+            .bind_runner_slot_child(fixture.turn_id, token, owner)
+            .unwrap();
+        // The real parent holds this journal until after ownership publication.
+        state
+            .complete_runner_spawn(fixture.task_id, fixture.turn_id, token, owner)
+            .unwrap();
+    }
+    thread::scope(|scope| {
+        let mut release = FenceRelease(Some(release_tx));
+        let runner = scope.spawn(|| {
+            TurnRunner::new(
+                &fixture.runner,
+                &fixture.config,
+                &fixture.paths,
+                &state,
+                &fixture.executor,
+            )
+            .with_slot_token(Some(token))
+            .run(fixture.task_id, fixture.turn_id, None)
+        });
+        contended_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("published child waits for the parent's journal fence");
+        if revoke_token {
+            state
+                .release_runner_slot(fixture.turn_id, token, owner)
+                .unwrap();
+            let replacement = state
+                .reserve_runner_slot(fixture.turn_id, owner, 8, false)
+                .unwrap();
+            assert!(matches!(replacement,
+                mac_worker::client_state::RunnerSlotDecision::Acquired { token: replacement }
+                if replacement != token));
+        }
+        drop(held);
+        release.release();
+        let result = runner.join().unwrap();
+        if revoke_token {
+            assert_eq!(
+                result.unwrap_err().public_code(),
+                "QUEUE_SLOT_TOKEN_MISMATCH"
+            );
+            let entry = state.queue_entry(fixture.turn_id).unwrap().unwrap();
+            assert_eq!(entry.owner_opt(), Some(&owner));
+            assert_ne!(entry.slot_reservation().unwrap().token(), token);
+            assert!(!entry.is_cancel_requested());
+        } else {
+            result.expect("child continues once the parent's publication fence drops");
+            assert!(state.queue_entry(fixture.turn_id).unwrap().is_none());
+        }
+    });
+    assert_eq!(
+        fixture
+            .runner
+            .requests()
+            .iter()
+            .filter(|request| request
+                .args
+                .last()
+                .is_some_and(|arg| arg == HostOperation::TaskTurn.command()))
+            .count(),
+        usize::from(!revoke_token)
+    );
+}
+
+#[test]
+fn runner_waits_for_parent_journal_after_ownership_publication() {
+    runner_parent_publication_contention(false);
+}
+
+#[test]
+fn contending_runner_stops_when_its_reservation_token_changes() {
+    runner_parent_publication_contention(true);
 }
 
 struct DelayedProjectionRemote<'a> {

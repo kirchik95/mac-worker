@@ -632,7 +632,7 @@ impl<'a> TurnRunner<'a> {
         let runner_owner = current_process_identity()?;
         let adoption_deadline = Instant::now() + self.adoption_wait;
         loop {
-            let record = self.client_state.load_task(task_id)?;
+            let mut record = self.client_state.load_task(task_id)?;
             let mut entry = self
                 .client_state
                 .queue_entry(turn_id)?
@@ -665,22 +665,15 @@ impl<'a> TurnRunner<'a> {
                     }
                 }
             }
-            if crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
-                .is_some_and(|s| s.completion.is_some())
-            {
-                if entry.owner_opt() != Some(&runner_owner) {
-                    return Err(queue_error(
-                        "QUEUE_OWNER_MISMATCH",
-                        "completed turn cleanup belongs to another runner",
-                    ));
-                }
-                return Ok((task_id, turn_id, runner_owner));
-            }
             // Recover pending journal transactions before considering admission
             // or cancellation. A parked accepted turn still belongs to its host.
             if entry.owner_opt() == Some(&runner_owner) {
-                let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
-                log.require_owner(self.client_state, runner_owner)?;
+                let mut log = self.open_owned_journal(task_id, turn_id, runner_owner)?;
+                // A refresh or the publishing parent may have changed the
+                // projection while we waited. Legacy acceptance migration must
+                // use the same-turn projection protected by the acquired fence.
+                record = self.client_state.load_task(task_id)?;
+                entry = self.require_runner_entry(task_id, turn_id, runner_owner)?;
                 if log.completion().is_some() {
                     return Ok((task_id, turn_id, runner_owner));
                 }
@@ -827,6 +820,57 @@ impl<'a> TurnRunner<'a> {
         }
     }
 
+    fn require_runner_entry(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+    ) -> Result<crate::job::QueueEntry, WorkerError> {
+        let entry = self
+            .client_state
+            .queue_entry_for_task_turn(task_id)?
+            .filter(|entry| entry.job_id() == turn_id && entry.owner_opt() == Some(&owner))
+            .ok_or_else(|| {
+                task_error(
+                    "TASK_BUSY",
+                    "task turn ownership changed while waiting for its journal",
+                )
+            })?;
+        if let Some(expected) = self.slot_token
+            && entry
+                .slot_reservation()
+                .is_some_and(|reservation| reservation.token() != expected)
+        {
+            return Err(queue_error(
+                "QUEUE_SLOT_TOKEN_MISMATCH",
+                "runner slot token is no longer current",
+            ));
+        }
+        // A completed parent handoff clears the token after publishing this
+        // child's ownership, so absence of a reservation is legitimate.
+        Ok(entry)
+    }
+
+    fn open_owned_journal(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+    ) -> Result<LogWriter, WorkerError> {
+        // Refresh and parent handoff publication briefly hold the same fence.
+        // Wait without holding state locks, but never wait for another turn or
+        // owner: retirement/reassignment revokes this runner's authority.
+        loop {
+            self.require_runner_entry(task_id, turn_id, owner)?;
+            if let Some(log) = LogWriter::try_open(&self.paths.state, task_id, turn_id)? {
+                self.require_runner_entry(task_id, turn_id, owner)?;
+                return Ok(log);
+            }
+            self.client_state.runner_log_contention();
+            std::thread::sleep(WAIT_POLL);
+        }
+    }
+
     fn execute(
         &self,
         task_id: TaskId,
@@ -834,27 +878,7 @@ impl<'a> TurnRunner<'a> {
         owner: ProcessIdentity,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
-        // Refresh and parent handoff publication briefly hold the same fence.
-        // Wait without holding state locks, but never wait for another turn or
-        // owner: retirement/reassignment revokes this runner's authority.
-        let mut log = loop {
-            if !self
-                .client_state
-                .queue_entry_for_task_turn(task_id)?
-                .is_some_and(|entry| entry.job_id() == turn_id && entry.owner_opt() == Some(&owner))
-            {
-                return Err(task_error(
-                    "TASK_BUSY",
-                    "task turn ownership changed while waiting for its journal",
-                ));
-            }
-            if let Some(log) = LogWriter::try_open(&self.paths.state, task_id, turn_id)? {
-                log.require_owner(self.client_state, owner)?;
-                break log;
-            }
-            self.client_state.runner_log_contention();
-            std::thread::sleep(WAIT_POLL);
-        };
+        let mut log = self.open_owned_journal(task_id, turn_id, owner)?;
         let initial_record = self.client_state.load_task(task_id)?;
         let project = self.load_project_for_record(&initial_record)?;
         require_project_match(
