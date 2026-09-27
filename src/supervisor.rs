@@ -34,7 +34,7 @@ use crate::{
     lease::LeaseService,
     project_readiness::load_setup_stage_result,
     rooted_fs::RootedDir,
-    turn::{EnvProfile, TerminalPath, TurnSection, TurnTerminalHook},
+    turn::{EnvProfile, TerminalPath, TurnSection, TurnTerminalHook, discard_launched_redaction},
 };
 
 const CONTROLLED_PATH: &str = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -2206,7 +2206,7 @@ impl<'a> Supervisor<'a> {
                 &section,
                 status_bytes,
                 status,
-                "ENV_PROFILE_PERMISSIONS",
+                "REDACTION_SNAPSHOT_FAILED",
                 error,
             );
         }
@@ -2932,6 +2932,8 @@ impl<'a> Supervisor<'a> {
             );
         let payload_removal = if unfinished_publication {
             Ok(())
+        } else if let Err(error) = discard_launched_redaction(job) {
+            Err(error)
         } else if job.entry_exists("execution.json")? {
             self.store
                 .remove_owned_regular_committed(job, "execution.json")

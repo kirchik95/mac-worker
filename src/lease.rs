@@ -918,6 +918,41 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn cleanup_removes_a_leftover_launched_redaction_snapshot() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let service = LeaseService::new(&store);
+        let acquire_request = request(41);
+        let lease = acquire(&service, &acquire_request);
+        publish_job(&store, &lease, &acquire_request);
+        store
+            .record_terminal_status(&lease, &JobStatus::succeeded(100, 0, 0).unwrap())
+            .unwrap();
+        let job = store
+            .open_directory(
+                &format!(
+                    "jobs/{}/{}/{}",
+                    lease.project_id(),
+                    lease.worktree_id(),
+                    lease.job_id()
+                ),
+                false,
+            )
+            .unwrap();
+        job.write_private_atomic_no_replace(
+            crate::turn::LAUNCHED_REDACTION_FILE,
+            br#"["purple-lantern-secret-qq"]"#,
+        )
+        .unwrap();
+        store.cleanup_job_owned(&lease).unwrap();
+        assert!(
+            !job.entry_exists(crate::turn::LAUNCHED_REDACTION_FILE)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn cleanup_preserves_substituted_scope_and_release_rechecks_absence() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("host");

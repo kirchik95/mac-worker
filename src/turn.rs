@@ -752,7 +752,7 @@ impl TurnTerminalHook {
         let meta = task_store.load_meta(section.project_id(), section.turn().task_id())?;
         let status = task_store.load_status(meta.project_id(), meta.task_id())?;
         let task = PreparedTask::new(meta.clone(), status.clone());
-        match TurnPublisher::new(store, &runner).publish_with_terminal(
+        let published = match TurnPublisher::new(store, &runner).publish_with_terminal(
             &task,
             turn_dir,
             terminal,
@@ -771,15 +771,7 @@ impl TurnTerminalHook {
                     result.questions(),
                     &task_store,
                 );
-                if meta.close_policy() == ClosePolicy::Done
-                    && result.outcome() == &TaskOutcome::Done
-                {
-                    TaskStore::new(store, &runner).close_after_own_terminal_turn(
-                        &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
-                        job_meta.job_id(),
-                    )?;
-                }
-                Ok(result)
+                Ok((result, meta))
             }
             Err(error) => {
                 // Auto-close TASK_BUSY runs after finish_turn already wrote
@@ -841,6 +833,31 @@ impl TurnTerminalHook {
                 }
                 Err(error)
             }
+        };
+        // The snapshot is the publication input. Drop it once this attempt
+        // cannot be retried. A still-recoverable failure keeps the file so
+        // the next attempt redacts with the same secrets.
+        if !own_turn_publication_still_recoverable(
+            store,
+            section.project_id(),
+            section.turn().task_id(),
+            job_meta.job_id(),
+        ) {
+            discard_launched_redaction(turn_dir)?;
+        }
+        match published {
+            Ok((result, meta)) => {
+                if meta.close_policy() == ClosePolicy::Done
+                    && result.outcome() == &TaskOutcome::Done
+                {
+                    TaskStore::new(store, &runner).close_after_own_terminal_turn(
+                        &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
+                        job_meta.job_id(),
+                    )?;
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -1927,7 +1944,10 @@ impl EnvProfile {
     /// Writes the secrets this launch actually loaded. Publication reads this
     /// file instead of the profile that happens to be on disk later.
     pub(crate) fn persist_launched_redaction(&self, job: &RootedDir) -> Result<(), WorkerError> {
-        if job.entry_exists(LAUNCHED_REDACTION_FILE)? {
+        let exists = job.entry_exists(LAUNCHED_REDACTION_FILE).map_err(|error| {
+            snapshot_error(format!("cannot store launched redaction snapshot: {error}"))
+        })?;
+        if exists {
             return Ok(());
         }
         let secrets = self
@@ -1937,24 +1957,32 @@ impl EnvProfile {
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
         let bytes = serde_json::to_vec(&secrets).map_err(|error| {
-            turn_error(
-                "ENV_PROFILE_INVALID",
-                format!("cannot encode launched redaction snapshot: {error}"),
-            )
+            snapshot_error(format!(
+                "cannot encode launched redaction snapshot: {error}"
+            ))
         })?;
         job.write_private_atomic_no_replace(LAUNCHED_REDACTION_FILE, &bytes)
             .map_err(|error| {
-                turn_error(
-                    "ENV_PROFILE_PERMISSIONS",
-                    format!("cannot store launched redaction snapshot: {error}"),
-                )
+                snapshot_error(format!("cannot store launched redaction snapshot: {error}"))
             })?;
         Ok(())
     }
 }
 
-const LAUNCHED_REDACTION_FILE: &str = "launched-redaction.json";
+pub(crate) const LAUNCHED_REDACTION_FILE: &str = "launched-redaction.json";
 const LAUNCHED_REDACTION_MAX_BYTES: u64 = 1024 * 1024;
+
+fn snapshot_error(message: impl Into<String>) -> WorkerError {
+    turn_error("REDACTION_SNAPSHOT_FAILED", message)
+}
+
+/// Removes the launch snapshot once publication will not read it again.
+pub(crate) fn discard_launched_redaction(job: &RootedDir) -> std::io::Result<()> {
+    if !job.entry_exists(LAUNCHED_REDACTION_FILE)? {
+        return Ok(());
+    }
+    job.remove_owned_regular(LAUNCHED_REDACTION_FILE)
+}
 
 fn publication_boundary(turn_dir: &RootedDir) -> Result<RedactionBoundary, WorkerError> {
     if !turn_dir.entry_exists(LAUNCHED_REDACTION_FILE)? {
@@ -2143,11 +2171,16 @@ fn os_str_bytes(value: &OsStr) -> &[u8] {
 mod tests {
     use super::*;
     use crate::{
-        agent::AgentKind,
+        agent::{AgentKind, PermissionPolicy},
         host_store::HostStore,
+        inputs::RelativePath,
+        job::{ClientId, CommandSpec, LeaseToken, RequestFingerprintMaterial},
         process::SystemProcessRunner,
         rooted_fs::RootedDir,
-        task::TaskId,
+        task::{
+            GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+            TaskState, TurnSummary,
+        },
         task_store::{SessionBinding, TaskPrebindRequest},
     };
     use tempfile::tempdir;
@@ -2251,6 +2284,223 @@ mod tests {
         .unwrap();
         let error = publication_boundary(&turn_dir).unwrap_err();
         assert_eq!(error.public_code(), "PUBLISH_FAILED");
+    }
+
+    struct PublicationFixture {
+        _temp: tempfile::TempDir,
+        store: HostStore,
+        turn_dir: RootedDir,
+        job_meta: JobMeta,
+        section: TurnSection,
+    }
+
+    fn publication_fixture(stdout: Option<&str>) -> PublicationFixture {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::generate();
+        let job_id = JobId::generate();
+        let worktree = "b".repeat(64);
+        let base_oid: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
+        let limits = TaskLimits::default();
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: PROJECT_ID.into(),
+            worktree_id: worktree.clone(),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: base_oid.clone(),
+            limits: limits.clone(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+            title: None,
+            prompt: "publish the change".into(),
+            created_at_millis: 100,
+        })
+        .unwrap();
+        let turn = TurnMaterial::from_prompt(
+            task_id,
+            1,
+            AgentKind::Codex,
+            None,
+            None,
+            PermissionPolicy::Workspace,
+            limits.turn.clone(),
+            base_oid,
+            "publish the change",
+            None,
+            Uuid::from_u128(7),
+            false,
+        )
+        .unwrap();
+        let section = TurnSection::new(
+            turn,
+            PROJECT_ID,
+            GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
+        )
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Active,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                job_id,
+                None,
+                None,
+                None,
+                false,
+                Some(1),
+                None,
+            )],
+            1,
+        )
+        .unwrap();
+        let task_dir = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        task_dir
+            .write_private_atomic_no_replace("meta.json", &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        task_dir
+            .write_private_atomic_no_replace("status.json", &serde_json::to_vec(&status).unwrap())
+            .unwrap();
+        let material = RequestFingerprintMaterial::new(
+            job_id,
+            ClientId::generate(),
+            LeaseToken::generate(),
+            1,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            worktree,
+            "c".repeat(64),
+            String::new(),
+            30_000,
+            "heavy".into(),
+            CommandSpec::shell("true".into()).unwrap(),
+        )
+        .unwrap();
+        let job_meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+        if let Some(stdout) = stdout {
+            task_dir
+                .write_private_atomic_no_replace("stdout.log", stdout.as_bytes())
+                .unwrap();
+        }
+        task_dir
+            .write_private_atomic_no_replace(
+                LAUNCHED_REDACTION_FILE,
+                br#"["purple-lantern-secret-qq"]"#,
+            )
+            .unwrap();
+        PublicationFixture {
+            _temp: temp,
+            store,
+            turn_dir: task_dir,
+            job_meta,
+            section,
+        }
+    }
+
+    fn invoke_publication(
+        fixture: &PublicationFixture,
+        terminal: TurnTerminal,
+        path: TerminalPath,
+        exit_code: Option<i32>,
+    ) -> Result<TurnResult, WorkerError> {
+        TurnTerminalHook.invoke(
+            &fixture.store,
+            &fixture.turn_dir,
+            &fixture.job_meta,
+            &fixture.section,
+            terminal,
+            path,
+            exit_code,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn launched_redaction_snapshot_is_absent_after_a_successful_publish() {
+        let stdout = format!(
+            "{}\n{}\n",
+            codex_session_line(),
+            codex_result_record("shipped")
+        );
+        let fixture = publication_fixture(Some(&stdout));
+        invoke_publication(
+            &fixture,
+            TurnTerminal::Succeeded,
+            TerminalPath::ChildExit(0),
+            Some(0),
+        )
+        .unwrap();
+        assert!(
+            !fixture
+                .turn_dir
+                .entry_exists(LAUNCHED_REDACTION_FILE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn launched_redaction_snapshot_is_absent_after_a_failed_publish() {
+        let fixture = publication_fixture(None);
+        let error = invoke_publication(
+            &fixture,
+            TurnTerminal::Failed,
+            TerminalPath::ChildExit(1),
+            Some(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "PUBLISH_FAILED");
+        assert!(
+            !fixture
+                .turn_dir
+                .entry_exists(LAUNCHED_REDACTION_FILE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn recoverable_publication_keeps_the_launched_redaction_snapshot() {
+        let fixture = publication_fixture(None);
+        let delivery = fixture
+            .turn_dir
+            .open_child_directory(&RelativePath::parse(b"delivery").unwrap(), true)
+            .unwrap();
+        delivery
+            .write_private_atomic_no_replace(&format!("{}.json", fixture.job_meta.job_id()), b"{")
+            .unwrap();
+        let error = invoke_publication(
+            &fixture,
+            TurnTerminal::Failed,
+            TerminalPath::ChildExit(1),
+            Some(1),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "PUBLISH_FAILED");
+        assert!(
+            fixture
+                .turn_dir
+                .entry_exists(LAUNCHED_REDACTION_FILE)
+                .unwrap()
+        );
     }
 
     fn codex_session_line() -> &'static str {

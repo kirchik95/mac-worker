@@ -34,7 +34,7 @@ use crate::{
     task_store::{TaskCancelRequest, TaskStore},
     turn::{
         TaskTurnRequest, TaskTurnResponse, TerminalPath, TurnReceipt, TurnSection,
-        TurnTerminalHook, own_turn_publication_still_recoverable,
+        TurnTerminalHook, discard_launched_redaction, own_turn_publication_still_recoverable,
     },
 };
 
@@ -1857,7 +1857,9 @@ impl<'a> JobService<'a> {
                         drop(supervisor);
                         return Err(error);
                     }
-                    let payload_removal = if job.entry_exists("execution.json")? {
+                    let payload_removal = if let Err(error) = discard_launched_redaction(&job) {
+                        Err(error)
+                    } else if job.entry_exists("execution.json")? {
                         self.store
                             .remove_owned_regular_committed(&job, "execution.json")
                     } else {
@@ -1872,7 +1874,9 @@ impl<'a> JobService<'a> {
                     let _ = cleanup;
                     return Err(error);
                 }
-                let payload_removal = if job.entry_exists("execution.json")? {
+                let payload_removal = if let Err(error) = discard_launched_redaction(&job) {
+                    Err(error)
+                } else if job.entry_exists("execution.json")? {
                     self.store
                         .remove_owned_regular_committed(&job, "execution.json")
                 } else {

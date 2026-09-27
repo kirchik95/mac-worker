@@ -3197,6 +3197,9 @@ impl HostStore {
                     job.resume_pending_owned_child_cleanup(name)?;
                 }
             }
+            if job.entry_exists(crate::turn::LAUNCHED_REDACTION_FILE)? {
+                self.remove_owned_regular_committed(&job, crate::turn::LAUNCHED_REDACTION_FILE)?;
+            }
             if job.entry_exists("execution.json")? {
                 self.remove_owned_regular_committed(&job, "execution.json")?;
             }
@@ -3221,7 +3224,13 @@ impl HostStore {
             lease.job_id()
         ))? {
             self.resume_job_replace_stages(&job)?;
-            for name in ["workspace", "home", "tmp", "execution.json"] {
+            for name in [
+                "workspace",
+                "home",
+                "tmp",
+                "execution.json",
+                crate::turn::LAUNCHED_REDACTION_FILE,
+            ] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
                         "mutable job scope {name} remains after cleanup"
@@ -3268,7 +3277,13 @@ impl HostStore {
             lease.job_id()
         ))? {
             self.resume_job_replace_stages(&job)?;
-            for name in ["workspace", "home", "tmp", "execution.json"] {
+            for name in [
+                "workspace",
+                "home",
+                "tmp",
+                "execution.json",
+                crate::turn::LAUNCHED_REDACTION_FILE,
+            ] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
                         "mutable job scope {name} remains after cleanup"
@@ -3319,7 +3334,13 @@ impl HostStore {
             identity.job_id()
         ))? {
             self.resume_job_replace_stages(&job)?;
-            for name in ["workspace", "home", "tmp", "execution.json"] {
+            for name in [
+                "workspace",
+                "home",
+                "tmp",
+                "execution.json",
+                crate::turn::LAUNCHED_REDACTION_FILE,
+            ] {
                 if job.entry_exists(name)? {
                     return Err(WorkerError::Protocol(format!(
                         "mutable job scope {name} remains after cleanup"
@@ -5241,6 +5262,7 @@ fn validate_terminal_job_basis(
         })
         .chain(["workspace", "home", "tmp"].into_iter().map(String::from))
         .collect::<BTreeSet<_>>();
+    allowed.insert(crate::turn::LAUNCHED_REDACTION_FILE.into());
     if prelaunch_cancelled {
         allowed.insert("execution.json".into());
     }
