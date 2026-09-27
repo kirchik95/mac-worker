@@ -915,7 +915,9 @@ fn run_controller_command(
         let client_state = ClientStateStore::open(&paths.state)?;
         let handler =
             crate::controller::TaskSubmitHandler::new(runner, &config, &paths, &client_state);
-        crate::controller::tick_controller_leader(&store, &handler)?;
+        let initial_tick = crate::controller::tick_controller_leader(&store, &handler);
+        initial_tick.bootstrap?;
+        initial_tick.resume?;
         let client = TaskClient::new(
             runner,
             &config,

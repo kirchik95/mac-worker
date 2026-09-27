@@ -704,11 +704,11 @@ fn capacity_code(code: &str) -> Option<&'static str> {
 pub fn tick_controller_leader(
     store: &ControllerStore,
     handler: &dyn ControllerCommandHandler,
-) -> Result<(), WorkerError> {
-    store.bootstrap_active_index()?;
-    store
-        .resume_active_bounded(handler, &ActiveResumeConfig::default())
-        .map(|_| ())
+) -> crate::controller::health::ControllerRequestTickReport {
+    crate::controller::health::ControllerRequestTickReport {
+        bootstrap: store.bootstrap_active_index(),
+        resume: store.resume_active_bounded(handler, &ActiveResumeConfig::default()),
+    }
 }
 
 #[cfg(test)]

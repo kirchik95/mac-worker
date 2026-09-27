@@ -391,6 +391,32 @@ impl ControllerAck {
 }
 
 impl ControllerStore {
+    /// Health reads only the pending index, never the historical request rows.
+    /// A concurrent retire or malformed receipt makes the age incomplete, not zero.
+    pub fn pending_health(
+        &self,
+        now_millis: u64,
+    ) -> Result<crate::controller::health::PendingHealth, WorkerError> {
+        let names = self.active_names()?;
+        let mut health = crate::controller::health::PendingHealth {
+            active_count: names.len() as u64,
+            oldest_pending_age_millis: None,
+            age_incomplete: false,
+        };
+        for name in names {
+            match self.read_pending(&name) {
+                Ok(receipt) => {
+                    let age = now_millis.saturating_sub(receipt.created_at_millis);
+                    health.oldest_pending_age_millis = Some(
+                        health.oldest_pending_age_millis.unwrap_or(0).max(age),
+                    );
+                }
+                Err(_) => health.age_incomplete = true,
+            }
+        }
+        Ok(health)
+    }
+
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
         let root = open_controller_root(state_root)?;
         let _requests = root

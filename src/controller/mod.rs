@@ -15,6 +15,7 @@ pub mod batch;
 pub mod batch_freeze;
 pub mod envelope;
 pub mod execute;
+pub mod health;
 pub mod leader;
 pub mod lifecycle;
 pub mod protocol;
