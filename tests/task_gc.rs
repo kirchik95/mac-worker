@@ -1317,7 +1317,12 @@ fn fleet_gc(second_host: SecondHostFault, json: bool) -> (u8, String, String, Ve
         second_host,
     };
     let temporary = tempfile::tempdir().unwrap();
-    let config_path = temporary.path().join("config.toml");
+    // Client state opens each path component with O_NOFOLLOW. The fixture uses
+    // the canonical directory so that walk stays on real directories.
+    let root = temporary.path().canonicalize().unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let config_path = root.join("config.toml");
     fs::write(
         &config_path,
         "\
@@ -1337,11 +1342,7 @@ slots = 1
 ",
     )
     .unwrap();
-    let runtime = RuntimeContext::isolated(
-        BTreeMap::new(),
-        temporary.path().join("home"),
-        temporary.path().to_path_buf(),
-    );
+    let runtime = RuntimeContext::isolated(BTreeMap::new(), home, root);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(
@@ -1381,7 +1382,7 @@ fn fleet_gc_reports_apply_results_when_the_second_host_fails() {
     assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(
         stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
-        "first host apply result missing from {stdout}"
+        "first host apply result missing from stdout={stdout:?} stderr={stderr:?} exit={exit}"
     );
     assert!(
         stdout.contains("worker mini-2")
@@ -1421,7 +1422,7 @@ fn fleet_gc_reports_unknown_when_the_second_host_times_out() {
     assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
     assert!(
         stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
-        "first host apply result missing from {stdout}"
+        "first host apply result missing from stdout={stdout:?} stderr={stderr:?} exit={exit}"
     );
     assert!(
         stdout.contains("worker mini-2")
