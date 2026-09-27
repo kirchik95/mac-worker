@@ -16,11 +16,24 @@ pub enum CommandOutput {
 
 impl CommandOutput {
     pub fn render_json(&self) -> Result<String, crate::error::WorkerError> {
-        serde_json::to_string(self).map_err(|error| {
+        let serialize = |error: serde_json::Error| {
             crate::error::WorkerError::Protocol(format!(
                 "failed to serialize command output: {error}"
             ))
-        })
+        };
+        // Keep struct field order for reports with no skew. serde_json::Value
+        // sorts keys, which would rewrite every existing snapshot.
+        let warnings = match self {
+            Self::Workers(report) => build_warning_values(&report.workers),
+            Self::Doctor(report) => build_warning_values(&report.workers),
+            _ => Vec::new(),
+        };
+        if warnings.is_empty() {
+            return serde_json::to_string(self).map_err(serialize);
+        }
+        let mut value = serde_json::to_value(self).map_err(serialize)?;
+        value["build_warnings"] = serde_json::Value::Array(warnings);
+        serde_json::to_string(&value).map_err(serialize)
     }
 
     pub fn render_human(&self) -> String {
@@ -43,6 +56,14 @@ impl CommandOutput {
                             let message = worker.error_message.as_deref().unwrap_or("setup failed");
                             format!("{}: failed [{code}]: {message}", worker.name)
                         };
+                        if let Some(build_id) = &worker.build_id {
+                            rendered.push_str("\n  build: ");
+                            rendered.push_str(build_id);
+                        }
+                        if let Some(sha256) = &worker.binary_sha256 {
+                            rendered.push_str("\n  sha256: ");
+                            rendered.push_str(sha256);
+                        }
                         if let Some(outbox) = &worker.outbox {
                             rendered.push_str("\n  outbox: ");
                             rendered.push_str(outbox);
@@ -151,6 +172,44 @@ impl CommandOutput {
             _ => None,
         }
     }
+}
+
+fn render_host_build(probe: &crate::protocol::ProbeResponse) -> String {
+    match &probe.build_id {
+        Some(build_id) => format!("  build: {build_id}"),
+        None if probe.binary_sha256.is_none() => "  build: unknown (older helper)".into(),
+        None => "  build: unknown".into(),
+    }
+}
+
+fn build_mismatch_line(host: &str, probe: &crate::protocol::ProbeResponse) -> Option<String> {
+    let host_sha = probe.binary_sha256.as_deref()?;
+    let laptop_sha = crate::binary_identity::current_binary_sha256()?;
+    if host_sha == laptop_sha {
+        return None;
+    }
+    let host_build = probe.build_id.as_deref().unwrap_or("unknown");
+    Some(format!(
+        "  warning [BUILD_MISMATCH]: {host} is {host_build}; laptop is {}",
+        crate::build_id::BUILD_ID
+    ))
+}
+
+fn build_warning_values(workers: &[crate::protocol::WorkerHealth]) -> Vec<serde_json::Value> {
+    workers
+        .iter()
+        .filter_map(|worker| {
+            let probe = worker.probe.as_ref()?;
+            build_mismatch_line(&worker.name, probe).map(|_| {
+                serde_json::json!({
+                    "host": worker.name,
+                    "code": "BUILD_MISMATCH",
+                    "host_build": probe.build_id.clone().unwrap_or_else(|| "unknown".into()),
+                    "laptop_build": crate::build_id::BUILD_ID,
+                })
+            })
+        })
+        .collect()
 }
 
 fn render_doctor_report(report: &crate::protocol::DoctorReport) -> String {
@@ -390,6 +449,12 @@ fn render_worker_health_with_labels(
             format!("{}: {unavailable_label} [{code}]: {message}", worker.name)
         }
     }];
+    if let Some(probe) = &worker.probe {
+        lines.push(render_host_build(probe));
+        if let Some(warning) = build_mismatch_line(&worker.name, probe) {
+            lines.push(warning);
+        }
+    }
 
     if !worker.missing_capabilities.is_empty() {
         lines.push(format!(
