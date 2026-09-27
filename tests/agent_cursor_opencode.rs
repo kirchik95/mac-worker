@@ -72,6 +72,7 @@ struct HostState {
     last_prompt: String,
     child_env: BTreeMap<String, String>,
     task: Option<(TaskMeta, TurnId)>,
+    completed_turns: Vec<TurnSummary>,
     turn_submitted: bool,
     native_job: Option<JobMeta>,
     fail_first_turn: bool,
@@ -95,6 +96,7 @@ impl RecordingHost {
                 last_prompt: String::new(),
                 child_env: BTreeMap::new(),
                 task: None,
+                completed_turns: Vec::new(),
                 turn_submitted: false,
                 native_job: None,
                 fail_first_turn: false,
@@ -160,7 +162,7 @@ impl RecordingHost {
             Some(TaskOutcome::Done)
         };
         let turn = TurnSummary::new(
-            1,
+            state.completed_turns.len() as u32 + 1,
             *turn_id,
             terminal.then_some(if failed {
                 TurnTerminal::Failed
@@ -187,7 +189,12 @@ impl RecordingHost {
             Vec::new(),
             Vec::new(),
             None,
-            vec![turn],
+            state
+                .completed_turns
+                .iter()
+                .cloned()
+                .chain([turn])
+                .collect(),
             meta.created_at_millis() + u64::from(terminal),
         )
     }
@@ -334,8 +341,19 @@ impl ProcessRunner for RecordingHost {
             }
             value if value == HostOperation::TaskTurn.command() => {
                 let turn: TaskTurnRequest = decode_request(request)?;
+                let material = turn.submit().material();
+                let previous = self.task_status(true)?;
                 let prompt = turn.prompt().to_owned();
                 let mut state = self.state.lock().unwrap();
+                let (meta, current_turn) = state.task.as_mut().expect("prepared task");
+                assert_eq!(meta.task_id(), turn.turn().task_id());
+                if *current_turn != material.job_id() {
+                    // Resume skips TaskPrepare. Model the real host's
+                    // prepare_resume transition before returning its status.
+                    assert!(turn.turn().resume());
+                    *current_turn = material.job_id();
+                    state.completed_turns = previous.turns().to_vec();
+                }
                 state.calls.push("task-turn".into());
                 state.last_prompt = prompt;
                 state.turn_submitted = true;
@@ -344,7 +362,16 @@ impl ProcessRunner for RecordingHost {
                 }
                 drop(state);
                 let active = self.task_status(false)?;
-                let material = turn.submit().material();
+                assert_eq!(
+                    active.turns().last().unwrap().turn_id(),
+                    material.job_id(),
+                    "fake host must acknowledge the submitted turn, including follow-ups"
+                );
+                assert_eq!(
+                    active.turns().last().unwrap().turn_number(),
+                    turn.turn().turn_number(),
+                    "fake host must retain the preceding turn history"
+                );
                 let job_meta = JobMeta::new(material, material.fingerprint())?;
                 self.state.lock().unwrap().native_job = Some(job_meta.clone());
                 let submit = SubmitResponse::Accepted {
@@ -819,8 +846,28 @@ fn cancel_then_resume_reuses_the_bound_session() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
     let harness = TaskHarness::cursor();
     harness.submit_first_turn().unwrap();
+    let task_id = harness.task_id.lock().unwrap().expect("submitted task");
+    let first = harness.state.load_task(task_id).unwrap();
+    assert_eq!(first.status().turns().len(), 1);
+    assert_eq!(
+        first.status().turns()[0].terminal(),
+        Some(TurnTerminal::Succeeded)
+    );
     harness.cancel().unwrap();
+    assert_eq!(
+        harness.state.load_task(task_id).unwrap().status().turns(),
+        first.status().turns(),
+        "cancelling an already finished turn must preserve its history"
+    );
     harness.say("continue after cancel").unwrap();
+    let resumed = harness.state.load_task(task_id).unwrap();
+    assert_eq!(resumed.status().turns().len(), 2);
+    assert_eq!(resumed.status().turns()[0], first.status().turns()[0]);
+    assert_eq!(resumed.status().turns()[1].turn_number(), 2);
+    assert_ne!(
+        resumed.status().turns()[1].turn_id(),
+        first.status().turns()[0].turn_id()
+    );
     assert_eq!(harness.persisted_session(), Some("chat0001".into()));
     assert!(harness.last_shell().contains("'--resume' 'chat0001'"));
 }
