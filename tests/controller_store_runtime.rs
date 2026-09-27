@@ -8,7 +8,7 @@
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, mpsc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use mac_worker::{
@@ -36,6 +36,8 @@ struct KernelTestExecutor {
     next_result: Mutex<Value>,
     fixed_meta: Option<OperationMeta>,
     gate: Mutex<Option<mpsc::Receiver<()>>>,
+    gate_request_id: Option<&'static str>,
+    gate_entered: Option<mpsc::Sender<()>>,
     seen_prepared: Mutex<Vec<Value>>,
     derive_result_from_prepared: bool,
 }
@@ -47,6 +49,8 @@ impl KernelTestExecutor {
             next_result: Mutex::new(result),
             fixed_meta: None,
             gate: Mutex::new(None),
+            gate_request_id: None,
+            gate_entered: None,
             seen_prepared: Mutex::new(Vec::new()),
             derive_result_from_prepared: false,
         }
@@ -58,6 +62,8 @@ impl KernelTestExecutor {
             next_result: Mutex::new(result),
             fixed_meta: Some(meta),
             gate: Mutex::new(None),
+            gate_request_id: None,
+            gate_entered: None,
             seen_prepared: Mutex::new(Vec::new()),
             derive_result_from_prepared: false,
         }
@@ -69,6 +75,8 @@ impl KernelTestExecutor {
             next_result: Mutex::new(Value::Null),
             fixed_meta: Some(meta),
             gate: Mutex::new(None),
+            gate_request_id: None,
+            gate_entered: None,
             seen_prepared: Mutex::new(Vec::new()),
             derive_result_from_prepared: true,
         }
@@ -98,7 +106,7 @@ impl ControllerCommandHandler for KernelTestExecutor {
 
     fn execute(&self, record: &DurableRequest) -> Result<Value, WorkerError> {
         // Record the call BEFORE the gate so observers can rendezvous with a
-        // blocked execution; the gate itself only pauses ID_F.
+        // blocked execution; the entered channel confirms the gate is held.
         self.calls
             .lock()
             .unwrap()
@@ -112,8 +120,9 @@ impl ControllerCommandHandler for KernelTestExecutor {
                 "rev": record.prepared().get("expected_revision").cloned().unwrap_or(Value::Null),
             }));
         }
-        if record.request_id() == ID_F && self.gate.lock().unwrap().is_some() {
+        if Some(record.request_id()) == self.gate_request_id {
             let guard = self.gate.lock().unwrap();
+            self.gate_entered.as_ref().unwrap().send(()).unwrap();
             guard
                 .as_ref()
                 .unwrap()
@@ -682,7 +691,7 @@ fn poisoned_early_entries_do_not_starve_later_work() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("mac-worker-controller");
     ControllerStore::open(&state).unwrap();
-    let executor = Arc::new(KernelTestExecutor::checkpoint(json!({"n": 1})));
+    let mut executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
     let plain = KernelTestExecutor::checkpoint(json!({"n": 1}));
     // Publish all four without executing; poison the early window afterwards:
     // ID_A will be permanently busy, ID_B permanently failing, while ID_C and
@@ -704,6 +713,10 @@ fn poisoned_early_entries_do_not_starve_later_work() {
     .unwrap();
     let (gate_tx, gate_rx) = mpsc::channel();
     *executor.gate.lock().unwrap() = Some(gate_rx);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    executor.gate_entered = Some(entered_tx);
+    executor.gate_request_id = Some(ID_A);
+    let executor = Arc::new(executor);
 
     // Background handle occupies ID_A inside its executor (per-request lock held).
     let background_state = state.clone();
@@ -718,14 +731,9 @@ fn poisoned_early_entries_do_not_starve_later_work() {
             )
             .unwrap()
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while executor.calls_for(ID_A) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "background execute did not start"
-        );
-        std::thread::yield_now();
-    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("background executor must enter the request gate");
 
     let tight = ActiveResumeConfig {
         max_requests_per_tick: 2,
@@ -1028,9 +1036,13 @@ fn busy_request_is_skipped_while_others_progress() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("mac-worker-controller");
     ControllerStore::open(&state).unwrap();
-    let executor = Arc::new(KernelTestExecutor::checkpoint(json!({"n": 1})));
+    let mut executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
     let (gate_tx, gate_rx) = mpsc::channel();
     *executor.gate.lock().unwrap() = Some(gate_rx);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    executor.gate_entered = Some(entered_tx);
+    executor.gate_request_id = Some(ID_F);
+    let executor = Arc::new(executor);
 
     // Background handle occupies ID_F inside its executor (per-request lock held).
     let background_state = state.clone();
@@ -1045,15 +1057,9 @@ fn busy_request_is_skipped_while_others_progress() {
             )
             .unwrap()
     });
-    // Wait until the background thread is inside execute (bounded, no sleep loop).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while executor.calls_for(ID_F) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "background execute did not start"
-        );
-        std::thread::yield_now();
-    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("background executor must enter the request gate");
     // A second request is pending while the first is busy.
     ControllerStore::open(&state)
         .unwrap()
