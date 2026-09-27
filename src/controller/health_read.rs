@@ -198,10 +198,24 @@ fn observe_leader(
     Ok(SystemProcessInspector.observe(expected))
 }
 
+// Older hosts route unknown commands through the durable request kernel. Use
+// an additive selector on an existing read for discovery: an older task.list
+// rejects the unknown key without publishing an orphan request receipt.
+pub fn is_health_read(request: &ControllerRequest) -> bool {
+    request.command() == "controller.health"
+        || (request.command() == "task.list" && request.body().get("controller_health").is_some())
+}
+
+fn valid_health_request(request: &ControllerRequest) -> bool {
+    (request.command() == "controller.health" && request.body() == &serde_json::json!({}))
+        || (request.command() == "task.list"
+            && request.body() == &serde_json::json!({"controller_health": true}))
+}
+
 pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec<u8>, WorkerError> {
-    if request.body() != &serde_json::json!({}) {
+    if !valid_health_request(request) {
         return Err(WorkerError::Protocol(
-            "INVALID_REQUEST: controller health requires an empty body".into(),
+            "INVALID_REQUEST: invalid controller health read".into(),
         ));
     }
     // Return an additive typed diagnostic even for unreadable health. The old
@@ -213,7 +227,7 @@ pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec
 
 impl ControllerReadIdentity for ControllerHealthStatus {
     fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
-        if request.command() != "controller.health"
+        if !valid_health_request(request)
             || self
                 .error_code
                 .as_ref()
@@ -236,7 +250,7 @@ pub fn fetch_controller_health(
         &serde_json::to_vec(&serde_json::json!({
             "protocol_version": crate::protocol::PROTOCOL_VERSION,
             "request_id": uuid::Uuid::new_v4().simple().to_string(),
-            "command": "controller.health", "body": {},
+            "command": "task.list", "body": {"controller_health": true},
         }))
         .expect("health request contains only JSON primitives"),
     )

@@ -276,3 +276,121 @@ fn health_reply_identity_is_verified_before_doctor_uses_it() {
     );
     assert_eq!(status.error_code.as_deref(), Some("CONTROLLER_UNAVAILABLE"));
 }
+
+#[test]
+fn health_check_against_legacy_dispatch_does_not_publish_orphan_requests() {
+    use mac_worker::{
+        client_state::ClientStateStore,
+        controller::{ControllerStore, FakeControllerExecutor},
+        task_client::TaskClient,
+        turn_runner::DetachedRunnerExecutor,
+    };
+    struct LegacyDispatch {
+        paths: PathLayout,
+        config: Config,
+    }
+    impl ProcessRunner for LegacyDispatch {
+        fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let request = mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())?;
+            // The exact pre-health dispatch shape: only existing read commands
+            // bypass the durable kernel. Unknown commands create a receipt
+            // before their handler rejects them.
+            let state = ClientStateStore::open(&self.paths.state)?;
+            let client = TaskClient::new(
+                &OldController,
+                &self.config,
+                &self.paths,
+                &state,
+                &DetachedRunnerExecutor,
+            );
+            let reply = if mac_worker::controller::is_read_command(request.command()) {
+                mac_worker::controller::read::serve_read_command(&request, &client)
+            } else {
+                ControllerStore::open(&self.paths.controller_state_root())?
+                    .handle_with(&request, &FakeControllerExecutor, ControllerFault::None)
+                    .and_then(|ack| encode_json_frame(&ack))
+            };
+            let (status, stdout) = match reply {
+                Ok(frame) => (0, frame),
+                Err(error) => (
+                    1 << 8,
+                    encode_json_frame(
+                        &HostControlError::new(error.public_code(), error.public_message())
+                            .unwrap(),
+                    )?,
+                ),
+            };
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(status),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    let config =
+        Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n").unwrap();
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let legacy = LegacyDispatch { paths, config };
+    for _ in 0..2 {
+        let health = mac_worker::controller::health_read::fetch_controller_health(
+            &legacy,
+            &legacy.config.controller,
+        );
+        assert_eq!(
+            health.state,
+            mac_worker::controller::health_read::HealthState::Unsupported
+        );
+    }
+    assert_eq!(
+        store.pending_health(1_000).unwrap().active_count,
+        0,
+        "diagnostics against old controllers must not create orphan retry work"
+    );
+}
+
+#[test]
+fn additive_health_selector_round_trips_without_opening_a_task_store() {
+    struct Loopback {
+        paths: PathLayout,
+        config: Config,
+    }
+    impl ProcessRunner for Loopback {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let mut stdout = Vec::new();
+            serve_rpc_with_runtime(
+                &self.paths,
+                &self.config,
+                &OldController,
+                &mut Cursor::new(request.stdin.as_ref().unwrap()),
+                &mut stdout,
+                ControllerFault::None,
+            )?;
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let runner = Loopback {
+        paths: paths(temp.path()),
+        config: Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n").unwrap(),
+    };
+    let status = mac_worker::controller::health_read::fetch_controller_health(
+        &runner,
+        &runner.config.controller,
+    );
+    assert_eq!(
+        status.state,
+        mac_worker::controller::health_read::HealthState::Stale
+    );
+    assert_eq!(
+        status.reason,
+        mac_worker::controller::health_read::HealthReason::Missing
+    );
+    assert!(!runner.paths.state.exists());
+    assert!(!runner.paths.controller_state_root().exists());
+}

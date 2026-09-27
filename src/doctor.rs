@@ -52,7 +52,10 @@ impl DoctorService<'_> {
         // Controller health is an additive read, also available on laptops
         // whose execution inventory lives entirely on the controller host.
         let controller = self.config.controller.enabled.then(|| {
-            crate::controller::health_read::fetch_controller_health(self.runner, &self.config.controller)
+            crate::controller::health_read::fetch_controller_health(
+                self.runner,
+                &self.config.controller,
+            )
         });
         let controller_only = controller.is_some() && self.config.workers.is_empty();
         let mut issues = if controller_only {
@@ -62,10 +65,14 @@ impl DoctorService<'_> {
         };
         issues.extend(controller_issues(controller.as_ref()));
         let eligible_worker_count = if controller_only {
-            usize::from(controller.as_ref().is_some_and(|status| matches!(status.state,
-                crate::controller::health_read::HealthState::Healthy
-                | crate::controller::health_read::HealthState::Running
-                | crate::controller::health_read::HealthState::Degraded)))
+            usize::from(controller.as_ref().is_some_and(|status| {
+                matches!(
+                    status.state,
+                    crate::controller::health_read::HealthState::Healthy
+                        | crate::controller::health_read::HealthState::Running
+                        | crate::controller::health_read::HealthState::Degraded
+                )
+            }))
         } else {
             eligible_worker_count
         };
@@ -168,7 +175,9 @@ fn controller_issues(
     status: Option<&crate::controller::health_read::ControllerHealthStatus>,
 ) -> Vec<DoctorIssue> {
     use crate::controller::health_read::HealthState;
-    let Some(status) = status else { return Vec::new(); };
+    let Some(status) = status else {
+        return Vec::new();
+    };
     let (severity, code) = match status.state {
         HealthState::Healthy | HealthState::Running => return Vec::new(),
         HealthState::Degraded => (IssueSeverity::Warning, "CONTROLLER_HEALTH_DEGRADED"),
