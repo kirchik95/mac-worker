@@ -820,6 +820,10 @@ fn diff_uses_private_index_and_bounds_escaped_output() {
 fn closed_task_diff_uses_retained_base_and_result() {
     let (_temp, store, base_oid) = store_with_mirror();
     let head = publish_and_close(&store, base_oid.clone());
+    // finish_turn records the published commit. Prepare's initial head is the
+    // base, and a closed diff must not treat that as the result.
+    let head_oid: BaseOid = head.parse().unwrap();
+    write_head_oid(&store, Some(head_oid));
     let mirror = store.mirror(PROJECT_ID).unwrap();
     let expected = expected_mirror_diff(mirror.path(), base_oid.as_str(), &head, false);
     assert!(
@@ -839,13 +843,6 @@ fn closed_task_diff_uses_retained_base_and_result() {
         .unwrap();
     assert_eq!(stat.text(), expected_stat);
     assert!(stat.text().contains("a.txt"));
-
-    let head_oid: BaseOid = head.parse().unwrap();
-    write_head_oid(&store, Some(head_oid));
-    let recorded = TaskStore::new(&store, &SystemProcessRunner)
-        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
-        .unwrap();
-    assert_eq!(recorded.text(), expected);
 
     let removed_base = git_status(
         mirror.path(),
@@ -947,6 +944,28 @@ fn closed_task_diff_refuses_a_result_that_does_not_match_the_record() {
     assert_eq!(
         error.public_message(),
         "task workspace is closed and its retained commits do not match the task record"
+    );
+}
+
+#[test]
+fn discarded_task_diff_is_not_task_not_found() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    publish_and_close(&store, base_oid);
+    TaskStore::new(&store, &SystemProcessRunner)
+        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), true))
+        .unwrap();
+    assert_eq!(
+        store.task_status(PROJECT_ID, task_id()).unwrap().state(),
+        TaskState::Abandoned
+    );
+
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .diff(&TaskDiffRequest::new(PROJECT_ID, task_id(), false))
+        .unwrap_err();
+    assert_ne!(error.public_code(), "TASK_NOT_FOUND");
+    assert_eq!(
+        error.public_message(),
+        "task workspace is closed and its result is no longer retained"
     );
 }
 

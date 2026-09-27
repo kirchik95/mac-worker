@@ -768,7 +768,23 @@ impl<'a> TaskStore<'a> {
         request.validate()?;
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let meta = self.read_meta(&task)?;
-        let workspace = self.open_workspace(&task)?;
+        let status = self.read_status(&task)?;
+        if diff_uses_retained_objects(&task, &status)? {
+            self.diff_retained(request.project_id(), &meta, &status, request.stat())
+        } else {
+            self.diff_workspace(&task, &meta, request.stat())
+        }
+    }
+
+    /// Diff the live workspace, including uncommitted files, through a private
+    /// index so the repository index is left unchanged.
+    fn diff_workspace(
+        &self,
+        task: &RootedDir,
+        meta: &TaskMeta,
+        stat: bool,
+    ) -> Result<TaskDiffResponse, WorkerError> {
+        let workspace = self.open_workspace(task)?;
         let index_path = self.git_index_path(workspace.path())?;
         let index_bytes = fs::read(&index_path).map_err(|error| {
             task_error("DIFF_FAILED", format!("could not read Git index: {error}"))
@@ -806,12 +822,12 @@ impl<'a> TaskStore<'a> {
         let add = match add {
             Ok(add) => add,
             Err(error) => {
-                let _ = remove_temporary_index(&task, &temporary_name);
+                let _ = remove_temporary_index(task, &temporary_name);
                 return Err(task_error("DIFF_FAILED", error.to_string()));
             }
         };
         if !add.status.success() {
-            let _ = remove_temporary_index(&task, &temporary_name);
+            let _ = remove_temporary_index(task, &temporary_name);
             return Err(task_error(
                 "DIFF_FAILED",
                 String::from_utf8_lossy(&add.stderr).trim().to_owned(),
@@ -823,12 +839,12 @@ impl<'a> TaskStore<'a> {
             workspace.path().as_os_str().to_os_string(),
             OsString::from("diff"),
         ];
-        if request.stat() {
+        if stat {
             diff_args.push(OsString::from("--stat"));
         }
         diff_args.push(meta.base_oid().to_string().into());
         let result = self.runner.run(&git_request(diff_args, temporary_index));
-        let cleanup = remove_temporary_index(&task, &temporary_name);
+        let cleanup = remove_temporary_index(task, &temporary_name);
         if let Err(error) = cleanup {
             return Err(task_error(
                 "DIFF_FAILED",
@@ -844,6 +860,86 @@ impl<'a> TaskStore<'a> {
         }
         let (text, truncated) = bound_diff(&result.stdout)?;
         Ok(TaskDiffResponse::new(text, truncated))
+    }
+
+    /// Diff a closed task from the base and result commits kept in the host
+    /// mirror. The result pin is `refs/heads/task/<id>` (the same ref upload
+    /// advertises). GC drops that pin before it prunes objects, so a missing
+    /// pin is "no longer retained" even while the object still exists.
+    fn diff_retained(
+        &self,
+        project_id: &str,
+        meta: &TaskMeta,
+        status: &TaskStatus,
+        stat: bool,
+    ) -> Result<TaskDiffResponse, WorkerError> {
+        let Some(mirror) = self.store.mirror_if_present(project_id)? else {
+            return Err(result_not_retained());
+        };
+        let result_ref = format!("refs/heads/task/{}", meta.task_id());
+        let Some(result) = self.read_ref(&mirror, &result_ref)? else {
+            return Err(result_not_retained());
+        };
+        if let Some(head) = status.head_oid()
+            && head.as_str() != result
+        {
+            return Err(retained_commits_mismatch());
+        }
+        if !self.mirror_has_commit(&mirror, &result)? {
+            return Err(result_not_retained());
+        }
+        let base = meta.base_oid().as_str();
+        let base_ref = format!("refs/mac-worker/bases/{}", meta.task_id());
+        if let Some(pinned) = self.read_ref(&mirror, &base_ref)?
+            && pinned != base
+        {
+            return Err(retained_commits_mismatch());
+        }
+        if !self.mirror_has_commit(&mirror, base)? {
+            return Err(result_not_retained());
+        }
+
+        let mut args = vec![
+            OsString::from("--git-dir"),
+            mirror.path().as_os_str().to_os_string(),
+            OsString::from("diff"),
+        ];
+        if stat {
+            args.push(OsString::from("--stat"));
+        }
+        args.push(OsString::from("--end-of-options"));
+        args.push(OsString::from(base));
+        args.push(OsString::from(&result));
+        let diff = self
+            .runner
+            .run(&git_request(args, None))
+            .map_err(|error| task_error("DIFF_FAILED", error.to_string()))?;
+        if !diff.status.success() {
+            return Err(task_error(
+                "DIFF_FAILED",
+                String::from_utf8_lossy(&diff.stderr).trim().to_owned(),
+            ));
+        }
+        let (text, truncated) = bound_diff(&diff.stdout)?;
+        Ok(TaskDiffResponse::new(text, truncated))
+    }
+
+    fn mirror_has_commit(&self, mirror: &RootedDir, oid: &str) -> Result<bool, WorkerError> {
+        let result = self
+            .runner
+            .run(&git_request(
+                vec![
+                    OsString::from("--git-dir"),
+                    mirror.path().as_os_str().to_os_string(),
+                    OsString::from("cat-file"),
+                    OsString::from("-t"),
+                    OsString::from("--end-of-options"),
+                    OsString::from(oid),
+                ],
+                None,
+            ))
+            .map_err(|error| task_error("DIFF_FAILED", error.to_string()))?;
+        Ok(result.status.success() && String::from_utf8_lossy(&result.stdout).trim() == "commit")
     }
 
     pub fn close(&self, request: &TaskCloseRequest) -> Result<TaskCloseResponse, WorkerError> {
@@ -2228,6 +2324,30 @@ fn require_task_execution_lease(
 
 fn task_not_found() -> WorkerError {
     task_error("TASK_NOT_FOUND", "task metadata or workspace is absent")
+}
+
+fn result_not_retained() -> WorkerError {
+    task_error(
+        "RESULT_NOT_RETAINED",
+        "task workspace is closed and its result is no longer retained",
+    )
+}
+
+fn retained_commits_mismatch() -> WorkerError {
+    task_error(
+        "DIFF_FAILED",
+        "task workspace is closed and its retained commits do not match the task record",
+    )
+}
+
+/// Closed tasks always diff the mirror. Other terminal states do too once
+/// the workspace is gone, so a discarded or lost task is not reported as
+/// missing while its metadata still exists.
+fn diff_uses_retained_objects(task: &RootedDir, status: &TaskStatus) -> Result<bool, WorkerError> {
+    if status.state() == TaskState::Closed {
+        return Ok(true);
+    }
+    Ok(status.state().is_terminal() && !task.entry_exists("workspace")?)
 }
 
 fn task_error(
