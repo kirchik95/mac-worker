@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod protocol;
 pub mod read;
 pub mod registry;
+pub mod runtime;
 pub mod store;
 pub mod stream_client;
 pub mod stream_rpc;

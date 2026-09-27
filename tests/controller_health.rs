@@ -79,7 +79,7 @@ fn repeated_failures_are_counted_without_hiding_neighbor_progress() {
             &store,
             &FailingRequest,
             || Ok(ReconcileReport::default()),
-            end,
+            || Ok(end),
         );
         health.begin_tick(end - 10);
         health.finish_tick(end, 10, &report);

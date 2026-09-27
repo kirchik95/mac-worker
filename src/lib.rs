@@ -750,7 +750,9 @@ pub fn run_with_stdio_in_context(
         return run_task_command(cli, runner, runtime, stdout, stderr);
     }
     if let Command::Controller { command } = cli.command {
-        return run_controller_command(command, cli.json, cli.config, runtime, runner, stdout, stderr);
+        return run_controller_command(
+            command, cli.json, cli.config, runtime, runner, stdout, stderr,
+        );
     }
     run_with_rsync_executor_in_context(
         cli,
@@ -908,8 +910,11 @@ fn run_controller_command(
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
         if matches!(command, ControllerCommand::Status) {
-            let status = crate::controller::health_read::read_health_status(&paths.controller_state_root())
-                .unwrap_or_else(|error| crate::controller::health_read::ControllerHealthStatus::unavailable(&error));
+            let status =
+                crate::controller::health_read::read_health_status(&paths.controller_state_root())
+                    .unwrap_or_else(|error| {
+                        crate::controller::health_read::ControllerHealthStatus::unavailable(&error)
+                    });
             if json {
                 serde_json::to_writer(&mut *stdout, &status).map_err(std::io::Error::other)?;
                 writeln!(stdout)?;
@@ -921,41 +926,99 @@ fn run_controller_command(
         }
         let config = load_controller_process_config(&paths)?;
         let state_root = paths.controller_state_root();
-        let _leader = crate::controller::ControllerLeader::acquire(&state_root)?;
+        use crate::controller::{
+            health::{ControllerHealth, ControllerTickReport, HealthLogger, HealthStore},
+            leader::now_millis,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let leader = crate::controller::ControllerLeader::acquire(&state_root)?;
         let store = crate::controller::ControllerStore::open(&state_root)?;
         let client_state = ClientStateStore::open(&paths.state)?;
-        let handler =
-            crate::controller::TaskSubmitHandler::new(runner, &config, &paths, &client_state);
-        let initial_tick = crate::controller::tick_controller_leader(&store, &handler);
-        initial_tick.bootstrap?;
-        initial_tick.resume?;
+        let health_store = HealthStore::open(&state_root)?;
+        let mut health = ControllerHealth::new(leader.identity(), now_millis()?);
+        health_store.write(&health)?;
+        let mut logger = HealthLogger::default();
+        let shutdown = AtomicBool::new(false);
+        let interruptible =
+            crate::controller::runtime::ControllerProcessRunner::new(runner, &shutdown);
+        let handler = crate::controller::TaskSubmitHandler::new(
+            &interruptible,
+            &config,
+            &paths,
+            &client_state,
+        );
         let client = TaskClient::new(
-            runner,
+            &interruptible,
             &config,
             &paths,
             &client_state,
             &DETACHED_TASK_EXECUTOR,
         );
-        client.client_state.recover_replacement_residue()?;
-        client.tick_selected_recovery()?;
-        writeln!(stdout, "controller leader acquired").map_err(WorkerError::Io)?;
-        stdout.flush().map_err(WorkerError::Io)?;
         let async_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(WorkerError::Io)?;
-        async_runtime.block_on(async {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = interval.tick() => {
-                        let _ = crate::controller::tick_controller_leader(&store, &handler);
-                        let _ = client.tick_selected_recovery();
-                    }
+        // Register before announcing readiness, including before the first tick.
+        let (mut interrupt, mut terminate) = {
+            let _entered = async_runtime.enter();
+            (
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            )
+        };
+        writeln!(stdout, "controller leader acquired")?;
+        stdout.flush()?;
+        let mut first_tick = true;
+        let result = crate::controller::runtime::run_tick_loop(
+            &async_runtime,
+            &shutdown,
+            || {
+                let start = now_millis()?;
+                let monotonic_start = std::time::Instant::now();
+                let previous_success = health.last_success_millis;
+                health.begin_tick(start);
+                if let Err(error) = health_store.write(&health) {
+                    health.record_failure(&error.public_code(), start);
                 }
-            }
-        });
+                let report = ControllerTickReport::collect(
+                    &store,
+                    &handler,
+                    || {
+                        if shutdown.load(Ordering::Acquire) {
+                            return Err(crate::error::ProcessError::Cancelled.into());
+                        }
+                        if first_tick {
+                            client.client_state.recover_replacement_residue()?;
+                            first_tick = false;
+                        }
+                        client.tick_selected_recovery()
+                    },
+                    now_millis,
+                );
+                let end = now_millis()?;
+                let duration =
+                    u64::try_from(monotonic_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                health.finish_tick(end, duration, &report);
+                if let Err(error) = health_store.write(&health) {
+                    health.last_success_millis = previous_success;
+                    health.record_failure(&error.public_code(), end);
+                }
+                Ok(logger.failure_line(&health, end))
+            },
+            async {
+                tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+            },
+            |line| {
+                writeln!(stderr, "{line}")?;
+                stderr.flush()?;
+                Ok(())
+            },
+        );
+        // Join has finished: publish stopped before dropping the leader lock.
+        health.stopped_at_millis = Some(now_millis()?);
+        let final_write = health_store.write(&health);
+        result?;
+        final_write?;
         Ok(())
     })();
 

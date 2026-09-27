@@ -407,9 +407,8 @@ impl ControllerStore {
             match self.read_pending(&name) {
                 Ok(receipt) => {
                     let age = now_millis.saturating_sub(receipt.created_at_millis);
-                    health.oldest_pending_age_millis = Some(
-                        health.oldest_pending_age_millis.unwrap_or(0).max(age),
-                    );
+                    health.oldest_pending_age_millis =
+                        Some(health.oldest_pending_age_millis.unwrap_or(0).max(age));
                 }
                 Err(_) => health.age_incomplete = true,
             }

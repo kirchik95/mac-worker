@@ -399,9 +399,37 @@ worker controller run
 
 That process takes the leader lock, resumes unfinished requests and bounded active tasks, prints `controller leader acquired`, and stays in the foreground until you stop it. Keep it running for **autonomous** progress (recovery, DAG readiness, turn runners). Laptop task commands use a separate `host controller-rpc` over SSH; that helper can accept and persist a queued submit even when the leader is not up. Do not treat a missing leader as a transport failure, and do not assume every RPC requires a live `controller run`. A second live `controller run` on the same host is `CONTROLLER_LOCK_HELD`. Restart is stop, then `worker controller run` again — it resumes the same store. This is not `launchd` and is not started from the MacBook as a local daemon.
 
-The controller host owns the worker list used for dispatch. A laptop config with `[controller] enabled = true` may omit `[[workers]]`. Laptop commands that then fail with `at least one worker is required` are `worker setup`, `worker doctor`, `worker workers`, `worker run`, streaming `worker logs`, and `worker gc`. Public job `status` and `cancel` stay laptop-local and do **not** use that inventory error. That is explicit, not empty-pool scheduling.
+The controller host owns the worker list used for dispatch. A laptop config with `[controller] enabled = true` may omit `[[workers]]`. Laptop commands that then fail with `at least one worker is required` are `worker setup`, `worker workers`, `worker run`, streaming `worker logs`, and `worker gc`. Public job `status` and `cancel` stay laptop-local and do **not** use that inventory error. That is explicit, not empty-pool scheduling.
 
 These stay on the laptop even when the controller is enabled: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Turn runners run on the controller host, not on the MacBook.
+
+### Health and shutdown
+
+On the **controller host**, use `worker controller status` or `worker controller status --json`.
+This is a local, read-only diagnostic. The JSON includes the leader PID and process start time,
+binary version, tick start/end/duration, last success and progress, failure counts by public code,
+active request count and oldest pending age, and scheduling truncation/cursor flags. Unknown
+pending ages are marked incomplete. Counts cover the current leader invocation; an idle successful
+tick updates success without inventing progress.
+
+The leader writes owner-only `health.json` in the controller state directory using atomic replacement.
+The record is capped at 16 KiB and 32 failure-code buckets (overflow uses `PROTOCOL`); it contains
+no request bodies or raw error messages. Failed ticks also produce a code-only stderr line at most
+once per 30 seconds, with cumulative counts so repeated failures stay visible. Ticks run with a
+2-second pause between them. A stopped or absent leader, reused PID, or record older than 10 seconds
+is **stale**. An unverifiable process identity is **unknown**, never proof that its work exited.
+A long-running tick becomes stale until it finishes; inspect its duration and last progress.
+
+On the **laptop**, `worker doctor [--json]` includes controller health over the existing authenticated
+controller RPC. An older controller produces an upgrade/restart message. A controller-only laptop
+needs no local worker inventory for this check: doctor checks its project/snapshot and controller
+health; execution-worker capacity still belongs to the controller host. Local inventory checks remain
+available when the laptop config includes workers. Stale/unknown/unavailable health blocks doctor
+readiness; reported tick failures are warnings and remain visible in the controller section.
+
+Ctrl-C or SIGTERM stops scheduling ticks, cancels interruptible Git/SSH subprocess I/O, and joins the
+active tick before writing the stopped record and releasing the leader lock. Filesystem operations
+and code without an interruption hook must finish before that join completes.
 
 ### Submit, disconnect, reconnect
 

@@ -42,12 +42,12 @@ impl ControllerTickReport {
         store: &ControllerStore,
         handler: &dyn ControllerCommandHandler,
         recovery: impl FnOnce() -> Result<ReconcileReport, WorkerError>,
-        now_millis: u64,
+        clock: impl FnOnce() -> Result<u64, WorkerError>,
     ) -> Self {
         Self {
             requests: tick_controller_leader(store, handler),
             recovery: recovery(),
-            pending: store.pending_health(now_millis),
+            pending: clock().and_then(|now| store.pending_health(now)),
         }
     }
 }
