@@ -5359,8 +5359,8 @@ impl<'de> Deserialize<'de> for PreacceptanceDisposition {
 pub struct HostControlErrorDetail {
     code: String,
     message: String,
-    /// Exit category from a helper that shares the laptop catalog.
-    /// Older helpers omit it; the laptop then keeps today's mapping.
+    /// Optional category from a future helper. The laptop's catalog takes
+    /// precedence; current helpers omit this field for older laptops.
     category: Option<String>,
 }
 
@@ -5430,7 +5430,6 @@ impl Serialize for HostControlErrorDetail {
 impl<'de> Deserialize<'de> for HostControlErrorDetail {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Wire {
             code: String,
             message: String,

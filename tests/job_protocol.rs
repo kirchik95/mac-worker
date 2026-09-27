@@ -763,6 +763,73 @@ fn resolution_outcomes_uncertainty_and_host_errors_are_strict_and_bounded() {
 }
 
 #[test]
+fn host_control_error_details_allow_future_fields_but_validate_known_fields() {
+    let wire = serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "error": {
+            "code": "TASK_BUSY",
+            "message": "task operation failed",
+            "future": {"nested": [1, true, null]},
+        },
+    });
+    for category in [
+        None,
+        Some("usage"),
+        Some("unavailable"),
+        Some("infrastructure"),
+        Some("io"),
+        Some("capacity"),
+    ] {
+        let mut value = wire.clone();
+        if let Some(category) = category {
+            value["error"]["category"] = category.into();
+        }
+        let decoded: HostControlError = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.error().code(), "TASK_BUSY");
+        assert_eq!(decoded.error().message(), "task operation failed");
+        assert_eq!(decoded.error().category(), category);
+    }
+    for (field, value) in [
+        ("code", serde_json::json!("invalid-code")),
+        ("code", serde_json::json!("X".repeat(129))),
+        ("code", serde_json::json!(null)),
+        ("message", serde_json::json!("unsafe\nmessage")),
+        ("message", serde_json::json!("X".repeat(4097))),
+        ("message", serde_json::json!(42)),
+        ("category", serde_json::json!("unknown")),
+        ("category", serde_json::json!(42)),
+    ] {
+        let mut invalid = wire.clone();
+        invalid["error"][field] = value;
+        assert!(
+            serde_json::from_value::<HostControlError>(invalid).is_err(),
+            "accepted invalid {field}"
+        );
+    }
+    for field in ["code", "message"] {
+        let mut invalid = wire.clone();
+        invalid["error"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<HostControlError>(invalid).is_err());
+    }
+    for detail in [
+        r#""code":"A","code":"B","message":"m""#,
+        r#""code":"A","message":"m","message":"n""#,
+        r#""code":"A","message":"m","category":"io","category":"usage""#,
+    ] {
+        let invalid = format!(
+            r#"{{"protocol_version":{PROTOCOL_VERSION},"error":{{{detail},"future":true}}}}"#
+        );
+        assert!(serde_json::from_str::<HostControlError>(&invalid).is_err());
+    }
+    let mut invalid = wire.clone();
+    invalid["protocol_version"] = (PROTOCOL_VERSION + 1).into();
+    assert!(serde_json::from_value::<HostControlError>(invalid).is_err());
+    let mut invalid = wire;
+    invalid["future_envelope_field"] = true.into();
+    assert!(serde_json::from_value::<HostControlError>(invalid).is_err());
+}
+
+#[test]
 fn host_control_error_messages_reject_control_characters_but_allow_unicode_and_spaces() {
     let message = "worker ещё выполняет задачу — retry later";
     let error = HostControlError::new("JOB_STILL_RUNNING", message).unwrap();

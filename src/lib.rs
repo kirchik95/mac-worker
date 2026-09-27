@@ -3462,27 +3462,21 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
     if let WorkerError::Protocol(message) = error
         && let Some((code, detail)) = message.split_once(": ")
         && crate::error::is_stable_public_code(code)
-        && let Ok(encoded) = classified_host_error(code, detail, error)
+        && let Ok(encoded) = HostControlError::new(code, detail)
     {
         return encoded;
     }
     let (code, message) = host_error_parts(error);
-    classified_host_error(&code, &message, error).expect("fixed host error is valid")
-}
-
-fn classified_host_error(
-    code: &str,
-    message: &str,
-    error: &WorkerError,
-) -> Result<HostControlError, WorkerError> {
-    HostControlError::with_category(code, message, error.exit_kind().as_wire())
+    // Older laptops reject unknown detail fields. Keep host emission on the
+    // original wire shape; current laptops classify known codes locally.
+    HostControlError::new(code, message).expect("fixed host error is valid")
 }
 
 fn host_error_parts(error: &WorkerError) -> (String, String) {
     match error {
         // A public admission reason is fixed inventory text by the contract on
         // `WorkerError::capacity`. It still travels on the wire. The laptop
-        // prints the catalog hint, not this string, once `category` is set.
+        // restores catalogued public text and hints without trusting this string.
         WorkerError::Capacity {
             code,
             message,
@@ -3656,19 +3650,18 @@ mod versioned_host_error_tests {
             assert!(!local_text.contains("PLANTED"), "{local_text}");
 
             let wire = versioned_host_error(&local);
-            assert_eq!(
-                wire.error().category(),
-                Some(local.exit_kind().as_wire()),
-                "{}",
-                local.public_code()
-            );
+            assert_eq!(wire.error().category(), None, "{}", local.public_code());
             let encoded = serde_json::to_string(&wire).unwrap();
+            assert!(!encoded.contains("\"category\""), "{encoded}");
             assert!(
                 !encoded.contains("PLANTED"),
                 "{} wire leaked a path: {encoded}",
                 local.public_code()
             );
             assert_same_decoded(&local, &wire, hint);
+
+            let legacy_wire = HostControlError::new(local.public_code(), planted).unwrap();
+            assert_same_decoded(&local, &legacy_wire, hint);
 
             let planted_wire = HostControlError::with_category(
                 local.public_code(),
@@ -3715,18 +3708,18 @@ mod versioned_host_error_tests {
     }
 
     #[test]
-    fn helpers_without_a_category_keep_todays_task_busy_mapping() {
+    fn helpers_without_a_category_use_the_local_catalog() {
         let planted = "/Users/alice/PLANTED_HOST_PATH";
         let wire = HostControlError::new("TASK_BUSY", planted).unwrap();
         assert!(wire.error().category().is_none());
         let mut bytes = serde_json::to_vec(&wire).unwrap();
         bytes.push(b'\n');
         let decoded = crate::transfer::decode_host_control_error(&bytes).unwrap();
-        assert_eq!(decoded.exit_code(), 70);
-        assert_eq!(decoded.public_message(), "protocol error");
+        assert_eq!(decoded.exit_code(), 64);
+        assert_eq!(decoded.public_message(), "task error");
         assert!(!decoded.public_message().contains("PLANTED"));
         let controller = crate::controller::execute::host_control_to_worker(&wire);
-        assert_eq!(controller.exit_code(), 70);
+        assert_eq!(controller.exit_code(), 64);
         assert!(!controller.public_message().contains("PLANTED"));
     }
 
@@ -3738,10 +3731,45 @@ mod versioned_host_error_tests {
             "usage",
         )
         .unwrap();
-        let decoded = crate::controller::execute::host_control_to_worker(&wire);
-        assert_eq!(decoded.exit_code(), 75);
-        assert_eq!(decoded.public_code(), "CAPACITY_BUSY");
-        assert!(!crate::error::operator_diagnostic(&decoded).contains("PLANTED"));
+        let local = WorkerError::capacity("CAPACITY_BUSY", "worker busy");
+        assert_same_decoded(
+            &local,
+            &wire,
+            crate::error::hint_for("CAPACITY_BUSY").unwrap(),
+        );
+    }
+
+    #[test]
+    fn unknown_codes_use_a_valid_future_category_or_the_legacy_mapping() {
+        for (category, exit) in [
+            (None, 70),
+            (Some("usage"), 64),
+            (Some("unavailable"), 69),
+            (Some("infrastructure"), 70),
+            (Some("io"), 74),
+            (Some("capacity"), 75),
+        ] {
+            let code = "FUTURE_HOST_ERROR";
+            let planted = "/Users/alice/PLANTED_HOST_PATH";
+            let wire = match category {
+                Some(category) => HostControlError::with_category(code, planted, category),
+                None => HostControlError::new(code, planted),
+            }
+            .unwrap();
+            let mut bytes = serde_json::to_vec(&wire).unwrap();
+            bytes.push(b'\n');
+            let host = crate::transfer::decode_host_control_error(&bytes).unwrap();
+            let controller = crate::controller::execute::host_control_to_worker(&wire);
+            for decoded in [host, controller] {
+                assert_eq!(decoded.exit_code(), exit, "{category:?}");
+                assert_eq!(decoded.public_code(), code);
+                assert!(crate::error::hint_for(code).is_none());
+                assert!(!crate::error::operator_diagnostic(&decoded).contains("PLANTED"));
+                if category.is_none() {
+                    assert_eq!(decoded.public_message(), "protocol error");
+                }
+            }
+        }
     }
 }
 

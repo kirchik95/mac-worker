@@ -722,18 +722,21 @@ pub fn tick_controller_leader(
 mod tests {
     use super::*;
 
-    /// C2 (laptop half): a capacity rejection that crosses the controller RPC
-    /// must come back as a capacity error, not as a generic protocol failure.
-    /// Collapsing it loses the documented exit status 75 and replaces the
-    /// operator-facing reason with the literal "protocol error".
+    /// Catalogued capacity rejections keep their exit and static public reason
+    /// across the controller RPC, without trusting the remote message.
     #[test]
     fn capacity_codes_decode_back_into_capacity_errors() {
-        for code in ["CAPACITY_BUSY", "CAPABILITY_MISSING"] {
-            let wire = HostControlError::new(
-                code,
+        for (code, message) in [
+            (
+                "CAPACITY_BUSY",
                 "no eligible worker currently has an available heavy slot",
-            )
-            .unwrap();
+            ),
+            (
+                "CAPABILITY_MISSING",
+                "a required capability is not available",
+            ),
+        ] {
+            let wire = HostControlError::new(code, "/Users/alice/PLANTED_HOST_PATH").unwrap();
             let error = host_control_to_worker(&wire);
             assert!(
                 matches!(error, WorkerError::Capacity { .. }),
@@ -742,22 +745,22 @@ mod tests {
             assert_eq!(error.public_code(), code);
             assert_eq!(
                 error.public_message(),
-                "no eligible worker currently has an available heavy slot",
-                "{code} lost its operator-facing reason"
+                message,
+                "{code} lost its catalog reason"
             );
             assert_eq!(error.exit_code(), 75, "{code} lost the capacity category");
         }
     }
 
-    /// The narrow allow-list must not swallow other codes: controller outages
-    /// and every other error keep today's mapping.
+    /// Known outages use the catalog; uncatalogued errors keep the legacy mapping.
     #[test]
     fn other_host_codes_keep_their_existing_mapping() {
         let unavailable = host_control_to_worker(
             &HostControlError::new("CONTROLLER_UNAVAILABLE", "down").unwrap(),
         );
-        assert!(matches!(unavailable, WorkerError::Unavailable(_)));
+        assert!(matches!(unavailable, WorkerError::Transport { .. }));
         assert_eq!(unavailable.public_code(), "CONTROLLER_UNAVAILABLE");
+        assert_eq!(unavailable.exit_code(), 69);
 
         let conflict = host_control_to_worker(
             &HostControlError::new("CONTROLLER_REQUEST_CONFLICT", "bound elsewhere").unwrap(),
@@ -793,6 +796,29 @@ mod tests {
             error.public_message(),
             "no eligible worker currently has an available heavy slot"
         );
+    }
+
+    #[test]
+    fn framed_host_error_accepts_unknown_detail_fields() {
+        let reply = serde_json::json!({
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
+            "error": {
+                "code": "TASK_BUSY",
+                "message": "/Users/alice/PLANTED_HOST_PATH",
+                "future": {"nested": [true]},
+            },
+        });
+        let result = ProcessResult {
+            status: <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(
+                64 << 8,
+            ),
+            stdout: crate::controller::protocol::encode_json_frame(&reply).unwrap(),
+            stderr: Vec::new(),
+        };
+        let error = decode_controller_stdout(&result).expect_err("host error frame");
+        assert_eq!(error.public_code(), "TASK_BUSY");
+        assert_eq!(error.exit_code(), 64);
+        assert!(!crate::error::operator_diagnostic(&error).contains("PLANTED"));
     }
     use crate::agent::{AgentKind, PermissionPolicy};
     use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};

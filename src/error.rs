@@ -12,6 +12,7 @@ pub enum ExitKind {
 }
 
 impl ExitKind {
+    #[cfg(test)]
     pub(crate) fn as_wire(self) -> &'static str {
         match self {
             Self::Usage => "usage",
@@ -67,6 +68,10 @@ pub enum WorkerError {
     Unavailable(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A future helper's uncatalogued code with a validated exit category.
+    /// Remote message text is deliberately not retained or displayed.
+    #[error("host error [{code}]")]
+    HostControl { code: String, category: ExitKind },
     #[error("project error [{code}]: {message}")]
     Project { code: &'static str, message: String },
     #[error("snapshot error [{code}]: {message}")]
@@ -126,6 +131,7 @@ impl WorkerError {
             Self::Unavailable(_) => ExitKind::Unavailable,
             Self::Capacity { .. } => ExitKind::Capacity,
             Self::Transport { .. } => ExitKind::Unavailable,
+            Self::HostControl { category, .. } => *category,
             Self::Git { code, .. } => git_exit_kind(code),
             Self::Agent { code, .. } => agent_exit_kind(code),
             Self::Task { code, .. } => task_exit_kind(code),
@@ -161,6 +167,7 @@ impl WorkerError {
             Self::Config(message) => coded_prefix(message).unwrap_or("CONFIG").to_owned(),
             Self::Unavailable(message) => coded_prefix(message).unwrap_or("UNAVAILABLE").to_owned(),
             Self::Protocol(message) => coded_prefix(message).unwrap_or("PROTOCOL").to_owned(),
+            Self::HostControl { code, .. } => stable_public_code(code, "HOST_CONTROL"),
             Self::CommandExit { .. } => "COMMAND_EXIT".to_owned(),
             Self::Io(_) | Self::HostIo { .. } => "IO".to_owned(),
             Self::Process(_) => "PROCESS".to_owned(),
@@ -191,6 +198,7 @@ impl WorkerError {
             Self::Config(_) => "configuration error".into(),
             Self::Unavailable(_) => "worker unavailable".into(),
             Self::Protocol(_) => "protocol error".into(),
+            Self::HostControl { .. } => "host request failed".into(),
             Self::CommandExit { .. } => "command exited".into(),
             Self::Io(_) | Self::HostIo { .. } => "I/O error".into(),
             Self::Process(_) => "process error".into(),
@@ -487,12 +495,17 @@ pub(crate) fn catalog_contains(code: &str) -> bool {
     CATALOG.iter().any(|entry| entry.code == code)
 }
 
-/// Rebuilds a catalogued error from a helper that sent an exit category.
-/// The wire message is ignored. Missing or unknown categories return `None`
-/// so the caller can keep the pre-catalog mapping.
+/// The local catalog owns known codes regardless of the helper's category.
+/// Uncatalogued codes may use a validated future category; otherwise the caller
+/// keeps its legacy mapping. Neither path trusts the remote message.
 pub(crate) fn error_from_host_category(code: &str, category: Option<&str>) -> Option<WorkerError> {
-    ExitKind::from_wire(category?)?;
-    catalog_error(code)
+    catalog_error(code).or_else(|| {
+        let category = ExitKind::from_wire(category?)?;
+        Some(WorkerError::HostControl {
+            code: code.to_owned(),
+            category,
+        })
+    })
 }
 
 fn catalog_error(code: &str) -> Option<WorkerError> {
@@ -511,10 +524,13 @@ fn build_catalog_error(code: &'static str) -> WorkerError {
         | "TASK_CONFIG_INVALID"
         | "FOLLOWUP_LIMIT"
         | "TASK_REVISION_CONFLICT"
-        | "RESULT_NOT_RETAINED"
         | "RUNNER_HANDOFF_FAILED"
         | "WAIT_TIMEOUT"
         | "WAIT_BLOCKED" => WorkerError::task(code, "task error"),
+        "RESULT_NOT_RETAINED" => WorkerError::task(
+            code,
+            "task workspace is closed and its result is no longer retained",
+        ),
         "NOT_A_WORKTREE" => WorkerError::Project {
             code,
             message: "project error".into(),
@@ -1048,6 +1064,31 @@ mod tests {
             let diagnostic = super::operator_diagnostic(&error);
             assert!(diagnostic.contains(hint), "{diagnostic}");
             assert_eq!(super::hint_for(entry.code), Some(hint), "{}", entry.code);
+        }
+    }
+
+    #[test]
+    fn catalog_codes_override_every_wire_category_including_absent() {
+        for entry in super::public_error_catalog() {
+            for category in [
+                None,
+                Some("usage"),
+                Some("unavailable"),
+                Some("infrastructure"),
+                Some("io"),
+                Some("capacity"),
+            ] {
+                let error = super::error_from_host_category(entry.code, category)
+                    .expect("catalog code must not depend on a wire category");
+                assert_eq!(error.public_code(), entry.code);
+                assert_eq!(
+                    error.exit_code(),
+                    entry.exit,
+                    "{} / {category:?}",
+                    entry.code
+                );
+                assert!(super::operator_diagnostic(&error).contains(entry.hint.unwrap()));
+            }
         }
     }
 

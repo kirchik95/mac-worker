@@ -1509,6 +1509,9 @@ pub(crate) fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let error = HostControlError::deserialize(&mut deserializer).ok()?;
     deserializer.end().ok()?;
+    // SSH control responses must remain byte-canonical. Detail decoding can
+    // accept future fields on other paths, but silently dropping one here would
+    // violate the existing re-encoding check.
     if serde_json::to_vec(&error).ok()?.as_slice() != body {
         return None;
     }
@@ -2764,6 +2767,37 @@ mod exec_inheritance_tests {
 #[cfg(test)]
 mod host_control_error_tests {
     use super::{HostControlError, decode_host_control_error};
+
+    #[test]
+    fn host_error_responses_still_require_canonical_bytes() {
+        let wire = HostControlError::new("TASK_BUSY", "task operation failed").unwrap();
+        let canonical = serde_json::to_string(&wire).unwrap();
+        assert!(decode_host_control_error(format!("{canonical}\n").as_bytes()).is_some());
+        for noncanonical in [
+            canonical.clone(),
+            format!("{canonical}\r\n"),
+            format!("{canonical}\n\n"),
+            format!(" {canonical}\n"),
+            format!("{canonical} {{}}\n"),
+            format!(
+                "{}\n",
+                canonical.replace("\"code\":", "\"future\":true,\"code\":")
+            ),
+            format!(
+                "{}\n",
+                canonical.replace("\"code\":", "\"code\":\"TASK_BUSY\",\"code\":")
+            ),
+            format!(
+                "{}\n",
+                canonical.replace("\"code\":", "\"category\":\"invalid\",\"code\":")
+            ),
+        ] {
+            assert!(
+                decode_host_control_error(noncanonical.as_bytes()).is_none(),
+                "accepted {noncanonical:?}"
+            );
+        }
+    }
 
     #[test]
     fn retained_result_error_keeps_its_static_message() {
