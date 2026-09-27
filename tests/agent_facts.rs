@@ -9,7 +9,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -20,9 +20,10 @@ use fake_herdr::{FakeHerdr, Reply};
 use mac_worker::{
     agent::{AgentKind, adapter_for},
     agent_facts::{
-        AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_TTL, HerdrFactState, HerdrFacts,
-        PROBE_DEADLINE, ProfileProbe, collect_agent_facts_at,
-        collect_agent_facts_at_host_with_timing, collect_agent_facts_at_with_timing,
+        AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_REFRESH_BUDGET_REASON, FACTS_TTL,
+        FactsClock, HerdrFactState, HerdrFacts, PROBE_DEADLINE, ProfileProbe,
+        collect_agent_facts_at, collect_agent_facts_at_host_with_timing,
+        collect_agent_facts_at_with_budget, collect_agent_facts_at_with_timing,
         turn_auth_failure_reason,
     },
     auth_incidents::{self, AUTH_INCIDENT_TTL_MILLIS, AUTH_INCIDENTS_UNREADABLE_REASON},
@@ -2144,5 +2145,222 @@ fn before_publish_lock_keeps_a_peer_process_from_erasing_an_incident() {
     assert_eq!(
         agent_named(&facts, "cursor").auth_by_profile,
         vec![("agents".into(), AgentAuth::UnknownWithReason(reason))]
+    );
+}
+
+struct SharedClock(Mutex<Duration>);
+
+impl FactsClock for SharedClock {
+    fn now(&self) -> Duration {
+        *self.0.lock().expect("facts clock")
+    }
+}
+
+fn budget_reason(auth: AgentAuth) -> bool {
+    auth.reason() == Some(FACTS_REFRESH_BUDGET_REASON)
+}
+
+struct PanicIfRun;
+
+impl ProcessRunner for PanicIfRun {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        panic!("facts collection must not start a process: {request:?}");
+    }
+}
+
+#[test]
+fn zero_budget_records_partial_facts_without_probing() {
+    let clock = SharedClock(Mutex::new(Duration::ZERO));
+    let (facts, _) = collect_agent_facts_at_with_budget(
+        &PanicIfRun,
+        Path::new("/tmp/account"),
+        &[] as &[EnvProfile],
+        1,
+        Duration::ZERO,
+        &clock,
+    );
+    assert!(!facts.git_identity);
+    assert!(facts.herdr.is_none());
+    assert!(facts.origin_https_helpers.is_empty());
+    assert_eq!(
+        facts
+            .agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["codex", "claude", "cursor", "opencode"]
+    );
+    for agent in &facts.agents {
+        assert!(agent.version.is_none(), "{}", agent.name);
+        assert!(budget_reason(agent.auth), "{:?}", agent.auth);
+    }
+    assert_eq!(clock.now(), Duration::ZERO);
+}
+
+struct SlowProbe {
+    clock: Arc<SharedClock>,
+    calls: AtomicUsize,
+}
+
+impl ProcessRunner for SlowProbe {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let shell = request
+            .args
+            .get(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cost = if shell.contains("command -v codex") {
+            Duration::from_millis(100)
+        } else if shell.contains("codex") && shell.contains("login") {
+            request.policy.deadline
+        } else {
+            panic!("unexpected probe after the codex budget: {shell}");
+        };
+        assert!(
+            cost <= request.policy.deadline,
+            "step advanced past its deadline"
+        );
+        *self.clock.0.lock().expect("facts clock") += cost;
+        if shell.contains("command -v codex") {
+            return Ok(ProcessResult {
+                status: 0_i32.into_exit_status(),
+                stdout: b"/opt/tools/codex\nMAC_WORKER_FACTS_VERSION\ncodex-cli 0.152.1\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
+        Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+            deadline: request.policy.deadline,
+        }))
+    }
+}
+
+#[test]
+fn slow_agent_probe_yields_partial_facts_inside_the_budget() {
+    let clock = Arc::new(SharedClock(Mutex::new(Duration::ZERO)));
+    let runner = SlowProbe {
+        clock: Arc::clone(&clock),
+        calls: AtomicUsize::new(0),
+    };
+    let budget = Duration::from_millis(2_000);
+    let started = Instant::now();
+    let (facts, _) = collect_agent_facts_at_with_budget(
+        &runner,
+        Path::new("/tmp/account"),
+        &[] as &[EnvProfile],
+        1,
+        budget,
+        clock.as_ref(),
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(clock.as_ref().now() <= budget);
+    assert_eq!(clock.as_ref().now(), budget);
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    let codex = agent_named(&facts, "codex");
+    assert_eq!(codex.version.as_deref(), Some("0.152.1"));
+    assert!(budget_reason(codex.auth), "{:?}", codex.auth);
+    for name in ["claude", "cursor", "opencode"] {
+        let agent = agent_named(&facts, name);
+        assert!(agent.version.is_none(), "{name}");
+        assert!(budget_reason(agent.auth), "{name} {:?}", agent.auth);
+    }
+    assert!(!facts.git_identity);
+    assert!(facts.herdr.is_none());
+}
+
+struct UnlockCounter {
+    unlocks: AtomicUsize,
+}
+
+impl ProcessRunner for UnlockCounter {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == "/usr/bin/security" {
+            self.unlocks.fetch_add(1, Ordering::SeqCst);
+            return Ok(success(b""));
+        }
+        if request.program == "/usr/bin/git" {
+            return Ok(failure(b""));
+        }
+        let shell = request
+            .args
+            .get(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if shell.contains("command -v codex") || shell.contains("command -v claude") {
+            let binary = if shell.contains("codex") {
+                "codex"
+            } else {
+                "claude"
+            };
+            let version = if binary == "codex" {
+                "codex-cli 0.152.1"
+            } else {
+                "2.1.252 (Claude Code)"
+            };
+            return Ok(ProcessResult {
+                status: 0_i32.into_exit_status(),
+                stdout: format!("/opt/tools/{binary}\nMAC_WORKER_FACTS_VERSION\n{version}\n")
+                    .into_bytes(),
+                stderr: Vec::new(),
+            });
+        }
+        if shell.contains("command -v") || shell.contains("git config") {
+            return Ok(failure(b""));
+        }
+        if shell.contains("login") && shell.contains("status") {
+            return Ok(success(b"Logged in using ChatGPT\n"));
+        }
+        if shell.contains("auth") && shell.contains("status") {
+            return Ok(success(br#"{"loggedIn":true}"#));
+        }
+        panic!(
+            "unexpected facts process: {shell} program={:?}",
+            request.program
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn two_adapters_unlock_a_shared_keychain_once() {
+    let clock = SharedClock(Mutex::new(Duration::ZERO));
+    let runner = UnlockCounter {
+        unlocks: AtomicUsize::new(0),
+    };
+    let profile = EnvProfile::new(
+        "shared",
+        true,
+        vec![
+            ("MAC_WORKER_KEYCHAIN_PASSWORD".into(), "secret".into()),
+            (
+                "MAC_WORKER_KEYCHAIN_PATH".into(),
+                "/tmp/shared.keychain-db".into(),
+            ),
+        ],
+    );
+    let (facts, _) = collect_agent_facts_at_with_budget(
+        &runner,
+        Path::new("/tmp/account"),
+        &[profile],
+        1,
+        Duration::from_secs(25),
+        &clock,
+    );
+    assert_eq!(runner.unlocks.load(Ordering::SeqCst), 1);
+    assert!(clock.now() < Duration::from_secs(25));
+    for name in ["codex", "claude"] {
+        let agent = agent_named(&facts, name);
+        assert_eq!(agent.auth, AgentAuth::Authenticated, "{name}");
+        assert_eq!(
+            agent.auth_by_profile,
+            vec![("shared".into(), AgentAuth::Authenticated)],
+            "{name}"
+        );
+    }
+    assert!(
+        facts
+            .agents
+            .iter()
+            .all(|agent| agent.name == "codex" || agent.name == "claude")
     );
 }
