@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use mac_worker::cli::{Cli, Command as WorkerCommand, ControllerCommand, HostCommand};
 use mac_worker::protocol::PROTOCOL_VERSION;
 use predicates::prelude::*;
@@ -50,8 +50,50 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
                 .stdout(predicate::str::contains("--port"))
                 .stdout(predicate::str::contains("--no-open"))
                 .stdout(predicate::str::contains("--no-facts-refresh"))
+                .stdout(predicate::str::contains(
+                    "Settings and task replies still work",
+                ))
+                .stdout(predicate::str::contains("read-only").not())
                 .stdout(predicate::str::contains("controller-viewer").not());
         }
+    }
+}
+
+#[test]
+fn every_public_argument_has_help() {
+    let mut missing = Vec::new();
+    collect_missing_help(&Cli::command(), "worker", &mut missing);
+    assert!(
+        missing.is_empty(),
+        "public arguments without help:\n{}",
+        missing.join("\n")
+    );
+}
+
+fn collect_missing_help(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+    if command.is_hide_set() {
+        return;
+    }
+    for arg in command.get_arguments() {
+        if arg.is_hide_set() {
+            continue;
+        }
+        let id = arg.get_id().as_str();
+        if id == "help" || id == "version" {
+            continue;
+        }
+        let help = arg
+            .get_help()
+            .or_else(|| arg.get_long_help())
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        if help.trim().is_empty() {
+            missing.push(format!("{path} {id}"));
+        }
+    }
+    for subcommand in command.get_subcommands() {
+        let child = format!("{path} {}", subcommand.get_name());
+        collect_missing_help(subcommand, &child, missing);
     }
 }
 

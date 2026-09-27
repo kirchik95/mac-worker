@@ -11,8 +11,10 @@ use crate::{job::JobId, task::TaskId};
     about = "Run trusted development jobs on macOS workers"
 )]
 pub struct Cli {
+    /// Configuration file path (default: ~/.config/mac-worker/config.toml)
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+    /// Print machine-readable JSON on stdout
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
@@ -42,7 +44,7 @@ pub enum Command {
     },
     #[command(about = "Install or update helpers on configured workers (all by default)")]
     Setup {
-        /// Inventory names, as shown by `worker workers`
+        /// Inventory names to update; omit to update every configured worker
         hosts: Vec<String>,
         /// Install a debug build. Setup refuses debug binaries unless this is set.
         #[arg(long)]
@@ -50,8 +52,10 @@ pub enum Command {
     },
     #[command(about = "Check a Git project and compatible workers before running a job")]
     Doctor {
+        /// Git project to check (default: the current directory)
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Extra snapshot include pattern (repeatable)
         #[arg(long = "include", value_parser = non_empty_pattern)]
         includes: Vec<String>,
     },
@@ -66,16 +70,19 @@ pub enum Command {
     },
     #[command(about = "Preview or apply retention garbage collection on workers")]
     Gc {
+        /// Reclaim retained tasks, branches, and mirrors; omit to preview only
         #[arg(long)]
         apply: bool,
     },
     #[command(about = "Open the local dashboard in your browser")]
     Dashboard {
+        /// Loopback port to listen on
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: Option<u16>,
+        /// Print the URL without opening a browser
         #[arg(long)]
         no_open: bool,
-        /// Keep the dashboard read-only: do not refresh stale agent facts
+        /// Skip the stale agent-facts refresh. Settings and task replies still work.
         #[arg(long)]
         no_facts_refresh: bool,
         /// Remote viewer mode: serve the local store and exit on stdin EOF.
@@ -88,30 +95,41 @@ pub enum Command {
         about = "Run a command on an automatically selected compatible worker, or pin one with --worker"
     )]
     Run {
+        /// Pin one inventory name instead of automatic selection
         #[arg(long, value_parser = non_empty_worker)]
         worker: Option<String>,
+        /// Reject the run when no heavy slot is free
         #[arg(long)]
         no_wait: bool,
+        /// Git project to snapshot (default: the current directory)
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Extra snapshot include pattern (repeatable)
         #[arg(long = "include", value_parser = non_empty_pattern)]
         includes: Vec<String>,
+        /// Maximum runtime, from 1s to 24h
         #[arg(long, value_parser = supported_duration)]
         timeout: Option<Duration>,
+        /// Shell command to run instead of the trailing arguments
         #[arg(long, value_parser = non_empty_shell, conflicts_with = "argv")]
         shell: Option<String>,
+        /// Command and arguments to run on the worker
         #[arg(last = true, num_args = 1.., required_unless_present = "shell")]
         argv: Vec<String>,
     },
     Status {
+        /// Job to show; omit to list recent jobs
         job_id: Option<JobId>,
     },
     Logs {
+        /// Keep printing new log lines until the job finishes
         #[arg(short = 'f')]
         follow: bool,
+        /// Job whose logs to print
         job_id: JobId,
     },
     Cancel {
+        /// Job to cancel
         job_id: JobId,
     },
     #[command(about = "Submit and manage durable agent tasks")]
@@ -148,18 +166,23 @@ pub enum Command {
 pub enum TaskCommand {
     #[command(about = "Submit a prompt as a durable agent task")]
     Submit {
+        /// Agent to run: codex, cursor, opencode, or claude
         #[arg(long, value_parser = non_empty_text)]
         agent: Option<String>,
+        /// Model name passed through to the agent
         #[arg(long, value_parser = non_empty_text)]
         model: Option<String>,
+        /// Effort level passed through to the agent
         #[arg(long, value_parser = non_empty_text)]
         effort: Option<String>,
+        /// Prompt text; required unless --prompt-file is set
         #[arg(
             long,
             conflicts_with = "prompt_file",
             required_unless_present = "prompt_file"
         )]
         prompt: Option<String>,
+        /// File whose contents are the prompt
         #[arg(
             long,
             value_name = "PATH",
@@ -167,118 +190,165 @@ pub enum TaskCommand {
             required_unless_present = "prompt"
         )]
         prompt_file: Option<PathBuf>,
+        /// Short title stored with the task
         #[arg(long, value_parser = non_empty_text)]
         title: Option<String>,
+        /// Git project to snapshot (default: the current directory)
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Base commit or ref (default: HEAD)
         #[arg(long, default_value = "HEAD", value_parser = non_empty_text)]
         base: String,
+        /// Include uncommitted work in the snapshot
         #[arg(long)]
         wip: bool,
+        /// Extra snapshot include pattern (repeatable)
         #[arg(long = "include", value_parser = non_empty_pattern)]
         includes: Vec<String>,
+        /// Turn time limit, from 1s to 24h
         #[arg(long, value_parser = supported_duration)]
         timeout: Option<Duration>,
+        /// Maximum agent turns for this task
         #[arg(long)]
         max_turns: Option<u32>,
+        /// Maximum agent token budget for this task
         #[arg(long)]
         max_budget: Option<u64>,
+        /// Maximum follow-up turns after the first
         #[arg(long)]
         max_followups: Option<u32>,
+        /// When to close the task: done or never
         #[arg(long, value_parser = non_empty_text)]
         close_on: Option<String>,
+        /// Environment profile name on the worker
         #[arg(long, value_parser = non_empty_text)]
         env_profile: Option<String>,
+        /// Pin one inventory name instead of automatic selection
         #[arg(long, value_parser = non_empty_worker)]
         worker: Option<String>,
+        /// Task source: local or origin
         #[arg(long, value_parser = non_empty_text)]
         source: Option<String>,
+        /// Origin delivery mode: fetch or push (repeatable)
         #[arg(long, value_parser = non_empty_text)]
         publish: Vec<String>,
+        /// Branch name used when publishing with push
         #[arg(long, value_parser = non_empty_text)]
         publish_branch: Option<String>,
+        /// Reject the submit when no heavy slot is free
         #[arg(long)]
         no_wait: bool,
+        /// Wait until the task is quiescent before returning
         #[arg(long)]
         wait: bool,
     },
     #[command(about = "Submit a validated TOML batch")]
     Batch {
+        /// TOML batch file to validate and submit
         file: PathBuf,
+        /// Name stored with this run
         #[arg(long, value_parser = non_empty_text)]
         name: Option<String>,
+        /// Requested cap on tasks running at once
         #[arg(long)]
         max_parallel: Option<u32>,
+        /// Wait until the batch is quiescent before returning
         #[arg(long)]
         wait: bool,
+        /// Validate and print the plan without submitting
         #[arg(long, conflicts_with = "wait")]
         preview: bool,
     },
     List {
+        /// Limit the list to one run id or name
         #[arg(long, value_name = "ID|NAME", value_parser = non_empty_text)]
         run: Option<String>,
+        /// Limit the list to one task state
         #[arg(long, value_parser = non_empty_text)]
         state: Option<String>,
+        /// Limit the list to one outcome
         #[arg(long, value_parser = non_empty_text)]
         outcome: Option<String>,
+        /// Print the full task record
         #[arg(long)]
         full: bool,
     },
     Status {
+        /// Task to show
         task_id: TaskId,
+        /// Print the full task record
         #[arg(long)]
         full: bool,
     },
     Logs {
+        /// Task whose logs to print
         task_id: TaskId,
+        /// Print one turn number instead of every turn
         #[arg(long)]
         turn: Option<u32>,
+        /// Keep printing new log lines until the turn finishes
         #[arg(short = 'f', long)]
         follow: bool,
+        /// Print the original log bytes
         #[arg(long)]
         raw: bool,
     },
     Diff {
+        /// Task whose change to show
         task_id: TaskId,
+        /// Print a diffstat instead of the full diff
         #[arg(long)]
         stat: bool,
     },
     Say {
+        /// Task to continue
         task_id: TaskId,
+        /// Follow-up text; required unless --message-file is set
         #[arg(
             long,
             conflicts_with = "message_file",
             required_unless_present = "message_file"
         )]
         message: Option<String>,
+        /// File whose contents are the follow-up
         #[arg(long, conflicts_with = "message", required_unless_present = "message")]
         message_file: Option<PathBuf>,
+        /// Wait until the new turn is quiescent before returning
         #[arg(long)]
         wait: bool,
     },
     Cancel {
+        /// Task to cancel
         task_id: TaskId,
     },
     Result {
+        /// Task whose result to print
         task_id: TaskId,
     },
     Fetch {
+        /// Task whose result ref to import
         task_id: TaskId,
     },
     Close {
+        /// Task to close
         task_id: TaskId,
+        /// Drop the retained result commits
         #[arg(long)]
         discard: bool,
     },
     #[command(about = "Re-drive a failed origin delivery after credentials are repaired")]
     PublishRetry {
+        /// Task whose origin delivery to retry
         task_id: TaskId,
     },
     Wait {
+        /// Wait for one task
         #[arg(long)]
         task_id: Option<TaskId>,
+        /// Wait for every task in one run
         #[arg(long, value_name = "ID|NAME", value_parser = non_empty_text)]
         run: Option<String>,
+        /// How long to wait, from 1s to 24h
         #[arg(long, value_parser = supported_duration)]
         timeout: Option<Duration>,
     },
