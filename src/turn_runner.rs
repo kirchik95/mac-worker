@@ -2256,9 +2256,17 @@ pub fn start_runner_with_reservation(
         RunnerSlotDecision::Saturated => Ok(RunnerStart::Saturated),
         RunnerSlotDecision::Pending { .. } => Ok(RunnerStart::Pending),
         RunnerSlotDecision::Acquired { token } => {
-            let expected = client_state
-                .queue_entry(turn_id)?
-                .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))?;
+            let expected = match client_state.queue_entry(turn_id).and_then(|entry| {
+                entry.ok_or_else(|| task_error("TASK_BUSY", "task turn was retired before handoff"))
+            }) {
+                Ok(expected) => expected,
+                Err(error) => {
+                    // No child has been started. Even expiry between reservation
+                    // publication and this read must leave the permit retryable.
+                    let _ = client_state.try_release_runner_slot(turn_id, token, reserver);
+                    return Err(error);
+                }
+            };
             match executor.start_with_slot_until(
                 paths,
                 task_id,

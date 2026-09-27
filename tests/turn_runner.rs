@@ -6400,6 +6400,77 @@ fn local_wait_deadline_bounds_post_bind_journal_fence_without_releasing_child() 
     local_wait_handoff_deadline(true);
 }
 
+struct ExpireReservationHook;
+
+impl ClientStateConcurrencyHook for ExpireReservationHook {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::RunnerSlotReservation {
+            // Pin reservation persistence across the caller's monotonic budget.
+            let (_sender, receiver) = mpsc::channel::<()>();
+            assert!(receiver.recv_timeout(Duration::from_millis(200)).is_err());
+        }
+    }
+}
+
+#[test]
+fn local_wait_expiring_during_reservation_releases_unstarted_permit() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    fixture.state.record_runner(fixture.task_id, None).unwrap();
+    let before = fixture.state.load_task(fixture.task_id).unwrap();
+    let owner = *fixture
+        .state
+        .queue_entry(fixture.turn_id)
+        .unwrap()
+        .unwrap()
+        .owner_opt()
+        .unwrap();
+    let state = ClientStateStore::open_with_concurrency_hook(
+        &fixture.paths.state,
+        Arc::new(ExpireReservationHook),
+    )
+    .unwrap();
+    let executor = CountedInlineExecutor::default();
+    let error = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &state,
+        &executor,
+    )
+    .wait(
+        WaitSelector::Task(fixture.task_id),
+        Some(Duration::from_millis(150)),
+    )
+    .unwrap_err();
+    assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+    assert!(
+        executor.0.lock().unwrap().is_empty(),
+        "no executor may start after expiry"
+    );
+    assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);
+    let entry = fixture.state.queue_entry(fixture.turn_id).unwrap().unwrap();
+    assert_eq!(entry.owner_opt(), Some(&owner));
+    assert!(!entry.is_cancel_requested());
+    assert!(
+        matches!(
+            start_runner_with_reservation(
+                &fixture.state,
+                &executor,
+                &fixture.paths,
+                fixture.task_id,
+                fixture.turn_id,
+                8,
+                false,
+            )
+            .unwrap(),
+            RunnerStart::Started(_)
+        ),
+        "same process must be able to retry an unstarted handoff"
+    );
+    assert_eq!(executor.0.lock().unwrap().len(), 1);
+}
+
 struct DelayedProjectionRemote<'a> {
     inner: &'a AcceptedThenTerminalRunner,
     accepted: Mutex<Option<mpsc::Sender<()>>>,
