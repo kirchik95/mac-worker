@@ -8,7 +8,7 @@
 //! `task.reconcile` is `operator_reconcile`. These commands are outside
 //! STORE and `is_read_command`.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,10 +27,7 @@ use crate::{
     process::ProcessRunner,
     protocol::PROTOCOL_VERSION,
     task::TaskId,
-    task_client::{
-        ReconcileReport, TaskClient, WAIT_MAX_POLL, WAIT_POLL, WaitReport, WaitSelector,
-        WaitSnapshot,
-    },
+    task_client::{ReconcileReport, TaskClient, WaitReport, WaitSelector, WaitSnapshot},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,22 +135,20 @@ pub fn wait_via_controller(
     selector: ControllerWaitSelector,
     timeout: Option<Duration>,
 ) -> Result<WaitReport, WorkerError> {
-    let started = SystemTime::now();
+    let deadline = crate::task_client::WaitDeadline::new(timeout);
+    let runner = crate::task_client::WaitDeadlineRunner::new(runner, &deadline);
     loop {
-        let snapshot = poll_wait(runner, controller, &selector)?;
+        deadline.remaining()?;
+        let snapshot = poll_wait(&runner, controller, &selector);
+        deadline.remaining()?;
+        let snapshot = snapshot?;
         if snapshot.quiescent() {
             return Ok(WaitReport::new(
                 snapshot.task_ids().to_vec(),
                 snapshot.exit_code(),
             ));
         }
-        if timeout.is_some_and(|limit| started.elapsed().is_ok_and(|elapsed| elapsed >= limit)) {
-            return Err(WorkerError::task(
-                "WAIT_TIMEOUT",
-                "task wait timed out without cancelling the task",
-            ));
-        }
-        std::thread::sleep(WAIT_POLL.min(WAIT_MAX_POLL));
+        std::thread::sleep(deadline.poll_delay()?);
     }
 }
 

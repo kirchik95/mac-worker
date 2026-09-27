@@ -1843,6 +1843,39 @@ fn laptop_wait_timeout_when_poll_stays_busy() {
     assert!(!laptop_task_store_exists(&laptop.paths));
 }
 
+struct DeadlineCheckedWaitPoll;
+
+impl ProcessRunner for DeadlineCheckedWaitPoll {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        assert!(
+            request.policy.deadline <= Duration::from_secs(2),
+            "wait poll exceeds the remaining timeout: {:?}",
+            request.policy.deadline
+        );
+        let result = BusyWaitPoll.run(request)?;
+        let mut reply: Value =
+            serde_json::from_slice(decode_frame(&result.stdout).unwrap()).unwrap();
+        reply["result"]["quiescent"] = json!(true);
+        Ok(ProcessResult {
+            stdout: encode_json_frame(&reply).unwrap(),
+            ..result
+        })
+    }
+}
+
+#[test]
+fn laptop_wait_passes_remaining_timeout_into_controller_poll() {
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let task_id = seeded_ids().0.to_string();
+    let (exit, _, stderr) = run_laptop_task(
+        &laptop,
+        &DeadlineCheckedWaitPoll,
+        &["wait", "--task-id", task_id.as_str(), "--timeout", "2s"],
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+}
+
 #[test]
 fn seeded_reconcile_does_not_create_laptop_store() {
     let controller = IsolatedHome::new();

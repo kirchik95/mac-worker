@@ -592,6 +592,47 @@ fn task_and_run_wait_classify_unknown_as_nonzero_and_keep_needs_input_semantics(
     }
 }
 
+struct DeadlineCheckedTaskRemote(TaskRemoteRunner);
+
+impl ProcessRunner for DeadlineCheckedTaskRemote {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        assert!(
+            request.policy.deadline <= Duration::from_secs(2),
+            "local wait poll exceeds timeout: {:?}",
+            request.policy.deadline
+        );
+        self.0.run(request)
+    }
+}
+
+#[test]
+fn local_wait_passes_remaining_timeout_into_remote_observations() {
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let task_id = TaskId::generate();
+    let record = task_record(
+        task_id,
+        JobId::generate(),
+        TaskState::Open,
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        "mini-1",
+        None,
+    );
+    let remote = DeadlineCheckedTaskRemote(TaskRemoteRunner::new(record.status().clone()));
+    store.create_task(record).unwrap();
+    let config = task_config();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    assert_eq!(
+        client
+            .wait(WaitSelector::Task(task_id), Some(Duration::from_secs(2)))
+            .unwrap()
+            .exit_code(),
+        0
+    );
+}
+
 fn retrying_delivery(turn: JobId, head: BaseOid) -> OriginDelivery {
     OriginDelivery::new(
         turn,

@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Condvar, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -65,6 +65,92 @@ const CLOSE_IN_PROGRESS: &str = crate::client_state::TASK_CLOSE_IN_PROGRESS;
 const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
 const PUBLISH_RETRY_MERGE_ATTEMPTS: usize = 3;
 const PUBLISH_RETRY_LOCAL_UPDATE_WARNING: &str = "origin retry was accepted on the worker, but the laptop record could not be updated with the returned deliveries";
+
+pub(crate) struct WaitDeadline {
+    started: Instant,
+    timeout: Option<Duration>,
+}
+
+impl WaitDeadline {
+    pub(crate) fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining_at(&self, now: Instant) -> Result<Option<Duration>, WorkerError> {
+        let elapsed = now.saturating_duration_since(self.started);
+        match self.timeout {
+            Some(timeout) if elapsed >= timeout => Err(task_error(
+                "WAIT_TIMEOUT",
+                "task wait timed out without cancelling the task",
+            )),
+            Some(timeout) => Ok(Some(timeout - elapsed)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Option<Duration>, WorkerError> {
+        self.remaining_at(Instant::now())
+    }
+
+    pub(crate) fn poll_delay(&self) -> Result<Duration, WorkerError> {
+        let poll = WAIT_POLL.min(WAIT_MAX_POLL);
+        Ok(self
+            .remaining()?
+            .map_or(poll, |remaining| poll.min(remaining)))
+    }
+}
+
+/// Bound each blocking process in a wait poll by the same remaining budget.
+/// Delegation preserves session and interruptible process semantics.
+pub(crate) struct WaitDeadlineRunner<'a> {
+    runner: &'a dyn ProcessRunner,
+    deadline: &'a WaitDeadline,
+}
+
+impl<'a> WaitDeadlineRunner<'a> {
+    pub(crate) fn new(runner: &'a dyn ProcessRunner, deadline: &'a WaitDeadline) -> Self {
+        Self { runner, deadline }
+    }
+
+    fn bounded(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessRequest, WorkerError> {
+        let mut request = request.clone();
+        if let Some(remaining) = self.deadline.remaining()? {
+            request.policy.deadline = request.policy.deadline.min(remaining);
+        }
+        Ok(request)
+    }
+}
+
+impl ProcessRunner for WaitDeadlineRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        self.runner.run(&self.bounded(request)?)
+    }
+
+    fn run_in_new_session(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        self.runner.run_in_new_session(&self.bounded(request)?)
+    }
+
+    fn run_interruptible(
+        &self,
+        request: &crate::process::ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        self.runner
+            .run_interruptible(&self.bounded(request)?, should_stop)
+    }
+}
 
 fn operator_revision_matches(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
     current.meta().task_id() == expected.meta().task_id()
@@ -3905,20 +3991,25 @@ impl<'a> TaskClient<'a> {
         selector: WaitSelector,
         timeout: Option<Duration>,
     ) -> Result<WaitReport, WorkerError> {
-        let started = SystemTime::now();
+        let deadline = WaitDeadline::new(timeout);
+        let runner = WaitDeadlineRunner::new(self.runner, &deadline);
+        let client = TaskClient::new(
+            &runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            self.executor,
+        )
+        .with_herdr_notifier(self.herdr_notifier.clone());
         loop {
-            let snapshot = self.wait_poll(selector)?;
+            deadline.remaining()?;
+            let snapshot = client.wait_poll(selector);
+            deadline.remaining()?;
+            let snapshot = snapshot?;
             if snapshot.quiescent() {
                 return Ok(WaitReport::new(snapshot.task_ids, snapshot.exit_code));
             }
-            if timeout.is_some_and(|limit| started.elapsed().is_ok_and(|elapsed| elapsed >= limit))
-            {
-                return Err(task_error(
-                    "WAIT_TIMEOUT",
-                    "task wait timed out without cancelling the task",
-                ));
-            }
-            std::thread::sleep(WAIT_POLL.min(WAIT_MAX_POLL));
+            std::thread::sleep(deadline.poll_delay()?);
         }
     }
 
@@ -6379,6 +6470,44 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_deadline_ignores_forward_and_backward_wall_clock_observations() {
+        let monotonic = std::time::Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(10_000);
+        let deadline = WaitDeadline {
+            started: monotonic,
+            timeout: Some(Duration::from_secs(10)),
+        };
+        for (mono_now, wall_now, expected) in [
+            (
+                monotonic,
+                wall + Duration::from_secs(3_600),
+                Some(Duration::from_secs(10)),
+            ),
+            (
+                monotonic,
+                wall - Duration::from_secs(3_600),
+                Some(Duration::from_secs(10)),
+            ),
+            (
+                monotonic + Duration::from_secs(5),
+                wall - Duration::from_secs(3_600),
+                Some(Duration::from_secs(5)),
+            ),
+            (
+                monotonic + Duration::from_secs(10),
+                wall - Duration::from_secs(3_600),
+                None,
+            ),
+        ] {
+            let remaining = deadline.remaining_at(mono_now).ok().flatten();
+            assert_eq!(
+                remaining, expected,
+                "wall={wall_now:?}, monotonic={mono_now:?}"
+            );
+        }
+    }
 
     #[test]
     fn batch_parallelism_defaults_to_the_configured_slot_count() {
