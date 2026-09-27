@@ -2557,6 +2557,12 @@ impl<'a> TaskClient<'a> {
             if log.current_entry(self.client_state)?.as_ref() != Some(&entry) {
                 return Err(task_error("TASK_BUSY", "task turn changed before close"));
             }
+            if log.is_accepted() {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "accepted task turn is still finishing",
+                ));
+            }
             let record = self.client_state.load_task(task_id)?;
             if !operator_revision_matches(&record, expected) {
                 return Err(task_error(
@@ -2795,8 +2801,9 @@ impl<'a> TaskClient<'a> {
                 && let Some(task_id) = self.selection_task_for_turn(&selection, entry.job_id())?
             {
                 let record = self.client_state.load_task(task_id)?;
-                if !submission_recovery_pending(&record) {
-                    self.finish_waiting_cancellation(&record, entry)?;
+                if !submission_recovery_pending(&record)
+                    && self.finish_waiting_cancellation(&record, entry)?
+                {
                     report.repaired_rows += 1;
                 }
             }
@@ -3923,6 +3930,8 @@ impl<'a> TaskClient<'a> {
                         .replacement_failure()
                         .is_some_and(|budget| budget.should_park())
                     {
+                        // A busy or accepted journal keeps the durable intent
+                        // for its runner; do not race a remote submit here.
                         self.finish_waiting_cancellation(&record, &entry)?;
                         return self.report_fenced_turn(
                             task_id,
@@ -3972,9 +3981,19 @@ impl<'a> TaskClient<'a> {
                         .is_some_and(|budget| budget.should_park())
             })
         {
-            let _ = self.client_state.record_runner(task_id, None);
-            self.client_state
-                .remove_task_turn_after_terminal(turn_id, current_process_identity()?)?;
+            // Parked terminal projections can still have undrained logs or an
+            // unimported result. Retire only under the journal's completion fence.
+            if let Some(log) =
+                crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, turn_id)?
+                && (!log.is_accepted() || log.completion().is_some())
+                && log
+                    .current_entry(self.client_state)?
+                    .is_some_and(|entry| matches!(entry.state(), QueueState::Parked))
+            {
+                let _ = self.client_state.record_runner(task_id, None);
+                self.client_state
+                    .remove_task_turn_after_terminal(turn_id, current_process_identity()?)?;
+            }
         }
         self.report_fenced_turn(task_id, turn_id, record.status().turns().len())
     }
@@ -4703,18 +4722,18 @@ impl<'a> TaskClient<'a> {
         &self,
         record: &LocalTaskRecord,
         entry: &QueueEntry,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
         let task = record.meta().task_id();
         let turn = entry.job_id();
         let Some(mut log) = crate::runner_log::RunnerLog::try_open(&self.paths.state, task, turn)?
         else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(current) = log.current_entry(self.client_state)? else {
-            return Ok(());
+            return Ok(false);
         };
         if current != *entry {
-            return Ok(());
+            return Ok(false);
         }
         self.finish_waiting_cancellation_locked(task, &current, &mut log)
     }
@@ -4724,7 +4743,12 @@ impl<'a> TaskClient<'a> {
         task: TaskId,
         entry: &QueueEntry,
         log: &mut crate::runner_log::RunnerLog,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<bool, WorkerError> {
+        // Waiting/Parked describes runnable ownership, not remote acceptance.
+        // Accepted cancellation must be forwarded and drained on its worker.
+        if log.is_accepted() {
+            return Ok(false);
+        }
         let turn = entry.job_id();
         let record = self.client_state.load_task(task)?;
         if !entry.is_cancel_requested() || matches!(entry.state(), QueueState::Dispatching { .. }) {
@@ -4759,7 +4783,7 @@ impl<'a> TaskClient<'a> {
                 .unwrap_or(current_process_identity()?),
         )?;
         self.client_state.remove_turn_prompt(task, turn)?;
-        Ok(())
+        Ok(true)
     }
 
     fn rollback_submission(
@@ -5253,6 +5277,9 @@ impl<'a> TaskClient<'a> {
                 return Ok(());
             };
             log.require_owner(self.client_state, current_process_identity()?)?;
+            if log.is_accepted() {
+                return Ok(());
+            }
             let Some(entry) = self.client_state.cancel_unstarted_handoff(
                 turn_id,
                 current_process_identity()?,

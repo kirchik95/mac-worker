@@ -174,7 +174,7 @@ impl RunnerExecutor for DetachedRunnerExecutor {
 /// flag and leaves state and reservation untouched, so a token-only check
 /// would spawn for a cancelled turn. Likewise `adopt_row` swaps the owner
 /// while keeping the token. Require the full permit: a live TaskTurn row for
-/// this turn, no requested cancellation, the row still owned by the identity
+/// this turn, no cancellation before acceptance, the row still owned by the identity
 /// pinned when the handoff started, and a reservation carrying this attempt's
 /// token, still owned by this process, with no child bound yet. A missing row
 /// fails closed as well.
@@ -184,13 +184,14 @@ fn handoff_spawn_admitted(
     token: Uuid,
     reserver: ProcessIdentity,
     owner: Option<ProcessIdentity>,
+    accepted: bool,
 ) -> bool {
     let Some(entry) = entry else {
         return false;
     };
     entry.kind() == QueueEntryKind::TaskTurn
         && entry.job_id() == turn_id
-        && !entry.is_cancel_requested()
+        && (accepted || !entry.is_cancel_requested())
         && entry.owner_opt().copied() == owner
         && entry.slot_reservation().is_some_and(|reservation| {
             reservation.token() == token
@@ -208,14 +209,16 @@ fn handoff_spawn_admitted(
 /// child `ADOPTION_WAIT`). Only `WouldBlock`/`None` retries; every other open
 /// error stays hard, and no lock is held while waiting.
 ///
-/// When the spawn carries a reservation token, the spawn permit is
-/// revalidated before every attempt through [`handoff_spawn_admitted`], and
-/// again under the acquired journal through `log.current_entry` (the journal
+/// When the spawn carries a reservation token, ownership and reservation are
+/// revalidated before every attempt through [`handoff_spawn_admitted`]. The
+/// cancellation gate is checked under the acquired journal, where acceptance
+/// distinguishes a remote drainer from an unstarted turn. The full permit is
+/// checked through `log.current_entry` (the journal
 /// flock is the finalization fence: refresh/finalizer mutations of this exact
 /// row serialize with it, so only the post-acquire check sees the task's
 /// current turn). The row owner is pinned on first sight: adoption away
-/// mid-handoff keeps the token but voids this attempt's permit. Cancelled,
-/// adopted-away, bound-elsewhere, or retired work therefore returns
+/// mid-handoff keeps the token but voids this attempt's permit. Cancelled
+/// unaccepted, adopted-away, bound-elsewhere, or retired work therefore returns
 /// `TASK_BUSY` at the flock check; the caller then drops the journal before
 /// spawn, so a later mutation in that residual window is out of this helper's
 /// scope and is caught by the post-bind fence. Bare starts without a token keep
@@ -250,6 +253,9 @@ fn open_handoff_journal_for_spawn(
                 token,
                 reserver,
                 owner,
+                // Acceptance is checked under the journal below. A cancelled
+                // accepted turn still needs a replacement to drain its worker.
+                true,
             )
         {
             return Err(task_error("TASK_BUSY", "task turn changed before handoff"));
@@ -263,6 +269,7 @@ fn open_handoff_journal_for_spawn(
                         token,
                         reserver,
                         owner,
+                        log.is_accepted(),
                     ),
                     None => true,
                 };
@@ -562,6 +569,9 @@ impl<'a> TurnRunner<'a> {
             return Ok(());
         };
         log.require_owner(self.client_state, owner)?;
+        if log.is_accepted() {
+            return Ok(());
+        }
         if self
             .client_state
             .cancel_unstarted_handoff(turn_id, owner, now_millis()?)?
@@ -2675,7 +2685,8 @@ mod tests {
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
 
         // Real task cancellation keeps the row and its token: must refuse.
@@ -2686,7 +2697,8 @@ mod tests {
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
 
         // Adopted away with the token intact: must refuse.
@@ -2699,7 +2711,8 @@ mod tests {
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
 
         // Already bound to a child elsewhere: must refuse.
@@ -2718,7 +2731,8 @@ mod tests {
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
 
         // Another process holds the reservation: must refuse.
@@ -2731,7 +2745,8 @@ mod tests {
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
 
         // Stale token and missing row fail closed as well.
@@ -2740,14 +2755,16 @@ mod tests {
             turn,
             uuid::Uuid::new_v4(),
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
         assert!(!handoff_spawn_admitted(
             None,
             turn,
             token,
             reserver,
-            Some(owner)
+            Some(owner),
+            false
         ));
     }
 
@@ -3026,6 +3043,141 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             Err(error) => assert_eq!(error.public_code(), "TASK_BUSY"),
             Ok(_) => panic!("expected TASK_BUSY from handoff journal helper"),
         }
+    }
+
+    #[test]
+    fn accepted_cancelled_handoff_allows_a_replacement_drainer() {
+        use super::{ClientStateStore, LogWriter, ProcessIdentity};
+        let owner = current_process_identity().unwrap();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+        let mut log = LogWriter::open(&paths.state, task_id, turn_id).unwrap();
+        log.accepted("mini-1", b"accepted\n").unwrap();
+        drop(log);
+        store.retain_task_turn_cancel(turn_id, 11).unwrap();
+        let log = open_handoff_journal_for_spawn(&store, &paths, task_id, turn_id, Some(token))
+            .expect("accepted cancellation still needs a remote drainer");
+        assert!(log.is_accepted());
+        drop(log);
+        let child = ProcessIdentity::new(8, 8).unwrap();
+        let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
+        let log = open_handoff_journal_after_bind(
+            &store, &paths, task_id, turn_id, token, owner, &expected,
+        )
+        .unwrap();
+        assert_eq!(log.current_entry(&store).unwrap().as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn accepted_handoff_failure_cannot_abandon_or_cancel_the_turn() {
+        use super::{
+            ClientStateStore, Config, InlineRunnerExecutor, LocalTaskRecord, LogWriter, TaskState,
+            TaskStatus, TurnRunner, TurnSummary,
+        };
+        use crate::task::{
+            ClosePolicy, GitIdentity, PublishMode, TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+        };
+        let owner = current_process_identity().unwrap();
+        let (_root, paths) = isolated_handoff_paths();
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let (task_id, turn_id, _) = plant_reserved_turn(&store, owner, true);
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: crate::agent::AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: crate::agent::PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: "a".repeat(40).parse().unwrap(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Fixture", "fixture@example.test").unwrap(),
+            title: None,
+            prompt: "work".into(),
+            created_at_millis: 10,
+        })
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Active,
+            None,
+            Some("mini-1".into()),
+            true,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn_id,
+                None,
+                None,
+                None,
+                false,
+                Some(10),
+                None,
+            )],
+            10,
+        )
+        .unwrap();
+        let record = LocalTaskRecord::new(
+            meta,
+            status,
+            None,
+            None,
+            None,
+            "c".repeat(64),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        store.create_task(record.clone()).unwrap();
+        let mut log = LogWriter::open(&paths.state, task_id, turn_id).unwrap();
+        log.accepted("mini-1", b"accepted\n").unwrap();
+        drop(log);
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let result = TurnRunner::new(
+            &crate::process::SystemProcessRunner,
+            &config,
+            &paths,
+            &store,
+            &InlineRunnerExecutor,
+        )
+        .abandon_handoff_failure(task_id, turn_id, owner);
+        assert_eq!(
+            store.load_task(task_id).unwrap(),
+            record,
+            "handoff failure rewrote an accepted turn"
+        );
+        result.unwrap();
+        assert!(
+            !store
+                .queue_entry(turn_id)
+                .unwrap()
+                .unwrap()
+                .is_cancel_requested()
+        );
+        assert!(
+            crate::runner_log::snapshot(&paths.state, task_id, turn_id)
+                .unwrap()
+                .unwrap()
+                .completion
+                .is_none()
+        );
     }
 
     #[test]

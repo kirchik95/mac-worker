@@ -1780,6 +1780,16 @@ struct ParkedRecoveryRemote<'a> {
 
 impl ProcessRunner for ParkedRecoveryRemote<'_> {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request
+            .args
+            .last()
+            .is_some_and(|arg| arg == HostOperation::TaskCancel.command())
+        {
+            let cancel: mac_worker::task_store::TaskCancelRequest = decode_request(request)?;
+            return canonical_process(&mac_worker::task_store::TaskCancelResponse::new(
+                self.inner.inner.task_status(cancel.task_id(), false)?,
+            ));
+        }
         let recovering = self.recovering.load(Ordering::SeqCst);
         let on_b = request.args.iter().any(|arg| arg == "mac2");
         if recovering {
@@ -1815,7 +1825,35 @@ impl ProcessRunner for ParkedRecoveryRemote<'_> {
     }
 }
 
-fn assert_accepted_turn_recovers_from_park(all_busy: bool, legacy_checkpoint: bool) {
+#[derive(Clone, Copy)]
+enum ParkedRecoveryAction {
+    Resume,
+    CancelActive,
+    CancelTerminal,
+    CloseTerminal,
+    FailHandoff,
+}
+
+struct RefuseRecoverySpawn;
+
+impl RunnerExecutor for RefuseRecoverySpawn {
+    fn start(
+        &self,
+        _: &mac_worker::paths::PathLayout,
+        _: TaskId,
+        _: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        Err(WorkerError::Io(io::Error::other(
+            "simulated replacement spawn failure",
+        )))
+    }
+}
+
+fn assert_accepted_turn_recovers_from_park(
+    all_busy: bool,
+    legacy_checkpoint: bool,
+    action: ParkedRecoveryAction,
+) {
     let mut fixture =
         AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
     fixture.config = Config::parse(
@@ -1899,6 +1937,81 @@ fn assert_accepted_turn_recovers_from_park(all_busy: bool, legacy_checkpoint: bo
             .state(),
         mac_worker::job::QueueState::Parked
     ));
+    match action {
+        ParkedRecoveryAction::Resume => {}
+        ParkedRecoveryAction::CancelActive
+        | ParkedRecoveryAction::CancelTerminal
+        | ParkedRecoveryAction::CloseTerminal => {
+            if matches!(
+                action,
+                ParkedRecoveryAction::CancelTerminal | ParkedRecoveryAction::CloseTerminal
+            ) {
+                let mut status = serde_json::to_value(
+                    fixture.runner.task_status(fixture.task_id, true).unwrap(),
+                )
+                .unwrap();
+                status["state"] = serde_json::json!("open");
+                let record = fixture.state.load_task(fixture.task_id).unwrap();
+                fixture
+                    .state
+                    .replace_task_fixture(
+                        record
+                            .with_status(serde_json::from_value(status).unwrap())
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let expected = fixture.state.load_task(fixture.task_id).unwrap();
+            if matches!(action, ParkedRecoveryAction::CloseTerminal) {
+                let error = client.close_from_expected(&expected, false).unwrap_err();
+                assert_eq!(error.public_code(), "TASK_BUSY");
+                assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), expected);
+            } else {
+                client.cancel_from_expected(&expected).unwrap();
+            }
+            assert!(
+                fixture
+                    .state
+                    .queue_entry(fixture.turn_id)
+                    .unwrap()
+                    .is_some(),
+                "accepted cancellation must retain the unfinished recovery row"
+            );
+            assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+        }
+        ParkedRecoveryAction::FailHandoff => {
+            fixture
+                .state
+                .set_replacement_failure(fixture.turn_id, None)
+                .unwrap();
+            let error = TaskClient::new(
+                &remote,
+                &fixture.config,
+                &fixture.paths,
+                &recovery_store,
+                &RefuseRecoverySpawn,
+            )
+            .reconcile_runners()
+            .unwrap_err();
+            assert_eq!(error.public_code(), "RUNNER_HANDOFF_FAILED");
+            let record = fixture.state.load_task(fixture.task_id).unwrap();
+            assert_eq!(
+                record.status().state(),
+                TaskState::Active,
+                "failed replacement must preserve the accepted task"
+            );
+            assert!(record.abandon_code().is_none());
+            assert!(
+                !fixture
+                    .state
+                    .queue_entry(fixture.turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .is_cancel_requested()
+            );
+            assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
+        }
+    }
     remote.recovering.store(true, Ordering::SeqCst);
     fixture
         .state
@@ -1959,19 +2072,43 @@ fn assert_accepted_turn_recovers_from_park(all_busy: bool, legacy_checkpoint: bo
 #[test]
 fn accepted_automatic_turn_recovers_on_original_worker_after_parking() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert_accepted_turn_recovers_from_park(false, false);
+    assert_accepted_turn_recovers_from_park(false, false, ParkedRecoveryAction::Resume);
 }
 
 #[test]
 fn accepted_automatic_turn_is_not_abandoned_when_all_workers_are_busy() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert_accepted_turn_recovers_from_park(true, false);
+    assert_accepted_turn_recovers_from_park(true, false, ParkedRecoveryAction::Resume);
 }
 
 #[test]
 fn legacy_accepted_turn_recovers_on_original_worker_after_parking() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert_accepted_turn_recovers_from_park(false, true);
+    assert_accepted_turn_recovers_from_park(false, true, ParkedRecoveryAction::Resume);
+}
+
+#[test]
+fn accepted_parked_active_cancellation_retains_remote_recovery() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, false, ParkedRecoveryAction::CancelActive);
+}
+
+#[test]
+fn accepted_parked_terminal_cancellation_retains_remote_recovery() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, false, ParkedRecoveryAction::CancelTerminal);
+}
+
+#[test]
+fn accepted_parked_handoff_failure_retains_remote_recovery() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, false, ParkedRecoveryAction::FailHandoff);
+}
+
+#[test]
+fn accepted_parked_terminal_close_waits_for_remote_recovery() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, false, ParkedRecoveryAction::CloseTerminal);
 }
 
 #[test]
