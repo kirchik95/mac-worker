@@ -23,7 +23,7 @@ use mac_worker::{
     task_store::{SessionBinding, TaskStore},
     transfer_repo::{TransferGc, TransferRepo},
 };
-use support::GitRepo;
+use support::{GitRepo, recording_runner::RecordingRunner};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -553,6 +553,100 @@ fn gc_prunes_expired_task_branch_without_removing_foreign_mirror_refs() {
         &format!("refs/mac-worker/bases/{task}")
     ));
     assert!(ref_exists(mirror.path(), "refs/heads/keep"));
+}
+
+#[test]
+fn gc_runs_one_maintenance_pass_without_immediate_prune() {
+    let (_temp, store, source, base_oid) = fixture();
+    let task = task_id(1);
+    let second = task_id(2);
+    let job = job_id(1);
+    prepare_task(&store, task, job, &base_oid);
+    release_lease(&store, job);
+    rewrite_status(&store, task, TaskState::Closed, 1);
+    let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
+    let oid = git(source.root(), &["rev-parse", "HEAD"]);
+    set_ref(&mirror_path, &format!("refs/heads/task/{second}"), &oid);
+    set_ref(
+        &mirror_path,
+        &format!("refs/mac-worker/bases/{second}"),
+        &oid,
+    );
+
+    HostGc::new(&store, &SystemProcessRunner)
+        .apply_at(1 + mac_worker::host_store::JOB_RETENTION_MILLIS)
+        .unwrap();
+    let now = u64::MAX / 2;
+    let preview = HostGc::new(&store, &SystemProcessRunner)
+        .preview_at(now)
+        .unwrap();
+    let branch_candidates = preview
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.kind() == "branch")
+        .count();
+    assert!(
+        branch_candidates >= 2,
+        "expected several branch candidates in one mirror, got {branch_candidates}: {preview:?}"
+    );
+
+    let runner = RecordingRunner::passthrough();
+    HostGc::new(&store, &runner).apply_at(now).unwrap();
+
+    let maintenance = git_gc_commands(&runner);
+    assert_eq!(
+        maintenance.len(),
+        1,
+        "one mirror pass must run one maintenance gc, saw {maintenance:?}"
+    );
+    assert!(
+        maintenance[0]
+            .iter()
+            .all(|argument| argument != "--prune=now" && !argument.contains("now")),
+        "maintenance gc must not prune immediately: {:?}",
+        maintenance[0]
+    );
+    assert!(
+        maintenance[0]
+            .iter()
+            .any(|argument| argument == "--prune=2.weeks.ago"),
+        "maintenance gc must keep a two-week grace: {:?}",
+        maintenance[0]
+    );
+    assert!(!ref_exists(
+        &mirror_path,
+        &format!("refs/heads/task/{task}")
+    ));
+    assert!(!ref_exists(
+        &mirror_path,
+        &format!("refs/mac-worker/bases/{task}")
+    ));
+    assert!(!ref_exists(
+        &mirror_path,
+        &format!("refs/heads/task/{second}")
+    ));
+    assert!(!ref_exists(
+        &mirror_path,
+        &format!("refs/mac-worker/bases/{second}")
+    ));
+}
+
+fn git_gc_commands(runner: &RecordingRunner) -> Vec<Vec<String>> {
+    runner
+        .requests()
+        .into_iter()
+        .filter_map(|request| {
+            let arguments = request
+                .args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            arguments
+                .iter()
+                .any(|argument| argument == "gc")
+                .then_some(arguments)
+        })
+        .collect()
 }
 
 #[test]
