@@ -351,6 +351,26 @@ fn historical_logs_report_the_selected_turn_outcome() {
 }
 
 #[test]
+fn raw_logs_keep_terminal_controls_and_rendered_logs_escape_them() {
+    let turn = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);
+    let bytes = b"plain \x1b]52;c;cHVycGxl\x07\n\x1b[2J\n";
+    fixture.append(turn.turn_id(), bytes);
+    assert_eq!(fixture.logs(None, true).unwrap(), bytes);
+    let rendered = fixture.logs(None, false).unwrap();
+    assert!(
+        !rendered.contains(&0x1b) && !rendered.contains(&0x07),
+        "{}",
+        String::from_utf8_lossy(&rendered)
+    );
+    assert!(
+        String::from_utf8_lossy(&rendered).contains("\\x1b"),
+        "{}",
+        String::from_utf8_lossy(&rendered)
+    );
+}
+
+#[test]
 fn raw_logs_preserve_mixed_bytes_and_normal_logs_keep_event_formatting() {
     let turn = finished_turn(1, TaskOutcome::Done);
     let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);

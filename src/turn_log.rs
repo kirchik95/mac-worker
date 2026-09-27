@@ -55,18 +55,18 @@ pub fn render_agent_log(
         if let Some(framing) = mac_worker_framing_line(line) {
             flush_unrecognised(&mut fold, stdout)?;
             if let FramingLine::Print(text) = framing {
-                writeln!(stdout, "{text}")?;
+                writeln_visible(stdout, &text)?;
             }
             continue;
         }
         if let Some(event) = adapter.parse_event(line) {
             flush_unrecognised(&mut fold, stdout)?;
-            writeln!(stdout, "{}", render_event(event))?;
+            writeln_visible(stdout, &render_event(event))?;
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             flush_unrecognised(&mut fold, stdout)?;
-            writeln!(stdout, "{line}")?;
+            writeln_visible(stdout, line)?;
             continue;
         };
         let key = structured_event_key(&value);
@@ -179,8 +179,103 @@ fn flush_unrecognised(
     let Some(run) = fold.take() else {
         return Ok(());
     };
-    writeln!(stdout, "{}", render_unrecognised(&run.key, run.count))?;
+    writeln_visible(stdout, &render_unrecognised(&run.key, run.count))?;
     Ok(())
+}
+
+fn writeln_visible(stdout: &mut dyn Write, text: &str) -> Result<(), WorkerError> {
+    writeln!(stdout, "{}", sanitize_terminal_text(text))?;
+    Ok(())
+}
+
+/// Escapes terminal controls so a log line cannot change the title, write the
+/// clipboard, or recolor the operator's terminal. Newlines and tabs stay.
+pub(crate) fn sanitize_terminal_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch != '\n' && ch != '\t' && ch.is_control() {
+            let code = u32::from(ch);
+            if code <= 0xff {
+                out.push_str(&format!("\\x{code:02x}"));
+            } else {
+                out.push_str(&format!("\\u{{{code:04X}}}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Byte renderer for streams that are not already decoded. Incomplete UTF-8
+/// stays buffered so a sequence split across reads cannot be completed into a
+/// live control, and invalid bytes are shown as `\xHH`.
+pub(crate) struct TerminalSanitizer {
+    pending: Vec<u8>,
+}
+
+impl TerminalSanitizer {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    pub(crate) fn write(&mut self, bytes: &[u8], out: &mut dyn Write) -> std::io::Result<()> {
+        self.pending.extend_from_slice(bytes);
+        loop {
+            if self.pending.is_empty() {
+                return Ok(());
+            }
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    write!(out, "{}", sanitize_terminal_text(text))?;
+                    self.pending.clear();
+                    return Ok(());
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        let text = std::str::from_utf8(&self.pending[..valid])
+                            .expect("valid_up_to is valid UTF-8");
+                        write!(out, "{}", sanitize_terminal_text(text))?;
+                        self.pending.drain(..valid);
+                    }
+                    match error.error_len() {
+                        Some(len) => {
+                            for byte in &self.pending[..len] {
+                                write!(out, "\\x{byte:02x}")?;
+                            }
+                            self.pending.drain(..len);
+                        }
+                        None => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
+        let rest = std::mem::take(&mut self.pending);
+        if rest.is_empty() {
+            return Ok(());
+        }
+        match std::str::from_utf8(&rest) {
+            Ok(text) => write!(out, "{}", sanitize_terminal_text(text)),
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text =
+                        std::str::from_utf8(&rest[..valid]).expect("valid_up_to is valid UTF-8");
+                    write!(out, "{}", sanitize_terminal_text(text))?;
+                }
+                for byte in &rest[valid..] {
+                    write!(out, "\\x{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn render_unrecognised(key: &str, count: usize) -> String {

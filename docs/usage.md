@@ -57,7 +57,7 @@ Confirm the installed grammar with `worker task --help`. There is no `worker tas
 
 `--max-parallel` is a **requested run cap**. Omitted, it defaults to `sum(worker.slots)` on the machine that owns the queue (each worker defaults to 1). An explicit positive value is accepted even when it is larger than that sum or than current host occupancy; extra tasks wait for a free execution slot. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity. On a controller-only laptop config, omit the flag rather than resolving it from an empty `[[workers]]` list; see [Remote controller](#remote-controller).
 
-`worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). It keeps stderr and launch failures verbatim and prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing; use `--raw` for the original log bytes.
+`worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). Terminal controls in decoded events, plain stdout, and stderr (ESC, OSC including clipboard and title sequences, CSI, and other C0/C1 controls) are shown as visible text such as `\x1b`; newlines and tabs stay. It prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing. `--raw` stays byte-exact.
 
 `worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
 
@@ -161,6 +161,18 @@ publish = ["fetch"]         # add "push" to also push task/<id> to origin
 timeout = "45m"
 max_followups = 10
 ```
+
+Permissions default to `workspace` for Codex and `unattended` for Claude, Cursor, and OpenCode. A partial `[task.permissions]` map keeps those defaults for omitted agents. Codex is the only agent with a workspace sandbox. Requesting `workspace` for Claude, Cursor, or OpenCode is `TASK_CONFIG_INVALID`: those adapters have no sandbox, so the requested mode would otherwise launch full unattended access. Set that agent to `unattended`, or opt in explicitly:
+
+```toml
+[task.permissions]
+claude = "workspace"
+
+[task.permission_fallback]
+claude = true
+```
+
+An opt-in keeps the requested permission as `workspace` and records the effective permission as `unattended` on the task and the turn, with a warning on `worker task status` and `worker task result`.
 
 `.worker.toml` `[task]` has no `close_on` field. Set close policy with `--close-on` on submit, or `close_on` at the batch top level or on a `[[tasks]]` entry (`done` or `never`).
 

@@ -30,7 +30,7 @@ use crate::{
     task::{TaskId, TaskOutcome, TaskStatus, TurnSummary, TurnTerminal},
     task_store::TaskStore,
     turn::LOG_CAP_BYTES,
-    turn_log::render_agent_log,
+    turn_log::{TerminalSanitizer, render_agent_log, sanitize_terminal_text},
 };
 
 /// How often the pane process looks for new log bytes and a terminal status.
@@ -40,7 +40,8 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// Writes the OSC 0 title `task <id12> · <title>` to `out`, then every
 /// complete line appended to the turn's `stdout.log` (rendered through the
-/// shared turn log renderer) and `stderr.log` (verbatim), polling every
+/// shared turn log renderer) and `stderr.log` (with terminal controls shown
+/// as text), polling every
 /// [`POLL_INTERVAL`]. When the task status records the turn as terminal it
 /// prints one outcome line and keeps running until `stop()` returns true. A
 /// `stop()` before the turn ends returns quietly.
@@ -103,6 +104,7 @@ pub fn follow_turn_with_poll_interval(
 
     let mut stdout_log = LogFollower::new("stdout.log");
     let mut stderr_log = LogFollower::new("stderr.log");
+    let mut stderr_sanitizer = TerminalSanitizer::new();
     let agent = turn.agent;
     let wrap = |error: WorkerError| {
         let lease = crate::lease::LeaseService::new(&store)
@@ -118,7 +120,7 @@ pub fn follow_turn_with_poll_interval(
             .map_err(&wrap)?;
         stderr_log
             .pump(&job, &mut |lines| {
-                out.write_all(lines).map_err(WorkerError::Io)
+                stderr_sanitizer.write(lines, out).map_err(WorkerError::Io)
             })
             .map_err(&wrap)?;
         if let Some((summary, status)) = terminal_turn(&tasks, project_id, turn.task_id, job_id)? {
@@ -130,16 +132,25 @@ pub fn follow_turn_with_poll_interval(
                 .map_err(&wrap)?;
             stderr_log
                 .pump(&job, &mut |lines| {
-                    out.write_all(lines).map_err(WorkerError::Io)
+                    stderr_sanitizer.write(lines, out).map_err(WorkerError::Io)
                 })
                 .map_err(&wrap)?;
             stdout_log
                 .finish(&mut |lines| render_agent_log(lines, agent, out))
                 .map_err(&wrap)?;
             stderr_log
-                .finish(&mut |lines| out.write_all(lines).map_err(WorkerError::Io))
+                .finish(&mut |lines| {
+                    stderr_sanitizer
+                        .write(lines, out)
+                        .map_err(WorkerError::Io)?;
+                    stderr_sanitizer.finish(out).map_err(WorkerError::Io)
+                })
                 .map_err(&wrap)?;
-            writeln!(out, "{}", outcome_line(&summary, &status))?;
+            writeln!(
+                out,
+                "{}",
+                sanitize_terminal_text(&outcome_line(&summary, &status))
+            )?;
             out.flush()?;
             break;
         }

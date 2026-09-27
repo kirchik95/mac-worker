@@ -563,6 +563,25 @@ fn the_osc_title_is_written_first_and_names_the_task() {
 }
 
 #[test]
+fn agent_controls_in_the_pane_are_visible_text() {
+    let fixture = Fixture::new(AgentKind::Codex);
+    append(&fixture.stderr_log(), b"err \x1b]52;c;QQQQ\x07\n");
+    append(&fixture.stdout_log(), b"plain \x1b[31mred\x1b[0m\n");
+    fixture.finish_done("ok");
+
+    let output = fixture.follow_once().unwrap();
+    let title = expected_title();
+    assert!(output.starts_with(title.as_bytes()));
+    let body = &output[title.len()..];
+    assert!(
+        !contains(body, b"\x1b") && !contains(body, b"\x07"),
+        "agent OSC and CSI must not reach the pane: {}",
+        text(body)
+    );
+    assert!(text(body).contains("\\x1b"), "{}", text(body));
+}
+
+#[test]
 fn stderr_lines_pass_through_verbatim_between_rendered_events() {
     let fixture = Fixture::new(AgentKind::Codex);
     let mut follower = Follower::spawn(&fixture);

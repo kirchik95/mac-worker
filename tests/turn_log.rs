@@ -288,3 +288,35 @@ fn turn_terminal_is_omitted_and_flushes_the_unrecognised_fold() {
         "turn_terminal must not print its payload: {rendered}"
     );
 }
+
+#[test]
+fn rendered_logs_show_osc_and_csi_as_text_and_keep_newlines() {
+    let osc = "before \u{1b}]52;c;cHVycGxlLWxhbnRlcm4=\u{7} after\n";
+    let csi = "color \u{1b}[31mred\u{1b}[0m\tend\n";
+    let rendered = render(AgentKind::Codex, &format!("{osc}{csi}"));
+    assert!(
+        !rendered.contains('\u{1b}') && !rendered.contains('\u{7}'),
+        "controls must not reach the terminal: {rendered:?}"
+    );
+    assert!(rendered.contains("\\x1b"), "{rendered:?}");
+    assert!(rendered.contains('\n'));
+    assert!(rendered.contains('\t'), "tabs stay: {rendered:?}");
+}
+
+#[test]
+fn terminal_controls_split_across_chunks_cannot_reassemble() {
+    let mut first = Vec::new();
+    render_agent_log(b"note \x1b]52;c;", AgentKind::Codex, &mut first).unwrap();
+    let mut second = Vec::new();
+    render_agent_log(b"cHVycGxl\x07\n", AgentKind::Codex, &mut second).unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8(first).unwrap(),
+        String::from_utf8(second).unwrap()
+    );
+    assert!(
+        !combined.contains('\u{1b}') && !combined.contains('\u{7}'),
+        "{combined:?}"
+    );
+    assert!(combined.contains("\\x1b"), "{combined:?}");
+}
