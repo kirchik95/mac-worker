@@ -1050,4 +1050,49 @@ mod tests {
             assert_eq!(super::hint_for(entry.code), Some(hint), "{}", entry.code);
         }
     }
+
+    #[test]
+    fn usage_exit_reference_matches_the_catalog() {
+        let usage = include_str!("../docs/usage.md");
+        let heading = usage
+            .find("## Exit codes and errors")
+            .expect("exit-code section");
+        let start = usage
+            .find("<!-- error-catalog:start -->")
+            .expect("catalog start");
+        let end = usage
+            .find("<!-- error-catalog:end -->")
+            .expect("catalog end");
+        assert!(heading < start && start < end);
+        let legend = &usage[heading..start];
+        for cell in [
+            "| 0 |", "| 1 |", "| 64 |", "| 69 |", "| 70 |", "| 74 |", "| 75 |",
+        ] {
+            assert!(legend.contains(cell), "legend missing {cell}");
+        }
+        let mut rows = Vec::new();
+        for line in usage[start..end].lines() {
+            let line = line.trim();
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let cells: Vec<&str> = line
+                .split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect();
+            assert_eq!(cells.len(), 3, "{line}");
+            let code = cells[0].trim_matches('`');
+            let exit: u8 = cells[1].parse().expect(line);
+            rows.push((code.to_owned(), exit, cells[2].to_owned()));
+        }
+        let catalog = super::public_error_catalog();
+        assert_eq!(rows.len(), catalog.len());
+        for (row, entry) in rows.iter().zip(catalog.iter()) {
+            assert_eq!(row.0, entry.code);
+            assert_eq!(row.1, entry.exit, "{}", entry.code);
+            assert_eq!(row.2, entry.hint.expect(entry.code));
+            assert!(!row.2.contains('|'), "{}", entry.code);
+        }
+    }
 }

@@ -506,3 +506,54 @@ worker logs -f <job-id>
 worker cancel <job-id>
 worker doctor --project .                   # validate a project before its first job
 ```
+
+## Exit codes and errors
+
+The process exit status is one of the categories below. The same public code keeps that status on the laptop, over SSH, and through the controller. A hint is a fixed next step: it never includes a path or text taken from a remote message. A helper that omits the category field keeps the previous mapping for that code.
+
+| Exit | Meaning |
+|---|---|
+| 0 | The command finished |
+| 1 | The agent's own status, including `AGENT_LIMIT_REACHED` |
+| 64 | Usage: the command or configuration needs a change |
+| 69 | Unavailable: SSH or the controller could not be reached, or a Git transfer can be retried |
+| 70 | Infrastructure: the worker, protocol, or wait failed |
+| 74 | I/O: a local read or write failed |
+| 75 | Capacity: a slot, resource, or agent login is not available |
+
+When `worker run` finishes, the process status is the remote command's own exit code.
+
+<!-- error-catalog:start -->
+| Code | Exit | Hint |
+|---|---|---|
+| `CONFIG_MISSING` | 64 | connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path) |
+| `CONFIG` | 64 | check the configuration syntax, worker names, and SSH destinations |
+| `TASK_BUSY` | 64 | wait for `worker task wait` to finish, then retry |
+| `TASK_CLOSED` | 64 | start a new task; this one is already closed |
+| `TASK_NOT_FOUND` | 64 | check the id with `worker task list` |
+| `TASK_CONFIG_INVALID` | 64 | fix the task options and submit again |
+| `FOLLOWUP_LIMIT` | 64 | close the task, or submit a new one with a higher follow-up limit |
+| `TASK_REVISION_CONFLICT` | 64 | refresh the task status and retry the close |
+| `RESULT_NOT_RETAINED` | 64 | the closed workspace is no longer retained |
+| `AGENT_UNSUPPORTED` | 64 | choose codex, cursor, opencode, or claude |
+| `NOT_A_WORKTREE` | 64 | run the command inside a Git worktree |
+| `SSH_UNAVAILABLE` | 69 | check SSH to the worker and retry |
+| `CONTROLLER_UNAVAILABLE` | 69 | check the controller host with `worker controller status` |
+| `BASE_PUSH_FAILED` | 69 | retry; the worker did not receive the base commit |
+| `RESULT_FETCH_FAILED` | 69 | retry the fetch; the result is still on the worker |
+| `WAIT_TIMEOUT` | 70 | the wait timed out; the task is still running |
+| `WAIT_BLOCKED` | 70 | inspect `worker task status` for the blocked turn |
+| `HOST_LAYOUT_OUTDATED` | 70 | run `worker setup` to update the helper |
+| `PUBLISH_FAILED` | 70 | retry publishing; the result is still on the worker |
+| `BASE_UNAVAILABLE` | 70 | choose a base commit that exists in the worktree |
+| `RUNNER_HANDOFF_FAILED` | 74 | retry; the local runner handoff failed |
+| `IO` | 74 | retry the command |
+| `CAPACITY_BUSY` | 75 | wait for a free heavy slot, or choose another worker |
+| `CAPABILITY_MISSING` | 75 | install the missing capability or pin a worker that has it |
+| `INSUFFICIENT_DISK` | 75 | free disk space on the worker and retry |
+| `MEMORY_PRESSURE` | 75 | wait until the worker has free memory and retry |
+| `SWAP_LIMIT` | 75 | wait until swap pressure drops and retry |
+| `AGENT_NOT_INSTALLED` | 75 | install the agent on the worker account |
+| `AGENT_NOT_AUTHENTICATED` | 75 | finish the agent's headless login on the worker |
+| `AGENT_LIMIT_REACHED` | 1 | raise the turn or budget limit and submit again |
+<!-- error-catalog:end -->
