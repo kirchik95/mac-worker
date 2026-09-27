@@ -2,7 +2,7 @@
 use crate::{
     error::WorkerError,
     inputs::RelativePath,
-    job::{LogChunk, LogStream},
+    job::{AcceptedTurnAssignment, LogChunk, LogStream},
     rooted_fs::RootedDir,
     task::{TaskId, TaskOutcome, TurnId},
 };
@@ -23,6 +23,8 @@ struct Commit {
     offsets: [u64; 2],
     len: u64,
     accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment: Option<AcceptedTurnAssignment>,
     completion: Option<Completion>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -238,6 +240,36 @@ impl RunnerLog {
     pub(crate) fn is_accepted(&self) -> bool {
         self.journal.committed.accepted
     }
+    /// Upgrade an older accepted checkpoint using its same-turn worker
+    /// projection. Never derive this from a newly admitted queue assignment.
+    pub(crate) fn accepted_assignment(
+        &mut self,
+        record: &crate::task::LocalTaskRecord,
+    ) -> Result<Option<AcceptedTurnAssignment>, WorkerError> {
+        if !self.is_accepted() {
+            return Ok(None);
+        }
+        if let Some(assignment) = &self.journal.committed.assignment {
+            return Ok(Some(assignment.clone()));
+        }
+        if record.meta().task_id() != self.journal.task_id
+            || record.status().turns().last().map(|turn| turn.turn_id())
+                != Some(self.journal.turn_id)
+        {
+            return Err(invalid());
+        }
+        let worker = record.status().worker().ok_or_else(|| {
+            WorkerError::task(
+                "TASK_ACCEPTED_ASSIGNMENT_MISSING",
+                "accepted turn has no proven worker assignment",
+            )
+        })?;
+        let assignment = AcceptedTurnAssignment::new(worker.to_owned(), self.journal.turn_id)?;
+        let mut next = self.journal.committed.clone();
+        next.assignment = Some(assignment.clone());
+        self.append(&[], next)?;
+        Ok(Some(assignment))
+    }
     pub(crate) fn len(&self) -> u64 {
         self.journal.committed.len
     }
@@ -340,12 +372,23 @@ impl RunnerLog {
         next.offsets[i] = chunk.next_offset();
         self.append(&bytes, next)
     }
-    pub(crate) fn accepted(&mut self, bytes: &[u8]) -> Result<bool, WorkerError> {
+    pub(crate) fn accepted(&mut self, worker: &str, bytes: &[u8]) -> Result<bool, WorkerError> {
+        let assignment = AcceptedTurnAssignment::new(worker.to_owned(), self.journal.turn_id)?;
         if self.journal.committed.accepted {
+            if self
+                .journal
+                .committed
+                .assignment
+                .as_ref()
+                .is_some_and(|current| current != &assignment)
+            {
+                return Err(invalid());
+            }
             return Ok(false);
         }
         let mut next = self.journal.committed.clone();
         next.accepted = true;
+        next.assignment = Some(assignment);
         self.append(bytes, next)?;
         Ok(true)
     }
@@ -397,6 +440,7 @@ fn decode(bytes: &[u8], task_id: TaskId, turn_id: TurnId) -> Result<Journal, Wor
     if j.version != 1 || j.task_id != task_id || j.turn_id != turn_id {
         return Err(invalid());
     }
+    validate_assignment(&j.committed, turn_id)?;
     if j.committed.offsets[0]
         .checked_add(j.committed.offsets[1])
         .is_none_or(|n| n > j.committed.len)
@@ -411,11 +455,13 @@ fn decode(bytes: &[u8], task_id: TaskId, turn_id: TurnId) -> Result<Journal, Wor
         return Err(invalid());
     }
     if let Some(p) = &j.pending {
+        validate_assignment(&p.next, turn_id)?;
         let b = STANDARD.decode(&p.payload).map_err(|_| invalid())?;
         if b.len() > CHUNK
             || j.committed.completion.is_some()
             || j.committed.len.checked_add(b.len() as u64) != Some(p.next.len)
             || (j.committed.accepted && !p.next.accepted)
+            || (j.committed.assignment.is_some() && j.committed.assignment != p.next.assignment)
         {
             return Err(invalid());
         }
@@ -448,9 +494,20 @@ fn decode(bytes: &[u8], task_id: TaskId, turn_id: TurnId) -> Result<Journal, Wor
     }
     Ok(j)
 }
+
+fn validate_assignment(commit: &Commit, turn_id: TurnId) -> Result<(), WorkerError> {
+    if let Some(assignment) = &commit.assignment {
+        if !commit.accepted {
+            return Err(invalid());
+        }
+        assignment.validate_for(turn_id).map_err(|_| invalid())?;
+    }
+    Ok(())
+}
 pub(crate) struct Snapshot {
     pub len: u64,
     pub completion: Option<Completion>,
+    pub accepted: bool,
 }
 pub(crate) fn snapshot(
     root: &Path,
@@ -462,6 +519,10 @@ pub(crate) fn snapshot(
         let bytes = dir.read_private_regular(&format!("{turn}.checkpoint.json"), LIMIT as u64)?;
         let j = decode(&bytes, task, turn)?;
         Ok(Snapshot {
+            accepted: j.committed.accepted
+                || j.pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.next.accepted),
             len: j.committed.len,
             completion: j.committed.completion,
         })
@@ -682,8 +743,8 @@ mod tests {
     fn completion_and_accepted_are_atomic_and_idempotent() {
         let (d, t, u) = setup();
         let mut w = RunnerLog::open(d.path(), t, u).unwrap();
-        assert!(w.accepted(b"accepted\n").unwrap());
-        assert!(!w.accepted(b"accepted\n").unwrap());
+        assert!(w.accepted("mini-1", b"accepted\n").unwrap());
+        assert!(!w.accepted("mini-1", b"accepted\n").unwrap());
         let c = Completion {
             outcome: TaskOutcome::Done,
             drained: true,
@@ -702,7 +763,7 @@ mod tests {
     fn accepted_undrainable_completion_is_valid_without_claiming_drained() {
         let (d, t, u) = setup();
         let mut w = RunnerLog::open(d.path(), t, u).unwrap();
-        assert!(w.accepted(b"accepted\n").unwrap());
+        assert!(w.accepted("mini-1", b"accepted\n").unwrap());
         let c = Completion {
             outcome: TaskOutcome::failed("LOG_DRAIN_UNAVAILABLE"),
             drained: false,
@@ -728,7 +789,7 @@ mod tests {
     fn accepted_success_cannot_complete_as_not_drained() {
         let (d, t, u) = setup();
         let mut w = RunnerLog::open(d.path(), t, u).unwrap();
-        assert!(w.accepted(b"accepted\n").unwrap());
+        assert!(w.accepted("mini-1", b"accepted\n").unwrap());
         assert!(
             w.finish(
                 Completion {

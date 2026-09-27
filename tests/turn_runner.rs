@@ -1771,6 +1771,209 @@ fn combined_follower_restarts_from_committed_offsets_after_a_late_tail() {
     );
 }
 
+struct ParkedRecoveryRemote<'a> {
+    inner: ReplayableLogsRunner<'a>,
+    recovering: AtomicBool,
+    all_busy: bool,
+    recovery_requests: Mutex<Vec<ProcessRequest>>,
+}
+
+impl ProcessRunner for ParkedRecoveryRemote<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let recovering = self.recovering.load(Ordering::SeqCst);
+        let on_b = request.args.iter().any(|arg| arg == "mac2");
+        if recovering {
+            self.recovery_requests.lock().unwrap().push(request.clone());
+            if on_b
+                && request
+                    .args
+                    .last()
+                    .is_some_and(|arg| arg == HostOperation::TaskStatus.command())
+            {
+                let mut result = canonical_process(&HostControlError::new(
+                    "TASK_NOT_FOUND",
+                    "turn was accepted on mini-1",
+                )?)?;
+                result.status = ExitStatus::from_raw(23 << 8);
+                return Ok(result);
+            }
+        }
+        let mut result = self.inner.run(request)?;
+        if recovering
+            && request
+                .args
+                .last()
+                .is_some_and(|arg| arg == "~/.local/bin/worker host probe")
+        {
+            let mut probe: ProbeResponse = serde_json::from_slice(&result.stdout).unwrap();
+            if !on_b || self.all_busy {
+                probe.slot_state = SlotState::Busy;
+            }
+            result = canonical_process(&probe)?;
+        }
+        Ok(result)
+    }
+}
+
+fn assert_accepted_turn_recovers_from_park(all_busy: bool, legacy_checkpoint: bool) {
+    let mut fixture =
+        AcceptedThenTerminalFixture::new_with_options(None, WorkerPreference::Automatic, false);
+    fixture.config = Config::parse(
+        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n[[workers]]\nname = \"mini-2\"\nssh = \"mac2\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n",
+    ).unwrap();
+    let remote = ParkedRecoveryRemote {
+        inner: ReplayableLogsRunner::new(&fixture.runner),
+        recovering: AtomicBool::new(false),
+        all_busy,
+        recovery_requests: Mutex::new(Vec::new()),
+    };
+    remote.inner.fail_stderr_once.store(true, Ordering::SeqCst);
+    let first = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert_eq!(first.public_code(), "SSH_LAUNCH_FAILED");
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .worker(),
+        Some("mini-1")
+    );
+    assert_eq!(fixture_checkpoint(&fixture)["committed"]["accepted"], true);
+    if legacy_checkpoint {
+        let mut checkpoint = fixture_checkpoint(&fixture);
+        checkpoint["committed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("assignment");
+        write_fixture_checkpoint(&fixture, &checkpoint);
+    }
+    *fixture.runner.turn_submitted.lock().unwrap() = false;
+    fixture
+        .state
+        .set_replacement_failure(
+            fixture.turn_id,
+            Some(
+                ReplacementFailureBudget::new(
+                    1,
+                    "SSH_LAUNCH_FAILED".into(),
+                    mac_worker::job::REPLACEMENT_FAILURE_PARK_AFTER,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let dead_owner = ProcessIdentity::new(424_299, 4_242_997).unwrap();
+    fixture
+        .state
+        .adopt_row(fixture.turn_id, dead_owner)
+        .unwrap();
+    let recovery_store = ClientStateStore::open_with_owner_inspector(
+        &fixture.paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    recovery_store.note_confirmed_runner_absence(dead_owner);
+    let client = TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &recovery_store,
+        &fixture.executor,
+    );
+    client.reconcile_runners().unwrap();
+    assert!(matches!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .unwrap()
+            .state(),
+        mac_worker::job::QueueState::Parked
+    ));
+    remote.recovering.store(true, Ordering::SeqCst);
+    fixture
+        .state
+        .invalidate_admission_observation("mini-1")
+        .unwrap();
+    fixture
+        .state
+        .invalidate_admission_observation("mini-2")
+        .unwrap();
+    let restarted = ClientStateStore::open(&fixture.paths.state).unwrap();
+    TaskClient::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &restarted,
+        &fixture.executor,
+    )
+    .operator_reconcile()
+    .unwrap();
+    *fixture.runner.turn_submitted.lock().unwrap() = true;
+    let result = TurnRunner::new(
+        &remote,
+        &fixture.config,
+        &fixture.paths,
+        &restarted,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    assert_eq!(result.exit_code(), 0);
+    let record = restarted.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().worker(), Some("mini-1"));
+    assert_eq!(record.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_ne!(record.status().state(), TaskState::Abandoned);
+    assert!(record.abandon_code().is_none());
+    assert!(!String::from_utf8_lossy(&fixture.runner_log()).contains("LOG_DRAIN_UNAVAILABLE"));
+    assert_eq!(
+        fixture.runner_log().iter().filter(|b| **b == 0xf1).count(),
+        150_011
+    );
+    assert_eq!(
+        fixture.runner_log().iter().filter(|b| **b == 0xfe).count(),
+        91_017
+    );
+    let requests = remote.recovery_requests.lock().unwrap();
+    assert_eq!(
+        count_host_ops(&requests, HostOperation::LeaseAcquire.command()),
+        0
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.args.iter().any(|arg| arg == "mac2")),
+        "recovery contacted worker B"
+    );
+}
+
+#[test]
+fn accepted_automatic_turn_recovers_on_original_worker_after_parking() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, false);
+}
+
+#[test]
+fn accepted_automatic_turn_is_not_abandoned_when_all_workers_are_busy() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(true, false);
+}
+
+#[test]
+fn legacy_accepted_turn_recovers_on_original_worker_after_parking() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_accepted_turn_recovers_from_park(false, true);
+}
+
 #[test]
 fn recovery_drains_the_log_tail_when_a_dead_owner_has_terminal_status_and_offsets_behind_available_streams()
  {

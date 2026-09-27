@@ -1292,6 +1292,29 @@ impl ClientStateStore {
         })
     }
 
+    /// Restore a journal-proven acceptance without admission. The journal's
+    /// writer lock must be held by the caller; the current queue owner is
+    /// checked again while publishing the dispatch.
+    pub(crate) fn resume_accepted_turn(
+        &self,
+        assignment: &crate::job::AcceptedTurnAssignment,
+        owner: ProcessIdentity,
+        now_millis: u64,
+    ) -> Result<(), WorkerError> {
+        assignment.validate_for(assignment.job_id)?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, assignment.job_id)?;
+            if entry.kind() != QueueEntryKind::TaskTurn || entry.owner_opt() != Some(&owner) {
+                return Err(queue_error(
+                    "QUEUE_OWNER_MISMATCH",
+                    "accepted turn ownership changed",
+                ));
+            }
+            entry.dispatch(owner, assignment.worker.clone(), now_millis)?;
+            Ok(((), true))
+        })
+    }
+
     pub fn claim_next(
         &self,
         owner: ProcessIdentity,

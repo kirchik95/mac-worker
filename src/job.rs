@@ -1328,6 +1328,32 @@ pub const RUNNER_REPEATED_FAILURE: &str = "RUNNER_REPEATED_FAILURE";
 /// restart trigger.
 pub const RUNNER_UNVERIFIABLE: &str = "RUNNER_UNVERIFIABLE";
 
+/// The host that accepted a task turn. Stored in the turn journal, independently
+/// of the queue row's runnable state and replacement runner ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedTurnAssignment {
+    pub worker: String,
+    pub job_id: JobId,
+}
+
+impl AcceptedTurnAssignment {
+    pub(crate) fn new(worker: String, job_id: JobId) -> Result<Self, WorkerError> {
+        validate_worker_name(&worker)?;
+        Ok(Self { worker, job_id })
+    }
+
+    pub(crate) fn validate_for(&self, turn_id: JobId) -> Result<(), WorkerError> {
+        validate_worker_name(&self.worker)?;
+        if self.job_id != turn_id {
+            return Err(protocol_error(
+                "accepted assignment differs from journal turn",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Durable restart budget for a turn whose replacement runner already exited
 /// after acceptance.
 ///

@@ -666,6 +666,23 @@ impl<'a> TurnRunner<'a> {
                 }
                 return Ok((task_id, turn_id, runner_owner));
             }
+            // Recover pending journal transactions before considering admission
+            // or cancellation. A parked accepted turn still belongs to its host.
+            if entry.owner_opt() == Some(&runner_owner) {
+                let mut log = LogWriter::open(&self.paths.state, task_id, turn_id)?;
+                log.require_owner(self.client_state, runner_owner)?;
+                if log.completion().is_some() {
+                    return Ok((task_id, turn_id, runner_owner));
+                }
+                if let Some(assignment) = log.accepted_assignment(&record)? {
+                    self.client_state.resume_accepted_turn(
+                        &assignment,
+                        runner_owner,
+                        now_millis()?,
+                    )?;
+                    return Ok((task_id, turn_id, runner_owner));
+                }
+            }
             if entry.is_cancel_requested()
                 && !matches!(entry.state(), QueueState::Dispatching { .. })
             {
@@ -860,15 +877,18 @@ impl<'a> TurnRunner<'a> {
                 });
             }
         }
-        let worker_name = self
-            .client_state
-            .queue_entry(turn_id)?
-            .and_then(|entry| match entry.state() {
-                QueueState::Dispatching {
-                    selected_worker, ..
-                } => Some(selected_worker.to_owned()),
-                _ => None,
-            })
+        let worker_name = log
+            .accepted_assignment(&initial_record)?
+            .map(|assignment| assignment.worker)
+            .or(self
+                .client_state
+                .queue_entry(turn_id)?
+                .and_then(|entry| match entry.state() {
+                    QueueState::Dispatching {
+                        selected_worker, ..
+                    } => Some(selected_worker.to_owned()),
+                    _ => None,
+                }))
             .or_else(|| initial_record.status().worker().map(str::to_owned))
             .ok_or_else(|| task_error("WORKER_NOT_FOUND", "task turn has no selected worker"))?;
         let worker = self
@@ -1183,6 +1203,11 @@ impl<'a> TurnRunner<'a> {
                             return Err(error);
                         }
                     };
+                    append_event(
+                        &mut log,
+                        follow,
+                        serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
+                    )?;
                     let status = if self.queue_cancel_requested(turn_id)? {
                         remote
                             .task_cancel(
@@ -1215,6 +1240,11 @@ impl<'a> TurnRunner<'a> {
                 }
             }
             LeaseAcquireResponse::ExistingAccepted { .. } => {
+                append_event(
+                    &mut log,
+                    follow,
+                    serde_json::json!({"type":"turn_accepted","protocol_version":crate::protocol::PROTOCOL_VERSION,"task_id":task_id,"turn_id":turn_id,"worker":worker.name}),
+                )?;
                 let status = remote
                     .task_status(
                         worker,
@@ -1440,6 +1470,11 @@ impl<'a> TurnRunner<'a> {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<bool, WorkerError> {
+        if crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?
+            .is_some_and(|snapshot| snapshot.accepted)
+        {
+            return Ok(false);
+        }
         if self
             .client_state
             .read_turn_prompt(task_id, turn_id)
@@ -1744,6 +1779,12 @@ impl<'a> TurnRunner<'a> {
             }
         };
         log.require_owner(self.client_state, owner)?;
+        if log.is_accepted() {
+            return Err(task_error(
+                "TASK_BUSY",
+                "accepted turn cannot be abandoned for capacity",
+            ));
+        }
         let record = &self.client_state.load_task(task_id)?;
         let status = TaskStatus::new(
             TaskState::Abandoned,
@@ -1823,6 +1864,12 @@ impl<'a> TurnRunner<'a> {
         let entry = log
             .current_entry(self.client_state)?
             .ok_or_else(|| task_error("TASK_BUSY", "task turn was retired"))?;
+        if log.is_accepted() {
+            return Err(task_error(
+                "TASK_BUSY",
+                "accepted turn requires remote cancellation",
+            ));
+        }
         if entry.owner_opt().is_some_and(|current| *current != owner) {
             return Err(task_error("TASK_BUSY", "task turn ownership changed"));
         }
@@ -2272,7 +2319,13 @@ fn append_event(
         .map_err(|error| task_error("TASK_EVENT_INVALID", error.to_string()))?;
     line.push(b'\n');
     let wrote = match event.get("type").and_then(|v| v.as_str()) {
-        Some("turn_accepted") => log.accepted(&line)?,
+        Some("turn_accepted") => log.accepted(
+            event
+                .get("worker")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| task_error("TASK_EVENT_INVALID", "accepted worker is missing"))?,
+            &line,
+        )?,
         Some("turn_terminal") => {
             let outcome = serde_json::from_value(event["outcome"].clone())
                 .map_err(|_| task_error("TASK_EVENT_INVALID", "terminal outcome is invalid"))?;
