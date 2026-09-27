@@ -51,8 +51,9 @@ impl WaitDeadline {
 
     /// Blocking flock is retained for callers without a wait budget. Timed
     /// callers retry nonblocking acquisition and recheck before using the lock.
-    pub(super) fn lock(self, fd: RawFd, operation: libc::c_int) -> Result<(), WorkerError> {
-        if self.expires().is_none() {
+    pub(crate) fn lock(self, fd: RawFd, operation: libc::c_int) -> Result<(), WorkerError> {
+        if self.expires().is_none() || operation & libc::LOCK_NB != 0 {
+            self.remaining()?;
             return super::cvt(unsafe { libc::flock(fd, operation) }).map_err(WorkerError::Io);
         }
         loop {

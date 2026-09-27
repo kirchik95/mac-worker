@@ -305,18 +305,42 @@ pub fn open_transfer_repo(
     project: &ProjectState,
     meta: &TaskMeta,
 ) -> Result<crate::transfer_repo::TransferRepo, WorkerError> {
+    open_transfer_repo_until(
+        &crate::process::SystemProcessRunner,
+        paths,
+        project,
+        meta,
+        crate::client_state::WaitDeadline::default(),
+    )
+}
+
+pub(crate) fn open_transfer_repo_until(
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    project: &ProjectState,
+    meta: &TaskMeta,
+    deadline: crate::client_state::WaitDeadline,
+) -> Result<crate::transfer_repo::TransferRepo, WorkerError> {
+    deadline.remaining()?;
     if let Some(registry) = ProjectRegistry::open_existing(&paths.controller_state_root())?
         && registry
             .try_resolve(meta.project_id(), meta.worktree_id())?
             .is_some()
     {
-        return crate::transfer_repo::TransferRepo::open_or_create_controller_cache(
+        return crate::transfer_repo::TransferRepo::open_or_create_controller_cache_until(
+            runner,
             &paths.cache,
             meta.project_id(),
             meta.worktree_id(),
+            deadline,
         );
     }
-    crate::transfer_repo::TransferRepo::open_or_create(&paths.cache, &project.context.common_dir)
+    crate::transfer_repo::TransferRepo::open_or_create_until(
+        runner,
+        &paths.cache,
+        &project.context.common_dir,
+        deadline,
+    )
 }
 
 fn is_registered_checkout(project: &Path, checkout: &Path) -> bool {

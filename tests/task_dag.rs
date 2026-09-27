@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
+    os::fd::AsRawFd,
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
@@ -1283,6 +1284,64 @@ fn dag_same_pid_concurrent_advancers_submit_one_identity() {
     assert_exact_once_submit(&fixture, created_at);
 }
 
+#[test]
+fn local_wait_deadline_bounds_same_process_submit_guard() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let fixture = prepared_frozen_dag_inner(Some(Arc::new(SubmitGuardBarrier {
+        entered: entered_tx,
+        release: Mutex::new(Some(release_rx)),
+        first: AtomicBool::new(false),
+    })));
+    let config = dag_test_config();
+    thread::scope(|scope| {
+        let first = scope.spawn(|| advance_dags(&fixture));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let before = fixture.store.load_run_dag(fixture.run_id).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let client = TaskClient::new(
+            &fixture.runner,
+            &config,
+            &fixture.paths,
+            &fixture.store,
+            &InlineRunnerExecutor,
+        );
+        let run_id = fixture.run_id;
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = client.wait(WaitSelector::Run(run_id), Some(Duration::from_millis(150)));
+            done_tx.send(started.elapsed()).unwrap();
+            result
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let after = fixture.store.load_run_dag(fixture.run_id).unwrap();
+        let task = fixture.store.load_task_optional(fixture.task_id).unwrap();
+        release_tx.send(()).unwrap();
+        let result = waiter.join().unwrap();
+        first.join().unwrap().unwrap();
+        assert!(
+            elapsed.is_ok(),
+            "same-process submit guard outlived wait deadline"
+        );
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+        assert_eq!(
+            after, before,
+            "waiting caller changed the in-flight DAG claim"
+        );
+        assert!(task.is_none());
+    });
+    assert_exact_once_submit(
+        &fixture,
+        fixture
+            .store
+            .load_task(fixture.task_id)
+            .unwrap()
+            .meta()
+            .created_at_millis(),
+    );
+}
+
 const SIDECAR_OBSERVED_AT: u64 = 1_700_000_000_042;
 const SIDECAR_DELIVERY_OID: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
@@ -2510,6 +2569,143 @@ base = "from:root"
     assert_eq!(child_task.meta().base_oid(), &result_oid);
     assert_ne!(child_task.meta().base_oid().to_string(), original_head);
     assert!(store.queue_entry(child_turn_id).unwrap().is_some());
+}
+
+struct SlowBindingGit<'a> {
+    inner: &'a IsolatedDagRunner,
+    command: &'static str,
+    reached: AtomicBool,
+}
+
+impl ProcessRunner for SlowBindingGit<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git")
+            && request.args.iter().any(|arg| arg == self.command)
+            && (self.command != "cat-file" || request.args.iter().any(|arg| arg == "-e"))
+        {
+            self.reached.store(true, Ordering::SeqCst);
+            let mut slow = request.clone();
+            slow.program = "/bin/sleep".into();
+            slow.args = vec!["2".into()];
+            slow.stdin = None;
+            // Exercise real subprocess timeout and cleanup, only replacing
+            // the slow external Git executable. No worker is contacted.
+            return SystemProcessRunner.run_in_new_session(&slow);
+        }
+        self.inner.run(request)
+    }
+}
+
+fn ready_wait_dag() -> (BatchHarness, RunId, DagRecord) {
+    let harness = BatchHarness::new(
+        br#"
+version = 1
+agent = "codex"
+[[tasks]]
+id = "root"
+prompt = "root work"
+[[tasks]]
+id = "child"
+prompt = "child work"
+depends_on = ["root"]
+base = "from:root"
+"#,
+    );
+    let run = harness.batch();
+    let dag = harness.store.load_run_dag(run.run_id()).unwrap().unwrap();
+    let parent = &dag.nodes["root"];
+    let oid = harness.commit_result(b"accepted parent result\n");
+    plant_closed_done_import(&harness.store, parent.task_id, parent.turn_id, oid);
+    (harness, run.run_id(), dag)
+}
+
+fn local_wait_slow_binding_git(command: &'static str) {
+    let (harness, run_id, dag) = ready_wait_dag();
+    let parent = &dag.nodes["root"];
+    let before = harness.store.load_task(parent.task_id).unwrap();
+    let slow = SlowBindingGit {
+        inner: &harness.runner,
+        command,
+        reached: AtomicBool::new(false),
+    };
+    let started = Instant::now();
+    let result = harness
+        .client_with(&slow)
+        .wait(WaitSelector::Run(run_id), Some(Duration::from_millis(500)));
+    let elapsed = started.elapsed();
+    assert!(
+        slow.reached.load(Ordering::SeqCst),
+        "{command} bypassed the wait ProcessRunner"
+    );
+    assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    assert!(
+        elapsed < Duration::from_millis(1300),
+        "slow Git exceeded the remaining budget: {elapsed:?}"
+    );
+    assert_eq!(harness.store.load_task(parent.task_id).unwrap(), before);
+    assert_eq!(
+        harness.store.load_run_dag(run_id).unwrap().unwrap(),
+        dag,
+        "expired Git must not publish a binding or claim a child"
+    );
+    assert!(
+        harness
+            .store
+            .load_task_optional(dag.nodes["child"].task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(harness.store.queue_snapshot().unwrap().entries().is_empty());
+}
+
+#[test]
+fn local_wait_deadline_bounds_slow_dag_object_probe() {
+    local_wait_slow_binding_git("cat-file");
+}
+
+#[test]
+fn local_wait_deadline_bounds_slow_owned_view_initialization() {
+    local_wait_slow_binding_git("init");
+}
+
+#[test]
+fn local_wait_deadline_bounds_transfer_repository_lock() {
+    let (harness, run_id, dag) = ready_wait_dag();
+    let parent = harness.store.load_task(dag.nodes["root"].task_id).unwrap();
+    let held = fs::File::open(
+        harness
+            .paths
+            .cache
+            .join("transfer")
+            .join(format!("{}.lock", parent.repo_id())),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let client = harness.client();
+    thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = client.wait(WaitSelector::Run(run_id), Some(Duration::from_millis(150)));
+            done_tx.send(started.elapsed()).unwrap();
+            result
+        });
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        let result = waiter.join().unwrap();
+        assert!(elapsed.is_ok(), "transfer lock outlived wait deadline");
+        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    });
+    assert_eq!(harness.store.load_run_dag(run_id).unwrap().unwrap(), dag);
+    assert_eq!(
+        harness.store.load_task(parent.meta().task_id()).unwrap(),
+        parent
+    );
+    assert!(harness.store.queue_snapshot().unwrap().entries().is_empty());
 }
 
 const PENDING_ORIGIN: &str = "ssh://127.0.0.1:1/repo.git";

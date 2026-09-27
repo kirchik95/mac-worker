@@ -11,7 +11,7 @@ use std::{
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
     sync::Arc,
     time::Duration,
 };
@@ -20,10 +20,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    client_state::WaitDeadline,
     error::WorkerError,
     gc::{GcCandidate, GcReport, git_ref_names},
     inputs::{InputSelector, RelativePath, SelectedInputKind, SelectionFailure},
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::ProjectContext,
     project_config::ProjectSettings,
     rooted_fs::{EntryKind, RootedDir},
@@ -168,6 +169,7 @@ pub struct TransferRepo {
     alternates_target: PathBuf,
     user_alternates: bool,
     _repo_lock: Arc<File>,
+    wait_deadline: WaitDeadline,
 }
 
 /// Excludes other publishers of one task's transfer and user result refs.
@@ -208,6 +210,7 @@ impl Clone for TransferRepo {
             alternates_target: self.alternates_target.clone(),
             user_alternates: self.user_alternates,
             _repo_lock: self._repo_lock.clone(),
+            wait_deadline: self.wait_deadline,
         }
     }
 }
@@ -411,8 +414,12 @@ fn push_warning(warnings: &mut Vec<String>, warning: &str) {
 /// maintenance is off. Result publishers for the same task also hold a
 /// ResultImport lock. The shared repository lock exists so transfer GC, which
 /// takes it exclusively, can never delete a repository with a live handle.
-fn lock_transfer_repo_shared(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
-    flock_transfer_file(parent, &format!("{repo_id}.lock"), libc::LOCK_SH)
+fn lock_transfer_repo_shared(
+    parent: &RootedDir,
+    repo_id: &str,
+    deadline: WaitDeadline,
+) -> Result<Arc<File>, WorkerError> {
+    flock_transfer_file(parent, &format!("{repo_id}.lock"), libc::LOCK_SH, deadline)
 }
 
 /// Transfer GC never waits for a repository: a live handle means the
@@ -446,19 +453,27 @@ const IN_USE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// First creation of a repository is the one step that must not run twice.
 /// It runs under a short exclusive lock on a separate file, so a shared
 /// holder never upgrades the lock it already holds.
-fn lock_transfer_repo_init(parent: &RootedDir, repo_id: &str) -> Result<Arc<File>, WorkerError> {
-    flock_transfer_file(parent, &format!("{repo_id}.init.lock"), libc::LOCK_EX)
+fn lock_transfer_repo_init(
+    parent: &RootedDir,
+    repo_id: &str,
+    deadline: WaitDeadline,
+) -> Result<Arc<File>, WorkerError> {
+    flock_transfer_file(
+        parent,
+        &format!("{repo_id}.init.lock"),
+        libc::LOCK_EX,
+        deadline,
+    )
 }
 
 fn flock_transfer_file(
     parent: &RootedDir,
     name: &str,
     operation: libc::c_int,
+    deadline: WaitDeadline,
 ) -> Result<Arc<File>, WorkerError> {
     let file = parent.open_private_lock(name)?;
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
-        return Err(WorkerError::Io(io::Error::last_os_error()));
-    }
+    deadline.lock(file.as_raw_fd(), operation)?;
     Ok(Arc::new(file))
 }
 
@@ -492,6 +507,21 @@ impl TransferRepo {
     }
 
     pub fn open_or_create(cache_root: &Path, user_common_dir: &Path) -> Result<Self, WorkerError> {
+        Self::open_or_create_until(
+            &SystemProcessRunner,
+            cache_root,
+            user_common_dir,
+            WaitDeadline::default(),
+        )
+    }
+
+    pub(crate) fn open_or_create_until(
+        runner: &dyn ProcessRunner,
+        cache_root: &Path,
+        user_common_dir: &Path,
+        deadline: WaitDeadline,
+    ) -> Result<Self, WorkerError> {
+        deadline.remaining()?;
         let repo_id = repo_id_for(user_common_dir)?;
         let alternates_target =
             fs::canonicalize(user_common_dir.join("objects")).map_err(|_| {
@@ -507,17 +537,18 @@ impl TransferRepo {
         };
         let transfer_parent = cache_root.join("transfer");
         let transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
-        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id)?;
+        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id, deadline)?;
         let path = transfer_parent.join(format!("{repo_id}.git"));
         let repo_dir = match open_initialized_transfer_repo(&path)? {
             Some(repo_dir) => repo_dir,
             None => {
-                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id)?;
+                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id, deadline)?;
                 match open_initialized_transfer_repo(&path)? {
                     Some(repo_dir) => repo_dir,
                     None => {
                         let repo_dir = open_or_create_owner_only_dir(&path)?;
-                        run_system_git(
+                        run_git(
+                            runner,
                             None,
                             &[
                                 OsString::from("init"),
@@ -544,6 +575,7 @@ impl TransferRepo {
             alternates_target,
             user_alternates: true,
             _repo_lock: repo_lock,
+            wait_deadline: deadline,
         };
         transfer.verify_alternates()?;
         Ok(transfer)
@@ -606,7 +638,30 @@ impl TransferRepo {
         project_id: &str,
         worktree_id: &str,
     ) -> Result<Self, WorkerError> {
-        Self::open_controller_cache_inner(cache_root, project_id, worktree_id, true)
+        Self::open_or_create_controller_cache_until(
+            &SystemProcessRunner,
+            cache_root,
+            project_id,
+            worktree_id,
+            WaitDeadline::default(),
+        )
+    }
+
+    pub(crate) fn open_or_create_controller_cache_until(
+        runner: &dyn ProcessRunner,
+        cache_root: &Path,
+        project_id: &str,
+        worktree_id: &str,
+        deadline: WaitDeadline,
+    ) -> Result<Self, WorkerError> {
+        Self::open_controller_cache_inner(
+            runner,
+            cache_root,
+            project_id,
+            worktree_id,
+            true,
+            deadline,
+        )
     }
 
     /// Hidden-helper open. Fails closed when prepare has not created the
@@ -616,15 +671,25 @@ impl TransferRepo {
         project_id: &str,
         worktree_id: &str,
     ) -> Result<Self, WorkerError> {
-        Self::open_controller_cache_inner(cache_root, project_id, worktree_id, false)
+        Self::open_controller_cache_inner(
+            &SystemProcessRunner,
+            cache_root,
+            project_id,
+            worktree_id,
+            false,
+            WaitDeadline::default(),
+        )
     }
 
     fn open_controller_cache_inner(
+        runner: &dyn ProcessRunner,
         cache_root: &Path,
         project_id: &str,
         worktree_id: &str,
         create: bool,
+        deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
+        deadline.remaining()?;
         let repo_id = Self::controller_transfer_cache_id(project_id, worktree_id)?;
         let cache_root = if cache_root.is_absolute() {
             cache_root.to_path_buf()
@@ -640,16 +705,17 @@ impl TransferRepo {
             ));
         }
         let transfer_ns = open_or_create_owner_only_dir(&transfer_parent)?;
-        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id)?;
+        let repo_lock = lock_transfer_repo_shared(&transfer_ns, &repo_id, deadline)?;
         let repo_dir = match open_initialized_transfer_repo(&path)? {
             Some(repo_dir) => repo_dir,
             None if create => {
-                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id)?;
+                let _init_lock = lock_transfer_repo_init(&transfer_ns, &repo_id, deadline)?;
                 match open_initialized_transfer_repo(&path)? {
                     Some(repo_dir) => repo_dir,
                     None => {
                         let repo_dir = open_or_create_owner_only_dir(&path)?;
-                        run_system_git(
+                        run_git(
+                            runner,
                             None,
                             &[
                                 OsString::from("init"),
@@ -681,6 +747,7 @@ impl TransferRepo {
             alternates_target: path.join("objects"),
             user_alternates: false,
             _repo_lock: repo_lock,
+            wait_deadline: deadline,
         })
     }
 
@@ -781,7 +848,7 @@ impl TransferRepo {
     pub fn unpin_object(&self, runner: &dyn ProcessRunner, name: &str) -> Result<(), WorkerError> {
         self.verify_alternates()?;
         validate_owned_pin_ref(name)?;
-        if !self.has_ref(name) {
+        if !self.has_ref_with_runner(runner, name)? {
             return Ok(());
         }
         self.update_ref(runner, name, None)
@@ -791,17 +858,25 @@ impl TransferRepo {
     /// alternates. This is not owned-graph proof; use [`Self::pin_object`]
     /// or [`Self::pin_frozen_source`] before treating a pin as durable.
     pub fn has_object(&self, oid: &BaseOid) -> bool {
-        run_system_git(
-            Some(&self.path),
-            &[
-                OsString::from("cat-file"),
-                OsString::from("-e"),
-                OsString::from(oid.as_str()),
-            ],
+        self.has_object_with_runner(&SystemProcessRunner, oid)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn has_object_with_runner(
+        &self,
+        runner: &dyn ProcessRunner,
+        oid: &BaseOid,
+    ) -> Result<bool, WorkerError> {
+        match self.transfer_git(
+            runner,
+            &["cat-file".into(), "-e".into(), oid.as_str().into()],
             None,
             None,
-        )
-        .is_ok()
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// First-slice fixture transfer: a git bundle of one frozen commit that
@@ -1004,7 +1079,7 @@ impl TransferRepo {
         stage: &'static str,
         pack_bytes: Option<usize>,
     ) -> Result<(), WorkerError> {
-        self.with_owned_object_view(|isolate| {
+        self.with_owned_object_view(runner, |isolate| {
             let cat = git_at(
                 runner,
                 isolate,
@@ -1054,7 +1129,7 @@ impl TransferRepo {
         runner: &dyn ProcessRunner,
         oid: &BaseOid,
     ) -> Result<bool, WorkerError> {
-        self.with_owned_object_view(|isolate| {
+        self.with_owned_object_view(runner, |isolate| {
             match git_at(
                 runner,
                 isolate,
@@ -1116,6 +1191,7 @@ impl TransferRepo {
 
     fn with_owned_object_view<T>(
         &self,
+        runner: &dyn ProcessRunner,
         work: impl FnOnce(&Path) -> Result<T, WorkerError>,
     ) -> Result<T, WorkerError> {
         let scratch = self.path.join("scratch");
@@ -1123,7 +1199,8 @@ impl TransferRepo {
         let isolate = scratch.join(format!("owned-{}", Uuid::new_v4().simple()));
         fs::create_dir(&isolate).map_err(WorkerError::Io)?;
         let result = (|| {
-            run_system_git(
+            run_git(
+                runner,
                 None,
                 &[
                     OsString::from("init"),
@@ -1548,7 +1625,7 @@ impl TransferRepo {
     ) -> Result<(), WorkerError> {
         self.verify_alternates()?;
         let name = base_ref(task_id);
-        if !self.has_ref(&name) {
+        if !self.has_ref_with_runner(runner, &name)? {
             return Ok(());
         }
         self.update_ref(runner, &name, None)
@@ -1584,7 +1661,12 @@ impl TransferRepo {
     ) -> Result<Option<ResultImport<'_>>, WorkerError> {
         let root = RootedDir::open(&self.path)?;
         let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
-        match flock_transfer_file(&root, &format!("mac-worker-result-{task_id}.lock"), mode) {
+        match flock_transfer_file(
+            &root,
+            &format!("mac-worker-result-{task_id}.lock"),
+            mode,
+            self.wait_deadline,
+        ) {
             Ok(lock) => Ok(Some(ResultImport {
                 repo: self,
                 task_id,
@@ -1790,18 +1872,30 @@ impl TransferRepo {
     }
 
     pub fn has_ref(&self, name: &str) -> bool {
-        run_system_git(
-            Some(&self.path),
+        self.has_ref_with_runner(&SystemProcessRunner, name)
+            .unwrap_or(false)
+    }
+
+    fn has_ref_with_runner(
+        &self,
+        runner: &dyn ProcessRunner,
+        name: &str,
+    ) -> Result<bool, WorkerError> {
+        match self.transfer_git(
+            runner,
             &[
-                OsString::from("show-ref"),
-                OsString::from("--verify"),
-                OsString::from("--quiet"),
-                OsString::from(name),
+                "show-ref".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                name.into(),
             ],
             None,
             None,
-        )
-        .is_ok()
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.public_code() == "BASE_UNAVAILABLE" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn capture_tree(
@@ -2675,43 +2769,50 @@ fn run_system_git(
     index: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> Result<ProcessResult, WorkerError> {
-    let mut command = Command::new(GIT_PROGRAM);
-    if let Some(git_dir) = git_dir {
-        command.arg("--git-dir").arg(git_dir);
-    }
-    command.args(args);
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    for name in GIT_ENVIRONMENT_REMOVALS {
-        if *name == "GIT_INDEX_FILE" && index.is_some() {
-            continue;
-        }
-        command.env_remove(name);
-    }
-    if let Some(index) = index {
-        command.env("GIT_INDEX_FILE", index);
-    }
-    if let Some(stdin) = stdin {
-        command.stdin(std::process::Stdio::piped());
-        let mut child = command.spawn()?;
-        use std::io::Write;
-        if let Some(mut handle) = child.stdin.take() {
-            handle.write_all(stdin)?;
-        }
-        let output = child.wait_with_output()?;
-        return process_output(output);
-    }
-    process_output(command.output()?)
+    run_git(&SystemProcessRunner, git_dir, args, index, stdin)
 }
 
-fn process_output(output: Output) -> Result<ProcessResult, WorkerError> {
-    let result = ProcessResult {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
+fn run_git(
+    runner: &dyn ProcessRunner,
+    git_dir: Option<&Path>,
+    args: &[OsString],
+    index: Option<&Path>,
+    stdin: Option<&[u8]>,
+) -> Result<ProcessResult, WorkerError> {
+    let mut command_args = Vec::new();
+    if let Some(git_dir) = git_dir {
+        command_args.extend([
+            OsString::from("--git-dir"),
+            git_dir.as_os_str().to_os_string(),
+        ]);
+    }
+    command_args.extend_from_slice(args);
+    let mut environment = vec![
+        ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+    ];
+    if let Some(index) = index {
+        environment.push(("GIT_INDEX_FILE".into(), index.as_os_str().to_os_string()));
+    }
+    let request = ProcessRequest {
+        program: GIT_PROGRAM.into(),
+        args: command_args,
+        environment,
+        environment_remove: GIT_ENVIRONMENT_REMOVALS
+            .iter()
+            .filter(|name| **name != "GIT_INDEX_FILE" || index.is_none())
+            .map(OsString::from)
+            .collect(),
+        stdin: stdin.map(<[u8]>::to_vec),
+        policy: ProcessPolicy {
+            stdout_limit: GIT_OUTPUT_LIMIT,
+            stderr_limit: GIT_OUTPUT_LIMIT,
+            deadline: GIT_DEADLINE,
+        },
+        isolate_parent_environment: false,
     };
+    let result = runner.run(&request)?;
     if result.status.success() {
         Ok(result)
     } else {

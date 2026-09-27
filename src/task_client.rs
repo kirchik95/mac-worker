@@ -223,13 +223,30 @@ impl Drop for InProcessSubmitGuard {
 /// Blocks same-store same-ID submits in this process. Keyed by client/task so
 /// unrelated stores and ordinary unique-ID submits do not wait. Acquire
 /// before TransferRepo; drop before attached runner reentry.
-fn acquire_in_process_submit_guard(client_id: ClientId, task_id: TaskId) -> InProcessSubmitGuard {
+fn acquire_in_process_submit_guard(
+    client_id: ClientId,
+    task_id: TaskId,
+    deadline: WaitDeadline,
+) -> Result<InProcessSubmitGuard, WorkerError> {
     let locks = in_process_submit_locks();
     let mut held = locks.held.lock().expect("in-process submit guard");
-    while !held.insert((client_id, task_id)) {
-        held = locks.cond.wait(held).expect("in-process submit guard");
+    loop {
+        let remaining = deadline.remaining()?;
+        if held.insert((client_id, task_id)) {
+            break;
+        }
+        held = match remaining {
+            Some(remaining) => {
+                locks
+                    .cond
+                    .wait_timeout(held, remaining)
+                    .expect("in-process submit guard")
+                    .0
+            }
+            None => locks.cond.wait(held).expect("in-process submit guard"),
+        };
     }
-    InProcessSubmitGuard { client_id, task_id }
+    Ok(InProcessSubmitGuard { client_id, task_id })
 }
 
 #[derive(Debug, Clone)]
@@ -1529,17 +1546,28 @@ impl<'a> TaskClient<'a> {
         };
         let now = current_time_millis()?;
         let created_at = original_created_at.unwrap_or(now);
-        let submit_guard = acquire_in_process_submit_guard(self.client_state.client_id(), task_id);
+        let submit_guard = acquire_in_process_submit_guard(
+            self.client_state.client_id(),
+            task_id,
+            self.client_state.wait_deadline(),
+        )?;
         self.client_state
             .reach_concurrency_point(ClientStateConcurrencyPoint::DagSubmit);
         let transfer = if controller_cache {
-            TransferRepo::open_or_create_controller_cache(
+            TransferRepo::open_or_create_controller_cache_until(
+                self.runner,
                 &self.paths.cache,
                 &context.project_id,
                 &context.worktree_id,
+                self.client_state.wait_deadline(),
             )?
         } else {
-            TransferRepo::open_or_create(&self.paths.cache, &context.common_dir)?
+            TransferRepo::open_or_create_until(
+                self.runner,
+                &self.paths.cache,
+                &context.common_dir,
+                self.client_state.wait_deadline(),
+            )?
         };
         let built_local_base = matches!(prepared_base, PreparedSubmitBase::Resolve { .. });
         let base = match prepared_base {
@@ -2443,8 +2471,13 @@ impl<'a> TaskClient<'a> {
             return Err(task_error("TASK_BUSY", reason));
         }
         let project = self.load_project_for_record(&record)?;
-        let transfer =
-            crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())?;
+        let transfer = crate::controller::registry::open_transfer_repo_until(
+            self.runner,
+            self.paths,
+            &project,
+            record.meta(),
+            self.client_state.wait_deadline(),
+        )?;
         let import = transfer
             .try_result_import(task_id)?
             .ok_or_else(|| task_error("TASK_BUSY", "task result import is already in progress"))?;
@@ -4640,7 +4673,9 @@ impl<'a> TaskClient<'a> {
             let transfer = self.transfer_for_record(&parent_record)?;
             let object_exists = parent_record
                 .fetched_head()
-                .is_some_and(|oid| transfer.has_object(oid));
+                .map(|oid| transfer.has_object_with_runner(self.runner, oid))
+                .transpose()?
+                .unwrap_or(false);
             let Some(oid) = accepted_import_oid(
                 &parent_record,
                 last_turn_id,
@@ -4864,7 +4899,13 @@ impl<'a> TaskClient<'a> {
 
     fn transfer_for_record(&self, record: &LocalTaskRecord) -> Result<TransferRepo, WorkerError> {
         let project = self.load_project_for_record(record)?;
-        crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
+        crate::controller::registry::open_transfer_repo_until(
+            self.runner,
+            self.paths,
+            &project,
+            record.meta(),
+            self.client_state.wait_deadline(),
+        )
     }
 
     fn refresh_task_status(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
@@ -5308,8 +5349,13 @@ impl<'a> TaskClient<'a> {
 
     fn release_task_base(&self, record: &LocalTaskRecord) -> Result<(), WorkerError> {
         let project = self.load_project_for_record(record)?;
-        let transfer =
-            crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())?;
+        let transfer = crate::controller::registry::open_transfer_repo_until(
+            self.runner,
+            self.paths,
+            &project,
+            record.meta(),
+            self.client_state.wait_deadline(),
+        )?;
         transfer.release_base(self.runner, record.meta().task_id())
     }
 

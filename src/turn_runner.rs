@@ -2139,7 +2139,13 @@ fn transfer_for_completed_turn(
         record.meta().project_id(),
         record.meta().worktree_id(),
     )?;
-    let transfer = crate::controller::registry::open_transfer_repo(paths, &project, record.meta())?;
+    let transfer = crate::controller::registry::open_transfer_repo_until(
+        runner,
+        paths,
+        &project,
+        record.meta(),
+        client_state.wait_deadline(),
+    )?;
     Ok((project, transfer))
 }
 
