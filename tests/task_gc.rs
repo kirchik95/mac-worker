@@ -2,20 +2,30 @@
 mod support;
 
 use std::{
-    fs, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::mpsc, thread,
+    collections::BTreeMap,
+    fs,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    path::Path,
+    process::{Command, ExitStatus},
+    sync::{Mutex, mpsc},
+    thread,
     time::Duration,
 };
 
 use mac_worker::{
+    RuntimeContext,
     agent::{AgentKind, PermissionPolicy},
+    cli::{Cli, Command as WorkerCommand},
+    error::{ProcessError, WorkerError},
     host_store::{HostGc, HostStore},
     job::{
         ClientId, CommandSpec, ExecutionScope, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
         LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
-    process::SystemProcessRunner,
-    protocol::MemoryPressure,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    protocol::{MemoryPressure, PROTOCOL_VERSION},
+    run_with_io_in_context,
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TurnSummary, TurnTerminal,
@@ -1230,4 +1240,219 @@ fn transfer_gc_can_collect_stale_result_refs_without_collecting_base_refs() {
         candidate.kind() == "transfer_repo" && candidate.identifier() == repo_id
     }));
     assert!(repo_path.exists());
+}
+
+#[derive(Clone, Copy)]
+enum SecondHostFault {
+    Unavailable,
+    Timeout,
+}
+
+struct FleetGcRunner {
+    requests: Mutex<Vec<ProcessRequest>>,
+    second_host: SecondHostFault,
+}
+
+impl ProcessRunner for FleetGcRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.requests
+            .lock()
+            .expect("requests")
+            .push(request.clone());
+        let destination = ssh_destination(request);
+        assert!(
+            request
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("host gc")),
+            "fleet gc must call host gc, saw {:?}",
+            request.args
+        );
+        if destination == "mac2" {
+            return match self.second_host {
+                SecondHostFault::Unavailable => Ok(ProcessResult {
+                    status: ExitStatus::from_raw(255 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"connection refused".to_vec(),
+                }),
+                SecondHostFault::Timeout => {
+                    Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+                        deadline: Duration::from_secs(30),
+                    }))
+                }
+            };
+        }
+        let applied = match destination.as_str() {
+            "mac1" => "applied-on-mini-1",
+            "mac3" => "applied-on-mini-3",
+            other => panic!("unexpected gc destination {other}"),
+        };
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: host_gc_stdout(applied),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+fn ssh_destination(request: &ProcessRequest) -> String {
+    let separator = request
+        .args
+        .iter()
+        .position(|argument| argument == "--")
+        .expect("ssh options are separated from the destination");
+    request.args[separator + 1].to_string_lossy().into_owned()
+}
+
+fn host_gc_stdout(identifier: &str) -> Vec<u8> {
+    format!(
+        r#"{{"protocol_version":{PROTOCOL_VERSION},"apply":true,"candidates":[{{"kind":"branch","identifier":"{identifier}","size_bytes":0,"reason":"branch retention"}}],"applied":[{{"kind":"branch","identifier":"{identifier}","size_bytes":0,"reason":"branch retention"}}],"warnings":[]}}"#
+    )
+    .into_bytes()
+}
+
+fn fleet_gc(second_host: SecondHostFault, json: bool) -> (u8, String, String, Vec<ProcessRequest>) {
+    let runner = FleetGcRunner {
+        requests: Mutex::new(Vec::new()),
+        second_host,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let config_path = temporary.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "\
+version = 1
+[[workers]]
+name = \"mini-1\"
+ssh = \"mac1\"
+slots = 1
+[[workers]]
+name = \"mini-2\"
+ssh = \"mac2\"
+slots = 1
+[[workers]]
+name = \"mini-3\"
+ssh = \"mac3\"
+slots = 1
+",
+    )
+    .unwrap();
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::new(),
+        temporary.path().join("home"),
+        temporary.path().to_path_buf(),
+    );
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(
+        Cli {
+            config: Some(config_path),
+            json,
+            command: WorkerCommand::Gc { apply: true },
+        },
+        &runner,
+        &runtime,
+        &mut stdout,
+        &mut stderr,
+    );
+    let requests = runner.requests.lock().expect("requests").clone();
+    (
+        exit,
+        String::from_utf8(stdout).unwrap(),
+        String::from_utf8(stderr).unwrap(),
+        requests,
+    )
+}
+
+fn assert_gc_calls_stay_bounded(requests: &[ProcessRequest]) {
+    let destinations = requests.iter().map(ssh_destination).collect::<Vec<_>>();
+    assert_eq!(destinations, ["mac1", "mac2", "mac3"]);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.policy.deadline == Duration::from_secs(30)),
+        "host gc must keep the 30s control deadline: {requests:?}"
+    );
+}
+
+#[test]
+fn fleet_gc_reports_apply_results_when_the_second_host_fails() {
+    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Unavailable, false);
+    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
+        "first host apply result missing from {stdout}"
+    );
+    assert!(
+        stdout.contains("worker mini-2")
+            && stdout.contains("error")
+            && stdout.contains("SSH_UNAVAILABLE"),
+        "second host error missing from {stdout}"
+    );
+    assert!(
+        stdout.contains("worker mini-3") && stdout.contains("applied-on-mini-3"),
+        "third host missing from {stdout}"
+    );
+    assert_gc_calls_stay_bounded(&requests);
+
+    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Unavailable, true);
+    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(report["workers"][0]["status"], "success");
+    assert_eq!(
+        report["workers"][0]["report"]["applied"][0]["identifier"],
+        "applied-on-mini-1"
+    );
+    assert_eq!(report["workers"][1]["worker"], "mini-2");
+    assert_eq!(report["workers"][1]["status"], "error");
+    assert_eq!(report["workers"][1]["error_code"], "SSH_UNAVAILABLE");
+    assert_eq!(report["workers"][2]["status"], "success");
+    assert_eq!(
+        report["workers"][2]["report"]["applied"][0]["identifier"],
+        "applied-on-mini-3"
+    );
+    assert!(report.get("transfer").is_some(), "{report}");
+    assert_gc_calls_stay_bounded(&requests);
+}
+
+#[test]
+fn fleet_gc_reports_unknown_when_the_second_host_times_out() {
+    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Timeout, false);
+    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
+        "first host apply result missing from {stdout}"
+    );
+    assert!(
+        stdout.contains("worker mini-2")
+            && stdout.contains("unknown")
+            && stdout.contains("SSH_TIMEOUT"),
+        "second host timeout missing from {stdout}"
+    );
+    assert!(
+        stdout.contains("worker mini-3") && stdout.contains("applied-on-mini-3"),
+        "third host missing from {stdout}"
+    );
+    assert_gc_calls_stay_bounded(&requests);
+
+    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Timeout, true);
+    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(report["workers"][0]["status"], "success");
+    assert_eq!(
+        report["workers"][0]["report"]["applied"][0]["identifier"],
+        "applied-on-mini-1"
+    );
+    assert_eq!(report["apply"], true);
+    assert_eq!(report["workers"][1]["worker"], "mini-2");
+    assert_eq!(report["workers"][1]["status"], "unknown");
+    assert_eq!(report["workers"][1]["error_code"], "SSH_TIMEOUT");
+    assert!(report["workers"][1].get("report").is_none(), "{report}");
+    assert_eq!(report["workers"][2]["status"], "success");
+    assert_eq!(
+        report["workers"][2]["report"]["applied"][0]["identifier"],
+        "applied-on-mini-3"
+    );
+    assert!(report.get("transfer").is_some(), "{report}");
+    assert_gc_calls_stay_bounded(&requests);
 }
