@@ -10334,16 +10334,18 @@ fn public_diag_missing_config_is_sanitized_for_human_and_json() {
                         message,
                     } => {
                         assert_eq!(*protocol_version, PROTOCOL_VERSION);
-                        assert_eq!(code, "CONFIG");
-                        assert_eq!(message, "configuration error");
+                        assert_eq!(code, "CONFIG_MISSING");
+                        let hint = mac_worker::error::hint_for("CONFIG_MISSING").unwrap();
+                        assert_eq!(message, &format!("configuration error. {hint}"));
                     }
                     other => panic!("JSON run/logs must emit JsonEvent::Error, got {other:?}"),
                 }
             } else {
                 assert!(stdout.is_empty(), "human/status stdout: {text}");
+                let hint = mac_worker::error::hint_for("CONFIG_MISSING").unwrap();
                 assert_eq!(
                     String::from_utf8_lossy(&stderr),
-                    "CONFIG: configuration error\n",
+                    format!("CONFIG_MISSING: configuration error\n{hint}\n"),
                     "json={json} command={kind}"
                 );
             }
@@ -10502,9 +10504,10 @@ fn public_diag_non_utf8_config_path_stays_sanitized_and_the_persisted_job_record
         );
         assert_eq!(exit, 64, "json={json}");
         assert!(stdout.is_empty(), "json={json}");
+        let hint = mac_worker::error::hint_for("CONFIG_MISSING").unwrap();
         assert_eq!(
             String::from_utf8(stderr.clone()).expect("diagnostic must stay valid UTF-8"),
-            "CONFIG: configuration error\n",
+            format!("CONFIG_MISSING: configuration error\n{hint}\n"),
             "json={json}"
         );
     }

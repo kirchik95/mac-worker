@@ -674,7 +674,12 @@ fn decode_controller_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Worker
     })
 }
 
-fn host_control_to_worker(error: &HostControlError) -> WorkerError {
+pub(crate) fn host_control_to_worker(error: &HostControlError) -> WorkerError {
+    if let Some(decoded) =
+        crate::error::error_from_host_category(error.error().code(), error.error().category())
+    {
+        return decoded;
+    }
     let code = error.error().code();
     // Admission rejections must keep their public category across the RPC.
     // Collapsing them into `Protocol` costs the documented capacity exit

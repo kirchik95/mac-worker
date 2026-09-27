@@ -5359,13 +5359,33 @@ impl<'de> Deserialize<'de> for PreacceptanceDisposition {
 pub struct HostControlErrorDetail {
     code: String,
     message: String,
+    /// Exit category from a helper that shares the laptop catalog.
+    /// Older helpers omit it; the laptop then keeps today's mapping.
+    category: Option<String>,
 }
 
 impl HostControlErrorDetail {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, WorkerError> {
+        Self::from_parts(code, message, None)
+    }
+
+    pub fn with_category(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        category: impl Into<String>,
+    ) -> Result<Self, WorkerError> {
+        Self::from_parts(code, message, Some(category.into()))
+    }
+
+    fn from_parts(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        category: Option<String>,
+    ) -> Result<Self, WorkerError> {
         let detail = Self {
             code: code.into(),
             message: message.into(),
+            category,
         };
         detail.validate()?;
         Ok(detail)
@@ -5373,7 +5393,13 @@ impl HostControlErrorDetail {
 
     pub fn validate(&self) -> Result<(), WorkerError> {
         validate_control_code(&self.code, "host control error code")?;
-        validate_control_message(&self.message, "host control error message")
+        validate_control_message(&self.message, "host control error message")?;
+        if let Some(category) = &self.category
+            && crate::error::ExitKind::from_wire(category).is_none()
+        {
+            return Err(protocol_error("host control error category is invalid"));
+        }
+        Ok(())
     }
 
     pub fn code(&self) -> &str {
@@ -5382,14 +5408,21 @@ impl HostControlErrorDetail {
     pub fn message(&self) -> &str {
         &self.message
     }
+    pub fn category(&self) -> Option<&str> {
+        self.category.as_deref()
+    }
 }
 
 impl Serialize for HostControlErrorDetail {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("HostControlErrorDetail", 2)?;
+        let fields = 2 + usize::from(self.category.is_some());
+        let mut record = serializer.serialize_struct("HostControlErrorDetail", fields)?;
         record.serialize_field("code", &self.code)?;
         record.serialize_field("message", &self.message)?;
+        if let Some(category) = &self.category {
+            record.serialize_field("category", category)?;
+        }
         record.end()
     }
 }
@@ -5401,9 +5434,11 @@ impl<'de> Deserialize<'de> for HostControlErrorDetail {
         struct Wire {
             code: String,
             message: String,
+            #[serde(default)]
+            category: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.code, wire.message).map_err(de::Error::custom)
+        Self::from_parts(wire.code, wire.message, wire.category).map_err(de::Error::custom)
     }
 }
 
@@ -5415,9 +5450,23 @@ pub struct HostControlError {
 
 impl HostControlError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, WorkerError> {
+        Self::from_detail(HostControlErrorDetail::new(code, message)?)
+    }
+
+    pub fn with_category(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        category: impl Into<String>,
+    ) -> Result<Self, WorkerError> {
+        Self::from_detail(HostControlErrorDetail::with_category(
+            code, message, category,
+        )?)
+    }
+
+    fn from_detail(detail: HostControlErrorDetail) -> Result<Self, WorkerError> {
         let error = Self {
             protocol_version: PROTOCOL_VERSION,
-            error: HostControlErrorDetail::new(code, message)?,
+            error: detail,
         };
         error.validate()?;
         Ok(error)
@@ -6078,6 +6127,7 @@ mod tests {
             let invalid_detail = HostControlErrorDetail {
                 code: "HOST_REQUEST_FAILED".into(),
                 message: message.into(),
+                category: None,
             };
             assert!(
                 serde_json::to_string(&invalid_detail).is_err(),

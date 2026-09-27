@@ -1501,7 +1501,7 @@ fn validate_remote_log_chunk(
     Ok(())
 }
 
-fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
+pub(crate) fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
     let body = bytes.strip_suffix(b"\n")?;
     if body.is_empty() || body.contains(&b'\n') || body.contains(&b'\r') {
         return None;
@@ -1511,6 +1511,11 @@ fn decode_host_control_error(bytes: &[u8]) -> Option<WorkerError> {
     deserializer.end().ok()?;
     if serde_json::to_vec(&error).ok()?.as_slice() != body {
         return None;
+    }
+    if let Some(decoded) =
+        crate::error::error_from_host_category(error.error().code(), error.error().category())
+    {
+        return Some(decoded);
     }
     let capacity_code = match error.error().code() {
         "CAPACITY_BUSY" => Some("CAPACITY_BUSY"),

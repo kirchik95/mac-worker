@@ -694,7 +694,7 @@ fn write_json_error_event(stdout: &mut dyn Write, error: &WorkerError) -> Result
     let event = JsonEvent::Error {
         protocol_version: PROTOCOL_VERSION,
         code: error.public_code(),
-        message: error.public_message(),
+        message: crate::error::operator_json_message(error),
     };
     let mut encoded = serde_json::to_vec(&event)
         .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
@@ -705,12 +705,7 @@ fn write_json_error_event(stdout: &mut dyn Write, error: &WorkerError) -> Result
 }
 
 fn write_public_diagnostic(stderr: &mut dyn Write, error: &WorkerError) {
-    let _ = writeln!(
-        stderr,
-        "{}: {}",
-        error.public_code(),
-        error.public_message()
-    );
+    let _ = writeln!(stderr, "{}", crate::error::operator_diagnostic(error));
 }
 
 #[doc(hidden)]
@@ -3466,21 +3461,39 @@ where
 fn versioned_host_error(error: &WorkerError) -> HostControlError {
     if let WorkerError::Protocol(message) = error
         && let Some((code, detail)) = message.split_once(": ")
-        && let Ok(error) = HostControlError::new(code, detail)
+        && crate::error::is_stable_public_code(code)
+        && let Ok(encoded) = classified_host_error(code, detail, error)
     {
-        return error;
+        return encoded;
     }
-    let (code, message) = match error {
+    let (code, message) = host_error_parts(error);
+    classified_host_error(&code, &message, error).expect("fixed host error is valid")
+}
+
+fn classified_host_error(
+    code: &str,
+    message: &str,
+    error: &WorkerError,
+) -> Result<HostControlError, WorkerError> {
+    HostControlError::with_category(code, message, error.exit_kind().as_wire())
+}
+
+fn host_error_parts(error: &WorkerError) -> (String, String) {
+    match error {
         // A public admission reason is fixed inventory text by the contract on
-        // `WorkerError::capacity`; send it so the laptop can show why. Redacted
-        // capacity messages keep the generic category label.
+        // `WorkerError::capacity`. It still travels on the wire. The laptop
+        // prints the catalog hint, not this string, once `category` is set.
         WorkerError::Capacity {
             code,
             message,
             public: true,
-        } => (*code, message.as_ref().to_owned()),
-        WorkerError::Capacity { code, .. } => (*code, "worker admission rejected".into()),
-        WorkerError::Snapshot { code, .. } => (*code, "snapshot operation failed".into()),
+        } => ((*code).to_owned(), message.as_ref().to_owned()),
+        WorkerError::Capacity { code, .. } => {
+            ((*code).to_owned(), "worker admission rejected".into())
+        }
+        WorkerError::Snapshot { code, .. } => {
+            ((*code).to_owned(), "snapshot operation failed".into())
+        }
         WorkerError::Git {
             code: crate::git_transport::ORIGIN_AUTH_FAILED,
             ..
@@ -3491,18 +3504,25 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
             )
             .expect("publish is vocabulary");
             (
-                crate::git_transport::ORIGIN_AUTH_FAILED,
+                crate::git_transport::ORIGIN_AUTH_FAILED.to_owned(),
                 receipt.host_message(),
             )
         }
-        WorkerError::Git { code, .. } => (*code, "Git operation failed".into()),
-        WorkerError::Task { code, .. } => (*code, "task operation failed".into()),
-        WorkerError::Agent { code, .. } => (*code, "agent operation failed".into()),
-        WorkerError::HostIo { receipt, .. } => ("HOST_IO", receipt.host_message()),
-        WorkerError::Io(_) => ("HOST_IO", "host state operation failed".into()),
-        _ => ("INVALID_REQUEST", "host request was invalid".into()),
-    };
-    HostControlError::new(code, message).expect("fixed host error is valid")
+        WorkerError::Git { code, .. } => ((*code).to_owned(), "Git operation failed".into()),
+        WorkerError::Task { code, .. } => ((*code).to_owned(), "task operation failed".into()),
+        WorkerError::Agent { code, .. } => ((*code).to_owned(), "agent operation failed".into()),
+        WorkerError::HostIo { receipt, .. } => ("HOST_IO".to_owned(), receipt.host_message()),
+        WorkerError::Io(_) => ("HOST_IO".to_owned(), "host state operation failed".into()),
+        WorkerError::Config(_) => (error.public_code(), "configuration error".into()),
+        other => {
+            let code = other.public_code();
+            if crate::error::catalog_contains(&code) {
+                (code, "request failed".into())
+            } else {
+                ("INVALID_REQUEST".into(), "host request was invalid".into())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3607,6 +3627,121 @@ mod versioned_host_error_tests {
                 .unwrap()
                 .contains("PLANTED_PATH")
         );
+    }
+
+    #[test]
+    fn catalog_codes_keep_one_exit_and_hint_locally_over_ssh_and_via_the_controller() {
+        let planted = "/Users/alice/PLANTED_HOST_PATH";
+        let missing = std::env::temp_dir()
+            .join("PLANTED_CONFIG_PATH")
+            .join("missing.toml");
+        let config_error = Config::load(&missing).expect_err("missing config");
+        assert_eq!(config_error.public_code(), "CONFIG_MISSING");
+        let cases = [
+            WorkerError::task("TASK_BUSY", "task turn is being dispatched"),
+            config_error,
+            WorkerError::capacity(
+                "CAPACITY_BUSY",
+                "no eligible worker currently has an available heavy slot",
+            ),
+        ];
+        for local in cases {
+            let hint = crate::error::hint_for(&local.public_code()).expect("catalog hint");
+            let local_text = crate::error::operator_diagnostic(&local);
+            assert_eq!(
+                local.exit_code(),
+                expected_catalog_exit(&local.public_code())
+            );
+            assert!(local_text.contains(hint), "{local_text}");
+            assert!(!local_text.contains("PLANTED"), "{local_text}");
+
+            let wire = versioned_host_error(&local);
+            assert_eq!(
+                wire.error().category(),
+                Some(local.exit_kind().as_wire()),
+                "{}",
+                local.public_code()
+            );
+            let encoded = serde_json::to_string(&wire).unwrap();
+            assert!(
+                !encoded.contains("PLANTED"),
+                "{} wire leaked a path: {encoded}",
+                local.public_code()
+            );
+            assert_same_decoded(&local, &wire, hint);
+
+            let planted_wire = HostControlError::with_category(
+                local.public_code(),
+                planted,
+                local.exit_kind().as_wire(),
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_string(&planted_wire)
+                    .unwrap()
+                    .contains(planted)
+            );
+            assert_same_decoded(&local, &planted_wire, hint);
+        }
+    }
+
+    fn expected_catalog_exit(code: &str) -> u8 {
+        crate::error::public_error_catalog()
+            .iter()
+            .find(|entry| entry.code == code)
+            .unwrap()
+            .exit
+    }
+
+    fn assert_same_decoded(local: &WorkerError, wire: &HostControlError, hint: &str) {
+        let mut bytes = serde_json::to_vec(wire).unwrap();
+        bytes.push(b'\n');
+        let host =
+            crate::transfer::decode_host_control_error(&bytes).expect("classified host error");
+        let controller = crate::controller::execute::host_control_to_worker(wire);
+        for decoded in [&host, &controller] {
+            assert_eq!(
+                decoded.exit_code(),
+                local.exit_code(),
+                "{}",
+                local.public_code()
+            );
+            assert_eq!(decoded.public_code(), local.public_code());
+            let text = crate::error::operator_diagnostic(decoded);
+            assert!(text.contains(hint), "{text}");
+            assert!(!text.contains("PLANTED"), "{text}");
+            assert!(!decoded.public_message().contains("PLANTED"));
+        }
+    }
+
+    #[test]
+    fn helpers_without_a_category_keep_todays_task_busy_mapping() {
+        let planted = "/Users/alice/PLANTED_HOST_PATH";
+        let wire = HostControlError::new("TASK_BUSY", planted).unwrap();
+        assert!(wire.error().category().is_none());
+        let mut bytes = serde_json::to_vec(&wire).unwrap();
+        bytes.push(b'\n');
+        let decoded = crate::transfer::decode_host_control_error(&bytes).unwrap();
+        assert_eq!(decoded.exit_code(), 70);
+        assert_eq!(decoded.public_message(), "protocol error");
+        assert!(!decoded.public_message().contains("PLANTED"));
+        let controller = crate::controller::execute::host_control_to_worker(&wire);
+        assert_eq!(controller.exit_code(), 70);
+        assert!(!controller.public_message().contains("PLANTED"));
+    }
+
+    #[test]
+    fn a_mismatched_category_still_uses_the_catalog_exit() {
+        let wire = HostControlError::with_category(
+            "CAPACITY_BUSY",
+            "/Users/alice/PLANTED_HOST_PATH",
+            "usage",
+        )
+        .unwrap();
+        let decoded = crate::controller::execute::host_control_to_worker(&wire);
+        assert_eq!(decoded.exit_code(), 75);
+        assert_eq!(decoded.public_code(), "CAPACITY_BUSY");
+        assert!(!crate::error::operator_diagnostic(&decoded).contains("PLANTED"));
     }
 }
 
@@ -4872,7 +5007,7 @@ fn controller_task_result(
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {
-    let _ = writeln!(stderr, "{error}");
+    let _ = writeln!(stderr, "{}", crate::error::operator_diagnostic(error));
 }
 
 fn load_config(
@@ -5270,9 +5405,10 @@ mod tests {
         let error = WorkerError::task("TASK_BUSY", "task turn is being dispatched");
         let mut stderr = Vec::new();
         super::write_public_diagnostic(&mut stderr, &error);
+        let hint = crate::error::hint_for("TASK_BUSY").unwrap();
         assert_eq!(
             std::str::from_utf8(&stderr).unwrap(),
-            "TASK_BUSY: task turn is being dispatched\n"
+            format!("TASK_BUSY: task turn is being dispatched\n{hint}\n")
         );
     }
 
@@ -5289,9 +5425,10 @@ mod tests {
         match event {
             crate::job::JsonEvent::Error { code, message, .. } => {
                 assert_eq!(code, "CAPACITY_BUSY");
+                let hint = crate::error::hint_for("CAPACITY_BUSY").unwrap();
                 assert_eq!(
                     message,
-                    "no eligible worker currently has an available heavy slot"
+                    format!("no eligible worker currently has an available heavy slot. {hint}")
                 );
             }
             other => panic!("expected a JSON error event, got {other:?}"),
@@ -5310,7 +5447,8 @@ mod tests {
         match event {
             crate::job::JsonEvent::Error { code, message, .. } => {
                 assert_eq!(code, "CAPACITY_BUSY");
-                assert_eq!(message, "capacity error");
+                let hint = crate::error::hint_for("CAPACITY_BUSY").unwrap();
+                assert_eq!(message, format!("capacity error. {hint}"));
             }
             other => panic!("expected a JSON error event, got {other:?}"),
         }

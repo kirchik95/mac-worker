@@ -931,9 +931,10 @@ fn executable_doctor_rejects_external_project_policy_without_leaking_diagnostics
 
     assert_eq!(exit, ExitKind::Usage as u8);
     assert!(stdout.is_empty());
+    let hint = mac_worker::error::hint_for("CONFIG").unwrap();
     assert_eq!(
         String::from_utf8_lossy(&stderr),
-        "configuration error: project configuration must be a regular file\n"
+        format!("CONFIG: configuration error\n{hint}\n")
     );
     for forbidden in [
         external_secret,

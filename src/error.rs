@@ -11,6 +11,29 @@ pub enum ExitKind {
     Capacity = 75,
 }
 
+impl ExitKind {
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::Usage => "usage",
+            Self::Unavailable => "unavailable",
+            Self::Infrastructure => "infrastructure",
+            Self::Io => "io",
+            Self::Capacity => "capacity",
+        }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "usage" => Self::Usage,
+            "unavailable" => Self::Unavailable,
+            "infrastructure" => Self::Infrastructure,
+            "io" => Self::Io,
+            "capacity" => Self::Capacity,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStream {
     Stdout,
@@ -282,6 +305,273 @@ pub(crate) fn is_stable_public_code(code: &str) -> bool {
         && code
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// One public code, the exit status it keeps on every path, and the only
+/// next-action text that may be printed. Hints are static: they never carry
+/// a path, a host message, or other source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicDiagnostic {
+    pub code: &'static str,
+    pub exit: u8,
+    pub hint: Option<&'static str>,
+}
+
+const CONFIG_MISSING_HINT: &str = "connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path)";
+
+static CATALOG: &[PublicDiagnostic] = &[
+    PublicDiagnostic {
+        code: "CONFIG_MISSING",
+        exit: 64,
+        hint: Some(CONFIG_MISSING_HINT),
+    },
+    PublicDiagnostic {
+        code: "CONFIG",
+        exit: 64,
+        hint: Some("check the configuration syntax, worker names, and SSH destinations"),
+    },
+    PublicDiagnostic {
+        code: "TASK_BUSY",
+        exit: 64,
+        hint: Some("wait for `worker task wait` to finish, then retry"),
+    },
+    PublicDiagnostic {
+        code: "TASK_CLOSED",
+        exit: 64,
+        hint: Some("start a new task; this one is already closed"),
+    },
+    PublicDiagnostic {
+        code: "TASK_NOT_FOUND",
+        exit: 64,
+        hint: Some("check the id with `worker task list`"),
+    },
+    PublicDiagnostic {
+        code: "TASK_CONFIG_INVALID",
+        exit: 64,
+        hint: Some("fix the task options and submit again"),
+    },
+    PublicDiagnostic {
+        code: "FOLLOWUP_LIMIT",
+        exit: 64,
+        hint: Some("close the task, or submit a new one with a higher follow-up limit"),
+    },
+    PublicDiagnostic {
+        code: "TASK_REVISION_CONFLICT",
+        exit: 64,
+        hint: Some("refresh the task status and retry the close"),
+    },
+    PublicDiagnostic {
+        code: "RESULT_NOT_RETAINED",
+        exit: 64,
+        hint: Some("the closed workspace is no longer retained"),
+    },
+    PublicDiagnostic {
+        code: "AGENT_UNSUPPORTED",
+        exit: 64,
+        hint: Some("choose codex, cursor, opencode, or claude"),
+    },
+    PublicDiagnostic {
+        code: "NOT_A_WORKTREE",
+        exit: 64,
+        hint: Some("run the command inside a Git worktree"),
+    },
+    PublicDiagnostic {
+        code: "SSH_UNAVAILABLE",
+        exit: 69,
+        hint: Some("check SSH to the worker and retry"),
+    },
+    PublicDiagnostic {
+        code: "CONTROLLER_UNAVAILABLE",
+        exit: 69,
+        hint: Some("check the controller host with `worker controller status`"),
+    },
+    PublicDiagnostic {
+        code: "BASE_PUSH_FAILED",
+        exit: 69,
+        hint: Some("retry; the worker did not receive the base commit"),
+    },
+    PublicDiagnostic {
+        code: "RESULT_FETCH_FAILED",
+        exit: 69,
+        hint: Some("retry the fetch; the result is still on the worker"),
+    },
+    PublicDiagnostic {
+        code: "WAIT_TIMEOUT",
+        exit: 70,
+        hint: Some("the wait timed out; the task is still running"),
+    },
+    PublicDiagnostic {
+        code: "WAIT_BLOCKED",
+        exit: 70,
+        hint: Some("inspect `worker task status` for the blocked turn"),
+    },
+    PublicDiagnostic {
+        code: "HOST_LAYOUT_OUTDATED",
+        exit: 70,
+        hint: Some("run `worker setup` to update the helper"),
+    },
+    PublicDiagnostic {
+        code: "PUBLISH_FAILED",
+        exit: 70,
+        hint: Some("retry publishing; the result is still on the worker"),
+    },
+    PublicDiagnostic {
+        code: "BASE_UNAVAILABLE",
+        exit: 70,
+        hint: Some("choose a base commit that exists in the worktree"),
+    },
+    PublicDiagnostic {
+        code: "RUNNER_HANDOFF_FAILED",
+        exit: 74,
+        hint: Some("retry; the local runner handoff failed"),
+    },
+    PublicDiagnostic {
+        code: "IO",
+        exit: 74,
+        hint: Some("retry the command"),
+    },
+    PublicDiagnostic {
+        code: "CAPACITY_BUSY",
+        exit: 75,
+        hint: Some("wait for a free heavy slot, or choose another worker"),
+    },
+    PublicDiagnostic {
+        code: "CAPABILITY_MISSING",
+        exit: 75,
+        hint: Some("install the missing capability or pin a worker that has it"),
+    },
+    PublicDiagnostic {
+        code: "INSUFFICIENT_DISK",
+        exit: 75,
+        hint: Some("free disk space on the worker and retry"),
+    },
+    PublicDiagnostic {
+        code: "MEMORY_PRESSURE",
+        exit: 75,
+        hint: Some("wait until the worker has free memory and retry"),
+    },
+    PublicDiagnostic {
+        code: "SWAP_LIMIT",
+        exit: 75,
+        hint: Some("wait until swap pressure drops and retry"),
+    },
+    PublicDiagnostic {
+        code: "AGENT_NOT_INSTALLED",
+        exit: 75,
+        hint: Some("install the agent on the worker account"),
+    },
+    PublicDiagnostic {
+        code: "AGENT_NOT_AUTHENTICATED",
+        exit: 75,
+        hint: Some("finish the agent's headless login on the worker"),
+    },
+    PublicDiagnostic {
+        code: "AGENT_LIMIT_REACHED",
+        exit: 1,
+        hint: Some("raise the turn or budget limit and submit again"),
+    },
+];
+
+pub fn public_error_catalog() -> &'static [PublicDiagnostic] {
+    CATALOG
+}
+
+pub fn hint_for(code: &str) -> Option<&'static str> {
+    CATALOG
+        .iter()
+        .find(|entry| entry.code == code)
+        .and_then(|entry| entry.hint)
+}
+
+pub(crate) fn catalog_contains(code: &str) -> bool {
+    CATALOG.iter().any(|entry| entry.code == code)
+}
+
+/// Rebuilds a catalogued error from a helper that sent an exit category.
+/// The wire message is ignored. Missing or unknown categories return `None`
+/// so the caller can keep the pre-catalog mapping.
+pub(crate) fn error_from_host_category(code: &str, category: Option<&str>) -> Option<WorkerError> {
+    ExitKind::from_wire(category?)?;
+    catalog_error(code)
+}
+
+fn catalog_error(code: &str) -> Option<WorkerError> {
+    CATALOG
+        .iter()
+        .find(|entry| entry.code == code)
+        .map(|entry| build_catalog_error(entry.code))
+}
+
+fn build_catalog_error(code: &'static str) -> WorkerError {
+    match code {
+        "CONFIG" | "CONFIG_MISSING" => WorkerError::Config(format!("{code}: configuration error")),
+        "TASK_BUSY"
+        | "TASK_CLOSED"
+        | "TASK_NOT_FOUND"
+        | "TASK_CONFIG_INVALID"
+        | "FOLLOWUP_LIMIT"
+        | "TASK_REVISION_CONFLICT"
+        | "RESULT_NOT_RETAINED"
+        | "RUNNER_HANDOFF_FAILED"
+        | "WAIT_TIMEOUT"
+        | "WAIT_BLOCKED" => WorkerError::task(code, "task error"),
+        "NOT_A_WORKTREE" => WorkerError::Project {
+            code,
+            message: "project error".into(),
+        },
+        "SSH_UNAVAILABLE" | "CONTROLLER_UNAVAILABLE" => WorkerError::Transport {
+            code,
+            message: "transport error".into(),
+        },
+        "BASE_PUSH_FAILED" | "RESULT_FETCH_FAILED" | "PUBLISH_FAILED" | "BASE_UNAVAILABLE" => {
+            WorkerError::Git {
+                code,
+                message: "git error".into(),
+            }
+        }
+        "HOST_LAYOUT_OUTDATED" => {
+            WorkerError::Unavailable(format!("{code}: worker layout is outdated"))
+        }
+        "IO" => WorkerError::Io(std::io::Error::other("I/O error")),
+        "CAPACITY_BUSY" => WorkerError::capacity(
+            code,
+            "no eligible worker currently has an available heavy slot",
+        ),
+        "CAPABILITY_MISSING" => {
+            WorkerError::capacity(code, "a required capability is not available")
+        }
+        "INSUFFICIENT_DISK" | "MEMORY_PRESSURE" | "SWAP_LIMIT" => {
+            WorkerError::capacity(code, "worker admission rejected")
+        }
+        "AGENT_UNSUPPORTED"
+        | "AGENT_NOT_INSTALLED"
+        | "AGENT_NOT_AUTHENTICATED"
+        | "AGENT_LIMIT_REACHED" => WorkerError::Agent {
+            code,
+            message: "agent error".into(),
+        },
+        _ => WorkerError::Protocol(format!("{code}: request failed")),
+    }
+}
+
+pub(crate) fn operator_diagnostic(error: &WorkerError) -> String {
+    let mut text = format!("{}: {}", error.public_code(), error.public_message());
+    if let Some(hint) = hint_for(&error.public_code())
+        && !error.public_message().contains(hint)
+    {
+        text.push('\n');
+        text.push_str(hint);
+    }
+    text
+}
+
+pub(crate) fn operator_json_message(error: &WorkerError) -> String {
+    match hint_for(&error.public_code()) {
+        Some(hint) if !error.public_message().contains(hint) => {
+            format!("{}. {hint}", error.public_message())
+        }
+        _ => error.public_message(),
+    }
 }
 
 #[cfg(test)]
@@ -736,5 +1026,28 @@ mod tests {
             .stage(),
             STAGE_FOLLOW
         );
+    }
+
+    #[test]
+    fn catalog_codes_rebuild_to_their_exit_and_a_static_hint() {
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in super::public_error_catalog() {
+            assert!(
+                seen.insert(entry.code),
+                "duplicate catalog code {}",
+                entry.code
+            );
+            let error = super::catalog_error(entry.code).expect(entry.code);
+            assert_eq!(error.public_code(), entry.code);
+            assert_eq!(error.exit_code(), entry.exit, "{}", entry.code);
+            let hint = entry.hint.expect(entry.code);
+            assert!(!hint.is_empty());
+            assert!(!hint.contains('/'));
+            assert!(!hint.contains('\\'));
+            assert!(!hint.chars().any(char::is_control));
+            let diagnostic = super::operator_diagnostic(&error);
+            assert!(diagnostic.contains(hint), "{diagnostic}");
+            assert_eq!(super::hint_for(entry.code), Some(hint), "{}", entry.code);
+        }
     }
 }

@@ -83,10 +83,17 @@ pub struct WorkerEntry {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, WorkerError> {
         let contents = fs::read_to_string(path).map_err(|error| {
-            let hint = if error.kind() == std::io::ErrorKind::NotFound {
-                "; connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path)"
-            } else { "" };
-            WorkerError::Config(format!("failed to read {}: {error}{hint}", path.display()))
+            // The path stays in Display for logs. The public code selects a
+            // static catalog hint and is the only text the CLI prints.
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                "CONFIG_MISSING"
+            } else {
+                "CONFIG"
+            };
+            WorkerError::Config(format!(
+                "{code}: failed to read {}: {error}",
+                path.display()
+            ))
         })?;
         let config = Self::parse(&contents)?;
         config.validate()?;
