@@ -176,19 +176,38 @@ fn controller_status_cli_reports_an_old_record_as_stale() {
     health.last_tick_start_millis = Some(100);
     health.last_tick_end_millis = Some(200);
     HealthStore::open(&state).unwrap().write(&health).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_worker"))
-        .env_clear()
-        .env("HOME", &root)
-        .env("XDG_STATE_HOME", &root)
-        .args(["controller", "status", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    struct MissingService;
+    impl ProcessRunner for MissingService {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(request.program, "/bin/launchctl");
+            assert_eq!(request.args[0], "print");
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(113 << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let runtime = mac_worker::RuntimeContext::isolated(
+        std::collections::BTreeMap::from([
+            ("HOME".into(), root.as_os_str().to_owned()),
+            ("XDG_STATE_HOME".into(), root.as_os_str().to_owned()),
+        ]),
+        root.clone(),
+        root.clone(),
     );
-    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = mac_worker::run_with_stdio_in_context(
+        Cli::try_parse_from(["worker", "controller", "status", "--json"]).unwrap(),
+        &MissingService,
+        &runtime,
+        &mut Cursor::new(Vec::new()),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    let status: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(status["state"], "stale");
     assert_eq!(status["reason"], "tick_overdue");
     assert_eq!(status["leader_running"], true);

@@ -145,7 +145,7 @@ fn harness_public_cli_grammar() {
     assert!(matches!(
         run.command,
         WorkerCommand::Controller {
-            command: ControllerCommand::Run
+            command: ControllerCommand::Run { supervised: false }
         }
     ));
 

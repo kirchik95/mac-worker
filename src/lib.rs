@@ -505,6 +505,16 @@ fn execute_with_context(
             "host outbox-retry requires the stdio execution boundary".into(),
         )),
         Command::Host {
+            command:
+                HostCommand::ControllerConfigure
+                | HostCommand::ControllerKey
+                | HostCommand::AuthorizeControllerKey
+                | HostCommand::ControllerService
+                | HostCommand::ControllerProbe,
+        } => Err(WorkerError::Protocol(
+            "host controller provisioning requires the stdio execution boundary".into(),
+        )),
+        Command::Host {
             command: HostCommand::ControllerRpc,
         } => Err(WorkerError::Protocol(
             "host controller-rpc requires the stdio execution boundary".into(),
@@ -916,20 +926,182 @@ fn run_controller_command(
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
         let paths = discover_paths(config_override, runtime)?;
-        if matches!(command, ControllerCommand::Status) {
-            let status =
-                crate::controller::health_read::read_health_status(&paths.controller_state_root())
-                    .unwrap_or_else(|error| {
-                        crate::controller::health_read::ControllerHealthStatus::unavailable(&error)
-                    });
+        if let ControllerCommand::Init {
+            destination,
+            worker_ssh,
+            force,
+        } = command
+        {
+            let digest = crate::binary_identity::current_binary_sha256().ok_or_else(|| {
+                WorkerError::Config("cannot determine laptop binary SHA-256".into())
+            })?;
+            let report = crate::controller::init::initialize(
+                runner,
+                &paths.config,
+                runtime.home(),
+                &digest,
+                crate::controller::init::InitRequest {
+                    destination,
+                    worker_ssh,
+                    force,
+                },
+            )?;
             if json {
-                serde_json::to_writer(&mut *stdout, &status).map_err(std::io::Error::other)?;
+                serde_json::to_writer(&mut *stdout, &report).map_err(std::io::Error::other)?;
                 writeln!(stdout)?;
             } else {
-                writeln!(stdout, "{}", status.summary())?;
+                writeln!(stdout, "{}", report.message)?;
+                if let Some(diff) = &report.config_diff {
+                    write!(stdout, "{diff}")?;
+                }
+                for worker in &report.workers {
+                    writeln!(
+                        stdout,
+                        "{} ({}): {}",
+                        worker.name,
+                        worker.destination,
+                        if worker.reachable {
+                            "reachable"
+                        } else {
+                            worker.error_code.as_deref().unwrap_or("not verified")
+                        }
+                    )?;
+                }
+                if let Some(commands) = &report.boot_commands {
+                    writeln!(
+                        stdout,
+                        "For start at boot, review and run these commands on the controller (not executed):\n{commands}"
+                    )?;
+                }
+            }
+            stdout.flush()?;
+            return if report.ready {
+                Ok(())
+            } else {
+                Err(WorkerError::Unavailable(
+                    "CONTROLLER_UNAVAILABLE: controller initialization incomplete".into(),
+                ))
+            };
+        }
+        if matches!(command, ControllerCommand::Disable) {
+            let service = crate::controller::init::disable(runner, &paths.config)?;
+            if json {
+                serde_json::to_writer(
+                    &mut *stdout,
+                    &serde_json::json!({"enabled":false,"service":service}),
+                )
+                .map_err(std::io::Error::other)?;
+                writeln!(stdout)?;
+            } else {
+                writeln!(
+                    stdout,
+                    "controller disabled; service unloaded; state and keys retained"
+                )?;
             }
             stdout.flush()?;
             return Ok(());
+        }
+        if let ControllerCommand::Drain { off } = command {
+            let config = Config::load(&paths.config)?;
+            let drained = if config.controller.enabled {
+                crate::controller::control::drain_via_controller(
+                    runner,
+                    &config.controller,
+                    Some(!off),
+                )?
+            } else {
+                crate::controller::drain::set_drained(&paths.controller_state_root(), !off)?;
+                !off
+            };
+            if json {
+                serde_json::to_writer(&mut *stdout, &serde_json::json!({"drained":drained}))
+                    .map_err(std::io::Error::other)?;
+                writeln!(stdout)?;
+            } else {
+                writeln!(
+                    stdout,
+                    "controller drained={drained}; running turns continue"
+                )?;
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
+        if matches!(command, ControllerCommand::Status) {
+            let config = match Config::load(&paths.config) {
+                Ok(config) => Some(config),
+                Err(WorkerError::Config(_)) if !paths.config.exists() => None,
+                Err(error) => return Err(error),
+            };
+            let (status, service, drained) = if let Some(controller) =
+                config.as_ref().map(|c| &c.controller).filter(|c| c.enabled)
+            {
+                let worker = crate::controller::controller_worker_entry(controller)?;
+                (
+                    crate::controller::health_read::fetch_controller_health(runner, controller),
+                    crate::transfer::controller_host_request::<
+                        _,
+                        crate::controller::service::ServiceStatus,
+                    >(
+                        runner,
+                        &worker,
+                        crate::transfer::HostOperation::ControllerService,
+                        &crate::protocol::ControllerServiceRequest {
+                            action: crate::controller::service::ServiceAction::Status,
+                        },
+                    ),
+                    crate::controller::control::drain_via_controller(runner, controller, None),
+                )
+            } else {
+                (
+                    crate::controller::health_read::read_health_status(
+                        &paths.controller_state_root(),
+                    )
+                    .unwrap_or_else(|error| {
+                        crate::controller::health_read::ControllerHealthStatus::unavailable(&error)
+                    }),
+                    crate::controller::service::manage(
+                        runtime.home(),
+                        unsafe { libc::geteuid() },
+                        runner,
+                        crate::controller::service::ServiceAction::Status,
+                    ),
+                    crate::controller::drain::is_drained(&paths.controller_state_root()),
+                )
+            };
+            if json {
+                let mut value = serde_json::to_value(&status).map_err(std::io::Error::other)?;
+                value["service"] = match &service {
+                    Ok(service) => serde_json::to_value(service).map_err(std::io::Error::other)?,
+                    Err(error) => serde_json::json!({"error_code":error.public_code()}),
+                };
+                value["drained"] = drained
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, |flag| serde_json::json!(flag));
+                if let Err(error) = &drained {
+                    value["drain_error_code"] = serde_json::json!(error.public_code());
+                }
+                serde_json::to_writer(&mut *stdout, &value).map_err(std::io::Error::other)?;
+                writeln!(stdout)?;
+            } else {
+                writeln!(stdout, "{}", status.summary())?;
+                match service {
+                    Ok(service) => writeln!(
+                        stdout,
+                        "service: installed={} loaded={} domain={}",
+                        service.installed, service.loaded, service.domain
+                    )?,
+                    Err(error) => writeln!(stdout, "service: unknown [{}]", error.public_code())?,
+                };
+                match drained {
+                    Ok(flag) => writeln!(stdout, "drained: {flag}")?,
+                    Err(error) => writeln!(stdout, "drained: unknown [{}]", error.public_code())?,
+                };
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
+        if matches!(command, ControllerCommand::Run { supervised: true }) {
+            crate::controller::service::truncate_log(runtime.home())?;
         }
         let config = load_controller_process_config(&paths)?;
         let state_root = paths.controller_state_root();
@@ -1998,6 +2170,25 @@ pub fn run_with_rsync_executor_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    if let Command::Host { command } = &cli.command
+        && matches!(
+            command,
+            HostCommand::ControllerConfigure
+                | HostCommand::ControllerKey
+                | HostCommand::AuthorizeControllerKey
+                | HostCommand::ControllerService
+                | HostCommand::ControllerProbe
+        )
+    {
+        return run_host_controller_provision(
+            command,
+            cli.config.clone(),
+            runtime,
+            runner,
+            stdin,
+            stdout,
+        );
+    }
     if let Command::Gc { apply } = &cli.command {
         return run_gc_command(
             cli.config, runtime, runner, *apply, cli.json, stdout, stderr,
@@ -6186,5 +6377,115 @@ mod enabled_submit_freeze_tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+    }
+}
+
+fn run_host_controller_provision(
+    command: &HostCommand,
+    config_override: Option<PathBuf>,
+    runtime: &RuntimeContext,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+) -> u8 {
+    let result = (|| -> Result<Vec<u8>, WorkerError> {
+        let paths = discover_paths(config_override, runtime)?;
+        let mut bytes = Vec::new();
+        stdin.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(WorkerError::Protocol(
+                "INVALID_REQUEST: controller request exceeds limit".into(),
+            ));
+        }
+        let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            WorkerError::Protocol("INVALID_REQUEST: invalid controller host request".into())
+        })?;
+        fn parse<T: serde::de::DeserializeOwned>(
+            body: serde_json::Value,
+        ) -> Result<T, WorkerError> {
+            serde_json::from_value(body).map_err(|_| {
+                WorkerError::Protocol("INVALID_REQUEST: invalid controller host request".into())
+            })
+        }
+        let encoded = match command {
+            HostCommand::ControllerConfigure => {
+                serde_json::to_vec(&crate::controller::init::configure_host(
+                    runtime.home(),
+                    &paths.config,
+                    &parse::<crate::protocol::ControllerConfigureRequest>(body)?,
+                )?)
+            }
+            HostCommand::ControllerKey => {
+                if body != serde_json::json!({}) {
+                    return Err(WorkerError::Protocol(
+                        "INVALID_REQUEST: key request must be empty".into(),
+                    ));
+                }
+                serde_json::to_vec(&crate::protocol::ControllerKeyResponse {
+                    public_key: crate::controller::provision::ensure_controller_key(
+                        runtime.home(),
+                        runner,
+                    )?,
+                    identity: Some(crate::controller::init::host_identity(runtime.home())?),
+                })
+            }
+            HostCommand::AuthorizeControllerKey => {
+                let key: crate::protocol::ControllerKeyRequest = parse(body)?;
+                serde_json::to_vec(&crate::protocol::ControllerChangedResponse {
+                    changed: crate::controller::provision::authorize_controller_key(
+                        runtime.home(),
+                        &key.public_key,
+                    )?,
+                })
+            }
+            HostCommand::ControllerService => {
+                let request: crate::protocol::ControllerServiceRequest = parse(body)?;
+                serde_json::to_vec(&crate::controller::service::manage(
+                    runtime.home(),
+                    unsafe { libc::geteuid() },
+                    runner,
+                    request.action,
+                )?)
+            }
+            HostCommand::ControllerProbe => {
+                if body != serde_json::json!({}) {
+                    return Err(WorkerError::Protocol(
+                        "INVALID_REQUEST: probe request must be empty".into(),
+                    ));
+                }
+                let config = Config::load(&paths.config)?;
+                config.require_local_inventory()?;
+                serde_json::to_vec(
+                    &crate::transport::WorkersService::new(crate::transport::SshTransport::new(
+                        runner,
+                    ))
+                    .inspect(&config),
+                )
+            }
+            _ => unreachable!(),
+        };
+        encoded.map_err(|_| {
+            WorkerError::Protocol("CONTROLLER_TRANSPORT: could not encode host result".into())
+        })
+    })();
+    match result {
+        Ok(bytes) => {
+            if stdout
+                .write_all(&bytes)
+                .and_then(|_| writeln!(stdout))
+                .and_then(|_| stdout.flush())
+                .is_ok()
+            {
+                0
+            } else {
+                74
+            }
+        }
+        Err(error) => {
+            let _ = serde_json::to_writer(&mut *stdout, &versioned_host_error(&error));
+            let _ = writeln!(stdout);
+            let _ = stdout.flush();
+            error.exit_code()
+        }
     }
 }

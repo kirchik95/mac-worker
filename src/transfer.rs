@@ -81,6 +81,11 @@ pub enum HostOperation {
     Reconcile,
     AgentSettingsGet,
     AgentSettingsSet,
+    ControllerConfigure,
+    ControllerKey,
+    AuthorizeControllerKey,
+    ControllerService,
+    ControllerProbe,
     ControllerRpc,
     ControllerReceivePack,
     ControllerUploadPack,
@@ -114,6 +119,11 @@ impl HostOperation {
             Self::Reconcile => "~/.local/bin/worker host reconcile",
             Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",
             Self::AgentSettingsSet => "~/.local/bin/worker host agent-settings-set",
+            Self::ControllerConfigure => "~/.local/bin/worker host controller-configure",
+            Self::ControllerKey => "~/.local/bin/worker host controller-key",
+            Self::AuthorizeControllerKey => "~/.local/bin/worker host authorize-controller-key",
+            Self::ControllerService => "~/.local/bin/worker host controller-service",
+            Self::ControllerProbe => "~/.local/bin/worker host controller-probe",
             Self::ControllerRpc => "~/.local/bin/worker host controller-rpc",
             Self::ControllerReceivePack => "~/.local/bin/worker host controller-receive-pack",
             Self::ControllerUploadPack => "~/.local/bin/worker host controller-upload-pack",
@@ -2833,4 +2843,19 @@ mod host_control_error_tests {
         );
         assert!(!decoded.public_message().contains(planted));
     }
+}
+
+/// Fixed-table JSON boundary for additive controller provisioning operations.
+pub fn controller_host_request<Req: Serialize, Res: DeserializeOwned + Serialize>(
+    runner: &dyn ProcessRunner,
+    worker: &WorkerEntry,
+    operation: HostOperation,
+    request: &Req,
+) -> Result<Res, WorkerError> {
+    SshJsonTransport::new(runner).request(
+        worker,
+        operation,
+        request,
+        crate::controller::provision::PROCESS_POLICY,
+    )
 }

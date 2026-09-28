@@ -372,14 +372,48 @@ pub enum SkillsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ControllerCommand {
-    #[command(about = "Read controller health on this host (use --json for details)")]
+    #[command(about = "Provision and start a supervised remote controller")]
+    Init {
+        /// Laptop SSH destination of the controller host.
+        destination: String,
+        /// Override a worker destination as seen from the controller (repeatable).
+        #[arg(long = "worker-ssh", value_name = "NAME=SSH")]
+        worker_ssh: Vec<String>,
+        /// Replace a differing controller inventory after reviewing its diff.
+        #[arg(long)]
+        force: bool,
+    },
+    #[command(about = "Unload the remote controller and disable laptop controller mode")]
+    Disable,
+    #[command(about = "Pause new turn runners while running turns finish")]
+    Drain {
+        /// Resume new runner handoffs instead of draining.
+        #[arg(long)]
+        off: bool,
+    },
+    #[command(
+        about = "Read controller health, service state and drain state (use --json for details)"
+    )]
     Status,
     #[command(about = "Hold the controller leader lock and resume durable requests")]
-    Run,
+    Run {
+        #[arg(long, hide = true)]
+        supervised: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum HostCommand {
+    #[command(name = "controller-configure", hide = true)]
+    ControllerConfigure,
+    #[command(name = "controller-key", hide = true)]
+    ControllerKey,
+    #[command(name = "authorize-controller-key", hide = true)]
+    AuthorizeControllerKey,
+    #[command(name = "controller-service", hide = true)]
+    ControllerService,
+    #[command(name = "controller-probe", hide = true)]
+    ControllerProbe,
     Probe,
     #[command(name = "gc")]
     Gc,

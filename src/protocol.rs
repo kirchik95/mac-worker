@@ -464,3 +464,40 @@ mod tests {
         );
     }
 }
+
+/// Additive controller provisioning messages carried by fixed hidden host operations.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerConfigureRequest {
+    pub config_toml: String,
+    pub workers: Vec<crate::controller::provision::PlannedWorker>,
+    pub known_hosts: String,
+    #[serde(default)]
+    pub force: bool,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerKeyRequest {
+    pub public_key: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ControllerKeyResponse {
+    pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ControllerHostIdentity>,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ControllerHostIdentity {
+    pub home: std::path::PathBuf,
+    pub username: String,
+    pub uid: u32,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ControllerChangedResponse {
+    pub changed: bool,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerServiceRequest {
+    pub action: crate::controller::service::ServiceAction,
+}

@@ -13,12 +13,13 @@
 
 pub mod batch;
 pub mod batch_freeze;
-pub mod envelope;
-pub mod drain;
 pub mod control;
+pub mod drain;
+pub mod envelope;
 pub mod execute;
 pub mod health;
 pub mod health_read;
+pub mod init;
 pub mod leader;
 pub mod lifecycle;
 pub mod protocol;
@@ -26,8 +27,8 @@ pub mod provision;
 pub mod read;
 pub mod registry;
 pub mod runtime;
-pub mod store;
 pub mod service;
+pub mod store;
 pub mod stream_client;
 pub mod stream_rpc;
 pub mod task_mutations;
@@ -165,3 +166,4 @@ pub fn controller_dashboard_ssh_request(
         DASHBOARD_TUNNEL_POLICY,
     )
 }
+

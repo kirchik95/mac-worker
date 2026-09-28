@@ -186,7 +186,7 @@ fn controller_run_is_public_and_controller_rpc_stays_hidden() {
     assert!(matches!(
         run.command,
         WorkerCommand::Controller {
-            command: ControllerCommand::Run
+            command: ControllerCommand::Run { supervised: false }
         }
     ));
     let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
