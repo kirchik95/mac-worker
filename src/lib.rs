@@ -1598,9 +1598,12 @@ fn write_turn_diagnostics(
     if let Some(turn) = status.turns().last()
         && let Some(outcome) = turn.outcome()
     {
-        match turn.result_parse_reason() {
-            Some(reason) => writeln!(stdout, "outcome: {} ({reason})", outcome.kind())?,
-            None => writeln!(stdout, "outcome: {}", outcome.kind())?,
+        match (outcome, turn.result_parse_reason()) {
+            (crate::task::TaskOutcome::Failed { reason }, _) => {
+                writeln!(stdout, "outcome: failed ({reason})")?
+            }
+            (_, Some(reason)) => writeln!(stdout, "outcome: {} ({reason})", outcome.kind())?,
+            (_, None) => writeln!(stdout, "outcome: {}", outcome.kind())?,
         }
     }
     Ok(())

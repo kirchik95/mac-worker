@@ -49,6 +49,25 @@ const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
 const PARSE_REASON_FILE: &str = "result-parse-reason.json";
 
+fn preparation_failure_outcome(dir: &RootedDir) -> Result<Option<TaskOutcome>, WorkerError> {
+    let Some(failure) = crate::project_readiness::load_setup_stage_result(dir)? else {
+        return Ok(None);
+    };
+    let reason = match failure.code.as_str() {
+        "SETUP_INPUTS_CHANGED" => {
+            "SETUP_INPUTS_CHANGED: review setup inputs and submit a new task to approve them"
+        }
+        "AGENT_IDENTITY_PROBE_FAILED" => {
+            "AGENT_IDENTITY_PROBE_FAILED: agent --version exceeded its time or output bound"
+        }
+        "AGENT_EXECUTABLE_NOT_FOUND" => {
+            "AGENT_EXECUTABLE_NOT_FOUND: check the agent PATH in the login shell and env profile"
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(TaskOutcome::failed(reason)))
+}
+
 fn persist_parse_reason(
     dir: &RootedDir,
     reason: Option<crate::agent::ResultParseReason>,
@@ -872,9 +891,11 @@ impl TurnTerminalHook {
                             .has_intent(meta.project_id(), meta.task_id(), turn.turn_id())
                             .unwrap_or(true);
                         if !recoverable_intent {
-                            let fallback = TaskOutcome::Failed {
-                                reason: "PUBLISH_FAILED".into(),
-                            };
+                            let fallback = preparation_failure_outcome(turn_dir)?.unwrap_or(
+                                TaskOutcome::Failed {
+                                    reason: "PUBLISH_FAILED".into(),
+                                },
+                            );
                             let _ = task_store.finish_turn(
                                 meta.project_id(),
                                 meta.task_id(),
@@ -1135,7 +1156,10 @@ impl<'a> TurnPublisher<'a> {
         {
             parse_reason = Some(crate::agent::ResultParseReason::NoResultJson);
         }
-        persist_parse_reason(turn_dir, parse_reason)?;
+        let preparation_failure = preparation_failure_outcome(turn_dir)?;
+        if preparation_failure.is_none() {
+            persist_parse_reason(turn_dir, parse_reason)?;
+        }
 
         let (agent_committed, head_oid, diff_stat, files_changed) = if self
             .store
@@ -1159,7 +1183,9 @@ impl<'a> TurnPublisher<'a> {
         let auth_failed = matches!(terminal, TurnTerminal::Succeeded | TurnTerminal::Failed)
             && matches!(agent_outcome, crate::agent::AgentOutcome::Failed { .. })
             && adapter.output_shows_auth_failure(&stdout_auth, &stderr_auth);
-        let outcome = if auth_failed {
+        let outcome = if let Some(outcome) = preparation_failure {
+            outcome
+        } else if auth_failed {
             crate::auth_incidents::record_incident(
                 self.store.host_state_root(),
                 meta.agent(),
@@ -2687,6 +2713,31 @@ mod tests {
             "/opt/[token]/agent"
         );
         assert!(!wire.to_string().contains("purple-lantern"));
+    }
+
+    #[test]
+    fn setup_input_refusal_reaches_the_public_task_outcome_with_a_hint() {
+        let fixture = publication_fixture(Some(""));
+        crate::project_readiness::write_setup_stage_result(
+            &fixture.turn_dir,
+            &WorkerError::task("SETUP_INPUTS_CHANGED", "private helper detail"),
+        )
+        .unwrap();
+        invoke_publication(
+            &fixture,
+            TurnTerminal::Failed,
+            TerminalPath::ChildExit(78),
+            Some(78),
+        )
+        .unwrap();
+        let status = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner)
+            .load_status(PROJECT_ID, fixture.section.turn().task_id())
+            .unwrap();
+        let wire = serde_json::to_value(status).unwrap();
+        let reason = wire["last_outcome"]["reason"].as_str().unwrap();
+        assert!(reason.contains("SETUP_INPUTS_CHANGED"), "{reason}");
+        assert!(reason.contains("submit a new task"), "{reason}");
+        assert!(!wire.to_string().contains("private helper detail"));
     }
 
     fn codex_result_record(summary: &str) -> String {
