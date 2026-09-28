@@ -9,6 +9,27 @@ fn executable(path: &std::path::Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The launch wrapper can be killed by a cancel at any point, so it may only
+/// write inside the turn's disposable `tmp` scope. Returns the staged record.
+fn staged_identity(turn: &std::path::Path) -> Vec<u8> {
+    let names = fs::read_dir(turn)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["tmp"], "the wrapper wrote outside tmp");
+    let names = fs::read_dir(turn.join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["mac-worker-agent-identity.json"]);
+    let path = turn.join("tmp/mac-worker-agent-identity.json");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::read(path).expect("identity staged at launch")
+}
+
 #[test]
 fn records_the_executable_and_version_after_final_login_environment_resolution() {
     let root = tempfile::tempdir().unwrap();
@@ -16,7 +37,7 @@ fn records_the_executable_and_version_after_final_login_environment_resolution()
     let old = root.path().join("cached-bin");
     let selected = root.path().join("profile-bin");
     let turn = root.path().join("turn");
-    for dir in [&home, &old, &selected, &turn] {
+    for dir in [&home, &old, &selected, &turn, &turn.join("tmp")] {
         fs::create_dir(dir).unwrap();
     }
     executable(
@@ -55,10 +76,7 @@ fn records_the_executable_and_version_after_final_login_environment_resolution()
         fs::read_to_string(root.path().join("ran")).unwrap(),
         "2.3.4"
     );
-    let identity: serde_json::Value = serde_json::from_slice(
-        &fs::read(turn.join("agent-identity.json")).expect("identity captured at launch"),
-    )
-    .unwrap();
+    let identity: serde_json::Value = serde_json::from_slice(&staged_identity(&turn)).unwrap();
     assert_eq!(
         identity["executable"],
         fs::canonicalize(selected.join("fixture-agent"))
@@ -87,6 +105,7 @@ fn assert_unavailable_probe_still_launches(probe: &str, observation: &str) {
     let root = tempfile::tempdir().unwrap();
     let turn = root.path().join("turn");
     fs::create_dir(&turn).unwrap();
+    fs::create_dir(turn.join("tmp")).unwrap();
     let program = root.path().join("fixture-agent");
     executable(
         &program,
@@ -107,7 +126,6 @@ fn assert_unavailable_probe_still_launches(probe: &str, observation: &str) {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fs::read_to_string(root.path().join("ran")).unwrap(), "ran");
-    assert!(!turn.join("setup-result.json").exists());
     let group = fs::read_to_string(root.path().join("agent.pgid")).unwrap();
     assert_eq!(
         group.trim(),
@@ -119,7 +137,7 @@ fn assert_unavailable_probe_still_launches(probe: &str, observation: &str) {
         group.trim(),
         fs::read_to_string(root.path().join("agent.pid")).unwrap()
     );
-    let bytes = fs::read(turn.join("agent-identity.json")).unwrap();
+    let bytes = staged_identity(&turn);
     let identity: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         identity["executable"],

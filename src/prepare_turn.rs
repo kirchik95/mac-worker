@@ -169,10 +169,9 @@ fn record_then_exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
 fn persist_agent_identity(identity: &crate::agent::AgentIdentity) -> Result<(), WorkerError> {
     let dir = std::env::var_os("MAC_WORKER_TURN_DIR")
         .ok_or_else(|| WorkerError::task("SETUP_FAILED", "turn identity directory is absent"))?;
-    let dir = crate::rooted_fs::RootedDir::open(Path::new(&dir))?;
     let bytes = serde_json::to_vec(identity)
         .map_err(|_| WorkerError::task("SETUP_FAILED", "cannot encode agent identity"))?;
-    dir.write_private_atomic_no_replace(crate::agent::identity::IDENTITY_FILE, &bytes)?;
+    crate::agent::identity::stage_identity(&Path::new(&dir).join("tmp"), &bytes)?;
     Ok(())
 }
 

@@ -5238,7 +5238,13 @@ fn validate_terminal_job_basis(
     .map(String::from)
     .collect::<BTreeSet<_>>();
     if is_turn {
-        retained.extend(crate::turn::retained_diagnostic_files(job)?);
+        // Judge diagnostics from the same listing as every other name, so a
+        // file that appears between two reads cannot make the sets disagree.
+        retained.extend(
+            crate::turn::retained_diagnostic_files(job)?
+                .into_iter()
+                .filter(|name| names.contains(name)),
+        );
     }
     let retained_with_supervisor_log = retained
         .iter()

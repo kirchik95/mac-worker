@@ -9,7 +9,29 @@ use crate::{
 };
 
 pub(crate) const IDENTITY_FILE: &str = "agent-identity.json";
+/// Written by the launch wrapper inside the turn's disposable `tmp` scope.
+pub(crate) const STAGED_IDENTITY_FILE: &str = "mac-worker-agent-identity.json";
+pub(crate) const IDENTITY_MAX_BYTES: u64 = 8192;
 pub(crate) const VERSION_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The launch wrapper runs in the agent's process group, so a cancel can kill
+/// it at any instruction. It must never write into the retained turn
+/// directory, where an interrupted private write is cleanup residue. It stages
+/// the record in `tmp`, which terminal cleanup removes whole, and the
+/// supervisor adopts it after the child is gone.
+pub(crate) fn stage_identity(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let partial = tmp.join(format!(".{STAGED_IDENTITY_FILE}.{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&partial)?;
+    file.write_all(bytes)?;
+    drop(file);
+    std::fs::rename(&partial, tmp.join(STAGED_IDENTITY_FILE))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

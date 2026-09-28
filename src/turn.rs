@@ -101,6 +101,38 @@ fn persist_parse_reason(
     Ok(())
 }
 
+/// Adopt the launch wrapper's staged identity into the retained turn
+/// directory. The terminal hook runs in the supervisor after the child is
+/// gone, so no process that a cancel can kill writes the private record.
+/// Best effort: identity is a diagnostic, and a missing, partial or invalid
+/// staged file only means the turn shows no agent build.
+pub(crate) fn adopt_staged_agent_identity(turn_dir: &RootedDir) {
+    use crate::agent::identity::{IDENTITY_FILE, IDENTITY_MAX_BYTES, STAGED_IDENTITY_FILE};
+    let _ = (|| -> Result<(), WorkerError> {
+        if turn_dir.entry_exists(IDENTITY_FILE)? {
+            return Ok(());
+        }
+        let tmp = crate::inputs::RelativePath::parse(b"tmp")
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let tmp = match turn_dir.open_child_directory(&tmp, false) {
+            Ok(tmp) => tmp,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let staged = match tmp.read_private_regular(STAGED_IDENTITY_FILE, IDENTITY_MAX_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let identity: crate::agent::AgentIdentity = serde_json::from_slice(&staged)
+            .map_err(|_| turn_error("PUBLISH_FAILED", "invalid staged agent identity"))?;
+        let bytes = serde_json::to_vec(&identity)
+            .map_err(|_| turn_error("PUBLISH_FAILED", "cannot encode agent identity"))?;
+        turn_dir.write_private_atomic_no_replace(IDENTITY_FILE, &bytes)?;
+        Ok(())
+    })();
+}
+
 pub(crate) fn attach_turn_diagnostics(
     store: &HostStore,
     project: &str,
@@ -867,6 +899,7 @@ impl TurnTerminalHook {
         log_truncated: bool,
     ) -> Result<TurnResult, WorkerError> {
         let _ = path;
+        adopt_staged_agent_identity(turn_dir);
         let runner = crate::process::SystemProcessRunner;
         let task_store = TaskStore::new(store, &runner);
         let meta = task_store.load_meta(section.project_id(), section.turn().task_id())?;
@@ -2347,6 +2380,59 @@ mod tests {
     use tempfile::tempdir;
 
     const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn terminal_hook_adopts_only_a_complete_staged_identity() {
+        use crate::agent::identity::{IDENTITY_FILE, STAGED_IDENTITY_FILE, stage_identity};
+        let identity = crate::agent::AgentIdentity {
+            executable: "/opt/agent/bin/codex".into(),
+            version: Some("0.157.1".into()),
+            version_observation: crate::agent::VersionObservation::Observed,
+        };
+        let staged = serde_json::to_vec(&identity).unwrap();
+        let fresh = || {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("turn");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+            let turn = RootedDir::open(&path).unwrap();
+            (temp, path, turn)
+        };
+
+        // No tmp scope, then an empty one: nothing to adopt.
+        let (_temp, path, turn) = fresh();
+        adopt_staged_agent_identity(&turn);
+        assert!(!turn.entry_exists(IDENTITY_FILE).unwrap());
+        turn.open_child_directory(&RelativePath::parse(b"tmp").unwrap(), true)
+            .unwrap();
+        adopt_staged_agent_identity(&turn);
+        assert!(!turn.entry_exists(IDENTITY_FILE).unwrap());
+
+        // A complete staged record becomes the retained private record.
+        stage_identity(&path.join("tmp"), &staged).unwrap();
+        adopt_staged_agent_identity(&turn);
+        assert_eq!(
+            turn.read_private_regular(IDENTITY_FILE, 8192).unwrap(),
+            staged
+        );
+        // An existing record is never replaced.
+        std::fs::write(path.join("tmp").join(STAGED_IDENTITY_FILE), b"{}").unwrap();
+        adopt_staged_agent_identity(&turn);
+        assert_eq!(
+            turn.read_private_regular(IDENTITY_FILE, 8192).unwrap(),
+            staged
+        );
+
+        // A write interrupted by a cancel leaves a partial record: ignore it.
+        let (_temp, path, turn) = fresh();
+        turn.open_child_directory(&RelativePath::parse(b"tmp").unwrap(), true)
+            .unwrap();
+        stage_identity(&path.join("tmp"), &staged[..staged.len() / 2]).unwrap();
+        adopt_staged_agent_identity(&turn);
+        assert!(!turn.entry_exists(IDENTITY_FILE).unwrap());
+        assert!(!turn.has_private_cleanup_residue().unwrap());
+    }
 
     #[test]
     fn prebind_rejects_an_existing_binding_for_a_different_agent() {
