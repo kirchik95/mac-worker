@@ -1771,6 +1771,31 @@ fn refresh_reports_every_worker_when_all_succeed() {
 }
 
 #[test]
+fn refresh_reports_fleet_skew_once_in_human_and_json_output() {
+    for json in [false, true] {
+        let mut results = vec![refresh_ok(), refresh_ok(), refresh_ok()];
+        for version in ["1.0.0", "1.0.0", "2.0.0"] {
+            let mut facts = facts_with_herdr(None);
+            facts.agents[0].version = Some(version.into());
+            let probe = herdr_health(Some(facts), Some(0)).probe.unwrap();
+            results.push(Ok(ProcessResult {
+                status: exit_status(0),
+                stdout: serde_json::to_vec(&probe).unwrap(),
+                stderr: Vec::new(),
+            }));
+        }
+        let runner = RecordingRunner::returning_results(results);
+        let (exit, stdout, stderr) = run_workers_refresh(&runner, 3, json);
+        assert_eq!(exit, 0, "{stderr}");
+        assert_eq!(stdout.matches("AGENT_VERSION_SKEW").count(), 1, "{stdout}");
+        if json {
+            let value = parse_workers_json(&stdout);
+            assert_eq!(value["agent_warnings"][0]["code"], "AGENT_VERSION_SKEW");
+        }
+    }
+}
+
+#[test]
 fn refresh_keeps_reporting_when_one_worker_is_unreachable() {
     let runner = RecordingRunner::returning_results(vec![
         refresh_ok(),
