@@ -3356,7 +3356,11 @@ fn setup_controller_matches_aliases_with_the_same_proxy_jump_route() {
     let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
     assert_eq!(json["workers"][0]["controller_service"], "restarted");
     assert_eq!(json["workers"][0]["warnings"], serde_json::json!([]));
-    assert_eq!(runner.requests().len(), 15);
+    assert_eq!(
+        runner.requests().len(),
+        16,
+        "two route resolutions, the restart and the verified leader health read"
+    );
 }
 
 #[test]
