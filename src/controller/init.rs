@@ -175,6 +175,33 @@ pub fn initialize_with_wait(
             "remaining ProxyJump requires --worker-ssh with a destination directly reachable from the controller",
         ));
     }
+    // Every helper must understand provisioning before any host is changed.
+    // Use the same laptop route and selected account as key authorization.
+    let mut stale = Vec::new();
+    for worker in &config.workers {
+        let mut target = worker.clone();
+        target.ssh = format!(
+            "{}@{}",
+            resolved[&worker.name].user,
+            worker.ssh.rsplit('@').next().unwrap_or(&worker.ssh)
+        );
+        let observed = SshTransport::new(runner).probe(&target);
+        if observed
+            .probe
+            .as_ref()
+            .and_then(|probe| probe.binary_sha256.as_deref())
+            != Some(expected_sha)
+        {
+            stale.push(worker.name.as_str());
+        }
+    }
+    if !stale.is_empty() {
+        report.message = format!(
+            "worker helpers are absent or differ from this laptop build: {}; run `worker setup` for those workers first",
+            stale.join(", ")
+        );
+        return Ok(report);
+    }
     let mut remote = config.clone();
     remote.controller = ControllerConfig::default();
     for (worker, plan) in remote.workers.iter_mut().zip(&planned) {

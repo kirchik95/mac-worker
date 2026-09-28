@@ -60,6 +60,7 @@ struct Fake {
     health_config: String,
     health_patch: Value,
     service_patch: Value,
+    stale_worker: bool,
 }
 impl Fake {
     fn new() -> Self {
@@ -76,6 +77,7 @@ impl Fake {
             health_config: "/Users/controller/.config/mac-worker/config.toml".into(),
             health_patch: json!({}),
             service_patch: json!({}),
+            stale_worker: false,
         }
     }
 }
@@ -134,7 +136,7 @@ impl ProcessRunner for Fake {
         let cmd = args.last().unwrap().as_str();
         Ok(match cmd {
             "~/.local/bin/worker host probe" => result(
-                json!({"protocol_version":PROTOCOL_VERSION,"supervision_version":3,"hostname":"mini-1","arch":"arm64","os_version":"15.0","free_disk_bytes":100000000000u64,"total_disk_bytes":200000000000u64,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[],"configured_slots":1,"busy_slots":0,"binary_sha256":self.digest}),
+                json!({"protocol_version":PROTOCOL_VERSION,"supervision_version":3,"hostname":"mini-1","arch":"arm64","os_version":"15.0","free_disk_bytes":100000000000u64,"total_disk_bytes":200000000000u64,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[],"configured_slots":1,"busy_slots":0,"binary_sha256":if self.stale_worker && args.iter().any(|arg| arg == "mac2" || arg == "kirchik@mac2") { "f".repeat(64) } else { self.digest.clone() }}),
             ),
             "~/.local/bin/worker host controller-configure" => {
                 let body: Value = serde_json::from_slice(req.stdin.as_ref().unwrap()).unwrap();
@@ -623,5 +625,31 @@ fn setup_restart_verification_requires_the_installed_digest_with_injected_wait()
             .unwrap()
             .iter()
             .all(|call| call.contains("controller-route"))
+    );
+}
+
+#[test]
+fn init_preflight_rejects_a_stale_non_controller_helper_before_remote_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.stale_worker = true;
+    let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+    assert!(!report.ready, "{report:?}");
+    assert!(
+        report.message.contains("mini-2") && report.message.contains("worker setup"),
+        "{report:?}"
+    );
+    assert!(!fake.calls.lock().unwrap().iter().any(|call| {
+        call.ends_with("host controller-configure")
+            || call.ends_with("host controller-key")
+            || call.ends_with("host authorize-controller-key")
+            || call.ends_with("host controller-service")
+    }));
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
     );
 }
