@@ -225,22 +225,29 @@ pub fn initialize_with_wait(
     // remote controller leader lock is held here.
     let lock = pending_root.open_private_lock("init.lock")?;
     super::leader::lock_exclusive(&lock)?;
+    let previous_pending = read_pending(&pending_root)?;
     write_pending(&pending_root, &request.destination, "configuring")?;
+    let mut remote_written = false;
     let progress = (|| -> Result<(), WorkerError> {
+        let configure_request = ControllerConfigureRequest {
+            config_toml: toml::to_string_pretty(&remote)
+                .map_err(|_| invalid("cannot encode controller inventory"))?,
+            workers: planned.clone(),
+            known_hosts,
+            force: request.force,
+            include_details: true,
+        };
+        // A failed mutating request may have written remotely before its reply
+        // was lost. Only an explicit conflict proves that no write happened.
+        remote_written = true;
         let configured: ConfiguredHost = controller_host_request(
             runner,
             &host,
             HostOperation::ControllerConfigure,
-            &ControllerConfigureRequest {
-                config_toml: toml::to_string_pretty(&remote)
-                    .map_err(|_| invalid("cannot encode controller inventory"))?,
-                workers: planned.clone(),
-                known_hosts,
-                force: request.force,
-                include_details: true,
-            },
+            &configure_request,
         )?;
         if configured.outcome.conflict {
+            remote_written = false;
             report.message =
                 "controller config differs; review the diff and rerun with --force to replace it"
                     .into();
@@ -363,7 +370,16 @@ pub fn initialize_with_wait(
         // and safe message. The pending destination supplies the recovery route.
         report.message = format!("{}: {}", error.public_code(), error.public_message());
     }
-    if !report.ready {
+    // Preflight exits above never publish a pending record. A no-write retry
+    // must not erase recovery evidence from an earlier attempt that did write.
+    if !remote_written {
+        if let Some(previous) = previous_pending {
+            write_pending(&pending_root, &previous.destination, &previous.stage)?;
+        } else {
+            clear_pending(&pending_root, &request.destination)?;
+        }
+    }
+    if !report.ready && remote_written {
         report.message.push_str(
             "; to stop the partially initialized service, run `worker controller disable`",
         );

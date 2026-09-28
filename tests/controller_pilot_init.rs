@@ -356,6 +356,11 @@ fn init_config_conflict_shows_diff_and_does_not_authorize_or_start() {
     assert!(!report.ready);
     assert_eq!(report.config_diff.as_deref(), Some("-old\n+new\n"));
     assert!(
+        !report.message.contains("worker controller disable"),
+        "{report:?}"
+    );
+    assert!(!pending_root(temp.path()).join("pending-init.json").exists());
+    assert!(
         !fake
             .calls
             .lock()
@@ -363,6 +368,78 @@ fn init_config_conflict_shows_diff_and_does_not_authorize_or_start() {
             .iter()
             .any(|c| c.ends_with("host controller-key") || c.ends_with("host controller-service"))
     );
+}
+
+#[test]
+fn init_config_conflict_preserves_enabled_destination_and_leaves_no_pending_cleanup() {
+    for destination in ["mac1", "old-controller"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = config(&temp);
+        let original = format!(
+            "{}\n[controller]\nenabled=true\nssh='{destination}'\n",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, &original).unwrap();
+        let mut fake = Fake::new();
+        fake.conflict = true;
+        let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+        assert!(!report.ready);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!pending_root(temp.path()).join("pending-init.json").exists());
+        assert!(
+            !report.message.contains("worker controller disable"),
+            "{report:?}"
+        );
+        disable(&fake, &path).unwrap();
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains(destination)
+        );
+    }
+}
+
+#[test]
+fn init_config_conflict_preserves_recovery_from_an_earlier_partial_init() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    assert!(
+        !initialize(&fake, &path, temp.path(), &fake.digest, request())
+            .unwrap()
+            .ready
+    );
+    let pending = pending_root(temp.path()).join("pending-init.json");
+    let earlier = fs::read(&pending).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&earlier).unwrap()["stage"],
+        "verifying"
+    );
+
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("slots=2", "slots=3"),
+    )
+    .unwrap();
+    fake.conflict = true;
+    let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+    assert!(!report.ready);
+    assert!(!report.message.contains("worker controller disable"));
+    let retained = fs::read(&pending).ok();
+    let cleanup = disable(&fake, &path);
+    assert!(
+        cleanup.is_ok(),
+        "a no-write retry lost the earlier service recovery destination: {cleanup:?}"
+    );
+    assert_eq!(retained.as_deref(), Some(earlier.as_slice()));
+    assert!(fake.calls.lock().unwrap().last().unwrap().contains("mac1"));
+    assert!(!pending.exists());
 }
 
 #[test]
@@ -710,6 +787,11 @@ fn init_preflight_rejects_a_stale_non_controller_helper_before_remote_writes() {
     fake.stale_worker = true;
     let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
     assert!(!report.ready, "{report:?}");
+    assert!(
+        !report.message.contains("worker controller disable"),
+        "{report:?}"
+    );
+    assert!(!pending_root(temp.path()).join("pending-init.json").exists());
     assert!(
         report.message.contains("mini-2") && report.message.contains("worker setup"),
         "{report:?}"
