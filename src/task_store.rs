@@ -1485,13 +1485,19 @@ impl<'a> TaskStore<'a> {
             Some(ended_at),
         );
         let _ = turns.pop();
-        turns.push(crate::turn::attach_turn_diagnostics(
-            self.store,
-            project_id,
-            task_id,
-            turn_id,
-            replacement,
-        )?);
+        // Parse reasons and agent identity are advisory. A missing launch
+        // record or an unreadable diagnostic file must not keep the turn from
+        // reaching its terminal state.
+        turns.push(
+            crate::turn::attach_turn_diagnostics(
+                self.store,
+                project_id,
+                task_id,
+                turn_id,
+                replacement.clone(),
+            )
+            .unwrap_or(replacement),
+        );
         let next_state = if close {
             TaskState::Closed
         } else {
