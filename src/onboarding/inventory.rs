@@ -4,6 +4,8 @@ use std::{
     io::{Read, Write},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
 use super::{InitRequest, worker_name};
@@ -13,6 +15,32 @@ use crate::{
 };
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// A lock holder can be transient: a process forked by another thread keeps a
+/// copy of the lock descriptor until it execs. Wait briefly before reporting a
+/// concurrent init instead of failing on the first contended attempt.
+const INVENTORY_LOCK_WAIT: Duration = Duration::from_secs(5);
+const INVENTORY_LOCK_POLL: Duration = Duration::from_millis(25);
+
+fn lock_inventory(lock: &File, wait: Duration) -> Result<(), WorkerError> {
+    let started = Instant::now();
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => {}
+            _ => return Err(WorkerError::Io(error)),
+        }
+        if started.elapsed() >= wait {
+            return Err(WorkerError::Config(
+                "another init is updating the inventory; retry shortly".into(),
+            ));
+        }
+        thread::sleep(INVENTORY_LOCK_POLL.min(wait.saturating_sub(started.elapsed())));
+    }
+}
 
 fn read(path: &Path) -> Result<Option<String>, WorkerError> {
     let mut file = match OpenOptions::new()
@@ -130,11 +158,7 @@ pub(super) fn register(path: &Path, request: &InitRequest) -> Result<WorkerEntry
         ));
     }
     // The persistent lock inode is shared by cooperating init processes. Closing releases it.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(WorkerError::Config(
-            "another init is updating the inventory; retry shortly".into(),
-        ));
-    }
+    lock_inventory(&lock, INVENTORY_LOCK_WAIT)?;
     let original = read(path)?;
     let (worker, added) = select(original.as_deref(), request)?;
     if !added {
@@ -177,4 +201,61 @@ pub(super) fn register(path: &Path, request: &InitRequest) -> Result<WorkerEntry
 
 fn invalid_inventory() -> WorkerError {
     WorkerError::Config("inventory is not valid mac-worker TOML; check version, worker names, SSH destinations and slots (see config.example.toml)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lock_file(dir: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dir.join("config.toml.lock"))
+            .unwrap()
+    }
+
+    #[test]
+    fn inventory_lock_waits_for_a_transient_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        // A second open file description holds the lock, as a forked child
+        // does between fork and exec.
+        let holder = lock_file(dir.path());
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        let lock = lock_file(dir.path());
+        let started = Instant::now();
+        lock_inventory(&lock, Duration::from_secs(5))
+            .expect("a transient holder must not fail init");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn inventory_lock_reports_a_persistent_holder_after_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = lock_file(dir.path());
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let lock = lock_file(dir.path());
+        let started = Instant::now();
+        let error = lock_inventory(&lock, Duration::from_millis(120)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert!(
+            matches!(&error, WorkerError::Config(message) if message.contains("another init")),
+            "{error:?}"
+        );
+        drop(holder);
+    }
 }
