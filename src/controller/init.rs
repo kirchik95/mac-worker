@@ -11,6 +11,7 @@ use crate::{
         ControllerChangedResponse, ControllerConfigureRequest, ControllerKeyRequest,
         ControllerKeyResponse, ControllerServiceRequest, HealthStatus, WorkersReport,
     },
+    rooted_fs::RootedDir,
     transfer::{HostOperation, controller_host_request},
     transport::SshTransport,
 };
@@ -54,6 +55,7 @@ pub struct InitReport {
 pub fn initialize(
     runner: &dyn ProcessRunner,
     config_path: &Path,
+    state_root: &Path,
     home: &Path,
     expected_sha: &str,
     request: InitRequest,
@@ -61,6 +63,7 @@ pub fn initialize(
     initialize_with_wait(
         runner,
         config_path,
+        state_root,
         home,
         expected_sha,
         request,
@@ -73,6 +76,7 @@ pub fn initialize(
 pub fn initialize_with_wait(
     runner: &dyn ProcessRunner,
     config_path: &Path,
+    state_root: &Path,
     home: &Path,
     expected_sha: &str,
     request: InitRequest,
@@ -207,126 +211,154 @@ pub fn initialize_with_wait(
     for (worker, plan) in remote.workers.iter_mut().zip(&planned) {
         worker.ssh = plan.alias.clone()
     }
-    let configured: ConfiguredHost = controller_host_request(
-        runner,
-        &host,
-        HostOperation::ControllerConfigure,
-        &ControllerConfigureRequest {
-            config_toml: toml::to_string_pretty(&remote)
-                .map_err(|_| invalid("cannot encode controller inventory"))?,
-            workers: planned.clone(),
-            known_hosts,
-            force: request.force,
-            include_details: true,
-        },
-    )?;
-    if configured.outcome.conflict {
-        report.message =
-            "controller config differs; review the diff and rerun with --force to replace it"
-                .into();
-        report.config_diff = configured.outcome.diff;
-        return Ok(report);
-    }
-    let key: ControllerKeyResponse = controller_host_request(
-        runner,
-        &host,
-        HostOperation::ControllerKey,
-        &serde_json::json!({}),
-    )?;
-    for (worker, summary) in config.workers.iter().zip(&mut report.workers) {
-        let mut authorization_worker = worker.clone();
-        // Reach the selected account using the laptop's original route/ProxyJump.
-        let selected_user = &resolved[&worker.name].user;
-        authorization_worker.ssh = format!(
-            "{}@{}",
-            selected_user,
-            worker.ssh.rsplit('@').next().unwrap_or(&worker.ssh)
-        );
-        match controller_host_request::<_, ControllerChangedResponse>(
+    let pending_root = super::leader::open_controller_root(state_root)?;
+    // Init/disable serialize only laptop recovery metadata. No state/queue or
+    // remote controller leader lock is held here.
+    let lock = pending_root.open_private_lock("init.lock")?;
+    super::leader::lock_exclusive(&lock)?;
+    write_pending(&pending_root, &request.destination, "configuring")?;
+    let progress = (|| -> Result<(), WorkerError> {
+        let configured: ConfiguredHost = controller_host_request(
             runner,
-            &authorization_worker,
-            HostOperation::AuthorizeControllerKey,
-            &ControllerKeyRequest {
-                public_key: key.public_key.clone(),
+            &host,
+            HostOperation::ControllerConfigure,
+            &ControllerConfigureRequest {
+                config_toml: toml::to_string_pretty(&remote)
+                    .map_err(|_| invalid("cannot encode controller inventory"))?,
+                workers: planned.clone(),
+                known_hosts,
+                force: request.force,
+                include_details: true,
             },
+        )?;
+        if configured.outcome.conflict {
+            report.message =
+                "controller config differs; review the diff and rerun with --force to replace it"
+                    .into();
+            report.config_diff = configured.outcome.diff;
+            return Ok(());
+        }
+        write_pending(&pending_root, &request.destination, "key")?;
+        let key: ControllerKeyResponse = controller_host_request(
+            runner,
+            &host,
+            HostOperation::ControllerKey,
+            &serde_json::json!({}),
+        )?;
+        write_pending(&pending_root, &request.destination, "authorizing")?;
+        for (worker, summary) in config.workers.iter().zip(&mut report.workers) {
+            let mut authorization_worker = worker.clone();
+            // Reach the selected account using the laptop's original route/ProxyJump.
+            let selected_user = &resolved[&worker.name].user;
+            authorization_worker.ssh = format!(
+                "{}@{}",
+                selected_user,
+                worker.ssh.rsplit('@').next().unwrap_or(&worker.ssh)
+            );
+            match controller_host_request::<_, ControllerChangedResponse>(
+                runner,
+                &authorization_worker,
+                HostOperation::AuthorizeControllerKey,
+                &ControllerKeyRequest {
+                    public_key: key.public_key.clone(),
+                },
+            ) {
+                Ok(_) => {}
+                Err(error) => summary.error_code = Some(error.public_code()),
+            }
+        }
+        if report.workers.iter().any(|w| w.error_code.is_some()) {
+            report.message="controller key authorization failed on one or more workers; rerun init after restoring laptop access".into();
+            return Ok(());
+        }
+        write_pending(&pending_root, &request.destination, "installing")?;
+        let installed: ServiceStatus = controller_host_request(
+            runner,
+            &host,
+            HostOperation::ControllerService,
+            &ControllerServiceRequest {
+                action: ServiceAction::Install,
+                include_details: true,
+            },
+        )?;
+        if let (Some(identity), Some(paths)) = (key.identity, installed.paths.as_ref()) {
+            report.boot_commands = Some(super::service::launchdaemon_commands(
+                &identity.home,
+                paths,
+                &identity.username,
+                identity.uid,
+            )?);
+        }
+        write_pending(&pending_root, &request.destination, "restarting")?;
+        let restarted: ServiceStatus = controller_host_request(
+            runner,
+            &host,
+            HostOperation::ControllerService,
+            &ControllerServiceRequest {
+                action: ServiceAction::Restart,
+                include_details: true,
+            },
+        )?;
+        write_pending(&pending_root, &request.destination, "verifying")?;
+        let observed: WorkersReport = controller_host_request(
+            runner,
+            &host,
+            HostOperation::ControllerProbe,
+            &serde_json::json!({}),
+        )?;
+        if observed.protocol_version != crate::protocol::PROTOCOL_VERSION {
+            return Err(invalid("invalid controller probe response"));
+        }
+        for (summary, plan) in report.workers.iter_mut().zip(&planned) {
+            let matches = observed
+                .workers
+                .iter()
+                .filter(|w| w.name == plan.name && w.ssh == plan.alias)
+                .collect::<Vec<_>>();
+            summary.reachable = matches.len() == 1 && matches[0].status == HealthStatus::Ready;
+            if !summary.reachable {
+                summary.error_code = Some("CONTROLLER_WORKER_UNREACHABLE".into())
+            }
+        }
+        let expected_config = configured
+            .config_path
+            .as_deref()
+            .ok_or_else(|| invalid("controller configure response has no config path"))?;
+        if let Err(error) = super::service::verify_restart(
+            runner,
+            &controller,
+            restarted,
+            expected_sha,
+            expected_config,
+            wait,
         ) {
-            Ok(_) => {}
-            Err(error) => summary.error_code = Some(error.public_code()),
+            report.error_code = Some(error.public_code());
+            report.message = error.to_string();
+            return Ok(());
         }
-    }
-    if report.workers.iter().any(|w| w.error_code.is_some()) {
-        report.message="controller key authorization failed on one or more workers; rerun init after restoring laptop access".into();
-        return Ok(report);
-    }
-    let installed: ServiceStatus = controller_host_request(
-        runner,
-        &host,
-        HostOperation::ControllerService,
-        &ControllerServiceRequest {
-            action: ServiceAction::Install,
-            include_details: true,
-        },
-    )?;
-    if let (Some(identity), Some(paths)) = (key.identity, installed.paths.as_ref()) {
-        report.boot_commands = Some(super::service::launchdaemon_commands(
-            &identity.home,
-            paths,
-            &identity.username,
-            identity.uid,
-        )?);
-    }
-    let restarted: ServiceStatus = controller_host_request(
-        runner,
-        &host,
-        HostOperation::ControllerService,
-        &ControllerServiceRequest {
-            action: ServiceAction::Restart,
-            include_details: true,
-        },
-    )?;
-    let observed: WorkersReport = controller_host_request(
-        runner,
-        &host,
-        HostOperation::ControllerProbe,
-        &serde_json::json!({}),
-    )?;
-    if observed.protocol_version != crate::protocol::PROTOCOL_VERSION {
-        return Err(invalid("invalid controller probe response"));
-    }
-    for (summary, plan) in report.workers.iter_mut().zip(&planned) {
-        let matches = observed
-            .workers
-            .iter()
-            .filter(|w| w.name == plan.name && w.ssh == plan.alias)
-            .collect::<Vec<_>>();
-        summary.reachable = matches.len() == 1 && matches[0].status == HealthStatus::Ready;
-        if !summary.reachable {
-            summary.error_code = Some("CONTROLLER_WORKER_UNREACHABLE".into())
+        if report.workers.iter().any(|w| !w.reachable) {
+            report.message="controller cannot reach every worker; correct SSH access or --worker-ssh overrides and rerun init".into();
+            return Ok(());
         }
-    }
-    let expected_config = configured
-        .config_path
-        .as_deref()
-        .ok_or_else(|| invalid("controller configure response has no config path"))?;
-    if let Err(error) = super::service::verify_restart(
-        runner,
-        &controller,
-        restarted,
-        expected_sha,
-        expected_config,
-        wait,
-    ) {
+        write_pending(&pending_root, &request.destination, "enabling")?;
+        crate::config::write_controller_mode(config_path, &original, &controller)?;
+        clear_pending(&pending_root, &request.destination)?;
+        report.ready = true;
+        report.message="controller is live; laptop controller mode enabled. LaunchAgent requires a logged-in GUI session after reboot.".into();
+        Ok(())
+    })();
+    if let Err(error) = progress {
+        report.ready = false;
         report.error_code = Some(error.public_code());
-        report.message = error.to_string();
-        return Ok(report);
+        // Remote diagnostics may contain secrets; retain only the public code
+        // and safe message. The pending destination supplies the recovery route.
+        report.message = format!("{}: {}", error.public_code(), error.public_message());
     }
-    if report.workers.iter().any(|w| !w.reachable) {
-        report.message="controller cannot reach every worker; correct SSH access or --worker-ssh overrides and rerun init".into();
-        return Ok(report);
+    if !report.ready {
+        report.message.push_str(
+            "; to stop the partially initialized service, run `worker controller disable`",
+        );
     }
-    crate::config::write_controller_mode(config_path, &original, &controller)?;
-    report.ready = true;
-    report.message="controller is live; laptop controller mode enabled. LaunchAgent requires a logged-in GUI session after reboot.".into();
     Ok(report)
 }
 
@@ -460,18 +492,105 @@ pub fn configure_host(
     })
 }
 
+const PENDING_INIT: &str = "pending-init.json";
+const MAX_PENDING_BYTES: u64 = 4096;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingInit {
+    version: u32,
+    destination: String,
+    stage: String,
+}
+
+fn read_pending(root: &RootedDir) -> Result<Option<PendingInit>, WorkerError> {
+    match root.read_private_regular(PENDING_INIT, MAX_PENDING_BYTES) {
+        Ok(bytes) => {
+            let pending: PendingInit = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("invalid pending controller init record"))?;
+            if pending.version != 1
+                || !crate::config::valid_ssh_destination(&pending.destination)
+                || pending.stage.len() > 64
+                || pending.stage.is_empty()
+                || !pending
+                    .stage
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c == b'_')
+            {
+                return Err(invalid("invalid pending controller init record"));
+            }
+            Ok(Some(pending))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_pending(root: &RootedDir, destination: &str, stage: &str) -> Result<(), WorkerError> {
+    if read_pending(root)?.is_some_and(|pending| pending.destination != destination) {
+        return Err(WorkerError::Unavailable("CONTROLLER_INIT_PENDING: another destination has an unfinished init; run worker controller disable before initializing a different destination".into()));
+    }
+    let bytes = serde_json::to_vec(&PendingInit {
+        version: 1,
+        destination: destination.into(),
+        stage: stage.into(),
+    })
+    .map_err(|_| invalid("cannot encode pending controller init"))?;
+    if root.entry_exists(PENDING_INIT)? {
+        let previous = root.read_private_regular(PENDING_INIT, MAX_PENDING_BYTES)?;
+        root.replace_private_regular_exact(PENDING_INIT, &previous, &bytes)?;
+    } else {
+        root.write_private_atomic_no_replace(PENDING_INIT, &bytes)?;
+    }
+    Ok(())
+}
+
+fn clear_pending(root: &RootedDir, destination: &str) -> Result<(), WorkerError> {
+    if read_pending(root)?.is_some_and(|pending| pending.destination == destination) {
+        root.remove_owned_regular(PENDING_INIT)?;
+    }
+    Ok(())
+}
+
 pub fn disable(
     runner: &dyn ProcessRunner,
     config_path: &Path,
+    state_root: &Path,
+    destination: Option<&str>,
 ) -> Result<ServiceStatus, WorkerError> {
-    let original = std::fs::read_to_string(config_path)?;
-    let config = Config::parse(&original)?;
-    config.validate()?;
-    let mut controller = config.controller.clone();
-    // Retain destination for idempotent disable and future reinitialization.
-    controller.enabled = true;
+    let original = match std::fs::read_to_string(config_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let config = original.as_deref().map(Config::parse).transpose()?;
+    if let Some(config) = &config {
+        config.validate()?;
+    }
+    let root = super::leader::open_existing_controller_root(state_root)?;
+    let _lock = root
+        .as_ref()
+        .map(|root| {
+            let lock = root.open_private_lock("init.lock")?;
+            super::leader::lock_exclusive(&lock)?;
+            Ok::<_, WorkerError>(lock)
+        })
+        .transpose()?;
+    let pending = root.as_ref().map(read_pending).transpose()?.flatten();
+    let configured = config.as_ref().map(|config| &config.controller);
+    let destination = destination
+        .or_else(|| configured.filter(|controller| controller.enabled).map(|controller| controller.ssh.as_str()))
+        .or_else(|| pending.as_ref().map(|pending| pending.destination.as_str()))
+        // Retain the existing idempotent second-disable behavior once cleanup
+        // has completed; a pending destination always wins over this fallback.
+        .or_else(|| configured.filter(|controller| !controller.ssh.is_empty()).map(|controller| controller.ssh.as_str()))
+        .ok_or_else(|| WorkerError::Unavailable("CONTROLLER_DESTINATION_REQUIRED: no enabled or pending controller destination; use worker controller disable --ssh <destination>".into()))?.to_owned();
+    let controller = ControllerConfig {
+        enabled: true,
+        ssh: destination.clone(),
+        ..Default::default()
+    };
     let worker = super::controller_worker_entry(&controller)?;
-    let service = controller_host_request(
+    let service: ServiceStatus = controller_host_request(
         runner,
         &worker,
         HostOperation::ControllerService,
@@ -480,8 +599,24 @@ pub fn disable(
             include_details: false,
         },
     )?;
-    controller.enabled = false;
-    crate::config::write_controller_mode(config_path, &original, &controller)?;
+    if service.label != super::service::LABEL || service.loaded || service.installed {
+        return Err(WorkerError::Unavailable("CONTROLLER_SERVICE: service uninstall was not confirmed; pending recovery destination retained".into()));
+    }
+    if let Some(original) = original {
+        let mut disabled = config.expect("parsed original config").controller;
+        // Explicit cleanup of a failed replacement must not turn off a
+        // different controller that the laptop still uses.
+        if disabled.ssh.is_empty() || disabled.ssh == destination {
+            disabled.enabled = false;
+            if disabled.ssh.is_empty() {
+                disabled.ssh = destination.clone();
+            }
+            crate::config::write_controller_mode(config_path, &original, &disabled)?;
+        }
+    }
+    if let Some(root) = root {
+        clear_pending(&root, &destination)?;
+    }
     Ok(service)
 }
 

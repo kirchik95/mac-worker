@@ -1,15 +1,61 @@
 use base64::Engine;
 use mac_worker::{
-    controller::{
-        decode_frame, encode_json_frame,
-        init::{InitRequest, initialize},
-    },
+    controller::{decode_frame, encode_json_frame, init::InitRequest},
     error::WorkerError,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     protocol::PROTOCOL_VERSION,
 };
 use serde_json::{Value, json};
 use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
+fn pending_root(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".local/state/mac-worker-controller")
+}
+fn initialize(
+    runner: &dyn ProcessRunner,
+    config: &std::path::Path,
+    home: &std::path::Path,
+    digest: &str,
+    request: InitRequest,
+) -> Result<mac_worker::controller::init::InitReport, WorkerError> {
+    mac_worker::controller::init::initialize(
+        runner,
+        config,
+        &pending_root(home),
+        home,
+        digest,
+        request,
+    )
+}
+fn initialize_with_wait(
+    runner: &dyn ProcessRunner,
+    config: &std::path::Path,
+    home: &std::path::Path,
+    digest: &str,
+    request: InitRequest,
+    wait: &dyn Fn(std::time::Duration),
+) -> Result<mac_worker::controller::init::InitReport, WorkerError> {
+    mac_worker::controller::init::initialize_with_wait(
+        runner,
+        config,
+        &pending_root(home),
+        home,
+        digest,
+        request,
+        wait,
+    )
+}
+fn disable(
+    runner: &dyn ProcessRunner,
+    config: &std::path::Path,
+) -> Result<mac_worker::controller::service::ServiceStatus, WorkerError> {
+    mac_worker::controller::init::disable(
+        runner,
+        config,
+        &pending_root(config.parent().unwrap()),
+        None,
+    )
+}
+
 fn key() -> String {
     let mut b = Vec::new();
     b.extend(11u32.to_be_bytes());
@@ -61,6 +107,9 @@ struct Fake {
     health_patch: Value,
     service_patch: Value,
     stale_worker: bool,
+    unreachable_worker: bool,
+    failure_command: Option<&'static str>,
+    pending_path: Option<std::path::PathBuf>,
 }
 impl Fake {
     fn new() -> Self {
@@ -78,6 +127,9 @@ impl Fake {
             health_patch: json!({}),
             service_patch: json!({}),
             stale_worker: false,
+            unreachable_worker: false,
+            failure_command: None,
+            pending_path: None,
         }
     }
 }
@@ -134,6 +186,22 @@ impl ProcessRunner for Fake {
             return Ok(ProcessResult{status:ExitStatus::from_raw(0),stdout:format!("user {}\nhostname {host}\nport {port}\nproxyjump {}\nuserknownhostsfile /tmp/trusted\n{}",if alias.starts_with("bob@"){"bob"}else{"kirchik"},if alias=="mac2"{&self.jump}else{"none"},if self.host_alias && alias=="mac2"{"hostkeyalias mini2-trust\n"}else{""}).into_bytes(),stderr:vec![]});
         }
         let cmd = args.last().unwrap().as_str();
+        if cmd == "~/.local/bin/worker host controller-configure"
+            && let Some(path) = &self.pending_path
+        {
+            let pending: Value = serde_json::from_slice(
+                &fs::read(path).expect("pending record must precede the first remote write"),
+            )
+            .unwrap();
+            assert_eq!(pending["destination"], "mac1");
+            assert_eq!(pending["stage"], "configuring");
+        }
+        if self.failure_command == Some(cmd) {
+            return Err(WorkerError::Unavailable(
+                "PLANTED_PRIVATE_REMOTE_ERROR".into(),
+            ));
+        }
+
         Ok(match cmd {
             "~/.local/bin/worker host probe" => result(
                 json!({"protocol_version":PROTOCOL_VERSION,"supervision_version":3,"hostname":"mini-1","arch":"arm64","os_version":"15.0","free_disk_bytes":100000000000u64,"total_disk_bytes":200000000000u64,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[],"configured_slots":1,"busy_slots":0,"binary_sha256":if self.stale_worker && args.iter().any(|arg| arg == "mac2" || arg == "kirchik@mac2") { "f".repeat(64) } else { self.digest.clone() }}),
@@ -155,13 +223,17 @@ impl ProcessRunner for Fake {
                     .unwrap()
                     .push(body["action"].as_str().unwrap().into());
                 let mut status = json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":remote_paths()});
+                if body["action"] == "uninstall" {
+                    status["installed"] = json!(false);
+                    status["loaded"] = json!(false);
+                }
                 for (key, value) in self.service_patch.as_object().unwrap() {
                     status[key] = value.clone();
                 }
                 result(status)
             }
             "~/.local/bin/worker host controller-probe" => result(
-                json!({"protocol_version":PROTOCOL_VERSION,"workers":[{"name":"mini-1","ssh":"mac-worker-controller-mini-1-42169ef9","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null},{"name":"mini-2","ssh":"mac-worker-controller-mini-2-100aaff3","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null}]}),
+                json!({"protocol_version":PROTOCOL_VERSION,"workers":[{"name":"mini-1","ssh":"mac-worker-controller-mini-1-42169ef9","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null},{"name":"mini-2","ssh":"mac-worker-controller-mini-2-100aaff3","status":if self.unreachable_worker { "unavailable" } else { "ready" },"probe":null,"missing_capabilities":[],"error_code":null,"error_message":null}]}),
             ),
             "~/.local/bin/worker host controller-rpc" => {
                 let request: Value =
@@ -325,7 +397,7 @@ fn disable_unloads_service_before_disabling_laptop_and_keeps_inventory() {
     let path = config(&temp);
     let fake = Fake::new();
     initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
-    mac_worker::controller::init::disable(&fake, &path).unwrap();
+    disable(&fake, &path).unwrap();
     let cfg = mac_worker::config::Config::load(&path).unwrap();
     assert!(!cfg.controller.enabled);
     assert_eq!(cfg.controller.ssh, "mac1");
@@ -402,16 +474,9 @@ fn init_waits_for_new_leader_health_with_an_injected_waiter() {
     let fake = Fake::new();
     *fake.pending_health.lock().unwrap() = 2;
     let waits = std::sync::atomic::AtomicUsize::new(0);
-    let report = mac_worker::controller::init::initialize_with_wait(
-        &fake,
-        &path,
-        temp.path(),
-        &fake.digest,
-        request(),
-        &|_| {
-            waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        },
-    )
+    let report = initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {
+        waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
     .unwrap();
     assert!(report.ready);
     assert_eq!(waits.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -486,15 +551,8 @@ fn init_rejects_leader_using_a_different_config_path() {
     let path = config(&temp);
     let mut fake = Fake::new();
     fake.health_config = "/Users/controller/wrong-config.toml".into();
-    let report = mac_worker::controller::init::initialize_with_wait(
-        &fake,
-        &path,
-        temp.path(),
-        &fake.digest,
-        request(),
-        &|_| {},
-    )
-    .unwrap();
+    let report =
+        initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
     assert!(!report.ready, "accepted a different config: {report:?}");
     assert!(report.message.contains("config"), "{report:?}");
     assert!(
@@ -512,15 +570,8 @@ fn init_supervision_rejects_a_foreign_manual_leader() {
     let mut fake = Fake::new();
     fake.service_patch = json!({"pid":43,"running":true,"last_exit_status":64});
     fake.health_patch = json!({"supervised":false});
-    let report = mac_worker::controller::init::initialize_with_wait(
-        &fake,
-        &path,
-        temp.path(),
-        &fake.digest,
-        request(),
-        &|_| {},
-    )
-    .unwrap();
+    let report =
+        initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
     assert!(!report.ready, "accepted a manual leader: {report:?}");
     assert!(
         report.message.contains("CONTROLLER_FOREIGN_LEADER"),
@@ -544,15 +595,8 @@ fn init_supervision_rejects_loaded_but_exited_service() {
     let path = config(&temp);
     let mut fake = Fake::new();
     fake.service_patch = json!({"pid":null,"running":false,"last_exit_status":64});
-    let report = mac_worker::controller::init::initialize_with_wait(
-        &fake,
-        &path,
-        temp.path(),
-        &fake.digest,
-        request(),
-        &|_| {},
-    )
-    .unwrap();
+    let report =
+        initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
     assert!(!report.ready, "accepted an exited job: {report:?}");
     assert!(
         !mac_worker::config::Config::load(&path)
@@ -578,17 +622,11 @@ fn init_supervision_rejects_old_build_old_start_and_wrong_roots_with_bounded_wai
         let mut fake = Fake::new();
         fake.health_patch = patch;
         let waits = std::cell::Cell::new(0);
-        let report = mac_worker::controller::init::initialize_with_wait(
-            &fake,
-            &path,
-            temp.path(),
-            &fake.digest,
-            request(),
-            &|_| {
+        let report =
+            initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {
                 waits.set(waits.get() + 1);
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(!report.ready, "{report:?}");
         assert_eq!(waits.get(), 20);
         assert!(report.message.contains("timed out"), "{report:?}");
@@ -652,4 +690,302 @@ fn init_preflight_rejects_a_stale_non_controller_helper_before_remote_writes() {
             .controller
             .enabled
     );
+}
+
+#[test]
+fn recovery_failed_first_init_can_be_disabled_without_a_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+    assert!(!report.ready);
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
+    let pending_file = temp
+        .path()
+        .join(".local/state/mac-worker-controller/pending-init.json");
+    let pending = fs::read(&pending_file).ok();
+    let disabled = disable(&fake, &path);
+    assert!(
+        disabled.is_ok(),
+        "failed init cannot be undone: {disabled:?}"
+    );
+    let pending: Value =
+        serde_json::from_slice(&pending.expect("pending destination recorded")).unwrap();
+    assert_eq!(pending["destination"], "mac1");
+    assert_eq!(pending["stage"], "verifying");
+    assert!(report.message.contains("worker controller disable"));
+    assert!(!pending_file.exists());
+    assert_eq!(
+        fake.service_actions.lock().unwrap().last().unwrap(),
+        "uninstall"
+    );
+}
+
+#[test]
+fn recovery_disable_accepts_an_explicit_destination() {
+    use clap::Parser;
+    assert!(
+        mac_worker::cli::Cli::try_parse_from(["worker", "controller", "disable", "--ssh", "mac1"])
+            .is_ok()
+    );
+}
+
+#[test]
+fn recovery_disable_without_enabled_or_pending_destination_fails_clearly() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let fake = Fake::new();
+    let error = disable(&fake, &path).unwrap_err();
+    assert_eq!(error.public_code(), "CONTROLLER_DESTINATION_REQUIRED");
+    assert!(error.to_string().contains("--ssh"));
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn recovery_failed_first_init_can_be_disabled_with_explicit_ssh() {
+    use clap::Parser;
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    let pending_file = pending_root(temp.path()).join("pending-init.json");
+    fake.pending_path = Some(pending_file.clone());
+    let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+    assert!(!report.ready);
+    let runtime = mac_worker::RuntimeContext::isolated(
+        Default::default(),
+        temp.path().into(),
+        temp.path().into(),
+    );
+    let mut out = vec![];
+    let mut err = vec![];
+    let exit = mac_worker::run_with_stdio_in_context(
+        mac_worker::cli::Cli::try_parse_from([
+            "worker",
+            "--config",
+            path.to_str().unwrap(),
+            "controller",
+            "disable",
+            "--ssh",
+            "mac1",
+        ])
+        .unwrap(),
+        &fake,
+        &runtime,
+        &mut std::io::Cursor::new([]),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(!pending_file.exists());
+    assert!(fake.calls.lock().unwrap().last().unwrap().contains("mac1"));
+    assert_eq!(
+        fake.service_actions.lock().unwrap().last().unwrap(),
+        "uninstall"
+    );
+}
+
+#[test]
+fn recovery_every_remote_failure_retains_private_pending_record_and_safe_hint() {
+    use std::os::unix::fs::PermissionsExt;
+    for command in [
+        "controller-configure",
+        "controller-key",
+        "authorize-controller-key",
+        "controller-service",
+        "controller-probe",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = config(&temp);
+        let mut fake = Fake::new();
+        fake.failure_command = Some(match command {
+            "controller-configure" => "~/.local/bin/worker host controller-configure",
+            "controller-key" => "~/.local/bin/worker host controller-key",
+            "authorize-controller-key" => "~/.local/bin/worker host authorize-controller-key",
+            "controller-service" => "~/.local/bin/worker host controller-service",
+            _ => "~/.local/bin/worker host controller-probe",
+        });
+        let pending_file = pending_root(temp.path()).join("pending-init.json");
+        fake.pending_path = Some(pending_file.clone());
+        let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report.message.contains("worker controller disable"),
+            "{report:?}"
+        );
+        assert!(!report.message.contains("PLANTED_PRIVATE"));
+        assert_eq!(
+            fs::metadata(&pending_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !mac_worker::config::Config::load(&path)
+                .unwrap()
+                .controller
+                .enabled
+        );
+        fake.failure_command = None;
+        disable(&fake, &path).unwrap();
+        assert!(!pending_file.exists());
+    }
+}
+
+#[test]
+fn recovery_success_clears_pending_and_failed_disable_keeps_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    assert!(
+        !initialize(&fake, &path, temp.path(), &fake.digest, request())
+            .unwrap()
+            .ready
+    );
+    fake.failure_command = Some("~/.local/bin/worker host controller-service");
+    assert!(disable(&fake, &path).is_err());
+    assert!(pending_root(temp.path()).join("pending-init.json").exists());
+    fake.failure_command = None;
+    fake.unreachable_worker = false;
+    assert!(
+        initialize(&fake, &path, temp.path(), &fake.digest, request())
+            .unwrap()
+            .ready
+    );
+    assert!(!pending_root(temp.path()).join("pending-init.json").exists());
+}
+
+#[test]
+fn recovery_pending_uses_resolved_xdg_state_for_cli_disable() {
+    use clap::Parser;
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let custom_state = temp.path().join("custom-state");
+    let root = custom_state.join("mac-worker-controller");
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    let report = mac_worker::controller::init::initialize_with_wait(
+        &fake,
+        &path,
+        &root,
+        temp.path(),
+        &fake.digest,
+        request(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(!report.ready);
+    assert!(root.join("pending-init.json").exists());
+    let runtime = mac_worker::RuntimeContext::isolated(
+        std::collections::BTreeMap::from([(
+            "XDG_STATE_HOME".into(),
+            custom_state.into_os_string(),
+        )]),
+        temp.path().into(),
+        temp.path().into(),
+    );
+    let mut out = vec![];
+    let mut err = vec![];
+    let exit = mac_worker::run_with_stdio_in_context(
+        mac_worker::cli::Cli::try_parse_from([
+            "worker",
+            "--config",
+            path.to_str().unwrap(),
+            "controller",
+            "disable",
+        ])
+        .unwrap(),
+        &fake,
+        &runtime,
+        &mut std::io::Cursor::new([]),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(!root.join("pending-init.json").exists());
+    assert!(!pending_root(temp.path()).exists());
+}
+
+#[test]
+fn recovery_pending_symlink_is_refused_before_remote_writes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let root = pending_root(temp.path());
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let unrelated = temp.path().join("unrelated");
+    fs::write(&unrelated, "preserve").unwrap();
+    symlink(&unrelated, root.join("pending-init.json")).unwrap();
+    let fake = Fake::new();
+    assert!(initialize(&fake, &path, temp.path(), &fake.digest, request()).is_err());
+    assert_eq!(fs::read_to_string(unrelated).unwrap(), "preserve");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.ends_with("host controller-configure"))
+    );
+}
+
+#[test]
+fn recovery_enabled_destination_takes_priority_without_erasing_other_pending_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!("{original}\n[controller]\nenabled=true\nssh='old-controller'\n"),
+    )
+    .unwrap();
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    assert!(
+        !initialize(&fake, &path, temp.path(), &fake.digest, request())
+            .unwrap()
+            .ready
+    );
+    disable(&fake, &path).unwrap();
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("old-controller")
+    );
+    assert!(pending_root(temp.path()).join("pending-init.json").exists());
+    disable(&fake, &path).unwrap();
+    assert!(fake.calls.lock().unwrap().last().unwrap().contains("mac1"));
+    assert!(!pending_root(temp.path()).join("pending-init.json").exists());
+}
+
+#[test]
+fn recovery_explicit_pending_cleanup_preserves_a_different_enabled_controller() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let original = format!(
+        "{}\n[controller]\nenabled=true\nssh='old-controller'\n",
+        fs::read_to_string(&path).unwrap()
+    );
+    fs::write(&path, &original).unwrap();
+    let mut fake = Fake::new();
+    fake.unreachable_worker = true;
+    assert!(
+        !initialize(&fake, &path, temp.path(), &fake.digest, request())
+            .unwrap()
+            .ready
+    );
+    mac_worker::controller::init::disable(&fake, &path, &pending_root(temp.path()), Some("mac1"))
+        .unwrap();
+    assert!(fake.calls.lock().unwrap().last().unwrap().contains("mac1"));
+    assert!(!pending_root(temp.path()).join("pending-init.json").exists());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }

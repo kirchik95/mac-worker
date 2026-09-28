@@ -945,6 +945,7 @@ fn run_controller_command(
             let report = crate::controller::init::initialize(
                 runner,
                 &paths.config,
+                &paths.controller_state_root(),
                 runtime.home(),
                 &digest,
                 crate::controller::init::InitRequest {
@@ -994,8 +995,13 @@ fn run_controller_command(
                 )))
             };
         }
-        if matches!(command, ControllerCommand::Disable) {
-            let service = crate::controller::init::disable(runner, &paths.config)?;
+        if let ControllerCommand::Disable { ssh } = command {
+            let service = crate::controller::init::disable(
+                runner,
+                &paths.config,
+                &paths.controller_state_root(),
+                ssh.as_deref(),
+            )?;
             if json {
                 serde_json::to_writer(
                     &mut *stdout,

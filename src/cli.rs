@@ -384,7 +384,11 @@ pub enum ControllerCommand {
         force: bool,
     },
     #[command(about = "Unload the remote controller and disable laptop controller mode")]
-    Disable,
+    Disable {
+        /// Controller SSH destination (also works after an incomplete init).
+        #[arg(long)]
+        ssh: Option<String>,
+    },
     #[command(about = "Pause new turn runners while running turns finish")]
     Drain {
         /// Resume new runner handoffs instead of draining.

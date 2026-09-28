@@ -389,6 +389,20 @@ static CATALOG: &[PublicDiagnostic] = &[
         hint: Some("check SSH to the worker and retry"),
     },
     PublicDiagnostic {
+        code: "CONTROLLER_DESTINATION_REQUIRED",
+        exit: 69,
+        hint: Some(
+            "no controller destination is recorded; use `worker controller disable --ssh <destination>`",
+        ),
+    },
+    PublicDiagnostic {
+        code: "CONTROLLER_INIT_PENDING",
+        exit: 69,
+        hint: Some(
+            "run `worker controller disable` to clean up the unfinished init before changing destination",
+        ),
+    },
+    PublicDiagnostic {
         code: "CONTROLLER_FOREIGN_LEADER",
         exit: 69,
         hint: Some(
