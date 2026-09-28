@@ -4484,6 +4484,23 @@ fn run_enabled_controller_task(
             Ok(0)
         }
         Command::Task {
+            command: TaskCommand::PublishRetry { task_id },
+        } => {
+            let report = crate::controller::lifecycle::publish_retry_via_controller(
+                runner,
+                &config.controller,
+                task_id,
+            )?;
+            write_publish_retry_report(
+                task_id,
+                report.deliveries(),
+                report.warnings(),
+                json,
+                stdout,
+            )?;
+            Ok(0)
+        }
+        Command::Task {
             command: TaskCommand::Fetch { task_id },
         } => {
             let project = runtime.current_dir()?;

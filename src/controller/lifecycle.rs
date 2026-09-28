@@ -1,4 +1,4 @@
-//! Short wait/reconcile controller RPC.
+//! Short wait/reconcile and origin publication retry controller RPC.
 //!
 //! Local `TaskClient::wait` loops reconcile+sleep on one process. A blocking
 //! wait on one SSH hop would exceed the 30s controller RPC deadline, and a
@@ -7,6 +7,8 @@
 //! (no 00ce budget reset) then a DAG-aware quiescence snapshot. Explicit
 //! `task.reconcile` is `operator_reconcile`. These commands are outside
 //! STORE and `is_read_command`.
+//! Publication retries reuse the worker's durable outbox and merge its
+//! refreshed deliveries into the controller's task store.
 
 use std::time::Duration;
 
@@ -20,13 +22,14 @@ use crate::{
         protocol::{ControllerRequest, encode_json_frame},
         read::{
             ControllerReadIdentity, ControllerReadReply, invalid_controller_reply,
-            map_missing_task, optional_string, reject_unknown_keys,
+            map_missing_task, optional_string, reject_unknown_keys, require_matching_task_id,
+            required_task_id,
         },
     },
     error::WorkerError,
     process::ProcessRunner,
     protocol::PROTOCOL_VERSION,
-    task::TaskId,
+    task::{OriginDelivery, TaskId},
     task_client::{ReconcileReport, TaskClient, WaitReport, WaitSelector, WaitSnapshot},
 };
 
@@ -112,8 +115,36 @@ impl ControllerReadIdentity for ControllerReconcileResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerPublishRetryResult {
+    task_id: TaskId,
+    deliveries: Vec<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+impl ControllerPublishRetryResult {
+    pub fn deliveries(&self) -> &[OriginDelivery] {
+        &self.deliveries
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+}
+
+impl ControllerReadIdentity for ControllerPublishRetryResult {
+    fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
+        require_matching_task_id(request, self.task_id)
+    }
+}
+
 pub(crate) fn is_lifecycle_command(command: &str) -> bool {
-    matches!(command, "task.wait.poll" | "task.reconcile")
+    matches!(
+        command,
+        "task.wait.poll" | "task.reconcile" | "task.publish-retry"
+    )
 }
 
 pub(crate) fn serve_lifecycle_command(
@@ -123,6 +154,7 @@ pub(crate) fn serve_lifecycle_command(
     match request.command() {
         "task.wait.poll" => Ok(encode_json_frame(&wait_poll_reply(request, client)?)?),
         "task.reconcile" => Ok(encode_json_frame(&reconcile_reply(request, client)?)?),
+        "task.publish-retry" => Ok(encode_json_frame(&publish_retry_reply(request, client)?)?),
         other => Err(WorkerError::Protocol(format!(
             "CONTROLLER_TRANSPORT: unsupported controller command {other}"
         ))),
@@ -164,6 +196,38 @@ pub fn reconcile_via_controller(
         result.started_runners(),
         result.repaired_rows(),
         result.unverifiable_rows(),
+    ))
+}
+
+pub fn publish_retry_via_controller(
+    runner: &dyn ProcessRunner,
+    controller: &ControllerConfig,
+    task_id: TaskId,
+) -> Result<ControllerPublishRetryResult, WorkerError> {
+    let request = lifecycle_request(
+        "task.publish-retry",
+        serde_json::json!({ "task_id": task_id.to_string() }),
+    )?;
+    Ok(
+        send_controller_read::<ControllerPublishRetryResult>(runner, controller, &request)?
+            .into_result(),
+    )
+}
+
+fn publish_retry_reply(
+    request: &ControllerRequest,
+    client: &TaskClient<'_>,
+) -> Result<ControllerReadReply<ControllerPublishRetryResult>, WorkerError> {
+    reject_unknown_keys(request.body(), &["task_id"], "task.publish-retry")?;
+    let task_id = required_task_id(request, "task.publish-retry")?;
+    let report = map_missing_task(client.publish_retry(task_id))?;
+    Ok(ControllerReadReply::from_request(
+        request,
+        ControllerPublishRetryResult {
+            task_id,
+            deliveries: report.deliveries().to_vec(),
+            warnings: report.warnings().to_vec(),
+        },
     ))
 }
 
