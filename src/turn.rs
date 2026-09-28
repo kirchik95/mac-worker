@@ -1162,8 +1162,17 @@ impl<'a> TurnPublisher<'a> {
                 "successful turn did not bind an agent session",
             ));
         }
+        // The display tail normally contains raw protocol envelopes, not a
+        // decoded agent result. Preserve its legacy valid-result fallback,
+        // but never let an envelope mask the decoded candidate's parse error.
+        let fallback_tail = tail.as_deref().filter(|text| {
+            adapter
+                .extract_result("", Some(text))
+                .ok()
+                .is_some_and(|result| result.status() != crate::agent::ResultStatus::Unknown)
+        });
         let structured = adapter
-            .extract_result(&stream, last_message.as_deref().or(tail.as_deref()))
+            .extract_result(&stream, last_message.as_deref().or(fallback_tail))
             .map_err(|error| turn_error("PUBLISH_FAILED", error.to_string()))?;
         let mut parse_reason = structured.parse_reason();
         if parse_reason == Some(crate::agent::ResultParseReason::EmptyOutput)
@@ -2706,6 +2715,39 @@ mod tests {
         let wire = serde_json::to_value(status).unwrap();
         assert_eq!(wire["turns"][0]["outcome"]["kind"], "unknown");
         assert_eq!(wire["turns"][0]["result_parse_reason"], "no_result_json");
+    }
+
+    #[test]
+    fn unknown_reason_comes_from_result_candidates_not_the_raw_stdout_tail() {
+        let malformed = serde_json::json!({
+            "type": "item.completed",
+            "item": { "type": "agent_message", "text": "{\"status\":\"done\",\"summary\":42}" },
+        })
+        .to_string();
+        for (record, expected) in [
+            ("", "no_result_json"),
+            (malformed.as_str(), "schema_mismatch:summary"),
+        ] {
+            let stdout = format!("{}\n{record}\n", codex_session_line());
+            let fixture = publication_fixture(Some(&stdout));
+            fixture
+                .turn_dir
+                .write_private_atomic_no_replace("tail.log", stdout.as_bytes())
+                .unwrap();
+            invoke_publication(
+                &fixture,
+                TurnTerminal::Succeeded,
+                TerminalPath::ChildExit(0),
+                Some(0),
+            )
+            .unwrap();
+            let status = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner)
+                .load_status(PROJECT_ID, fixture.section.turn().task_id())
+                .unwrap();
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire["turns"][0]["outcome"]["kind"], "unknown");
+            assert_eq!(wire["turns"][0]["result_parse_reason"], expected);
+        }
     }
 
     #[test]

@@ -1187,7 +1187,11 @@ fn resolve_structured_result(
             return result;
         }
     }
-    StructuredResult::unknown(invalid_result_reason(last_message_file, stream_candidates))
+    StructuredResult::unknown(invalid_result_reason(
+        last_message_file,
+        stream_candidates,
+        extract_json_object,
+    ))
 }
 
 fn resolve_last_structured_result(
@@ -1206,10 +1210,22 @@ fn resolve_last_structured_result(
             return result;
         }
     }
-    StructuredResult::unknown(invalid_result_reason(last_message_file, stream_candidates))
+    StructuredResult::unknown(invalid_result_reason(
+        last_message_file,
+        stream_candidates,
+        |text| {
+            last_trailer_block(text)
+                .and_then(extract_json_object)
+                .or_else(|| extract_last_json_object(text))
+        },
+    ))
 }
 
-fn invalid_result_reason(last: Option<&str>, candidates: &[String]) -> ResultParseReason {
+fn invalid_result_reason(
+    last: Option<&str>,
+    candidates: &[String],
+    extract: fn(&str) -> Option<Value>,
+) -> ResultParseReason {
     use ResultParseReason::*;
     let mut reason = EmptyOutput;
     for text in last
@@ -1220,16 +1236,13 @@ fn invalid_result_reason(last: Option<&str>, candidates: &[String]) -> ResultPar
             continue;
         }
         reason = NoResultJson;
-        let Some(start) = text.find('{') else {
+        let Some(value) = extract(text) else {
+            if let Some(start) = text.find('{')
+                && matches!(serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>().next(), Some(Err(error)) if error.is_eof())
+            {
+                return Truncated;
+            }
             continue;
-        };
-        let value = match serde_json::Deserializer::from_str(&text[start..])
-            .into_iter::<Value>()
-            .next()
-        {
-            Some(Ok(value)) => value,
-            Some(Err(error)) if error.is_eof() => return Truncated,
-            _ => continue,
         };
         if !matches!(
             value.get("status").and_then(Value::as_str),

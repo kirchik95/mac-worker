@@ -80,3 +80,17 @@ fn truncated_stream_envelope_is_distinguished_from_non_json_output() {
         );
     }
 }
+
+#[test]
+fn last_object_adapters_classify_the_selected_result_schema() {
+    for kind in [AgentKind::Cursor, AgentKind::Opencode] {
+        let result = adapter_for(kind)
+            .extract_result("", Some(r#"{} {"status":"done","summary":42}"#))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result.parse_reason()).unwrap(),
+            "schema_mismatch:summary",
+            "{kind:?}"
+        );
+    }
+}
