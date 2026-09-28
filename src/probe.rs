@@ -8,6 +8,8 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_int, c_void};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     agent_facts::{
         AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming,
@@ -39,7 +41,9 @@ const HOST_COMMAND_POLICY: ProcessPolicy = ProcessPolicy {
     deadline: Duration::from_secs(5),
 };
 const FACTS_FILE: &str = "facts.json";
+const TOOL_CAPABILITIES_FILE: &str = "tool-capabilities.json";
 const MAX_FACTS_BYTES: u64 = 1024 * 1024;
+const MAX_TOOL_CAPABILITY_BYTES: u64 = 64 * 1024;
 const FACTS_WRITE_RETRIES: usize = 3;
 
 struct ProcessOutput {
@@ -179,6 +183,7 @@ impl ProbeCollector {
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
+        let cached_tools = load_cached_tools(host_state_root);
         let mut response = Self::collect_with(
             &SystemCommandExecutor::default(),
             &SystemMemoryPressureQuery,
@@ -186,6 +191,7 @@ impl ProbeCollector {
             &search_paths,
             std::env::consts::OS,
             std::env::consts::ARCH,
+            cached_tools.as_deref(),
         )?;
         let (free, total) = filesystem_capacity(host_state_root)?;
         response.free_disk_bytes = free;
@@ -268,6 +274,7 @@ impl ProbeCollector {
             budget,
         );
         write_cached_facts(host_state_root, &facts)?;
+        write_tool_capability_cache(host_state_root)?;
         overlay?;
         Ok((facts, timing))
     }
@@ -301,6 +308,7 @@ impl ProbeCollector {
         search_paths: &[PathBuf],
         os: &str,
         arch: &str,
+        cached_tools: Option<&[String]>,
     ) -> Result<ProbeResponse, WorkerError> {
         let hostname = required_text(executor, Path::new("/bin/hostname"), &[], "hostname")?;
         let arch = normalize_arch(arch)?;
@@ -320,7 +328,7 @@ impl ProbeCollector {
         let memory_pressure = collect_memory_pressure(memory_pressure_query);
         let swap_used_bytes = collect_swap_used_bytes(executor);
         let available_memory_bytes = collect_available_memory_bytes(executor);
-        let capabilities = collect_capabilities(executor, search_paths, os, &arch);
+        let capabilities = collect_capabilities(executor, search_paths, os, &arch, cached_tools);
 
         Ok(ProbeResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -425,6 +433,100 @@ fn write_cached_facts(host_state_root: &Path, facts: &AgentFacts) -> Result<(), 
             }
         } else {
             match root.write_private_atomic_no_replace(FACTS_FILE, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        }
+    }
+    Err(WorkerError::Io(io::Error::from_raw_os_error(libc::EAGAIN)))
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ToolCapabilityCache {
+    tools: Vec<String>,
+}
+
+fn load_cached_tools(host_state_root: &Path) -> Option<Vec<String>> {
+    let root = RootedDir::open(host_state_root).ok()?;
+    if !root.entry_exists(TOOL_CAPABILITIES_FILE).ok()? {
+        return None;
+    }
+    let bytes = root
+        .read_private_regular(TOOL_CAPABILITIES_FILE, MAX_TOOL_CAPABILITY_BYTES)
+        .ok()?;
+    let cache: ToolCapabilityCache = serde_json::from_slice(&bytes).ok()?;
+    if !cached_tools_are_ordered(&cache.tools) {
+        return None;
+    }
+    Some(cache.tools)
+}
+
+fn cached_tools_are_ordered(tools: &[String]) -> bool {
+    let mut previous = None;
+    for name in tools {
+        let Some(position) = TOOL_PROBES
+            .iter()
+            .position(|probe| probe.capability == name)
+        else {
+            return false;
+        };
+        if previous.is_some_and(|earlier| position <= earlier) {
+            return false;
+        }
+        previous = Some(position);
+    }
+    true
+}
+
+fn write_tool_capability_cache(host_state_root: &Path) -> Result<(), WorkerError> {
+    let search_paths = CONTROLLED_HOST_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let detected = collect_capabilities(
+        &SystemCommandExecutor::default(),
+        &search_paths,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        None,
+    );
+    let tools = detected
+        .into_iter()
+        .filter(|name| name != "darwin-arm64")
+        .collect::<Vec<_>>();
+    store_tool_capabilities(host_state_root, &tools)
+}
+
+fn store_tool_capabilities(host_state_root: &Path, tools: &[String]) -> Result<(), WorkerError> {
+    if !cached_tools_are_ordered(tools) {
+        return Err(WorkerError::Protocol(
+            "tool capability cache is invalid".into(),
+        ));
+    }
+    let bytes = serde_json::to_vec(&ToolCapabilityCache {
+        tools: tools.to_vec(),
+    })
+    .map_err(|_| WorkerError::Protocol("failed to serialize tool capabilities".into()))?;
+    if bytes.len() as u64 > MAX_TOOL_CAPABILITY_BYTES {
+        return Err(WorkerError::Protocol(
+            "tool capability cache exceeds 64 KiB".into(),
+        ));
+    }
+    let root = RootedDir::open(host_state_root).map_err(WorkerError::Io)?;
+    for _ in 0..FACTS_WRITE_RETRIES {
+        if root.entry_exists(TOOL_CAPABILITIES_FILE)? {
+            let previous = root
+                .read_private_regular(TOOL_CAPABILITIES_FILE, MAX_TOOL_CAPABILITY_BYTES)
+                .map_err(WorkerError::Io)?;
+            match root.replace_private_regular_exact(TOOL_CAPABILITIES_FILE, &previous, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ESTALE) => continue,
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        } else {
+            match root.write_private_atomic_no_replace(TOOL_CAPABILITIES_FILE, &bytes) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(WorkerError::Io(error)),
@@ -720,10 +822,20 @@ fn collect_capabilities(
     search_paths: &[PathBuf],
     os: &str,
     arch: &str,
+    cached_tools: Option<&[String]>,
 ) -> Vec<String> {
     let mut capabilities = Vec::new();
     if matches!(os.to_ascii_lowercase().as_str(), "macos" | "darwin") && arch == "arm64" {
         capabilities.push("darwin-arm64".into());
+    }
+
+    if let Some(cached_tools) = cached_tools {
+        for probe in TOOL_PROBES {
+            if cached_tools.iter().any(|name| name == probe.capability) {
+                capabilities.push(probe.capability.into());
+            }
+        }
+        return capabilities;
     }
 
     for probe in TOOL_PROBES {
@@ -1034,6 +1146,7 @@ mod tests {
             &[directory.path().to_path_buf()],
             "macos",
             "aarch64",
+            None,
         )
         .unwrap();
 
@@ -1083,6 +1196,7 @@ mod tests {
             &[directory.path().to_path_buf()],
             "macos",
             "arm64",
+            None,
         )
         .unwrap();
 
@@ -1126,6 +1240,57 @@ mod tests {
     }
 
     #[test]
+    fn cached_tool_capabilities_skip_version_probes_and_round_trip() {
+        let directory = tempdir().unwrap();
+        for name in ["git", "swift", "docker"] {
+            executable(directory.path(), name);
+        }
+        let executor = CapabilityRecordingExecutor::default();
+        let cached = vec!["git".to_owned(), "swift".to_owned()];
+        let response = ProbeCollector::collect_with(
+            &executor,
+            &FixtureMemoryPressureQuery::available(0),
+            None,
+            &[directory.path().to_path_buf()],
+            "macos",
+            "arm64",
+            Some(&cached),
+        )
+        .unwrap();
+        assert_eq!(
+            response.capabilities,
+            vec!["darwin-arm64".to_owned(), "git".into(), "swift".into()]
+        );
+        assert!(executor.calls.lock().unwrap().iter().all(|(_, args)| {
+            !matches!(args.as_slice(), [arg] if arg == "--version" || arg == "version")
+        }));
+
+        let root = tempdir().unwrap();
+        let mut permissions = fs::metadata(root.path()).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(root.path(), permissions).unwrap();
+        super::store_tool_capabilities(root.path(), &cached).unwrap();
+        assert_eq!(
+            super::load_cached_tools(root.path()).as_deref(),
+            Some(cached.as_slice())
+        );
+        assert!(
+            super::store_tool_capabilities(root.path(), &["swift".into(), "git".into()]).is_err()
+        );
+        let rooted = crate::rooted_fs::RootedDir::open(root.path()).unwrap();
+        let previous = rooted
+            .read_private_regular(
+                super::TOOL_CAPABILITIES_FILE,
+                super::MAX_TOOL_CAPABILITY_BYTES,
+            )
+            .unwrap();
+        rooted
+            .replace_private_regular_exact(super::TOOL_CAPABILITIES_FILE, &previous, b"{not json")
+            .unwrap();
+        assert!(super::load_cached_tools(root.path()).is_none());
+    }
+
+    #[test]
     fn documented_macos_pressure_levels_map_to_wire_states() {
         for (level, expected) in [
             (0, MemoryPressure::Normal),
@@ -1152,6 +1317,7 @@ mod tests {
             &[],
             "macos",
             "arm64",
+            None,
         )
         .unwrap();
 
@@ -1176,6 +1342,7 @@ mod tests {
                 &[],
                 "macos",
                 "arm64",
+                None,
             )
             .expect_err("mandatory facts must not produce a partial probe");
 
@@ -1192,6 +1359,7 @@ mod tests {
             &[],
             "macos",
             "",
+            None,
         )
         .expect_err("an unknown architecture must not produce a partial probe");
 
