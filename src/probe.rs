@@ -304,7 +304,7 @@ impl ProbeCollector {
             budget,
         );
         write_cached_facts(host_state_root, &facts)?;
-        write_tool_capability_cache(host_state_root, budget, &clock)?;
+        publish_tool_capability_cache(host_state_root, budget, &clock);
         overlay?;
         Ok((facts, timing))
     }
@@ -510,6 +510,56 @@ fn cached_tools_are_ordered(tools: &[String]) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static TOOL_PROBE_FAULT: std::cell::Cell<Option<io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
+    static TOOL_CACHE_WRITE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn arm_tool_probe_fault(kind: io::ErrorKind) {
+    TOOL_PROBE_FAULT.with(|slot| slot.set(Some(kind)));
+}
+
+#[cfg(test)]
+fn take_tool_probe_fault() -> Option<io::ErrorKind> {
+    TOOL_PROBE_FAULT.with(|slot| slot.replace(None))
+}
+
+#[cfg(test)]
+fn arm_tool_cache_write_fault() {
+    TOOL_CACHE_WRITE_FAULT.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn tool_cache_write_faulted() -> bool {
+    TOOL_CACHE_WRITE_FAULT.with(|slot| {
+        let armed = slot.get();
+        if armed {
+            slot.set(false);
+        }
+        armed
+    })
+}
+
+fn publish_tool_capability_cache(host_state_root: &Path, budget: Duration, clock: &dyn FactsClock) {
+    if write_tool_capability_cache(host_state_root, budget, clock).is_err() {
+        eprintln!(
+            "warning: tool capability cache was not updated; the next host probe will detect tools directly"
+        );
+        let _ = remove_tool_capability_cache(host_state_root);
+    }
+}
+
+fn remove_tool_capability_cache(host_state_root: &Path) -> io::Result<()> {
+    let root = RootedDir::open(host_state_root)?;
+    if root.entry_exists(TOOL_CAPABILITIES_FILE)? {
+        root.remove_owned_regular(TOOL_CAPABILITIES_FILE)?;
+    }
+    Ok(())
+}
+
 fn write_tool_capability_cache(
     host_state_root: &Path,
     budget: Duration,
@@ -574,6 +624,10 @@ fn refresh_tool_capability_cache(
         if tool_probe_allowance(budget, clock.now()).is_none() {
             break;
         }
+        #[cfg(test)]
+        if let Some(kind) = take_tool_probe_fault() {
+            return Err(WorkerError::Io(io::Error::new(kind, "tool probe failed")));
+        }
         observed[index] = observe_tool(probe, search_paths, executor, budget, clock)?;
     }
     let probed_any = observed
@@ -626,6 +680,12 @@ fn merge_observed_tools(previous: &[String], observed: &[ToolObservation]) -> Ve
 }
 
 fn store_tool_capabilities(host_state_root: &Path, tools: &[String]) -> Result<(), WorkerError> {
+    #[cfg(test)]
+    if tool_cache_write_faulted() {
+        return Err(WorkerError::Io(io::Error::other(
+            "tool capability cache write failed",
+        )));
+    }
     if !cached_tools_are_ordered(tools) {
         return Err(WorkerError::Protocol(
             "tool capability cache is invalid".into(),
@@ -994,8 +1054,9 @@ fn find_executable(search_paths: &[PathBuf], executable: &str) -> Option<PathBuf
 mod tests {
     use std::{
         fs, io,
-        os::unix::fs::PermissionsExt,
+        os::unix::{fs::PermissionsExt, process::ExitStatusExt},
         path::{Path, PathBuf},
+        process::ExitStatus,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -1521,6 +1582,58 @@ mod tests {
             super::load_cached_tools(host.path()).as_deref(),
             Some(previous.as_slice())
         );
+    }
+
+    struct UnavailableRunner;
+
+    impl crate::process::ProcessRunner for UnavailableRunner {
+        fn run(
+            &self,
+            _request: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            Ok(crate::process::ProcessResult {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn facts_file(host: &Path) -> Vec<u8> {
+        let root = crate::rooted_fs::RootedDir::open(host).unwrap();
+        root.read_private_regular(super::FACTS_FILE, super::MAX_FACTS_BYTES)
+            .unwrap()
+    }
+
+    #[test]
+    fn tool_cache_failures_do_not_fail_facts_refresh_or_change_facts_json() {
+        let root = tempdir().unwrap();
+        let host = root.path().join("data/mac-worker/host");
+        crate::host_store::HostStore::open(&host).unwrap();
+        let mut permissions = fs::metadata(&host).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&host, permissions).unwrap();
+        let home = tempdir().unwrap();
+
+        super::arm_tool_probe_fault(io::ErrorKind::PermissionDenied);
+        let (facts, _) = ProbeCollector::refresh_facts_at_with_budget(
+            &host,
+            home.path(),
+            &UnavailableRunner,
+            false,
+            Duration::from_secs(5),
+        )
+        .expect("a failed tool probe must not fail facts refresh");
+        assert_eq!(facts_file(&host), facts.canonical_bytes().unwrap());
+        assert!(super::load_cached_tools(&host).is_none());
+
+        let before = facts_file(&host);
+        super::store_tool_capabilities(&host, &["git".into()]).unwrap();
+        super::arm_tool_cache_write_fault();
+        let clock = crate::agent_facts::SystemFactsClock::new();
+        super::publish_tool_capability_cache(&host, Duration::ZERO, &clock);
+        assert_eq!(facts_file(&host), before);
+        assert!(super::load_cached_tools(&host).is_none());
     }
 
     #[test]
