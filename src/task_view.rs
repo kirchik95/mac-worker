@@ -239,6 +239,8 @@ pub struct TaskTurnProjection {
     pub log_truncated: bool,
     pub started_at_millis: Option<u64>,
     pub ended_at_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_parse_reason: Option<crate::agent::ResultParseReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -645,6 +647,7 @@ fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnPro
         log_truncated: turn.log_truncated(),
         started_at_millis: turn.started_at_millis(),
         ended_at_millis: turn.ended_at_millis(),
+        result_parse_reason: turn.result_parse_reason(),
     }
 }
 
@@ -950,6 +953,62 @@ mod tests {
         assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(json["deliveries"][0]["state"], "failed");
         assert_eq!(json["deliveries"][0]["last_error"], "ORIGIN_AUTH_FAILED");
+    }
+
+    #[test]
+    fn turn_parse_reason_survives_status_result_and_detail_projection() {
+        let record = closed_record(vec![PublishMode::Fetch], None);
+        let mut wire = serde_json::to_value(record.status()).unwrap();
+        wire["last_outcome"] = serde_json::json!({"kind": "unknown"});
+        wire["turns"][0]["outcome"] = serde_json::json!({"kind": "unknown"});
+        wire["turns"][0]["result_parse_reason"] = serde_json::json!("schema_mismatch:summary");
+        let status: TaskStatus = serde_json::from_value(wire).unwrap();
+        let detail = project_task_detail(&record, &status, None, TaskFreshness::Current).unwrap();
+        assert_eq!(
+            serde_json::to_value(detail).unwrap()["turns"][0]["result_parse_reason"],
+            "schema_mismatch:summary"
+        );
+        let report = TaskReport::from_controller(ControllerTaskProjection {
+            task_id: record.meta().task_id(),
+            run_id: None,
+            status: status.clone(),
+            warnings: vec![],
+            events: vec![],
+            runner: None,
+            exit_code: None,
+            delivery: None,
+            deliveries: vec![],
+            failure_receipt: None,
+        });
+        let result = TaskResultReport::from_controller(
+            record.meta().task_id(),
+            status,
+            "task/1".into(),
+            "worker task fetch 1".into(),
+            None,
+            vec![],
+        );
+        for json in [false, true] {
+            let mut status_bytes = vec![];
+            let mut result_bytes = vec![];
+            crate::write_task_report(&report, json, &mut status_bytes).unwrap();
+            crate::write_task_result_report(&result, json, &mut result_bytes).unwrap();
+            for bytes in [status_bytes, result_bytes] {
+                if json {
+                    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        wire["status"]["turns"][0]["result_parse_reason"],
+                        "schema_mismatch:summary"
+                    );
+                } else {
+                    assert!(
+                        String::from_utf8(bytes)
+                            .unwrap()
+                            .contains("unknown (schema_mismatch:summary)")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

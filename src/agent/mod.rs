@@ -348,6 +348,37 @@ pub enum ResultStatus {
     Unknown,
 }
 
+/// Fixed public codes only: neither parser errors nor agent-controlled keys
+/// may become a diagnostic (both can contain credentials).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultParseReason {
+    #[serde(rename = "no_result_json")]
+    NoResultJson,
+    #[serde(rename = "empty_output")]
+    EmptyOutput,
+    #[serde(rename = "truncated")]
+    Truncated,
+    #[serde(rename = "schema_mismatch:status")]
+    Status,
+    #[serde(rename = "schema_mismatch:summary")]
+    Summary,
+    #[serde(rename = "schema_mismatch:questions")]
+    Questions,
+    #[serde(rename = "schema_mismatch:files_changed")]
+    FilesChanged,
+    #[serde(rename = "schema_mismatch:checks")]
+    Checks,
+    #[serde(rename = "schema_mismatch:unknown_field")]
+    UnknownField,
+}
+
+impl std::fmt::Display for ResultParseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        f.write_str(value.as_str().ok_or(std::fmt::Error)?)
+    }
+}
+
 /// One question an agent ends a turn with. `options` carries the machine
 /// readable answers the agent will accept, so an orchestrator can pick a key
 /// instead of parsing prose; an empty list means the question is open.
@@ -506,9 +537,20 @@ pub struct StructuredResult {
     questions: Vec<Question>,
     files_changed: Vec<String>,
     checks: Vec<ReportedCheck>,
+    parse_reason: Option<ResultParseReason>,
 }
 
 impl StructuredResult {
+    pub fn parse_reason(&self) -> Option<ResultParseReason> {
+        self.parse_reason
+    }
+
+    fn with_output_presence(mut self, stream: &str) -> Self {
+        if self.parse_reason == Some(ResultParseReason::EmptyOutput) && !stream.trim().is_empty() {
+            self.parse_reason = Some(ResultParseReason::NoResultJson);
+        }
+        self
+    }
     pub fn status(&self) -> ResultStatus {
         self.status
     }
@@ -529,13 +571,14 @@ impl StructuredResult {
         &self.checks
     }
 
-    fn unknown() -> Self {
+    fn unknown(reason: ResultParseReason) -> Self {
         Self {
             status: ResultStatus::Unknown,
             summary: String::new(),
             questions: Vec::new(),
             files_changed: Vec::new(),
             checks: Vec::new(),
+            parse_reason: Some(reason),
         }
     }
 }
@@ -1127,7 +1170,7 @@ fn resolve_structured_result(
             return result;
         }
     }
-    StructuredResult::unknown()
+    StructuredResult::unknown(invalid_result_reason(last_message_file, stream_candidates))
 }
 
 fn resolve_last_structured_result(
@@ -1146,7 +1189,70 @@ fn resolve_last_structured_result(
             return result;
         }
     }
-    StructuredResult::unknown()
+    StructuredResult::unknown(invalid_result_reason(last_message_file, stream_candidates))
+}
+
+fn invalid_result_reason(last: Option<&str>, candidates: &[String]) -> ResultParseReason {
+    use ResultParseReason::*;
+    let mut reason = EmptyOutput;
+    for text in last
+        .into_iter()
+        .chain(candidates.iter().map(String::as_str))
+    {
+        if text.trim().is_empty() {
+            continue;
+        }
+        reason = NoResultJson;
+        let Some(start) = text.find('{') else {
+            continue;
+        };
+        let value = match serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<Value>()
+            .next()
+        {
+            Some(Ok(value)) => value,
+            Some(Err(error)) if error.is_eof() => return Truncated,
+            _ => continue,
+        };
+        if !matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("done" | "needs_input" | "blocked")
+        ) {
+            return Status;
+        }
+        if value.get("summary").and_then(Value::as_str).is_none() {
+            return Summary;
+        }
+        if value
+            .get("questions")
+            .is_some_and(|v| serde_json::from_value::<Vec<Question>>(v.clone()).is_err())
+        {
+            return Questions;
+        }
+        if value
+            .get("files_changed")
+            .is_some_and(|v| serde_json::from_value::<Vec<String>>(v.clone()).is_err())
+        {
+            return FilesChanged;
+        }
+        if value
+            .get("checks")
+            .is_some_and(|v| serde_json::from_value::<Vec<ReportedCheck>>(v.clone()).is_err())
+        {
+            return Checks;
+        }
+        if value.as_object().is_some_and(|v| {
+            v.keys().any(|k| {
+                !matches!(
+                    k.as_str(),
+                    "status" | "summary" | "questions" | "files_changed" | "checks"
+                )
+            })
+        }) {
+            return UnknownField;
+        }
+    }
+    reason
 }
 
 fn parse_structured_result(text: &str) -> Option<StructuredResult> {
@@ -1192,6 +1298,7 @@ fn parse_structured_result_value(value: Value) -> Option<StructuredResult> {
         questions: wire.questions,
         files_changed: wire.files_changed,
         checks: wire.checks.into_iter().take(MAX_REPORTED_CHECKS).collect(),
+        parse_reason: None,
     })
 }
 

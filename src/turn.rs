@@ -47,6 +47,51 @@ pub(crate) const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_ENV_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+const PARSE_REASON_FILE: &str = "result-parse-reason.json";
+
+fn persist_parse_reason(
+    dir: &RootedDir,
+    reason: Option<crate::agent::ResultParseReason>,
+) -> Result<(), WorkerError> {
+    if let Some(reason) = reason {
+        let bytes = serde_json::to_vec(&reason)
+            .map_err(|_| turn_error("PUBLISH_FAILED", "cannot encode parse reason"))?;
+        if !dir.entry_exists(PARSE_REASON_FILE)? {
+            dir.write_private_atomic_no_replace(PARSE_REASON_FILE, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn attach_turn_diagnostics(
+    store: &HostStore,
+    project: &str,
+    task: TaskId,
+    turn: crate::task::TurnId,
+    summary: crate::task::TurnSummary,
+) -> Result<crate::task::TurnSummary, WorkerError> {
+    let meta =
+        TaskStore::new(store, &crate::process::SystemProcessRunner).load_meta(project, task)?;
+    let dir = match store.open_directory(
+        &format!("jobs/{project}/{}/{turn}", meta.worktree_id()),
+        false,
+    ) {
+        Ok(dir) => dir,
+        Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(summary);
+        }
+        Err(error) => return Err(error),
+    };
+    let reason = match dir.read_private_regular(PARSE_REASON_FILE, 256) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes)
+                .map_err(|_| turn_error("PUBLISH_FAILED", "invalid result parse reason"))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(summary.with_parse_reason(reason))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnMaterial {
@@ -1046,6 +1091,7 @@ impl<'a> TurnPublisher<'a> {
         // (stderr overflow) is recorded on the turn and must not fail a
         // complete session/result when last.md is absent.
         if (protocol_truncated || scan.truncated) && !last_parses {
+            persist_parse_reason(turn_dir, Some(crate::agent::ResultParseReason::Truncated))?;
             return Err(turn_error(
                 "PUBLISH_FAILED",
                 "truncated protocol output cannot be published as a result",
@@ -1069,6 +1115,15 @@ impl<'a> TurnPublisher<'a> {
         let structured = adapter
             .extract_result(&stream, last_message.as_deref().or(tail.as_deref()))
             .map_err(|error| turn_error("PUBLISH_FAILED", error.to_string()))?;
+        let mut parse_reason = structured.parse_reason();
+        if parse_reason == Some(crate::agent::ResultParseReason::EmptyOutput)
+            && !read_auth_scan_tail(turn_dir, "stdout.log")?
+                .trim()
+                .is_empty()
+        {
+            parse_reason = Some(crate::agent::ResultParseReason::NoResultJson);
+        }
+        persist_parse_reason(turn_dir, parse_reason)?;
 
         let (agent_committed, head_oid, diff_stat, files_changed) = if self
             .store
@@ -2455,7 +2510,7 @@ mod tests {
             1,
             "mini-1".into(),
             PROJECT_ID.into(),
-            worktree,
+            worktree.clone(),
             "c".repeat(64),
             String::new(),
             30_000,
@@ -2464,12 +2519,15 @@ mod tests {
         )
         .unwrap();
         let job_meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+        let turn_dir = store
+            .open_directory(&format!("jobs/{PROJECT_ID}/{worktree}/{job_id}"), true)
+            .unwrap();
         if let Some(stdout) = stdout {
-            task_dir
+            turn_dir
                 .write_private_atomic_no_replace("stdout.log", stdout.as_bytes())
                 .unwrap();
         }
-        task_dir
+        turn_dir
             .write_private_atomic_no_replace(
                 LAUNCHED_REDACTION_FILE,
                 br#"["purple-lantern-secret-qq"]"#,
@@ -2478,7 +2536,7 @@ mod tests {
         PublicationFixture {
             _temp: temp,
             store,
-            turn_dir: task_dir,
+            turn_dir,
             job_meta,
             section,
         }
@@ -2549,7 +2607,9 @@ mod tests {
     fn recoverable_publication_keeps_the_launched_redaction_snapshot() {
         let fixture = publication_fixture(None);
         let delivery = fixture
-            .turn_dir
+            .store
+            .open_task_directory(PROJECT_ID, fixture.section.turn().task_id(), false)
+            .unwrap()
             .open_child_directory(&RelativePath::parse(b"delivery").unwrap(), true)
             .unwrap();
         delivery
@@ -2573,6 +2633,24 @@ mod tests {
 
     fn codex_session_line() -> &'static str {
         "{\"type\":\"thread.started\",\"thread_id\":\"session-1\"}"
+    }
+
+    #[test]
+    fn unknown_turn_publishes_a_safe_parse_reason() {
+        let fixture = publication_fixture(Some(codex_session_line()));
+        invoke_publication(
+            &fixture,
+            TurnTerminal::Succeeded,
+            TerminalPath::ChildExit(0),
+            Some(0),
+        )
+        .unwrap();
+        let status = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner)
+            .load_status(PROJECT_ID, fixture.section.turn().task_id())
+            .unwrap();
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(wire["turns"][0]["outcome"]["kind"], "unknown");
+        assert_eq!(wire["turns"][0]["result_parse_reason"], "no_result_json");
     }
 
     fn codex_result_record(summary: &str) -> String {

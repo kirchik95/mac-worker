@@ -129,10 +129,10 @@ impl AgentAdapter for CodexAdapter {
         stream: &str,
         last_message_file: Option<&str>,
     ) -> Result<StructuredResult, AdapterError> {
-        Ok(resolve_structured_result(
-            last_message_file,
-            &assistant_candidates(stream),
-        ))
+        Ok(
+            resolve_structured_result(last_message_file, &assistant_candidates(stream))
+                .with_output_presence(stream),
+        )
     }
 }
 

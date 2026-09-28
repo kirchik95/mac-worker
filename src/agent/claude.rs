@@ -95,10 +95,10 @@ impl AgentAdapter for ClaudeAdapter {
         stream: &str,
         last_message_file: Option<&str>,
     ) -> Result<StructuredResult, AdapterError> {
-        Ok(resolve_structured_result(
-            last_message_file,
-            &result_candidates(stream),
-        ))
+        Ok(
+            resolve_structured_result(last_message_file, &result_candidates(stream))
+                .with_output_presence(stream),
+        )
     }
 }
 

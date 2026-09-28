@@ -1176,6 +1176,8 @@ pub struct TurnSummary {
     ended_at_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr: Option<HerdrTurnReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_parse_reason: Option<crate::agent::ResultParseReason>,
 }
 
 /// Whether, and where, a turn was shown in the worker's herdr.
@@ -1222,6 +1224,7 @@ impl TurnSummary {
             started_at_millis,
             ended_at_millis,
             herdr: None,
+            result_parse_reason: None,
         }
     }
 
@@ -1232,6 +1235,18 @@ impl TurnSummary {
 
     pub fn herdr(&self) -> Option<&HerdrTurnReport> {
         self.herdr.as_ref()
+    }
+
+    pub fn result_parse_reason(&self) -> Option<crate::agent::ResultParseReason> {
+        self.result_parse_reason
+    }
+
+    pub(crate) fn with_parse_reason(
+        mut self,
+        reason: Option<crate::agent::ResultParseReason>,
+    ) -> Self {
+        self.result_parse_reason = reason;
+        self
     }
 
     pub fn turn_number(&self) -> u32 {

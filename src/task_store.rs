@@ -1485,7 +1485,13 @@ impl<'a> TaskStore<'a> {
             Some(ended_at),
         );
         let _ = turns.pop();
-        turns.push(replacement);
+        turns.push(crate::turn::attach_turn_diagnostics(
+            self.store,
+            project_id,
+            task_id,
+            turn_id,
+            replacement,
+        )?);
         let next_state = if close {
             TaskState::Closed
         } else {

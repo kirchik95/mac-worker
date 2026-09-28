@@ -1583,6 +1583,21 @@ fn parse_task_state(value: &str) -> Result<crate::task::TaskState, WorkerError> 
     }
 }
 
+fn write_turn_diagnostics(
+    stdout: &mut dyn Write,
+    status: &crate::task::TaskStatus,
+) -> Result<(), WorkerError> {
+    if let Some(turn) = status.turns().last()
+        && let Some(outcome) = turn.outcome()
+    {
+        match turn.result_parse_reason() {
+            Some(reason) => writeln!(stdout, "outcome: {} ({reason})", outcome.kind())?,
+            None => writeln!(stdout, "outcome: {}", outcome.kind())?,
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_task_report(
     report: &task_client::TaskReport,
     json: bool,
@@ -1623,6 +1638,7 @@ pub(crate) fn write_task_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        write_turn_diagnostics(stdout, report.status())?;
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }
@@ -1772,6 +1788,7 @@ pub(crate) fn write_task_result_report(
             report.task_id(),
             task_state_name(report.status().state())
         )?;
+        write_turn_diagnostics(stdout, report.status())?;
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }

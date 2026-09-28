@@ -102,10 +102,10 @@ impl AgentAdapter for OpencodeAdapter {
         stream: &str,
         last_message_file: Option<&str>,
     ) -> Result<StructuredResult, AdapterError> {
-        Ok(resolve_last_structured_result(
-            last_message_file,
-            &result_candidates(stream),
-        ))
+        Ok(
+            resolve_last_structured_result(last_message_file, &result_candidates(stream))
+                .with_output_presence(stream),
+        )
     }
 }
 
