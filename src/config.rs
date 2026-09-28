@@ -4,13 +4,13 @@ use std::{
     path::Path,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::WorkerError;
 
 const REMOTE_BINARY: &str = "~/.local/bin/worker";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
@@ -23,7 +23,7 @@ pub struct Config {
 }
 
 /// Laptop opt-in for a remote persistent controller reached over authenticated SSH.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerConfig {
     #[serde(default)]
@@ -45,7 +45,7 @@ impl Default for ControllerConfig {
 }
 
 /// Laptop-side notifications about finished turns.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationsConfig {
     /// Tell the MacBook's herdr when a turn ends.  On by default because it
@@ -64,7 +64,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerEntry {
     pub name: String,
@@ -255,4 +255,102 @@ pub(crate) fn valid_ssh_destination(value: &str) -> bool {
         .first()
         .is_some_and(u8::is_ascii_alphanumeric)
         && valid_identifier(value)
+}
+
+/// Atomically switch only controller settings while preserving the laptop inventory.
+/// The expected text fences concurrent edits; the stable per-config lock serializes
+/// cooperating writers. Descriptor-relative operations reject symlink substitution.
+pub fn write_controller_mode(
+    path: &Path,
+    expected: &str,
+    controller: &ControllerConfig,
+) -> Result<(), WorkerError> {
+    use std::{
+        ffi::CString,
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+    let absolute = std::path::absolute(path)?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| WorkerError::Config("config parent missing".into()))?;
+    let name = absolute
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| WorkerError::Config("invalid config filename".into()))?;
+    let root = crate::rooted_fs::RootedDir::open_anchored_absolute(parent)?;
+    let _lock =
+        crate::controller::provision::exclusive_lock(&root, &format!("{name}.controller.lock"))?;
+    let current = crate::controller::provision::read_optional(&root, name)?
+        .ok_or_else(|| WorkerError::Config("config disappeared during controller setup".into()))?;
+    if current != expected.as_bytes() {
+        return Err(WorkerError::Config(
+            "config changed during controller setup; rerun the command".into(),
+        ));
+    }
+    let mut document: toml::Value =
+        toml::from_str(expected).map_err(|_| WorkerError::Config("invalid config".into()))?;
+    document
+        .as_table_mut()
+        .ok_or_else(|| WorkerError::Config("invalid config root".into()))?
+        .insert(
+            "controller".into(),
+            toml::Value::try_from(controller)
+                .map_err(|_| WorkerError::Config("invalid controller config".into()))?,
+        );
+    let text = toml::to_string_pretty(&document)
+        .map_err(|_| WorkerError::Config("invalid config".into()))?;
+    Config::parse(&text)?.validate()?;
+    if current == text.as_bytes() {
+        return Ok(());
+    }
+    let temporary = format!(".controller-config-{}", uuid::Uuid::new_v4().simple());
+    let tmp = CString::new(temporary).unwrap();
+    let target =
+        CString::new(name).map_err(|_| WorkerError::Config("invalid config filename".into()))?;
+    let fd = unsafe {
+        libc::openat(
+            root.raw_directory_fd(),
+            tmp.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let write = (|| -> Result<(), WorkerError> {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        root.verify_bound()?;
+        if root.read_private_regular(name, 1024 * 1024)? != current {
+            return Err(WorkerError::Config(
+                "config changed during controller setup".into(),
+            ));
+        }
+        if unsafe {
+            libc::renameat(
+                root.raw_directory_fd(),
+                tmp.as_ptr(),
+                root.raw_directory_fd(),
+                target.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe { libc::fsync(root.raw_directory_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        unsafe {
+            libc::unlinkat(root.raw_directory_fd(), tmp.as_ptr(), 0);
+        }
+    }
+    // Keep the retained writer descriptor alive through directory fsync.
+    let _ = file.as_raw_fd();
+    write
 }

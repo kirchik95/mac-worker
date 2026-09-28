@@ -21,6 +21,7 @@ pub mod health_read;
 pub mod leader;
 pub mod lifecycle;
 pub mod protocol;
+pub mod provision;
 pub mod read;
 pub mod registry;
 pub mod runtime;
