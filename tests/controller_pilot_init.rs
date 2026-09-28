@@ -101,6 +101,8 @@ struct Fake {
     service_actions: Mutex<Vec<String>>,
     host_alias: bool,
     jump: String,
+    /// ProxyJump reported for the `controller-route` hop itself.
+    hop_jump: String,
     controller_port: u16,
     pending_health: Mutex<usize>,
     health_config: String,
@@ -121,6 +123,7 @@ impl Fake {
             service_actions: Mutex::new(vec![]),
             host_alias: false,
             jump: "mac1".into(),
+            hop_jump: "none".into(),
             controller_port: 22,
             pending_health: Mutex::new(0),
             health_config: "/Users/controller/.config/mac-worker/config.toml".into(),
@@ -183,7 +186,7 @@ impl ProcessRunner for Fake {
                         22
                     }
                 });
-            return Ok(ProcessResult{status:ExitStatus::from_raw(0),stdout:format!("user {}\nhostname {host}\nport {port}\nproxyjump {}\nuserknownhostsfile /tmp/trusted\n{}",if alias.starts_with("bob@"){"bob"}else{"kirchik"},if alias=="mac2"{&self.jump}else{"none"},if self.host_alias && alias=="mac2"{"hostkeyalias mini2-trust\n"}else{""}).into_bytes(),stderr:vec![]});
+            return Ok(ProcessResult{status:ExitStatus::from_raw(0),stdout:format!("user {}\nhostname {host}\nport {port}\nproxyjump {}\nuserknownhostsfile /tmp/trusted\n{}",if alias.starts_with("bob@"){"bob"}else{"kirchik"},if alias=="mac2"{&self.jump}else if bare_alias=="controller-route"{&self.hop_jump}else{"none"},if self.host_alias && alias=="mac2"{"hostkeyalias mini2-trust\n"}else{""}).into_bytes(),stderr:vec![]});
         }
         let cmd = args.last().unwrap().as_str();
         if cmd == "~/.local/bin/worker host controller-configure"
@@ -509,6 +512,39 @@ fn init_keeps_a_first_jump_to_the_same_host_on_a_different_port() {
     fake.jump = "kirchik@controller-route:2223".into();
     let error = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap_err();
     assert!(error.to_string().contains("remaining ProxyJump"), "{error}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.ends_with("host controller-configure"))
+    );
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
+}
+
+#[test]
+fn init_refuses_a_first_jump_to_the_controller_address_behind_another_route() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.controller_port = 2222;
+    fake.jump = "kirchik@controller-route:2222".into();
+    // Same address and port as the controller, reached through a bastion the
+    // controller itself does not use: possibly another machine.
+    fake.hop_jump = "bastion-b".into();
+    let error = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous first ProxyJump hop for worker"),
+        "{error}"
+    );
     assert!(
         !fake
             .calls

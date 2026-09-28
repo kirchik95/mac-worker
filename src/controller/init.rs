@@ -139,10 +139,19 @@ pub fn initialize_with_wait(
     let mut planned =
         provision::plan_inventory(&config, &controller_target, &request.destination, &resolved)?;
     // Resolve first-hop aliases as well: mac1, user@mac1 and its IP must agree.
+    // The hop's account does not matter, but the same address behind a
+    // different jump chain may be another machine: refuse instead of dropping it.
     for worker in &mut planned {
         if let Some(jumps) = worker.target.proxy_jump.clone() {
             let (first, rest) = jumps.split_once(',').unwrap_or((&jumps, ""));
-            if resolve_jump(runner, first)?.same_host(&controller_target) {
+            let hop = resolve_jump(runner, first)?;
+            if hop.same_host(&controller_target) {
+                if hop.proxy_jump != controller_target.proxy_jump {
+                    return Err(invalid(&format!(
+                        "ambiguous first ProxyJump hop for worker {}; use --worker-ssh {}=<destination> with a distinct controller-reachable destination",
+                        worker.name, worker.name
+                    )));
+                }
                 worker.target.proxy_jump = (!rest.is_empty()).then(|| rest.to_owned());
             }
         }
