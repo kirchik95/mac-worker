@@ -224,7 +224,7 @@ impl ProcessRunner for SettingsTransportFixture {
         response.agent = "cursor".into();
         response.model_catalog_source = Some("live".into());
         response.model_catalog_profile = Some("agents".into());
-        let get = request.args.last().unwrap() == &HostOperation::AgentSettingsGet.command();
+        let get = request.args.last().unwrap() == HostOperation::AgentSettingsGet.command();
         let response = if get {
             serde_json::to_vec(&AgentSettingsList {
                 agents: vec![response],
