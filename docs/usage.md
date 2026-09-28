@@ -594,6 +594,9 @@ When `worker run` finishes, the process status is the remote command's own exit 
 | `AGENT_UNSUPPORTED` | 64 | choose codex, cursor, opencode, or claude |
 | `NOT_A_WORKTREE` | 64 | run the command inside a Git worktree |
 | `SSH_UNAVAILABLE` | 69 | check SSH to the worker and retry |
+| `CONTROLLER_DESTINATION_REQUIRED` | 69 | no controller destination is recorded; use `worker controller disable --ssh <destination>` |
+| `CONTROLLER_INIT_PENDING` | 69 | run `worker controller disable` to clean up the unfinished init before changing destination |
+| `CONTROLLER_FOREIGN_LEADER` | 69 | stop the foreign controller leader process reported by init, then rerun `worker controller init` |
 | `CONTROLLER_UNAVAILABLE` | 69 | check the controller host with `worker controller status` |
 | `BASE_PUSH_FAILED` | 69 | retry; the worker did not receive the base commit |
 | `RESULT_FETCH_FAILED` | 69 | retry the fetch; the result is still on the worker |

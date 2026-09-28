@@ -569,6 +569,11 @@ fn build_catalog_error(code: &'static str) -> WorkerError {
         "HOST_LAYOUT_OUTDATED" => {
             WorkerError::Unavailable(format!("{code}: worker layout is outdated"))
         }
+        "CONTROLLER_DESTINATION_REQUIRED"
+        | "CONTROLLER_INIT_PENDING"
+        | "CONTROLLER_FOREIGN_LEADER" => {
+            WorkerError::Unavailable(format!("{code}: controller lifecycle error"))
+        }
         "IO" => WorkerError::Io(std::io::Error::other("I/O error")),
         "CAPACITY_BUSY" => WorkerError::capacity(
             code,
