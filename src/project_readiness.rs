@@ -62,7 +62,7 @@ impl FrozenSetup {
     ) -> Result<Option<Self>, WorkerError> {
         let read = |path: &str| -> Result<Option<Vec<u8>>, WorkerError> {
             let result = runner.run(&crate::process::ProcessRequest {
-                program: "git".into(),
+                program: "/usr/bin/git".into(),
                 args: vec![
                     "-C".into(),
                     repository.into(),
@@ -100,7 +100,7 @@ impl FrozenSetup {
                 ));
             }
             let result = runner.run(&crate::process::ProcessRequest {
-                program: "git".into(),
+                program: "/usr/bin/git".into(),
                 args: vec![
                     "-C".into(),
                     repository.into(),
