@@ -46,6 +46,16 @@ use crate::{
 const LOG_CHUNK_LIMIT: u32 = 64 * 1024;
 const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
 const WAIT_POLL: Duration = Duration::from_millis(100);
+/// Idle follow starts here and doubles until [`FOLLOW_POLL_MAX`].
+const FOLLOW_POLL_MIN: Duration = Duration::from_millis(100);
+/// Longest wait after an observation before the next follow poll.
+/// Cancellation and a terminal job are noticed on the next observation, so
+/// that wait is at most this long after the previous SSH call returns, plus
+/// the deadline of an SSH call already in flight.
+const FOLLOW_POLL_MAX: Duration = Duration::from_secs(2);
+/// `task_status` while a non-terminal job is idle. Terminal jobs poll every
+/// observation; this only covers a turn that stays quiet.
+const FOLLOW_TASK_STATUS_PERIOD: Duration = Duration::from_secs(10);
 const MAX_CAPACITY_BACKOFF_SECS: u64 = 30;
 const RUNNER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a runner waits for a waiting row held by another identity to be
@@ -53,6 +63,21 @@ const RUNNER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 /// or abandons the handoff; a runner started by hand for a row that belongs
 /// to someone else would otherwise wait forever.
 const ADOPTION_WAIT: Duration = Duration::from_secs(10);
+
+/// Idle wait used only by [`TurnRunner::follow_remote`].
+pub(crate) trait FollowClock: Send + Sync {
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemFollowClock;
+
+impl FollowClock for SystemFollowClock {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+static SYSTEM_FOLLOW_CLOCK: SystemFollowClock = SystemFollowClock;
 
 /// Starts the durable process responsible for one queued task turn.
 pub trait RunnerExecutor: Send + Sync {
@@ -356,6 +381,7 @@ pub struct TurnRunner<'a> {
     pub(crate) notifier: Option<crate::herdr::HerdrSocket>,
     adoption_wait: Duration,
     slot_token: Option<Uuid>,
+    follow_clock: &'a dyn FollowClock,
 }
 
 impl<'a> TurnRunner<'a> {
@@ -384,7 +410,16 @@ impl<'a> TurnRunner<'a> {
             notifier: None,
             adoption_wait: ADOPTION_WAIT,
             slot_token: None,
+            follow_clock: &SYSTEM_FOLLOW_CLOCK,
         }
+    }
+
+    /// Clock for [`Self::follow_remote`] idle waits. Production sleeps.
+    /// Tests record the durations and do not wait.
+    #[cfg(test)]
+    pub(crate) fn with_follow_clock(mut self, clock: &'a dyn FollowClock) -> Self {
+        self.follow_clock = clock;
+        self
     }
 
     /// Hidden detached children refuse claim/adopt unless the row still holds
@@ -1609,6 +1644,9 @@ impl<'a> TurnRunner<'a> {
             LogCursor::new(LogStream::Stdout, offsets[0], LOG_CHUNK_LIMIT)?,
             LogCursor::new(LogStream::Stderr, offsets[1], LOG_CHUNK_LIMIT)?,
         )?;
+        let mut poll_delay = FOLLOW_POLL_MIN;
+        let mut idle_for = Duration::ZERO;
+        let mut seen_job_state = None;
         loop {
             if self.queue_cancel_requested(turn_id)? && status.state() == TaskState::Active {
                 status = remote
@@ -1629,13 +1667,14 @@ impl<'a> TurnRunner<'a> {
                 LOG_CHUNK_LIMIT,
             )?;
             let mut progressed = false;
-            if let Some((job, stdout_chunk, stderr_chunk)) = combined {
+            let job = if let Some((job, stdout_chunk, stderr_chunk)) = combined {
                 self.validate_follow_job(&record, worker, turn_id, &job)?;
                 if job.status().state().is_terminal() {
                     drain.set_terminal_status(&job)?;
                 }
                 progressed |= Self::apply_log_chunk(&mut drain, log, follow, stdout_chunk)?;
                 progressed |= Self::apply_log_chunk(&mut drain, log, follow, stderr_chunk)?;
+                job
             } else {
                 let job = remote.status(worker, turn_id)?;
                 self.validate_follow_job(&record, worker, turn_id, &job)?;
@@ -1652,35 +1691,58 @@ impl<'a> TurnRunner<'a> {
                     )?;
                     progressed |= Self::apply_log_chunk(&mut drain, log, follow, chunk)?;
                 }
+                job
+            };
+            let observed = job.status().state();
+            let state_changed = seen_job_state.is_some_and(|previous| previous != observed);
+            seen_job_state = Some(observed);
+            if progressed || state_changed {
+                poll_delay = FOLLOW_POLL_MIN;
+                idle_for = Duration::ZERO;
             }
+            let mut polled_task_status = false;
             if drain.cursor(LogStream::Stdout).is_drained()
                 && drain.cursor(LogStream::Stderr).is_drained()
             {
                 drain.revalidate_terminal_status(&remote.status(worker, turn_id)?)?;
-                status = remote
-                    .task_status(
-                        worker,
-                        &TaskStatusRequest::new(record.meta().project_id(), task_id),
-                    )?
-                    .status()
-                    .clone();
-                self.persist_status(task_id, status.clone())?;
+                status = self.poll_follow_task_status(&remote, worker, &record, task_id)?;
+                polled_task_status = true;
                 if follow_is_complete(&status) {
                     return Ok(status);
                 }
             }
-            if !progressed {
-                std::thread::sleep(WAIT_POLL);
+            if !polled_task_status
+                && (observed.is_terminal() || idle_for >= FOLLOW_TASK_STATUS_PERIOD)
+            {
+                status = self.poll_follow_task_status(&remote, worker, &record, task_id)?;
+                if !observed.is_terminal() {
+                    idle_for = Duration::ZERO;
+                }
             }
-            status = remote
-                .task_status(
-                    worker,
-                    &TaskStatusRequest::new(record.meta().project_id(), task_id),
-                )?
-                .status()
-                .clone();
-            self.persist_status(task_id, status.clone())?;
+            if !progressed && !state_changed {
+                self.follow_clock.sleep(poll_delay);
+                idle_for = idle_for.saturating_add(poll_delay);
+                poll_delay = poll_delay.saturating_mul(2).min(FOLLOW_POLL_MAX);
+            }
         }
+    }
+
+    fn poll_follow_task_status(
+        &self,
+        remote: &RemoteJobClient<'_>,
+        worker: &WorkerEntry,
+        record: &LocalTaskRecord,
+        task_id: TaskId,
+    ) -> Result<TaskStatus, WorkerError> {
+        let status = remote
+            .task_status(
+                worker,
+                &TaskStatusRequest::new(record.meta().project_id(), task_id),
+            )?
+            .status()
+            .clone();
+        self.persist_status(task_id, status.clone())?;
+        Ok(status)
     }
 
     fn validate_follow_job(
@@ -3508,5 +3570,326 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
                 "bound reservation must remain after post-bind TASK_BUSY"
             );
         });
+    }
+
+    use super::{
+        FollowClock, ProcessRunner, TaskState, TaskStatus, TurnId, TurnRunner, TurnSummary,
+    };
+    use crate::error::WorkerError;
+    use crate::process::ProcessResult;
+    use std::time::Duration;
+
+    struct FollowStep {
+        status: crate::job::JobStatus,
+        stdout: Vec<u8>,
+    }
+
+    struct FollowScript {
+        meta: crate::job::JobMeta,
+        steps: std::sync::Mutex<std::collections::VecDeque<FollowStep>>,
+        terminal: std::sync::Mutex<Option<crate::job::StatusResponse>>,
+        status_logs: std::sync::atomic::AtomicUsize,
+        statuses: std::sync::atomic::AtomicUsize,
+        task_statuses: std::sync::atomic::AtomicUsize,
+        active: TaskStatus,
+        open: TaskStatus,
+    }
+
+    struct RecordingClock {
+        sleeps: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl FollowClock for RecordingClock {
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+        }
+    }
+
+    impl ProcessRunner for FollowScript {
+        fn run(
+            &self,
+            request: &crate::process::ProcessRequest,
+        ) -> Result<ProcessResult, WorkerError> {
+            use crate::job::{LogChunk, LogStream, StatusLogsRequest, StatusResponse};
+            use crate::task_store::TaskStatusResponse;
+            use crate::transfer::HostOperation;
+            use std::os::unix::process::ExitStatusExt;
+            use std::sync::atomic::Ordering;
+
+            let operation = request.args.last().and_then(|arg| arg.to_str());
+            fn ok(value: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
+                Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: serde_json::to_vec(value).unwrap(),
+                    stderr: Vec::new(),
+                })
+            }
+            if operation == Some(HostOperation::StatusLogs.command()) {
+                let query: StatusLogsRequest =
+                    serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+                let step = self
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("follow script ended before the turn finished");
+                self.status_logs.fetch_add(1, Ordering::Relaxed);
+                let response = StatusResponse::new(self.meta.clone(), step.status.clone()).unwrap();
+                if step.status.state().is_terminal() {
+                    *self.terminal.lock().unwrap() = Some(response.clone());
+                }
+                let stdout = LogChunk::new(LogStream::Stdout, query.stdout_offset(), step.stdout)?;
+                let stderr = LogChunk::new(LogStream::Stderr, query.stderr_offset(), Vec::new())?;
+                return ok(&crate::job::StatusLogsResponse::new(
+                    response, stdout, stderr,
+                )?);
+            }
+            if operation == Some(HostOperation::Status.command()) {
+                self.statuses.fetch_add(1, Ordering::Relaxed);
+                let response = self
+                    .terminal
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("status before a terminal job");
+                return ok(&response);
+            }
+            if operation == Some(HostOperation::TaskStatus.command()) {
+                self.task_statuses.fetch_add(1, Ordering::Relaxed);
+                let status = if self.terminal.lock().unwrap().is_some() {
+                    self.open.clone()
+                } else {
+                    self.active.clone()
+                };
+                return ok(&TaskStatusResponse::new(status));
+            }
+            panic!("unexpected follow command: {operation:?}");
+        }
+    }
+
+    struct FollowPace {
+        sleeps: Vec<Duration>,
+        status_logs: usize,
+        statuses: usize,
+        task_statuses: usize,
+    }
+
+    fn follow_task_status(state: TaskState, turn_id: TurnId) -> TaskStatus {
+        TaskStatus::new(
+            state,
+            None,
+            Some("mini-1".into()),
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn_id,
+                None,
+                None,
+                None,
+                false,
+                Some(10),
+                None,
+            )],
+            20,
+        )
+        .unwrap()
+    }
+
+    fn run_follow_script(steps: Vec<FollowStep>) -> FollowPace {
+        use super::{ClientStateStore, Config, InlineRunnerExecutor, LocalTaskRecord, LogWriter};
+        use crate::job::{CommandSpec, JobMeta, LeaseToken, RequestFingerprintMaterial};
+        use crate::task::{
+            ClosePolicy, GitIdentity, PublishMode, TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+        };
+        use std::sync::atomic::Ordering;
+
+        let (_root, paths) = isolated_handoff_paths();
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let task_id = crate::task::TaskId::generate();
+        let turn_id = TurnId::generate();
+        let active = follow_task_status(TaskState::Active, turn_id);
+        let open = follow_task_status(TaskState::Open, turn_id);
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: crate::agent::AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: crate::agent::PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: "a".repeat(40).parse().unwrap(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Fixture", "fixture@example.test").unwrap(),
+            title: None,
+            prompt: "work".into(),
+            created_at_millis: 10,
+        })
+        .unwrap();
+        store
+            .create_task(
+                LocalTaskRecord::new(
+                    meta,
+                    active.clone(),
+                    None,
+                    None,
+                    None,
+                    "c".repeat(64),
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let material = RequestFingerprintMaterial::new(
+            turn_id,
+            store.client_id(),
+            LeaseToken::new(turn_id.as_uuid()),
+            10,
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "d".repeat(64),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::argv(vec!["true".into()]).unwrap(),
+        )
+        .unwrap();
+        let script = FollowScript {
+            meta: JobMeta::new(&material, material.fingerprint()).unwrap(),
+            steps: std::sync::Mutex::new(steps.into()),
+            terminal: std::sync::Mutex::new(None),
+            status_logs: std::sync::atomic::AtomicUsize::new(0),
+            statuses: std::sync::atomic::AtomicUsize::new(0),
+            task_statuses: std::sync::atomic::AtomicUsize::new(0),
+            active,
+            open,
+        };
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let worker = config.worker("mini-1").unwrap().clone();
+        let clock = RecordingClock {
+            sleeps: std::sync::Mutex::new(Vec::new()),
+        };
+        let runner = TurnRunner::new(&script, &config, &paths, &store, &InlineRunnerExecutor)
+            .with_follow_clock(&clock);
+        let mut log = LogWriter::open(&paths.state, task_id, turn_id).unwrap();
+        let mut follow = None;
+        let status = runner
+            .follow_remote(
+                &worker,
+                task_id,
+                turn_id,
+                follow_task_status(TaskState::Active, turn_id),
+                &mut log,
+                &mut follow,
+            )
+            .unwrap();
+        assert_eq!(status.state(), TaskState::Open);
+        FollowPace {
+            sleeps: clock.sleeps.lock().unwrap().clone(),
+            status_logs: script.status_logs.load(Ordering::Relaxed),
+            statuses: script.statuses.load(Ordering::Relaxed),
+            task_statuses: script.task_statuses.load(Ordering::Relaxed),
+        }
+    }
+
+    #[test]
+    fn follow_backs_off_while_idle_and_resets_on_bytes_or_state_change() {
+        use crate::job::JobStatus;
+        let pace = run_follow_script(vec![
+            FollowStep {
+                status: JobStatus::accepted(11).unwrap(),
+                stdout: Vec::new(),
+            },
+            FollowStep {
+                status: JobStatus::accepted(12).unwrap(),
+                stdout: Vec::new(),
+            },
+            FollowStep {
+                status: JobStatus::accepted(12).unwrap(),
+                stdout: vec![b'x'],
+            },
+            FollowStep {
+                status: JobStatus::accepted(12).unwrap(),
+                stdout: Vec::new(),
+            },
+            FollowStep {
+                status: JobStatus::running(13, 1, 1, 2, 2).unwrap(),
+                stdout: Vec::new(),
+            },
+            FollowStep {
+                status: JobStatus::succeeded(14, 1, 0).unwrap(),
+                stdout: Vec::new(),
+            },
+        ]);
+        assert_eq!(
+            pace.sleeps,
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(100),
+            ]
+        );
+        assert_eq!(pace.status_logs, 6);
+        assert_eq!(pace.statuses, 1);
+        assert_eq!(pace.task_statuses, 1);
+    }
+
+    #[test]
+    fn follow_caps_idle_waits_and_polls_task_status_on_a_ten_second_idle_period() {
+        use crate::job::JobStatus;
+        let mut steps = Vec::new();
+        for _ in 0..10 {
+            steps.push(FollowStep {
+                status: JobStatus::accepted(11).unwrap(),
+                stdout: Vec::new(),
+            });
+        }
+        steps.push(FollowStep {
+            status: JobStatus::succeeded(12, 0, 0).unwrap(),
+            stdout: Vec::new(),
+        });
+        let pace = run_follow_script(steps);
+        assert_eq!(
+            pace.sleeps,
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+                Duration::from_millis(1_600),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            ]
+        );
+        assert!(
+            pace.sleeps
+                .iter()
+                .all(|delay| *delay <= Duration::from_secs(2))
+        );
+        assert_eq!(pace.status_logs, 11);
+        assert_eq!(pace.statuses, 1);
+        assert_eq!(pace.task_statuses, 2);
     }
 }
