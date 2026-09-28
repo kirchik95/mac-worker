@@ -224,6 +224,7 @@ fn origin_config() -> Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: vec![origin_worker()],
     }
 }

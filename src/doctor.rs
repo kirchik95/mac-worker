@@ -618,6 +618,7 @@ mod tests {
             version: 1,
             notifications: crate::config::NotificationsConfig::default(),
             controller: crate::config::ControllerConfig::default(),
+            ssh: Default::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: "mac1".into(),

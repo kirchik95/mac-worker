@@ -514,6 +514,7 @@ fn production_run_config_with_slots(slots: u8) -> Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: vec![WorkerEntry {
             name: "mini-a".into(),
             ssh: "mini-a".into(),

@@ -1,7 +1,11 @@
 use std::{
+    cell::RefCell,
     collections::HashSet,
     ffi::{OsStr, OsString},
+    fs, io,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -11,7 +15,7 @@ use std::{
 };
 
 #[cfg(debug_assertions)]
-use std::path::{Component, Path};
+use std::path::Component;
 
 use crate::{
     config::{Config, WorkerEntry, valid_ssh_destination},
@@ -775,29 +779,258 @@ fn stable_required_capabilities(worker: &WorkerEntry, requirements: &[String]) -
         .collect()
 }
 
+/// Runtime SSH client plan. `control_dir` overrides `~/.cache/mac-worker/ssh`
+/// in tests. Production leaves it empty and uses the account cache.
+#[derive(Clone, Debug)]
+struct SshSettings {
+    multiplex: bool,
+    control_dir: Option<PathBuf>,
+}
+
+impl SshSettings {
+    #[cfg(test)]
+    fn direct() -> Self {
+        Self {
+            multiplex: false,
+            control_dir: None,
+        }
+    }
+
+    fn from_installed() -> Self {
+        Self {
+            multiplex: crate::config::installed_ssh().multiplex,
+            control_dir: None,
+        }
+    }
+}
+
+enum SshRoute {
+    Direct,
+    Multiplexed { control_path: String },
+}
+
+thread_local! {
+    static SSH_OVERRIDE: RefCell<Option<SshSettings>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct RestoreSshOverride(Option<SshSettings>);
+
+#[cfg(test)]
+impl Drop for RestoreSshOverride {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SSH_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+#[cfg(test)]
+fn with_ssh_settings<T>(settings: SshSettings, body: impl FnOnce() -> T) -> T {
+    let previous = SSH_OVERRIDE.with(|slot| slot.replace(Some(settings)));
+    let _restore = RestoreSshOverride(previous);
+    body()
+}
+
+fn current_ssh_settings() -> SshSettings {
+    SSH_OVERRIDE.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(SshSettings::from_installed)
+    })
+}
+
+fn ssh_exec_args(destination: &str, remote_command: &str) -> Result<Vec<OsString>, WorkerError> {
+    let mut args = ssh_option_args(true);
+    args.push("--".into());
+    args.push(destination.into());
+    args.push(remote_command.into());
+    Ok(args)
+}
+
+fn ssh_option_args(clear_forwardings: bool) -> Vec<OsString> {
+    option_values(clear_forwardings)
+        .into_iter()
+        .flat_map(|value| [OsString::from("-o"), OsString::from(value)])
+        .collect()
+}
+
+fn ssh_shell_options(clear_forwardings: bool) -> Result<String, WorkerError> {
+    let mut parts = Vec::new();
+    for value in option_values(clear_forwardings) {
+        parts.push(format!("-o {}", shell_option_value(&value)?));
+    }
+    Ok(parts.join(" "))
+}
+
+fn option_values(clear_forwardings: bool) -> Vec<String> {
+    let mut values = vec![
+        "BatchMode=yes".to_owned(),
+        "ConnectTimeout=5".to_owned(),
+        "ForwardAgent=no".to_owned(),
+    ];
+    if clear_forwardings {
+        values.push("ClearAllForwardings=yes".to_owned());
+    } else {
+        values.push("ExitOnForwardFailure=yes".to_owned());
+    }
+    if let SshRoute::Multiplexed { control_path } = resolve_ssh_route(&current_ssh_settings()) {
+        values.push("ControlMaster=auto".to_owned());
+        values.push(format!("ControlPath={control_path}"));
+        values.push("ControlPersist=60".to_owned());
+        values.push("ServerAliveInterval=10".to_owned());
+        values.push("ServerAliveCountMax=3".to_owned());
+    }
+    values
+}
+
+fn shell_option_value(value: &str) -> Result<String, WorkerError> {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'=' | b'%')
+    }) {
+        return Ok(value.to_owned());
+    }
+    posix_shell_quote(OsStr::new(value))
+}
+
+/// Direct when multiplexing is off, or when the private control directory or
+/// an existing control socket cannot be used. A socket that does not accept
+/// immediately is removed so the next command can open a new master instead
+/// of waiting on the stuck one.
+fn resolve_ssh_route(settings: &SshSettings) -> SshRoute {
+    if !settings.multiplex {
+        return SshRoute::Direct;
+    }
+    let Some(directory) = control_directory(settings) else {
+        return SshRoute::Direct;
+    };
+    if prepare_control_directory(&directory).is_err() {
+        return SshRoute::Direct;
+    }
+    if control_directory_unusable(&directory) {
+        return SshRoute::Direct;
+    }
+    let control_path = directory.join("%C");
+    let Some(control_path) = control_path.to_str() else {
+        return SshRoute::Direct;
+    };
+    SshRoute::Multiplexed {
+        control_path: control_path.to_owned(),
+    }
+}
+
+fn control_directory(settings: &SshSettings) -> Option<PathBuf> {
+    if let Some(directory) = &settings.control_dir {
+        return Some(directory.clone());
+    }
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join("mac-worker")
+            .join("ssh"),
+    )
+}
+
+fn prepare_control_directory(directory: &Path) -> io::Result<()> {
+    if directory.exists() {
+        if !directory.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "ssh control path is not a directory",
+            ));
+        }
+    } else {
+        fs::create_dir_all(directory)?;
+    }
+    let mut permissions = fs::metadata(directory)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(directory, permissions)?;
+    let mode = fs::metadata(directory)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::other("ssh control directory is not private"));
+    }
+    Ok(())
+}
+
+fn control_directory_unusable(directory: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return true;
+    };
+    let mut unusable = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_socket() {
+            continue;
+        }
+        if unix_socket_unusable(&path) {
+            let _ = fs::remove_file(&path);
+            unusable = true;
+        }
+    }
+    unusable
+}
+
+fn unix_socket_unusable(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return true;
+    };
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() >= 104 {
+        return true;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return true;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (index, byte) in bytes.iter().enumerate() {
+        address.sun_path[index] = *byte as libc::c_char;
+    }
+    let path_len = bytes.len();
+    let addr_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_len + 1;
+    address.sun_len = u8::try_from(addr_len).unwrap_or(u8::MAX);
+    let length = libc::socklen_t::try_from(addr_len).unwrap_or(0);
+    let connected =
+        unsafe { libc::connect(fd, (&raw const address).cast::<libc::sockaddr>(), length) };
+    unsafe {
+        libc::close(fd);
+    }
+    connected != 0
+}
+
 pub(crate) fn ssh_request(
     worker: &WorkerEntry,
     remote_command: String,
     policy: ProcessPolicy,
 ) -> Result<ProcessRequest, WorkerError> {
+    ssh_exec_request(&worker.ssh, &remote_command, policy, None)
+}
+
+pub(crate) fn ssh_exec_request(
+    destination: &str,
+    remote_command: &str,
+    policy: ProcessPolicy,
+    stdin: Option<Vec<u8>>,
+) -> Result<ProcessRequest, WorkerError> {
     Ok(ProcessRequest {
         program: ssh_program()?,
-        args: vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            "-o".into(),
-            "ForwardAgent=no".into(),
-            "-o".into(),
-            "ClearAllForwardings=yes".into(),
-            "--".into(),
-            worker.ssh.clone().into(),
-            remote_command.into(),
-        ],
+        args: ssh_exec_args(destination, remote_command)?,
         environment: Vec::new(),
         environment_remove: Vec::new(),
-        stdin: None,
+        stdin,
         policy,
         isolate_parent_environment: false,
     })
@@ -813,23 +1046,15 @@ pub(crate) fn ssh_local_forward_request(
     policy: ProcessPolicy,
 ) -> Result<ProcessRequest, WorkerError> {
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{port}");
+    let mut args = ssh_option_args(false);
+    args.push("-L".into());
+    args.push(forward.into());
+    args.push("--".into());
+    args.push(destination.into());
+    args.push(remote_command.into());
     Ok(ProcessRequest {
         program: ssh_program()?,
-        args: vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=5".into(),
-            "-o".into(),
-            "ForwardAgent=no".into(),
-            "-o".into(),
-            "ExitOnForwardFailure=yes".into(),
-            "-L".into(),
-            forward.into(),
-            "--".into(),
-            destination.into(),
-            remote_command.into(),
-        ],
+        args,
         environment: Vec::new(),
         environment_remove: Vec::new(),
         stdin: None,
@@ -953,15 +1178,27 @@ pub(crate) fn posix_shell_quote(value: &OsStr) -> Result<String, WorkerError> {
 
 pub(crate) fn git_ssh_command_line(program: &OsStr) -> Result<String, WorkerError> {
     Ok(format!(
-        "{} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes",
-        posix_shell_quote(program)?
+        "{} {}",
+        posix_shell_quote(program)?,
+        ssh_shell_options(true)?
     ))
+}
+
+pub(crate) fn rsync_ssh_shell() -> Result<OsString, WorkerError> {
+    let program = ssh_program()?;
+    Ok(format!(
+        "{} {} --",
+        posix_shell_quote(&program)?,
+        ssh_shell_options(true)?
+    )
+    .into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::os::unix::io::IntoRawFd;
 
     #[test]
     fn test_ssh_override_accepts_only_absolute_paths() {
@@ -1079,5 +1316,179 @@ mod tests {
             cleared.contains("host refresh-facts --clear-auth-incidents"),
             "{cleared}"
         );
+    }
+
+    fn tiny_policy() -> ProcessPolicy {
+        ProcessPolicy {
+            stdout_limit: 64,
+            stderr_limit: 64,
+            deadline: Duration::from_secs(1),
+        }
+    }
+
+    fn arg_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn direct_ssh_argv_matches_the_historical_option_list() {
+        with_ssh_settings(SshSettings::direct(), || {
+            let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+            assert_eq!(exec.program, OsString::from("/usr/bin/ssh"));
+            assert_eq!(
+                arg_strings(&exec.args),
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "ForwardAgent=no",
+                    "-o",
+                    "ClearAllForwardings=yes",
+                    "--",
+                    "mac1",
+                    "true",
+                ]
+            );
+            let forward =
+                ssh_local_forward_request("mac1", 9, "true".into(), tiny_policy()).unwrap();
+            assert_eq!(
+                arg_strings(&forward.args),
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "ForwardAgent=no",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-L",
+                    "127.0.0.1:9:127.0.0.1:9",
+                    "--",
+                    "mac1",
+                    "true",
+                ]
+            );
+            assert_eq!(
+                git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap(),
+                "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+            );
+            assert_eq!(
+                rsync_ssh_shell().unwrap(),
+                OsString::from(
+                    "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn multiplex_ssh_argv_uses_a_private_control_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        with_ssh_settings(
+            SshSettings {
+                multiplex: true,
+                control_dir: Some(dir.path().to_path_buf()),
+            },
+            || {
+                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let args = arg_strings(&exec.args);
+                assert!(args.iter().any(|arg| arg == "ControlMaster=auto"));
+                assert!(args.iter().any(|arg| arg == "ControlPersist=60"));
+                assert!(args.iter().any(|arg| arg == "ServerAliveInterval=10"));
+                assert!(args.iter().any(|arg| arg == "ServerAliveCountMax=3"));
+                let control = args
+                    .iter()
+                    .find(|arg| arg.starts_with("ControlPath="))
+                    .expect("control path");
+                assert!(control.ends_with("/%C"), "{control}");
+                assert!(control.contains(dir.path().to_str().unwrap()));
+                let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+                let shell = git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap();
+                assert!(shell.contains("ControlMaster=auto"), "{shell}");
+                assert!(shell.contains("/%C"), "{shell}");
+            },
+        );
+    }
+
+    #[test]
+    fn unusable_control_socket_falls_back_to_a_direct_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stale.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let raw = listener.into_raw_fd();
+        unsafe { libc::close(raw) };
+        assert!(socket.exists());
+        with_ssh_settings(
+            SshSettings {
+                multiplex: true,
+                control_dir: Some(dir.path().to_path_buf()),
+            },
+            || {
+                let first = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                assert!(
+                    !arg_strings(&first.args)
+                        .iter()
+                        .any(|arg| arg == "ControlMaster=auto")
+                );
+                assert!(!socket.exists(), "stale control socket must be removed");
+                let second = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                assert!(
+                    arg_strings(&second.args)
+                        .iter()
+                        .any(|arg| arg == "ControlMaster=auto")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn control_path_that_is_not_a_directory_stays_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, b"blocked").unwrap();
+        with_ssh_settings(
+            SshSettings {
+                multiplex: true,
+                control_dir: Some(file.clone()),
+            },
+            || {
+                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                assert!(
+                    !arg_strings(&exec.args)
+                        .iter()
+                        .any(|arg| arg == "ControlMaster=auto")
+                );
+            },
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"blocked");
+    }
+
+    #[test]
+    fn listening_control_socket_stays_in_place_and_multiplexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        with_ssh_settings(
+            SshSettings {
+                multiplex: true,
+                control_dir: Some(dir.path().to_path_buf()),
+            },
+            || {
+                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                assert!(
+                    arg_strings(&exec.args)
+                        .iter()
+                        .any(|arg| arg == "ControlMaster=auto")
+                );
+            },
+        );
+        assert!(socket.exists());
+        drop(listener);
     }
 }

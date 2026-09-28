@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs,
     path::Path,
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,45 @@ pub struct Config {
     pub workers: Vec<WorkerEntry>,
     #[serde(default)]
     pub controller: ControllerConfig,
+    /// SSH client options for every mac-worker connection. Absent tables keep
+    /// direct connections, so existing files stay valid.
+    #[serde(default)]
+    pub ssh: SshConfig,
+}
+
+/// Laptop and controller SSH client behavior.
+///
+/// `multiplex` is off unless the file sets it. A ControlMaster changes how
+/// connection failures show up, and a stuck master must not become the only
+/// path to the workers, so the default stays a direct `ssh` for each call.
+/// Turn it on for a host that opens many short sessions, especially the
+/// controller. See the SSH section of `docs/usage.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshConfig {
+    #[serde(default)]
+    pub multiplex: bool,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self { multiplex: false }
+    }
+}
+
+static INSTALLED_SSH: Mutex<SshConfig> = Mutex::new(SshConfig { multiplex: false });
+
+pub(crate) fn installed_ssh() -> SshConfig {
+    INSTALLED_SSH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn install_ssh(ssh: &SshConfig) {
+    *INSTALLED_SSH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ssh.clone();
 }
 
 /// Laptop opt-in for a remote persistent controller reached over authenticated SSH.
@@ -97,6 +137,7 @@ impl Config {
         })?;
         let config = Self::parse(&contents)?;
         config.validate()?;
+        install_ssh(&config.ssh);
         Ok(config)
     }
 
@@ -200,6 +241,7 @@ impl Config {
             notifications: self.notifications.clone(),
             workers,
             controller: self.controller.clone(),
+            ssh: self.ssh.clone(),
         }
     }
 
@@ -353,4 +395,24 @@ pub fn write_controller_mode(
     // Keep the retained writer descriptor alive through directory fsync.
     let _ = file.as_raw_fd();
     write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    fn controller_only(extra: &str) -> String {
+        format!("version = 1\n[controller]\nenabled = true\nssh = \"mac1\"\n{extra}")
+    }
+
+    #[test]
+    fn ssh_section_defaults_off_and_parses_multiplex() {
+        let absent = Config::parse(&controller_only("")).unwrap();
+        assert!(!absent.ssh.multiplex);
+        let enabled = Config::parse(&controller_only("[ssh]\nmultiplex = true\n")).unwrap();
+        assert!(enabled.ssh.multiplex);
+        let disabled = Config::parse(&controller_only("[ssh]\nmultiplex = false\n")).unwrap();
+        assert!(!disabled.ssh.multiplex);
+        assert!(Config::parse(&controller_only("[ssh]\nunknown = true\n")).is_err());
+    }
 }

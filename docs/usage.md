@@ -402,6 +402,17 @@ enabled = false
 # remote_binary = "~/.local/bin/worker"   # only this path is accepted
 ```
 
+## SSH
+
+mac-worker opens a fresh SSH connection for each remote call unless multiplexing is enabled.
+
+```toml
+[ssh]
+multiplex = false
+```
+
+Set `multiplex = true` on a machine that makes many SSH calls, especially the controller host. mac-worker then passes `ControlMaster=auto`, a `ControlPath` under `~/.cache/mac-worker/ssh/` (mode `0700`, `%C`), `ControlPersist=60`, `ServerAliveInterval=10`, and `ServerAliveCountMax=3`. If that directory or a control socket cannot be used, the command connects directly instead, so one stuck master does not block later commands. The default is off so existing SSH behavior stays the same until you opt in.
+
 ## Remote controller
 
 Opt-in. Default remains the laptop-owned queue: omit `[controller]`, or keep `enabled = false`. Confirm flags with `worker controller --help` and `worker dashboard --help`. Do not treat a missing table as a second store.

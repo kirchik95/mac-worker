@@ -495,6 +495,7 @@ impl Fixture {
             version: 1,
             notifications: mac_worker::config::NotificationsConfig::default(),
             controller: Default::default(),
+            ssh: Default::default(),
             workers: vec![WorkerEntry {
                 name: "mini-1".into(),
                 ssh: REMOTE_SSH.into(),

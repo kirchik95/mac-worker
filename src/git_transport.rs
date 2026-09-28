@@ -36,7 +36,12 @@ pub(crate) const GIT_FSYNC_METHOD: &str = "fsync";
 pub const OBJECT_STORE_SYNC_RECEIPT: &str = "mw-object-sync.json";
 const OBJECT_STORE_SYNC_LOCK: &str = "mw-object-sync.lock";
 const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
+#[cfg(test)]
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
+
+fn origin_git_ssh_command() -> Result<String, WorkerError> {
+    crate::transport::git_ssh_command_line(&crate::transport::ssh_program()?)
+}
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
 const ORIGIN_CONFIG_DEADLINE: Duration = Duration::from_secs(5);
@@ -119,7 +124,7 @@ impl<'a> GitTransport<'a> {
             .map_err(|_| git_error("BASE_NOT_ON_ORIGIN", "origin URL is invalid"))?;
         let result = self
             .runner
-            .run(&origin_request(normalized))
+            .run(&origin_request(normalized)?)
             .map_err(|_| git_error("BASE_NOT_ON_ORIGIN", "origin did not advertise the base"))?;
         if !result.status.success() {
             return Err(git_error(
@@ -158,7 +163,7 @@ impl<'a> GitTransport<'a> {
             .runner
             .run(&git_request(
                 mirror.path(),
-                Some(ORIGIN_GIT_SSH_COMMAND.to_owned()),
+                Some(origin_git_ssh_command()?),
                 vec![
                     OsString::from("fetch"),
                     OsString::from("--no-write-fetch-head"),
@@ -196,7 +201,7 @@ impl<'a> GitTransport<'a> {
             .runner
             .run(&git_request_with_config(
                 mirror.path(),
-                Some(ORIGIN_GIT_SSH_COMMAND.to_owned()),
+                Some(origin_git_ssh_command()?),
                 &extra_config,
                 vec![
                     OsString::from("push"),
@@ -251,7 +256,7 @@ impl<'a> GitTransport<'a> {
         let wanted = format!("refs/heads/{branch}");
         let result = self
             .runner
-            .run(&origin_ref_request(normalized, &wanted))
+            .run(&origin_ref_request(normalized, &wanted)?)
             .map_err(|_| git_error("PUBLISH_FAILED", "origin advertisement failed"))?;
         if !result.status.success() {
             return Err(git_error("PUBLISH_FAILED", "origin advertisement failed"));
@@ -926,12 +931,12 @@ fn origin_auth_failed(stderr: &[u8]) -> bool {
         || stderr.contains("Permission denied (publickey)")
 }
 
-fn origin_request(origin: String) -> ProcessRequest {
-    ProcessRequest {
+fn origin_request(origin: String) -> Result<ProcessRequest, WorkerError> {
+    Ok(ProcessRequest {
         program: GIT_PROGRAM.into(),
         args: vec![OsString::from("ls-remote"), origin.into()],
         environment: vec![
-            ("GIT_SSH_COMMAND".into(), ORIGIN_GIT_SSH_COMMAND.into()),
+            ("GIT_SSH_COMMAND".into(), origin_git_ssh_command()?.into()),
             (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
             (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
             (GIT_TERMINAL_PROMPT.into(), "0".into()),
@@ -947,13 +952,13 @@ fn origin_request(origin: String) -> ProcessRequest {
             deadline: ORIGIN_PREFLIGHT_DEADLINE,
         },
         isolate_parent_environment: false,
-    }
+    })
 }
 
-fn origin_ref_request(origin: String, reference: &str) -> ProcessRequest {
-    let mut request = origin_request(origin);
+fn origin_ref_request(origin: String, reference: &str) -> Result<ProcessRequest, WorkerError> {
+    let mut request = origin_request(origin)?;
     request.args.push(OsString::from(reference));
-    request
+    Ok(request)
 }
 
 fn delivery_origin(origin: &str) -> Result<String, WorkerError> {

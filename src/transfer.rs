@@ -567,12 +567,7 @@ impl<'a> HostTransferService<'a> {
 }
 
 fn rsync_remote_shell() -> Result<OsString, WorkerError> {
-    let program = crate::transport::ssh_program()?;
-    Ok(format!(
-        "{} -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --",
-        crate::transport::posix_shell_quote(&program)?
-    )
-    .into())
+    crate::transport::rsync_ssh_shell()
 }
 
 impl<'a> RsyncTransport<'a> {
@@ -723,27 +718,12 @@ impl<'a> SshJsonTransport<'a> {
         validate_control_policy(policy)?;
         let stdin = serde_json::to_vec(request)
             .map_err(|_| transport_error("INVALID_REQUEST", "control request is invalid"))?;
-        let request = ProcessRequest {
-            program: crate::transport::ssh_program()?,
-            args: vec![
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "-o".into(),
-                "ForwardAgent=no".into(),
-                "-o".into(),
-                "ClearAllForwardings=yes".into(),
-                "--".into(),
-                worker.ssh.clone().into(),
-                operation.command().into(),
-            ],
-            environment: Vec::new(),
-            environment_remove: Vec::new(),
-            stdin: Some(stdin),
+        let request = crate::transport::ssh_exec_request(
+            &worker.ssh,
+            operation.command(),
             policy,
-            isolate_parent_environment: false,
-        };
+            Some(stdin),
+        )?;
         self.runner.run(&request).map_err(map_control_failure)
     }
 
@@ -756,27 +736,8 @@ impl<'a> SshJsonTransport<'a> {
     ) -> Result<crate::process::ProcessResult, WorkerError> {
         validate_worker(worker)?;
         validate_control_policy(policy)?;
-        let request = ProcessRequest {
-            program: crate::transport::ssh_program()?,
-            args: vec![
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=5".into(),
-                "-o".into(),
-                "ForwardAgent=no".into(),
-                "-o".into(),
-                "ClearAllForwardings=yes".into(),
-                "--".into(),
-                worker.ssh.clone().into(),
-                command.into(),
-            ],
-            environment: Vec::new(),
-            environment_remove: Vec::new(),
-            stdin: Some(stdin),
-            policy,
-            isolate_parent_environment: false,
-        };
+        let request =
+            crate::transport::ssh_exec_request(&worker.ssh, &command, policy, Some(stdin))?;
         self.runner.run(&request).map_err(map_control_failure)
     }
 

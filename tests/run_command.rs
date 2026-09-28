@@ -276,6 +276,7 @@ fn config() -> Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: vec![WorkerEntry {
             name: "mini-1".into(),
             ssh: "mac1".into(),
@@ -3694,6 +3695,7 @@ fn run_config() -> Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: vec![
             WorkerEntry {
                 name: "mini-1".into(),
@@ -3952,6 +3954,7 @@ fn no_wait_busy_pin_never_reconciles_a_recoverable_existing_job() {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: vec![
             run_config().workers[0].clone(),
             WorkerEntry {
@@ -8878,6 +8881,7 @@ fn logs_requires_the_exact_local_job_and_never_falls_back() {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: Vec::new(),
     };
     let error = logs_service(&empty_config, &store, &remote, &runtime)

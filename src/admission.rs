@@ -1062,6 +1062,7 @@ mod tests {
             version: 1,
             notifications: crate::config::NotificationsConfig::default(),
             controller: crate::config::ControllerConfig::default(),
+            ssh: Default::default(),
             workers,
         }
     }

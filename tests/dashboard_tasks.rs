@@ -1209,6 +1209,7 @@ fn config_with_workers(names: &[&str]) -> Config {
         version: 1,
         notifications: mac_worker::config::NotificationsConfig::default(),
         controller: Default::default(),
+        ssh: Default::default(),
         workers: names
             .iter()
             .map(|name| WorkerEntry {
