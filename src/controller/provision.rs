@@ -482,7 +482,7 @@ pub fn write_ssh_settings(
         trusted_host_keys(&matches, &expected, 22)?;
         generated.push_str(&format!("Host {}\n  HostName {}\n  User {}\n  Port {}\n  ProxyJump {}\n  IdentityFile ~/.ssh/mac-worker-controller_ed25519\n  IdentitiesOnly yes\n  IdentityAgent none\n  BatchMode yes\n  StrictHostKeyChecking yes\n  NoHostAuthenticationForLocalhost no\n  HostKeyAlias {}\n  UserKnownHostsFile ~/.ssh/{}.known_hosts\n  GlobalKnownHostsFile /dev/null\n\n",worker.alias,t.hostname,t.user,t.port,t.proxy_jump.as_deref().unwrap_or("none"),expected,worker.alias));
     }
-    generated.push_str("Host *\n");
+    generated.push_str("Host *\n  ControlMaster no\n  ControlPath none\n");
     let dir = directory(&home.join(".ssh"))?;
     let _lock = exclusive_lock(&dir, "mac-worker-controller-ssh.lock")?;
     for (name, content) in [
@@ -515,14 +515,6 @@ pub fn write_ssh_settings(
         let content = trusted_host_keys(&matching, identity, 22)?;
         let old = read_optional(&dir, &name)?;
         replace(&dir, &name, old.as_deref(), content.as_bytes())?;
-    }
-    let old = read_optional(&dir, "config")?;
-    let include = "Include ~/.ssh/mac-worker-controller.conf\n";
-    let bytes = old.as_deref().unwrap_or_default();
-    if !bytes.starts_with(include.as_bytes()) {
-        let mut new = include.as_bytes().to_vec();
-        new.extend(bytes);
-        replace(&dir, "config", old.as_deref(), &new)?;
     }
     Ok(())
 }

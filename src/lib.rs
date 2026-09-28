@@ -6416,10 +6416,18 @@ fn run_host_controller_provision(
         }
         let encoded = match command {
             HostCommand::ControllerConfigure => {
+                let mut request = parse::<crate::protocol::ControllerConfigureRequest>(body)?;
+                let mut config = Config::parse(&request.config_toml)?;
+                config.ssh.config_file =
+                    Some(runtime.home().join(".ssh/mac-worker-controller.conf"));
+                config.validate()?;
+                request.config_toml = toml::to_string_pretty(&config).map_err(|_| {
+                    crate::controller::provision::invalid("cannot encode controller inventory")
+                })?;
                 serde_json::to_vec(&crate::controller::init::configure_host(
                     runtime.home(),
                     &paths.config,
-                    &parse::<crate::protocol::ControllerConfigureRequest>(body)?,
+                    &request,
                 )?)
             }
             HostCommand::ControllerKey => {

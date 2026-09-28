@@ -122,8 +122,9 @@ fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
     let temp = tempfile::tempdir().unwrap();
     let ssh = temp.path().join(".ssh");
     fs::create_dir(&ssh).unwrap();
-    let original = "Host origin\n  IdentityFile ~/.ssh/id_ed25519\n";
+    let original = "Host *\n  IdentityFile ~/.ssh/id_ed25519\n  ControlMaster auto\n  ControlPath ~/.ssh/cm-%r@%h:%p\n";
     fs::write(ssh.join("config"), original).unwrap();
+    fs::set_permissions(ssh.join("config"), fs::Permissions::from_mode(0o644)).unwrap();
     let cfg = inventory();
     let controller = resolved("192.168.1.11", 22, None);
     let targets = BTreeMap::from([
@@ -134,7 +135,15 @@ fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
     let trust = format!("192.168.1.11 {}\n10.0.0.2 {}\n", key(), key());
     write_ssh_settings(temp.path(), &plan, &trust).unwrap();
     let once = fs::read(ssh.join("config")).unwrap();
-    assert!(String::from_utf8_lossy(&once).ends_with(original));
+    assert_eq!(once, original.as_bytes());
+    assert_eq!(
+        fs::metadata(ssh.join("config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
     write_ssh_settings(temp.path(), &plan, &trust).unwrap();
     assert_eq!(fs::read(ssh.join("config")).unwrap(), once);
     let generated = fs::read_to_string(ssh.join("mac-worker-controller.conf")).unwrap();
@@ -143,9 +152,70 @@ fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
     assert!(generated.contains("  IdentityFile ~/.ssh/mac-worker-controller_ed25519\n"));
     assert!(generated.contains("  StrictHostKeyChecking yes\n"));
     assert!(generated.contains("  NoHostAuthenticationForLocalhost no\n"));
+    assert!(generated.contains("Host *\n  ControlMaster no\n  ControlPath none\n"));
     assert!(generated.contains("  HostKeyAlias 192.168.1.11\n"));
     assert!(!generated.contains("accept-new"));
     assert!(!generated.contains("ProxyJump mac1"));
+}
+
+#[test]
+fn generated_ssh_settings_effective_config_is_isolated_offline() {
+    use mac_worker::controller::provision::write_ssh_settings;
+    if !std::path::Path::new("/usr/bin/ssh").exists() {
+        eprintln!("skipping effective SSH config: /usr/bin/ssh is missing");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let ssh = temp.path().join(".ssh");
+    fs::create_dir(&ssh).unwrap();
+    fs::write(ssh.join("config"), "Host *\n  IdentityFile ~/.ssh/id_ed25519\n  ControlMaster auto\n  ControlPath ~/.ssh/cm-%r@%h:%p\n").unwrap();
+    let controller = resolved("192.168.1.11", 22, None);
+    let targets = BTreeMap::from([
+        ("mini-1".into(), controller.clone()),
+        ("mini-2".into(), resolved("10.0.0.2", 2222, None)),
+    ]);
+    let plan = plan_inventory(&inventory(), &controller, "mac1", &targets).unwrap();
+    let trust = format!("192.168.1.11 {}\n10.0.0.2 {}\n", key(), key());
+    write_ssh_settings(temp.path(), &plan, &trust).unwrap();
+    for worker in &plan {
+        let output = std::process::Command::new("/usr/bin/ssh")
+            .arg("-G")
+            .arg("-F")
+            .arg(ssh.join("mac-worker-controller.conf"))
+            .arg(&worker.alias)
+            .env("HOME", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let values: BTreeMap<_, _> = stdout
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .collect();
+        let identities: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("identityfile "))
+            .collect();
+        assert_eq!(identities.len(), 1, "{stdout}");
+        assert!(identities[0].ends_with("/.ssh/mac-worker-controller_ed25519"));
+        assert_eq!(values["identitiesonly"], "yes");
+        assert_eq!(values["identityagent"], "none");
+        // Some OpenSSH versions omit disabled optional paths from `ssh -G`.
+        assert_eq!(values.get("controlpath").copied().unwrap_or("none"), "none");
+        assert_eq!(values["controlmaster"], "false");
+        assert_eq!(values["stricthostkeychecking"], "true");
+        assert_eq!(
+            values["hostkeyalias"],
+            worker.target.host_key_alias.as_deref().unwrap()
+        );
+        assert!(
+            values["userknownhostsfile"].ends_with(&format!("/.ssh/{}.known_hosts", worker.alias))
+        );
+    }
 }
 
 #[test]

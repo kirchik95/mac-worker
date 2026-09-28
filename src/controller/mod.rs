@@ -160,6 +160,7 @@ pub fn controller_dashboard_ssh_request(
         format!("~/.local/bin/worker dashboard --port {port} --no-open --controller-viewer")
     };
     ssh_local_forward_request(
+        crate::transport::SshTarget::Worker,
         &controller.ssh,
         port,
         remote_command,

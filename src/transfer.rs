@@ -567,7 +567,7 @@ impl<'a> HostTransferService<'a> {
 }
 
 fn rsync_remote_shell() -> Result<OsString, WorkerError> {
-    crate::transport::rsync_ssh_shell()
+    crate::transport::rsync_ssh_shell(crate::transport::SshTarget::Worker)
 }
 
 impl<'a> RsyncTransport<'a> {
@@ -719,6 +719,7 @@ impl<'a> SshJsonTransport<'a> {
         let stdin = serde_json::to_vec(request)
             .map_err(|_| transport_error("INVALID_REQUEST", "control request is invalid"))?;
         let request = crate::transport::ssh_exec_request(
+            crate::transport::SshTarget::Worker,
             &worker.ssh,
             operation.command(),
             policy,
@@ -736,8 +737,13 @@ impl<'a> SshJsonTransport<'a> {
     ) -> Result<crate::process::ProcessResult, WorkerError> {
         validate_worker(worker)?;
         validate_control_policy(policy)?;
-        let request =
-            crate::transport::ssh_exec_request(&worker.ssh, &command, policy, Some(stdin))?;
+        let request = crate::transport::ssh_exec_request(
+            crate::transport::SshTarget::Worker,
+            &worker.ssh,
+            &command,
+            policy,
+            Some(stdin),
+        )?;
         self.runner.run(&request).map_err(map_control_failure)
     }
 

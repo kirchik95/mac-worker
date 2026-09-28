@@ -40,7 +40,10 @@ const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 
 fn origin_git_ssh_command() -> Result<String, WorkerError> {
-    crate::transport::git_ssh_command_line(&crate::transport::ssh_program()?)
+    crate::transport::git_ssh_command_line(
+        crate::transport::SshTarget::Origin,
+        &crate::transport::ssh_program()?,
+    )
 }
 const ORIGIN_PREFLIGHT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const ORIGIN_PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);

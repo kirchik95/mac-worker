@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -39,9 +39,15 @@ pub struct Config {
 pub struct SshConfig {
     #[serde(default)]
     pub multiplex: bool,
+    /// Exclusive SSH configuration for worker connections on the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<PathBuf>,
 }
 
-static INSTALLED_SSH: Mutex<SshConfig> = Mutex::new(SshConfig { multiplex: false });
+static INSTALLED_SSH: Mutex<SshConfig> = Mutex::new(SshConfig {
+    multiplex: false,
+    config_file: None,
+});
 
 pub(crate) fn installed_ssh() -> SshConfig {
     INSTALLED_SSH
@@ -149,6 +155,16 @@ impl Config {
         }
 
         self.controller.validate()?;
+        if self
+            .ssh
+            .config_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(WorkerError::Config(
+                "ssh.config_file must be an absolute path".into(),
+            ));
+        }
         if self.workers.is_empty() {
             if self.controller.enabled {
                 return Ok(());
@@ -408,5 +424,28 @@ mod tests {
         let disabled = Config::parse(&controller_only("[ssh]\nmultiplex = false\n")).unwrap();
         assert!(!disabled.ssh.multiplex);
         assert!(Config::parse(&controller_only("[ssh]\nunknown = true\n")).is_err());
+    }
+
+    #[test]
+    fn ssh_config_file_is_optional_and_must_be_absolute() {
+        let absent = Config::parse(&controller_only("")).unwrap();
+        assert!(!toml::to_string(&absent).unwrap().contains("config_file"));
+        for path in [
+            "/tmp/controller home/.ssh/mac-worker-controller.conf",
+            "",
+            "relative.conf",
+            "~/.ssh/controller.conf",
+        ] {
+            let config = Config::parse(&controller_only(&format!(
+                "[ssh]\nconfig_file = '{path}'\n"
+            )))
+            .unwrap();
+            let result = config.validate();
+            if path.starts_with('/') {
+                result.unwrap();
+            } else {
+                assert!(result.is_err(), "relative SSH config accepted: {path:?}");
+            }
+        }
     }
 }

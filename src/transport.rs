@@ -245,7 +245,7 @@ impl<R: ProcessRunner> SshTransport<R> {
                 message: "worker transport configuration is invalid".into(),
             });
         }
-        git_ssh_command_line(&ssh_program()?)
+        git_ssh_command_line(SshTarget::Worker, &ssh_program()?)
     }
 
     pub fn refresh_facts(&self, worker: &WorkerEntry) -> Result<(), WorkerError> {
@@ -784,6 +784,7 @@ fn stable_required_capabilities(worker: &WorkerEntry, requirements: &[String]) -
 #[derive(Clone, Debug)]
 struct SshSettings {
     multiplex: bool,
+    config_file: Option<PathBuf>,
     control_dir: Option<PathBuf>,
 }
 
@@ -792,16 +793,27 @@ impl SshSettings {
     fn direct() -> Self {
         Self {
             multiplex: false,
+            config_file: None,
             control_dir: None,
         }
     }
 
     fn from_installed() -> Self {
+        let ssh = crate::config::installed_ssh();
         Self {
-            multiplex: crate::config::installed_ssh().multiplex,
+            multiplex: ssh.multiplex,
+            config_file: ssh.config_file,
             control_dir: None,
         }
     }
+}
+
+/// Worker traffic uses the controller's managed identity/trust. Origin traffic
+/// always uses the account's own SSH configuration (including git-shell keys).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshTarget {
+    Worker,
+    Origin,
 }
 
 enum SshRoute {
@@ -839,30 +851,50 @@ fn current_ssh_settings() -> SshSettings {
     })
 }
 
-fn ssh_exec_args(destination: &str, remote_command: &str) -> Result<Vec<OsString>, WorkerError> {
-    let mut args = ssh_option_args(true);
+fn ssh_exec_args(
+    target: SshTarget,
+    destination: &str,
+    remote_command: &str,
+) -> Result<Vec<OsString>, WorkerError> {
+    let mut args = ssh_option_args(target, true);
     args.push("--".into());
     args.push(destination.into());
     args.push(remote_command.into());
     Ok(args)
 }
 
-fn ssh_option_args(clear_forwardings: bool) -> Vec<OsString> {
-    option_values(clear_forwardings)
-        .into_iter()
-        .flat_map(|value| [OsString::from("-o"), OsString::from(value)])
-        .collect()
-}
-
-fn ssh_shell_options(clear_forwardings: bool) -> Result<String, WorkerError> {
-    let mut parts = Vec::new();
-    for value in option_values(clear_forwardings) {
-        parts.push(format!("-o {}", shell_option_value(&value)?));
+fn ssh_option_args(target: SshTarget, clear_forwardings: bool) -> Vec<OsString> {
+    let settings = current_ssh_settings();
+    let mut args = Vec::new();
+    if target == SshTarget::Worker
+        && let Some(path) = &settings.config_file
+    {
+        args.extend([OsString::from("-F"), path.as_os_str().to_owned()]);
     }
-    Ok(parts.join(" "))
+    args.extend(
+        option_values(&settings, target, clear_forwardings)
+            .into_iter()
+            .flat_map(|value| [OsString::from("-o"), OsString::from(value)]),
+    );
+    args
 }
 
-fn option_values(clear_forwardings: bool) -> Vec<String> {
+fn ssh_shell_options(target: SshTarget, clear_forwardings: bool) -> Result<String, WorkerError> {
+    ssh_option_args(target, clear_forwardings)
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map_or_else(|| Err(invalid_test_ssh()), shell_option_value)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|parts| parts.join(" "))
+}
+
+fn option_values(
+    settings: &SshSettings,
+    target: SshTarget,
+    clear_forwardings: bool,
+) -> Vec<String> {
     let mut values = vec![
         "BatchMode=yes".to_owned(),
         "ConnectTimeout=5".to_owned(),
@@ -873,7 +905,7 @@ fn option_values(clear_forwardings: bool) -> Vec<String> {
     } else {
         values.push("ExitOnForwardFailure=yes".to_owned());
     }
-    if let SshRoute::Multiplexed { control_path } = resolve_ssh_route(&current_ssh_settings()) {
+    if let SshRoute::Multiplexed { control_path } = resolve_ssh_route(settings, target) {
         values.push("ControlMaster=auto".to_owned());
         values.push(format!("ControlPath={control_path}"));
         values.push("ControlPersist=60".to_owned());
@@ -896,11 +928,11 @@ fn shell_option_value(value: &str) -> Result<String, WorkerError> {
 /// an existing control socket cannot be used. A socket that does not accept
 /// immediately is removed so the next command can open a new master instead
 /// of waiting on the stuck one.
-fn resolve_ssh_route(settings: &SshSettings) -> SshRoute {
+fn resolve_ssh_route(settings: &SshSettings, target: SshTarget) -> SshRoute {
     if !settings.multiplex {
         return SshRoute::Direct;
     }
-    let Some(directory) = control_directory(settings) else {
+    let Some(directory) = control_directory(settings, target) else {
         return SshRoute::Direct;
     };
     if prepare_control_directory(&directory).is_err() {
@@ -918,20 +950,27 @@ fn resolve_ssh_route(settings: &SshSettings) -> SshRoute {
     }
 }
 
-fn control_directory(settings: &SshSettings) -> Option<PathBuf> {
-    if let Some(directory) = &settings.control_dir {
-        return Some(directory.clone());
-    }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
-        return None;
-    }
-    Some(
+fn control_directory(settings: &SshSettings, target: SshTarget) -> Option<PathBuf> {
+    let directory = if let Some(directory) = &settings.control_dir {
+        directory.clone()
+    } else {
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
         PathBuf::from(home)
             .join(".cache")
             .join("mac-worker")
-            .join("ssh"),
-    )
+            .join("ssh")
+    };
+    if target == SshTarget::Worker
+        && let Some(path) = &settings.config_file
+    {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
+        return Some(directory.with_file_name(format!("ssh-{}", &digest[..16])));
+    }
+    Some(directory)
 }
 
 fn prepare_control_directory(directory: &Path) -> io::Result<()> {
@@ -1016,10 +1055,17 @@ pub(crate) fn ssh_request(
     remote_command: String,
     policy: ProcessPolicy,
 ) -> Result<ProcessRequest, WorkerError> {
-    ssh_exec_request(&worker.ssh, &remote_command, policy, None)
+    ssh_exec_request(
+        SshTarget::Worker,
+        &worker.ssh,
+        &remote_command,
+        policy,
+        None,
+    )
 }
 
 pub(crate) fn ssh_exec_request(
+    target: SshTarget,
     destination: &str,
     remote_command: &str,
     policy: ProcessPolicy,
@@ -1027,7 +1073,7 @@ pub(crate) fn ssh_exec_request(
 ) -> Result<ProcessRequest, WorkerError> {
     Ok(ProcessRequest {
         program: ssh_program()?,
-        args: ssh_exec_args(destination, remote_command)?,
+        args: ssh_exec_args(target, destination, remote_command)?,
         environment: Vec::new(),
         environment_remove: Vec::new(),
         stdin,
@@ -1040,13 +1086,14 @@ pub(crate) fn ssh_exec_request(
 /// local forwards (`ExitOnForwardFailure=yes`, no `ClearAllForwardings`) so the
 /// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`.
 pub(crate) fn ssh_local_forward_request(
+    target: SshTarget,
     destination: &str,
     port: u16,
     remote_command: String,
     policy: ProcessPolicy,
 ) -> Result<ProcessRequest, WorkerError> {
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{port}");
-    let mut args = ssh_option_args(false);
+    let mut args = ssh_option_args(target, false);
     args.push("-L".into());
     args.push(forward.into());
     args.push("--".into());
@@ -1176,22 +1223,27 @@ pub(crate) fn posix_shell_quote(value: &OsStr) -> Result<String, WorkerError> {
     Ok(quoted)
 }
 
-pub(crate) fn git_ssh_command_line(program: &OsStr) -> Result<String, WorkerError> {
+pub(crate) fn git_ssh_command_line(
+    target: SshTarget,
+    program: &OsStr,
+) -> Result<String, WorkerError> {
     Ok(format!(
         "{} {}",
         posix_shell_quote(program)?,
-        ssh_shell_options(true)?
+        ssh_shell_options(target, true)?
     ))
 }
 
-pub(crate) fn rsync_ssh_shell() -> Result<OsString, WorkerError> {
+pub(crate) fn rsync_ssh_shell(target: SshTarget) -> Result<OsString, WorkerError> {
     let program = ssh_program()?;
-    Ok(format!(
+    let shell = format!(
         "{} {} --",
         posix_shell_quote(&program)?,
-        ssh_shell_options(true)?
-    )
-    .into())
+        ssh_shell_options(target, true)?
+    );
+    // rsync's -e parser understands quote alternation but not backslash
+    // escapes. Keep Git's POSIX encoding and use literal apostrophes here.
+    Ok(shell.replace("'\\''", "'\"'\"'").into())
 }
 
 #[cfg(test)]
@@ -1247,15 +1299,16 @@ mod tests {
     #[test]
     fn git_ssh_command_quotes_paths_that_need_a_shell() {
         assert_eq!(
-            git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap(),
+            git_ssh_command_line(SshTarget::Worker, OsStr::new("/usr/bin/ssh")).unwrap(),
             "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
         );
         assert_eq!(
-            git_ssh_command_line(OsStr::new("/tmp/mac-worker fake-ssh")).unwrap(),
+            git_ssh_command_line(SshTarget::Worker, OsStr::new("/tmp/mac-worker fake-ssh"))
+                .unwrap(),
             "'/tmp/mac-worker fake-ssh' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
         );
         assert_eq!(
-            git_ssh_command_line(OsStr::new("/tmp/mac-worker's-ssh")).unwrap(),
+            git_ssh_command_line(SshTarget::Worker, OsStr::new("/tmp/mac-worker's-ssh")).unwrap(),
             "'/tmp/mac-worker'\\''s-ssh' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
         );
     }
@@ -1335,7 +1388,8 @@ mod tests {
     #[test]
     fn direct_ssh_argv_matches_the_historical_option_list() {
         with_ssh_settings(SshSettings::direct(), || {
-            let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+            let exec =
+                ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None).unwrap();
             assert_eq!(exec.program, OsString::from("/usr/bin/ssh"));
             assert_eq!(
                 arg_strings(&exec.args),
@@ -1353,8 +1407,14 @@ mod tests {
                     "true",
                 ]
             );
-            let forward =
-                ssh_local_forward_request("mac1", 9, "true".into(), tiny_policy()).unwrap();
+            let forward = ssh_local_forward_request(
+                SshTarget::Worker,
+                "mac1",
+                9,
+                "true".into(),
+                tiny_policy(),
+            )
+            .unwrap();
             assert_eq!(
                 arg_strings(&forward.args),
                 [
@@ -1374,15 +1434,194 @@ mod tests {
                 ]
             );
             assert_eq!(
-                git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap(),
+                git_ssh_command_line(SshTarget::Worker, OsStr::new("/usr/bin/ssh")).unwrap(),
                 "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
             );
             assert_eq!(
-                rsync_ssh_shell().unwrap(),
+                rsync_ssh_shell(SshTarget::Worker).unwrap(),
                 OsString::from(
                     "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
                 )
             );
+        });
+    }
+
+    #[test]
+    fn managed_config_is_used_by_every_worker_builder_and_never_by_origin() {
+        let path = "/tmp/controller owner's/.ssh/mac-worker-controller.conf";
+        with_ssh_settings(
+            SshSettings {
+                config_file: Some(path.into()),
+                ..SshSettings::direct()
+            },
+            || {
+                let worker = WorkerEntry {
+                    name: "mini-1".into(),
+                    ssh: "managed-mini-1".into(),
+                    slots: 1,
+                    capabilities: vec![],
+                    remote_binary: "~/.local/bin/worker".into(),
+                    herdr: false,
+                };
+                for request in [
+                    ssh_request(&worker, "true".into(), tiny_policy()).unwrap(),
+                    ssh_exec_request(SshTarget::Worker, &worker.ssh, "true", tiny_policy(), None)
+                        .unwrap(),
+                    ssh_local_forward_request(
+                        SshTarget::Worker,
+                        &worker.ssh,
+                        9,
+                        "true".into(),
+                        tiny_policy(),
+                    )
+                    .unwrap(),
+                ] {
+                    assert_eq!(&arg_strings(&request.args)[..2], &["-F", path]);
+                    assert_eq!(request.args[request.args.len() - 2], worker.ssh.as_str());
+                }
+                let prefix = "/usr/bin/ssh -F '/tmp/controller owner'\\''s/.ssh/mac-worker-controller.conf' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
+                let git = SshTransport::new(crate::process::SystemProcessRunner)
+                    .git_ssh_command(&worker)
+                    .unwrap();
+                assert_eq!(git, prefix);
+                assert_eq!(
+                    rsync_ssh_shell(SshTarget::Worker).unwrap(),
+                    OsString::from(
+                        "/usr/bin/ssh -F '/tmp/controller owner'\"'\"'s/.ssh/mac-worker-controller.conf' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
+                    )
+                );
+                assert_eq!(
+                    git_ssh_command_line(SshTarget::Origin, OsStr::new("/usr/bin/ssh")).unwrap(),
+                    "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
+                );
+                let origin = ssh_exec_request(
+                    SshTarget::Origin,
+                    "git@example.test",
+                    "true",
+                    tiny_policy(),
+                    None,
+                )
+                .unwrap();
+                assert!(!origin.args.iter().any(|arg| arg == "-F"));
+            },
+        );
+    }
+
+    #[test]
+    fn managed_rsync_config_path_reaches_the_child_as_one_literal_argument() {
+        if !Path::new("/usr/bin/rsync").is_file() {
+            eprintln!("skipping rsync argv capture: /usr/bin/rsync is missing");
+            return;
+        }
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let fake = temp.path().join("fake-transport");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"offline fixture\n").unwrap();
+        let config_file = "/tmp/controller owner's/\"managed config\".conf";
+        with_ssh_settings(
+            SshSettings {
+                config_file: Some(config_file.into()),
+                ..SshSettings::direct()
+            },
+            || {
+                // Replace only the executable, so even a parser failure can never
+                // fall through to a real SSH invocation or host connection.
+                let shell = rsync_ssh_shell(SshTarget::Worker)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replacen("/usr/bin/ssh", fake.to_str().unwrap(), 1);
+                let output = std::process::Command::new("/usr/bin/rsync")
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .arg("-e")
+                    .arg(shell)
+                    .arg(&source)
+                    .arg("offline-worker:incoming")
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                let captured = fs::read_to_string(fake.with_extension("args")).unwrap_or_default();
+                let args: Vec<_> = captured.lines().collect();
+                assert!(
+                    args.windows(2).any(|pair| pair == ["-F", config_file]),
+                    "rsync child argv: {args:?}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn managed_multiplex_connections_cannot_reuse_shared_or_other_config_masters() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let shared = temp.path().join("ssh");
+        let settings = SshSettings {
+            multiplex: true,
+            config_file: Some("/tmp/controller-a.conf".into()),
+            control_dir: Some(shared.clone()),
+        };
+        let control = |target| {
+            let request = ssh_exec_request(target, "mac1", "true", tiny_policy(), None).unwrap();
+            arg_strings(&request.args)
+                .into_iter()
+                .find_map(|arg| arg.strip_prefix("ControlPath=").map(str::to_owned))
+                .unwrap()
+        };
+        let managed = with_ssh_settings(settings.clone(), || {
+            let managed = control(SshTarget::Worker);
+            assert_ne!(managed, shared.join("%C").to_str().unwrap());
+            assert_eq!(
+                control(SshTarget::Origin),
+                shared.join("%C").to_str().unwrap()
+            );
+            assert_eq!(control(SshTarget::Worker), managed);
+            managed
+        });
+        let directory = Path::new(&managed).parent().unwrap();
+        assert_eq!(directory.parent(), shared.parent());
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let other = SshSettings {
+            config_file: Some("/tmp/controller-b.conf".into()),
+            ..settings.clone()
+        };
+        assert_ne!(
+            with_ssh_settings(other, || control(SshTarget::Worker)),
+            managed
+        );
+        let direct = SshSettings {
+            config_file: None,
+            ..settings.clone()
+        };
+        assert_eq!(
+            with_ssh_settings(direct, || control(SshTarget::Worker)),
+            shared.join("%C").to_str().unwrap()
+        );
+
+        let socket = directory.join("stale.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let fd = listener.into_raw_fd();
+        unsafe { libc::close(fd) };
+        with_ssh_settings(settings, || {
+            let request =
+                ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None).unwrap();
+            assert_eq!(request.args[0], "-F");
+            assert!(
+                !arg_strings(&request.args)
+                    .iter()
+                    .any(|arg| arg == "ControlMaster=auto")
+            );
+            assert!(!socket.exists());
+            assert_eq!(control(SshTarget::Worker), managed);
         });
     }
 
@@ -1392,10 +1631,12 @@ mod tests {
         with_ssh_settings(
             SshSettings {
                 multiplex: true,
+                config_file: None,
                 control_dir: Some(dir.path().to_path_buf()),
             },
             || {
-                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let exec = ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None)
+                    .unwrap();
                 let args = arg_strings(&exec.args);
                 assert!(args.iter().any(|arg| arg == "ControlMaster=auto"));
                 assert!(args.iter().any(|arg| arg == "ControlPersist=60"));
@@ -1409,7 +1650,8 @@ mod tests {
                 assert!(control.contains(dir.path().to_str().unwrap()));
                 let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o700);
-                let shell = git_ssh_command_line(OsStr::new("/usr/bin/ssh")).unwrap();
+                let shell =
+                    git_ssh_command_line(SshTarget::Worker, OsStr::new("/usr/bin/ssh")).unwrap();
                 assert!(shell.contains("ControlMaster=auto"), "{shell}");
                 assert!(shell.contains("/%C"), "{shell}");
             },
@@ -1427,17 +1669,22 @@ mod tests {
         with_ssh_settings(
             SshSettings {
                 multiplex: true,
+                config_file: None,
                 control_dir: Some(dir.path().to_path_buf()),
             },
             || {
-                let first = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let first =
+                    ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None)
+                        .unwrap();
                 assert!(
                     !arg_strings(&first.args)
                         .iter()
                         .any(|arg| arg == "ControlMaster=auto")
                 );
                 assert!(!socket.exists(), "stale control socket must be removed");
-                let second = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let second =
+                    ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None)
+                        .unwrap();
                 assert!(
                     arg_strings(&second.args)
                         .iter()
@@ -1455,10 +1702,12 @@ mod tests {
         with_ssh_settings(
             SshSettings {
                 multiplex: true,
+                config_file: None,
                 control_dir: Some(file.clone()),
             },
             || {
-                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let exec = ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None)
+                    .unwrap();
                 assert!(
                     !arg_strings(&exec.args)
                         .iter()
@@ -1477,10 +1726,12 @@ mod tests {
         with_ssh_settings(
             SshSettings {
                 multiplex: true,
+                config_file: None,
                 control_dir: Some(dir.path().to_path_buf()),
             },
             || {
-                let exec = ssh_exec_request("mac1", "true", tiny_policy(), None).unwrap();
+                let exec = ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None)
+                    .unwrap();
                 assert!(
                     arg_strings(&exec.args)
                         .iter()
