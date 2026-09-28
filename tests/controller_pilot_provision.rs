@@ -53,6 +53,45 @@ fn destinations_use_loopback_drop_controller_jump_preserve_port_and_allow_overri
 }
 
 #[test]
+fn route_ambiguous_controller_matches_require_a_named_worker_override() {
+    let cfg = inventory();
+    let controller = resolved("10.0.0.1", 22, Some("gateway-a"));
+    for jump in [Some("gateway-b"), None, Some("gateway-a,gateway-b")] {
+        let targets = BTreeMap::from([
+            ("mini-1".into(), controller.clone()),
+            ("mini-2".into(), resolved("10.0.0.1", 22, jump)),
+        ]);
+        let error = plan_inventory(&cfg, &controller, "controller-alias", &targets)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("mini-2"), "{error}");
+        assert!(error.contains("--worker-ssh mini-2="), "{error}");
+    }
+}
+
+#[test]
+fn route_loopback_requires_matching_account_host_port_and_entire_jump_chain() {
+    let cfg = inventory();
+    let controller = resolved("mini.local", 2222, Some("owner@gateway-a:2200,gateway-b"));
+    let same_route = resolved("MINI.local", 2222, Some("owner@gateway-a:2200,gateway-b"));
+    let mut other_account = same_route.clone();
+    other_account.user = "other".into();
+    let targets = BTreeMap::from([
+        ("mini-1".into(), same_route),
+        ("mini-2".into(), other_account),
+    ]);
+    let plan = plan_inventory(&cfg, &controller, "controller-alias", &targets).unwrap();
+    assert_eq!(plan[0].target.hostname, "127.0.0.1");
+    assert_eq!(plan[0].target.proxy_jump, None);
+    assert_eq!(plan[1].target.hostname, "MINI.local");
+    assert_eq!(
+        plan[1].target.proxy_jump.as_deref(),
+        Some("owner@gateway-a:2200,gateway-b")
+    );
+}
+
+#[test]
 fn managed_alias_encodes_at_names_without_sanitization_collisions() {
     let mut config = inventory();
     config.workers[0].name = "a@mini2".into();

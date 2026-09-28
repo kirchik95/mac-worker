@@ -113,7 +113,7 @@ impl<'a> Installer<'a> {
         }
         let controller = crate::controller::init::resolve(self.runner, &controller.ssh)?;
         let worker = crate::controller::init::resolve(self.runner, &worker.ssh)?;
-        Ok(controller.same_host(&worker) && controller.user == worker.user)
+        controller.same_route(&worker)
     }
 
     fn install_verified(

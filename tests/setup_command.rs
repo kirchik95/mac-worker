@@ -3266,6 +3266,55 @@ fn setup_controller_matches_aliases_by_resolved_host_port_and_account() {
 }
 
 #[test]
+fn setup_controller_ambiguous_proxy_jump_route_warns_without_restart() {
+    let mut results = success_results();
+    results.extend([
+        Ok(result(
+            0,
+            b"user owner\nhostname 10.0.0.1\nport 22\nproxyjump gateway-a\n",
+            b"",
+        )),
+        Ok(result(
+            0,
+            b"user owner\nhostname 10.0.0.1\nport 22\nproxyjump gateway-b\n",
+            b"",
+        )),
+        // Let the broken implementation return success so this fails on the
+        // public outcome, rather than an exhausted fake response queue.
+        Ok(restarted_controller_service()),
+    ]);
+    let (output, runner) = setup_with_controller(true, "controller-alias", results);
+    assert_controller_restart_warning(&output);
+    assert!(
+        output
+            .render_human()
+            .contains("could not determine whether this worker is the controller")
+    );
+    assert_eq!(runner.requests().len(), 14);
+    assert!(
+        !runner
+            .requests()
+            .iter()
+            .any(|request| request_command(request).contains("controller-service"))
+    );
+}
+
+#[test]
+fn setup_controller_matches_aliases_with_the_same_proxy_jump_route() {
+    let mut results = success_results();
+    results.extend([
+        Ok(result(0, b"user owner\nhostname mini.local\nport 2222\nproxyjump owner@gateway-a:2200,gateway-b\n", b"")),
+        Ok(result(0, b"user owner\nhostname MINI.local\nport 2222\nproxyjump owner@gateway-a:2200,gateway-b\n", b"")),
+        Ok(restarted_controller_service()),
+    ]);
+    let (output, runner) = setup_with_controller(true, "controller-alias", results);
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["controller_service"], "restarted");
+    assert_eq!(json["workers"][0]["warnings"], serde_json::json!([]));
+    assert_eq!(runner.requests().len(), 15);
+}
+
+#[test]
 fn setup_controller_does_not_restart_other_hosts_ports_or_accounts() {
     for (user, host, port) in [
         ("owner", "mini-2.local", 22),

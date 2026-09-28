@@ -73,6 +73,20 @@ impl ResolvedSsh {
     pub fn same_host(&self, other: &Self) -> bool {
         self.hostname.eq_ignore_ascii_case(&other.hostname) && self.port == other.port
     }
+
+    /// Endpoint coordinates can name different machines behind different jumps.
+    /// Treat those observations as ambiguous, never as a controller match.
+    pub fn same_route(&self, other: &Self) -> Result<bool, WorkerError> {
+        if !self.same_host(other) {
+            return Ok(false);
+        }
+        if self.proxy_jump != other.proxy_jump {
+            return Err(invalid(
+                "ambiguous SSH routes to the same hostname and port",
+            ));
+        }
+        Ok(self.user == other.user)
+    }
 }
 fn token(s: &str) -> bool {
     !s.is_empty()
@@ -145,7 +159,11 @@ pub fn plan_inventory(
                     .clone()
                     .unwrap_or_else(|| target.hostname.clone()),
             );
-            if target.same_host(controller) {
+            let same_route = target.same_route(controller).map_err(|_| invalid(&format!(
+                "ambiguous controller route for worker {}; use --worker-ssh {}=<destination> with a distinct controller-reachable destination",
+                worker.name, worker.name
+            )))?;
+            if same_route {
                 target.hostname = "127.0.0.1".into();
                 target.proxy_jump = None;
             } else if let Some(jumps) = target.proxy_jump.clone() {
