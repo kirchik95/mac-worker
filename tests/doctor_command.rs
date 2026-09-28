@@ -840,6 +840,7 @@ fn doctor_renders_a_turn_auth_failure_reason() {
     let probe = report.workers[0].probe.as_mut().unwrap();
     probe.agent_facts = Some(AgentFacts {
         agents: vec![AgentProbe {
+            autoupdate: None,
             name: "codex".into(),
             version: Some("0.152.1".into()),
             auth: AgentAuth::UnknownWithReason(reason),
@@ -2249,4 +2250,28 @@ fn doctor_warns_when_a_running_dashboard_is_older_than_the_installed_binary() {
         "{}",
         warning.message
     );
+}
+
+#[test]
+fn doctor_agent_warnings_are_informational_and_include_the_autoupdate_fix() {
+    let mut report = ready_output_report();
+    let mut workers = vec![];
+    for (index, version) in ["1.0.0", "1.0.0", "2.0.0"].into_iter().enumerate() {
+        let mut worker = report.workers[0].clone();
+        worker.name = format!("mini-{}", index + 1);
+        worker.probe.as_mut().unwrap().agent_facts = Some(serde_json::from_value(serde_json::json!({
+            "agents": [{"name":"opencode","version":version,"auth":"authenticated","auth_by_profile":[],"autoupdate":"not_configured"}],
+            "env_profiles":[],"git_identity":true,"collected_at_millis":1
+        })).unwrap());
+        workers.push(worker);
+    }
+    report.workers = workers;
+    let output = CommandOutput::Doctor(report);
+    let human = output.render_human();
+    assert!(human.contains("AGENT_VERSION_SKEW"), "{human}");
+    assert!(human.contains("AGENT_AUTOUPDATE_ENABLED"), "{human}");
+    assert!(human.contains("\"autoupdate\": false"), "{human}");
+    let wire: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(wire["agent_warnings"].as_array().unwrap().len(), 4);
+    assert!(output.aggregate_exit_kind().is_none());
 }

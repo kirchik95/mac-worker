@@ -188,6 +188,7 @@ fn a_turn_auth_failure_reason_is_not_an_agent_capability() {
     let probe = health.probe.as_mut().unwrap();
     probe.agent_facts = Some(AgentFacts {
         agents: vec![AgentProbe {
+            autoupdate: None,
             name: "codex".into(),
             version: Some("0.152.1".into()),
             auth: AgentAuth::UnknownWithReason(reason),

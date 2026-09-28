@@ -15,6 +15,11 @@ Honor the agent, model, and profile you configured. Do not copy credential profi
 
 Each completed turn records the executable resolved **after** login-shell startup and the env profile, plus a bounded `--version` observation. `task status`, `task result`, and dashboard detail JSON expose `turns[].agent_identity`; account-home paths are shown relative to `~/` and secrets remain redacted. The private job `agent-identity.json` retains the resolved path. An unsupported version command is recorded as unavailable. A probe that exceeds two seconds (or the remaining turn deadline) or 4 KiB per stream stops launch with `AGENT_IDENTITY_PROBE_FAILED`, so its descendants stay subject to supervisor cleanup.
 
+`worker workers` and `worker doctor` emit informational `AGENT_VERSION_SKEW` notes when hosts report different versions of the same agent. They do not affect eligibility or scheduling. Facts refresh reads only the global OpenCode `~/.config/opencode/opencode.json` / `.jsonc` autoupdate setting. `AGENT_AUTOUPDATE_ENABLED` means automatic updates are not confirmed disabled there; set `"autoupdate": false` to disable them. OpenCode's `"notify"` mode also disables automatic installation. Missing, unreadable, malformed, or conflicting config produces a note; configuration contents are never emitted. Project/environment/managed overrides may differ from this global observation. No config is edited by mac-worker.
+
+Cursor CLI `2026.09.26-dd393fe` advertises `update` but no disable-auto-update option in `--help`; mac-worker does not infer Cursor's effective update setting from undocumented configuration.
+
+
 An `unknown` result includes `result_parse_reason`: `no_result_json`, `schema_mismatch:<field>`, `truncated`, or `empty_output`. These fixed codes contain no raw agent output. Truncated protocol still fails publication conservatively and records `truncated` for diagnosis.
 
 

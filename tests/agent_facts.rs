@@ -489,24 +489,28 @@ fn collects_all_adapters_with_profile_keyed_auth_and_git_identity() {
         facts.agents,
         vec![
             AgentProbe {
+                autoupdate: None,
                 name: "codex".into(),
                 version: Some("0.152.1".into()),
                 auth: AgentAuth::Authenticated,
                 auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
             },
             AgentProbe {
+                autoupdate: None,
                 name: "claude".into(),
                 version: Some("2.1.252".into()),
                 auth: AgentAuth::Unauthenticated,
                 auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
             },
             AgentProbe {
+                autoupdate: None,
                 name: "cursor".into(),
                 version: Some("1.3.0".into()),
                 auth: AgentAuth::Unauthenticated,
                 auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
             },
             AgentProbe {
+                autoupdate: Some(mac_worker::agent_facts::AgentAutoUpdate::NotConfigured),
                 name: "opencode".into(),
                 version: Some("1.0.0".into()),
                 auth: AgentAuth::Unauthenticated,
@@ -816,6 +820,7 @@ fn facts_are_stale_only_after_the_ttl_and_age_subtraction_is_saturating() {
 fn dto_json_is_canonical_and_laptop_readers_ignore_unknown_host_fields() {
     let facts = AgentFacts {
         agents: vec![AgentProbe {
+            autoupdate: None,
             name: "codex".into(),
             version: Some("0.152.1".into()),
             auth: AgentAuth::Authenticated,
@@ -2363,4 +2368,56 @@ fn two_adapters_unlock_a_shared_keychain_once() {
             .iter()
             .all(|agent| agent.name == "codex" || agent.name == "claude")
     );
+}
+
+#[test]
+fn facts_refresh_detects_opencode_autoupdate_from_bounded_config_fixtures() {
+    for (name, body, expected) in [
+        ("opencode.json", Some(r#"{"autoupdate":true}"#), "enabled"),
+        ("opencode.json", Some(r#"{"autoupdate":false}"#), "disabled"),
+        ("opencode.json", None, "not_configured"),
+        (
+            "opencode.jsonc",
+            Some(
+                "{ // keep builds stable\n \"autoupdate\": false, /* approved */ \"url\": \"https://example.test/a//b\", }",
+            ),
+            "disabled",
+        ),
+        (
+            "opencode.jsonc",
+            Some(r#"{"autoupdate":"notify"}"#),
+            "disabled",
+        ),
+        (
+            "opencode.json",
+            Some("malformed secret-config-body"),
+            "unknown",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".config/opencode");
+        fs::create_dir_all(&config).unwrap();
+        if let Some(body) = body {
+            fs::write(config.join(name), body).unwrap();
+        }
+        let runner = FakeProcessRunner::new(Scenario::AllAgents);
+        let facts =
+            collect_agent_facts_at(&runner, root.path(), &[] as &[EnvProfile], COLLECTED_AT);
+        let wire = serde_json::to_value(&facts).unwrap();
+        let opencode = wire["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "opencode")
+            .unwrap();
+        assert_eq!(opencode["autoupdate"], expected, "{name}: {body:?}");
+        assert!(!wire.to_string().contains("secret-config-body"));
+        assert_eq!(
+            serde_json::to_value(
+                AgentFacts::from_host_store(&serde_json::to_vec(&facts).unwrap()).unwrap()
+            )
+            .unwrap(),
+            wire
+        );
+    }
 }

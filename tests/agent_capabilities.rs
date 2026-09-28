@@ -316,6 +316,7 @@ fn unverified_cursor_login_is_not_advertised_as_an_agent_capability() {
     let probe = health.probe.as_mut().unwrap();
     probe.agent_facts = Some(AgentFacts {
         agents: vec![AgentProbe {
+            autoupdate: None,
             name: "cursor".into(),
             version: Some("2026.09.02".into()),
             auth: AgentAuth::UnknownWithReason("login unverified: user details unavailable"),

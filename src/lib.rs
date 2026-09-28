@@ -2552,7 +2552,7 @@ fn write_workers_refresh_output(
 
 fn render_workers_refresh_human(inspection: &WorkersInspection) -> String {
     let refresh = inspection.refresh.as_deref().unwrap_or(&[]);
-    inspection
+    let mut rendered = inspection
         .report
         .workers
         .iter()
@@ -2568,7 +2568,18 @@ fn render_workers_refresh_human(inspection: &WorkersInspection) -> String {
             rendered
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // Per-worker rendering above already includes autoupdate notes. Version
+    // skew needs the whole fleet, so append it once after the refresh rows.
+    let notes = crate::agent_facts::agent_fleet_notes(&inspection.report.workers)
+        .into_iter()
+        .filter(|note| note.code == "AGENT_VERSION_SKEW")
+        .collect::<Vec<_>>();
+    if !notes.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(&crate::agent_facts::render_agent_fleet_notes(&notes));
+    }
+    rendered
 }
 
 fn render_refresh_line(outcome: &WorkerRefreshOutcome) -> String {
@@ -2593,6 +2604,8 @@ fn render_workers_refresh_json(inspection: &WorkersInspection) -> Result<String,
         kind: &'static str,
         protocol_version: u32,
         workers: Vec<Worker<'a>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        agent_warnings: Vec<crate::agent_facts::AgentFleetNote>,
     }
     #[derive(Serialize)]
     struct Worker<'a> {
@@ -2616,6 +2629,7 @@ fn render_workers_refresh_json(inspection: &WorkersInspection) -> Result<String,
                 refresh: refresh.and_then(|outcomes| outcomes.get(index)),
             })
             .collect(),
+        agent_warnings: crate::agent_facts::agent_fleet_notes(&inspection.report.workers),
     };
     serde_json::to_string(&payload).map_err(|error| {
         WorkerError::Protocol(format!("failed to serialize command output: {error}"))

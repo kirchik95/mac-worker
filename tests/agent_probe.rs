@@ -209,12 +209,14 @@ fn facts(collected_at_millis: u64) -> AgentFacts {
     AgentFacts {
         agents: vec![
             AgentProbe {
+                autoupdate: None,
                 name: "codex".into(),
                 version: Some("0.152.1".into()),
                 auth: AgentAuth::Authenticated,
                 auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
             },
             AgentProbe {
+                autoupdate: None,
                 name: "claude".into(),
                 version: Some("2.1.252".into()),
                 auth: AgentAuth::Unauthenticated,

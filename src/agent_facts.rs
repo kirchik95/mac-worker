@@ -298,6 +298,7 @@ pub struct AgentProbe {
     pub version: Option<String>,
     pub auth: AgentAuth,
     pub auth_by_profile: Vec<(String, AgentAuth)>,
+    pub autoupdate: Option<AgentAutoUpdate>,
 }
 
 impl AgentProbe {
@@ -312,6 +313,7 @@ impl AgentProbe {
             version,
             auth,
             auth_by_profile,
+            autoupdate: None,
         };
         probe.validate()?;
         Ok(probe)
@@ -338,11 +340,15 @@ impl Serialize for AgentProbe {
         self.validate().map_err(ser::Error::custom)?;
         let mut auth_by_profile = self.auth_by_profile.clone();
         auth_by_profile.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut record = serializer.serialize_struct("AgentProbe", 4)?;
+        let mut record = serializer
+            .serialize_struct("AgentProbe", 4 + usize::from(self.autoupdate.is_some()))?;
         record.serialize_field("name", &self.name)?;
         record.serialize_field("version", &self.version)?;
         record.serialize_field("auth", &self.auth)?;
         record.serialize_field("auth_by_profile", &auth_by_profile)?;
+        if let Some(autoupdate) = self.autoupdate {
+            record.serialize_field("autoupdate", &autoupdate)?;
+        }
         record.end()
     }
 }
@@ -357,10 +363,16 @@ impl<'de> Deserialize<'de> for AgentProbe {
             version: Option<String>,
             auth: AgentAuth,
             auth_by_profile: Vec<(String, AgentAuth)>,
+            #[serde(default)]
+            autoupdate: Option<AgentAutoUpdate>,
         }
 
         let wire: Wire = deserialize_unique_object(deserializer)?;
         Self::new(wire.name, wire.version, wire.auth, wire.auth_by_profile)
+            .map(|mut probe| {
+                probe.autoupdate = wire.autoupdate;
+                probe
+            })
             .map_err(de::Error::custom)
     }
 }
@@ -636,6 +648,8 @@ impl AgentFacts {
             version: Option<String>,
             auth: AgentAuth,
             auth_by_profile: Vec<(String, AgentAuth)>,
+            #[serde(default)]
+            autoupdate: Option<AgentAutoUpdate>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -678,6 +692,10 @@ impl AgentFacts {
         for agent in wire.agents {
             agents.push(
                 AgentProbe::new(agent.name, agent.version, agent.auth, agent.auth_by_profile)
+                    .map(|mut probe| {
+                        probe.autoupdate = agent.autoupdate;
+                        probe
+                    })
                     .map_err(de::Error::custom)?,
             );
         }
@@ -1394,6 +1412,7 @@ where
             version,
             auth,
             auth_by_profile,
+            autoupdate: (kind == AgentKind::Opencode).then(|| opencode_autoupdate(account_home)),
         });
     }
 
@@ -1427,6 +1446,7 @@ fn unfinished_agent(name: &str, profiles: &[ProfileProbe]) -> AgentProbe {
     let auth = budget_exhausted_auth();
     AgentProbe {
         name: name.to_owned(),
+        autoupdate: None,
         version: None,
         auth,
         auth_by_profile: profiles
@@ -2341,4 +2361,197 @@ mod tests {
         let json = serde_json::to_string(&helpers).unwrap();
         assert!(!json.contains("osxkeychain") && !json.contains("gh auth"));
     }
+}
+
+/// Observation of the account's global OpenCode configuration only. Project,
+/// custom environment and managed overrides can still change effective policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAutoUpdate {
+    Enabled,
+    Disabled,
+    NotConfigured,
+    Unknown,
+}
+
+fn opencode_autoupdate(home: &Path) -> AgentAutoUpdate {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+    let mut observed = None;
+    for name in ["opencode.json", "opencode.jsonc"] {
+        let path = home.join(".config/opencode").join(name);
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return AgentAutoUpdate::Unknown,
+        };
+        if !file
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() <= 64 * 1024)
+        {
+            return AgentAutoUpdate::Unknown;
+        }
+        let mut bytes = vec![];
+        if Read::by_ref(&mut file)
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() > 64 * 1024
+        {
+            return AgentAutoUpdate::Unknown;
+        }
+        let Some(value) = parse_jsonc(&bytes) else {
+            return AgentAutoUpdate::Unknown;
+        };
+        if !value.is_object() {
+            return AgentAutoUpdate::Unknown;
+        }
+        let next = match value.get("autoupdate") {
+            None => continue,
+            Some(Value::Bool(false)) => AgentAutoUpdate::Disabled,
+            Some(Value::String(v)) if v == "notify" => AgentAutoUpdate::Disabled,
+            Some(Value::Bool(true)) => AgentAutoUpdate::Enabled,
+            _ => AgentAutoUpdate::Unknown,
+        };
+        // Conflicting files are ambiguous rather than falsely declared safe.
+        if observed.is_some_and(|previous| previous != next) {
+            return AgentAutoUpdate::Unknown;
+        }
+        observed = Some(next);
+    }
+    observed.unwrap_or(AgentAutoUpdate::NotConfigured)
+}
+
+/// Strip comments/trailing commas only outside JSON strings. Never substitute
+/// env/file references: configuration values may contain secrets.
+fn parse_jsonc(bytes: &[u8]) -> Option<Value> {
+    let mut clean = Vec::with_capacity(bytes.len());
+    let (mut i, mut string, mut escaped) = (0, false, false);
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if string {
+            clean.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+            i += 1;
+        } else if byte == b'"' {
+            string = true;
+            clean.push(byte);
+            i += 1;
+        } else if bytes.get(i..i + 2) == Some(b"//") {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            clean.push(b' ');
+        } else if bytes.get(i..i + 2) == Some(b"/*") {
+            i += 2;
+            while i + 1 < bytes.len() && &bytes[i..i + 2] != b"*/" {
+                i += 1;
+            }
+            if i + 1 >= bytes.len() {
+                return None;
+            }
+            i += 2;
+            clean.push(b' ');
+        } else {
+            clean.push(byte);
+            i += 1;
+        }
+    }
+    let mut json = vec![];
+    string = false;
+    escaped = false;
+    for (i, byte) in clean.iter().copied().enumerate() {
+        if string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+        } else if byte == b'"' {
+            string = true;
+        } else if byte == b','
+            && clean[i + 1..]
+                .iter()
+                .find(|b| !b.is_ascii_whitespace())
+                .is_some_and(|b| matches!(b, b'}' | b']'))
+        {
+            continue;
+        }
+        json.push(byte);
+    }
+    serde_json::from_slice(&json).ok()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentFleetNote {
+    pub code: &'static str,
+    pub agent: String,
+    pub message: String,
+}
+
+pub fn agent_fleet_notes(workers: &[crate::protocol::WorkerHealth]) -> Vec<AgentFleetNote> {
+    let boundary = crate::redaction::RedactionBoundary::from_env();
+    let mut versions: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+    let mut notes = vec![];
+    for worker in workers {
+        let Some(facts) = worker.probe.as_ref().and_then(|p| p.agent_facts.as_ref()) else {
+            continue;
+        };
+        for agent in &facts.agents {
+            if let Some(version) = &agent.version {
+                versions
+                    .entry(&agent.name)
+                    .or_default()
+                    .entry(version)
+                    .or_default()
+                    .push(&worker.name);
+            }
+            if agent.name == "opencode"
+                && agent
+                    .autoupdate
+                    .is_some_and(|v| v != AgentAutoUpdate::Disabled)
+            {
+                notes.push(AgentFleetNote {
+                    code: "AGENT_AUTOUPDATE_ENABLED", agent: "opencode".into(),
+                    message: boundary.summary(&format!("{}: OpenCode global autoupdate is not confirmed disabled; set \"autoupdate\": false in ~/.config/opencode/opencode.json or .jsonc", worker.name)),
+                });
+            }
+        }
+    }
+    for (agent, versions) in versions {
+        if versions.len() > 1 {
+            let builds = versions
+                .into_iter()
+                .map(|(version, hosts)| format!("{}={version}", hosts.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            notes.push(AgentFleetNote {
+                code: "AGENT_VERSION_SKEW",
+                agent: boundary.summary(agent),
+                message: boundary
+                    .summary(&format!("{agent} versions differ across hosts: {builds}")),
+            });
+        }
+    }
+    notes
+}
+
+pub fn render_agent_fleet_notes(notes: &[AgentFleetNote]) -> String {
+    notes
+        .iter()
+        .map(|note| format!("note [{}]: {}", note.code, note.message))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

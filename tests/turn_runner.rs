@@ -1212,6 +1212,7 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                     capabilities: vec!["darwin-arm64".into()],
                     agent_facts: Some(AgentFacts {
                         agents: vec![AgentProbe {
+                            autoupdate: None,
                             name: "codex".into(),
                             version: Some("0.1.0".into()),
                             auth: AgentAuth::Authenticated,
@@ -3790,6 +3791,7 @@ impl ProcessRunner for FetchFailingRunner {
                 capabilities: vec!["darwin-arm64".into()],
                 agent_facts: Some(AgentFacts {
                     agents: vec![AgentProbe {
+                        autoupdate: None,
                         name: "codex".into(),
                         version: Some("0.1.0".into()),
                         auth: AgentAuth::Authenticated,

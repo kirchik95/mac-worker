@@ -988,6 +988,7 @@ mod tests {
             FactsKind::Missing => None,
             FactsKind::Authenticated => Some(AgentFacts {
                 agents: vec![AgentProbe {
+                    autoupdate: None,
                     name: "codex".into(),
                     version: Some("0.1.0".into()),
                     auth: AgentAuth::Authenticated,
@@ -1004,6 +1005,7 @@ mod tests {
             }),
             FactsKind::Unauthenticated => Some(AgentFacts {
                 agents: vec![AgentProbe {
+                    autoupdate: None,
                     name: "codex".into(),
                     version: Some("0.1.0".into()),
                     auth: AgentAuth::Unauthenticated,

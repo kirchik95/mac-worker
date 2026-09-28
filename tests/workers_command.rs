@@ -1492,6 +1492,7 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
                 capabilities: vec!["darwin-arm64".into(), "agent:cursor@agents".into()],
                 agent_facts: Some(AgentFacts {
                     agents: vec![AgentProbe {
+                        autoupdate: None,
                         name: "cursor".into(),
                         version: Some("1.0.0".into()),
                         auth: AgentAuth::Authenticated,
@@ -1566,6 +1567,7 @@ fn workers_render_a_turn_auth_failure_reason() {
                 capabilities: vec!["darwin-arm64".into()],
                 agent_facts: Some(AgentFacts {
                     agents: vec![AgentProbe {
+                        autoupdate: None,
                         name: "codex".into(),
                         version: Some("0.152.1".into()),
                         auth: AgentAuth::UnknownWithReason(reason),
@@ -1905,6 +1907,7 @@ fn herdr_health(facts: Option<AgentFacts>, facts_age_millis: Option<u64>) -> Wor
 fn facts_with_herdr(herdr: Option<HerdrFacts>) -> AgentFacts {
     AgentFacts {
         agents: vec![AgentProbe {
+            autoupdate: None,
             name: "cursor".into(),
             version: Some("1.0.0".into()),
             auth: AgentAuth::Authenticated,
@@ -2137,4 +2140,32 @@ fn workers_output_renders_origin_https_helper_presence() {
         !json.contains("gh auth") && !json.contains("git-credential"),
         "helper command text must never appear: {json}"
     );
+}
+
+#[test]
+fn workers_warn_when_one_of_three_hosts_has_a_different_agent_version() {
+    let workers = ["1.0.0", "1.0.0", "2.0.0"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, version)| {
+            let mut facts = facts_with_herdr(None);
+            facts.agents[0].version = Some(version.into());
+            let mut health = herdr_health(Some(facts), Some(0));
+            health.name = format!("mini-{}", index + 1);
+            health
+        })
+        .collect();
+    let output = CommandOutput::Workers(WorkersReport {
+        protocol_version: PROTOCOL_VERSION,
+        workers,
+    });
+    let human = output.render_human();
+    assert!(human.contains("AGENT_VERSION_SKEW"), "{human}");
+    for host in ["mini-1", "mini-2", "mini-3"] {
+        assert!(human.contains(host));
+    }
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["agent_warnings"][0]["code"], "AGENT_VERSION_SKEW");
+    assert_eq!(json["agent_warnings"].as_array().unwrap().len(), 1);
+    assert!(output.aggregate_exit_kind().is_none());
 }

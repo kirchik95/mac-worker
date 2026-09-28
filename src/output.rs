@@ -28,16 +28,26 @@ impl CommandOutput {
             Self::Doctor(report) => build_warning_values(&report.workers),
             _ => Vec::new(),
         };
-        if warnings.is_empty() {
+        let agent_warnings = match self {
+            Self::Workers(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
+            Self::Doctor(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
+            _ => Vec::new(),
+        };
+        if warnings.is_empty() && agent_warnings.is_empty() {
             return serde_json::to_string(self).map_err(serialize);
         }
         let mut value = serde_json::to_value(self).map_err(serialize)?;
-        value["build_warnings"] = serde_json::Value::Array(warnings);
+        if !warnings.is_empty() {
+            value["build_warnings"] = serde_json::Value::Array(warnings);
+        }
+        if !agent_warnings.is_empty() {
+            value["agent_warnings"] = serde_json::to_value(agent_warnings).map_err(serialize)?;
+        }
         serde_json::to_string(&value).map_err(serialize)
     }
 
     pub fn render_human(&self) -> String {
-        match self {
+        let mut rendered = match self {
             Self::Init(report) => report.render_human(),
             Self::Setup(report) => {
                 let mut lines = report
@@ -109,7 +119,17 @@ impl CommandOutput {
                     job_state_name(response.status().status().state())
                 ),
             },
+        };
+        let notes = match self {
+            Self::Workers(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
+            Self::Doctor(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
+            _ => Vec::new(),
+        };
+        if !notes.is_empty() {
+            rendered.push('\n');
+            rendered.push_str(&crate::agent_facts::render_agent_fleet_notes(&notes));
         }
+        rendered
     }
 
     pub fn write_to(
