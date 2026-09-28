@@ -1178,6 +1178,8 @@ pub struct TurnSummary {
     herdr: Option<HerdrTurnReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result_parse_reason: Option<crate::agent::ResultParseReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_identity: Option<crate::agent::AgentIdentity>,
 }
 
 /// Whether, and where, a turn was shown in the worker's herdr.
@@ -1225,6 +1227,7 @@ impl TurnSummary {
             ended_at_millis,
             herdr: None,
             result_parse_reason: None,
+            agent_identity: None,
         }
     }
 
@@ -1239,6 +1242,18 @@ impl TurnSummary {
 
     pub fn result_parse_reason(&self) -> Option<crate::agent::ResultParseReason> {
         self.result_parse_reason
+    }
+
+    pub fn agent_identity(&self) -> Option<&crate::agent::AgentIdentity> {
+        self.agent_identity.as_ref()
+    }
+
+    pub(crate) fn with_agent_identity(
+        mut self,
+        identity: Option<crate::agent::AgentIdentity>,
+    ) -> Self {
+        self.agent_identity = identity;
+        self
     }
 
     pub(crate) fn with_parse_reason(
@@ -1284,6 +1299,9 @@ impl TurnSummary {
     fn redact(self, boundary: &RedactionBoundary) -> Self {
         Self {
             outcome: self.outcome.map(|outcome| outcome.redact(boundary)),
+            agent_identity: self
+                .agent_identity
+                .map(|identity| identity.redacted(boundary)),
             ..self
         }
     }

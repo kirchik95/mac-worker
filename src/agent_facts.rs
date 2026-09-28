@@ -1942,7 +1942,7 @@ fn contains_auth_probe_error(result: &ProcessResult) -> bool {
         })
 }
 
-fn parse_version(output: &[u8]) -> Option<String> {
+pub(crate) fn parse_version(output: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(output).ok()?;
     text.split_whitespace().find_map(|token| {
         let token = token.trim_matches(|character: char| {

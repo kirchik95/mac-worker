@@ -90,7 +90,19 @@ pub(crate) fn attach_turn_diagnostics(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    Ok(summary.with_parse_reason(reason))
+    let identity: Option<crate::agent::AgentIdentity> =
+        match dir.read_private_regular(crate::agent::identity::IDENTITY_FILE, 8192) {
+            Ok(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| turn_error("PUBLISH_FAILED", "invalid agent identity"))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+    let boundary = publication_boundary(&dir)?;
+    Ok(summary
+        .with_parse_reason(reason)
+        .with_agent_identity(identity.map(|identity| identity.redacted(&boundary))))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2651,6 +2663,30 @@ mod tests {
         let wire = serde_json::to_value(status).unwrap();
         assert_eq!(wire["turns"][0]["outcome"]["kind"], "unknown");
         assert_eq!(wire["turns"][0]["result_parse_reason"], "no_result_json");
+    }
+
+    #[test]
+    fn failed_publication_keeps_redacted_launch_identity() {
+        let fixture = publication_fixture(None);
+        fixture.turn_dir.write_private_atomic_no_replace("agent-identity.json",
+            br#"{"executable":"/opt/purple-lantern-secret-qq/agent","version":"2.3.4","version_observation":"observed"}"#).unwrap();
+        invoke_publication(
+            &fixture,
+            TurnTerminal::Failed,
+            TerminalPath::ChildExit(1),
+            Some(1),
+        )
+        .unwrap_err();
+        let status = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner)
+            .load_status(PROJECT_ID, fixture.section.turn().task_id())
+            .unwrap();
+        let wire = serde_json::to_value(status).unwrap();
+        assert_eq!(wire["turns"][0]["agent_identity"]["version"], "2.3.4");
+        assert_eq!(
+            wire["turns"][0]["agent_identity"]["executable"],
+            "/opt/[token]/agent"
+        );
+        assert!(!wire.to_string().contains("purple-lantern"));
     }
 
     fn codex_result_record(summary: &str) -> String {

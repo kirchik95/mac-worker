@@ -1587,6 +1587,14 @@ fn write_turn_diagnostics(
     stdout: &mut dyn Write,
     status: &crate::task::TaskStatus,
 ) -> Result<(), WorkerError> {
+    if let Some(identity) = status.turns().last().and_then(|turn| turn.agent_identity()) {
+        writeln!(
+            stdout,
+            "agent build: {} ({})",
+            identity.executable,
+            identity.version.as_deref().unwrap_or("version unavailable")
+        )?;
+    }
     if let Some(turn) = status.turns().last()
         && let Some(outcome) = turn.outcome()
     {

@@ -13,6 +13,11 @@ Start with the [quick start](../README.md#quick-start) to install the CLI and co
 
 Honor the agent, model, and profile you configured. Do not copy credential profile contents. Every agent gets the same contract: work only in the task worktree, do not switch branches or push, and end with a JSON result. Agents that cannot ask questions interactively return `needs_input` with the exact question; you answer with `worker task say <id> --message "…" --wait`, which starts the next turn in the same agent session.
 
+Each completed turn records the executable resolved **after** login-shell startup and the env profile, plus a bounded `--version` observation. `task status`, `task result`, and dashboard detail JSON expose `turns[].agent_identity`; account-home paths are shown relative to `~/` and secrets remain redacted. The private job `agent-identity.json` retains the resolved path. An unsupported version command is recorded as unavailable. A probe that exceeds two seconds (or the remaining turn deadline) or 4 KiB per stream stops launch with `AGENT_IDENTITY_PROBE_FAILED`, so its descendants stay subject to supervisor cleanup.
+
+An `unknown` result includes `result_parse_reason`: `no_result_json`, `schema_mismatch:<field>`, `truncated`, or `empty_output`. These fixed codes contain no raw agent output. Truncated protocol still fails publication conservatively and records `truncated` for diagnosis.
+
+
 ### Env profiles
 
 Some agents need environment variables or a keychain unlock on the worker. Put them in an owner-only file on each worker, never in the repository:

@@ -1,7 +1,10 @@
 mod claude;
 mod codex;
 mod cursor;
+pub(crate) mod identity;
 mod opencode;
+
+pub use identity::{AgentIdentity, VersionObservation};
 
 use std::{ffi::OsString, path::Path, time::Duration};
 

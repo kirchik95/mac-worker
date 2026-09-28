@@ -241,6 +241,8 @@ pub struct TaskTurnProjection {
     pub ended_at_millis: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_parse_reason: Option<crate::agent::ResultParseReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<crate::agent::AgentIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -648,6 +650,9 @@ fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnPro
         started_at_millis: turn.started_at_millis(),
         ended_at_millis: turn.ended_at_millis(),
         result_parse_reason: turn.result_parse_reason(),
+        agent_identity: turn
+            .agent_identity()
+            .map(|identity| identity.redacted(boundary)),
     }
 }
 
@@ -962,10 +967,16 @@ mod tests {
         wire["last_outcome"] = serde_json::json!({"kind": "unknown"});
         wire["turns"][0]["outcome"] = serde_json::json!({"kind": "unknown"});
         wire["turns"][0]["result_parse_reason"] = serde_json::json!("schema_mismatch:summary");
+        wire["turns"][0]["agent_identity"] = serde_json::json!({"executable":"/opt/agents/cursor-agent","version":"2.3.4","version_observation":"observed"});
         let status: TaskStatus = serde_json::from_value(wire).unwrap();
         let detail = project_task_detail(&record, &status, None, TaskFreshness::Current).unwrap();
+        let detail = serde_json::to_value(detail).unwrap();
         assert_eq!(
-            serde_json::to_value(detail).unwrap()["turns"][0]["result_parse_reason"],
+            detail["turns"][0]["agent_identity"]["executable"],
+            "/opt/agents/cursor-agent"
+        );
+        assert_eq!(
+            detail["turns"][0]["result_parse_reason"],
             "schema_mismatch:summary"
         );
         let report = TaskReport::from_controller(ControllerTaskProjection {
@@ -997,15 +1008,17 @@ mod tests {
                 if json {
                     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(
+                        wire["status"]["turns"][0]["agent_identity"]["version"],
+                        "2.3.4"
+                    );
+                    assert_eq!(
                         wire["status"]["turns"][0]["result_parse_reason"],
                         "schema_mismatch:summary"
                     );
                 } else {
-                    assert!(
-                        String::from_utf8(bytes)
-                            .unwrap()
-                            .contains("unknown (schema_mismatch:summary)")
-                    );
+                    let text = String::from_utf8(bytes).unwrap();
+                    assert!(text.contains("unknown (schema_mismatch:summary)"));
+                    assert!(text.contains("agent build: /opt/agents/cursor-agent (2.3.4)"));
                 }
             }
         }

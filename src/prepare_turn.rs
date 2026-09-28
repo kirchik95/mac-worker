@@ -1,6 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::process::CommandExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,11 +17,12 @@ use crate::{
 };
 
 pub const ARG: &str = "__mac_worker_prepare_turn";
+const IDENTITY_ARG: &str = "__mac_worker_record_agent";
 
 pub fn requested() -> bool {
     std::env::args_os()
         .nth(1)
-        .is_some_and(|argument| argument == ARG)
+        .is_some_and(|argument| argument == ARG || argument == IDENTITY_ARG)
 }
 
 pub fn run() -> ExitCode {
@@ -54,7 +55,13 @@ fn run_with_args<I>(args: I) -> u8
 where
     I: IntoIterator<Item = OsString>,
 {
-    let error = match run_setup_then_exec_agent(args) {
+    let args: Vec<_> = args.into_iter().collect();
+    let result = if args.get(1).is_some_and(|arg| arg == IDENTITY_ARG) {
+        agent_argv(args).and_then(|agent| record_then_exec_agent(&agent))
+    } else {
+        run_setup_then_exec_agent(args)
+    };
+    let error = match result {
         Ok(()) => {
             // SAFETY: the helper is the recorded child. `_exit` skips
             // destructors so abandoned inherit-group capture threads cannot
@@ -85,7 +92,7 @@ where
     let mut args = args.into_iter();
     let _argv0 = args.next();
     let marker = args.next();
-    if marker.as_deref() != Some(OsStr::new(ARG)) {
+    if !matches!(marker.as_deref(), Some(marker) if marker == ARG || marker == IDENTITY_ARG) {
         return Err(WorkerError::task(
             "SETUP_FAILED",
             "prepare-turn helper marker is absent",
@@ -109,11 +116,89 @@ where
 }
 
 fn exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
+    if argv.len() == 3
+        && argv[0] == "/bin/zsh"
+        && argv[1] == "-lc"
+        && let Some(command) = argv[2]
+            .to_str()
+            .and_then(|shell| shell.strip_prefix("exec "))
+    {
+        let helper = std::env::current_exe().map_err(WorkerError::Io)?;
+        let helper = helper
+            .to_str()
+            .ok_or_else(|| WorkerError::task("SETUP_FAILED", "helper path is not UTF-8"))?;
+        let shell = format!(
+            "exec '{}' {IDENTITY_ARG} -- {command}",
+            helper.replace('\'', "'\\''")
+        );
+        return exec_direct(&[argv[0].clone(), argv[1].clone(), shell.into()]);
+    }
+    exec_direct(argv)
+}
+
+fn exec_direct(argv: &[OsString]) -> Result<(), WorkerError> {
     let program = &argv[0];
     let error = Command::new(program).args(&argv[1..]).exec();
     Err(WorkerError::task(
         "SETUP_FAILED",
         format!("agent executable could not be started: {error}"),
+    ))
+}
+
+fn record_then_exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
+    use crate::agent::{
+        VersionObservation,
+        identity::{IDENTITY_FILE, VERSION_DEADLINE, observe_identity},
+    };
+    let executable = resolve_executable(&argv[0])?;
+    let deadline = std::env::var("MAC_WORKER_LEASE_DEADLINE_MILLIS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|end| Duration::from_millis(end.saturating_sub(unix_now_millis().unwrap_or(end))))
+        .unwrap_or(VERSION_DEADLINE)
+        .min(VERSION_DEADLINE);
+    let identity = observe_identity(&InheritProcessGroupRunner, &executable, deadline);
+    let dir = std::env::var_os("MAC_WORKER_TURN_DIR")
+        .ok_or_else(|| WorkerError::task("SETUP_FAILED", "turn identity directory is absent"))?;
+    let dir = crate::rooted_fs::RootedDir::open(Path::new(&dir))?;
+    let bytes = serde_json::to_vec(&identity)
+        .map_err(|_| WorkerError::task("SETUP_FAILED", "cannot encode agent identity"))?;
+    dir.write_private_atomic_no_replace(IDENTITY_FILE, &bytes)?;
+    if matches!(
+        identity.version_observation,
+        VersionObservation::TimedOut | VersionObservation::OutputLimit
+    ) {
+        // The probe remains in the recorded child group. Exit the helper so
+        // supervisor cleanup also reaps descendants retaining capture pipes.
+        return Err(WorkerError::task(
+            "AGENT_IDENTITY_PROBE_FAILED",
+            "agent --version exceeded its time or output bound",
+        ));
+    }
+    let mut resolved = argv.to_vec();
+    resolved[0] = executable.into_os_string();
+    exec_direct(&resolved)
+}
+
+fn resolve_executable(program: &OsStr) -> Result<PathBuf, WorkerError> {
+    let candidates = if program.as_encoded_bytes().contains(&b'/') {
+        vec![PathBuf::from(program)]
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .map(|directory| directory.join(program))
+            .collect()
+    };
+    for path in candidates {
+        if let Ok(metadata) = path.metadata()
+            && metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return std::fs::canonicalize(path).map_err(WorkerError::Io);
+        }
+    }
+    Err(WorkerError::task(
+        "AGENT_EXECUTABLE_NOT_FOUND",
+        "agent executable was not found in the final login context",
     ))
 }
 
