@@ -9,9 +9,9 @@ use std::{
 use crate::{
     error::WorkerError,
     process::InheritProcessGroupRunner,
-    project_config::ProjectSettings,
     project_readiness::{
-        SETUP_STAGE_EXIT_CODE, SetupRequest, persist_setup_stage_result, prepare_project_setup,
+        FrozenSetup, SETUP_STAGE_EXIT_CODE, SetupRequest, persist_setup_stage_result,
+        prepare_project_setup,
     },
     turn::EnvProfile,
 };
@@ -122,10 +122,13 @@ fn run_supervised_turn_setup() -> Result<(), WorkerError> {
         return Ok(());
     }
     let workspace = std::env::current_dir().map_err(WorkerError::Io)?;
-    let settings = ProjectSettings::load(&workspace, &[])?;
-    let Some(recipe) = settings.setup.as_ref() else {
+    let Some(encoded) = std::env::var_os("MAC_WORKER_FROZEN_SETUP") else {
         return Ok(());
     };
+    let frozen: FrozenSetup = serde_json::from_str(&encoded.to_string_lossy())
+        .map_err(|_| WorkerError::task("SETUP_FAILED", "frozen setup is invalid"))?;
+    frozen.verify_inputs(&workspace)?;
+    let recipe = frozen.settings();
     let account_home = PathBuf::from(
         std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
@@ -174,8 +177,8 @@ fn run_supervised_turn_setup() -> Result<(), WorkerError> {
             env_profile_name: env_profile_name.as_deref(),
             workspace: &workspace,
             cache_root: &cache_root,
-            requires: &settings.requires,
-            recipe,
+            requires: frozen.requires(),
+            recipe: &recipe,
             profile_entries: profile.entries(),
             now_millis: unix_now_millis()?,
             deadline,

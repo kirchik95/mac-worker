@@ -33,6 +33,204 @@ const WORKSPACE_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const LOCK_POLL: Duration = Duration::from_millis(50);
 const DIAGNOSTIC_TAIL_BYTES: usize = 200;
 
+/// Operator-approved setup, bound to the original submit snapshot. Never rebuilt
+/// from the agent workspace or from a follow-up's result commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenSetup {
+    recipe: FrozenRecipe,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenRecipe {
+    requires: Vec<String>,
+    timeout_millis: u64,
+    commands: Vec<String>,
+    check: Option<String>,
+    lockfiles: Vec<String>,
+    inputs: Vec<String>,
+    input_digests: BTreeMap<String, String>,
+}
+
+impl FrozenSetup {
+    pub fn from_snapshot(
+        runner: &dyn ProcessRunner,
+        repository: &Path,
+        base: &crate::task::BaseOid,
+    ) -> Result<Option<Self>, WorkerError> {
+        let read = |path: &str| -> Result<Option<Vec<u8>>, WorkerError> {
+            let result = runner.run(&crate::process::ProcessRequest {
+                program: "git".into(),
+                args: vec![
+                    "-C".into(),
+                    repository.into(),
+                    "ls-tree".into(),
+                    "-z".into(),
+                    base.as_str().into(),
+                    "--".into(),
+                    path.into(),
+                ],
+                environment: vec![],
+                environment_remove: vec![],
+                stdin: None,
+                policy: ProcessPolicy {
+                    stdout_limit: 8192,
+                    stderr_limit: 4096,
+                    deadline: Duration::from_secs(10),
+                },
+                isolate_parent_environment: false,
+            })?;
+            if !result.status.success() {
+                return Err(setup_error(
+                    "SETUP_FAILED",
+                    "trusted setup snapshot is unavailable",
+                ));
+            }
+            if result.stdout.is_empty() {
+                return Ok(None);
+            }
+            if !result.stdout.starts_with(b"100644 blob ")
+                && !result.stdout.starts_with(b"100755 blob ")
+            {
+                return Err(setup_error(
+                    "SETUP_FAILED",
+                    "trusted setup input is not a regular file",
+                ));
+            }
+            let result = runner.run(&crate::process::ProcessRequest {
+                program: "git".into(),
+                args: vec![
+                    "-C".into(),
+                    repository.into(),
+                    "show".into(),
+                    format!("{}:{path}", base.as_str()).into(),
+                ],
+                environment: vec![],
+                environment_remove: vec![],
+                stdin: None,
+                policy: ProcessPolicy {
+                    stdout_limit: WORKSPACE_FILE_MAX_BYTES as usize,
+                    stderr_limit: 4096,
+                    deadline: Duration::from_secs(10),
+                },
+                isolate_parent_environment: false,
+            })?;
+            if !result.status.success() {
+                return Err(setup_error(
+                    "SETUP_FAILED",
+                    "trusted setup input is unavailable",
+                ));
+            }
+            Ok(Some(result.stdout))
+        };
+        let Some(config) = read(".worker.toml")? else {
+            return Ok(None);
+        };
+        let config = std::str::from_utf8(&config)
+            .map_err(|_| setup_error("SETUP_FAILED", "trusted setup config is not UTF-8"))?;
+        let (requires, recipe) =
+            crate::project_config::ProjectSettings::setup_from_snapshot(config)?;
+        let Some(recipe) = recipe else {
+            return Ok(None);
+        };
+        let mut input_digests = BTreeMap::new();
+        for path in recipe.lockfiles.iter().chain(&recipe.inputs) {
+            let bytes = read(path)?.ok_or_else(|| {
+                setup_error(
+                    "SETUP_FAILED",
+                    "declared setup input is absent from the trusted snapshot",
+                )
+            })?;
+            input_digests.insert(path.clone(), sha256_hex(&bytes));
+        }
+        let recipe = FrozenRecipe {
+            requires,
+            timeout_millis: duration_millis(recipe.timeout)?,
+            commands: recipe.commands,
+            check: recipe.check,
+            lockfiles: recipe.lockfiles,
+            inputs: recipe.inputs,
+            input_digests,
+        };
+        let digest = Self::recipe_digest(&recipe)?;
+        Ok(Some(Self { recipe, digest }))
+    }
+
+    fn recipe_digest(recipe: &FrozenRecipe) -> Result<String, WorkerError> {
+        // Value provides a stable sorted-key encoding, independent of field order.
+        let value = serde_json::to_value(recipe)
+            .map_err(|_| setup_error("SETUP_FAILED", "cannot encode frozen setup"))?;
+        Ok(sha256_hex(&serde_json::to_vec(&value).map_err(|_| {
+            setup_error("SETUP_FAILED", "cannot encode frozen setup")
+        })?))
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.digest != Self::recipe_digest(&self.recipe)? {
+            return Err(setup_error(
+                "SETUP_FAILED",
+                "frozen setup digest does not match",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn requires(&self) -> &[String] {
+        &self.recipe.requires
+    }
+
+    pub fn settings(&self) -> SetupSettings {
+        SetupSettings {
+            timeout: Duration::from_millis(self.recipe.timeout_millis),
+            commands: self.recipe.commands.clone(),
+            check: self.recipe.check.clone(),
+            lockfiles: self.recipe.lockfiles.clone(),
+            inputs: self.recipe.inputs.clone(),
+        }
+    }
+
+    pub fn verify_inputs(&self, workspace: &Path) -> Result<(), WorkerError> {
+        self.validate()?;
+        let paths = self
+            .recipe
+            .input_digests
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let actual = file_digests(workspace, &paths).map_err(|_| setup_inputs_changed())?;
+        if actual != self.recipe.input_digests {
+            return Err(setup_inputs_changed());
+        }
+        Ok(())
+    }
+}
+
+fn setup_inputs_changed() -> WorkerError {
+    setup_error(
+        "SETUP_INPUTS_CHANGED",
+        "setup inputs changed; review the changes and submit a new task to approve them",
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn frozen_setup_fixture(requires: Vec<String>, recipe: SetupSettings) -> FrozenSetup {
+    let recipe = FrozenRecipe {
+        requires,
+        timeout_millis: duration_millis(recipe.timeout).unwrap(),
+        commands: recipe.commands,
+        check: recipe.check,
+        lockfiles: recipe.lockfiles,
+        inputs: recipe.inputs,
+        input_digests: BTreeMap::new(),
+    };
+    FrozenSetup {
+        digest: FrozenSetup::recipe_digest(&recipe).unwrap(),
+        recipe,
+    }
+}
+
 pub struct SetupRequest<'a> {
     pub account_home: &'a Path,
     pub project_id: &'a str,

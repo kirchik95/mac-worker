@@ -1052,7 +1052,12 @@ impl<'a> TurnRunner<'a> {
         let turn = match initial_record.meta().effective_policy() {
             Some(effective) => turn.with_effective_policy(effective)?,
             None => turn,
-        };
+        }
+        .with_frozen_setup(crate::project_readiness::FrozenSetup::from_snapshot(
+            self.runner,
+            transfer.path(),
+            initial_record.meta().base_oid(),
+        )?)?;
         let params = TurnParams {
             kind: turn.agent(),
             model: turn.model().map(str::to_owned),

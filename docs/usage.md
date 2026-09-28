@@ -261,7 +261,11 @@ check = "cargo fetch --locked --offline"   # current workspace only
 lockfiles = ["Cargo.lock"]
 ```
 
-Optional `[setup]` runs in the task workspace with the same account and env-profile as the agent, before the agent starts. Absent `[setup]` keeps today's defaults. `check` proves **this** workspace is ready; a matching identity in another worktree is not skip proof. Toolchains stay user-owned.
+Optional `[setup]` runs in the task workspace with the same account and env-profile as the agent, before the agent starts. The recipe and its digest are frozen from the original submit commit (or operator WIP snapshot); agent edits to `.worker.toml` cannot change it. Absent `[setup]` runs no setup. Older tasks without a frozen recipe also skip setup; submit a new task if setup is needed.
+
+Declare every file that setup or its check executes or consumes in `lockfiles` or `inputs`, including `package.json` and local lifecycle scripts when using npm. Prefer `npm ci --ignore-scripts` if lifecycle scripts are unnecessary. A frozen command alone does not make undeclared, agent-modified scripts safe. Before any setup command **or check**, declared inputs must still match the approved snapshot. A change, deletion, or unsafe file yields `SETUP_INPUTS_CHANGED`: review the changes and submit a new task with the reviewed commit/WIP to approve them. Setup should not rewrite its declared inputs.
+
+For unchanged inputs the per-task receipt cache behaves as before: `check` proves **this** workspace is ready, and a failed check repairs it using the approved commands. A receipt in another worktree is not skip proof. Toolchains stay user-owned.
 
 `worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, and setup without creating tasks, opening client state, or talking to workers. Preview reports `dag.status = "enforced"` (`Dependencies execute when parents are Closed and Done.`). Submit of `depends_on` or `base = "from:<id>"` executes that graph; independent batches stay on today's path. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
 

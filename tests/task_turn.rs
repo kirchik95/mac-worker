@@ -303,6 +303,7 @@ fn prepared_task_turn_with_close(
         &temp.path().join("host"),
         script,
         PreparedTaskTurnSpec {
+            setup: None,
             task_source: TaskSource::Local {
                 wip: false,
                 push_target: None,
@@ -317,13 +318,14 @@ fn prepared_task_turn_with_close(
     (temp, store, request, cancel)
 }
 
-fn prepared_task_turn_with_timeout(
+fn prepared_task_turn_with_setup(
     script: &str,
     timeout_millis: u64,
+    setup: Option<&str>,
 ) -> (
     tempfile::TempDir,
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    TaskTurnRequest,
     TaskCancelRequest,
 ) {
     let temp = tempdir().unwrap();
@@ -331,6 +333,7 @@ fn prepared_task_turn_with_timeout(
         &temp.path().join("host"),
         script,
         PreparedTaskTurnSpec {
+            setup: setup.map(str::to_owned),
             task_source: TaskSource::Local {
                 wip: false,
                 push_target: None,
@@ -359,6 +362,7 @@ fn prepared_push_task_turn(
         &temp.path().join("host"),
         script,
         PreparedTaskTurnSpec {
+            setup: None,
             task_source: TaskSource::Local {
                 wip: false,
                 push_target: Some(PushTarget::new(origin.to_owned()).unwrap()),
@@ -386,6 +390,7 @@ fn request_with_mismatched_origin(
 }
 
 struct PreparedTaskTurnSpec {
+    setup: Option<String>,
     task_source: TaskSource,
     publish: Vec<PublishMode>,
     publish_branch: Option<BranchName>,
@@ -404,6 +409,7 @@ fn prepared_task_turn_at(
     TaskCancelRequest,
 ) {
     let PreparedTaskTurnSpec {
+        setup,
         task_source,
         publish,
         publish_branch,
@@ -414,6 +420,9 @@ fn prepared_task_turn_at(
     let store = HostStore::open(host).unwrap();
     let source = GitRepo::init();
     source.write("base.txt", b"base\n");
+    if let Some(setup) = &setup {
+        source.write(".worker.toml", setup.as_bytes());
+    }
     source.commit_all("base");
     let base_oid: BaseOid = String::from_utf8(source.git(&["rev-parse", "HEAD"]).stdout)
         .unwrap()
@@ -445,6 +454,15 @@ fn prepared_task_turn_at(
         None,
         Uuid::from_u128(2),
         false,
+    )
+    .unwrap()
+    .with_frozen_setup(
+        mac_worker::project_readiness::FrozenSetup::from_snapshot(
+            &SystemProcessRunner,
+            source.root(),
+            &base_oid,
+        )
+        .unwrap(),
     )
     .unwrap();
     let launch = TurnLaunch::new(
@@ -2370,6 +2388,7 @@ fn scoped_close_on_done_leaves_a_peer_task_lease_untouched() {
         &host,
         AUTO_CLOSE_DONE_SCRIPT,
         PreparedTaskTurnSpec {
+            setup: None,
             task_source: TaskSource::Local {
                 wip: false,
                 push_target: None,
@@ -2904,11 +2923,6 @@ fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home() {
     );
 }
 
-fn write_workspace_setup(store: &HostStore, body: &str) {
-    let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
-    fs::write(workspace.join(".worker.toml"), body).unwrap();
-}
-
 fn wait_until_turn_running(store: &HostStore, deadline: Instant) -> PathBuf {
     let job_path = store
         .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
@@ -3001,8 +3015,8 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
         return;
     }
     let script = "printf ran > agent.ran";
-    let (_temp, store, request, cancel_request) = prepared_task_turn(script);
-    write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
+    let (_temp, store, request, cancel_request) =
+        prepared_task_turn_with_setup(script, 30_000, Some(SETUP_SLEEP_RECIPE));
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let submit_store = store.clone();
@@ -3102,6 +3116,7 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
         &host,
         script,
         PreparedTaskTurnSpec {
+            setup: Some(SETUP_SLEEP_RECIPE.into()),
             task_source: TaskSource::Local {
                 wip: false,
                 push_target: None,
@@ -3113,7 +3128,6 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
             close_policy: ClosePolicy::Never,
         },
     );
-    write_workspace_setup(&store, SETUP_SLEEP_RECIPE);
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let launcher =
         SystemSupervisorLauncher::with_executable(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
@@ -3240,15 +3254,17 @@ fn setup_and_agent_share_one_total_turn_budget() {
         return;
     }
     let script = "printf started > agent.started; sleep 8; printf done > agent.ran";
-    let (_temp, store, request, _cancel) = prepared_task_turn_with_timeout(script, 10_000);
-    write_workspace_setup(
-        &store,
-        r#"
+    let (_temp, store, request, _cancel) = prepared_task_turn_with_setup(
+        script,
+        10_000,
+        Some(
+            r#"
 version = 1
 [setup]
 timeout = "20s"
 commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 "#,
+        ),
     );
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));

@@ -187,6 +187,19 @@ impl Default for RawTaskSettings {
 }
 
 impl ProjectSettings {
+    /// Parse the trusted commit's setup without consulting a mutable checkout.
+    pub(crate) fn setup_from_snapshot(
+        contents: &str,
+    ) -> Result<(Vec<String>, Option<SetupSettings>), WorkerError> {
+        let raw: RawProjectSettings = toml::from_str(contents)
+            .map_err(|_| WorkerError::Config("invalid snapshot project configuration".into()))?;
+        validate_requirements(&raw.requires)?;
+        Ok((
+            raw.requires,
+            raw.setup.map(validate_setup_settings).transpose()?,
+        ))
+    }
+
     pub fn load(root: &Path, cli_includes: &[String]) -> Result<Self, WorkerError> {
         let raw = match read_project_config(root)? {
             Some(contents) => toml::from_str(&contents).map_err(|_| {

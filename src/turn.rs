@@ -63,6 +63,7 @@ pub struct TurnMaterial {
     env_profile: Option<String>,
     session_seed: Uuid,
     resume: bool,
+    frozen_setup: Option<crate::project_readiness::FrozenSetup>,
 }
 
 impl TurnMaterial {
@@ -95,6 +96,7 @@ impl TurnMaterial {
             env_profile,
             session_seed,
             resume,
+            frozen_setup: None,
         };
         material.validate()?;
         Ok(material)
@@ -234,6 +236,21 @@ impl TurnMaterial {
         self.resume
     }
 
+    pub fn with_frozen_setup(
+        mut self,
+        setup: Option<crate::project_readiness::FrozenSetup>,
+    ) -> Result<Self, WorkerError> {
+        if let Some(setup) = &setup {
+            setup.validate()?;
+        }
+        self.frozen_setup = setup;
+        Ok(self)
+    }
+
+    pub fn frozen_setup(&self) -> Option<&crate::project_readiness::FrozenSetup> {
+        self.frozen_setup.as_ref()
+    }
+
     fn validate(&self) -> Result<(), WorkerError> {
         if self.turn_number == 0 {
             return Err(turn_error("TURN_INVALID", "turn number must be positive"));
@@ -273,7 +290,9 @@ impl serde::Serialize for TurnMaterial {
         // bytes, and therefore the digest, it had before the field existed.
         let mut record = serializer.serialize_struct(
             "TurnMaterial",
-            11 + usize::from(self.effort.is_some()) + usize::from(self.effective_policy.is_some()),
+            11 + usize::from(self.effort.is_some())
+                + usize::from(self.effective_policy.is_some())
+                + usize::from(self.frozen_setup.is_some()),
         )?;
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("turn_number", &self.turn_number)?;
@@ -292,6 +311,9 @@ impl serde::Serialize for TurnMaterial {
         record.serialize_field("env_profile", &self.env_profile)?;
         record.serialize_field("session_seed", &self.session_seed.to_string())?;
         record.serialize_field("resume", &self.resume)?;
+        if let Some(setup) = &self.frozen_setup {
+            record.serialize_field("frozen_setup", setup)?;
+        }
         record.end()
     }
 }
@@ -316,6 +338,8 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             env_profile: Option<String>,
             session_seed: String,
             resume: bool,
+            #[serde(default)]
+            frozen_setup: Option<crate::project_readiness::FrozenSetup>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let session_seed = Uuid::parse_str(&wire.session_seed)
@@ -334,6 +358,7 @@ impl<'de> serde::Deserialize<'de> for TurnMaterial {
             session_seed,
             wire.resume,
         )
+        .and_then(|material| material.with_frozen_setup(wire.frozen_setup))
         .map_err(D::Error::custom)?;
         match wire.effective_policy {
             Some(effective) => material

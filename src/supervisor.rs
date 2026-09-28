@@ -335,6 +335,14 @@ impl LaunchPlan {
             env.push(("MAC_WORKER_ENV_PROFILE".into(), name.into()));
         }
         env.extend(profile.entries().iter().cloned());
+        if let Some(setup) = section.turn().frozen_setup() {
+            env.push((
+                "MAC_WORKER_FROZEN_SETUP".into(),
+                serde_json::to_string(setup)
+                    .map_err(|_| protocol_code("SETUP_FAILED", "cannot encode frozen setup"))?
+                    .into(),
+            ));
+        }
         for (name, value) in &env {
             if name.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
                 return Err(protocol_code(
@@ -7338,7 +7346,21 @@ mod tests {
             created_at_millis + turn_timeout_millis,
         )
         .unwrap();
-        let section = pump_turn_section();
+        let mut section = pump_turn_section();
+        // This fixture explicitly models an operator-approved recipe.
+        let (requires, recipe) =
+            crate::project_config::ProjectSettings::setup_from_snapshot(setup_toml).unwrap();
+        let frozen = crate::project_readiness::frozen_setup_fixture(requires, recipe.unwrap());
+        section = TurnSection::new(
+            section
+                .turn()
+                .clone()
+                .with_frozen_setup(Some(frozen))
+                .unwrap(),
+            section.project_id(),
+            section.git_identity().clone(),
+        )
+        .unwrap();
         let plan = LaunchPlan::turn_at(
             &command,
             &lease,
