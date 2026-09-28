@@ -1031,6 +1031,7 @@ mod tests {
             "worker task fetch 1".into(),
             None,
             vec![],
+            vec![],
         );
         for json in [false, true] {
             let mut status_bytes = vec![];
