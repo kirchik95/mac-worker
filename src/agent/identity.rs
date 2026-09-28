@@ -31,17 +31,28 @@ pub enum VersionObservation {
 impl AgentIdentity {
     pub(crate) fn redacted(&self, boundary: &RedactionBoundary) -> Self {
         // Keep the useful path below the account home while hiding its owner.
-        let executable = std::env::var_os("HOME")
-            .and_then(|home| std::fs::canonicalize(home).ok())
-            .and_then(|home| {
-                Path::new(&self.executable)
-                    .strip_prefix(home)
-                    .ok()
-                    .map(|p| format!("~/{}", p.display()))
-            })
-            .unwrap_or_else(|| self.executable.clone());
+        let relative = self
+            .executable
+            .strip_prefix("~/")
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .and_then(|home| std::fs::canonicalize(home).ok())
+                    .and_then(|home| {
+                        Path::new(&self.executable)
+                            .strip_prefix(home)
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    })
+            });
+        // Redact the suffix before adding the public home marker; the generic
+        // boundary deliberately removes entire tilde-prefixed paths.
+        let executable = relative.map_or_else(
+            || boundary.text(&self.executable, 4096),
+            |relative| format!("~/{}", boundary.text(&relative, 4094)),
+        );
         Self {
-            executable: boundary.text(&executable, 4096),
+            executable,
             version: self.version.as_ref().map(|v| boundary.text(v, 128)),
             version_observation: self.version_observation,
         }
@@ -116,6 +127,23 @@ mod tests {
             }
             .into())
         }
+    }
+
+    #[test]
+    fn public_home_path_preserves_agent_location_and_redacts_secrets_idempotently() {
+        let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
+        let identity = AgentIdentity {
+            executable: home
+                .join(".local/redaction-test-marker/bin/agent")
+                .to_string_lossy()
+                .into_owned(),
+            version: Some("2.3.4".into()),
+            version_observation: VersionObservation::Observed,
+        };
+        let boundary = RedactionBoundary::from_env().with_secrets(["redaction-test-marker"]);
+        let public = identity.redacted(&boundary);
+        assert_eq!(public.executable, "~/.local/[token]/bin/agent");
+        assert_eq!(public.redacted(&boundary), public);
     }
 
     #[test]
