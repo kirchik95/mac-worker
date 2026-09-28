@@ -229,6 +229,13 @@ fn calculate_cpu_busy(previous: CpuCounters, current: CpuCounters) -> Option<Cpu
     CpuBusyPercent::new(value).ok()
 }
 
+fn push_bounded(samples: &mut VecDeque<ObservationSample>, sample: ObservationSample) {
+    samples.push_back(sample);
+    if samples.len() > MAX_SAMPLES_PER_WORKER {
+        samples.pop_front();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{IDLE_PROBE_INTERVAL_MILLIS, idle_probe_due};
@@ -251,12 +258,5 @@ mod tests {
             true,
             true
         ));
-    }
-}
-
-fn push_bounded(samples: &mut VecDeque<ObservationSample>, sample: ObservationSample) {
-    samples.push_back(sample);
-    if samples.len() > MAX_SAMPLES_PER_WORKER {
-        samples.pop_front();
     }
 }

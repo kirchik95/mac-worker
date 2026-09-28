@@ -34,17 +34,11 @@ pub struct Config {
 /// path to the workers, so the default stays a direct `ssh` for each call.
 /// Turn it on for a host that opens many short sessions, especially the
 /// controller. See the SSH section of `docs/usage.md`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SshConfig {
     #[serde(default)]
     pub multiplex: bool,
-}
-
-impl Default for SshConfig {
-    fn default() -> Self {
-        Self { multiplex: false }
-    }
 }
 
 static INSTALLED_SSH: Mutex<SshConfig> = Mutex::new(SshConfig { multiplex: false });
