@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent_facts::{
-        AgentFacts, EnvProfile as AgentEnvProfile, FactsTiming,
+        AgentFacts, EnvProfile as AgentEnvProfile, FactsClock, FactsTiming, SystemFactsClock,
         collect_agent_facts_at_host_with_overlay, facts_refresh_budget_from_env,
     },
     auth_incidents,
-    error::WorkerError,
+    error::{ProcessError, WorkerError},
     host_store::HostStore,
     lease::{LeaseService, SlotState},
     paths::PathLayout,
@@ -42,6 +42,8 @@ const HOST_COMMAND_POLICY: ProcessPolicy = ProcessPolicy {
 };
 const FACTS_FILE: &str = "facts.json";
 const TOOL_CAPABILITIES_FILE: &str = "tool-capabilities.json";
+/// Per-tool cap inside the facts refresh budget. Live probes keep the 5s host policy.
+const TOOL_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_FACTS_BYTES: u64 = 1024 * 1024;
 const MAX_TOOL_CAPABILITY_BYTES: u64 = 64 * 1024;
 const FACTS_WRITE_RETRIES: usize = 3;
@@ -54,6 +56,15 @@ struct ProcessOutput {
 
 trait CommandExecutor {
     fn output(&self, program: &Path, args: &[&str]) -> io::Result<ProcessOutput>;
+}
+
+trait ToolProbeExecutor {
+    fn output_with_deadline(
+        &self,
+        program: &Path,
+        args: &[&str],
+        deadline: Duration,
+    ) -> io::Result<ProcessOutput>;
 }
 
 trait MemoryPressureQuery {
@@ -100,6 +111,24 @@ impl SystemCommandExecutor {
     #[cfg(test)]
     fn with_policy(policy: ProcessPolicy) -> Self {
         Self { policy }
+    }
+}
+
+impl ToolProbeExecutor for SystemCommandExecutor {
+    fn output_with_deadline(
+        &self,
+        program: &Path,
+        args: &[&str],
+        deadline: Duration,
+    ) -> io::Result<ProcessOutput> {
+        let executor = SystemCommandExecutor {
+            policy: ProcessPolicy {
+                stdout_limit: self.policy.stdout_limit,
+                stderr_limit: self.policy.stderr_limit,
+                deadline,
+            },
+        };
+        executor.output(program, args)
     }
 }
 
@@ -259,6 +288,7 @@ impl ProbeCollector {
         clear_auth_incidents: bool,
         budget: Duration,
     ) -> Result<(AgentFacts, FactsTiming), WorkerError> {
+        let clock = SystemFactsClock::new();
         HostStore::open(host_state_root)?;
         if clear_auth_incidents {
             auth_incidents::clear_all(host_state_root)?;
@@ -274,7 +304,7 @@ impl ProbeCollector {
             budget,
         );
         write_cached_facts(host_state_root, &facts)?;
-        write_tool_capability_cache(host_state_root)?;
+        write_tool_capability_cache(host_state_root, budget, &clock)?;
         overlay?;
         Ok((facts, timing))
     }
@@ -480,23 +510,119 @@ fn cached_tools_are_ordered(tools: &[String]) -> bool {
     true
 }
 
-fn write_tool_capability_cache(host_state_root: &Path) -> Result<(), WorkerError> {
+fn write_tool_capability_cache(
+    host_state_root: &Path,
+    budget: Duration,
+    clock: &dyn FactsClock,
+) -> Result<(), WorkerError> {
     let search_paths = CONTROLLED_HOST_PATHS
         .iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    let detected = collect_capabilities(
-        &SystemCommandExecutor::default(),
+    refresh_tool_capability_cache(
+        host_state_root,
         &search_paths,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        None,
-    );
-    let tools = detected
-        .into_iter()
-        .filter(|name| name != "darwin-arm64")
-        .collect::<Vec<_>>();
+        &SystemCommandExecutor::default(),
+        budget,
+        clock,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ToolObservation {
+    Unprobed,
+    Present,
+    Absent,
+}
+
+/// Time left for one tool version command: the 2s cap, or whatever the facts
+/// refresh budget still has. `None` means later tools must not start.
+fn tool_probe_allowance(budget: Duration, elapsed: Duration) -> Option<Duration> {
+    let remaining = budget.saturating_sub(elapsed);
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(TOOL_PROBE_DEADLINE.min(remaining))
+    }
+}
+
+fn tool_probe_timed_out(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<WorkerError>())
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    WorkerError::Process(ProcessError::DeadlineExceeded { .. })
+                )
+            })
+}
+
+fn refresh_tool_capability_cache(
+    host_state_root: &Path,
+    search_paths: &[PathBuf],
+    executor: &impl ToolProbeExecutor,
+    budget: Duration,
+    clock: &dyn FactsClock,
+) -> Result<(), WorkerError> {
+    let previous = load_cached_tools(host_state_root);
+    let had_cache = previous.is_some();
+    let previous = previous.unwrap_or_default();
+    let mut observed = vec![ToolObservation::Unprobed; TOOL_PROBES.len()];
+    for (index, probe) in TOOL_PROBES.iter().enumerate() {
+        if tool_probe_allowance(budget, clock.now()).is_none() {
+            break;
+        }
+        observed[index] = observe_tool(probe, search_paths, executor, budget, clock)?;
+    }
+    let probed_any = observed
+        .iter()
+        .any(|observation| !matches!(observation, ToolObservation::Unprobed));
+    if !probed_any && !had_cache {
+        return Ok(());
+    }
+    let tools = merge_observed_tools(&previous, &observed);
     store_tool_capabilities(host_state_root, &tools)
+}
+
+fn observe_tool(
+    probe: &ToolProbe,
+    search_paths: &[PathBuf],
+    executor: &impl ToolProbeExecutor,
+    budget: Duration,
+    clock: &dyn FactsClock,
+) -> Result<ToolObservation, WorkerError> {
+    for executable in probe.executables {
+        let Some(program) = find_executable(search_paths, executable) else {
+            continue;
+        };
+        let Some(deadline) = tool_probe_allowance(budget, clock.now()) else {
+            return Ok(ToolObservation::Unprobed);
+        };
+        match executor.output_with_deadline(&program, probe.argv, deadline) {
+            Ok(output) if output.code == Some(0) => return Ok(ToolObservation::Present),
+            Ok(_) => {}
+            Err(error) if tool_probe_timed_out(&error) => return Ok(ToolObservation::Unprobed),
+            Err(error) => return Err(WorkerError::Io(error)),
+        }
+    }
+    Ok(ToolObservation::Absent)
+}
+
+fn merge_observed_tools(previous: &[String], observed: &[ToolObservation]) -> Vec<String> {
+    TOOL_PROBES
+        .iter()
+        .zip(observed)
+        .filter_map(|(probe, observation)| {
+            let keep = match observation {
+                ToolObservation::Present => true,
+                ToolObservation::Absent => false,
+                ToolObservation::Unprobed => previous.iter().any(|name| name == probe.capability),
+            };
+            keep.then(|| probe.capability.to_owned())
+        })
+        .collect()
 }
 
 fn store_tool_capabilities(host_state_root: &Path, tools: &[String]) -> Result<(), WorkerError> {
@@ -870,7 +996,7 @@ mod tests {
         fs, io,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
-        sync::Mutex,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -882,6 +1008,7 @@ mod tests {
         parse_available_memory_bytes,
     };
     use crate::{
+        agent_facts::FactsClock,
         error::{ProcessError, ProcessStream, WorkerError},
         lease::SlotState,
         process::ProcessPolicy,
@@ -1288,6 +1415,112 @@ mod tests {
             .replace_private_regular_exact(super::TOOL_CAPABILITIES_FILE, &previous, b"{not json")
             .unwrap();
         assert!(super::load_cached_tools(root.path()).is_none());
+    }
+
+    struct BudgetClock {
+        now: Mutex<Duration>,
+    }
+
+    impl crate::agent_facts::FactsClock for BudgetClock {
+        fn now(&self) -> Duration {
+            *self.now.lock().expect("facts clock")
+        }
+    }
+
+    struct SlowToolExecutor {
+        clock: Arc<BudgetClock>,
+        budget: Duration,
+        calls: Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl super::ToolProbeExecutor for SlowToolExecutor {
+        fn output_with_deadline(
+            &self,
+            program: &Path,
+            _args: &[&str],
+            deadline: Duration,
+        ) -> io::Result<super::ProcessOutput> {
+            let name = program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let elapsed = self.clock.now();
+            assert!(
+                deadline <= super::TOOL_PROBE_DEADLINE,
+                "tool deadline {deadline:?} exceeds the per-tool cap"
+            );
+            assert!(
+                deadline <= self.budget.saturating_sub(elapsed),
+                "tool deadline {deadline:?} exceeds the remaining facts budget"
+            );
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((name.clone(), deadline));
+            if name == "git" {
+                return Ok(super::ProcessOutput {
+                    code: Some(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            *self.clock.now.lock().expect("facts clock") += deadline;
+            Err(io::Error::new(io::ErrorKind::TimedOut, "slow tool"))
+        }
+    }
+
+    #[test]
+    fn slow_tool_version_probe_stays_within_the_facts_budget_and_keeps_unprobed_tools() {
+        // 2.5s budget: git is fast (2s cap, no time used), rsync runs until its
+        // 2s cap, node gets the remaining 500ms, and later tools are not started.
+        let bin = tempdir().unwrap();
+        for name in ["git", "rsync", "node"] {
+            executable(bin.path(), name);
+        }
+        let host = tempdir().unwrap();
+        let mut permissions = fs::metadata(host.path()).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(host.path(), permissions).unwrap();
+        let previous = vec![
+            "git".to_owned(),
+            "node".to_owned(),
+            "swift".to_owned(),
+            "docker".to_owned(),
+        ];
+        super::store_tool_capabilities(host.path(), &previous).unwrap();
+
+        let budget = Duration::from_millis(2_500);
+        let clock = Arc::new(BudgetClock {
+            now: Mutex::new(Duration::ZERO),
+        });
+        let executor = SlowToolExecutor {
+            clock: Arc::clone(&clock),
+            budget,
+            calls: Mutex::new(Vec::new()),
+        };
+        super::refresh_tool_capability_cache(
+            host.path(),
+            &[bin.path().to_path_buf()],
+            &executor,
+            budget,
+            clock.as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            executor.calls.lock().expect("calls").as_slice(),
+            [
+                ("git".to_owned(), Duration::from_secs(2)),
+                ("rsync".to_owned(), Duration::from_secs(2)),
+                ("node".to_owned(), Duration::from_millis(500)),
+            ]
+        );
+        assert_eq!(clock.now(), budget);
+        assert_eq!(
+            super::load_cached_tools(host.path()).as_deref(),
+            Some(previous.as_slice())
+        );
     }
 
     #[test]
