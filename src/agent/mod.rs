@@ -550,7 +550,21 @@ impl StructuredResult {
 
     fn with_output_presence(mut self, stream: &str) -> Self {
         if self.parse_reason == Some(ResultParseReason::EmptyOutput) && !stream.trim().is_empty() {
-            self.parse_reason = Some(ResultParseReason::NoResultJson);
+            let last_line = stream
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            self.parse_reason = Some(
+                if last_line.starts_with('{')
+                    && serde_json::from_str::<serde_json::Value>(last_line)
+                        .is_err_and(|error| error.is_eof())
+                {
+                    ResultParseReason::Truncated
+                } else {
+                    ResultParseReason::NoResultJson
+                },
+            );
         }
         self
     }

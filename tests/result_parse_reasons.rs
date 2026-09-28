@@ -61,3 +61,22 @@ fn malformed_result_fixtures_have_typed_safe_reasons() {
         );
     }
 }
+
+#[test]
+fn truncated_stream_envelope_is_distinguished_from_non_json_output() {
+    for kind in [
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Cursor,
+        AgentKind::Opencode,
+    ] {
+        let result = adapter_for(kind)
+            .extract_result("{\"type\":\"result\",\"result\":\"unfinished", None)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result.parse_reason()).unwrap(),
+            "truncated",
+            "{kind:?}"
+        );
+    }
+}
