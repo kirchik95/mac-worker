@@ -2226,7 +2226,9 @@ fn undrainable_failure_status(
         last.log_truncated(),
         last.started_at_millis(),
         Some(ended_at_millis),
-    );
+    )
+    .with_parse_reason(last.result_parse_reason())
+    .with_agent_identity(last.agent_identity().cloned());
     *turns
         .last_mut()
         .expect("cloned last turn must remain present") = replacement;
@@ -2644,7 +2646,9 @@ fn publication_failure_status(
             last.log_truncated(),
             last.started_at_millis(),
             Some(ended_at_millis),
-        );
+        )
+        .with_parse_reason(last.result_parse_reason())
+        .with_agent_identity(last.agent_identity().cloned());
         *turns
             .last_mut()
             .expect("cloned last turn must remain present") = replacement;
@@ -3008,6 +3012,55 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             last_post_acceptance_public_code(b"exited: CAPACITY_BUSY workers=mini-1\n"),
             None
         );
+    }
+
+    #[test]
+    fn local_failure_rewrites_preserve_remote_turn_diagnostics() {
+        use super::{publication_failure_status, undrainable_failure_status};
+        use crate::task::{TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal};
+        let identity = crate::agent::AgentIdentity {
+            executable: "~/bin/agent".into(),
+            version: Some("2.3.4".into()),
+            version_observation: crate::agent::VersionObservation::Observed,
+        };
+        let turn = TurnSummary::new(
+            1,
+            TurnId::new(uuid::Uuid::new_v4()),
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Unknown),
+            Some(false),
+            false,
+            Some(1),
+            Some(2),
+        )
+        .with_agent_identity(Some(identity.clone()))
+        .with_parse_reason(Some(crate::agent::ResultParseReason::NoResultJson));
+        let terminal = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Unknown),
+            Some("mini-1".into()),
+            true,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![turn.clone()],
+            2,
+        )
+        .unwrap();
+        for rewritten in [
+            publication_failure_status(&terminal, TaskOutcome::failed("PUBLISH_FAILED"), 3)
+                .unwrap(),
+            undrainable_failure_status(&terminal, turn.turn_id(), 3).unwrap(),
+        ] {
+            let last = rewritten.turns().last().unwrap();
+            assert_eq!(last.agent_identity(), Some(&identity));
+            assert_eq!(
+                last.result_parse_reason(),
+                Some(crate::agent::ResultParseReason::NoResultJson)
+            );
+        }
     }
 
     #[test]
