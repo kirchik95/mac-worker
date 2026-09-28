@@ -5346,7 +5346,12 @@ fn controller_task_result(
         &config.controller,
         &request,
     )?;
-    Ok(reply.into_result().into_report())
+    // Status already carries warnings in the legacy protocol. Fetch it only
+    // for result rendering, after the result reply's identity was verified.
+    let status = controller_task_status(runner, config, task_id)?;
+    Ok(reply
+        .into_result()
+        .into_report_with_warnings(status.warnings().to_vec()))
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {

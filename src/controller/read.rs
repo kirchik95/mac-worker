@@ -370,13 +370,20 @@ pub struct ControllerTaskResult {
     delivery: Option<OriginDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deliveries: Vec<OriginDelivery>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Accept the short-lived wave-2 field on reads, but never emit it: the
+    // legacy result decoder is strict. Status is the compatible warning source.
+    #[serde(default, skip_serializing)]
     warnings: Vec<String>,
 }
 
 impl ControllerTaskResult {
     pub fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    pub fn into_report_with_warnings(mut self, warnings: Vec<String>) -> TaskResultReport {
+        self.warnings = warnings;
+        self.into_report()
     }
 
     pub fn into_report(self) -> TaskResultReport {
