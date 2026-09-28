@@ -1328,7 +1328,8 @@ fn run_task_command(
         };
         let notifier = herdr_notifier_socket(&config, runtime);
         let client = TaskClient::new(runner, &config, &paths, &client_state, executor)
-            .with_herdr_notifier(notifier.clone());
+            .with_herdr_notifier(notifier.clone())
+            .with_json_events(json);
 
         match command {
             Command::Runner {

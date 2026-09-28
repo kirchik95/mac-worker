@@ -486,8 +486,10 @@ and code without an interruption hook must finish before that join completes.
 
 Pause new runner handoffs with `worker controller drain`; resume with `worker controller drain --off`.
 The flag survives leader restarts. Requests continue to be accepted and persisted while drained;
-already-running turns finish. The shared launch gate covers ordinary, recovery, replacement, and
-completion-triggered runners. `status` reports `drained`; unreadable drain state fails closed.
+already-running turns finish. Local attached `task submit --wait` and `task say --wait` keep their
+turn queued and wait for drain to lift, then retry admission. A wait timeout leaves the turn queued
+for recovery. The shared launch gate covers ordinary, recovery, replacement, and completion-triggered
+runners, plus reassignment to parked turns. `status` reports `drained`; unreadable drain state fails closed.
 
 `worker controller disable` unloads the remote LaunchAgent and sets laptop `enabled = false`.
 It preserves both inventories, task state, keys, and trusted hosts. Finish controller work before

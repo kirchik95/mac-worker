@@ -1050,6 +1050,8 @@ pub struct TaskClient<'a> {
     pub(crate) client_state: &'a ClientStateStore,
     pub(crate) executor: &'a dyn RunnerExecutor,
     pub(crate) herdr_notifier: Option<crate::herdr::HerdrSocket>,
+    json_events: bool,
+    drain_wait: Option<&'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync)>,
 }
 
 impl<'a> TaskClient<'a> {
@@ -1067,6 +1069,8 @@ impl<'a> TaskClient<'a> {
             client_state,
             executor,
             herdr_notifier: None,
+            json_events: false,
+            drain_wait: None,
         }
     }
 
@@ -1074,6 +1078,22 @@ impl<'a> TaskClient<'a> {
     /// finished turns.  Detached runners receive theirs from the CLI.
     pub fn with_herdr_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
         self.herdr_notifier = socket;
+        self
+    }
+
+    /// Emit attached admission notices as JSON events on stdout.
+    pub fn with_json_events(mut self, json: bool) -> Self {
+        self.json_events = json;
+        self
+    }
+
+    /// Deterministic drain polling for embedders and admission tests.
+    #[doc(hidden)]
+    pub fn with_drain_wait(
+        mut self,
+        wait: &'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync),
+    ) -> Self {
+        self.drain_wait = Some(wait);
         self
     }
 
@@ -1207,7 +1227,7 @@ impl<'a> TaskClient<'a> {
         turn_id_override: Option<TurnId>,
         title: Option<String>,
         stdout: &mut dyn Write,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
         skip_reconcile: bool,
         frozen: Option<FrozenSubmit<'_>>,
         original_created_at: Option<u64>,
@@ -1892,12 +1912,14 @@ impl<'a> TaskClient<'a> {
             self.client_state
                 .clear_submission_intent(current.without_submission_intent()?)?;
         }
+        let mut drained = false;
         if !(resuming && self.submission_handoff_already_adopted(task_id, turn_id)?) {
             match self.start_runner(task_id, turn_id, request.attached, false)? {
                 RunnerStart::Started(_) => {
                     report.runner = self.client_state.runner_liveness(task_id)?;
                 }
                 RunnerStart::Pending => {}
+                RunnerStart::Drained => drained = true,
                 RunnerStart::Saturated => {
                     // Parking publishes eligibility to an independent runner. A park
                     // error may therefore mean ownership already transferred, so
@@ -1921,6 +1943,9 @@ impl<'a> TaskClient<'a> {
         drop(submit_guard);
         report.events.push(event_task_created(&report));
         if request.attached {
+            if drained {
+                self.wait_for_drain_admission(task_id, turn_id, stdout, stderr)?;
+            }
             let mut follow = stdout;
             let outcome = TurnRunner::new(
                 self.runner,
@@ -3092,7 +3117,7 @@ impl<'a> TaskClient<'a> {
                 }
                 match self.start_runner(record.meta().task_id(), turn_id, false, false)? {
                     RunnerStart::Started(_) => report.started_runners += 1,
-                    RunnerStart::Pending | RunnerStart::Saturated => {}
+                    RunnerStart::Pending | RunnerStart::Drained | RunnerStart::Saturated => {}
                 }
             }
         }
@@ -3329,7 +3354,7 @@ impl<'a> TaskClient<'a> {
             }
             match self.start_runner(task_id, entry.job_id(), false, false)? {
                 RunnerStart::Started(_) => report.started_runners += 1,
-                RunnerStart::Pending | RunnerStart::Saturated => {}
+                RunnerStart::Pending | RunnerStart::Drained | RunnerStart::Saturated => {}
             }
         }
         Ok(())
@@ -3354,7 +3379,7 @@ impl<'a> TaskClient<'a> {
         message: String,
         attached: bool,
         stdout: &mut dyn Write,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
         let prepared = PreparedFollowup::prepare(
             expected,
@@ -3362,7 +3387,7 @@ impl<'a> TaskClient<'a> {
             TurnId::generate(),
             current_time_millis()?,
         )?;
-        self.say_prepared(&prepared, attached, stdout, _stderr)
+        self.say_prepared(&prepared, attached, stdout, stderr)
     }
 
     /// Performs one prepared follow-up, converging to a single new turn across
@@ -3372,7 +3397,7 @@ impl<'a> TaskClient<'a> {
         prepared: &PreparedFollowup,
         attached: bool,
         stdout: &mut dyn Write,
-        _stderr: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
@@ -3386,7 +3411,7 @@ impl<'a> TaskClient<'a> {
         prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
-            return self.resume_prepared_followup(prepared, &current, attached, stdout);
+            return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
         if !operator_revision_matches(&current, expected) {
             return Err(task_error(
@@ -3471,13 +3496,11 @@ impl<'a> TaskClient<'a> {
                     .client_state
                     .update_task_if_current(&current, rebased.clone())?
                 {
-                    return self
-                        .reload_resume_or_conflict(prepared, task_id, turn_id, attached, stdout);
+                    return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
                 }
                 rebased
             } else {
-                return self
-                    .reload_resume_or_conflict(prepared, task_id, turn_id, attached, stdout);
+                return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
             }
         };
         let entry = match self.client_state.queue_entry_for_task_turn(task_id)? {
@@ -3487,11 +3510,14 @@ impl<'a> TaskClient<'a> {
             }
             None => self.enqueue_prepared_followup(prepared, expected)?,
         };
-        match self.start_runner(task_id, turn_id, attached, false) {
-            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
+        let drained = match self.start_runner(task_id, turn_id, attached, false) {
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => false,
+            Ok(RunnerStart::Drained) => true,
             Ok(RunnerStart::Saturated) => {
                 self.park_prepared_turn(turn_id)?;
+                false
             }
+            Err(error) if attached && error.public_code() == "WAIT_TIMEOUT" => return Err(error),
             Err(error) => {
                 return Err(self.fail_handoff(
                     task_id,
@@ -3500,10 +3526,13 @@ impl<'a> TaskClient<'a> {
                     error,
                 ));
             }
-        }
+        };
         let mut report = self.report_fenced_say(&committed, task_id, turn_id)?;
         report.events.push(event_task_created(&report));
         if attached {
+            if drained {
+                self.wait_for_drain_admission(task_id, turn_id, stdout, stderr)?;
+            }
             let outcome = TurnRunner::new(
                 self.runner,
                 self.config,
@@ -3526,6 +3555,7 @@ impl<'a> TaskClient<'a> {
         current: &LocalTaskRecord,
         attached: bool,
         stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
@@ -3610,11 +3640,14 @@ impl<'a> TaskClient<'a> {
                 self.enqueue_prepared_followup(prepared, current)?
             }
         };
-        match self.start_runner(task_id, turn_id, attached, false) {
-            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => {}
+        let drained = match self.start_runner(task_id, turn_id, attached, false) {
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => false,
+            Ok(RunnerStart::Drained) => true,
             Ok(RunnerStart::Saturated) => {
                 self.park_prepared_turn(turn_id)?;
+                false
             }
+            Err(error) if attached && error.public_code() == "WAIT_TIMEOUT" => return Err(error),
             Err(error) => {
                 return Err(self.fail_handoff(
                     task_id,
@@ -3623,10 +3656,13 @@ impl<'a> TaskClient<'a> {
                     error,
                 ));
             }
-        }
+        };
         let mut report = self.report_fenced_say(current, task_id, turn_id)?;
         report.events.push(event_task_created(&report));
         if attached {
+            if drained {
+                self.wait_for_drain_admission(task_id, turn_id, stdout, stderr)?;
+            }
             let outcome = TurnRunner::new(
                 self.runner,
                 self.config,
@@ -3702,14 +3738,15 @@ impl<'a> TaskClient<'a> {
     fn reload_resume_or_conflict(
         &self,
         prepared: &PreparedFollowup,
-        task_id: TaskId,
-        turn_id: TurnId,
         attached: bool,
         stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
         let current = self.client_state.load_task(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
-            return self.resume_prepared_followup(prepared, &current, attached, stdout);
+            return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
         Err(task_error(
             "TASK_REVISION_CONFLICT",
@@ -4998,6 +5035,21 @@ impl<'a> TaskClient<'a> {
         attached: bool,
         exclude_reserver: bool,
     ) -> Result<RunnerStart, WorkerError> {
+        match self.try_start_runner(task_id, turn_id, attached, exclude_reserver) {
+            Err(error) if attached && error.public_code() == "WAIT_TIMEOUT" => {
+                Err(self.queued_wait_timeout(turn_id))
+            }
+            result => result,
+        }
+    }
+
+    fn try_start_runner(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        attached: bool,
+        exclude_reserver: bool,
+    ) -> Result<RunnerStart, WorkerError> {
         if self.task_has_submission_recovery_pending(task_id)? {
             return Err(task_error(
                 "TASK_SUBMISSION_RECOVERY_PENDING",
@@ -5022,7 +5074,7 @@ impl<'a> TaskClient<'a> {
         } else {
             self.config.configured_runner_slots()
         };
-        start_runner_with_reservation(
+        let result = start_runner_with_reservation(
             self.client_state,
             self.executor,
             self.paths,
@@ -5030,6 +5082,106 @@ impl<'a> TaskClient<'a> {
             turn_id,
             slot_limit,
             exclude_reserver,
+        )?;
+        if attached && result == RunnerStart::Drained {
+            // Do not enter the drain wait until we own its row. A resumed
+            // request can name a dead process or be parked by an earlier
+            // timeout. Recheck under the journal fence and the queue CAS.
+            loop {
+                let expected = self.client_state.queue_entry(turn_id)?.ok_or_else(|| {
+                    task_error("TASK_BUSY", "task turn was retired before handoff")
+                })?;
+                if expected.owner_opt() == Some(&caller) {
+                    break;
+                }
+                if expected.owner_opt().is_some_and(|owner| {
+                    self.client_state.runner_identity_verdict(*owner)
+                        != RunnerLivenessVerdict::Exited
+                }) {
+                    // A competing admission won before this caller retained
+                    // the row. Preserve the existing live-owner outcome.
+                    return Ok(RunnerStart::Pending);
+                }
+                if let Some(log) =
+                    crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, turn_id)?
+                {
+                    if log.current_entry(self.client_state)?.as_ref() == Some(&expected)
+                        && self
+                            .client_state
+                            .retain_attached_row_if_current(&expected, caller)?
+                    {
+                        break;
+                    }
+                } else {
+                    self.client_state.runner_log_contention();
+                }
+                std::thread::sleep(self.client_state.wait_deadline().poll_delay()?);
+            }
+        }
+        Ok(result)
+    }
+
+    fn wait_for_drain_admission(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<(), WorkerError> {
+        const MESSAGE: &str = "controller is draining; the turn is queued and will start after `worker controller drain --off`";
+        if self.json_events {
+            serde_json::to_writer(
+                &mut *stdout,
+                &serde_json::json!({
+                    "type": "controller_draining",
+                    "protocol_version": crate::protocol::PROTOCOL_VERSION,
+                    "task_id": task_id,
+                    "turn_id": turn_id,
+                    "message": MESSAGE,
+                }),
+            )
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+        } else {
+            writeln!(stderr, "{MESSAGE}")?;
+            stderr.flush()?;
+        }
+        let result: Result<(), WorkerError> = (|| {
+            loop {
+                let delay = self.client_state.wait_deadline().poll_delay()?;
+                if let Some(wait) = self.drain_wait {
+                    wait(delay)?;
+                } else {
+                    std::thread::sleep(delay);
+                }
+                self.client_state.wait_deadline().remaining()?;
+                // Retry the same admission, retaining its drain permit through
+                // spawn and ownership publication. No permit spans this wait
+                // or the subsequent TurnRunner::run.
+                if matches!(
+                    self.start_runner(task_id, turn_id, true, false)?,
+                    RunnerStart::Started(_)
+                ) {
+                    return Ok(());
+                }
+            }
+        })();
+        match result {
+            Err(error) if error.public_code() == "WAIT_TIMEOUT" => {
+                Err(self.queued_wait_timeout(turn_id))
+            }
+            result => result,
+        }
+    }
+
+    fn queued_wait_timeout(&self, turn_id: TurnId) -> WorkerError {
+        if let Ok(owner) = current_process_identity() {
+            let _ = self.client_state.try_park_attached_waiter(turn_id, owner);
+        }
+        task_error(
+            "WAIT_TIMEOUT",
+            "task wait timed out; the turn remains queued for admission after `worker controller drain --off`",
         )
     }
 
@@ -5116,7 +5268,7 @@ impl<'a> TaskClient<'a> {
         // exclude_reserver belongs only to TurnRunner::start_next_parked.
         match self.start_runner(task_id, turn_id, false, false) {
             Ok(RunnerStart::Started(_)) => Ok(ParkedStart::Started),
-            Ok(RunnerStart::Pending) => Ok(ParkedStart::Deferred),
+            Ok(RunnerStart::Pending | RunnerStart::Drained) => Ok(ParkedStart::Deferred),
             Ok(RunnerStart::Saturated) => {
                 self.client_state.park_row(turn_id)?;
                 Ok(ParkedStart::Stopped)
@@ -6541,6 +6693,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drain_admission_checks_expired_deadline_before_reading_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: root.path().canonicalize().unwrap().join("config.toml"),
+            state: root.path().canonicalize().unwrap().join("state"),
+            cache: root.path().canonicalize().unwrap().join("cache"),
+            data: root.path().canonicalize().unwrap().join("data"),
+        };
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        crate::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+        // The expired budget must win even if another setter holds the gate.
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.controller_state_root().join("drain.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let expired =
+            store.with_wait_deadline(WaitDeadline::until(Some(std::time::Instant::now())));
+        let result = start_runner_with_reservation(
+            &expired,
+            &crate::turn_runner::InlineRunnerExecutor,
+            &paths,
+            TaskId::generate(),
+            TurnId::generate(),
+            1,
+            false,
+        );
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+    }
+
+    #[test]
+    fn drain_wait_expired_monotonic_deadline_does_not_poll_or_start() {
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("expired drain wait cannot reach a worker");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: root.path().canonicalize().unwrap().join("config.toml"),
+            state: root.path().canonicalize().unwrap().join("state"),
+            cache: root.path().canonicalize().unwrap().join("cache"),
+            data: root.path().canonicalize().unwrap().join("data"),
+        };
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let expired =
+            store.with_wait_deadline(WaitDeadline::until(Some(std::time::Instant::now())));
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"fixture\"\nssh = \"never-connect\"\nslots = 1\n",
+        )
+        .unwrap();
+        let poll = |_| -> Result<(), WorkerError> { panic!("expired wait must not poll") };
+        let client = TaskClient::new(
+            &NoProcesses,
+            &config,
+            &paths,
+            &expired,
+            &crate::turn_runner::InlineRunnerExecutor,
+        )
+        .with_drain_wait(&poll);
+        let error = client
+            .wait_for_drain_admission(
+                TaskId::generate(),
+                TurnId::generate(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+        assert!(error.to_string().contains("queued"));
+    }
+
+    #[test]
     fn wait_deadline_ignores_forward_and_backward_wall_clock_observations() {
         let monotonic = std::time::Instant::now();
         let wall = UNIX_EPOCH + Duration::from_secs(10_000);
@@ -6745,7 +6979,7 @@ mod tests {
             &crate::turn_runner::InlineRunnerExecutor,
         );
         let report = client
-            .resume_prepared_followup(&prepared, &saved, false, &mut Vec::new())
+            .resume_prepared_followup(&prepared, &saved, false, &mut Vec::new(), &mut Vec::new())
             .unwrap();
         assert_eq!(report.status().turns().len(), 2);
         assert_eq!(report.status().turns().last().unwrap().turn_id(), turn_n);

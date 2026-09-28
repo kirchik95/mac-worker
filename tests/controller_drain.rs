@@ -199,7 +199,7 @@ fn drained_controller_blocks_all_shared_runner_handoffs_before_reservation() {
 
         assert_eq!(
             fixture.launch(&executor, exclude_reserver).unwrap(),
-            RunnerStart::Pending,
+            RunnerStart::Drained,
             "drain must defer every path through the shared handoff"
         );
         assert_eq!(executor.starts(), 0);

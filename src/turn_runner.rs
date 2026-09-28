@@ -120,6 +120,8 @@ pub trait RunnerExecutor: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerStart {
     Started(RunnerIdentity),
+    /// Admission was refused by the persistent controller drain gate.
+    Drained,
     Pending,
     Saturated,
 }
@@ -611,7 +613,7 @@ impl<'a> TurnRunner<'a> {
             self.config.configured_runner_slots(),
             true,
         ) {
-            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => Ok(()),
+            Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending | RunnerStart::Drained) => Ok(()),
             Ok(RunnerStart::Saturated) => {
                 self.client_state.park_row(entry.job_id())?;
                 Ok(())
@@ -868,15 +870,12 @@ impl<'a> TurnRunner<'a> {
                                 &missing,
                             )?);
                         }
-                        if let Some((next_task, claim)) =
-                            self.client_state.claim_parked_for_waiting_runner(
-                                task_id,
-                                turn_id,
-                                runner_owner,
-                                &observations,
-                                now_millis()?,
-                            )?
-                        {
+                        if let Some((next_task, claim)) = self.claim_parked_if_admitted(
+                            task_id,
+                            turn_id,
+                            runner_owner,
+                            &observations,
+                        )? {
                             return Ok((next_task, claim.entry().job_id(), runner_owner));
                         }
                     }
@@ -885,6 +884,31 @@ impl<'a> TurnRunner<'a> {
             std::thread::sleep(Duration::from_secs(backoff));
             backoff = (backoff * 2).min(MAX_CAPACITY_BACKOFF_SECS);
         }
+    }
+
+    fn claim_parked_if_admitted(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        observations: &[CandidateObservation],
+    ) -> Result<Option<(TaskId, crate::job::QueueClaim)>, WorkerError> {
+        // Reusing a process still starts a different turn. Fence the queue
+        // claim and recipient ownership publication just like a new spawn.
+        let Some(_drain_permit) = crate::controller::drain::launch_permit(
+            &self.paths.controller_state_root(),
+            self.client_state.wait_deadline(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.client_state.claim_parked_for_waiting_runner(
+            task_id,
+            turn_id,
+            owner,
+            observations,
+            now_millis()?,
+        )
     }
 
     fn require_runner_entry(
@@ -2310,7 +2334,7 @@ fn undrainable_failure_status(
 }
 
 /// Reserve a spawn permit, start only on [`RunnerSlotDecision::Acquired`], then
-/// adopt the child and clear that token. `Pending` and `Saturated` never spawn.
+/// adopt the child and clear that token. `Drained`, `Pending`, and `Saturated` never spawn.
 pub fn start_runner_with_reservation(
     client_state: &ClientStateStore,
     executor: &dyn RunnerExecutor,
@@ -2320,10 +2344,12 @@ pub fn start_runner_with_reservation(
     slot_limit: usize,
     exclude_reserver: bool,
 ) -> Result<RunnerStart, WorkerError> {
-    let Some(_drain_permit) =
-        crate::controller::drain::launch_permit(&paths.controller_state_root())?
+    let Some(_drain_permit) = crate::controller::drain::launch_permit(
+        &paths.controller_state_root(),
+        client_state.wait_deadline(),
+    )?
     else {
-        return Ok(RunnerStart::Pending);
+        return Ok(RunnerStart::Drained);
     };
     let reserver = current_process_identity()?;
     match client_state.reserve_runner_slot(turn_id, reserver, slot_limit, exclude_reserver)? {
@@ -3201,6 +3227,35 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             data: root.path().join("data"),
         };
         (root, paths)
+    }
+
+    #[test]
+    fn claim_reassignment_drain_defers_before_queue_mutation() {
+        let (_root, paths) = isolated_handoff_paths();
+        let store = crate::client_state::ClientStateStore::open(&paths.state).unwrap();
+        crate::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+        let config = crate::config::Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"never-connect\"\nslots = 1\n",
+        )
+        .unwrap();
+        let owner = super::current_process_identity().unwrap();
+        let before = store.queue_snapshot().unwrap();
+        let result = super::TurnRunner::new(
+            &crate::process::SystemProcessRunner,
+            &config,
+            &paths,
+            &store,
+            &super::InlineRunnerExecutor,
+        )
+        .claim_parked_if_admitted(
+            crate::task::TaskId::generate(),
+            crate::task::TurnId::generate(),
+            owner,
+            &[],
+        )
+        .expect("drain must defer reassignment before attempting a new queue claim");
+        assert!(result.is_none());
+        assert_eq!(store.queue_snapshot().unwrap(), before);
     }
 
     fn plant_reserved_turn(

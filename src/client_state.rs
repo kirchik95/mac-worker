@@ -1395,6 +1395,76 @@ impl ClientStateStore {
         })
     }
 
+    /// Retain an unstarted attached turn while admission is drained. The
+    /// caller holds the journal fence; the queue CAS also fences a concurrent
+    /// reservation, which is published before its launcher takes that fence.
+    pub(crate) fn retain_attached_row_if_current(
+        &self,
+        expected: &QueueEntry,
+        owner: ProcessIdentity,
+    ) -> Result<bool, WorkerError> {
+        owner.validate()?;
+        self.update_queue(|snapshot| {
+            let entry = find_queue_entry_mut(snapshot, expected.job_id())?;
+            if entry != expected
+                || !matches!(
+                    entry.state(),
+                    QueueState::Waiting { .. } | QueueState::Parked
+                )
+                || entry.slot_reservation().is_some_and(|reservation| {
+                    self.observation_counts_as_slot(reservation.reserver())
+                        || reservation
+                            .child()
+                            .is_some_and(|child| self.observation_counts_as_slot(child))
+                })
+                || entry.owner_opt().is_some_and(|previous| {
+                    *previous != owner
+                        && self.runner_identity_verdict(*previous) != RunnerLivenessVerdict::Exited
+                })
+            {
+                return Ok((false, false));
+            }
+            let changed = entry.owner_opt() != Some(&owner) || entry.slot_reservation().is_some();
+            entry.set_slot_reservation(None)?;
+            if matches!(entry.state(), QueueState::Parked) {
+                entry.unpark(owner)?;
+            } else {
+                entry.adopt(owner)?;
+            }
+            Ok((true, changed))
+        })
+    }
+
+    /// Best-effort release after an attached wait expires. Never extend an
+    /// expired budget or park a turn that has acquired a spawn reservation.
+    pub(crate) fn try_park_attached_waiter(
+        &self,
+        turn_id: JobId,
+        owner: ProcessIdentity,
+    ) -> Result<(), WorkerError> {
+        let _lock = QueueLock::acquire_inner(
+            self.inner.root.as_raw_fd(),
+            self.inner.queue.as_raw_fd(),
+            &self.inner.sync_counts,
+            WaitDeadline::default(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )?;
+        self.update_queue_locked(|snapshot| {
+            let Some(entry) = snapshot.entries.iter_mut().find(|entry| entry.job_id() == turn_id)
+            else {
+                return Ok(((), false));
+            };
+            if entry.kind() == QueueEntryKind::TaskTurn
+                && matches!(entry.state(), QueueState::Waiting { owner: current } if *current == owner)
+                && entry.slot_reservation().is_none()
+            {
+                entry.park()?;
+                return Ok(((), true));
+            }
+            Ok(((), false))
+        })
+    }
+
     /// Restore a journal-proven acceptance without admission. The journal's
     /// writer lock must be held by the caller; the current queue owner is
     /// checked again while publishing the dispatch.

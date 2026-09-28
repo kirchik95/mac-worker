@@ -92,14 +92,18 @@ pub fn is_drained(state_root: &Path) -> Result<bool, WorkerError> {
 
 /// None means drained; errors also prohibit launch. No files are created
 /// on this path, so clients without a controller store retain local mode.
-pub(crate) fn launch_permit(state_root: &Path) -> Result<Option<DrainLaunchPermit>, WorkerError> {
+pub(crate) fn launch_permit(
+    state_root: &Path,
+    deadline: crate::client_state::WaitDeadline,
+) -> Result<Option<DrainLaunchPermit>, WorkerError> {
+    deadline.remaining()?;
     let Some(root) = open_existing_controller_root(state_root)? else {
         return Ok(Some(DrainLaunchPermit { _lock: None }));
     };
     let Some(lock) = existing_lock(&root)? else {
         return Ok(Some(DrainLaunchPermit { _lock: None }));
     };
-    lock_shared(&lock)?;
+    deadline.lock(lock.as_raw_fd(), libc::LOCK_SH)?;
     validate_lock(&root, &lock)?;
     if read_state(&root)?.1.drained {
         return Ok(None);
