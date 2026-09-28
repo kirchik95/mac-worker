@@ -15,6 +15,7 @@ pub mod batch;
 pub mod batch_freeze;
 pub mod envelope;
 pub mod drain;
+pub mod control;
 pub mod execute;
 pub mod health;
 pub mod health_read;

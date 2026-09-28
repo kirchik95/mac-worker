@@ -540,6 +540,8 @@ pub fn serve_rpc_with_runtime(
     let request = crate::controller::protocol::parse_request(&payload)?;
     let frame = if crate::controller::health_read::is_health_read(&request) {
         crate::controller::health_read::serve_health_read(&request, &paths.controller_state_root())?
+    } else if request.command() == "controller.drain" {
+        crate::controller::control::serve_drain(&request, &paths.controller_state_root())?
     } else if is_read_command(request.command()) {
         let client_state = ClientStateStore::open(&paths.state)?;
         let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
