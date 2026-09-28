@@ -2258,6 +2258,11 @@ pub fn start_runner_with_reservation(
     slot_limit: usize,
     exclude_reserver: bool,
 ) -> Result<RunnerStart, WorkerError> {
+    let Some(_drain_permit) =
+        crate::controller::drain::launch_permit(&paths.controller_state_root())?
+    else {
+        return Ok(RunnerStart::Pending);
+    };
     let reserver = current_process_identity()?;
     match client_state.reserve_runner_slot(turn_id, reserver, slot_limit, exclude_reserver)? {
         RunnerSlotDecision::Saturated => Ok(RunnerStart::Saturated),

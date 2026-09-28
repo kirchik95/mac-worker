@@ -418,6 +418,7 @@ impl ControllerStore {
 
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
         let root = open_controller_root(state_root)?;
+        super::drain::initialize(&root)?;
         let _requests = root
             .open_private_lock(REQUESTS_LOCK)
             .map_err(|error| op_io("open-lock", REQUESTS_LOCK, error))?;
