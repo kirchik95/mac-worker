@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { ChevronRight, Info, Settings } from 'lucide-react'
+import { ChevronRight, Cpu, HardDrive, Info, MemoryStick, Settings } from 'lucide-react'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { AgentMark } from '@/components/AgentMark'
@@ -79,6 +79,9 @@ export function WorkerCard({
   onSelectTask?: (id: string) => void
 }) {
   const offline = worker.health === 'unavailable'
+  const metricsCurrent = !offline && worker.freshness === 'current'
+  const pressure = worker.system.memory_pressure
+  const memory = pressure === 'unknown' ? '—' : pressure === 'warn' ? 'High' : humanize(pressure)
   const known = !offline && worker.freshness === 'current' && worker.slot.state !== 'unknown'
   const busy = slotBusy(worker.slot)
   const running = known && busy > 0 && worker.active_task != null
@@ -232,6 +235,38 @@ export function WorkerCard({
             </div>
           </div>
         </div>
+        <div className="mw-worker-metrics">
+          {!metricsCurrent ? (
+            <p className="mw-worker-metrics-note">
+              {worker.observed_at_millis == null
+                ? 'Metrics not reported'
+                : 'Last reported · ' + relativeTime(worker.observed_at_millis, now)}
+            </p>
+          ) : null}
+          <dl className="mw-worker-metrics-grid" aria-label="System resources">
+            <div>
+              <dt><Cpu size={14} strokeWidth={1.5} aria-hidden="true" />CPU</dt>
+              <dd>
+                <span>{worker.system.cpu_busy_percent == null ? '—' : worker.system.cpu_busy_percent.toFixed(1) + '%'}</span>
+                {worker.system.cpu_busy_percent != null ? <small>load</small> : null}
+              </dd>
+            </div>
+            <div>
+              <dt><MemoryStick size={14} strokeWidth={1.5} aria-hidden="true" />RAM</dt>
+              <dd data-tone={metricsCurrent && pressure === 'critical' ? 'error' : metricsCurrent && pressure === 'warn' ? 'warning' : undefined}>
+                <span>{memory}</span>
+                {memory !== '—' ? <small>pressure</small> : null}
+              </dd>
+            </div>
+            <div>
+              <dt><HardDrive size={14} strokeWidth={1.5} aria-hidden="true" />DISK</dt>
+              <dd title={worker.system.total_disk_bytes == null ? undefined : bytes(worker.system.total_disk_bytes) + ' total'}>
+                <span>{bytes(worker.system.free_disk_bytes)}</span>
+                {worker.system.free_disk_bytes != null ? <small>free</small> : null}
+              </dd>
+            </div>
+          </dl>
+        </div>
         <CollapsibleContent keepMounted>
           <div className="mw-worker-diagnostics">
             <div className="mb-4 flex items-center justify-between gap-3">
@@ -246,24 +281,6 @@ export function WorkerCard({
             {described?.code ? (
               <p className="mb-3 font-mono text-xs text-destructive">{described.code}</p>
             ) : null}
-            <dl className="grid grid-cols-3 gap-3">
-              <div>
-                <dt className="mw-help">{known ? 'CPU' : 'LAST CPU'}</dt>
-                <dd>
-                  {worker.system.cpu_busy_percent == null
-                    ? '—'
-                    : worker.system.cpu_busy_percent.toFixed(1) + '%'}
-                </dd>
-              </div>
-              <div>
-                <dt className="mw-help">MEMORY</dt>
-                <dd>{humanize(worker.system.memory_pressure)}</dd>
-              </div>
-              <div>
-                <dt className="mw-help">DISK FREE</dt>
-                <dd>{bytes(worker.system.free_disk_bytes)}</dd>
-              </div>
-            </dl>
             <p className="mt-3 text-xs text-muted-foreground">
               {known
                 ? busy + ' / ' + worker.slot.capacity + ' slots occupied'

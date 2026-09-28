@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { TaskBadge } from '@/components/TaskBadge'
 import { AgentMark } from '@/components/AgentMark'
 import { DeliveryChip } from '@/components/DeliveryChip'
-import type { TaskRow } from '@/lib/api'
+import { lastDelivery, type TaskRow } from '@/lib/api'
 import { relativeTime } from '@/lib/format'
 import { taskPresentation, setupAgent, waitingReason } from '@/lib/taskPresentation'
 
@@ -59,6 +59,7 @@ export function TaskTable({
           ) : null}
           {tasks.map((task) => {
             const presentation = taskPresentation(task)
+            const delivery = lastDelivery(task)
             const setup = setupAgent(task) && onSetup
             const run =
               compact && task.blocking_code === 'RUN_MAX_PARALLEL' && task.run_id && onShowRun
@@ -73,8 +74,7 @@ export function TaskTable({
             return (
               <tr key={task.task_id}>
                 <td>
-                  <TaskBadge task={task} />
-                  <DeliveryChip task={task} freshness={task.freshness} />
+                  <TaskBadge task={task} variant={compact ? 'pill' : 'default'} />
                 </td>
                 <td>
                   <button
@@ -93,6 +93,9 @@ export function TaskTable({
                         <span className="text-xs">{waitingReason(task)}</span>
                       ) : null}
                     </>
+                  ) : null}
+                  {delivery?.state === 'failed' || delivery?.state === 'retrying' ? (
+                    <DeliveryChip task={task} freshness={task.freshness} className="mt-1" />
                   ) : null}
                 </td>
                 <td>{compact ? waitingReason(task) : <AgentMark agent={task.agent} label />}</td>

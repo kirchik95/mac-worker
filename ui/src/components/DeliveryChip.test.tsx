@@ -18,8 +18,8 @@ describe('DeliveryChip', () => {
         }}
       />,
     )
-    expect(screen.getByText('retrying')).toBeInTheDocument()
-    expect(screen.queryByText('stale')).toBeNull()
+    expect(screen.getByText('Retrying push')).toBeInTheDocument()
+    expect(screen.queryByText(/Last known/)).toBeNull()
   })
 
   it('marks a last-observed delivery as stale', () => {
@@ -29,13 +29,12 @@ describe('DeliveryChip', () => {
         freshness="stale"
       />,
     )
-    expect(screen.getByText('failed')).toBeInTheDocument()
-    expect(screen.getByText('stale')).toBeInTheDocument()
+    expect(screen.getByText('Last known: Push failed')).toBeInTheDocument()
   })
 
-  it('labels a stale delivery with its observed time', () => {
+  it('labels a stale delivery as last known', () => {
     expect(
       deliveryLabel(originDelivery({ state: 'pending', turn_id: 'f'.repeat(32), updated_at_millis: 1_000 }), 'stale'),
-    ).toMatch(/^pending · ffffffff · observed /)
+    ).toBe('Last known: Push pending')
   })
 })

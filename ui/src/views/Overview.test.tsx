@@ -51,9 +51,11 @@ describe('Overview', () => {
     expect(within(mini).getByText('available')).toBeInTheDocument()
     expect(within(mini).getByText('Ready for the next task')).toBeInTheDocument()
     expect(within(mini).getByText('0 / 1 slots occupied')).toBeInTheDocument()
-    expect(within(mini).getByText('DISK FREE')).toBeInTheDocument()
-    expect(within(mini).getByText('150.0 GB')).toBeInTheDocument()
-    expect(within(mini).getByText('Warn')).toBeInTheDocument()
+    expect(within(mini).getByText('CPU')).toBeVisible()
+    expect(within(mini).getByText('RAM')).toBeVisible()
+    expect(within(mini).getByText('DISK')).toBeVisible()
+    expect(within(mini).getByText('150.0 GB')).toBeVisible()
+    expect(within(mini).getByText('High')).toBeVisible()
   })
 
   it('shows a dash for a CPU reading the worker did not report', () => {
@@ -80,7 +82,7 @@ describe('Overview', () => {
     expect(within(mini).getByText('Cursor smoke test')).toBeInTheDocument()
     expect(within(mini).getByText('AGENT')).toBeInTheDocument()
     expect(within(mini).getByText('gpt-5')).toBeInTheDocument()
-    expect(within(mini).getByText('High')).toBeInTheDocument()
+    expect(within(mini).getByText('EFFORT').nextElementSibling).toHaveTextContent('High')
   })
 
   it('shows occupancy against the worker capacity', () => {
@@ -136,7 +138,7 @@ describe('Overview', () => {
 
     expect(within(mini).getByText('stale')).toBeInTheDocument()
     expect(within(mini).getByText('Observation is out of date')).toBeInTheDocument()
-    expect(within(mini).getByText('LAST CPU')).toBeInTheDocument()
+    expect(within(mini).getByText(/^Last reported · /)).toBeVisible()
   })
 
   it('surfaces the reason an unreachable worker is offline', () => {

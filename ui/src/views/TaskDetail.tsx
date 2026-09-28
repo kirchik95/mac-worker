@@ -16,6 +16,7 @@ import {
   acceptTask,
   ApiError,
   fetchTaskDetail,
+  lastDelivery,
   questionOptions,
   questionText,
   replyToTask,
@@ -353,7 +354,6 @@ export function TaskDetail({
           <h1 className="mw-page-title">{task.title}</h1>
           <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-muted-foreground">
             <TaskBadge task={{ ...task, review_state: detail.review_state }} />
-            <DeliveryChip task={detail} freshness={task.freshness} />
             <span className="inline-flex items-center gap-2">
               <Monitor size={14} aria-hidden="true" />
               {task.worker ?? 'Unassigned'}
@@ -693,6 +693,12 @@ export function TaskDetail({
             </dd>
             <dt>Branch</dt>
             <dd className="font-mono text-xs">{task.branch ?? 'Not published'}</dd>
+            {lastDelivery(detail) ? (
+              <>
+                <dt>Git push</dt>
+                <dd><DeliveryChip task={detail} freshness={task.freshness} /></dd>
+              </>
+            ) : null}
             <dt>Base</dt>
             <dd className="font-mono text-xs" title={detail.base_oid ?? undefined}>
               {shortId(detail.base_oid, 12)}

@@ -112,7 +112,7 @@ describe('TaskDetail', () => {
     expect(await screen.findByText('Added two tests.')).toBeInTheDocument()
     expect(screen.getByText('worker task fetch aaaa')).toBeInTheDocument()
     expect(screen.getByText('src/lib.rs')).toBeInTheDocument()
-    expect(screen.queryByText('delivered')).toBeNull()
+    expect(screen.queryByText('Pushed to origin')).toBeNull()
   })
 
   it('shows origin delivery from the detail payload the host serializes', async () => {
@@ -120,7 +120,7 @@ describe('TaskDetail', () => {
     serve(detail({ delivery, deliveries: [delivery] }))
     render(<TaskDetail taskId="aaaa" />)
 
-    expect(await screen.findByText('delivered')).toBeInTheDocument()
+    expect(await screen.findByText('Pushed to origin')).toBeInTheDocument()
   })
 
   it('shows a pending delivery listed only in deliveries', async () => {
@@ -131,7 +131,7 @@ describe('TaskDetail', () => {
     )
     render(<TaskDetail taskId="aaaa" />)
 
-    expect(await screen.findByText('pending')).toBeInTheDocument()
+    expect(await screen.findByText('Push pending')).toBeInTheDocument()
   })
 
   it('renders both question shapes, with the answers an agent will accept', async () => {

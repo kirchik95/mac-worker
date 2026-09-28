@@ -63,7 +63,7 @@ describe('Tasks', () => {
       />,
     )
     expect(screen.getByText('Push the result')).toBeInTheDocument()
-    expect(screen.getByText('retrying')).toBeInTheDocument()
+    expect(screen.getByText('Retrying push')).toBeInTheDocument()
   })
 
   it('filters locally without issuing a request', async () => {

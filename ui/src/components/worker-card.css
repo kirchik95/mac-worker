@@ -4,6 +4,70 @@
   gap: 4px;
 }
 
+.mw-worker-metrics {
+  border-top: 1px solid var(--border);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.mw-worker-metrics-note {
+  margin-bottom: 8px;
+  color: #667085;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.mw-worker-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mw-worker-metrics-grid dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #667085;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.mw-worker-metrics-grid dt svg {
+  flex-shrink: 0;
+}
+
+.mw-worker-metrics-grid dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 4px;
+  margin-top: 4px;
+  color: #344054;
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 20px;
+}
+
+.mw-worker-metrics-grid dd > span {
+  white-space: nowrap;
+}
+
+.mw-worker-metrics-grid dd small {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.mw-worker-metrics-grid dd[data-tone='warning'] {
+  color: #b54708;
+}
+
+.mw-worker-metrics-grid dd[data-tone='error'] {
+  color: #b42318;
+}
+
 .mw-worker-observation {
   display: inline-flex;
   flex-shrink: 0;

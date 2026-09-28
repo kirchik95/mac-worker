@@ -472,6 +472,23 @@
     color: #b42318;
     background: #fef3f2;
   }
+  .mw-task-badge > svg {
+    flex-shrink: 0;
+  }
+  .mw-task-badge[data-variant='pill'] {
+    gap: 5px;
+    padding-inline: 10px;
+    border-radius: 12px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .mw-task-badge[data-variant='pill'][data-kind='queued'] {
+    background: #f1f3f5;
+    color: #475467;
+  }
+  .mw-task-badge[data-variant='pill'][data-kind='queued'] > svg {
+    color: #344054;
+  }
   .mw-card-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -648,6 +665,35 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     margin-top: 3px;
+  }
+  .mw-delivery {
+    display: inline-flex;
+    max-width: 100%;
+    align-items: center;
+    gap: 6px;
+    border-radius: 3px;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    line-height: 18px;
+    vertical-align: middle;
+    cursor: help;
+  }
+  .mw-delivery > svg {
+    flex-shrink: 0;
+  }
+  .mw-delivery[data-tone='warning'] {
+    color: #b54708;
+  }
+  .mw-delivery[data-tone='error'] {
+    color: var(--destructive);
+  }
+  .mw-delivery-tooltip {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    line-height: 18px;
+    overflow-wrap: anywhere;
   }
   .mw-empty {
     display: flex;
