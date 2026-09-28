@@ -382,3 +382,34 @@ fn launchdaemon_instructions_use_supplied_account_and_safe_fixed_paths() {
     assert!(launchdaemon_commands(Path::new("relative/home"), "user", 501).is_err());
     assert!(launchdaemon_commands(Path::new("/Users/user"), "bad\nuser", 501).is_err());
 }
+
+#[test]
+fn changed_service_plist_reloads_in_an_existing_public_launchagents_directory() {
+    let (_temp, home) = home();
+    let runner = Launchctl::default();
+    manage(&home, 501, &runner, ServiceAction::Install).unwrap();
+    let agents = home.join("Library/LaunchAgents");
+    fs::set_permissions(&agents, fs::Permissions::from_mode(0o755)).unwrap();
+    let original = fs::read_to_string(home.join(PLIST)).unwrap();
+    fs::write(
+        home.join(PLIST),
+        original.replace("<integer>30</integer>", "<integer>1</integer>"),
+    )
+    .unwrap();
+    runner.calls();
+    let status = manage(&home, 501, &runner, ServiceAction::Install).unwrap();
+    assert!(status.installed && status.loaded);
+    assert_eq!(fs::read_to_string(home.join(PLIST)).unwrap(), original);
+    assert_eq!(
+        fs::metadata(agents).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        runner
+            .calls()
+            .iter()
+            .map(|a| a[0].as_str())
+            .collect::<Vec<_>>(),
+        ["print", "bootout", "bootstrap", "kickstart", "print"]
+    );
+}

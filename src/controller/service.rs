@@ -1,7 +1,7 @@
 //! LaunchAgent lifecycle for the persistent controller.
 
 use std::{
-    ffi::OsString,
+    ffi::{CStr, CString, OsString},
     io,
     path::{Component, Path},
     time::Duration,
@@ -116,11 +116,7 @@ pub fn manage(
                 != Some(desired.as_bytes());
             if changed {
                 match previous {
-                    Some(previous) => agents.replace_private_regular_exact(
-                        PLIST_NAME,
-                        &previous.bytes,
-                        desired.as_bytes(),
-                    )?,
+                    Some(previous) => replace_plist(&agents, &previous, desired.as_bytes())?,
                     None => {
                         agents.write_private_atomic_no_replace(PLIST_NAME, desired.as_bytes())?
                     }
@@ -322,6 +318,85 @@ fn read_plist(agents: &RootedDir) -> Result<Option<InstalledPlist>, WorkerError>
     Ok(Some(InstalledPlist { bytes, identity }))
 }
 
+fn replace_plist(
+    agents: &RootedDir,
+    previous: &InstalledPlist,
+    desired: &[u8],
+) -> Result<(), WorkerError> {
+    // RootedDir's general replacement cleanup requires a private directory.
+    // LaunchAgents is shared with other jobs and normally 0755: retain both
+    // inodes across an atomic exchange and unlink only the displaced plist.
+    let original = agents.open_private_regular_handle(PLIST_NAME)?;
+    agents.validate_private_regular_binding(PLIST_NAME, &original, previous.identity)?;
+    let temporary = format!(".controller-plist-{}", uuid::Uuid::new_v4().simple());
+    agents.write_private_atomic_no_replace(&temporary, desired)?;
+    let replacement = agents.open_private_regular_handle(&temporary)?;
+    let replacement_identity = agents.private_entry_identity(&temporary)?;
+    let temporary_name = CString::new(temporary.as_str()).expect("generated name has no NUL");
+    let exchange = (|| -> Result<(), WorkerError> {
+        agents.validate_private_regular_binding(&temporary, &replacement, replacement_identity)?;
+        if agents.read_private_regular(PLIST_NAME, MAX_PLIST_BYTES)? != previous.bytes {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE).into());
+        }
+        agents.validate_private_regular_binding(PLIST_NAME, &original, previous.identity)?;
+        exchange_plist(agents.raw_directory_fd(), &temporary_name)?;
+        Ok(())
+    })();
+    if let Err(error) = exchange {
+        // If an uncooperative writer replaced the staged file, preserve it and
+        // return the original failure rather than unlinking an unknown inode.
+        let _ = unlink_exact(agents, &temporary_name, &replacement, replacement_identity);
+        return Err(error);
+    }
+    agents.validate_private_regular_binding(PLIST_NAME, &replacement, replacement_identity)?;
+    agents.validate_private_regular_binding(&temporary, &original, previous.identity)?;
+    if agents.read_private_regular(&temporary, MAX_PLIST_BYTES)? != previous.bytes {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE).into());
+    }
+    agents.sync_root()?;
+    unlink_exact(agents, &temporary_name, &original, previous.identity)?;
+    agents.validate_private_regular_binding(PLIST_NAME, &replacement, replacement_identity)?;
+    Ok(())
+}
+
+fn exchange_plist(directory: std::os::fd::RawFd, temporary: &CStr) -> io::Result<()> {
+    // SAFETY: the retained directory and both fixed/generated NUL-terminated
+    // components remain valid for this non-retaining atomic exchange.
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        libc::renameatx_np(
+            directory,
+            temporary.as_ptr(),
+            directory,
+            c"com.mac-worker.controller.plist".as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            directory,
+            temporary.as_ptr(),
+            directory,
+            c"com.mac-worker.controller.plist".as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let result = {
+        let _ = (directory, temporary);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic plist exchange is unavailable",
+        ));
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn prepare_log(home: &Path) -> Result<RootedDir, WorkerError> {
     let logs = open_directory_chain(home, &["Library", "Logs", "mac-worker"], true)?
         .ok_or_else(|| service_error("service log directory is missing"))?;
@@ -338,14 +413,20 @@ fn remove_plist(agents: &RootedDir, identity: PrivateEntryIdentity) -> Result<()
     // API (which requires a 0700 parent) is deliberately not used. Unlink only
     // this fixed entry through the retained directory; never follow a symlink.
     let file = agents.open_private_regular_handle(PLIST_NAME)?;
-    agents.validate_private_regular_binding(PLIST_NAME, &file, identity)?;
-    let result = unsafe {
-        libc::unlinkat(
-            agents.raw_directory_fd(),
-            c"com.mac-worker.controller.plist".as_ptr(),
-            0,
-        )
-    };
+    unlink_exact(agents, c"com.mac-worker.controller.plist", &file, identity)
+}
+
+fn unlink_exact(
+    agents: &RootedDir,
+    name: &CStr,
+    file: &std::fs::File,
+    identity: PrivateEntryIdentity,
+) -> Result<(), WorkerError> {
+    let component = name.to_str().expect("fixed/generated name is UTF-8");
+    agents.validate_private_regular_binding(component, file, identity)?;
+    // SAFETY: the retained descriptor and validated name are live. unlinkat
+    // removes the entry itself, without following a symbolic link.
+    let result = unsafe { libc::unlinkat(agents.raw_directory_fd(), name.as_ptr(), 0) };
     if result != 0 {
         return Err(io::Error::last_os_error().into());
     }

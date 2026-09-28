@@ -166,4 +166,3 @@ pub fn controller_dashboard_ssh_request(
         DASHBOARD_TUNNEL_POLICY,
     )
 }
-
