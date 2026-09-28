@@ -4,6 +4,24 @@ use crate::dashboard::model::{DashboardError, DashboardWorker, Freshness};
 
 pub const SNAPSHOT_INTERVAL_MILLIS: u64 = 2_000;
 pub const OBSERVATION_TTL_MILLIS: u64 = 10_000;
+/// Idle, unchanged hosts are not probed again until this much dashboard time
+/// has passed. The UI snapshot stays on [`SNAPSHOT_INTERVAL_MILLIS`].
+pub const IDLE_PROBE_INTERVAL_MILLIS: u64 = 10_000;
+
+/// Whether a host should be probed on this snapshot.
+///
+/// The first observation has no `last`. A frozen clock (`now <= last`) probes
+/// again so tests that do not advance time keep collecting. Busy or changed
+/// hosts probe on every snapshot. An idle unchanged host waits out the interval.
+pub fn idle_probe_due(now: u64, last: Option<u64>, idle: bool, unchanged: bool) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if !idle || !unchanged || now <= last {
+        return true;
+    }
+    now.saturating_sub(last) >= IDLE_PROBE_INTERVAL_MILLIS
+}
 pub const MAX_SAMPLES_PER_WORKER: usize = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +227,31 @@ fn calculate_cpu_busy(previous: CpuCounters, current: CpuCounters) -> Option<Cpu
     let busy_ticks = delta_total - delta_idle;
     let value = (busy_ticks as f64 / delta_total as f64) * 100.0;
     CpuBusyPercent::new(value).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IDLE_PROBE_INTERVAL_MILLIS, idle_probe_due};
+
+    #[test]
+    fn idle_unchanged_hosts_wait_ten_seconds_and_everything_else_probes() {
+        assert!(idle_probe_due(1_000, None, true, true));
+        assert!(idle_probe_due(5_000, Some(5_000), true, true));
+        assert!(idle_probe_due(6_000, Some(5_000), false, true));
+        assert!(idle_probe_due(6_000, Some(5_000), true, false));
+        assert!(!idle_probe_due(
+            5_000 + IDLE_PROBE_INTERVAL_MILLIS - 1,
+            Some(5_000),
+            true,
+            true
+        ));
+        assert!(idle_probe_due(
+            5_000 + IDLE_PROBE_INTERVAL_MILLIS,
+            Some(5_000),
+            true,
+            true
+        ));
+    }
 }
 
 fn push_bounded(samples: &mut VecDeque<ObservationSample>, sample: ObservationSample) {

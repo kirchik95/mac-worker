@@ -12,12 +12,12 @@ use std::{
 use crate::{
     agent_facts::FACTS_TTL,
     dashboard::{
-        cache::{Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS},
+        cache::{Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS, idle_probe_due},
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
             DashboardError, DashboardJob, DashboardJobState, DashboardLaptop,
-            DashboardProjectDefaults, DashboardQueueEntry, DashboardSnapshot, DashboardWorker,
-            Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            DashboardProjectDefaults, DashboardQueueEntry, DashboardSlotState, DashboardSnapshot,
+            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
     },
     error::WorkerError,
@@ -161,6 +161,14 @@ pub trait DashboardDataSource: Send + Sync + 'static {
     }
 
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult>;
+
+    /// Probe only the named workers. The default collects everyone so existing
+    /// sources keep compiling; the mac-worker source skips SSH for names that
+    /// are not due.
+    fn probe_workers(&self, names: &[String], deadline: Duration) -> Vec<WorkerObservationResult> {
+        let _ = names;
+        self.collect_workers(deadline)
+    }
     fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError>;
     fn authoritative_active_jobs(
         &self,
@@ -219,6 +227,7 @@ pub struct DashboardService<S, C, M> {
     revision: AtomicU64,
     refresh: Mutex<RefreshState>,
     facts_refresh: Arc<Mutex<FactsRefreshTracker>>,
+    probe_records: Mutex<HashMap<String, WorkerProbeRecord>>,
     clock: C,
     monotonic: M,
     deadlines: DashboardDeadlines,
@@ -361,6 +370,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 in_flight: None,
             }),
             facts_refresh: Arc::new(Mutex::new(FactsRefreshTracker::default())),
+            probe_records: Mutex::new(HashMap::new()),
             clock,
             monotonic,
             deadlines,
@@ -652,14 +662,23 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         }
 
         let budget = self.deadlines.worker.min(remaining);
-        let rows = self.source.collect_workers(budget);
+        let now = self.clock.now_millis();
+        let due = self.workers_due(configured, now);
+        let rows = if due.is_empty() {
+            Vec::new()
+        } else {
+            self.source.probe_workers(&due, budget)
+        };
         let configured_set: HashSet<&str> = configured.iter().map(String::as_str).collect();
+        let due_set: HashSet<&str> = due.iter().map(String::as_str).collect();
         let mut grouped: HashMap<String, Vec<WorkerObservationResult>> = HashMap::new();
         let mut unknown = Vec::new();
         for row in rows {
             let worker_name = worker_result_name(&row).to_owned();
             if configured_set.contains(worker_name.as_str()) {
-                grouped.entry(worker_name).or_default().push(row);
+                if due_set.contains(worker_name.as_str()) {
+                    grouped.entry(worker_name).or_default().push(row);
+                }
             } else {
                 unknown.push(worker_name);
             }
@@ -668,6 +687,12 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
 
         let mut workers = Vec::with_capacity(configured.len());
         for worker_name in configured {
+            if !due_set.contains(worker_name.as_str())
+                && let Some(worker) = self.reused_worker(worker_name, now)
+            {
+                workers.push(worker);
+                continue;
+            }
             let rows = grouped.remove(worker_name).unwrap_or_default();
             let worker = match rows.len() {
                 0 => {
@@ -676,10 +701,12 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                         format!("configured worker {worker_name} returned no observation row"),
                     );
                     push_error(errors, error.clone());
+                    self.note_probe_failure(worker_name, now);
                     self.fallback_worker(worker_name, error)
                 }
                 1 => match rows.into_iter().next().expect("one row exists") {
                     WorkerObservationResult::Current(observation) => {
+                        self.note_probe_success(worker_name, now, &observation.worker);
                         self.maybe_start_stale_facts_refresh(&observation);
                         let cached = lock_recover(&self.cache).record(observation);
                         if let Some(cached) = cached {
@@ -692,12 +719,14 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                                 "worker observation timestamp was not newer",
                             );
                             push_error(errors, error.clone());
+                            self.note_probe_failure(worker_name, now);
                             self.fallback_worker(worker_name, error)
                         }
                     }
                     WorkerObservationResult::Failed { error, .. } => {
                         let error = bounded_error(error);
                         push_error(errors, error.clone());
+                        self.note_probe_failure(worker_name, now);
                         self.fallback_worker(worker_name, error)
                     }
                 },
@@ -707,6 +736,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                         format!("worker {worker_name} returned multiple observation rows"),
                     );
                     push_error(errors, error.clone());
+                    self.note_probe_failure(worker_name, now);
                     self.fallback_worker(worker_name, error)
                 }
             };
@@ -723,6 +753,72 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             );
         }
         workers
+    }
+
+    fn workers_due(&self, configured: &[String], now: u64) -> Vec<String> {
+        let records = lock_recover(&self.probe_records);
+        let cache = lock_recover(&self.cache);
+        configured
+            .iter()
+            .filter(|name| {
+                let record = records.get(name.as_str());
+                let has_cache = cache.latest(name).is_some();
+                !has_cache
+                    || idle_probe_due(
+                        now,
+                        record.map(|record| record.last_probe_millis),
+                        record.is_some_and(|record| record.idle),
+                        record.is_some_and(|record| record.unchanged),
+                    )
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn reused_worker(&self, worker_name: &str, now: u64) -> Option<DashboardWorker> {
+        let mut observation = lock_recover(&self.cache).latest(worker_name)?.clone();
+        let mut workers = [observation.worker.clone()];
+        refresh_agent_facts_freshness(&mut workers, now);
+        observation.worker = workers[0].clone();
+        observation.worker.freshness = Freshness::Current;
+        observation.worker.error = None;
+        self.maybe_start_stale_facts_refresh(&observation);
+        Some(observation.worker)
+    }
+
+    fn note_probe_success(&self, worker_name: &str, now: u64, worker: &DashboardWorker) {
+        let signature = probe_signature(worker);
+        let idle = worker_is_idle(worker);
+        let mut records = lock_recover(&self.probe_records);
+        let unchanged = records
+            .get(worker_name)
+            .is_none_or(|previous| previous.signature == signature);
+        records.insert(
+            worker_name.to_owned(),
+            WorkerProbeRecord {
+                last_probe_millis: now,
+                signature,
+                idle,
+                unchanged,
+            },
+        );
+    }
+
+    fn note_probe_failure(&self, worker_name: &str, now: u64) {
+        let mut records = lock_recover(&self.probe_records);
+        let signature = records
+            .get(worker_name)
+            .map(|record| record.signature.clone())
+            .unwrap_or_else(empty_probe_signature);
+        records.insert(
+            worker_name.to_owned(),
+            WorkerProbeRecord {
+                last_probe_millis: now,
+                signature,
+                idle: false,
+                unchanged: false,
+            },
+        );
     }
 
     fn fallback_worker(&self, worker_name: &str, error: DashboardError) -> DashboardWorker {
@@ -1029,6 +1125,51 @@ fn unique_jobs(rows: Vec<DashboardJob>) -> (HashMap<JobId, DashboardJob>, Vec<Jo
     }
     duplicates.sort_by_key(ToString::to_string);
     (unique, duplicates)
+}
+
+#[derive(Clone, PartialEq)]
+struct WorkerProbeSignature {
+    health: WorkerHealth,
+    hostname: Option<String>,
+    slot_state: DashboardSlotState,
+    busy: u8,
+    active_job_ids: Vec<JobId>,
+    capabilities: Vec<String>,
+}
+
+struct WorkerProbeRecord {
+    last_probe_millis: u64,
+    signature: WorkerProbeSignature,
+    idle: bool,
+    unchanged: bool,
+}
+
+fn probe_signature(worker: &DashboardWorker) -> WorkerProbeSignature {
+    WorkerProbeSignature {
+        health: worker.health.clone(),
+        hostname: worker.hostname.clone(),
+        slot_state: worker.slot.state.clone(),
+        busy: worker.slot.busy,
+        active_job_ids: worker.slot.active_job_ids.clone(),
+        capabilities: worker.capabilities.clone(),
+    }
+}
+
+fn worker_is_idle(worker: &DashboardWorker) -> bool {
+    worker.health == WorkerHealth::Ready
+        && worker.slot.busy == 0
+        && worker.slot.state != DashboardSlotState::Busy
+}
+
+fn empty_probe_signature() -> WorkerProbeSignature {
+    WorkerProbeSignature {
+        health: WorkerHealth::Unavailable,
+        hostname: None,
+        slot_state: DashboardSlotState::Idle,
+        busy: 0,
+        active_job_ids: Vec::new(),
+        capabilities: Vec::new(),
+    }
 }
 
 fn worker_result_name(result: &WorkerObservationResult) -> &str {

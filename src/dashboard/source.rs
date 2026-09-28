@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -246,6 +247,21 @@ impl MacWorkerDashboardSource {
                 )
             })
     }
+
+    fn inspect_workers(&self, config: &Config, deadline: Duration) -> Vec<WorkerObservationResult> {
+        let report = self.workers.inspect(config, deadline);
+        let observed_at_millis = current_time_millis();
+        report
+            .workers
+            .into_iter()
+            .map(|worker| {
+                let worker_name = worker.name.clone();
+                project_worker(&worker, observed_at_millis)
+                    .map(WorkerObservationResult::Current)
+                    .unwrap_or_else(|error| WorkerObservationResult::Failed { error, worker_name })
+            })
+            .collect()
+    }
 }
 
 impl DashboardDataSource for MacWorkerDashboardSource {
@@ -270,18 +286,20 @@ impl DashboardDataSource for MacWorkerDashboardSource {
     }
 
     fn collect_workers(&self, deadline: Duration) -> Vec<WorkerObservationResult> {
-        let report = self.workers.inspect(&self.config, deadline);
-        let observed_at_millis = current_time_millis();
-        report
-            .workers
-            .into_iter()
-            .map(|worker| {
-                let worker_name = worker.name.clone();
-                project_worker(&worker, observed_at_millis)
-                    .map(WorkerObservationResult::Current)
-                    .unwrap_or_else(|error| WorkerObservationResult::Failed { error, worker_name })
-            })
-            .collect()
+        self.inspect_workers(&self.config, deadline)
+    }
+
+    fn probe_workers(&self, names: &[String], deadline: Duration) -> Vec<WorkerObservationResult> {
+        let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let config = self.config.with_workers(
+            self.config
+                .workers
+                .iter()
+                .filter(|worker| wanted.contains(worker.name.as_str()))
+                .cloned()
+                .collect(),
+        );
+        self.inspect_workers(&config, deadline)
     }
 
     fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {

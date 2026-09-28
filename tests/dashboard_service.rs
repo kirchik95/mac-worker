@@ -11,7 +11,7 @@ use std::{
 use mac_worker::{
     agent_facts::{AgentFacts, FACTS_TTL},
     dashboard::{
-        cache::{CpuCounters, OBSERVATION_TTL_MILLIS, Observation},
+        cache::{CpuCounters, IDLE_PROBE_INTERVAL_MILLIS, OBSERVATION_TTL_MILLIS, Observation},
         model::{
             CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
             DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
@@ -226,6 +226,123 @@ fn cache_normalization_stale_expiry_and_rejected_timestamps_have_exact_shapes() 
 }
 
 #[test]
+fn idle_unchanged_hosts_skip_probes_until_ten_seconds_and_busy_or_changed_hosts_do_not() {
+    let source = FakeSource::new();
+    source.set_configured(Ok(vec!["mini-1".into(), "mini-2".into()]));
+    let mut busy = observation("mini-2", 1_000, "busy.local");
+    busy.worker.slot = busy_slot(JobId::generate());
+    source.set_workers(vec![
+        WorkerObservationResult::Current(observation("mini-1", 1_000, "idle.local")),
+        WorkerObservationResult::Current(busy),
+    ]);
+    let wall = ManualClock::new(1_000);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+
+    service.snapshot(Default::default()).unwrap();
+    assert_eq!(source.worker_call_count(), 1);
+
+    wall.set(3_000);
+    let mut busy_again = observation("mini-2", 3_000, "busy-next.local");
+    busy_again.worker.slot = busy_slot(JobId::generate());
+    source.set_workers(vec![
+        WorkerObservationResult::Current(observation("mini-1", 3_000, "idle-next.local")),
+        WorkerObservationResult::Current(busy_again.clone()),
+    ]);
+    let during_idle_window = service.snapshot(Default::default()).unwrap();
+    assert_eq!(source.worker_call_count(), 2);
+    assert_eq!(
+        during_idle_window.workers[0].hostname.as_deref(),
+        Some("idle.local")
+    );
+    assert_eq!(
+        during_idle_window.workers[1].hostname.as_deref(),
+        Some("busy-next.local")
+    );
+
+    let stamp = |mut observation: Observation, at: u64| {
+        observation.observed_at_millis = at;
+        observation.worker.observed_at_millis = Some(at);
+        observation
+    };
+    wall.set(1_000 + IDLE_PROBE_INTERVAL_MILLIS);
+    source.set_workers(vec![
+        WorkerObservationResult::Current(observation(
+            "mini-1",
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS,
+            "idle-next.local",
+        )),
+        WorkerObservationResult::Current(stamp(busy_again, 1_000 + IDLE_PROBE_INTERVAL_MILLIS)),
+    ]);
+    let idle_due = service.snapshot(Default::default()).unwrap();
+    assert_eq!(source.worker_call_count(), 3);
+    assert_eq!(
+        idle_due.workers[0].hostname.as_deref(),
+        Some("idle-next.local")
+    );
+
+    wall.set(1_000 + IDLE_PROBE_INTERVAL_MILLIS + 2_000);
+    let mut settled = observation(
+        "mini-2",
+        1_000 + IDLE_PROBE_INTERVAL_MILLIS + 2_000,
+        "busy-next.local",
+    );
+    settled.worker.slot = SlotSummary::idle(1);
+    source.set_workers(vec![
+        WorkerObservationResult::Current(observation(
+            "mini-1",
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS + 2_000,
+            "idle-changed.local",
+        )),
+        WorkerObservationResult::Current(settled.clone()),
+    ]);
+    let changed = service.snapshot(Default::default()).unwrap();
+    assert_eq!(source.worker_call_count(), 4);
+    assert_eq!(
+        changed.workers[0].hostname.as_deref(),
+        Some("idle-changed.local")
+    );
+
+    wall.set(1_000 + IDLE_PROBE_INTERVAL_MILLIS + 4_000);
+    source.set_workers(vec![
+        WorkerObservationResult::Current(stamp(
+            observation("mini-1", 0, "idle-changed.local"),
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS + 4_000,
+        )),
+        WorkerObservationResult::Current(stamp(
+            settled,
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS + 4_000,
+        )),
+    ]);
+    service.snapshot(Default::default()).unwrap();
+    assert_eq!(
+        source.worker_call_count(),
+        5,
+        "changed signature probes once more"
+    );
+
+    wall.set(1_000 + IDLE_PROBE_INTERVAL_MILLIS + 6_000);
+    source.set_workers(vec![
+        WorkerObservationResult::Current(observation(
+            "mini-1",
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS + 6_000,
+            "idle-ignored.local",
+        )),
+        WorkerObservationResult::Current(observation(
+            "mini-2",
+            1_000 + IDLE_PROBE_INTERVAL_MILLIS + 6_000,
+            "busy-ignored.local",
+        )),
+    ]);
+    let held = service.snapshot(Default::default()).unwrap();
+    assert_eq!(source.worker_call_count(), 5);
+    assert_eq!(
+        held.workers[0].hostname.as_deref(),
+        Some("idle-changed.local")
+    );
+    assert_eq!(held.workers[1].hostname.as_deref(), Some("busy-next.local"));
+}
+
+#[test]
 fn current_and_cached_workers_recheck_their_own_agent_facts_freshness() {
     let source = FakeSource::new();
     let wall = ManualClock::new(10_000);
@@ -241,7 +358,7 @@ fn current_and_cached_workers_recheck_their_own_agent_facts_freshness() {
         mac_worker::dashboard::model::AgentFactsFreshness::Current
     );
 
-    wall.set(10_006);
+    wall.set(10_000 + IDLE_PROBE_INTERVAL_MILLIS);
     source.set_workers(vec![WorkerObservationResult::Failed {
         worker_name: "mini-1".into(),
         error: error("WORKER_DOWN", "current probe failed"),
