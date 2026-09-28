@@ -26,7 +26,7 @@ impl PathLayout {
             return Err(WorkerError::Config("home directory is unavailable".into()));
         }
 
-        let config_home = env_path(env, "XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let config_home = Self::config_home(env, home);
         let state_home =
             env_path(env, "XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state"));
         let cache_home = env_path(env, "XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"));
@@ -38,6 +38,11 @@ impl PathLayout {
             cache: cache_home.join("mac-worker"),
             data: data_home.join("mac-worker"),
         })
+    }
+
+    /// The agent-settings root remains independent of an explicit config file.
+    pub fn config_home(env: &BTreeMap<OsString, OsString>, home: &Path) -> PathBuf {
+        env_path(env, "XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
     }
 
     /// Returns the fixed worker-owned execution root beneath the installer data container.

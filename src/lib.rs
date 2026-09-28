@@ -1068,6 +1068,7 @@ fn run_controller_command(
                     crate::controller::service::manage(
                         runtime.home(),
                         &paths,
+                        &PathLayout::config_home(runtime.environment(), runtime.home()),
                         unsafe { libc::geteuid() },
                         runner,
                         crate::controller::service::ServiceAction::Status,
@@ -6492,6 +6493,7 @@ fn run_host_controller_provision(
                     &crate::controller::service::manage(
                         runtime.home(),
                         &paths,
+                        &PathLayout::config_home(runtime.environment(), runtime.home()),
                         unsafe { libc::geteuid() },
                         runner,
                         request.action,

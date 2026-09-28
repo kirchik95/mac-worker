@@ -105,6 +105,7 @@ struct InstalledPlist {
 pub fn manage(
     home: &Path,
     paths: &PathLayout,
+    config_home: &Path,
     uid: u32,
     runner: &dyn ProcessRunner,
     action: ServiceAction,
@@ -167,8 +168,12 @@ pub fn manage(
                 ));
             }
             let _logs = prepare_log(home)?;
-            let desired =
-                launchd_plist(home, status.paths.as_ref().expect("resolved paths"), None)?;
+            let desired = launchd_plist(
+                home,
+                status.paths.as_ref().expect("resolved paths"),
+                config_home,
+                None,
+            )?;
             let changed = previous.as_ref().map(|previous| previous.bytes.as_slice())
                 != Some(desired.as_bytes());
             if changed {
@@ -248,7 +253,14 @@ pub fn launchdaemon_commands(
     {
         return Err(service_error("account name is invalid"));
     }
-    let plist = launchd_plist(home, paths, Some(username))?;
+    // Provisioning writes the helper's default <config_home>/mac-worker/config.toml.
+    // Reuse that verified root without adding fields to canonical wire replies.
+    let config_home = paths
+        .config
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| service_error("missing config home"))?;
+    let plist = launchd_plist(home, paths, config_home, Some(username))?;
     let agent = shell_quote(
         home.join("Library/LaunchAgents")
             .join(PLIST_NAME)
@@ -271,9 +283,11 @@ pub fn launchdaemon_commands(
 fn launchd_plist(
     home: &Path,
     paths: &ServicePaths,
+    config_home: &Path,
     username: Option<&str>,
 ) -> Result<String, WorkerError> {
     let config = xml_escape(validate_home(&paths.config)?);
+    let config_home = xml_escape(validate_home(config_home)?);
     let xdg_root = |path: &Path| -> Result<String, WorkerError> {
         Ok(xml_escape(validate_home(
             path.parent()
@@ -314,6 +328,8 @@ fn launchd_plist(
   <dict>
     <key>HOME</key>
     <string>{home}</string>
+    <key>XDG_CONFIG_HOME</key>
+    <string>{config_home}</string>
     <key>XDG_STATE_HOME</key>
     <string>{state}</string>
     <key>XDG_CACHE_HOME</key>

@@ -26,7 +26,7 @@ fn manage(
     action: ServiceAction,
 ) -> Result<ServiceStatus, WorkerError> {
     let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
-    manage_with_paths(home, &paths, uid, runner, action)
+    manage_with_paths(home, &paths, &home.join(".config"), uid, runner, action)
 }
 fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<String, WorkerError> {
     let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
@@ -391,6 +391,9 @@ fn launchdaemon_instructions_use_supplied_account_and_safe_fixed_paths() {
     assert!(commands.contains(
         "<key>XDG_STATE_HOME</key>\n    <string>/Users/some &apos; owner/.local/state</string>"
     ));
+    assert!(commands.contains(
+        "<key>XDG_CONFIG_HOME</key>\n    <string>/Users/some &apos; owner/.config</string>"
+    ));
     assert!(commands.contains("<string>/Users/some &apos; owner/.local/bin/worker</string>"));
     assert!(commands.contains("sudo /bin/launchctl bootout 'gui/777/com.mac-worker.controller'"));
     assert!(commands.contains("sudo /bin/launchctl bootstrap system '/Library/LaunchDaemons/com.mac-worker.controller.plist'"));
@@ -442,6 +445,15 @@ fn changed_service_plist_reloads_in_an_existing_public_launchagents_directory() 
 }
 
 fn host_service_install(home: &Path, variable: &str, root: &Path) -> String {
+    host_service_install_with_config(home, variable, root, None)
+}
+
+fn host_service_install_with_config(
+    home: &Path,
+    variable: &str,
+    root: &Path,
+    config: Option<&Path>,
+) -> String {
     use clap::Parser;
     use mac_worker::{RuntimeContext, cli::Cli, run_with_stdio_in_context};
     use std::{collections::BTreeMap, io::Cursor};
@@ -481,8 +493,13 @@ fn host_service_install(home: &Path, variable: &str, root: &Path) -> String {
     );
     let mut out = vec![];
     let mut err = vec![];
+    let mut args = vec!["worker"];
+    if let Some(config) = config {
+        args.extend(["--config", config.to_str().unwrap()]);
+    }
+    args.extend(["host", "controller-service"]);
     let exit = run_with_stdio_in_context(
-        Cli::try_parse_from(["worker", "host", "controller-service"]).unwrap(),
+        Cli::try_parse_from(args).unwrap(),
         &HostLaunchctl(Mutex::new(false)),
         &runtime,
         &mut Cursor::new(br#"{"action":"install"}"#),
@@ -497,6 +514,28 @@ fn host_service_install(home: &Path, variable: &str, root: &Path) -> String {
         String::from_utf8_lossy(&err)
     );
     fs::read_to_string(home.join(PLIST)).unwrap()
+}
+
+#[test]
+fn service_paths_pin_helper_config_home_independently_of_explicit_config() {
+    let (_temp, home) = home();
+    let root = home.join("custom-config-home");
+    let config = home.join("custom-inventory.toml");
+    let plist = host_service_install_with_config(&home, "XDG_CONFIG_HOME", &root, Some(&config));
+    let escaped_root = root.to_str().unwrap().replace('&', "&amp;");
+    assert!(
+        plist.contains(&format!(
+            "<key>XDG_CONFIG_HOME</key>\n    <string>{escaped_root}</string>"
+        )),
+        "{plist}"
+    );
+    let escaped_config = config.to_str().unwrap().replace('&', "&amp;");
+    assert!(
+        plist.contains(&format!(
+            "<string>--config</string>\n    <string>{escaped_config}</string>"
+        )),
+        "{plist}"
+    );
 }
 
 #[test]
@@ -515,6 +554,24 @@ fn service_paths_pin_helper_xdg_config_in_supervised_argv() {
         )),
         "{plist}"
     );
+    let escaped_root = root.to_str().unwrap().replace('&', "&amp;");
+    let config_environment =
+        format!("<key>XDG_CONFIG_HOME</key>\n    <string>{escaped_root}</string>");
+    assert!(plist.contains(&config_environment), "{plist}");
+    let paths = mac_worker::paths::PathLayout::discover(
+        None,
+        &std::collections::BTreeMap::from([("XDG_CONFIG_HOME".into(), root.into())]),
+        &home,
+    )
+    .unwrap();
+    let commands = daemon_with_paths(
+        &home,
+        &ServicePaths::from_layout(&paths).unwrap(),
+        "owner",
+        501,
+    )
+    .unwrap();
+    assert!(commands.contains(&config_environment), "{commands}");
 }
 
 #[test]
@@ -523,6 +580,7 @@ fn service_paths_pin_helper_xdg_state_and_other_child_roots() {
     let root = home.join("custom-state");
     let plist = host_service_install(&home, "XDG_STATE_HOME", &root);
     for (key, path) in [
+        ("XDG_CONFIG_HOME", home.join(".config")),
         ("XDG_STATE_HOME", root),
         ("XDG_CACHE_HOME", home.join(".cache")),
         ("XDG_DATA_HOME", home.join(".local/share")),
