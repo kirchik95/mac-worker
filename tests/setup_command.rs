@@ -3356,10 +3356,28 @@ fn setup_controller_matches_aliases_with_the_same_proxy_jump_route() {
     let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
     assert_eq!(json["workers"][0]["controller_service"], "restarted");
     assert_eq!(json["workers"][0]["warnings"], serde_json::json!([]));
+    let requests = runner.requests();
     assert_eq!(
-        runner.requests().len(),
+        requests.len(),
         16,
         "two route resolutions, the restart and the verified leader health read"
+    );
+    assert!(
+        requests[14]
+            .args
+            .iter()
+            .any(|arg| arg == "controller-alias")
+    );
+    assert_eq!(
+        request_command(&requests[14]),
+        "~/.local/bin/worker host controller-service"
+    );
+    let restart: serde_json::Value =
+        serde_json::from_slice(requests[14].stdin.as_ref().unwrap()).unwrap();
+    assert_eq!(restart["action"], "restart");
+    assert_eq!(
+        request_command(&requests[15]),
+        "~/.local/bin/worker host controller-rpc"
     );
 }
 
