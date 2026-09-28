@@ -210,6 +210,9 @@ pub struct SetupHostResult {
     /// their existing shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<String>,
+    /// Service restart after installing the enabled controller's helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_service: Option<String>,
     /// Build id of the candidate installed on this host. Omitted when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<String>,
@@ -260,6 +263,8 @@ pub enum SetupWarningCode {
     LaptopBinaryOutdated,
     /// Post-install `host outbox --wake` failed; the helper stayed installed.
     OutboxWakeFailed,
+    /// The enabled controller's service restart could not be confirmed.
+    ControllerRestartFailed,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -445,6 +450,7 @@ mod tests {
                 failure_kind: None,
                 warnings: Vec::new(),
                 outbox: None,
+                controller_service: None,
                 build_id: None,
                 binary_sha256: None,
             }],

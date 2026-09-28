@@ -232,7 +232,13 @@ fn execute_with_context(
             let workers = match install::prepare_candidate(runner, &current_exe, allow_debug) {
                 Ok(candidate) => selected
                     .into_iter()
-                    .map(|worker| Installer::new(runner).install_candidate(&candidate, &worker))
+                    .map(|worker| {
+                        Installer::new(runner).install_candidate_with_controller(
+                            &candidate,
+                            &worker,
+                            &config.controller,
+                        )
+                    })
                     .collect(),
                 Err(error) if error.debug_refused => {
                     return Err(WorkerError::Config(error.message));

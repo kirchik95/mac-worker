@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    config::WorkerEntry,
+    config::{ControllerConfig, WorkerEntry},
     error::WorkerError,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
@@ -53,6 +53,67 @@ impl<'a> Installer<'a> {
         result.build_id = candidate.build_id.clone();
         result.binary_sha256 = Some(candidate.digest.clone());
         result
+    }
+
+    /// Restart only the enabled controller account after its helper is verified.
+    /// A restart failure is reported separately from the successful installation.
+    pub fn install_candidate_with_controller(
+        &self,
+        candidate: &InstallCandidate,
+        worker: &WorkerEntry,
+        controller: &ControllerConfig,
+    ) -> SetupHostResult {
+        let mut result = self.install_candidate(candidate, worker);
+        if !result.installed || !controller.enabled {
+            return result;
+        }
+        match self.is_controller_worker(worker, controller) {
+            Ok(false) => return result,
+            Err(_) => {
+                controller_restart_warning(
+                    &mut result,
+                    "could not determine whether this worker is the controller; check SSH aliases and rerun worker setup",
+                );
+                return result;
+            }
+            Ok(true) => {}
+        }
+        let restarted = crate::transfer::controller_host_request::<
+            _,
+            crate::controller::service::ServiceStatus,
+        >(
+            self.runner,
+            worker,
+            crate::transfer::HostOperation::ControllerService,
+            &crate::protocol::ControllerServiceRequest {
+                action: crate::controller::service::ServiceAction::Restart,
+            },
+        )
+        .is_ok_and(|status| {
+            status.label == crate::controller::service::LABEL && status.installed && status.loaded
+        });
+        if restarted {
+            result.controller_service = Some("restarted".into());
+        } else {
+            controller_restart_warning(
+                &mut result,
+                "controller service restart could not be confirmed after installing the helper; check worker controller status and rerun worker controller init",
+            );
+        }
+        result
+    }
+
+    fn is_controller_worker(
+        &self,
+        worker: &WorkerEntry,
+        controller: &ControllerConfig,
+    ) -> Result<bool, WorkerError> {
+        if worker.ssh == controller.ssh {
+            return Ok(true);
+        }
+        let controller = crate::controller::init::resolve(self.runner, &controller.ssh)?;
+        let worker = crate::controller::init::resolve(self.runner, &worker.ssh)?;
+        Ok(controller.same_host(&worker) && controller.user == worker.user)
     }
 
     fn install_verified(
@@ -439,6 +500,7 @@ impl<'a> Installer<'a> {
             failure_kind: None,
             warnings,
             outbox,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }
@@ -1510,7 +1572,16 @@ fn failed(
         failure_kind: Some(failure_kind),
         warnings,
         outbox: None,
+        controller_service: None,
         build_id: None,
         binary_sha256: None,
     }
+}
+
+fn controller_restart_warning(result: &mut SetupHostResult, message: &'static str) {
+    result.controller_service = Some("failed CONTROLLER_RESTART_FAILED".into());
+    result.warnings.push(SetupWarning {
+        code: SetupWarningCode::ControllerRestartFailed,
+        message: message.into(),
+    });
 }

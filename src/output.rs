@@ -78,6 +78,10 @@ impl CommandOutput {
                             rendered.push_str("\n  outbox: ");
                             rendered.push_str(outbox);
                         }
+                        if let Some(service) = &worker.controller_service {
+                            rendered.push_str("\n  controller: ");
+                            rendered.push_str(service);
+                        }
                         for warning in &worker.warnings {
                             rendered.push_str("\n  warning [");
                             rendered.push_str(setup_warning_code(&warning.code));
@@ -620,6 +624,7 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
         crate::protocol::SetupWarningCode::OutboxWakeFailed => {
             crate::protocol::OUTBOX_WAKE_FAILED_CODE
         }
+        crate::protocol::SetupWarningCode::ControllerRestartFailed => "CONTROLLER_RESTART_FAILED",
     }
 }
 

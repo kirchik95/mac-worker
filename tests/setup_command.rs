@@ -2044,6 +2044,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 failure_kind: None,
                 warnings: Vec::new(),
                 outbox: None,
+                controller_service: None,
                 build_id: None,
                 binary_sha256: None,
             },
@@ -2057,6 +2058,7 @@ fn setup_json_and_human_output_keep_per_host_results() {
                 failure_kind: Some(SetupFailureKind::Infrastructure),
                 warnings: Vec::new(),
                 outbox: None,
+                controller_service: None,
                 build_id: None,
                 binary_sha256: None,
             },
@@ -2163,6 +2165,7 @@ fn setup_wakes_the_outbox_after_a_successful_install_and_renders_the_outcome() {
                 message: "outbox wake failed with exit 70".into(),
             }],
             outbox: Some("failed OUTBOX_WAKE_FAILED".into()),
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -2198,6 +2201,7 @@ fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
                 message: "lock release failed".into(),
             }],
             outbox: None,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -2229,6 +2233,7 @@ fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
                 message: "process exceeded its 90s execution deadline".into(),
             }],
             outbox: None,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -2262,6 +2267,7 @@ fn setup_human_output_surfaces_facts_refresh_warning_after_verified_success() {
                         .into(),
             }],
             outbox: None,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -2988,6 +2994,7 @@ fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
             failure_kind: None,
             warnings: vec![herdr_unavailable_warning()],
             outbox: None,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -3023,6 +3030,7 @@ fn setup_human_and_json_output_surface_an_outdated_laptop_binary_warning() {
             failure_kind: None,
             warnings: Vec::new(),
             outbox: None,
+            controller_service: None,
             build_id: None,
             binary_sha256: None,
         }],
@@ -3138,4 +3146,198 @@ fn debug_probe_json() -> Vec<u8> {
     probe["build_id"] = serde_json::json!("0.1.0+0123456789ab-debug");
     probe["binary_sha256"] = serde_json::json!(CANDIDATE_DIGEST);
     serde_json::to_vec(&probe).unwrap()
+}
+
+fn setup_with_controller(
+    enabled: bool,
+    destination: &str,
+    results: Vec<Result<ProcessResult, WorkerError>>,
+) -> (CommandOutput, RecordingRunner) {
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!("version = 1\n[controller]\nenabled = {enabled}\nssh = '{destination}'\n[[workers]]\nname = 'mini-1'\nssh = 'mac1'\nslots = 1\n"),
+    )
+    .unwrap();
+    let runner = RecordingRunner::returning_results(results);
+    let output = execute_with(
+        Cli {
+            config: Some(config_path),
+            json: true,
+            command: Command::Setup {
+                hosts: Vec::new(),
+                allow_debug: false,
+            },
+        },
+        &runner,
+    )
+    .unwrap();
+    (output, runner)
+}
+
+fn restarted_controller_service() -> ProcessResult {
+    result(0, br#"{"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true}"#, b"")
+}
+
+fn resolved_setup_host(user: &str, hostname: &str, port: u16) -> ProcessResult {
+    result(
+        0,
+        format!("user {user}\nhostname {hostname}\nport {port}\nproxyjump none\n"),
+        b"",
+    )
+}
+
+#[test]
+fn setup_controller_restarts_the_service_after_verified_install_and_reports_it() {
+    let mut results = success_results();
+    results.push(Ok(restarted_controller_service()));
+    let (output, runner) = setup_with_controller(true, "mac1", results);
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["installed"], true);
+    assert_eq!(json["workers"][0]["controller_service"], "restarted");
+    assert_eq!(json["workers"][0]["warnings"], serde_json::json!([]));
+    assert!(output.render_human().contains("\n  controller: restarted"));
+    assert_eq!(output.aggregate_exit_kind(), None);
+    let requests = runner.requests();
+    assert_eq!(
+        requests.len(),
+        13,
+        "exact SSH match needs no alias resolution"
+    );
+    let restart = &requests[12];
+    assert_eq!(
+        request_command(restart),
+        "~/.local/bin/worker host controller-service"
+    );
+    assert!(restart.args.iter().any(|arg| arg == "mac1"));
+    let request: serde_json::Value =
+        serde_json::from_slice(restart.stdin.as_ref().unwrap()).unwrap();
+    assert_eq!(request, serde_json::json!({ "action": "restart" }));
+}
+
+#[test]
+fn setup_controller_disabled_mode_leaves_the_service_stopped_without_extra_calls() {
+    let (output, runner) = setup_with_controller(false, "mac1", success_results());
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["installed"], true);
+    assert!(json["workers"][0].get("controller_service").is_none());
+    assert_eq!(runner.requests().len(), 12);
+}
+
+#[test]
+fn setup_controller_does_not_restart_after_a_failed_install() {
+    let (output, runner) = setup_with_controller(
+        true,
+        "mac1",
+        vec![
+            Ok(result(0, valid_probe_json(), b"")),
+            Ok(result(75, b"", b"busy")),
+        ],
+    );
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["installed"], false);
+    assert!(json["workers"][0].get("controller_service").is_none());
+    assert_eq!(runner.requests().len(), 2);
+}
+
+#[test]
+fn setup_controller_matches_aliases_by_resolved_host_port_and_account() {
+    let mut results = success_results();
+    results.extend([
+        Ok(resolved_setup_host("owner", "mini-1.local", 2222)),
+        Ok(resolved_setup_host("owner", "MINI-1.local", 2222)),
+        Ok(restarted_controller_service()),
+    ]);
+    let (output, runner) = setup_with_controller(true, "controller-alias", results);
+    let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+    assert_eq!(json["workers"][0]["controller_service"], "restarted");
+    let requests = runner.requests();
+    assert_eq!(requests.len(), 15);
+    assert_eq!(
+        requests[12].args,
+        ["-G", "--", "controller-alias"].map(OsString::from)
+    );
+    assert_eq!(requests[13].args, ["-G", "--", "mac1"].map(OsString::from));
+    assert_eq!(
+        request_command(&requests[14]),
+        "~/.local/bin/worker host controller-service"
+    );
+}
+
+#[test]
+fn setup_controller_does_not_restart_other_hosts_ports_or_accounts() {
+    for (user, host, port) in [
+        ("owner", "mini-2.local", 22),
+        ("other", "mini-1.local", 22),
+        ("owner", "mini-1.local", 2222),
+    ] {
+        let mut results = success_results();
+        results.extend([
+            Ok(resolved_setup_host("owner", "mini-1.local", 22)),
+            Ok(resolved_setup_host(user, host, port)),
+        ]);
+        let (output, runner) = setup_with_controller(true, "controller-alias", results);
+        let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+        assert_eq!(json["workers"][0]["installed"], true);
+        assert!(json["workers"][0].get("controller_service").is_none());
+        assert_eq!(json["workers"][0]["warnings"], serde_json::json!([]));
+        assert_eq!(runner.requests().len(), 14);
+    }
+}
+
+#[test]
+fn setup_controller_alias_resolution_failure_is_a_redacted_install_warning() {
+    let mut results = success_results();
+    results.push(Ok(result(
+        1,
+        b"",
+        b"token=PLANTED_CONTROLLER_SECRET /private/owner",
+    )));
+    let (output, runner) = setup_with_controller(true, "controller-alias", results);
+    assert_controller_restart_warning(&output);
+    assert_eq!(
+        runner.requests().len(),
+        13,
+        "unknown alias must not restart any service"
+    );
+}
+
+#[test]
+fn setup_controller_restart_failures_keep_the_helper_installed_and_report_a_warning() {
+    for failure in [
+        Ok(result(70, b"", b"token=PLANTED_CONTROLLER_SECRET /private/owner")),
+        Err(WorkerError::Io(io::Error::other("PLANTED_CONTROLLER_SECRET /private/owner"))),
+        Ok(result(0, br#"{"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":false}"#, b"")),
+        Ok(result(0, br#"{"label":"com.example.other-service","domain":"gui/501","installed":true,"loaded":true}"#, b"")),
+    ] {
+        let mut results = success_results();
+        results.push(failure);
+        let (output, runner) = setup_with_controller(true, "mac1", results);
+        assert_controller_restart_warning(&output);
+        assert_eq!(runner.requests().len(), 13);
+    }
+}
+
+fn assert_controller_restart_warning(output: &CommandOutput) {
+    let encoded = output.render_json().unwrap();
+    let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(json["workers"][0]["installed"], true);
+    assert_eq!(json["workers"][0]["error_code"], serde_json::Value::Null);
+    assert_eq!(
+        json["workers"][0]["controller_service"],
+        "failed CONTROLLER_RESTART_FAILED"
+    );
+    assert_eq!(
+        json["workers"][0]["warnings"][0]["code"],
+        "CONTROLLER_RESTART_FAILED"
+    );
+    assert_eq!(output.aggregate_exit_kind(), None);
+    let human = output.render_human();
+    assert!(human.contains("controller: failed CONTROLLER_RESTART_FAILED"));
+    assert!(human.contains("warning [CONTROLLER_RESTART_FAILED]"));
+    for rendered in [encoded, human] {
+        assert!(!rendered.contains("PLANTED_CONTROLLER_SECRET"));
+        assert!(!rendered.contains("/private/owner"));
+    }
 }
