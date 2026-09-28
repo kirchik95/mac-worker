@@ -4,12 +4,16 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Full suite nightly; pushes and pull requests run the fast tier only.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -38,8 +42,25 @@ jobs:
           diff -r "$asset_dir" src/dashboard/static/app
 
   rust:
+    # Fast tier: formatting, lints and library/binary unit tests. The full
+    # integration suite runs nightly, on demand and in the release workflow;
+    # run it locally before landing larger changes.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --lib --bins --no-fail-fast
+
+  rust-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
     steps:
