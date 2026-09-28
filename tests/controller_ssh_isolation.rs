@@ -69,6 +69,7 @@ fn controller_configure_records_host_config_file_and_probe_installs_it_process_w
             base64::engine::general_purpose::STANDARD.encode(blob)
         ),
         force: false,
+        include_details: false,
     };
     let runtime = RuntimeContext::isolated(BTreeMap::new(), home.clone(), home.clone());
     let runner = ProbeRunner::default();
