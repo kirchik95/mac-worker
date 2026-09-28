@@ -25,10 +25,12 @@ use crate::{
 pub const SETUP_RECEIPT_VERSION: u32 = 1;
 pub const SETUP_LOG_LIMIT: usize = 64 * 1024;
 pub const SETUP_RESULT_FILE: &str = "setup-result.json";
+/// Written by the prepare-turn helper inside the turn's disposable `tmp` scope.
+pub const STAGED_SETUP_RESULT_FILE: &str = "mac-worker-setup-result.json";
 pub const SETUP_STAGE_EXIT_CODE: u8 = 78;
 const SETUP_CACHE_DIR: &str = "project-setup";
 const RECEIPT_MAX_BYTES: u64 = 16 * 1024;
-const SETUP_RESULT_MAX_BYTES: u64 = 4 * 1024;
+pub(crate) const SETUP_RESULT_MAX_BYTES: u64 = 4 * 1024;
 const WORKSPACE_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const LOCK_POLL: Duration = Duration::from_millis(50);
 const DIAGNOSTIC_TAIL_BYTES: usize = 200;
@@ -342,14 +344,28 @@ pub fn compute_setup_identity(
     Ok(sha256_hex(&encoded))
 }
 
+/// Called by the prepare-turn helper, which a cancel can kill mid-write. Stage
+/// the record in the turn's `tmp` scope; the supervisor adopts it before it
+/// reads the setup outcome.
 pub fn persist_setup_stage_result(turn_dir: &Path, error: &WorkerError) -> Result<(), WorkerError> {
-    let directory = RootedDir::open(turn_dir).map_err(|error| {
+    let result = SetupStageResult {
+        code: error.public_code(),
+        message: setup_stage_message(error),
+    };
+    let bytes = serde_json::to_vec(&result).map_err(|error| {
         setup_error(
             "SETUP_FAILED",
-            format!("setup result directory is unavailable: {error}"),
+            format!("setup result could not be encoded: {error}"),
         )
     })?;
-    write_setup_stage_result(&directory, error)
+    crate::prepare_turn::stage_turn_diagnostic(turn_dir, STAGED_SETUP_RESULT_FILE, &bytes).map_err(
+        |error| {
+            setup_error(
+                "SETUP_FAILED",
+                format!("setup result directory is unavailable: {error}"),
+            )
+        },
+    )
 }
 
 pub fn write_setup_stage_result(

@@ -44,7 +44,7 @@ fn run(root: &std::path::Path, frozen: Option<&str>) -> std::process::Output {
 
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    for dir in ["workspace", "home", "turn"] {
+    for dir in ["workspace", "home", "turn", "turn/tmp"] {
         fs::create_dir(root.path().join(dir)).unwrap();
     }
     fs::write(root.path().join("workspace/lock"), "original").unwrap();
@@ -91,9 +91,10 @@ fn followup_refuses_changed_lockfile_and_lifecycle_input_before_check_or_agent()
         .unwrap();
         let result = run(root.path(), Some(&frozen()));
         assert_eq!(result.status.code(), Some(78));
-        let failure: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.path().join("turn/setup-result.json")).unwrap())
-                .unwrap();
+        let failure: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("turn/tmp/mac-worker-setup-result.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(failure["code"], "SETUP_INPUTS_CHANGED");
         assert!(!root.path().join("workspace/agent-ran").exists());
         assert_eq!(

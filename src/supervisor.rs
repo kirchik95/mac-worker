@@ -2715,6 +2715,9 @@ impl<'a> Supervisor<'a> {
         if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
             return Err(injected_supervisor_fault("log sync"));
         }
+        // The prepare-turn helper stages its failure record in tmp; adopt it
+        // now that the child is gone and before the setup outcome is read.
+        crate::turn::adopt_staged_turn_diagnostics(&current_job);
         let setup = load_setup_stage_result(&current_job)?;
         let (terminal, terminal_kind, exit_code, terminal_path) = terminal_from_setup_or_outcome(
             &current_status,
@@ -7315,6 +7318,9 @@ mod tests {
         fs::write(workspace.join(".worker.toml"), setup_toml).unwrap();
         let turn_dir = temp.path().join("turn");
         RootedDir::create(&turn_dir).unwrap();
+        // Jobs always have a private tmp scope; the helper stages records there.
+        fs::create_dir(turn_dir.join("tmp")).unwrap();
+        fs::set_permissions(turn_dir.join("tmp"), fs::Permissions::from_mode(0o700)).unwrap();
         let account = temp.path().join("account");
         fs::create_dir_all(&account).unwrap();
         fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
@@ -7482,6 +7488,8 @@ mod tests {
             "agent launched after setup {expected_code}"
         );
         let turn = RootedDir::open(&fixture.turn_dir).unwrap();
+        // The supervisor adopts the helper's staged record before reading it.
+        crate::turn::adopt_staged_turn_diagnostics(&turn);
         let setup = load_setup_stage_result(&turn)
             .unwrap()
             .expect("setup-result");
@@ -7587,6 +7595,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         assert!(!fixture.workspace.join("setup.done").exists());
         assert!(!fixture.workspace.join("agent.ran").exists());
         let turn = RootedDir::open(&fixture.turn_dir).unwrap();
+        // The supervisor adopts the helper's staged record before reading it.
+        crate::turn::adopt_staged_turn_diagnostics(&turn);
         let setup = load_setup_stage_result(&turn)
             .unwrap()
             .expect("setup-result");

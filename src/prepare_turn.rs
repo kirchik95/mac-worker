@@ -171,8 +171,36 @@ fn persist_agent_identity(identity: &crate::agent::AgentIdentity) -> Result<(), 
         .ok_or_else(|| WorkerError::task("SETUP_FAILED", "turn identity directory is absent"))?;
     let bytes = serde_json::to_vec(identity)
         .map_err(|_| WorkerError::task("SETUP_FAILED", "cannot encode agent identity"))?;
-    crate::agent::identity::stage_identity(&Path::new(&dir).join("tmp"), &bytes)?;
+    stage_turn_diagnostic(
+        Path::new(&dir),
+        crate::agent::identity::STAGED_IDENTITY_FILE,
+        &bytes,
+    )?;
     Ok(())
+}
+
+/// This helper runs in the agent's process group, so a cancel can kill it at
+/// any instruction. It must never write into the retained turn directory,
+/// where an interrupted private write is cleanup residue. Diagnostics are
+/// staged in the turn's `tmp` scope, which terminal cleanup removes whole,
+/// and the supervisor adopts complete records after the child is gone.
+pub(crate) fn stage_turn_diagnostic(
+    turn_dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let tmp = turn_dir.join("tmp");
+    let partial = tmp.join(format!(".{name}.{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&partial)?;
+    file.write_all(bytes)?;
+    drop(file);
+    std::fs::rename(&partial, tmp.join(name))
 }
 
 fn resolve_executable(program: &OsStr) -> Result<PathBuf, WorkerError> {

@@ -183,6 +183,7 @@ fn unresolvable_or_unexecutable_agents_still_fail_launch() {
         let root = tempfile::tempdir().unwrap();
         let turn = root.path().join("turn");
         fs::create_dir(&turn).unwrap();
+        fs::create_dir(turn.join("tmp")).unwrap();
         let program = root.path().join("fixture-agent");
         if invalid_executable {
             executable(&program, "#!/nonexistent/fixture-interpreter\n");
@@ -198,8 +199,17 @@ fn unresolvable_or_unexecutable_agents_still_fail_launch() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(78));
-        let failure: serde_json::Value =
-            serde_json::from_slice(&fs::read(turn.join("setup-result.json")).unwrap()).unwrap();
+        // A failing helper can still be killed by a cancel, so its failure
+        // record is staged in tmp like the identity, never in the turn dir.
+        let names = fs::read_dir(&turn)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["tmp"], "the helper wrote outside tmp");
+        let failure: serde_json::Value = serde_json::from_slice(
+            &fs::read(turn.join("tmp/mac-worker-setup-result.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             failure["code"],
             if invalid_executable {
