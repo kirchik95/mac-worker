@@ -25,6 +25,7 @@ pub mod read;
 pub mod registry;
 pub mod runtime;
 pub mod store;
+pub mod service;
 pub mod stream_client;
 pub mod stream_rpc;
 pub mod task_mutations;
