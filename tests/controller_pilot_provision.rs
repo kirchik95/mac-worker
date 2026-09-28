@@ -51,6 +51,116 @@ fn destinations_use_loopback_drop_controller_jump_preserve_port_and_allow_overri
         "10.9.0.2"
     );
 }
+
+#[test]
+fn managed_alias_encodes_at_names_without_sanitization_collisions() {
+    let mut config = inventory();
+    config.workers[0].name = "a@mini2".into();
+    config.workers[1].name = "a_mini2".into();
+    config.validate().unwrap();
+    let controller = resolved("192.168.1.11", 22, None);
+    let targets = BTreeMap::from([
+        ("a@mini2".into(), resolved("10.0.0.2", 2222, None)),
+        ("a_mini2".into(), resolved("10.0.0.3", 22, None)),
+    ]);
+    let plan = plan_inventory(&config, &controller, "mac1", &targets).unwrap();
+    assert_eq!(plan[0].name, "a@mini2");
+    assert_eq!(plan[0].alias, "mac-worker-controller-a_mini2-4e1d99eb");
+    assert_eq!(plan[1].alias, "mac-worker-controller-a_mini2-1f1fbb88");
+}
+
+#[test]
+fn managed_alias_hash_collision_is_refused_before_provisioning() {
+    // These distinct valid names share both the first 32 sanitized bytes and
+    // the first 8 SHA-256 hex digits (0766d888).
+    let names = [
+        "worker-name-with-a-shared-prefix-3753",
+        "worker-name-with-a-shared-prefix-110160",
+    ];
+    for name in names {
+        assert_eq!(
+            mac_worker::controller::provision::worker_ssh_alias(name),
+            "mac-worker-controller-worker-name-with-a-shared-prefix-0766d888"
+        );
+    }
+    let mut config = inventory();
+    for (worker, name) in config.workers.iter_mut().zip(names) {
+        worker.name = name.into();
+    }
+    config.validate().unwrap();
+    let controller = resolved("192.168.1.11", 22, None);
+    let targets = names
+        .into_iter()
+        .map(|name| (name.into(), controller.clone()))
+        .collect();
+    let error = plan_inventory(&config, &controller, "mac1", &targets)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("alias collision"), "{error}");
+    for name in names {
+        assert!(error.contains(name), "{error}");
+    }
+}
+
+#[test]
+fn managed_alias_at_name_is_one_transport_destination_and_resolves_offline() {
+    use mac_worker::{
+        controller::provision::write_ssh_settings,
+        error::WorkerError,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        transport::SshTransport,
+    };
+    let mut config = inventory();
+    config.workers.truncate(1);
+    config.workers[0].name = "a@mini2".into();
+    let controller = resolved("192.168.1.11", 22, None);
+    let targets = BTreeMap::from([("a@mini2".into(), resolved("10.0.0.2", 2222, None))]);
+    let plan = plan_inventory(&config, &controller, "mac1", &targets).unwrap();
+    config.workers[0].ssh = plan[0].alias.clone();
+    struct Offline;
+    impl ProcessRunner for Offline {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(
+                request.args[request.args.len() - 2],
+                "mac-worker-controller-a_mini2-4e1d99eb"
+            );
+            Err(WorkerError::Io(std::io::Error::other("offline fixture")))
+        }
+    }
+    SshTransport::new(Offline).probe(&config.workers[0]);
+    let temp = tempfile::tempdir().unwrap();
+    write_ssh_settings(temp.path(), &plan, &format!("10.0.0.2 {}\n", key())).unwrap();
+    assert!(
+        temp.path()
+            .join(".ssh/mac-worker-controller-a_mini2-4e1d99eb.known_hosts")
+            .is_file()
+    );
+    if !std::path::Path::new("/usr/bin/ssh").exists() {
+        eprintln!("skipping effective SSH config: /usr/bin/ssh is missing");
+        return;
+    }
+    let output = std::process::Command::new("/usr/bin/ssh")
+        .arg("-G")
+        .arg("-F")
+        .arg(temp.path().join(".ssh/mac-worker-controller.conf"))
+        .arg(&plan[0].alias)
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let values: BTreeMap<_, _> = stdout
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect();
+    assert_eq!(values["hostname"], "10.0.0.2");
+    assert_eq!(values["user"], "kirchik");
+    assert_eq!(values["port"], "2222");
+}
 #[test]
 fn authorization_is_idempotent_preserves_other_lines_and_repairs_mode() {
     let temp = tempfile::tempdir().unwrap();
@@ -147,7 +257,9 @@ fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
     write_ssh_settings(temp.path(), &plan, &trust).unwrap();
     assert_eq!(fs::read(ssh.join("config")).unwrap(), once);
     let generated = fs::read_to_string(ssh.join("mac-worker-controller.conf")).unwrap();
-    assert!(generated.contains("Host mac-worker-controller-mini-1\n  HostName 127.0.0.1\n"));
+    assert!(
+        generated.contains("Host mac-worker-controller-mini-1-42169ef9\n  HostName 127.0.0.1\n")
+    );
     assert!(generated.contains("  Port 2222\n"));
     assert!(generated.contains("  IdentityFile ~/.ssh/mac-worker-controller_ed25519\n"));
     assert!(generated.contains("  StrictHostKeyChecking yes\n"));

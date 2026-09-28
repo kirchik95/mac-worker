@@ -2,7 +2,12 @@
 use crate::{config::Config, error::WorkerError, rooted_fs::RootedDir};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io, os::fd::AsRawFd, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    os::fd::AsRawFd,
+    path::Path,
+};
 
 const MAX_FILE: u64 = 1024 * 1024;
 const KEY_COMMENT: &str = "mac-worker-controller";
@@ -91,6 +96,24 @@ pub struct PlannedWorker {
     pub trusted_keys: Option<String>,
 }
 
+/// An opaque SSH host token: never allow worker names to become user@host syntax.
+pub fn worker_ssh_alias(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let sanitized: String = name
+        .bytes()
+        .take(32)
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"._-".contains(&byte) {
+                char::from(byte)
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+    format!("mac-worker-controller-{sanitized}-{}", &digest[..8])
+}
+
 pub fn plan_inventory(
     config: &Config,
     controller: &ResolvedSsh,
@@ -98,10 +121,18 @@ pub fn plan_inventory(
     resolved: &BTreeMap<String, ResolvedSsh>,
 ) -> Result<Vec<PlannedWorker>, WorkerError> {
     config.require_local_inventory()?;
+    let mut aliases = BTreeMap::new();
     config
         .workers
         .iter()
         .map(|worker| {
+            let alias = worker_ssh_alias(&worker.name);
+            if let Some(previous) = aliases.insert(alias.clone(), worker.name.clone()) {
+                return Err(invalid(&format!(
+                    "worker SSH alias collision between {previous} and {}; rename one worker",
+                    worker.name
+                )));
+            }
             let mut target = resolved
                 .get(&worker.name)
                 .ok_or_else(|| invalid("missing resolved worker"))?
@@ -132,7 +163,7 @@ pub fn plan_inventory(
             }
             Ok(PlannedWorker {
                 name: worker.name.clone(),
-                alias: format!("mac-worker-controller-{}", worker.name),
+                alias,
                 target,
                 trusted_keys: None,
             })
@@ -454,10 +485,12 @@ pub fn write_ssh_settings(
         return Err(invalid("invalid controller SSH inventory"));
     }
     let mut generated = String::from("# Managed by worker controller init\n");
+    let mut aliases = BTreeSet::new();
     for worker in workers {
         worker.target.validate()?;
         if !crate::config::valid_identifier(&worker.name)
-            || worker.alias != format!("mac-worker-controller-{}", worker.name)
+            || worker.alias != worker_ssh_alias(&worker.name)
+            || !aliases.insert(&worker.alias)
         {
             return Err(invalid("invalid managed SSH alias"));
         }

@@ -146,7 +146,7 @@ impl ProcessRunner for Fake {
                 )
             }
             "~/.local/bin/worker host controller-probe" => result(
-                json!({"protocol_version":PROTOCOL_VERSION,"workers":[{"name":"mini-1","ssh":"mac-worker-controller-mini-1","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null},{"name":"mini-2","ssh":"mac-worker-controller-mini-2","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null}]}),
+                json!({"protocol_version":PROTOCOL_VERSION,"workers":[{"name":"mini-1","ssh":"mac-worker-controller-mini-1-42169ef9","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null},{"name":"mini-2","ssh":"mac-worker-controller-mini-2-100aaff3","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null}]}),
             ),
             "~/.local/bin/worker host controller-rpc" => {
                 let request: Value =
