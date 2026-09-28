@@ -597,6 +597,7 @@ When `worker run` finishes, the process status is the remote command's own exit 
 | `CONTROLLER_DESTINATION_REQUIRED` | 69 | no controller destination is recorded; use `worker controller disable --ssh <destination>` |
 | `CONTROLLER_INIT_PENDING` | 69 | run `worker controller disable` to clean up the unfinished init before changing destination |
 | `CONTROLLER_FOREIGN_LEADER` | 69 | stop the foreign controller leader process reported by init, then rerun `worker controller init` |
+| `CONTROLLER_SERVICE_UNVERIFIED` | 69 | inspect `worker controller status` and retry init after launchd exposes a verifiable supervised process |
 | `CONTROLLER_UNAVAILABLE` | 69 | check the controller host with `worker controller status` |
 | `BASE_PUSH_FAILED` | 69 | retry; the worker did not receive the base commit |
 | `RESULT_FETCH_FAILED` | 69 | retry the fetch; the result is still on the worker |

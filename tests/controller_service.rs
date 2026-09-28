@@ -637,13 +637,13 @@ fn service_observation_parses_running_pid_and_last_exit_status() {
     let (_temp, home) = home();
     let runner = Launchctl::loaded();
     *runner.print_output.lock().unwrap() = Some(format!(
-        "{TARGET} = {{\n\tstate = running\n\tpid = 42\n\tlast exit code = 64\n\tenvironment = {{\n\t\tpid = 99\n\t}}\n}}\n"
+        "{TARGET} = {{\n\tstate = running\n\tpid = 42\n\tlast exit code = 70\n\tenvironment = {{\n\t\tpid = 99\n\t}}\n}}\n"
     ));
     let status =
         serde_json::to_value(manage(&home, 501, &runner, ServiceAction::Status).unwrap()).unwrap();
     assert_eq!(status["pid"], 42);
     assert_eq!(status["running"], true);
-    assert_eq!(status["last_exit_status"], 64);
+    assert_eq!(status["last_exit_status"], 70);
 }
 
 #[test]
@@ -652,7 +652,7 @@ fn service_observation_exited_or_unknown_never_reports_a_live_pid() {
     let runner = Launchctl::loaded();
     for (output, running) in [
         (
-            format!("{TARGET} = {{\nstate = not running\npid = 42\nlast exit code = 64\n}}\n"),
+            format!("{TARGET} = {{\nstate = not running\npid = 42\nlast exit code = 70\n}}\n"),
             serde_json::json!(false),
         ),
         (

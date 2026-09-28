@@ -681,7 +681,7 @@ fn init_supervision_rejects_a_foreign_manual_leader() {
     let temp = tempfile::tempdir().unwrap();
     let path = config(&temp);
     let mut fake = Fake::new();
-    fake.service_patch = json!({"pid":43,"running":true,"last_exit_status":64});
+    fake.service_patch = json!({"pid":43,"running":true,"last_exit_status":70});
     fake.health_patch = json!({"supervised":false});
     let report =
         initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
@@ -707,16 +707,81 @@ fn init_supervision_rejects_loaded_but_exited_service() {
     let temp = tempfile::tempdir().unwrap();
     let path = config(&temp);
     let mut fake = Fake::new();
-    fake.service_patch = json!({"pid":null,"running":false,"last_exit_status":64});
-    let report =
-        initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
+    let lock_held_exit = WorkerError::Protocol("CONTROLLER_LOCK_HELD: held".into()).exit_code();
+    assert_eq!(lock_held_exit, 70);
+    fake.service_patch = json!({"pid":null,"running":false,"last_exit_status":lock_held_exit});
+    let report = initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {
+        panic!("a known lock-held exit must not wait for missing pid evidence");
+    })
+    .unwrap();
     assert!(!report.ready, "accepted an exited job: {report:?}");
+    assert_eq!(
+        report.error_code.as_deref(),
+        Some("CONTROLLER_FOREIGN_LEADER")
+    );
     assert!(
         !mac_worker::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
     );
+}
+
+#[test]
+fn init_supervision_missing_launchd_pid_is_unverified_without_stop_advice() {
+    for patch in [
+        json!({"pid":null,"running":null,"last_exit_status":null}),
+        json!({"pid":null,"running":true,"last_exit_status":null}),
+        json!({"pid":null,"running":false,"last_exit_status":64}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = config(&temp);
+        let mut fake = Fake::new();
+        fake.service_patch = patch;
+        let waits = std::cell::Cell::new(0);
+        let report =
+            initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {
+                waits.set(waits.get() + 1);
+            })
+            .unwrap();
+        assert!(!report.ready);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("CONTROLLER_SERVICE_UNVERIFIED"),
+            "{report:?}"
+        );
+        assert_eq!(waits.get(), 20);
+        assert!(
+            report.message.contains("launchd exposed no pid"),
+            "{report:?}"
+        );
+        assert!(!report.message.contains("FOREIGN_LEADER"));
+        assert!(!report.message.contains("stop that process"));
+        assert!(
+            !mac_worker::config::Config::load(&path)
+                .unwrap()
+                .controller
+                .enabled
+        );
+    }
+}
+
+#[test]
+fn init_supervision_matching_pid_without_supervised_health_is_not_foreign() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.health_patch = json!({"supervised":false});
+    let report =
+        initialize_with_wait(&fake, &path, temp.path(), &fake.digest, request(), &|_| {}).unwrap();
+    assert!(!report.ready);
+    assert_eq!(
+        report.error_code.as_deref(),
+        Some("CONTROLLER_SERVICE_UNVERIFIED"),
+        "{report:?}"
+    );
+    assert!(!report.message.contains("FOREIGN_LEADER"));
+    assert!(!report.message.contains("stop that process"));
 }
 
 fn remote_paths() -> Value {

@@ -410,6 +410,13 @@ static CATALOG: &[PublicDiagnostic] = &[
         ),
     },
     PublicDiagnostic {
+        code: "CONTROLLER_SERVICE_UNVERIFIED",
+        exit: 69,
+        hint: Some(
+            "inspect `worker controller status` and retry init after launchd exposes a verifiable supervised process",
+        ),
+    },
+    PublicDiagnostic {
         code: "CONTROLLER_UNAVAILABLE",
         exit: 69,
         hint: Some("check the controller host with `worker controller status`"),
@@ -571,7 +578,8 @@ fn build_catalog_error(code: &'static str) -> WorkerError {
         }
         "CONTROLLER_DESTINATION_REQUIRED"
         | "CONTROLLER_INIT_PENDING"
-        | "CONTROLLER_FOREIGN_LEADER" => {
+        | "CONTROLLER_FOREIGN_LEADER"
+        | "CONTROLLER_SERVICE_UNVERIFIED" => {
             WorkerError::Unavailable(format!("{code}: controller lifecycle error"))
         }
         "IO" => WorkerError::Io(std::io::Error::other("I/O error")),

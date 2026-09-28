@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     controller::leader::lock_exclusive,
-    error::WorkerError,
+    error::{ExitKind, WorkerError},
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::{PrivateEntryIdentity, RootedDir},
@@ -657,14 +657,23 @@ pub fn verify_restart(
         if observed.leader_running == Some(true) {
             if let Some(health) = observed.health {
                 let pid = health.leader.pid();
-                if !health.supervised
-                    || status.pid.is_some_and(|service_pid| service_pid != pid)
+                if status.pid.is_some_and(|service_pid| service_pid != pid)
                     || (status.pid.is_none()
-                        && (status.last_exit_status == Some(64) || attempt == 20))
+                        && status.last_exit_status == Some(ExitKind::Infrastructure as i32))
                 {
                     return Err(WorkerError::Unavailable(format!(
                         "CONTROLLER_FOREIGN_LEADER: process {pid} holds the controller leader lock outside the restarted LaunchAgent; stop that process, then rerun worker controller init"
                     )));
+                }
+                if status.pid.is_none() && attempt == 20 {
+                    return Err(WorkerError::Unavailable(
+                        "CONTROLLER_SERVICE_UNVERIFIED: restart verification could not identify the LaunchAgent process (launchd exposed no pid)".into(),
+                    ));
+                }
+                if !health.supervised {
+                    return Err(WorkerError::Unavailable(
+                        "CONTROLLER_SERVICE_UNVERIFIED: the live controller leader does not report a supervised startup".into(),
+                    ));
                 }
                 if !status.loaded || status.running != Some(true) || status.pid != Some(pid) {
                     reason = format!(
