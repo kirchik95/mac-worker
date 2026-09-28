@@ -1087,6 +1087,8 @@ fn fixture_detail() -> TaskDetailProjection {
         .parse()
         .expect("valid run ID fixture");
     let turn = TaskTurnProjection {
+        agent_identity: None,
+        result_parse_reason: None,
         turn_number: 1,
         turn_id,
         terminal: Some(TurnTerminal::Succeeded),
