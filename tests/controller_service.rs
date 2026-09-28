@@ -42,6 +42,7 @@ struct Launchctl {
     loaded: Mutex<bool>,
     calls: Mutex<Vec<Vec<String>>>,
     failures: Mutex<VecDeque<(&'static str, i32)>>,
+    print_output: Mutex<Option<String>>,
 }
 
 impl Launchctl {
@@ -113,7 +114,14 @@ impl ProcessRunner for Launchctl {
         };
         Ok(ProcessResult {
             status: ExitStatus::from_raw(code << 8),
-            stdout: b"deliberately opaque launchctl output".to_vec(),
+            stdout: self
+                .print_output
+                .lock()
+                .unwrap()
+                .as_deref()
+                .unwrap_or("deliberately opaque launchctl output")
+                .as_bytes()
+                .to_vec(),
             stderr: Vec::new(),
         })
     }
@@ -622,4 +630,49 @@ fn service_paths_runner_child_uses_plist_config_and_inherited_state() {
     );
     assert!(state_root.join("mac-worker").is_dir());
     assert!(!home.join(".local/state/mac-worker").exists());
+}
+
+#[test]
+fn service_observation_parses_running_pid_and_last_exit_status() {
+    let (_temp, home) = home();
+    let runner = Launchctl::loaded();
+    *runner.print_output.lock().unwrap() = Some(format!(
+        "{TARGET} = {{\n\tstate = running\n\tpid = 42\n\tlast exit code = 64\n\tenvironment = {{\n\t\tpid = 99\n\t}}\n}}\n"
+    ));
+    let status =
+        serde_json::to_value(manage(&home, 501, &runner, ServiceAction::Status).unwrap()).unwrap();
+    assert_eq!(status["pid"], 42);
+    assert_eq!(status["running"], true);
+    assert_eq!(status["last_exit_status"], 64);
+}
+
+#[test]
+fn service_observation_exited_or_unknown_never_reports_a_live_pid() {
+    let (_temp, home) = home();
+    let runner = Launchctl::loaded();
+    for (output, running) in [
+        (
+            format!("{TARGET} = {{\nstate = not running\npid = 42\nlast exit code = 64\n}}\n"),
+            serde_json::json!(false),
+        ),
+        (
+            format!("{TARGET} = {{\nstate = future-format\npid = 42\n}}\n"),
+            serde_json::json!(null),
+        ),
+        (
+            format!("{TARGET} = {{\nstate = running\npid = 42\npid = 43\n}}\n"),
+            serde_json::json!(true),
+        ),
+        (
+            "unrecognized format pid = 42".into(),
+            serde_json::json!(null),
+        ),
+    ] {
+        *runner.print_output.lock().unwrap() = Some(output);
+        let status =
+            serde_json::to_value(manage(&home, 501, &runner, ServiceAction::Status).unwrap())
+                .unwrap();
+        assert_eq!(status["pid"], serde_json::Value::Null, "{status}");
+        assert_eq!(status["running"], running, "{status}");
+    }
 }

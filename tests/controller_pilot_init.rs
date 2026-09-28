@@ -58,6 +58,8 @@ struct Fake {
     controller_port: u16,
     pending_health: Mutex<usize>,
     health_config: String,
+    health_patch: Value,
+    service_patch: Value,
 }
 impl Fake {
     fn new() -> Self {
@@ -72,6 +74,8 @@ impl Fake {
             controller_port: 22,
             pending_health: Mutex::new(0),
             health_config: "/Users/controller/.config/mac-worker/config.toml".into(),
+            health_patch: json!({}),
+            service_patch: json!({}),
         }
     }
 }
@@ -148,9 +152,11 @@ impl ProcessRunner for Fake {
                     .lock()
                     .unwrap()
                     .push(body["action"].as_str().unwrap().into());
-                result(
-                    json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true}),
-                )
+                let mut status = json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":remote_paths()});
+                for (key, value) in self.service_patch.as_object().unwrap() {
+                    status[key] = value.clone();
+                }
+                result(status)
             }
             "~/.local/bin/worker host controller-probe" => result(
                 json!({"protocol_version":PROTOCOL_VERSION,"workers":[{"name":"mini-1","ssh":"mac-worker-controller-mini-1-42169ef9","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null},{"name":"mini-2","ssh":"mac-worker-controller-mini-2-100aaff3","status":"ready","probe":null,"missing_capabilities":[],"error_code":null,"error_message":null}]}),
@@ -170,12 +176,18 @@ impl ProcessRunner for Fake {
                     {
                         let mut record = serde_json::to_value(
                             mac_worker::controller::health::ControllerHealth::new(
-                                mac_worker::job::ProcessIdentity::new(42, 1000).unwrap(),
-                                1,
+                                mac_worker::job::ProcessIdentity::new(42, 1001000).unwrap(),
+                                1001,
                             ),
                         )
                         .unwrap();
                         record["config_path"] = json!(self.health_config);
+                        record["supervised"] = json!(true);
+                        record["binary_sha256"] = json!(self.digest);
+                        record["paths"] = remote_paths();
+                        for (key, value) in self.health_patch.as_object().unwrap() {
+                            record[key] = value.clone();
+                        }
                         json!({"state":"healthy","reason":"tick_succeeded","leader_running":true,"record_age_millis":0,"health":record,"error_code":null})
                     }
                 };
@@ -488,5 +500,128 @@ fn init_rejects_leader_using_a_different_config_path() {
             .unwrap()
             .controller
             .enabled
+    );
+}
+
+#[test]
+fn init_supervision_rejects_a_foreign_manual_leader() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.service_patch = json!({"pid":43,"running":true,"last_exit_status":64});
+    fake.health_patch = json!({"supervised":false});
+    let report = mac_worker::controller::init::initialize_with_wait(
+        &fake,
+        &path,
+        temp.path(),
+        &fake.digest,
+        request(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(!report.ready, "accepted a manual leader: {report:?}");
+    assert!(
+        report.message.contains("CONTROLLER_FOREIGN_LEADER"),
+        "{report:?}"
+    );
+    assert!(
+        report.message.contains("42"),
+        "must identify the foreign pid: {report:?}"
+    );
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
+}
+
+#[test]
+fn init_supervision_rejects_loaded_but_exited_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.service_patch = json!({"pid":null,"running":false,"last_exit_status":64});
+    let report = mac_worker::controller::init::initialize_with_wait(
+        &fake,
+        &path,
+        temp.path(),
+        &fake.digest,
+        request(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(!report.ready, "accepted an exited job: {report:?}");
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
+}
+
+fn remote_paths() -> Value {
+    json!({"config":"/Users/controller/.config/mac-worker/config.toml","state":"/Users/controller/.local/state/mac-worker","cache":"/Users/controller/.cache/mac-worker","data":"/Users/controller/.local/share/mac-worker"})
+}
+
+#[test]
+fn init_supervision_rejects_old_build_old_start_and_wrong_roots_with_bounded_wait() {
+    for patch in [
+        json!({"binary_sha256":"old"}),
+        json!({"started_at_millis":999}),
+        json!({"paths":{"config":"/Users/controller/.config/mac-worker/config.toml","state":"/wrong/state","cache":"/wrong/cache","data":"/wrong/data"}}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = config(&temp);
+        let mut fake = Fake::new();
+        fake.health_patch = patch;
+        let waits = std::cell::Cell::new(0);
+        let report = mac_worker::controller::init::initialize_with_wait(
+            &fake,
+            &path,
+            temp.path(),
+            &fake.digest,
+            request(),
+            &|_| {
+                waits.set(waits.get() + 1);
+            },
+        )
+        .unwrap();
+        assert!(!report.ready, "{report:?}");
+        assert_eq!(waits.get(), 20);
+        assert!(report.message.contains("timed out"), "{report:?}");
+        assert!(
+            !mac_worker::config::Config::load(&path)
+                .unwrap()
+                .controller
+                .enabled
+        );
+    }
+}
+
+#[test]
+fn setup_restart_verification_requires_the_installed_digest_with_injected_wait() {
+    let fake = Fake::new();
+    let controller = mac_worker::config::ControllerConfig {
+        enabled: true,
+        ssh: "controller-route".into(),
+        ..Default::default()
+    };
+    let waits = std::cell::Cell::new(0);
+    let error = mac_worker::controller::service::restart_and_verify(
+        &fake,
+        &controller,
+        "different-installed-build",
+        &|_| waits.set(waits.get() + 1),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("binary digest"), "{error}");
+    assert_eq!(waits.get(), 20);
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call.contains("controller-route"))
     );
 }

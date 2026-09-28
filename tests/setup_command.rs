@@ -3170,14 +3170,50 @@ fn setup_with_controller(
                 allow_debug: false,
             },
         },
-        &runner,
+        &SetupControllerHealth(&runner),
     )
     .unwrap();
     (output, runner)
 }
 
+struct SetupControllerHealth<'a>(&'a RecordingRunner);
+impl ProcessRunner for SetupControllerHealth<'_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request
+            .args
+            .last()
+            .is_some_and(|arg| arg == "~/.local/bin/worker host controller-rpc")
+        {
+            self.0.requests.lock().unwrap().push(request.clone());
+            let parsed = mac_worker::controller::parse_request(
+                mac_worker::controller::decode_frame(request.stdin.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let mut health =
+                serde_json::to_value(mac_worker::controller::health::ControllerHealth::new(
+                    mac_worker::job::ProcessIdentity::new(42, 1001000).unwrap(),
+                    1001,
+                ))
+                .unwrap();
+            health["supervised"] = serde_json::json!(true);
+            health["binary_sha256"] =
+                serde_json::json!(mac_worker::binary_identity::current_binary_sha256().unwrap());
+            health["config_path"] =
+                serde_json::json!("/Users/controller/.config/mac-worker/config.toml");
+            health["paths"] = setup_service_paths();
+            return Ok(result(0, mac_worker::controller::encode_json_frame(&serde_json::json!({"protocol_version":PROTOCOL_VERSION,"command":parsed.command(),"request_id":parsed.request_id(),"payload_sha256":parsed.payload_sha256(),"result":{"state":"healthy","reason":"tick_succeeded","leader_running":true,"health":health}})).unwrap(), b""));
+        }
+        self.0.run(request)
+    }
+}
+
+fn setup_service_paths() -> serde_json::Value {
+    serde_json::json!({"config":"/Users/controller/.config/mac-worker/config.toml","state":"/Users/controller/.local/state/mac-worker","cache":"/Users/controller/.cache/mac-worker","data":"/Users/controller/.local/share/mac-worker"})
+}
+
 fn restarted_controller_service() -> ProcessResult {
-    result(0, br#"{"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true}"#, b"")
+    let status: mac_worker::controller::service::ServiceStatus = serde_json::from_value(serde_json::json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":setup_service_paths()})).unwrap();
+    result(0, serde_json::to_vec(&status).unwrap(), b"")
 }
 
 fn resolved_setup_host(user: &str, hostname: &str, port: u16) -> ProcessResult {
@@ -3202,8 +3238,8 @@ fn setup_controller_restarts_the_service_after_verified_install_and_reports_it()
     let requests = runner.requests();
     assert_eq!(
         requests.len(),
-        13,
-        "exact SSH match needs no alias resolution"
+        14,
+        "exact SSH match needs restart plus verified leader health"
     );
     let restart = &requests[12];
     assert_eq!(
@@ -3213,7 +3249,10 @@ fn setup_controller_restarts_the_service_after_verified_install_and_reports_it()
     assert!(restart.args.iter().any(|arg| arg == "mac1"));
     let request: serde_json::Value =
         serde_json::from_slice(restart.stdin.as_ref().unwrap()).unwrap();
-    assert_eq!(request, serde_json::json!({ "action": "restart" }));
+    assert_eq!(
+        request,
+        serde_json::json!({ "action": "restart", "include_details": true })
+    );
 }
 
 #[test]
@@ -3253,7 +3292,13 @@ fn setup_controller_matches_aliases_by_resolved_host_port_and_account() {
     let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
     assert_eq!(json["workers"][0]["controller_service"], "restarted");
     let requests = runner.requests();
-    assert_eq!(requests.len(), 15);
+    assert_eq!(requests.len(), 16);
+    assert!(
+        requests[14]
+            .args
+            .iter()
+            .any(|arg| arg == "controller-alias")
+    );
     assert_eq!(
         requests[12].args,
         ["-G", "--", "controller-alias"].map(OsString::from)
@@ -3389,4 +3434,12 @@ fn assert_controller_restart_warning(output: &CommandOutput) {
         assert!(!rendered.contains("PLANTED_CONTROLLER_SECRET"));
         assert!(!rendered.contains("/private/owner"));
     }
+}
+
+#[test]
+fn setup_controller_loaded_job_without_verified_leader_is_a_warning() {
+    let mut results = success_results();
+    results.push(Ok(result(0, br#"{"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true}"#, b"")));
+    let (output, _) = setup_with_controller(true, "mac1", results);
+    assert_controller_restart_warning(&output);
 }

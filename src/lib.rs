@@ -985,9 +985,13 @@ fn run_controller_command(
             return if report.ready {
                 Ok(())
             } else {
-                Err(WorkerError::Unavailable(
-                    "CONTROLLER_UNAVAILABLE: controller initialization incomplete".into(),
-                ))
+                Err(WorkerError::Unavailable(format!(
+                    "{}: controller initialization incomplete",
+                    report
+                        .error_code
+                        .as_deref()
+                        .unwrap_or("CONTROLLER_UNAVAILABLE")
+                )))
             };
         }
         if matches!(command, ControllerCommand::Disable) {
@@ -1042,20 +1046,9 @@ fn run_controller_command(
             let (status, service, drained) = if let Some(controller) =
                 config.as_ref().map(|c| &c.controller).filter(|c| c.enabled)
             {
-                let worker = crate::controller::controller_worker_entry(controller)?;
                 (
                     crate::controller::health_read::fetch_controller_health(runner, controller),
-                    crate::transfer::controller_host_request::<
-                        _,
-                        crate::controller::service::ServiceStatus,
-                    >(
-                        runner,
-                        &worker,
-                        crate::transfer::HostOperation::ControllerService,
-                        &crate::protocol::ControllerServiceRequest {
-                            action: crate::controller::service::ServiceAction::Status,
-                        },
-                    ),
+                    crate::controller::service::fetch_status(runner, controller),
                     crate::controller::control::drain_via_controller(runner, controller, None),
                 )
             } else {
@@ -1095,8 +1088,19 @@ fn run_controller_command(
                 match service {
                     Ok(service) => writeln!(
                         stdout,
-                        "service: installed={} loaded={} domain={}",
-                        service.installed, service.loaded, service.domain
+                        "service: installed={} loaded={} domain={} pid={} running={} last_exit_status={}",
+                        service.installed,
+                        service.loaded,
+                        service.domain,
+                        service
+                            .pid
+                            .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                        service
+                            .running
+                            .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                        service
+                            .last_exit_status
+                            .map_or_else(|| "unknown".into(), |value| value.to_string())
                     )?,
                     Err(error) => writeln!(stdout, "service: unknown [{}]", error.public_code())?,
                 };
@@ -1127,6 +1131,12 @@ fn run_controller_command(
         let health_store = HealthStore::open(&state_root)?;
         let mut health = ControllerHealth::new(leader.identity(), now_millis()?);
         health.config_path = Some(std::path::absolute(&paths.config)?);
+        health.supervised = matches!(command, ControllerCommand::Run { supervised: true });
+        health.build_id = Some(crate::build_id::BUILD_ID.to_owned());
+        health.binary_sha256 = crate::binary_identity::current_binary_sha256();
+        health.paths = Some(Box::new(
+            crate::controller::service::ServicePaths::from_layout(&paths)?,
+        ));
         health_store.write(&health)?;
         let mut logger = HealthLogger::default();
         let shutdown = AtomicBool::new(false);
@@ -6467,13 +6477,16 @@ fn run_host_controller_provision(
             }
             HostCommand::ControllerService => {
                 let request: crate::protocol::ControllerServiceRequest = parse(body)?;
-                serde_json::to_vec(&crate::controller::service::manage(
-                    runtime.home(),
-                    &paths,
-                    unsafe { libc::geteuid() },
-                    runner,
-                    request.action,
-                )?)
+                serde_json::to_vec(
+                    &crate::controller::service::manage(
+                        runtime.home(),
+                        &paths,
+                        unsafe { libc::geteuid() },
+                        runner,
+                        request.action,
+                    )?
+                    .for_wire(request.include_details),
+                )
             }
             HostCommand::ControllerProbe => {
                 if body != serde_json::json!({}) {

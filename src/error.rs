@@ -389,6 +389,13 @@ static CATALOG: &[PublicDiagnostic] = &[
         hint: Some("check SSH to the worker and retry"),
     },
     PublicDiagnostic {
+        code: "CONTROLLER_FOREIGN_LEADER",
+        exit: 69,
+        hint: Some(
+            "stop the foreign controller leader process reported by init, then rerun `worker controller init`",
+        ),
+    },
+    PublicDiagnostic {
         code: "CONTROLLER_UNAVAILABLE",
         exit: 69,
         hint: Some("check the controller host with `worker controller status`"),

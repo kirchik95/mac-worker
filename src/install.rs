@@ -78,27 +78,14 @@ impl<'a> Installer<'a> {
             }
             Ok(true) => {}
         }
-        let restarted = crate::transfer::controller_host_request::<
-            _,
-            crate::controller::service::ServiceStatus,
-        >(
+        match crate::controller::service::restart_and_verify(
             self.runner,
-            worker,
-            crate::transfer::HostOperation::ControllerService,
-            &crate::protocol::ControllerServiceRequest {
-                action: crate::controller::service::ServiceAction::Restart,
-            },
-        )
-        .is_ok_and(|status| {
-            status.label == crate::controller::service::LABEL && status.installed && status.loaded
-        });
-        if restarted {
-            result.controller_service = Some("restarted".into());
-        } else {
-            controller_restart_warning(
-                &mut result,
-                "controller service restart could not be confirmed after installing the helper; check worker controller status and rerun worker controller init",
-            );
+            controller,
+            &candidate.digest,
+            &std::thread::sleep,
+        ) {
+            Ok(()) => result.controller_service = Some("restarted".into()),
+            Err(error) => controller_restart_warning(&mut result, &error.to_string()),
         }
         result
     }
@@ -1578,7 +1565,7 @@ fn failed(
     }
 }
 
-fn controller_restart_warning(result: &mut SetupHostResult, message: &'static str) {
+fn controller_restart_warning(result: &mut SetupHostResult, message: &str) {
     result.controller_service = Some("failed CONTROLLER_RESTART_FAILED".into());
     result.warnings.push(SetupWarning {
         code: SetupWarningCode::ControllerRestartFailed,

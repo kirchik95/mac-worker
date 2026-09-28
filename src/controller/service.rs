@@ -46,7 +46,31 @@ pub struct ServiceStatus {
     pub installed: bool,
     pub loaded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_status: Option<i32>,
+    /// Host clock sampled immediately before this request's kickstart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_started_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<ServicePaths>,
+}
+
+impl ServiceStatus {
+    pub(crate) fn for_wire(mut self, include_details: bool) -> Self {
+        // Host replies are checked by typed byte-canonical reserialization.
+        // Even additive response fields therefore require an explicit opt-in.
+        if !include_details {
+            self.pid = None;
+            self.running = None;
+            self.last_exit_status = None;
+            self.restart_started_at_millis = None;
+            self.paths = None;
+        }
+        self
+    }
 }
 
 /// Resolved helper paths, also used by the printed LaunchDaemon variant.
@@ -102,11 +126,16 @@ pub fn manage(
         None
     };
     let previous = agents.as_ref().map(read_plist).transpose()?.flatten();
+    let observation = observe(runner, uid)?;
     let mut status = ServiceStatus {
         label: LABEL.to_owned(),
         domain: format!("gui/{uid}"),
         installed: previous.is_some(),
-        loaded: is_loaded(runner, uid)?,
+        loaded: observation.loaded,
+        pid: observation.pid,
+        running: observation.running,
+        last_exit_status: observation.last_exit_status,
+        restart_started_at_millis: None,
         paths: Some(ServicePaths::from_layout(paths)?),
     };
     let target = format!("{}/{LABEL}", status.domain);
@@ -124,6 +153,8 @@ pub fn manage(
             }
             status.installed = false;
             status.loaded = false;
+            status.pid = None;
+            status.running = Some(false);
             Ok(status)
         }
         ServiceAction::Install | ServiceAction::Restart => {
@@ -166,8 +197,15 @@ pub fn manage(
                 )?;
             }
             if action == ServiceAction::Restart || !status.loaded {
+                status.restart_started_at_millis = (action == ServiceAction::Restart)
+                    .then(super::leader::now_millis)
+                    .transpose()?;
                 run_checked(runner, &["kickstart".into(), "-k".into(), target.into()])?;
-                if !is_loaded(runner, uid)? {
+                let observed = observe(runner, uid)?;
+                status.pid = observed.pid;
+                status.running = observed.running;
+                status.last_exit_status = observed.last_exit_status;
+                if !observed.loaded {
                     return Err(service_error("service did not remain loaded after start"));
                 }
             }
@@ -488,20 +526,248 @@ fn unlink_exact(
     Ok(())
 }
 
+#[derive(Default)]
+struct LaunchdObservation {
+    loaded: bool,
+    pid: Option<u32>,
+    running: Option<bool>,
+    last_exit_status: Option<i32>,
+}
+
 fn is_loaded(runner: &dyn ProcessRunner, uid: u32) -> Result<bool, WorkerError> {
-    let result = run(
-        runner,
-        &["print".into(), format!("gui/{uid}/{LABEL}").into()],
-    )?;
+    Ok(observe(runner, uid)?.loaded)
+}
+
+fn observe(runner: &dyn ProcessRunner, uid: u32) -> Result<LaunchdObservation, WorkerError> {
+    let target = format!("gui/{uid}/{LABEL}");
+    let result = run(runner, &["print".into(), target.clone().into()])?;
     if result.status.success() {
-        return Ok(true);
+        return Ok(parse_observation(&result.stdout, &target));
     }
     if result.status.code() == Some(SERVICE_NOT_FOUND) {
-        return Ok(false);
+        return Ok(LaunchdObservation {
+            running: Some(false),
+            ..Default::default()
+        });
     }
     Err(service_error(
         "launchctl could not determine service state; verify a logged-in GUI session",
     ))
+}
+
+fn parse_observation(bytes: &[u8], target: &str) -> LaunchdObservation {
+    let unknown = || LaunchdObservation {
+        loaded: true,
+        ..Default::default()
+    };
+    let Ok(output) = std::str::from_utf8(bytes) else {
+        return unknown();
+    };
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    if lines.next() != Some(format!("{target} = {{").as_str()) {
+        return unknown();
+    }
+    let mut depth = 1usize;
+    let mut fields = std::collections::BTreeMap::new();
+    for line in lines {
+        if line == "}" {
+            let Some(next) = depth.checked_sub(1) else {
+                return unknown();
+            };
+            depth = next;
+        } else if line.ends_with('{') {
+            depth += 1;
+        } else if depth == 1 {
+            if let Some((key, value)) = line.split_once(" = ") {
+                // Duplicate fields are ambiguous, including duplicate equal values.
+                fields
+                    .entry(key)
+                    .and_modify(|value| *value = None)
+                    .or_insert(Some(value));
+            }
+        } else if depth == 0 {
+            return unknown();
+        }
+    }
+    if depth != 0 {
+        return unknown();
+    }
+    let value = |key| fields.get(key).copied().flatten();
+    let running = match value("state") {
+        Some("running") => Some(true),
+        Some("not running" | "exited" | "waiting") => Some(false),
+        _ => None,
+    };
+    LaunchdObservation {
+        loaded: true,
+        running,
+        pid: if running == Some(true) {
+            value("pid")
+                .and_then(|v| v.parse().ok())
+                .filter(|pid| *pid > 0)
+        } else {
+            None
+        },
+        last_exit_status: value("last exit code").and_then(|v| v.parse().ok()),
+    }
+}
+
+/// Init and setup use the same bounded proof. launchctl registration alone is
+/// never readiness; all observations must identify the newly supervised build.
+pub fn verify_restart(
+    runner: &dyn ProcessRunner,
+    controller: &crate::config::ControllerConfig,
+    restarted: ServiceStatus,
+    expected_sha: &str,
+    expected_config: &Path,
+    wait: &dyn Fn(Duration),
+) -> Result<(), WorkerError> {
+    let restart_time = restarted.restart_started_at_millis.ok_or_else(|| {
+        service_error("restart has no start-time proof; upgrade the controller helper")
+    })?;
+    let expected_paths = restarted.paths.clone().ok_or_else(|| {
+        service_error("restart has no resolved paths; upgrade the controller helper")
+    })?;
+    if expected_paths.config != expected_config || !expected_config.is_absolute() {
+        return Err(service_error(
+            "service config path differs from the configured inventory",
+        ));
+    }
+    let mut status = restarted;
+    let mut reason = String::new();
+    for attempt in 0..=20 {
+        if status.label != LABEL || !status.installed {
+            return Err(service_error("controller LaunchAgent is not installed"));
+        }
+        let observed = super::health_read::fetch_controller_health(runner, controller);
+        use super::health_read::HealthReason;
+        if matches!(
+            observed.reason,
+            HealthReason::LeaderUnverifiable
+                | HealthReason::ReadFailed
+                | HealthReason::HealthUnsupported
+        ) {
+            return Err(service_error(
+                "leader health or process identity could not be verified",
+            ));
+        }
+        if observed.leader_running == Some(true) {
+            if let Some(health) = observed.health {
+                let pid = health.leader.pid();
+                if !health.supervised
+                    || status.pid.is_some_and(|service_pid| service_pid != pid)
+                    || (status.pid.is_none()
+                        && (status.last_exit_status == Some(64) || attempt == 20))
+                {
+                    return Err(WorkerError::Unavailable(format!(
+                        "CONTROLLER_FOREIGN_LEADER: process {pid} holds the controller leader lock outside the restarted LaunchAgent; stop that process, then rerun worker controller init"
+                    )));
+                }
+                if !status.loaded || status.running != Some(true) || status.pid != Some(pid) {
+                    reason = format!(
+                        "LaunchAgent is not running (last exit status {:?})",
+                        status.last_exit_status
+                    );
+                } else if health.started_at_millis <= restart_time {
+                    reason = "leader predates this restart".into();
+                } else if health.binary_sha256.as_deref() != Some(expected_sha)
+                    || expected_sha.is_empty()
+                {
+                    reason = "leader binary digest differs from the installed helper".into();
+                } else if health.config_path.as_deref() != Some(expected_config) {
+                    reason = "leader config path differs from the configured inventory".into();
+                } else if health.paths.as_deref() != Some(&expected_paths) {
+                    reason = "leader state/cache/data roots differ from the service roots".into();
+                } else {
+                    return Ok(());
+                }
+            } else {
+                reason = "live leader health has no process identity".into();
+            }
+        } else {
+            reason = format!(
+                "no live leader; LaunchAgent running={:?}, last exit status={:?}",
+                status.running, status.last_exit_status
+            );
+        }
+        if attempt == 20 {
+            break;
+        }
+        wait(Duration::from_millis(250));
+        status = fetch_status(runner, controller).map_err(|error| {
+            service_error(&format!(
+                "service status could not be verified [{}]",
+                error.public_code()
+            ))
+        })?;
+        if status.paths.as_ref() != Some(&expected_paths) {
+            return Err(service_error(
+                "service paths changed during restart verification",
+            ));
+        }
+    }
+    Err(service_error(&format!(
+        "restart verification timed out: {reason}"
+    )))
+}
+
+pub fn fetch_status(
+    runner: &dyn ProcessRunner,
+    controller: &crate::config::ControllerConfig,
+) -> Result<ServiceStatus, WorkerError> {
+    let host = super::controller_worker_entry(controller)?;
+    let request = |include_details| {
+        crate::transfer::controller_host_request(
+            runner,
+            &host,
+            crate::transfer::HostOperation::ControllerService,
+            &crate::protocol::ControllerServiceRequest {
+                action: ServiceAction::Status,
+                include_details,
+            },
+        )
+    };
+    match request(true) {
+        // Old helpers strictly reject unknown request fields. Retrying this
+        // read-only operation preserves status access without claiming proof.
+        Err(error) if error.public_code() == "INVALID_REQUEST" => request(false),
+        result => result,
+    }
+}
+
+pub fn restart_and_verify(
+    runner: &dyn ProcessRunner,
+    controller: &crate::config::ControllerConfig,
+    expected_sha: &str,
+    wait: &dyn Fn(Duration),
+) -> Result<(), WorkerError> {
+    let host = super::controller_worker_entry(controller)?;
+    let restarted: ServiceStatus = crate::transfer::controller_host_request(
+        runner,
+        &host,
+        crate::transfer::HostOperation::ControllerService,
+        &crate::protocol::ControllerServiceRequest {
+            action: ServiceAction::Restart,
+            include_details: true,
+        },
+    )
+    .map_err(|error| service_error(&format!("restart request failed [{}]", error.public_code())))?;
+    let config_path = restarted
+        .paths
+        .as_ref()
+        .map(|paths| paths.config.clone())
+        .ok_or_else(|| service_error("restart has no resolved config path"))?;
+    verify_restart(
+        runner,
+        controller,
+        restarted,
+        expected_sha,
+        &config_path,
+        wait,
+    )
 }
 
 fn run_checked(runner: &dyn ProcessRunner, args: &[OsString]) -> Result<(), WorkerError> {

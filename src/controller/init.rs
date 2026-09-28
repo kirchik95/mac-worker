@@ -44,6 +44,8 @@ pub struct InitWorkerSummary {
 pub struct InitReport {
     pub ready: bool,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     pub config_diff: Option<String>,
     pub boot_commands: Option<String>,
     pub workers: Vec<InitWorkerSummary>,
@@ -89,6 +91,7 @@ pub fn initialize_with_wait(
     let mut report = InitReport {
         ready: false,
         message: String::new(),
+        error_code: None,
         config_diff: None,
         boot_commands: None,
         workers: vec![],
@@ -187,6 +190,7 @@ pub fn initialize_with_wait(
             workers: planned.clone(),
             known_hosts,
             force: request.force,
+            include_details: true,
         },
     )?;
     if configured.outcome.conflict {
@@ -233,6 +237,7 @@ pub fn initialize_with_wait(
         HostOperation::ControllerService,
         &ControllerServiceRequest {
             action: ServiceAction::Install,
+            include_details: true,
         },
     )?;
     if let (Some(identity), Some(paths)) = (key.identity, installed.paths.as_ref()) {
@@ -243,12 +248,13 @@ pub fn initialize_with_wait(
             identity.uid,
         )?);
     }
-    let _: ServiceStatus = controller_host_request(
+    let restarted: ServiceStatus = controller_host_request(
         runner,
         &host,
         HostOperation::ControllerService,
         &ControllerServiceRequest {
             action: ServiceAction::Restart,
+            include_details: true,
         },
     )?;
     let observed: WorkersReport = controller_host_request(
@@ -271,35 +277,20 @@ pub fn initialize_with_wait(
             summary.error_code = Some("CONTROLLER_WORKER_UNREACHABLE".into())
         }
     }
-    let mut health = super::health_read::fetch_controller_health(runner, &controller);
-    // kickstart acknowledges launch, not readiness. Only retry expected startup
-    // observations; transport failures and unverifiable identities remain failures.
-    for _ in 0..20 {
-        use super::health_read::HealthReason;
-        if health.leader_running == Some(true)
-            || !matches!(
-                health.reason,
-                HealthReason::Missing | HealthReason::Stopped | HealthReason::LeaderNotRunning
-            )
-        {
-            break;
-        }
-        wait(std::time::Duration::from_millis(250));
-        health = super::health_read::fetch_controller_health(runner, &controller);
-    }
-    if health.leader_running != Some(true) {
-        report.message="controller service installed but no live leader was verified; inspect `worker controller status` on the controller and rerun init".into();
-        return Ok(report);
-    }
-    if configured.config_path.as_ref().is_none_or(|expected| {
-        !expected.is_absolute()
-            || health
-                .health
-                .as_ref()
-                .and_then(|record| record.config_path.as_ref())
-                != Some(expected)
-    }) {
-        report.message = "controller leader config path does not match the configured inventory; inspect worker controller status and rerun init".into();
+    let expected_config = configured
+        .config_path
+        .as_deref()
+        .ok_or_else(|| invalid("controller configure response has no config path"))?;
+    if let Err(error) = super::service::verify_restart(
+        runner,
+        &controller,
+        restarted,
+        expected_sha,
+        expected_config,
+        wait,
+    ) {
+        report.error_code = Some(error.public_code());
+        report.message = error.to_string();
         return Ok(report);
     }
     if report.workers.iter().any(|w| !w.reachable) {
@@ -435,7 +426,10 @@ pub fn configure_host(
     }
     Ok(ConfiguredHost {
         outcome,
-        config_path: Some(std::path::absolute(config_path)?),
+        config_path: request
+            .include_details
+            .then(|| std::path::absolute(config_path))
+            .transpose()?,
     })
 }
 
@@ -456,6 +450,7 @@ pub fn disable(
         HostOperation::ControllerService,
         &ControllerServiceRequest {
             action: ServiceAction::Uninstall,
+            include_details: false,
         },
     )?;
     controller.enabled = false;

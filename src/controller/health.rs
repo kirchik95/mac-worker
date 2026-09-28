@@ -76,6 +76,14 @@ pub struct ControllerHealth {
     pub binary_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
+    #[serde(default)]
+    pub supervised: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Box<super::service::ServicePaths>>,
     pub started_at_millis: u64,
     #[serde(default)]
     pub last_tick_start_millis: Option<u64>,
@@ -112,6 +120,10 @@ impl ControllerHealth {
             leader,
             binary_version: env!("CARGO_PKG_VERSION").into(),
             config_path: None,
+            supervised: false,
+            build_id: None,
+            binary_sha256: None,
+            paths: None,
             started_at_millis,
             last_tick_start_millis: None,
             last_tick_end_millis: None,

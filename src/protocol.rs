@@ -480,6 +480,8 @@ pub struct ControllerConfigureRequest {
     pub known_hosts: String,
     #[serde(default)]
     pub force: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_details: bool,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,4 +508,6 @@ pub struct ControllerChangedResponse {
 #[serde(deny_unknown_fields)]
 pub struct ControllerServiceRequest {
     pub action: crate::controller::service::ServiceAction,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_details: bool,
 }
