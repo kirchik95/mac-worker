@@ -49,6 +49,8 @@ struct Fake {
     conflict: bool,
     service_actions: Mutex<Vec<String>>,
     host_alias: bool,
+    jump: String,
+    controller_port: u16,
     pending_health: Mutex<usize>,
 }
 impl Fake {
@@ -60,6 +62,8 @@ impl Fake {
             conflict: false,
             service_actions: Mutex::new(vec![]),
             host_alias: false,
+            jump: "mac1".into(),
+            controller_port: 22,
             pending_health: Mutex::new(0),
         }
     }
@@ -93,14 +97,28 @@ impl ProcessRunner for Fake {
         }
         if args.first().map(String::as_str) == Some("-G") {
             let alias = args.last().unwrap();
-            let host = if alias == "mac1" {
+            let bare_alias = alias.rsplit('@').next().unwrap();
+            let host = if matches!(bare_alias, "mac1" | "controller-route" | "192.168.1.11") {
                 "192.168.1.11"
             } else if alias == "mac2" {
                 "10.0.0.2"
             } else {
                 "10.9.0.2"
             };
-            return Ok(ProcessResult{status:ExitStatus::from_raw(0),stdout:format!("user {}\nhostname {host}\nport {}\nproxyjump {}\nuserknownhostsfile /tmp/trusted\n{}",if alias.starts_with("bob@"){"bob"}else{"kirchik"},if self.host_alias && alias=="mac2"{2222}else{22},if alias=="mac2"{"mac1"}else{"none"},if self.host_alias && alias=="mac2"{"hostkeyalias mini2-trust\n"}else{""}).into_bytes(),stderr:vec![]});
+            let port = args
+                .windows(2)
+                .find(|pair| pair[0] == "-p")
+                .map(|pair| pair[1].parse::<u16>().unwrap())
+                .unwrap_or_else(|| {
+                    if matches!(bare_alias, "mac1" | "controller-route") {
+                        self.controller_port
+                    } else if self.host_alias && alias == "mac2" {
+                        2222
+                    } else {
+                        22
+                    }
+                });
+            return Ok(ProcessResult{status:ExitStatus::from_raw(0),stdout:format!("user {}\nhostname {host}\nport {port}\nproxyjump {}\nuserknownhostsfile /tmp/trusted\n{}",if alias.starts_with("bob@"){"bob"}else{"kirchik"},if alias=="mac2"{&self.jump}else{"none"},if self.host_alias && alias=="mac2"{"hostkeyalias mini2-trust\n"}else{""}).into_bytes(),stderr:vec![]});
         }
         let cmd = args.last().unwrap().as_str();
         Ok(match cmd {
@@ -366,4 +384,67 @@ fn init_waits_for_new_leader_health_with_an_injected_waiter() {
     .unwrap();
     assert!(report.ready);
     assert_eq!(waits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn init_resolves_controller_first_jump_with_an_explicit_user_and_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.controller_port = 2222;
+    fake.jump = "kirchik@controller-route:2222".into();
+    let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
+    assert!(report.ready, "{report:?}");
+    assert!(
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "-G -p 2222 -- kirchik@controller-route")
+    );
+}
+
+#[test]
+fn init_keeps_a_first_jump_to_the_same_host_on_a_different_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.controller_port = 2222;
+    fake.jump = "kirchik@controller-route:2223".into();
+    let error = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap_err();
+    assert!(error.to_string().contains("remaining ProxyJump"), "{error}");
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.ends_with("host controller-configure"))
+    );
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
+}
+
+#[test]
+fn init_resolves_literal_first_jump_before_assuming_the_controllers_port() {
+    for jump in ["192.168.1.11", "kirchik@192.168.1.11"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = config(&temp);
+        let mut fake = Fake::new();
+        fake.controller_port = 2222;
+        fake.jump = jump.into();
+        let error = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap_err();
+        assert!(error.to_string().contains("remaining ProxyJump"), "{error}");
+        assert!(
+            fake.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == &format!("-G -- {jump}"))
+        );
+    }
 }

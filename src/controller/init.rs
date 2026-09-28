@@ -124,7 +124,7 @@ pub fn initialize_with_wait(
     for worker in &mut planned {
         if let Some(jumps) = worker.target.proxy_jump.clone() {
             let (first, rest) = jumps.split_once(',').unwrap_or((&jumps, ""));
-            if resolve(runner, first)?.same_host(&controller_target) {
+            if resolve_jump(runner, first)?.same_host(&controller_target) {
                 worker.target.proxy_jump = (!rest.is_empty()).then(|| rest.to_owned());
             }
         }
@@ -293,13 +293,39 @@ pub(crate) fn resolve(
     runner: &dyn ProcessRunner,
     destination: &str,
 ) -> Result<ResolvedSsh, WorkerError> {
+    resolve_with_port(runner, destination, None)
+}
+
+fn resolve_jump(runner: &dyn ProcessRunner, jump: &str) -> Result<ResolvedSsh, WorkerError> {
+    // ProxyJump has a separate [user@]host[:port] grammar. Feed an explicit
+    // port to ssh -G as an option instead of treating it as part of the alias.
+    match jump.rsplit_once(':') {
+        Some((destination, port)) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| invalid("invalid ProxyJump port"))?;
+            resolve_with_port(runner, destination, Some(port))
+        }
+        None => resolve(runner, jump),
+    }
+}
+
+fn resolve_with_port(
+    runner: &dyn ProcessRunner,
+    destination: &str,
+    port: Option<u16>,
+) -> Result<ResolvedSsh, WorkerError> {
     if !crate::config::valid_ssh_destination(destination) {
         return Err(invalid("invalid SSH destination"));
     }
-    let mut req = process(
-        "/usr/bin/ssh",
-        vec!["-G".into(), "--".into(), destination.into()],
-    );
+    let mut args = vec!["-G".into()];
+    if let Some(port) = port {
+        args.extend(["-p".into(), port.to_string().into()]);
+    }
+    args.extend(["--".into(), destination.into()]);
+    let mut req = process("/usr/bin/ssh", args);
     req.policy = PROCESS_POLICY;
     let result = runner.run(&req)?;
     if !result.status.success() {

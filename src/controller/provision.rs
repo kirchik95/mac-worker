@@ -119,8 +119,10 @@ pub fn plan_inventory(
                 target.proxy_jump = None;
             } else if let Some(jumps) = target.proxy_jump.clone() {
                 let (first, rest) = jumps.split_once(',').unwrap_or((&jumps, ""));
-                let explicit = format!("{}@{}", controller.user, controller.hostname);
-                if first == controller_alias || first == controller.hostname || first == explicit {
+                // Only the exact controller alias was already resolved. A
+                // literal hostname or another alias can select a different
+                // port; init resolves those before deciding to remove a hop.
+                if first == controller_alias {
                     target.proxy_jump = if rest.is_empty() {
                         None
                     } else {
