@@ -705,6 +705,105 @@ fn service_observation_parses_running_pid_and_last_exit_status() {
 }
 
 #[test]
+fn service_observation_parses_a_real_macos_launchctl_print_dump() {
+    // Captured from `launchctl print gui/501/<label>` for a running Homebrew
+    // LaunchAgent on macOS 26 (Darwin 25.2), relabelled to the controller and
+    // with account-specific environment values removed. Nested blocks repeat
+    // `state` and `active count`; only the top-level keys may be read.
+    let (_temp, home) = home();
+    let runner = Launchctl::loaded();
+    *runner.print_output.lock().unwrap() = Some(format!(
+        "{TARGET} = {{
+\tactive count = 1
+\tpath = /Users/owner/Library/LaunchAgents/com.mac-worker.controller.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /Users/owner/.local/bin/worker
+\targuments = {{
+\t\t/Users/owner/.local/bin/worker
+\t\t--config
+\t\t/Users/owner/.config/mac-worker/config.toml
+\t\tcontroller
+\t\trun
+\t\t--supervised
+\t}}
+
+\tworking directory = /Users/owner
+
+\tstdout path = /Users/owner/Library/Logs/mac-worker/controller.log
+\tstderr path = /Users/owner/Library/Logs/mac-worker/controller.log
+\tinherited environment = {{
+\t\tSSH_AUTH_SOCK => /private/tmp/com.apple.launchd.example/Listeners
+\t}}
+
+\tdefault environment = {{
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}}
+
+\tenvironment = {{
+\t\tHOME => /Users/owner
+\t\tXPC_SERVICE_NAME => com.mac-worker.controller
+\t}}
+
+\tdomain = gui/501 [100023]
+\tasid = 100023
+\tminimum runtime = 10
+\texit timeout = 5
+\truns = 1
+\tpid = 806
+\timmediate reason = speculative
+\tforks = 12
+\texecs = 1
+\tinitialized = 1
+\ttrampolined = 1
+\tstarted suspended = 0
+\tproxy started suspended = 0
+\tchecked allocations = 0 (queried = 1)
+\tchecked allocations reason = no host
+\tchecked allocations flags = 0x0
+\tlast exit code = (never exited)
+
+\tresource coalition = {{
+\t\tID = 977
+\t\ttype = resource
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = com.mac-worker.controller
+\t}}
+
+\tjetsam coalition = {{
+\t\tID = 978
+\t\ttype = jetsam
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = com.mac-worker.controller
+\t}}
+
+\tspawn type = daemon (3)
+\tjetsam priority = 40
+\tjetsam memory limit (active) = (unlimited)
+\tjetsam memory limit (inactive) = (unlimited)
+\tjetsamproperties category = daemon
+\tjetsam thread limit = 32
+\tcpumon = default
+
+\tproperties = keepalive | runatload | inferred program | managed LWCR | has LWCR
+}}
+"
+    ));
+    let status =
+        serde_json::to_value(manage(&home, 501, &runner, ServiceAction::Status).unwrap()).unwrap();
+    assert_eq!(status["running"], true, "{status}");
+    assert_eq!(status["pid"], 806, "{status}");
+    assert_eq!(
+        status["last_exit_status"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+}
+
+#[test]
 fn service_observation_exited_or_unknown_never_reports_a_live_pid() {
     let (_temp, home) = home();
     let runner = Launchctl::loaded();
