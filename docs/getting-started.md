@@ -208,11 +208,12 @@ The scheduler uses an available compatible worker. Each Mac defaults to **one** 
 
 ## Controller setup
 
-To keep the queue running while the laptop is disconnected, first install the current helper on
-an always-on Mac listed in your laptop inventory, then initialize it:
+To keep the queue running while the laptop is disconnected, choose an always-on Mac listed in
+your laptop inventory. Update every worker helper so each supports controller-key authorization,
+then initialize the controller:
 
 ```bash
-worker setup mini-1
+worker setup
 worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
 worker controller status
 ```

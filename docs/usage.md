@@ -413,12 +413,12 @@ Use this when an always-on Mac should keep the queue after the laptop sleeps or 
 Run from the laptop with a worker inventory that includes the controller host:
 
 ```bash
-worker setup mini-1
+worker setup
 worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
 worker controller status
 ```
 
-`init` requires the controller helper's SHA-256 to match the running laptop CLI; install that build with `worker setup` first. It resolves the inventory with laptop `ssh -G`, removes a first ProxyJump through the controller, and maps the controller's own worker to loopback. Generated `mac-worker-controller-<worker>` SSH aliases preserve each resolved user and port. Repeat `--worker-ssh NAME=DESTINATION` for explicit controller-reachable overrides. Remaining jump chains require a direct override; they are never copied silently from the laptop.
+`init` requires the controller helper's SHA-256 to match the running laptop CLI. Run `worker setup` for the whole inventory first: every worker needs the new helper operation that authorizes the controller key. Init resolves the inventory with laptop `ssh -G`, removes a first ProxyJump through the controller, and maps the controller's own worker to loopback. Generated `mac-worker-controller-<worker>` SSH aliases preserve each resolved user and port. Repeat `--worker-ssh NAME=DESTINATION` for explicit controller-reachable overrides. Remaining jump chains require a direct override; they are never copied silently from the laptop.
 
 The controller receives `~/.config/mac-worker/config.toml`, a dedicated `~/.ssh/mac-worker-controller_ed25519` key, managed SSH settings, and laptop-trusted host keys in per-worker `~/.ssh/mac-worker-controller-<worker>.known_hosts` files (with a combined `mac-worker-controller_known_hosts` copy). Only public keys returned by laptop `ssh-keygen -F` are seeded; missing or revoked trust stops setup for that worker. Strict host-key checking stays enabled, including loopback; the verification name is pinned explicitly and each worker has its own trusted-key file. Init prepends its managed Include to the account's SSH config and preserves the existing content. Authorization appends one recognizable `mac-worker-controller` line, preserves all existing restrictions/keys, and is idempotent. Existing controller private keys are retained.
 
