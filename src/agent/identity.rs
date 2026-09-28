@@ -29,6 +29,18 @@ pub enum VersionObservation {
 }
 
 impl AgentIdentity {
+    pub(crate) fn version_display(&self) -> &str {
+        self.version
+            .as_deref()
+            .unwrap_or(match self.version_observation {
+                VersionObservation::TimedOut => "version unavailable(timeout)",
+                VersionObservation::OutputLimit => "version unavailable(output_too_large)",
+                VersionObservation::Observed | VersionObservation::Unavailable => {
+                    "version unavailable"
+                }
+            })
+    }
+
     pub(crate) fn redacted(&self, boundary: &RedactionBoundary) -> Self {
         // Keep the useful path below the account home while hiding its owner.
         let relative = self

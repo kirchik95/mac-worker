@@ -961,6 +961,39 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_agent_versions_show_fixed_probe_reasons() {
+        let record = closed_record(vec![PublishMode::Fetch], None);
+        for (observation, expected) in [
+            ("timed_out", "version unavailable(timeout)"),
+            ("output_limit", "version unavailable(output_too_large)"),
+        ] {
+            let mut wire = serde_json::to_value(record.status()).unwrap();
+            wire["turns"][0]["agent_identity"] = serde_json::json!({
+                "executable": "/opt/agents/cursor-agent", "version": null,
+                "version_observation": observation,
+            });
+            let status: TaskStatus = serde_json::from_value(wire).unwrap();
+            let mut output = Vec::new();
+            crate::write_turn_diagnostics(&mut output, &status).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                output.contains(&format!(
+                    "agent build: /opt/agents/cursor-agent ({expected})"
+                )),
+                "{output}"
+            );
+            let detail =
+                project_task_detail(&record, &status, None, TaskFreshness::Current).unwrap();
+            let wire = serde_json::to_value(detail).unwrap();
+            assert!(wire["turns"][0]["agent_identity"]["version"].is_null());
+            assert_eq!(
+                wire["turns"][0]["agent_identity"]["version_observation"],
+                observation
+            );
+        }
+    }
+
+    #[test]
     fn turn_parse_reason_survives_status_result_and_detail_projection() {
         let record = closed_record(vec![PublishMode::Fetch], None);
         let mut wire = serde_json::to_value(record.status()).unwrap();

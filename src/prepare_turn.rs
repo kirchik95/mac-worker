@@ -146,10 +146,7 @@ fn exec_direct(argv: &[OsString]) -> Result<(), WorkerError> {
 }
 
 fn record_then_exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
-    use crate::agent::{
-        VersionObservation,
-        identity::{IDENTITY_FILE, VERSION_DEADLINE, observe_identity},
-    };
+    use crate::agent::identity::{VERSION_DEADLINE, observe_identity};
     let executable = resolve_executable(&argv[0])?;
     let deadline = std::env::var("MAC_WORKER_LEASE_DEADLINE_MILLIS")
         .ok()
@@ -158,26 +155,25 @@ fn record_then_exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
         .unwrap_or(VERSION_DEADLINE)
         .min(VERSION_DEADLINE);
     let identity = observe_identity(&InheritProcessGroupRunner, &executable, deadline);
-    let dir = std::env::var_os("MAC_WORKER_TURN_DIR")
-        .ok_or_else(|| WorkerError::task("SETUP_FAILED", "turn identity directory is absent"))?;
-    let dir = crate::rooted_fs::RootedDir::open(Path::new(&dir))?;
-    let bytes = serde_json::to_vec(&identity)
-        .map_err(|_| WorkerError::task("SETUP_FAILED", "cannot encode agent identity"))?;
-    dir.write_private_atomic_no_replace(IDENTITY_FILE, &bytes)?;
-    if matches!(
-        identity.version_observation,
-        VersionObservation::TimedOut | VersionObservation::OutputLimit
-    ) {
-        // The probe remains in the recorded child group. Exit the helper so
-        // supervisor cleanup also reaps descendants retaining capture pipes.
-        return Err(WorkerError::task(
-            "AGENT_IDENTITY_PROBE_FAILED",
-            "agent --version exceeded its time or output bound",
-        ));
-    }
+    // Identity is diagnostic: unavailable versions or storage must not stop
+    // real work. On a probe bound, the runner reaps the direct probe child.
+    // Exec closes the helper's capture FDs and discards its capture threads;
+    // any remaining descendants stay in the recorded group for supervisor
+    // cleanup after the agent exits or the turn is cancelled.
+    let _ = persist_agent_identity(&identity);
     let mut resolved = argv.to_vec();
     resolved[0] = executable.into_os_string();
     exec_direct(&resolved)
+}
+
+fn persist_agent_identity(identity: &crate::agent::AgentIdentity) -> Result<(), WorkerError> {
+    let dir = std::env::var_os("MAC_WORKER_TURN_DIR")
+        .ok_or_else(|| WorkerError::task("SETUP_FAILED", "turn identity directory is absent"))?;
+    let dir = crate::rooted_fs::RootedDir::open(Path::new(&dir))?;
+    let bytes = serde_json::to_vec(identity)
+        .map_err(|_| WorkerError::task("SETUP_FAILED", "cannot encode agent identity"))?;
+    dir.write_private_atomic_no_replace(crate::agent::identity::IDENTITY_FILE, &bytes)?;
+    Ok(())
 }
 
 fn resolve_executable(program: &OsStr) -> Result<PathBuf, WorkerError> {

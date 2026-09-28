@@ -1592,7 +1592,7 @@ fn write_turn_diagnostics(
             stdout,
             "agent build: {} ({})",
             identity.executable,
-            identity.version.as_deref().unwrap_or("version unavailable")
+            identity.version_display()
         )?;
     }
     if let Some(turn) = status.turns().last()

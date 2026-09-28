@@ -75,6 +75,8 @@ fn preparation_failure_outcome(dir: &RootedDir) -> Result<Option<TaskOutcome>, W
             "SETUP_INPUTS_CHANGED: review setup inputs and submit a new task to approve them"
         }
         "AGENT_IDENTITY_PROBE_FAILED" => {
+            // Preserve the public reason for legacy turns refused before
+            // version observation became best effort.
             "AGENT_IDENTITY_PROBE_FAILED: agent --version exceeded its time or output bound"
         }
         "AGENT_EXECUTABLE_NOT_FOUND" => {
