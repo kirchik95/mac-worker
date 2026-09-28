@@ -27,6 +27,11 @@ fn result(value: Value) -> ProcessResult {
             &serde_json::from_value::<mac_worker::protocol::WorkersReport>(value).unwrap(),
         )
         .unwrap()
+    } else if value.get("conflict").is_some() {
+        serde_json::to_vec(
+            &serde_json::from_value::<mac_worker::controller::init::ConfiguredHost>(value).unwrap(),
+        )
+        .unwrap()
     } else if value.get("label").is_some() {
         serde_json::to_vec(
             &serde_json::from_value::<mac_worker::controller::service::ServiceStatus>(value)
@@ -52,6 +57,7 @@ struct Fake {
     jump: String,
     controller_port: u16,
     pending_health: Mutex<usize>,
+    health_config: String,
 }
 impl Fake {
     fn new() -> Self {
@@ -65,6 +71,7 @@ impl Fake {
             jump: "mac1".into(),
             controller_port: 22,
             pending_health: Mutex::new(0),
+            health_config: "/Users/controller/.config/mac-worker/config.toml".into(),
         }
     }
 }
@@ -130,7 +137,7 @@ impl ProcessRunner for Fake {
                 assert_eq!(body["workers"][0]["target"]["hostname"], "127.0.0.1");
                 assert_eq!(body["workers"][1]["target"]["proxy_jump"], Value::Null);
                 result(
-                    json!({"changed":false,"conflict":self.conflict,"diff":if self.conflict{Some("-old\n+new\n")}else{None}}),
+                    json!({"config_path":"/Users/controller/.config/mac-worker/config.toml","changed":false,"conflict":self.conflict,"diff":if self.conflict{Some("-old\n+new\n")}else{None}}),
                 )
             }
             "~/.local/bin/worker host controller-key" => result(json!({"public_key":key()})),
@@ -160,7 +167,17 @@ impl ProcessRunner for Fake {
                     *pending -= 1;
                     json!({"state":"stale","reason":"missing","leader_running":null,"record_age_millis":null,"health":null,"error_code":null})
                 } else {
-                    json!({"state":"healthy","reason":"tick_succeeded","leader_running":true,"record_age_millis":0,"health":null,"error_code":null})
+                    {
+                        let mut record = serde_json::to_value(
+                            mac_worker::controller::health::ControllerHealth::new(
+                                mac_worker::job::ProcessIdentity::new(42, 1000).unwrap(),
+                                1,
+                            ),
+                        )
+                        .unwrap();
+                        record["config_path"] = json!(self.health_config);
+                        json!({"state":"healthy","reason":"tick_succeeded","leader_running":true,"record_age_millis":0,"health":record,"error_code":null})
+                    }
                 };
                 ProcessResult{status:ExitStatus::from_raw(0),stdout:encode_json_frame(&json!({"protocol_version":PROTOCOL_VERSION,"command":parsed.command(),"request_id":parsed.request_id(),"payload_sha256":parsed.payload_sha256(),"result":health})).unwrap(),stderr:vec![]}
             }
@@ -447,4 +464,29 @@ fn init_resolves_literal_first_jump_before_assuming_the_controllers_port() {
                 .any(|call| call == &format!("-G -- {jump}"))
         );
     }
+}
+
+#[test]
+fn init_rejects_leader_using_a_different_config_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(&temp);
+    let mut fake = Fake::new();
+    fake.health_config = "/Users/controller/wrong-config.toml".into();
+    let report = mac_worker::controller::init::initialize_with_wait(
+        &fake,
+        &path,
+        temp.path(),
+        &fake.digest,
+        request(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(!report.ready, "accepted a different config: {report:?}");
+    assert!(report.message.contains("config"), "{report:?}");
+    assert!(
+        !mac_worker::config::Config::load(&path)
+            .unwrap()
+            .controller
+            .enabled
+    );
 }

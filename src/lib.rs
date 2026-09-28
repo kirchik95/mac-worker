@@ -931,6 +931,7 @@ fn run_controller_command(
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
+        let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
         if let ControllerCommand::Init {
             destination,
@@ -1067,6 +1068,7 @@ fn run_controller_command(
                     }),
                     crate::controller::service::manage(
                         runtime.home(),
+                        &paths,
                         unsafe { libc::geteuid() },
                         runner,
                         crate::controller::service::ServiceAction::Status,
@@ -1109,7 +1111,10 @@ fn run_controller_command(
         if matches!(command, ControllerCommand::Run { supervised: true }) {
             crate::controller::service::truncate_log(runtime.home())?;
         }
-        let config = load_controller_process_config(&paths)?;
+        let config = load_controller_process_config(
+            &paths,
+            !explicit_config && !matches!(command, ControllerCommand::Run { supervised: true }),
+        )?;
         let state_root = paths.controller_state_root();
         use crate::controller::{
             health::{ControllerHealth, ControllerTickReport, HealthLogger, HealthStore},
@@ -1121,6 +1126,7 @@ fn run_controller_command(
         let client_state = ClientStateStore::open(&paths.state)?;
         let health_store = HealthStore::open(&state_root)?;
         let mut health = ControllerHealth::new(leader.identity(), now_millis()?);
+        health.config_path = Some(std::path::absolute(&paths.config)?);
         health_store.write(&health)?;
         let mut logger = HealthLogger::default();
         let shutdown = AtomicBool::new(false);
@@ -1225,8 +1231,9 @@ fn run_host_controller_rpc(
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| -> Result<(), WorkerError> {
+        let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
-        let config = load_controller_process_config(&paths)?;
+        let config = load_controller_process_config(&paths, !explicit_config)?;
         crate::controller::serve_rpc_with_runtime(
             &paths,
             &config,
@@ -4504,10 +4511,15 @@ fn run_host_snapshot_verify(
     exit
 }
 
-fn load_controller_process_config(paths: &PathLayout) -> Result<Config, WorkerError> {
-    if paths.config.is_file() {
+fn load_controller_process_config(
+    paths: &PathLayout,
+    allow_missing: bool,
+) -> Result<Config, WorkerError> {
+    if !allow_missing || paths.config.exists() {
         Config::load(&paths.config)
     } else {
+        // Legacy manual leaders and bootstrap RPC may have no default inventory
+        // yet. Explicit or supervised starts must load the verified file.
         let config =
             Config::parse("version = 1\n[controller]\nenabled = true\nssh = \"controller\"\n")?;
         config.validate()?;
@@ -6457,6 +6469,7 @@ fn run_host_controller_provision(
                 let request: crate::protocol::ControllerServiceRequest = parse(body)?;
                 serde_json::to_vec(&crate::controller::service::manage(
                     runtime.home(),
+                    &paths,
                     unsafe { libc::geteuid() },
                     runner,
                     request.action,

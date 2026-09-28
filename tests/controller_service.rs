@@ -12,11 +12,26 @@ use std::{
 
 use mac_worker::{
     controller::service::{
-        ServiceAction, ServiceStatus, launchdaemon_commands, manage, truncate_log,
+        ServiceAction, ServicePaths, ServiceStatus, launchdaemon_commands as daemon_with_paths,
+        manage as manage_with_paths, truncate_log,
     },
     error::WorkerError,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
 };
+
+fn manage(
+    home: &Path,
+    uid: u32,
+    runner: &dyn ProcessRunner,
+    action: ServiceAction,
+) -> Result<ServiceStatus, WorkerError> {
+    let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
+    manage_with_paths(home, &paths, uid, runner, action)
+}
+fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<String, WorkerError> {
+    let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
+    daemon_with_paths(home, &ServicePaths::from_layout(&paths)?, username, uid)
+}
 
 const TARGET: &str = "gui/501/com.mac-worker.controller";
 const PLIST: &str = "Library/LaunchAgents/com.mac-worker.controller.plist";
@@ -364,6 +379,10 @@ fn launchdaemon_instructions_use_supplied_account_and_safe_fixed_paths() {
     let commands =
         launchdaemon_commands(Path::new("/Users/some ' owner"), "different-user", 777).unwrap();
     assert!(commands.contains("<key>UserName</key>\n  <string>different-user</string>"));
+    assert!(commands.contains("<string>--config</string>\n    <string>/Users/some &apos; owner/.config/mac-worker/config.toml</string>"));
+    assert!(commands.contains(
+        "<key>XDG_STATE_HOME</key>\n    <string>/Users/some &apos; owner/.local/state</string>"
+    ));
     assert!(commands.contains("<string>/Users/some &apos; owner/.local/bin/worker</string>"));
     assert!(commands.contains("sudo /bin/launchctl bootout 'gui/777/com.mac-worker.controller'"));
     assert!(commands.contains("sudo /bin/launchctl bootstrap system '/Library/LaunchDaemons/com.mac-worker.controller.plist'"));
@@ -412,4 +431,195 @@ fn changed_service_plist_reloads_in_an_existing_public_launchagents_directory() 
             .collect::<Vec<_>>(),
         ["print", "bootout", "bootstrap", "kickstart", "print"]
     );
+}
+
+fn host_service_install(home: &Path, variable: &str, root: &Path) -> String {
+    use clap::Parser;
+    use mac_worker::{RuntimeContext, cli::Cli, run_with_stdio_in_context};
+    use std::{collections::BTreeMap, io::Cursor};
+    struct HostLaunchctl(Mutex<bool>);
+    impl ProcessRunner for HostLaunchctl {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(request.program, "/bin/launchctl");
+            let mut loaded = self.0.lock().unwrap();
+            let code = match request.args[0].to_str().unwrap() {
+                "print" => {
+                    if *loaded {
+                        0
+                    } else {
+                        113
+                    }
+                }
+                "bootstrap" | "kickstart" => {
+                    *loaded = true;
+                    0
+                }
+                other => panic!("unexpected action {other}"),
+            };
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+    let runtime = RuntimeContext::isolated(
+        BTreeMap::from([
+            ("HOME".into(), home.as_os_str().into()),
+            (variable.into(), root.as_os_str().into()),
+        ]),
+        home.into(),
+        home.into(),
+    );
+    let mut out = vec![];
+    let mut err = vec![];
+    let exit = run_with_stdio_in_context(
+        Cli::try_parse_from(["worker", "host", "controller-service"]).unwrap(),
+        &HostLaunchctl(Mutex::new(false)),
+        &runtime,
+        &mut Cursor::new(br#"{"action":"install"}"#),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(
+        exit,
+        0,
+        "{} {}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    fs::read_to_string(home.join(PLIST)).unwrap()
+}
+
+#[test]
+fn service_paths_pin_helper_xdg_config_in_supervised_argv() {
+    let (_temp, home) = home();
+    let root = home.join("custom-config");
+    let plist = host_service_install(&home, "XDG_CONFIG_HOME", &root);
+    let config = root
+        .join("mac-worker/config.toml")
+        .to_str()
+        .unwrap()
+        .replace('&', "&amp;");
+    assert!(
+        plist.contains(&format!(
+            "<string>--config</string>\n    <string>{config}</string>"
+        )),
+        "{plist}"
+    );
+}
+
+#[test]
+fn service_paths_pin_helper_xdg_state_and_other_child_roots() {
+    let (_temp, home) = home();
+    let root = home.join("custom-state");
+    let plist = host_service_install(&home, "XDG_STATE_HOME", &root);
+    for (key, path) in [
+        ("XDG_STATE_HOME", root),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+    ] {
+        let escaped = path.to_str().unwrap().replace('&', "&amp;");
+        assert!(
+            plist.contains(&format!("<key>{key}</key>\n    <string>{escaped}</string>")),
+            "{plist}"
+        );
+    }
+}
+
+#[test]
+fn service_paths_missing_config_fails_before_leader_acquisition() {
+    use clap::Parser;
+    use mac_worker::{
+        RuntimeContext, cli::Cli, controller::ControllerLeader, paths::PathLayout,
+        run_with_stdio_in_context,
+    };
+    use std::{collections::BTreeMap, io::Cursor};
+    for explicit in [false, true] {
+        let (_temp, home) = home();
+        let runtime = RuntimeContext::isolated(BTreeMap::new(), home.clone(), home.clone());
+        let paths = PathLayout::discover(None, &BTreeMap::new(), &home).unwrap();
+        let _leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+        let mut args = vec!["worker"];
+        if explicit {
+            args.extend(["--config", paths.config.to_str().unwrap()]);
+        }
+        args.extend(["controller", "run"]);
+        if !explicit {
+            args.push("--supervised");
+        }
+        let mut out = vec![];
+        let mut err = vec![];
+        let exit = run_with_stdio_in_context(
+            Cli::try_parse_from(args).unwrap(),
+            &Launchctl::default(),
+            &runtime,
+            &mut Cursor::new([]),
+            &mut out,
+            &mut err,
+        );
+        let error = String::from_utf8_lossy(&err);
+        assert_ne!(exit, 0);
+        assert!(
+            !error.contains("CONTROLLER_LOCK_HELD"),
+            "missing config silently fell back: {error}"
+        );
+        assert!(error.contains("config"), "{error}");
+    }
+}
+
+#[test]
+fn service_paths_runner_child_uses_plist_config_and_inherited_state() {
+    // DetachedRunnerExecutor passes --config and inherits the leader environment.
+    // Exercise a real runner child in exactly that launch context, with no task
+    // present, so it must stop locally without reaching any worker transport.
+    let (_temp, home) = home();
+    let home = home.canonicalize().unwrap();
+    let state_root = home.join("custom-state");
+    let plist = host_service_install(&home, "XDG_STATE_HOME", &state_root);
+    let config = home.join(".config/mac-worker/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "version=1\n[[workers]]\nname='fixture'\nssh='never-contact'\nslots=1\n",
+    )
+    .unwrap();
+    mac_worker::config::Config::load(&config).unwrap();
+    fn value_after(plist: &str, marker: &str) -> String {
+        plist
+            .split_once(marker)
+            .expect("pinned launch value")
+            .1
+            .split_once("<string>")
+            .unwrap()
+            .1
+            .split_once("</string>")
+            .unwrap()
+            .0
+            .replace("&amp;", "&")
+            .replace("&apos;", "'")
+    }
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_worker"));
+    child.env_clear().current_dir(&home);
+    for name in ["HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"] {
+        child.env(name, value_after(&plist, &format!("<key>{name}</key>")));
+    }
+    let output = child
+        .args([
+            "--config",
+            &value_after(&plist, "<string>--config</string>"),
+            "runner",
+            "018f0f4a6b5c7d8e9f00112233445566",
+            "118f0f4a6b5c7d8e9f00112233445566",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("IO:"),
+        "runner must stop at its absent task files: {error}"
+    );
+    assert!(state_root.join("mac-worker").is_dir());
+    assert!(!home.join(".local/state/mac-worker").exists());
 }

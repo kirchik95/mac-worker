@@ -1,6 +1,10 @@
 //! Bounded, code-only controller health. This is an observation, never ownership
 //! authority: request locks, runner identities and durable rows remain authoritative.
-use std::{collections::BTreeMap, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +74,8 @@ pub struct ControllerHealth {
     pub version: u32,
     pub leader: ProcessIdentity,
     pub binary_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
     pub started_at_millis: u64,
     #[serde(default)]
     pub last_tick_start_millis: Option<u64>,
@@ -105,6 +111,7 @@ impl ControllerHealth {
             version: 1,
             leader,
             binary_version: env!("CARGO_PKG_VERSION").into(),
+            config_path: None,
             started_at_millis,
             last_tick_start_millis: None,
             last_tick_end_millis: None,

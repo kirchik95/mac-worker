@@ -14,8 +14,19 @@ use crate::{
     transfer::{HostOperation, controller_host_request},
     transport::SshTransport,
 };
-use serde::Serialize;
-use std::{collections::BTreeMap, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfiguredHost {
+    #[serde(flatten)]
+    pub outcome: ConfigWriteResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
+}
 
 pub struct InitRequest {
     pub destination: String,
@@ -166,7 +177,7 @@ pub fn initialize_with_wait(
     for (worker, plan) in remote.workers.iter_mut().zip(&planned) {
         worker.ssh = plan.alias.clone()
     }
-    let configured: ConfigWriteResult = controller_host_request(
+    let configured: ConfiguredHost = controller_host_request(
         runner,
         &host,
         HostOperation::ControllerConfigure,
@@ -178,11 +189,11 @@ pub fn initialize_with_wait(
             force: request.force,
         },
     )?;
-    if configured.conflict {
+    if configured.outcome.conflict {
         report.message =
             "controller config differs; review the diff and rerun with --force to replace it"
                 .into();
-        report.config_diff = configured.diff;
+        report.config_diff = configured.outcome.diff;
         return Ok(report);
     }
     let key: ControllerKeyResponse = controller_host_request(
@@ -191,13 +202,6 @@ pub fn initialize_with_wait(
         HostOperation::ControllerKey,
         &serde_json::json!({}),
     )?;
-    if let Some(identity) = key.identity {
-        report.boot_commands = Some(super::service::launchdaemon_commands(
-            &identity.home,
-            &identity.username,
-            identity.uid,
-        )?);
-    }
     for (worker, summary) in config.workers.iter().zip(&mut report.workers) {
         let mut authorization_worker = worker.clone();
         // Reach the selected account using the laptop's original route/ProxyJump.
@@ -223,7 +227,7 @@ pub fn initialize_with_wait(
         report.message="controller key authorization failed on one or more workers; rerun init after restoring laptop access".into();
         return Ok(report);
     }
-    let _: ServiceStatus = controller_host_request(
+    let installed: ServiceStatus = controller_host_request(
         runner,
         &host,
         HostOperation::ControllerService,
@@ -231,6 +235,14 @@ pub fn initialize_with_wait(
             action: ServiceAction::Install,
         },
     )?;
+    if let (Some(identity), Some(paths)) = (key.identity, installed.paths.as_ref()) {
+        report.boot_commands = Some(super::service::launchdaemon_commands(
+            &identity.home,
+            paths,
+            &identity.username,
+            identity.uid,
+        )?);
+    }
     let _: ServiceStatus = controller_host_request(
         runner,
         &host,
@@ -277,6 +289,17 @@ pub fn initialize_with_wait(
     }
     if health.leader_running != Some(true) {
         report.message="controller service installed but no live leader was verified; inspect `worker controller status` on the controller and rerun init".into();
+        return Ok(report);
+    }
+    if configured.config_path.as_ref().is_none_or(|expected| {
+        !expected.is_absolute()
+            || health
+                .health
+                .as_ref()
+                .and_then(|record| record.config_path.as_ref())
+                != Some(expected)
+    }) {
+        report.message = "controller leader config path does not match the configured inventory; inspect worker controller status and rerun init".into();
         return Ok(report);
     }
     if report.workers.iter().any(|w| !w.reachable) {
@@ -393,7 +416,7 @@ pub fn configure_host(
     home: &Path,
     config_path: &Path,
     request: &ControllerConfigureRequest,
-) -> Result<ConfigWriteResult, WorkerError> {
+) -> Result<ConfiguredHost, WorkerError> {
     let config = Config::parse(&request.config_toml)?;
     config.validate()?;
     if config.workers.len() != request.workers.len()
@@ -410,7 +433,10 @@ pub fn configure_host(
     if !outcome.conflict {
         provision::write_ssh_settings(home, &request.workers, &request.known_hosts)?
     }
-    Ok(outcome)
+    Ok(ConfiguredHost {
+        outcome,
+        config_path: Some(std::path::absolute(config_path)?),
+    })
 }
 
 pub fn disable(

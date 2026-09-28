@@ -3,7 +3,7 @@
 use std::{
     ffi::{CStr, CString, OsString},
     io,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     controller::leader::lock_exclusive,
     error::WorkerError,
+    paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
@@ -44,6 +45,28 @@ pub struct ServiceStatus {
     pub domain: String,
     pub installed: bool,
     pub loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<ServicePaths>,
+}
+
+/// Resolved helper paths, also used by the printed LaunchDaemon variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicePaths {
+    pub config: PathBuf,
+    pub state: PathBuf,
+    pub cache: PathBuf,
+    pub data: PathBuf,
+}
+
+impl ServicePaths {
+    pub fn from_layout(paths: &PathLayout) -> Result<Self, WorkerError> {
+        Ok(Self {
+            config: std::path::absolute(&paths.config)?,
+            state: std::path::absolute(&paths.state)?,
+            cache: std::path::absolute(&paths.cache)?,
+            data: std::path::absolute(&paths.data)?,
+        })
+    }
 }
 
 struct InstalledPlist {
@@ -57,6 +80,7 @@ struct InstalledPlist {
 /// healthy; controller health supplies that independent observation.
 pub fn manage(
     home: &Path,
+    paths: &PathLayout,
     uid: u32,
     runner: &dyn ProcessRunner,
     action: ServiceAction,
@@ -83,6 +107,7 @@ pub fn manage(
         domain: format!("gui/{uid}"),
         installed: previous.is_some(),
         loaded: is_loaded(runner, uid)?,
+        paths: Some(ServicePaths::from_layout(paths)?),
     };
     let target = format!("{}/{LABEL}", status.domain);
     match action {
@@ -111,7 +136,8 @@ pub fn manage(
                 ));
             }
             let _logs = prepare_log(home)?;
-            let desired = launchd_plist(home, None)?;
+            let desired =
+                launchd_plist(home, status.paths.as_ref().expect("resolved paths"), None)?;
             let changed = previous.as_ref().map(|previous| previous.bytes.as_slice())
                 != Some(desired.as_bytes());
             if changed {
@@ -169,7 +195,12 @@ pub fn truncate_log(home: &Path) -> Result<(), WorkerError> {
 
 /// Render instructions only. The caller prints these for an operator to review
 /// and run on the controller host; this function never launches any process.
-pub fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<String, WorkerError> {
+pub fn launchdaemon_commands(
+    home: &Path,
+    paths: &ServicePaths,
+    username: &str,
+    uid: u32,
+) -> Result<String, WorkerError> {
     validate_home(home)?;
     if username.is_empty()
         || username.len() > 255
@@ -179,7 +210,7 @@ pub fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<St
     {
         return Err(service_error("account name is invalid"));
     }
-    let plist = launchd_plist(home, Some(username))?;
+    let plist = launchd_plist(home, paths, Some(username))?;
     let agent = shell_quote(
         home.join("Library/LaunchAgents")
             .join(PLIST_NAME)
@@ -199,7 +230,21 @@ pub fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<St
     ))
 }
 
-fn launchd_plist(home: &Path, username: Option<&str>) -> Result<String, WorkerError> {
+fn launchd_plist(
+    home: &Path,
+    paths: &ServicePaths,
+    username: Option<&str>,
+) -> Result<String, WorkerError> {
+    let config = xml_escape(validate_home(&paths.config)?);
+    let xdg_root = |path: &Path| -> Result<String, WorkerError> {
+        Ok(xml_escape(validate_home(
+            path.parent()
+                .ok_or_else(|| service_error("missing XDG root"))?,
+        )?))
+    };
+    let state = xdg_root(&paths.state)?;
+    let cache = xdg_root(&paths.cache)?;
+    let data = xdg_root(&paths.data)?;
     let home = xml_escape(validate_home(home)?);
     let username = username
         .map(|username| {
@@ -221,6 +266,8 @@ fn launchd_plist(home: &Path, username: Option<&str>) -> Result<String, WorkerEr
 {username}  <key>ProgramArguments</key>
   <array>
     <string>{home}/.local/bin/worker</string>
+    <string>--config</string>
+    <string>{config}</string>
     <string>controller</string>
     <string>run</string>
     <string>--supervised</string>
@@ -229,6 +276,12 @@ fn launchd_plist(home: &Path, username: Option<&str>) -> Result<String, WorkerEr
   <dict>
     <key>HOME</key>
     <string>{home}</string>
+    <key>XDG_STATE_HOME</key>
+    <string>{state}</string>
+    <key>XDG_CACHE_HOME</key>
+    <string>{cache}</string>
+    <key>XDG_DATA_HOME</key>
+    <string>{data}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>{home}</string>
