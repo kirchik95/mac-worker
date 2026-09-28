@@ -508,6 +508,7 @@ impl TaskResultReport {
         fetch_instruction: String,
         failure_receipt: Option<crate::failure_receipt::FailureReceipt>,
         deliveries: Vec<OriginDelivery>,
+        warnings: Vec<String>,
     ) -> Self {
         Self {
             task_id,
@@ -518,7 +519,7 @@ impl TaskResultReport {
             deliveries,
             freshness: TaskFreshness::Current,
             observed_at_millis: None,
-            warnings: Vec::new(),
+            warnings,
         }
     }
 }

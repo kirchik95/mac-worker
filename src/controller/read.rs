@@ -370,6 +370,8 @@ pub struct ControllerTaskResult {
     delivery: Option<OriginDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deliveries: Vec<OriginDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 impl ControllerTaskResult {
@@ -395,6 +397,7 @@ impl ControllerTaskResult {
                 None => None,
             },
             self.deliveries,
+            self.warnings,
         )
     }
 }
@@ -551,6 +554,7 @@ fn result_reply(
             }),
             delivery: report.last_delivery().cloned(),
             deliveries: report.deliveries().to_vec(),
+            warnings: report.warnings().to_vec(),
         },
     ))
 }
@@ -559,7 +563,7 @@ fn reply<T>(request: &ControllerRequest, result: T) -> ControllerReadReply<T> {
     ControllerReadReply::from_request(request, result)
 }
 
-fn require_matching_task_id(
+pub(crate) fn require_matching_task_id(
     request: &ControllerRequest,
     task_id: TaskId,
 ) -> Result<(), WorkerError> {
@@ -573,7 +577,10 @@ fn require_matching_task_id(
     Ok(())
 }
 
-fn required_task_id(request: &ControllerRequest, command: &str) -> Result<TaskId, WorkerError> {
+pub(crate) fn required_task_id(
+    request: &ControllerRequest,
+    command: &str,
+) -> Result<TaskId, WorkerError> {
     let Some(value) = request.body().get("task_id").and_then(Value::as_str) else {
         return Err(WorkerError::Protocol(format!(
             "CONTROLLER_TRANSPORT: {command} requires task_id"
@@ -936,6 +943,7 @@ mod tests {
             residual: None,
             delivery: Some(published.clone()),
             deliveries: vec![published.clone()],
+            warnings: Vec::new(),
         })
         .unwrap();
         assert_eq!(encoded["delivery"]["state"], "delivered");
