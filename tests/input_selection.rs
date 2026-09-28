@@ -159,6 +159,10 @@ fn select(
     repo: &GitRepo,
     settings: &SnapshotSettings,
 ) -> Result<mac_worker::inputs::InputSelection, mac_worker::inputs::SelectionFailure> {
+    // Selection reads the user's Git configuration through HOME. Another test
+    // may point HOME at a temporary directory, so serialize with it unless
+    // this thread already holds the lock.
+    let _home = (!HOLDS_HOME_LOCK.get()).then(IsolatedHome::lock);
     InputSelector::new(&SystemProcessRunner).select(&context(repo), settings)
 }
 
@@ -866,6 +870,10 @@ impl ProcessRunner for AttributeOutputRunner {
 
 static HOME_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static HOLDS_HOME_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct IsolatedHome {
     _guard: std::sync::MutexGuard<'static, ()>,
     previous_home: Option<OsString>,
@@ -874,12 +882,17 @@ struct IsolatedHome {
 
 impl IsolatedHome {
     fn lock() -> Self {
-        let previous_home = std::env::var_os("HOME");
-        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // Read the values to restore only while holding the lock: another
+        // holder may have pointed HOME at its temporary directory. A panic in
+        // another test must not poison the lock for every later test.
+        let guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HOLDS_HOME_LOCK.set(true);
         Self {
-            _guard: HOME_LOCK.lock().expect("home lock"),
-            previous_home,
-            previous_xdg,
+            _guard: guard,
+            previous_home: std::env::var_os("HOME"),
+            previous_xdg: std::env::var_os("XDG_CONFIG_HOME"),
         }
     }
 
@@ -894,6 +907,7 @@ impl IsolatedHome {
 
 impl Drop for IsolatedHome {
     fn drop(&mut self) {
+        HOLDS_HOME_LOCK.set(false);
         unsafe {
             match &self.previous_home {
                 Some(value) => std::env::set_var("HOME", value),
