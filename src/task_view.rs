@@ -1069,6 +1069,7 @@ mod tests {
             "worker task fetch 1".into(),
             None,
             vec![delivery],
+            Vec::new(),
         );
         let mut text = Vec::new();
         crate::write_task_result_report(&report, false, &mut text).unwrap();
