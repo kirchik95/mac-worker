@@ -206,9 +206,30 @@ worker init yourname@second-mini.local --name mini-2
 
 The scheduler uses an available compatible worker. Each Mac defaults to **one** concurrent turn (`slots = 1` per worker); that host may opt in to `1..=8`. Combined capacity is the sum of per-worker ceilings. Laptop `slots` is a client ceiling, not host authority. Use `--worker <name>` on `task submit` only as a diagnostic pin.
 
+## Controller setup
+
+To keep the queue running while the laptop is disconnected, first install the current helper on
+an always-on Mac listed in your laptop inventory, then initialize it:
+
+```bash
+worker setup mini-1
+worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
+worker controller status
+```
+
+Init uses the laptop's trusted host keys, preserves existing SSH access, provisions a dedicated
+controller key, and starts a supervised LaunchAgent. It keeps the laptop worker inventory.
+Reruns are safe; differing controller config requires the displayed diff and `--force`.
+A LaunchAgent needs a logged-in session after reboot; init prints optional LaunchDaemon commands
+for start at boot without executing them. `sudo pmset -a autorestart 1` is a separate power-loss
+recovery setting. Use `controller drain` before maintenance, `controller drain --off` to resume,
+and `controller disable` to unload the agent and return the laptop to local mode while keeping state.
+For this supervised pilot, `worker setup` restarts the controller after helper upgrades and reports
+the result. See [Remote controller](usage.md#remote-controller) for trust, logs, overrides and recovery.
+
 ## Update or remove
 
-Before updating, let active tasks finish and keep a copy of the current binaries for rollback. If you use a remote controller, stop its `worker controller run` process for the update and keep the laptop CLI, controller CLI, and worker helpers on the same build.
+Before updating, let active tasks finish and keep a copy of the current binaries for rollback. `worker setup` restarts a supervised controller after installing its helper. Stop a manually run `worker controller run` process before updating it. Keep the laptop CLI, controller CLI, and worker helpers on the same build.
 
 Install a newer published CLI with `install.sh --version <release-tag>` on the laptop and, if used, the controller host. Then update the helpers and check their health using a configuration containing the worker inventory:
 

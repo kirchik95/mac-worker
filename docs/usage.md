@@ -410,33 +410,45 @@ Use this when an always-on Mac should keep the queue after the laptop sleeps or 
 
 ### Enable
 
-On the **laptop** `config.toml`:
+Run from the laptop with a worker inventory that includes the controller host:
+
+```bash
+worker setup mini-1
+worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
+worker controller status
+```
+
+`init` requires the controller helper's SHA-256 to match the running laptop CLI; install that build with `worker setup` first. It resolves the inventory with laptop `ssh -G`, removes a first ProxyJump through the controller, and maps the controller's own worker to loopback. Generated `mac-worker-controller-<worker>` SSH aliases preserve each resolved user and port. Repeat `--worker-ssh NAME=DESTINATION` for explicit controller-reachable overrides. Remaining jump chains require a direct override; they are never copied silently from the laptop.
+
+The controller receives `~/.config/mac-worker/config.toml`, a dedicated `~/.ssh/mac-worker-controller_ed25519` key, managed SSH settings, and laptop-trusted host keys in per-worker `~/.ssh/mac-worker-controller-<worker>.known_hosts` files (with a combined `mac-worker-controller_known_hosts` copy). Only public keys returned by laptop `ssh-keygen -F` are seeded; missing or revoked trust stops setup for that worker. Strict host-key checking stays enabled, including loopback; the verification name is pinned explicitly and each worker has its own trusted-key file. Init prepends its managed Include to the account's SSH config and preserves the existing content. Authorization appends one recognizable `mac-worker-controller` line, preserves all existing restrictions/keys, and is idempotent. Existing controller private keys are retained.
+
+Rerun `init` after correcting access or inventory. Identical controller configuration is kept; a different existing config produces a diff and requires `--force`. Init installs and restarts the service, probes every worker from the controller, and checks a live leader through RPC before enabling laptop controller mode. It prints a per-worker result. Partial initialization is recoverable by rerunning the command. The laptop keeps its `[[workers]]`, so `setup`, `doctor`, `workers`, and `gc` remain usable there.
+
+The resulting laptop settings are:
 
 ```toml
 [controller]
 enabled = true
-ssh = "yourname@always-on-host"
+ssh = "mac1"
 remote_binary = "~/.local/bin/worker"
 ```
 
-`ssh` must be a valid destination (same family as a worker entry). `remote_binary` must be exactly `~/.local/bin/worker`. When this mode is on, a real SSH or `host controller-rpc` failure is `CONTROLLER_UNAVAILABLE` — not a silent return to a laptop task queue. Absence of `worker controller run` is not that outage.
+The controller host's own config has controller mode disabled and contains its dispatch inventory. `remote_binary` must be exactly `~/.local/bin/worker`. Task commands use authenticated `host controller-rpc`; transport failure never silently switches to a laptop task queue. RPC can persist requests even while the leader is stopped.
 
-On the **controller host**, install the same CLI, put that host’s execution workers in **its** `config.toml`, and run:
+The service is `~/Library/LaunchAgents/com.mac-worker.controller.plist` in `gui/<uid>`, with RunAtLoad, KeepAlive, and a 30-second restart throttle. It runs `worker controller run --supervised`; stdout and stderr share `~/Library/Logs/mac-worker/controller.log`. Each supervised process start truncates that log in place, including lock-contention restarts. Long uninterrupted runs retain their current log until the next start. `worker setup` restarts an enabled configured controller after installing its helper and reports `controller: restarted`; restart failures retain the installed helper and produce `CONTROLLER_RESTART_FAILED`.
 
-```bash
-worker controller run
-```
+A LaunchAgent **requires a logged-in GUI session after reboot**. No auto-login means it will not start before login. Successful init prints the complete, account-specific `sudo` commands and equivalent LaunchDaemon plist (including `UserName=kirchik` for the pilot) for operators who want boot startup. These commands are instructions only and are never executed by init. Review and run them on the controller; they unload the agent before loading the daemon so there is only one leader. For automatic recovery after power loss, also consider running `sudo pmset -a autorestart 1` on that host. Never-sleep settings alone do not enable boot or power-loss recovery. The init/disable/setup service commands manage the LaunchAgent; operators choosing the printed LaunchDaemon alternative manage its system-domain lifecycle themselves.
 
-That process takes the leader lock, resumes unfinished requests and bounded active tasks, prints `controller leader acquired`, and stays in the foreground until you stop it. Keep it running for **autonomous** progress (recovery, DAG readiness, turn runners). Laptop task commands use a separate `host controller-rpc` over SSH; that helper can accept and persist a queued submit even when the leader is not up. Do not treat a missing leader as a transport failure, and do not assume every RPC requires a live `controller run`. A second live `controller run` on the same host is `CONTROLLER_LOCK_HELD`. Restart is stop, then `worker controller run` again — it resumes the same store. This is not `launchd` and is not started from the MacBook as a local daemon.
+For manual foreground operation, stop/unload the service first, then run `worker controller run` on the controller. It holds the leader lock, resumes the same durable store, and prints `controller leader acquired`; a second leader gets `CONTROLLER_LOCK_HELD`.
 
-The controller host owns the worker list used for dispatch. A laptop config with `[controller] enabled = true` may omit `[[workers]]`. Laptop commands that then fail with `at least one worker is required` are `worker setup`, `worker workers`, `worker run`, streaming `worker logs`, and `worker gc`. Public job `status` and `cancel` stay laptop-local and do **not** use that inventory error. That is explicit, not empty-pool scheduling.
-
-These stay on the laptop even when the controller is enabled: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Turn runners run on the controller host, not on the MacBook.
+These stay on the laptop in controller mode: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Controller-only hand-written laptop configs may omit workers, but inventory-based commands still require them. Turn runners run on the controller host.
 
 ### Health and shutdown
 
-On the **controller host**, use `worker controller status` or `worker controller status --json`.
-This is a local, read-only diagnostic. The JSON includes the leader PID and process start time,
+Use `worker controller status` or `worker controller status --json` on either host.
+With laptop controller mode enabled, it reads the remote health, LaunchAgent state, and persisted
+`drained` flag. On the controller it reads local state. Service lookup failure is shown as unknown,
+separately from the leader's process identity. This is a read-only diagnostic. The JSON includes the leader PID and process start time,
 binary version, tick start/end/duration, last success and progress, failure counts by public code,
 active request count and oldest pending age, and scheduling truncation/cursor flags. Unknown
 pending ages are marked incomplete. Counts cover the current leader invocation; an idle successful
@@ -460,6 +472,19 @@ readiness; reported tick failures are warnings and remain visible in the control
 Ctrl-C or SIGTERM stops scheduling ticks, cancels interruptible Git/SSH subprocess I/O, and joins the
 active tick before writing the stopped record and releasing the leader lock. Filesystem operations
 and code without an interruption hook must finish before that join completes.
+
+Pause new runner handoffs with `worker controller drain`; resume with `worker controller drain --off`.
+The flag survives leader restarts. Requests continue to be accepted and persisted while drained;
+already-running turns finish. The shared launch gate covers ordinary, recovery, replacement, and
+completion-triggered runners. `status` reports `drained`; unreadable drain state fails closed.
+
+`worker controller disable` unloads the remote LaunchAgent and sets laptop `enabled = false`.
+It preserves both inventories, task state, keys, and trusted hosts. Finish controller work before
+switching back: local mode does not import the controller's task store. Rerun init to re-enable it.
+
+`worker task publish-retry TASK_ID` is routed to the controller, which retries the worker outbox
+and persists refreshed delivery state. `worker task result` includes the same effective-permission
+warnings as local task results.
 
 ### Submit, disconnect, reconnect
 
