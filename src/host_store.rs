@@ -5214,7 +5214,7 @@ fn validate_terminal_job_basis(
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
     let is_turn = job.entry_exists("prompt.md")?;
-    let retained = if is_turn {
+    let mut retained = if is_turn {
         vec![
             ".mac-worker-rooted-fs",
             "meta.json",
@@ -5237,6 +5237,9 @@ fn validate_terminal_job_basis(
     .into_iter()
     .map(String::from)
     .collect::<BTreeSet<_>>();
+    if is_turn {
+        retained.extend(crate::turn::retained_diagnostic_files(job)?);
+    }
     let retained_with_supervisor_log = retained
         .iter()
         .cloned()

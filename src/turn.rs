@@ -49,6 +49,23 @@ const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
 const PARSE_REASON_FILE: &str = "result-parse-reason.json";
 
+/// These immutable, private diagnostics survive terminal cleanup so publication
+/// and postmortem inspection can be retried after a supervisor handoff.
+pub(crate) fn retained_diagnostic_files(dir: &RootedDir) -> Result<Vec<String>, WorkerError> {
+    let mut retained = Vec::new();
+    for (name, limit) in [
+        (crate::agent::identity::IDENTITY_FILE, 8192),
+        (PARSE_REASON_FILE, 256),
+        (crate::project_readiness::SETUP_RESULT_FILE, 4096),
+    ] {
+        if dir.entry_exists(name)? {
+            dir.read_private_regular(name, limit)?;
+            retained.push(name.into());
+        }
+    }
+    Ok(retained)
+}
+
 fn preparation_failure_outcome(dir: &RootedDir) -> Result<Option<TaskOutcome>, WorkerError> {
     let Some(failure) = crate::project_readiness::load_setup_stage_result(dir)? else {
         return Ok(None);

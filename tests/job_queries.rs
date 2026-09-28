@@ -804,6 +804,55 @@ fn cancel_terms_then_kills_only_the_exact_recorded_group_before_cleanup() {
 }
 
 #[test]
+fn terminal_turn_cleanup_retains_bounded_private_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let (store, lease, _request, status, _child) =
+        indexed_running_job(&temp.path().join("turn-diagnostics"), 90_501, 90_502);
+    let cancelled = status
+        .into_infrastructure_terminal(JobState::Cancelled, 14, 0, 0, "CANCELLED".into())
+        .unwrap();
+    install_job_status(&store, &lease, &cancelled, false);
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    for name in ["prompt.md", "result.schema.json", "tail.log"] {
+        replace_bytes(&job.join(name), b"").unwrap();
+    }
+    for name in [
+        "agent-identity.json",
+        "result-parse-reason.json",
+        "setup-result.json",
+    ] {
+        replace_bytes(&job.join(name), b"{}").unwrap();
+    }
+    fs::remove_file(job.join("agent-identity.json")).unwrap();
+    symlink(job.join("stdout.log"), job.join("agent-identity.json")).unwrap();
+    assert!(
+        store.cleanup_job_owned(&lease).is_err(),
+        "diagnostic symlink must block cleanup"
+    );
+    replace_bytes(&job.join("agent-identity.json"), &vec![b'x'; 8193]).unwrap();
+    assert!(
+        store.cleanup_job_owned(&lease).is_err(),
+        "unbounded diagnostic must block cleanup"
+    );
+    replace_bytes(&job.join("agent-identity.json"), b"{}").unwrap();
+    let receipt = store.cleanup_job_owned(&lease).unwrap();
+    LeaseService::new(&store)
+        .release_after_cleanup(&lease, &receipt)
+        .unwrap();
+    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    assert_mutable_job_scopes_absent(&store, &lease);
+    for name in [
+        "agent-identity.json",
+        "result-parse-reason.json",
+        "setup-result.json",
+    ] {
+        assert_eq!(fs::read(job.join(name)).unwrap(), b"{}");
+    }
+}
+
+#[test]
 fn overlapping_cancels_do_not_record_lease_release_failed_after_the_slot_is_free() {
     // Break caught: two cancels in quick succession both capture the live
     // lease, the winner retires it, and the loser stamps LEASE_RELEASE_FAILED
