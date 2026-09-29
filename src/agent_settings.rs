@@ -198,6 +198,8 @@ impl AgentKind {
 pub struct NativeAgentSettingsStore {
     home: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+    codex_catalog: Option<serde_json::Value>,
+    opencode_catalog: Option<Vec<String>>,
     cursor_catalog: Option<Vec<CursorCatalogModel>>,
     cursor_catalog_profile: Option<String>,
 }
@@ -210,6 +212,8 @@ impl NativeAgentSettingsStore {
             // once, while all native descendants remain no-follow checked.
             home: fs::canonicalize(&home).unwrap_or(home),
             environment: BTreeMap::new(),
+            codex_catalog: None,
+            opencode_catalog: None,
             cursor_catalog: None,
             cursor_catalog_profile: None,
         }
@@ -225,6 +229,17 @@ impl NativeAgentSettingsStore {
         self
     }
 
+    pub fn with_codex_catalog(mut self, value: Option<serde_json::Value>) -> Self {
+        self.codex_catalog =
+            value.filter(|value| !catalog_entries_from_value(value, true, false).is_empty());
+        self
+    }
+
+    pub fn with_opencode_catalog(mut self, value: Option<String>) -> Self {
+        self.opencode_catalog = value.as_deref().and_then(parse_opencode_catalog);
+        self
+    }
+
     pub fn with_cursor_catalog_profile(mut self, profile: Option<String>) -> Self {
         self.cursor_catalog_profile = profile;
         self
@@ -237,14 +252,13 @@ impl NativeAgentSettingsStore {
     }
 
     fn model_catalog_source(&self, kind: AgentKind) -> Option<String> {
-        (kind == AgentKind::Cursor).then(|| {
-            if self.cursor_catalog.is_some() {
-                "live"
-            } else {
-                "remembered"
-            }
-            .to_owned()
-        })
+        let live = match kind {
+            AgentKind::Codex => self.codex_catalog.is_some(),
+            AgentKind::Cursor => self.cursor_catalog.is_some(),
+            AgentKind::Opencode => self.opencode_catalog.is_some(),
+            AgentKind::Claude => return None,
+        };
+        Some(if live { "live" } else { "remembered" }.to_owned())
     }
 
     pub fn read_all(&self) -> AgentSettingsList {
@@ -466,7 +480,12 @@ impl NativeAgentSettingsStore {
 
     fn codex_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
         let path = self.home.join(".codex/models_cache.json");
-        let Some(value) = read_catalog_value(&path, MAX_SETTINGS_SOURCE_BYTES) else {
+        let remembered = self
+            .codex_catalog
+            .is_none()
+            .then(|| read_catalog_value(&path, MAX_SETTINGS_SOURCE_BYTES))
+            .flatten();
+        let Some(value) = self.codex_catalog.as_ref().or(remembered.as_ref()) else {
             return current_model
                 .filter(|model| validate_catalog_id(model))
                 .map(|model| {
@@ -480,8 +499,8 @@ impl NativeAgentSettingsStore {
                 })
                 .unwrap_or_default();
         };
-        let all = catalog_entries_from_value(&value, false, false);
-        let visible = finalize_catalog(catalog_entries_from_value(&value, true, false), true);
+        let all = catalog_entries_from_value(value, false, false);
+        let visible = finalize_catalog(catalog_entries_from_value(value, true, false), true);
         let mut options = visible;
         if let Some(model) = current_model
             && !options.iter().any(|option| option.id == model)
@@ -629,7 +648,39 @@ impl NativeAgentSettingsStore {
 
     fn opencode_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
         let cache = self.home.join(".cache/opencode/models.json");
-        let Some(value) = read_catalog_value(&cache, MAX_OPENCODE_CATALOG_BYTES) else {
+        let value = read_catalog_value(&cache, MAX_OPENCODE_CATALOG_BYTES);
+        if let Some(catalog) = &self.opencode_catalog {
+            let mut ids = catalog.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Some(model) = current_model.filter(|model| validate_catalog_id(model))
+                && !ids.contains(&model)
+            {
+                if ids.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+                    ids.pop();
+                }
+                ids.push(model);
+            }
+            return ids
+                .into_iter()
+                .map(|id| {
+                    let label = id
+                        .split_once('/')
+                        .and_then(|(provider, model)| {
+                            let metadata =
+                                value.as_ref()?.get(provider)?.get("models")?.get(model)?;
+                            catalog_text(metadata.get("name"), MAX_SETTINGS_LABEL_BYTES)
+                        })
+                        .unwrap_or_else(|| id.to_owned());
+                    ModelOption {
+                        id: id.to_owned(),
+                        label,
+                        effort_options: Vec::new(),
+                        fast_supported: false,
+                        capabilities_known: false,
+                    }
+                })
+                .collect();
+        }
+        let Some(value) = value else {
             return current_model
                 .filter(|model| validate_catalog_id(model))
                 .map(|model| {
@@ -886,7 +937,7 @@ impl NativeAgentSettingsStore {
             revision,
             writable,
             message,
-            model_catalog_source: None,
+            model_catalog_source: self.model_catalog_source(AgentKind::Opencode),
             model_catalog_profile: None,
         })
     }
@@ -1015,6 +1066,63 @@ struct CursorCatalogModel {
     option: ModelOption,
     effort_parameter: Option<String>,
     default_parameters: Vec<serde_json::Value>,
+}
+
+fn parse_opencode_catalog(output: &str) -> Option<Vec<String>> {
+    let mut ids = Vec::new();
+    for line in output.lines() {
+        let Some(id) = strip_catalog_ansi(line) else {
+            continue;
+        };
+        let Some((provider, model)) = id.split_once('/') else {
+            continue;
+        };
+        if !validate_catalog_id(&id)
+            || id.chars().any(char::is_whitespace)
+            || provider.is_empty()
+            || model.is_empty()
+            || !provider
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            || ids.contains(&id)
+        {
+            continue;
+        }
+        ids.push(id);
+        if ids.len() >= MAX_SETTINGS_MODEL_OPTIONS {
+            break;
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Strip terminal CSI styling and OSC titles/hyperlinks before validating a
+/// complete line. A truncated escape sequence makes the line unusable.
+fn strip_catalog_ansi(line: &str) -> Option<String> {
+    let mut plain = String::new();
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            plain.push(character);
+            continue;
+        }
+        match chars.next()? {
+            '[' => loop {
+                if ('@'..='~').contains(&chars.next()?) {
+                    break;
+                }
+            },
+            ']' => loop {
+                match chars.next()? {
+                    '\u{7}' => break,
+                    '\u{1b}' if chars.next()? == '\\' => break,
+                    _ => {}
+                }
+            },
+            _ => {}
+        }
+    }
+    Some(plain)
 }
 
 fn parse_cursor_catalog(value: &serde_json::Value) -> Option<Vec<CursorCatalogModel>> {
