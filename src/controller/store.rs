@@ -841,11 +841,27 @@ impl ControllerStore {
         }
         let name = active_file_name(request_id)?;
         // Idempotent: already-absent counts as retired (heals the
-        // crash-after-ACK window on the next tick).
-        self.active
-            .remove_owned_regular(&name)
-            .map_err(|error| op_io("retire-receipt", &name, error))?;
-        Ok(())
+        // crash-after-ACK window on the next tick). A peer retiring the same
+        // receipt at the same time (an RPC handler and the leader tick, or a
+        // retried request) makes the removal's identity checks report ESTALE.
+        // Once the entry is gone that is the same outcome; otherwise retry.
+        let mut attempts = 0;
+        loop {
+            match self.active.remove_owned_regular(&name) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ESTALE) && attempts < 3 => {
+                    attempts += 1;
+                    if !self
+                        .active
+                        .entry_exists(&name)
+                        .map_err(|error| op_io("retire-receipt", &name, error))?
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(error) => return Err(op_io("retire-receipt", &name, error)),
+            }
+        }
     }
 
     fn lock_request(&self, request_id: &str) -> Result<File, WorkerError> {
