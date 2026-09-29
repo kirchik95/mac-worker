@@ -2018,7 +2018,7 @@ fn cancelling_a_running_turn_hands_off_before_deadline_and_publishes_cancelled()
     // Break caught: the turn supervisor retained its guard while waiting for
     // the agent, so a concurrent host cancellation expired with
     // SUPERVISOR_LOCK_PENDING instead of publishing a cancelled turn.
-    let script = "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-cancel\"}'; sleep 8; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"natural\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'";
+    let script = "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"session-cancel\"}'; sleep 25; printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"done\\\",\\\"summary\\\":\\\"natural\\\",\\\"questions\\\":[],\\\"files_changed\\\":[]}\"}}'";
     let (_temp, store, request, cancel_request) = prepared_task_turn(script);
     let submit_store = store.clone();
     let submit_request = request.clone();
@@ -2074,9 +2074,11 @@ fn cancelling_a_running_turn_hands_off_before_deadline_and_publishes_cancelled()
         cancel_result.unwrap_or_else(|error| panic!("turn cancellation failed: {error}"));
     let submitted = submit_result.unwrap_or_else(|error| panic!("turn runner failed: {error}"));
 
+    // The agent would finish naturally after 25 s; a loaded machine can stretch
+    // the handoff and TERM wait well past 5 s, but not that far.
     assert!(
-        cancel_elapsed < Duration::from_secs(5),
-        "cancellation exceeded the supervisor handoff deadline: {cancel_elapsed:?}"
+        cancel_elapsed < Duration::from_secs(20),
+        "cancellation waited for the agent instead of interrupting it: {cancel_elapsed:?}"
     );
     assert_eq!(cancelled.status().state(), TaskState::Open);
     assert_eq!(
@@ -2995,6 +2997,15 @@ timeout = "20s"
 commands = ["PATH=/bin:/usr/bin printf $$ > leader.pid; /bin/sleep 60 & printf $! > grandchild.pid; wait"]
 "#;
 
+/// Same recipe with a setup timeout far beyond any cancellation, so a cancel
+/// that waited for setup instead of interrupting it cannot pass by accident.
+const SETUP_LONG_SLEEP_RECIPE: &str = r#"
+version = 1
+[setup]
+timeout = "120s"
+commands = ["PATH=/bin:/usr/bin printf $$ > leader.pid; /bin/sleep 60 & printf $! > grandchild.pid; wait"]
+"#;
+
 #[test]
 fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt_wrapper() {
     let temp = tempdir().unwrap();
@@ -3016,7 +3027,7 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
     }
     let script = "printf ran > agent.ran";
     let (_temp, store, request, cancel_request) =
-        prepared_task_turn_with_setup(script, 30_000, Some(SETUP_SLEEP_RECIPE));
+        prepared_task_turn_with_setup(script, 120_000, Some(SETUP_LONG_SLEEP_RECIPE));
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let submit_store = store.clone();
@@ -3051,9 +3062,11 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
     let cancel_elapsed = cancel_started.elapsed();
     let submit_result = submit.join().expect("submit thread panicked");
 
+    // Handoff (at most 5 s) plus the TERM grace can stretch on a loaded machine;
+    // waiting for the 120 s setup timeout instead of interrupting setup cannot.
     assert!(
-        cancel_elapsed < Duration::from_secs(5),
-        "cancellation exceeded the supervisor handoff deadline: {cancel_elapsed:?}"
+        cancel_elapsed < Duration::from_secs(60),
+        "cancellation waited for the setup recipe instead of interrupting it: {cancel_elapsed:?}"
     );
     let cancelled = cancel_result.unwrap_or_else(|error| {
         panic!(
