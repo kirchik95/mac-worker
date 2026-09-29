@@ -39,9 +39,9 @@ use crate::{
     supervisor::SystemProcessInspector,
     task::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, PushTarget, RunId, RunRecord, RunnerState, TaskCloseIntent, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnId, TurnSummary, TurnTerminal, merge_origin_deliveries,
+        PublishMode, PushTarget, QuestionsPolicy, RunId, RunRecord, RunnerState, TaskCloseIntent,
+        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        TaskStatus, TurnId, TurnSummary, TurnTerminal, merge_origin_deliveries,
     },
     task_view::{
         TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
@@ -251,6 +251,7 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
+    pub questions: Option<crate::task::QuestionsPolicy>,
     pub agent: AgentKind,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -325,6 +326,7 @@ impl PublishRetryReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
     task_id: TaskId,
+    questions_policy: QuestionsPolicy,
     run_id: Option<RunId>,
     status: TaskStatus,
     warnings: Vec<String>,
@@ -339,6 +341,10 @@ pub struct TaskReport {
 }
 
 impl TaskReport {
+    pub fn questions_policy(&self) -> QuestionsPolicy {
+        self.questions_policy
+    }
+
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -388,7 +394,15 @@ impl TaskReport {
     }
 
     pub(crate) fn from_controller(projection: ControllerTaskProjection) -> Self {
+        let questions_policy = projection
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "questions_policy")
+            .and_then(|event| serde_json::from_value(event["policy"].clone()).ok())
+            .unwrap_or(QuestionsPolicy::Ask);
         Self {
+            questions_policy,
             task_id: projection.task_id,
             run_id: projection.run_id,
             status: projection.status,
@@ -770,6 +784,8 @@ impl<'de> Deserialize<'de> for BatchFile {
             #[serde(default)]
             max_followups: Option<u32>,
             #[serde(default)]
+            questions: Option<crate::task::QuestionsPolicy>,
+            #[serde(default)]
             close_on: Option<String>,
             #[serde(default)]
             env_profile: Option<String>,
@@ -795,6 +811,7 @@ impl<'de> Deserialize<'de> for BatchFile {
             wire.max_turns.is_some(),
             wire.max_budget_usd_cents.is_some(),
             wire.max_followups.is_some(),
+            wire.questions.is_some(),
             wire.close_on.is_some(),
             wire.env_profile.is_some(),
             wire.worker.is_some(),
@@ -838,6 +855,9 @@ impl<'de> Deserialize<'de> for BatchFile {
         if wire.max_followups.is_some() {
             defaults.max_followups = wire.max_followups;
         }
+        if wire.questions.is_some() {
+            defaults.questions = wire.questions;
+        }
         if wire.close_on.is_some() {
             defaults.close_on = wire.close_on;
         }
@@ -868,6 +888,8 @@ impl<'de> Deserialize<'de> for BatchFile {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchDefaults {
+    #[serde(default)]
+    pub questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default = "default_agent_name")]
     pub agent: String,
     #[serde(default)]
@@ -903,6 +925,7 @@ pub struct BatchDefaults {
 impl Default for BatchDefaults {
     fn default() -> Self {
         Self {
+            questions: None,
             agent: default_agent_name(),
             model: None,
             effort: None,
@@ -925,6 +948,8 @@ impl Default for BatchDefaults {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
+    #[serde(default)]
+    pub questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -1157,6 +1182,7 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let request = TaskSubmitRequest {
+            questions: prepared.questions,
             agent: prepared.agent,
             model: prepared.model.clone(),
             effort: prepared.effort.clone(),
@@ -1641,6 +1667,16 @@ impl<'a> TaskClient<'a> {
                 resuming = true;
                 existing
             } else {
+                let questions_policy = match request.questions.or(settings.task.questions) {
+                    Some(policy) => policy,
+                    None if matches!(frozen, Some(FrozenSubmit::Prepared(_))) => {
+                        crate::project_config::ProjectSettings::load(&context.root, &[])?
+                            .task
+                            .questions
+                            .unwrap_or_default()
+                    }
+                    None => QuestionsPolicy::default(),
+                };
                 let meta = TaskMeta::new(TaskMetaInput {
                     task_id,
                     run_id: request.run_id,
@@ -1703,7 +1739,7 @@ impl<'a> TaskClient<'a> {
                     request.wait_for_capacity,
                     None,
                 )?
-                .with_questions_policy(settings.task.questions.unwrap_or_default())
+                .with_questions_policy(questions_policy)
                 // The intent is written in the initial task-record creation, before
                 // any prompt, queue, report, or marker update can fail. Reconciliation
                 // may compensate only while this marker remains present.
@@ -2029,6 +2065,9 @@ impl<'a> TaskClient<'a> {
             || existing.meta().publish_branch() != publish_branch
             || existing.meta().limits() != limits
             || existing.meta().policy() != policy
+            || request
+                .questions
+                .is_some_and(|policy| existing.questions_policy() != policy)
             || existing.meta().close_policy() != close_policy
             || existing.meta().model() != model
             || existing.meta().effort() != effort
@@ -3872,6 +3911,7 @@ impl<'a> TaskClient<'a> {
 
     fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         Ok(TaskReport {
+            questions_policy: record.questions_policy(),
             task_id: record.meta().task_id(),
             run_id: record.meta().run_id(),
             status: record.status().clone(),
@@ -5335,6 +5375,7 @@ impl<'a> TaskClient<'a> {
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         Ok(TaskReport {
+            questions_policy: record.questions_policy(),
             task_id,
             run_id: record.meta().run_id(),
             status: record.status().clone(),
@@ -5353,6 +5394,7 @@ impl<'a> TaskClient<'a> {
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let observed = self.observe_task(record)?;
         Ok(TaskReport {
+            questions_policy: observed.record.questions_policy(),
             task_id: observed.record.meta().task_id(),
             run_id: observed.record.meta().run_id(),
             status: observed.record.status().clone(),
@@ -6160,6 +6202,7 @@ pub(crate) fn freeze_spec(
         PermissionPolicy::Workspace => "workspace",
     };
     Ok(DagFrozenSpec {
+        questions: request.questions.or(settings.questions),
         prompt: request.prompt.clone(),
         title: None,
         agent: agent_name(request.agent).to_owned(),
@@ -6199,6 +6242,7 @@ pub(crate) fn request_from_frozen_node(
 ) -> Result<TaskSubmitRequest, WorkerError> {
     let spec = &node.frozen;
     Ok(TaskSubmitRequest {
+        questions: spec.questions,
         agent: parse_agent(&spec.agent)?,
         model: spec.model.clone(),
         effort: spec.effort.clone(),
@@ -6315,6 +6359,7 @@ pub(crate) fn resolve_batch_task_without_local_workers(
             .unwrap_or(default_limits.max_followups),
     )?;
     let request = TaskSubmitRequest {
+        questions: task.questions.or(defaults.questions).or(settings.questions),
         agent,
         model: task.model.clone().or_else(|| defaults.model.clone()),
         effort: task.effort.clone().or_else(|| defaults.effort.clone()),
@@ -6702,6 +6747,38 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn questions_batch_resolves_node_over_defaults_over_project() {
+        use crate::task::QuestionsPolicy::{Ask, Decide};
+        for (project_policy, batch_policy, node_policy, expected) in [
+            (None, None, None, Decide),
+            (Some(Ask), None, None, Ask),
+            (Some(Ask), Some(Decide), None, Decide),
+            (Some(Decide), Some(Decide), Some(Ask), Ask),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::project_config::ProjectSettings::load(root.path(), &[])
+                .unwrap()
+                .task;
+            settings.questions = project_policy;
+            let defaults = BatchDefaults {
+                questions: batch_policy,
+                ..BatchDefaults::default()
+            };
+            let mut node: BatchTask = toml::from_str("prompt = \"work\"").unwrap();
+            node.questions = node_policy;
+            let request = resolve_batch_task_without_local_workers(
+                &defaults,
+                &node,
+                root.path(),
+                root.path(),
+                &settings,
+            )
+            .unwrap();
+            assert_eq!(request.questions.unwrap_or_default(), expected);
+        }
+    }
 
     #[test]
     fn questions_decide_prompt_instructs_every_agent_on_every_turn() {

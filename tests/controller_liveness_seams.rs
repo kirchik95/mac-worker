@@ -174,6 +174,7 @@ fn plant_task_turn(
 
 fn frozen() -> DagFrozenSpec {
     DagFrozenSpec {
+        questions: None,
         prompt: "do work".into(),
         title: None,
         agent: "codex".into(),

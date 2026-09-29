@@ -185,6 +185,7 @@ fn bind_task(isolated: &Isolated, task_id: TaskId, request_id: &str, fingerprint
 
 fn submit_body(task: u128, turn: u128, oid: &BaseOid) -> FrozenSubmitBody {
     FrozenSubmitBody {
+        questions: None,
         task_id: task_n(task),
         turn_id: turn_n(turn),
         run_id: None,
@@ -222,6 +223,7 @@ fn submit_body(task: u128, turn: u128, oid: &BaseOid) -> FrozenSubmitBody {
 
 fn dag_spec() -> DagFrozenSpec {
     DagFrozenSpec {
+        questions: None,
         prompt: "batch node".into(),
         title: None,
         agent: "codex".into(),

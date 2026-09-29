@@ -1372,6 +1372,7 @@ fn submit_request(
     wait_for_capacity: bool,
 ) -> TaskSubmitRequest {
     TaskSubmitRequest {
+        questions: None,
         agent: AgentKind::Codex,
         model: None,
         effort: None,
@@ -1526,6 +1527,56 @@ fn successful_submission_reports_the_handed_off_runner() {
         fixture.state.runner_liveness(fixture.task_id).unwrap()
     );
     assert_eq!(fixture.reported_runner, Some(RunnerState::Live));
+}
+
+#[test]
+fn questions_submit_resolves_flag_over_project_over_default() {
+    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (project_policy, flag, expected) in [
+        (None, None, Decide),
+        (Some(Ask), None, Ask),
+        (Some(Decide), Some(Ask), Ask),
+        (Some(Ask), Some(Decide), Decide),
+    ] {
+        let fixture = AcceptedThenTerminalFixture::new();
+        if let Some(policy) = project_policy {
+            fixture._repo.write(
+                ".worker.toml",
+                format!("[task]\nquestions = \"{}\"\n", policy.as_str()).as_bytes(),
+            );
+            fixture._repo.commit_all("questions policy");
+        }
+        let mut request = submit_request(
+            fixture._repo.root(),
+            None,
+            WorkerPreference::Automatic,
+            true,
+        );
+        request.questions = flag;
+        let report = TaskClient::new(
+            &fixture.runner,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .submit(request, &mut Vec::new(), &mut Vec::new())
+        .unwrap();
+        let record = fixture.state.load_task(report.task_id()).unwrap();
+        assert_eq!(record.questions_policy(), expected);
+        let turn = fixture
+            .state
+            .queue_entry_for_task_turn(report.task_id())
+            .unwrap()
+            .unwrap()
+            .job_id();
+        let prompt = fixture
+            .state
+            .read_turn_prompt(report.task_id(), turn)
+            .unwrap();
+        assert_eq!(prompt.contains("No human is available"), expected == Decide);
+    }
 }
 
 #[test]
@@ -3031,6 +3082,7 @@ fn submit_pool_task(
     )
     .submit(
         TaskSubmitRequest {
+            questions: None,
             agent: AgentKind::Codex,
             model: None,
             effort: None,
@@ -3941,6 +3993,7 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
     let report = client
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -4393,6 +4446,7 @@ fn close_succeeds_immediately_after_wait_returns() {
     let report = client
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -4504,6 +4558,7 @@ fn assert_submit_rolls_back_post_create_state(
     let error = client
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -4835,6 +4890,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -4967,6 +5023,7 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
         ],
     );
     let request = || TaskSubmitRequest {
+        questions: None,
         agent: AgentKind::Codex,
         model: None,
         effort: None,
@@ -5053,6 +5110,7 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     let executor = InlineRunnerExecutor;
     plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
+        questions: None,
         agent: AgentKind::Codex,
         model: None,
         effort: None,
@@ -5140,6 +5198,7 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
     let executor = InlineRunnerExecutor;
     plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
+        questions: None,
         agent: AgentKind::Codex,
         model: None,
         effort: None,
@@ -5239,6 +5298,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
     );
 
     let request = || TaskSubmitRequest {
+        questions: None,
         agent: AgentKind::Codex,
         model: None,
         effort: None,
@@ -5343,6 +5403,7 @@ fn reconciliation_keeps_pending_submission_intent_out_of_runner_startup_until_re
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -5451,6 +5512,7 @@ fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -5528,6 +5590,7 @@ fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,
@@ -7198,6 +7261,7 @@ fn a_pinned_submit_for_a_missing_agent_prints_the_capability_reason() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Cursor,
                 model: None,
                 effort: None,

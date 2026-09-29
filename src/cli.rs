@@ -217,6 +217,9 @@ pub enum TaskCommand {
         /// Maximum follow-up turns after the first
         #[arg(long)]
         max_followups: Option<u32>,
+        /// Questions policy: decide autonomously (default) or ask for human input; overrides [task] questions
+        #[arg(long, value_enum)]
+        questions: Option<crate::task::QuestionsPolicy>,
         /// When to close the task: done or never
         #[arg(long, value_parser = non_empty_text)]
         close_on: Option<String>,

@@ -109,6 +109,7 @@ fn oid_of(repo: &GitRepo) -> BaseOid {
 
 fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
     FrozenSubmitBody {
+        questions: None,
         task_id: TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566)),
         turn_id: TurnId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5577)),
         run_id: None,

@@ -1099,6 +1099,7 @@ fn fixture_detail() -> TaskDetailProjection {
         ended_at_millis: Some(2_000),
     };
     TaskDetailProjection {
+        questions_policy: mac_worker::task::QuestionsPolicy::Ask,
         task: TaskListRow {
             task_id,
             run_id: Some(run_id),

@@ -1433,6 +1433,7 @@ fn run_task_subcommand(
             max_turns,
             max_budget,
             max_followups,
+            questions,
             close_on,
             env_profile,
             worker,
@@ -1452,6 +1453,7 @@ fn run_task_subcommand(
             };
             let report = client.submit_titled(
                 TaskSubmitRequest {
+                    questions,
                     agent: task_agent,
                     model,
                     effort,
@@ -1822,6 +1824,7 @@ pub(crate) fn write_task_report(
             "protocol_version": PROTOCOL_VERSION,
             "task_id": report.task_id().to_string(),
             "run_id": report.run_id().map(|id| id.to_string()),
+            "questions_policy": report.questions_policy(),
             "status": report.status(),
             "runner": report.runner(),
             "events": report.events(),
@@ -1853,6 +1856,11 @@ pub(crate) fn write_task_report(
             task_state_name(report.status().state())
         )?;
         write_turn_diagnostics(stdout, report.status())?;
+        writeln!(
+            stdout,
+            "questions policy: {}",
+            report.questions_policy().as_str()
+        )?;
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }
@@ -4571,6 +4579,7 @@ fn run_enabled_controller_task(
                     max_turns,
                     max_budget,
                     max_followups,
+                    questions,
                     close_on,
                     env_profile,
                     worker,
@@ -4599,6 +4608,7 @@ fn run_enabled_controller_task(
                 paths,
                 config,
                 ControllerSubmitFields {
+                    questions,
                     project,
                     prompt,
                     title,
@@ -4949,6 +4959,7 @@ fn controller_ack_id(id: Option<&str>) -> &str {
 }
 
 struct ControllerSubmitFields {
+    questions: Option<crate::task::QuestionsPolicy>,
     project: PathBuf,
     prompt: String,
     title: Option<String>,
@@ -4976,6 +4987,7 @@ fn freeze_and_submit_via_controller(
     cli: ControllerSubmitFields,
 ) -> Result<crate::controller::ControllerAck, WorkerError> {
     let ControllerSubmitFields {
+        questions,
         project,
         prompt,
         title,
@@ -5038,6 +5050,7 @@ fn freeze_and_submit_via_controller(
         publish
     };
     let body = crate::prepared_submit::FrozenSubmitBody {
+        questions: questions.or(probed.settings.task.questions),
         task_id,
         turn_id,
         run_id: None,
@@ -6179,6 +6192,7 @@ mod enabled_submit_freeze_tests {
                 max_turns: None,
                 max_budget: None,
                 max_followups: None,
+                questions: None,
                 close_on: None,
                 env_profile: None,
                 worker: None,
@@ -6254,6 +6268,54 @@ mod enabled_submit_freeze_tests {
             report.get("task_ids").is_none(),
             "must not write a WaitReport shape"
         );
+    }
+
+    #[test]
+    fn questions_controller_freeze_carries_project_override_but_omits_default() {
+        for (policy, flag, expected) in [
+            (None, None, None),
+            (Some("ask"), None, Some("ask")),
+            (Some("decide"), None, Some("decide")),
+            (
+                Some("ask"),
+                Some(crate::task::QuestionsPolicy::Decide),
+                Some("decide"),
+            ),
+            (
+                Some("decide"),
+                Some(crate::task::QuestionsPolicy::Ask),
+                Some("ask"),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            if let Some(policy) = policy {
+                std::fs::write(
+                    fixture.repo.join(".worker.toml"),
+                    format!("[task]\nquestions = \"{policy}\"\n"),
+                )
+                .unwrap();
+            }
+            let mock = MockControllerRpc::new();
+            let mut command = submit_command(fixture.repo.clone(), false, false);
+            if let Command::Task {
+                command: TaskCommand::Submit { questions, .. },
+            } = &mut command
+            {
+                *questions = flag;
+            }
+            crate::run_enabled_controller_task(
+                command,
+                &mock,
+                &fixture.runtime,
+                &fixture.paths,
+                &fixture.config,
+                true,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let bodies = mock.submit_bodies.lock().unwrap();
+            assert_eq!(bodies[0].get("questions").and_then(Value::as_str), expected);
+        }
     }
 
     #[test]

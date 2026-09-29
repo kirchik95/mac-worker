@@ -125,6 +125,7 @@ fn owner(pid: u32) -> ProcessIdentity {
 
 fn frozen() -> DagFrozenSpec {
     DagFrozenSpec {
+        questions: None,
         prompt: "do work".into(),
         title: None,
         agent: "codex".into(),
@@ -1055,6 +1056,7 @@ fn prepared_frozen_dag_mutated(
             wip: false,
         },
         frozen: DagFrozenSpec {
+            questions: None,
             prompt: "do work".into(),
             title: None,
             agent: "codex".into(),
@@ -1597,6 +1599,7 @@ fn dag_first_submit_start_runner_failure_is_not_hidden_by_a_queued_row() {
     let error = TaskClient::new(&runner, &config, &paths, &store, &executor)
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,

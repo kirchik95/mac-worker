@@ -204,6 +204,7 @@ pub struct TaskRunProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskDetailProjection {
+    pub questions_policy: crate::task::QuestionsPolicy,
     pub task: TaskListRow,
     pub project_id: String,
     pub worktree_id: String,
@@ -465,6 +466,7 @@ pub fn project_task_detail(
         .collect::<Vec<_>>();
 
     Ok(TaskDetailProjection {
+        questions_policy: record.questions_policy(),
         task,
         project_id: record.meta().project_id().to_owned(),
         worktree_id: record.meta().worktree_id().to_owned(),

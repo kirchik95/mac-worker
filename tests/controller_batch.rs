@@ -283,6 +283,7 @@ fn frozen_node(
         depends_on,
         base,
         frozen: DagFrozenSpec {
+            questions: None,
             prompt: format!("do {batch_id}"),
             title: None,
             agent: "codex".into(),

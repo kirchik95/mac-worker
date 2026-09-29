@@ -19,6 +19,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenSubmitBody {
+    /// Explicit override only: older controllers reject unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<crate::task::QuestionsPolicy>,
     pub task_id: TaskId,
     pub turn_id: TurnId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +76,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSubmit {
+    pub questions: Option<crate::task::QuestionsPolicy>,
     pub task_id: TaskId,
     pub turn_id: TurnId,
     pub run_id: Option<RunId>,
@@ -127,6 +131,7 @@ impl FrozenSubmitBody {
             self.max_followups,
         )?;
         Ok(PreparedSubmit {
+            questions: self.questions,
             task_id: self.task_id,
             turn_id: self.turn_id,
             run_id: self.run_id,
@@ -219,6 +224,25 @@ mod tests {
         let body: FrozenSubmitBody = serde_json::from_value(sample_body_json(None)).unwrap();
         assert!(body.wait_for_capacity);
         assert!(body.prepared().unwrap().wait_for_capacity);
+    }
+
+    #[test]
+    fn questions_submit_wire_accepts_explicit_policy_and_keeps_default_absent() {
+        let old: FrozenSubmitBody = serde_json::from_value(sample_body_json(None)).unwrap();
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("questions")
+                .is_none()
+        );
+        for policy in ["ask", "decide"] {
+            let mut wire = sample_body_json(None);
+            wire["questions"] = json!(policy);
+            let body: FrozenSubmitBody =
+                serde_json::from_value(wire).expect("opt-in questions field");
+            assert_eq!(serde_json::to_value(&body).unwrap()["questions"], policy);
+            body.prepared().unwrap();
+        }
     }
 
     #[test]

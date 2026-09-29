@@ -76,11 +76,19 @@ Confirm the installed grammar with `worker task --help`. There is no `worker tas
 Outcomes are recorded on the task, independent of the process exit code:
 
 - `done`: the agent finished and the branch is published. That is **not** human acceptance. Default `--close-on done` then closes the task. Origin `delivery` may still be `pending` / `retrying`. For a human review loop (ready for review → follow-up → accepted), submit with `--close-on never`, then `worker task say` as needed and `worker task close` when you accept.
-- `needs_input`: the agent has a bounded question; `say` answers it.
+- `needs_input`: the agent has a bounded question; the questions policy below determines whether it continues automatically or waits for `say`.
 - `blocked`: the agent could not finish. Read `result` and `logs`, then `say` guidance or `close --discard`.
 - `unknown`: the agent did not return a structured result; the branch is still published. Attached turn commands and `worker task wait` (including `--run`) exit **70** (`Infrastructure`) for this outcome. A run containing any `unknown` outcome also exits 70. `done` and `needs_input` keep exit 0; waits aggregate other unsuccessful outcomes as exit 1, while attached turns preserve a reported agent exit code.
 
 If a worker job or its logs vanish after acceptance, the task outcome is `failed: LOG_DRAIN_UNAVAILABLE`. `worker task wait --task-id <id>` completes with exit 1, `worker task logs -f <id>` stops, and the dashboard shows the same outcome. A later `worker task say <id> --message "…"` starts a fresh turn. The result may still have been imported before the failure was finalized: inspect `worker task result <id>` and use `worker task fetch <id>` to check or import it.
+
+### Questions policy
+
+New tasks default to `decide`: every turn tells the agent to choose reasonable options, keep working, and summarize its decisions and assumptions. Use `worker task submit --questions ask` for interactive daytime work. The submit flag overrides `.worker.toml` `[task] questions = "ask"` or `"decide"`; without either, the policy is `decide`. Batch and DAG tasks accept `questions` on each `[[tasks]]` entry, overriding batch defaults and then the project setting. The effective policy is saved on the task, so later turns keep it even if configuration changes. Tasks created before this policy existed continue to use `ask`.
+
+If a `decide` turn still returns `needs_input`, the runner starts one detached continuation in the same agent session, including the agent's questions and options and asking it to choose its recommendations. This consumes one `max_followups` slot. A second `needs_input` from that automatic turn waits for a human. `ask`, `blocked`, failures, cancellations, and an exhausted budget never trigger automatic continuation. `--close-on done` still closes only on `done`, and DAG dependents wait for the continuation's final result. `task status` prints the saved policy and labels automatic turns `(auto-continue)`.
+
+The controller submit field is omitted when no override is configured, preserving default submits to older controllers. Explicit questions overrides require an upgraded controller; an older strict controller rejects that opt-in field. When the field is absent, the composing controller resolves its project setting and default.
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.
 

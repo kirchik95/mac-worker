@@ -135,12 +135,19 @@ pub struct ControllerTaskStatusResult {
 
 impl ControllerTaskStatusResult {
     pub fn from_report(report: &TaskReport) -> Self {
+        // The v7 DTO denies unknown top-level fields. Carry coordinator-only
+        // annotations in its existing extensible event list for older laptops.
+        let mut events = report.events().to_vec();
+        events.retain(|event| event["type"] != "questions_policy");
+        events.push(serde_json::json!({
+            "type": "questions_policy", "policy": report.questions_policy(),
+        }));
         Self {
             task_id: report.task_id(),
             run_id: report.run_id(),
             status: report.status().clone(),
             warnings: report.warnings().to_vec(),
-            events: report.events().to_vec(),
+            events,
             runner: report.runner(),
             exit_code: report.exit_code(),
             delivery: report.delivery().cloned(),
@@ -922,6 +929,24 @@ mod tests {
         assert!(laptop.get("deliveries").is_none());
         assert!(laptop.get("stage").is_none());
         assert!(laptop.get("residual").is_none());
+    }
+
+    #[test]
+    fn questions_status_policy_uses_extensible_events_for_old_laptops() {
+        let report = status_report(None, Vec::new());
+        let mut wire =
+            serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
+        wire["events"] = json!([{"type":"questions_policy", "policy":"decide"}]);
+        let restored = serde_json::from_value::<ControllerTaskStatusResult>(wire)
+            .unwrap()
+            .into_report();
+        let mut text = Vec::new();
+        crate::write_task_report(&restored, false, &mut text).unwrap();
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains("questions policy: decide")
+        );
     }
 
     #[test]

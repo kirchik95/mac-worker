@@ -60,6 +60,8 @@ pub enum DagBase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DagFrozenSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<crate::task::QuestionsPolicy>,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -982,6 +984,7 @@ mod tests {
 
     fn sample_frozen() -> DagFrozenSpec {
         DagFrozenSpec {
+            questions: None,
             prompt: "do work".into(),
             title: None,
             agent: "codex".into(),

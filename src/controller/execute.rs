@@ -917,6 +917,7 @@ mod tests {
 
     fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
         FrozenSubmitBody {
+            questions: None,
             task_id: TaskId::generate(),
             turn_id: TurnId::generate(),
             run_id: None,
@@ -986,6 +987,7 @@ mod tests {
             depends_on,
             base,
             frozen: DagFrozenSpec {
+                questions: None,
                 prompt: format!("do {batch_id}"),
                 title: None,
                 agent: "codex".into(),
@@ -1054,6 +1056,77 @@ mod tests {
                 .contains("gitdir:"),
             "request checkout must be a linked worktree, not the shared main worktree"
         );
+    }
+
+    #[test]
+    fn questions_absent_controller_field_resolves_at_composition_and_replay_keeps_policy() {
+        use crate::task::QuestionsPolicy::{Ask, Decide};
+        for (project_policy, override_policy, expected) in [
+            (None, None, Decide),
+            (Some(Ask), None, Ask),
+            (Some(Ask), Some(Decide), Decide),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = layout(&temp.path().canonicalize().unwrap());
+            let runner = SystemProcessRunner;
+            let (git_dir, oid) = committed_source(temp.path(), "source", b"hello\n");
+            let mut body = frozen_body(&oid);
+            body.questions = override_policy;
+            seed_pinned_source(&paths, &git_dir, REQUEST_A, &oid);
+            let checkout = materialize_frozen_checkout(&runner, &paths, REQUEST_A, &body).unwrap();
+            if let Some(policy) = project_policy {
+                fs::write(
+                    checkout.join(".worker.toml"),
+                    format!("[task]\nquestions = \"{}\"\n", policy.as_str()),
+                )
+                .unwrap();
+            }
+            let state = ClientStateStore::open(&paths.state).unwrap();
+            let config = Config::parse("version = 1\nworkers = []\n").unwrap();
+            let client = TaskClient::new(
+                &runner,
+                &config,
+                &paths,
+                &state,
+                &crate::turn_runner::InlineRunnerExecutor,
+            );
+            let prepared = body.prepared().unwrap();
+            client
+                .submit_prepared(
+                    &prepared,
+                    &checkout,
+                    true,
+                    true,
+                    &mut io::sink(),
+                    &mut io::sink(),
+                )
+                .unwrap();
+            assert_eq!(
+                state.load_task(body.task_id).unwrap().questions_policy(),
+                expected
+            );
+            let prompt = state.read_turn_prompt(body.task_id, body.turn_id).unwrap();
+            assert_eq!(prompt.contains("No human is available"), expected == Decide);
+            fs::write(
+                checkout.join(".worker.toml"),
+                "[task]\nquestions = \"ask\"\n",
+            )
+            .unwrap();
+            client
+                .submit_prepared(
+                    &prepared,
+                    &checkout,
+                    true,
+                    true,
+                    &mut io::sink(),
+                    &mut io::sink(),
+                )
+                .unwrap();
+            assert_eq!(
+                state.load_task(body.task_id).unwrap().questions_policy(),
+                expected
+            );
+        }
     }
 
     #[test]

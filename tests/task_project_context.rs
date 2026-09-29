@@ -501,6 +501,7 @@ fn submit_persists_private_context_before_handoff_and_retires_it_on_rollback() {
         )
         .submit(
             TaskSubmitRequest {
+                questions: None,
                 agent: AgentKind::Codex,
                 model: None,
                 effort: None,

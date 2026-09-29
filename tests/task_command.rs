@@ -8,6 +8,45 @@ use mac_worker::{
 };
 
 #[test]
+fn questions_submit_accepts_only_ask_or_decide() {
+    for policy in ["ask", "decide"] {
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "submit",
+            "--prompt",
+            "x",
+            "--questions",
+            policy,
+        ])
+        .expect("questions override");
+    }
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "submit",
+            "--prompt",
+            "x",
+            "--questions",
+            "sometimes"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn questions_batch_accepts_defaults_and_node_overrides() {
+    for defaults in ["questions = \"ask\"", "[defaults]\nquestions = \"ask\""] {
+        let parsed: BatchFile = toml::from_str(&format!(
+            "{defaults}\n[[tasks]]\nprompt = \"work\"\nquestions = \"decide\"\n"
+        ))
+        .expect("batch questions policy");
+        assert_eq!(parsed.tasks.len(), 1);
+    }
+}
+
+#[test]
 fn task_commands_parse_the_documented_forms() {
     for arguments in [
         vec![
