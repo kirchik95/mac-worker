@@ -1,0 +1,42 @@
+# cargo-nextest configuration. See docs/testing.md.
+#
+# Each test runs in its own process, so tests that change the process working
+# directory, HOME or process-wide settings cannot disturb each other, and tests
+# from different binaries run in parallel.
+
+[profile.default]
+fail-fast = false
+retries = 0
+# A test that runs past 3 minutes is reported slow after 60 s and then killed.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[test-groups]
+# Heavy repetition kept for nightly runs (`_stress` tests are #[ignore]d).
+stress = { max-threads = 1 }
+# Real fork, signal and process-group tests. Keep a few in flight so they do not
+# starve each other of time slices around their deadlines.
+fork_heavy = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'test(/_stress$/)'
+test-group = 'stress'
+slow-timeout = { period = "300s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = 'binary(supervisor) | binary(job_queries) | binary(task_turn)'
+test-group = 'fork_heavy'
+
+[[profile.default.overrides]]
+# These wait the real 10 s supervisor TERM grace and assert an upper bound on
+# wall-clock time, which a loaded machine can miss. Retry until the grace is
+# injectable in tests.
+filter = 'test(/timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent|successful_leader_cannot_leave_a_background_process_group_after_cleanup|timeout_owns_the_real_exit_to_waitable_transition_after_successful_term|timeout_rechecks_waitable_anchor_when_descendants_vanish_before_kill/)'
+retries = 2
+
+[profile.ci]
+fail-fast = false
+retries = 1
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"
