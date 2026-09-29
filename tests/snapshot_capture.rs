@@ -32,7 +32,8 @@ use support::{GitRepo, create_directory};
 
 const MANIFEST_PROPERTY_CASES: u32 = 256;
 const MAX_MANIFEST_PATH_BYTES: usize = 1_024;
-const MUTATION_CAPTURE_COUNT: usize = 1_000;
+const GATE_MUTATION_CAPTURES: usize = 50;
+const STRESS_MUTATION_CAPTURES: usize = 1_000;
 const STAGING_SIBLING: &str = ".partial-22222222-2222-4222-8222-222222222222";
 
 fn settings(include_untracked: &[&str], include_empty_dirs: &[&str]) -> SnapshotSettings {
@@ -904,10 +905,10 @@ fn assert_snapshot_capture_roots_empty(cache: &Path) {
     }
 }
 
-#[test]
-fn one_thousand_deterministic_source_mutations_publish_zero_snapshots() {
-    // Catches accepting even one hybrid capture at the binding 1,000-edit
-    // go/no-go threshold while proving every owned partial is removed.
+fn deterministic_source_mutations_publish_zero_snapshots(capture_count: usize) {
+    // Catches accepting even one hybrid capture while proving every owned
+    // partial is removed. The gate uses 50 captures; the phase-2 1,000-edit
+    // go/no-go threshold is the ignored stress test.
     let source = tempfile::tempdir().unwrap();
     create_directory(source.path().join("matrix"));
     let root = fs::canonicalize(source.path()).unwrap();
@@ -928,7 +929,7 @@ fn one_thousand_deterministic_source_mutations_publish_zero_snapshots() {
     let mut successful_publications = 0;
     let mut mutated_paths = BTreeSet::new();
 
-    for index in 0..MUTATION_CAPTURE_COUNT {
+    for index in 0..capture_count {
         let relative = format!("matrix/capture-{index:04}.bin");
         assert!(mutated_paths.insert(relative.clone()));
         let source_path = root.join(&relative);
@@ -994,12 +995,24 @@ fn one_thousand_deterministic_source_mutations_publish_zero_snapshots() {
 
     let elapsed = started.elapsed();
     eprintln!(
-        "mutation matrix: {MUTATION_CAPTURE_COUNT} captures in {:.3}s",
+        "mutation matrix: {capture_count} captures in {:.3}s",
         elapsed.as_secs_f64()
     );
     assert_eq!(successful_publications, 0);
-    assert_eq!(mutated_paths.len(), MUTATION_CAPTURE_COUNT);
+    assert_eq!(mutated_paths.len(), capture_count);
     assert_snapshot_capture_roots_empty(cache.path());
+}
+
+#[test]
+fn one_thousand_deterministic_source_mutations_publish_zero_snapshots() {
+    deterministic_source_mutations_publish_zero_snapshots(GATE_MUTATION_CAPTURES);
+}
+
+// Nightly: cargo nextest run --locked -E 'test(/_stress$/)' --run-ignored ignored
+#[test]
+#[ignore = "stress: phase-2 1,000-edit go/no-go threshold"]
+fn one_thousand_deterministic_source_mutations_publish_zero_snapshots_stress() {
+    deterministic_source_mutations_publish_zero_snapshots(STRESS_MUTATION_CAPTURES);
 }
 
 #[test]
