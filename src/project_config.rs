@@ -191,6 +191,28 @@ impl Default for RawTaskSettings {
 }
 
 impl ProjectSettings {
+    /// Resolve only the setting missing from an older frozen task. Its other
+    /// settings were already validated and must not be re-read from the checkout.
+    pub(crate) fn load_questions_for_frozen_task(
+        root: &Path,
+    ) -> Result<Option<crate::task::QuestionsPolicy>, WorkerError> {
+        #[derive(Default, Deserialize)]
+        struct QuestionsTask {
+            questions: Option<crate::task::QuestionsPolicy>,
+        }
+        #[derive(Deserialize)]
+        struct QuestionsProject {
+            #[serde(default)]
+            task: QuestionsTask,
+        }
+        let Some(contents) = read_project_config(root)? else {
+            return Ok(None);
+        };
+        let raw: QuestionsProject = toml::from_str(&contents)
+            .map_err(|_| task_config("invalid [task] questions configuration"))?;
+        Ok(raw.task.questions)
+    }
+
     /// Parse the trusted commit's setup without consulting a mutable checkout.
     pub(crate) fn setup_from_snapshot(
         contents: &str,

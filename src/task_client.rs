@@ -1719,11 +1719,11 @@ impl<'a> TaskClient<'a> {
             } else {
                 let questions_policy = match request.questions.or(settings.task.questions) {
                     Some(policy) => policy,
-                    None if matches!(frozen, Some(FrozenSubmit::Prepared(_))) => {
-                        crate::project_config::ProjectSettings::load(&context.root, &[])?
-                            .task
-                            .questions
-                            .unwrap_or_default()
+                    None if frozen.is_some() => {
+                        crate::project_config::ProjectSettings::load_questions_for_frozen_task(
+                            &context.root,
+                        )?
+                        .unwrap_or_default()
                     }
                     None => QuestionsPolicy::default(),
                 };

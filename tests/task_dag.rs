@@ -3270,6 +3270,68 @@ fn assert_prepared_resume_conflict(mutate: impl FnOnce(&mut DagNode)) {
 }
 
 #[test]
+fn questions_legacy_frozen_dag_resolves_project_policy_and_retains_it_on_replay() {
+    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    for (frozen_policy, project_policy, expected) in [
+        (None, Some(Ask), Ask),
+        (None, None, Decide),
+        (Some(Decide), Some(Ask), Decide),
+    ] {
+        let fixture =
+            prepared_frozen_dag_mutated(None, |node| node.frozen.questions = frozen_policy);
+        if let Some(policy) = project_policy {
+            fixture._repo.write(
+                ".worker.toml",
+                format!("[task]\nquestions = \"{}\"\n", policy.as_str()).as_bytes(),
+            );
+        }
+        occupy_worker_slot(&fixture);
+        advance_dags(&fixture).unwrap();
+        let record = fixture.store.load_task(fixture.task_id).unwrap();
+        assert_eq!(record.questions_policy(), expected);
+        let prompt = fixture
+            .store
+            .read_turn_prompt(fixture.task_id, fixture.turn_id)
+            .unwrap();
+        assert_eq!(prompt.contains("No human is available"), expected == Decide);
+        fixture._repo.write(
+            ".worker.toml",
+            if expected == Ask {
+                b"[task]\nquestions = \"decide\"\n"
+            } else {
+                b"[task]\nquestions = \"ask\"\n"
+            },
+        );
+        let node = fixture
+            .store
+            .load_run_dag(fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .nodes
+            .remove("root")
+            .unwrap();
+        let config = dag_test_config();
+        TaskClient::new(
+            &fixture.runner,
+            &config,
+            &fixture.paths,
+            &fixture.store,
+            &InlineRunnerExecutor,
+        )
+        .submit_prepared_dag_node(fixture.run_id, &node, true)
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .load_task(fixture.task_id)
+                .unwrap()
+                .questions_policy(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn dag_prepared_resume_conflicts_when_close_policy_changes() {
     assert_prepared_resume_conflict(|node| {
         node.frozen.close_on = ClosePolicy::Never;
