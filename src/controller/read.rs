@@ -952,6 +952,25 @@ mod tests {
     }
 
     #[test]
+    fn questions_transport_annotation_is_consumed_before_cli_json() {
+        let report = status_report(None, Vec::new());
+        let mut wire =
+            serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
+        let first = json!({"type":"task_created", "task_id":report.task_id().to_string()});
+        let last = json!({"type":"turn_terminal", "outcome":{"kind":"needs_input"}});
+        wire["events"] = json!([
+            first, {"type":"questions_policy", "policy":"ask"}, last,
+            {"type":"questions_policy", "policy":"decide", "auto_continue_turns":[]}
+        ]);
+        let restored = serde_json::from_value::<ControllerTaskStatusResult>(wire)
+            .unwrap()
+            .into_report();
+        let output = laptop_status_json(&restored);
+        assert_eq!(output["questions_policy"], "decide");
+        assert_eq!(output["events"], json!([first, last]));
+    }
+
+    #[test]
     fn result_legacy_json_without_delivery_fields_is_empty() {
         let legacy = json!({
             "task_id": TaskId::generate().to_string(),

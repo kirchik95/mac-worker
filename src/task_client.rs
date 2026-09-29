@@ -457,7 +457,11 @@ impl TaskReport {
             run_id: projection.run_id,
             status: projection.status.with_auto_continue_turns(&automatic),
             warnings: projection.warnings,
-            events: projection.events,
+            events: projection
+                .events
+                .into_iter()
+                .filter(|event| event["type"] != "questions_policy")
+                .collect(),
             runner: projection.runner,
             exit_code: projection.exit_code,
             delivery: projection.delivery,

@@ -104,6 +104,10 @@ fn questions_auto_history_is_carried_in_events_compatible_with_f59e56a() {
         .unwrap()
         .into_report();
     assert!(report.status().turns()[0].auto_continue());
+    assert!(
+        report.events().is_empty(),
+        "transport-only annotations must be consumed"
+    );
     let value = serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
     assert!(value["status"]["turns"][0].get("auto_continue").is_none());
     let old: v7::ControllerTaskStatusResult = serde_json::from_value(value).unwrap();
