@@ -406,6 +406,38 @@ fn task_say_accepts_interrupt_only_with_the_say_message_forms() {
 }
 
 #[test]
+fn task_say_interrupt_records_the_flag_with_message_and_wait() {
+    let id = "018f0f4a6b5c7d8e9f00112233445566";
+    let parsed = Cli::try_parse_from([
+        "worker",
+        "task",
+        "say",
+        id,
+        "--interrupt",
+        "--message",
+        "steer",
+        "--wait",
+    ])
+    .unwrap();
+    match parsed.command {
+        Command::Task {
+            command:
+                TaskCommand::Say {
+                    task_id,
+                    interrupt: true,
+                    wait: true,
+                    message: Some(message),
+                    message_file: None,
+                },
+        } => {
+            assert_eq!(task_id.to_string(), id);
+            assert_eq!(message, "steer");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
 fn task_list_json_envelope_flattens_the_shared_projection() {
     let projection = TaskListProjection {
         tasks: Vec::new(),

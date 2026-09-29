@@ -1563,10 +1563,16 @@ fn run_task_subcommand(
             message,
             message_file,
             wait,
+            interrupt,
         } => {
             let message = read_prompt(message, message_file)?;
+            let interrupted = if interrupt {
+                interrupt_local_turn(client, task_id)?
+            } else {
+                None
+            };
             let report = client.say(task_id, message, wait, stdout, stderr)?;
-            write_task_report(&report, json, stdout)?;
+            write_task_report_with_interrupt(&report, interrupted.as_ref(), json, stdout)?;
             Ok(if wait {
                 report.exit_code().unwrap_or(0)
             } else {
@@ -1817,8 +1823,109 @@ fn write_turn_diagnostics(
     Ok(())
 }
 
+struct InterruptedTurn {
+    turn_number: u32,
+    turn_id: crate::task::TurnId,
+    outcome: String,
+}
+
+fn turn_in_progress(status: &crate::task::TaskStatus) -> bool {
+    matches!(
+        status.state(),
+        crate::task::TaskState::Queued | crate::task::TaskState::Active
+    )
+}
+
+fn turn_is_terminal(status: &crate::task::TaskStatus) -> bool {
+    !turn_in_progress(status)
+        && status
+            .turns()
+            .last()
+            .is_none_or(|turn| turn.terminal().is_some())
+}
+
+fn interrupted_from(report: &task_client::TaskReport) -> Result<InterruptedTurn, WorkerError> {
+    let turn = report
+        .status()
+        .turns()
+        .last()
+        .ok_or_else(|| WorkerError::task("TASK_INCONSISTENT", "cancelled turn is missing"))?;
+    let outcome = turn
+        .outcome()
+        .or(report.status().last_outcome())
+        .ok_or_else(|| WorkerError::task("TASK_INCONSISTENT", "cancelled turn has no outcome"))?;
+    Ok(InterruptedTurn {
+        turn_number: turn.turn_number(),
+        turn_id: turn.turn_id(),
+        outcome: outcome.kind().to_owned(),
+    })
+}
+
+fn interrupt_local_turn(
+    client: &task_client::TaskClient<'_>,
+    task_id: crate::task::TaskId,
+) -> Result<Option<InterruptedTurn>, WorkerError> {
+    let current = client.status(task_id)?;
+    if !turn_in_progress(current.status()) {
+        return Ok(None);
+    }
+    let cancelled = client.cancel(task_id)?;
+    if !turn_is_terminal(cancelled.status()) {
+        return Err(WorkerError::task(
+            "TASK_BUSY",
+            "cancelled turn is not terminal",
+        ));
+    }
+    Ok(Some(interrupted_from(&cancelled)?))
+}
+
+fn interrupt_controller_turn(
+    runner: &dyn ProcessRunner,
+    paths: &PathLayout,
+    config: &Config,
+    task_id: crate::task::TaskId,
+) -> Result<Option<InterruptedTurn>, WorkerError> {
+    let current = controller_task_status(runner, config, task_id)?;
+    if !turn_in_progress(current.status()) {
+        return Ok(None);
+    }
+    let ack = persist_and_send_controller(
+        runner,
+        paths,
+        config,
+        "task.cancel",
+        serde_json::json!({ "task_id": task_id.to_string() }),
+    )?;
+    let mut report = task_report_from_controller_ack(&ack)?;
+    if !turn_is_terminal(report.status()) {
+        let _ = crate::controller::wait_via_controller(
+            runner,
+            &config.controller,
+            crate::controller::ControllerWaitSelector::Task(task_id),
+            None,
+        )?;
+        report = controller_task_status(runner, config, task_id)?;
+        if !turn_is_terminal(report.status()) {
+            return Err(WorkerError::task(
+                "TASK_BUSY",
+                "cancelled turn is not terminal",
+            ));
+        }
+    }
+    Ok(Some(interrupted_from(&report)?))
+}
+
 pub(crate) fn write_task_report(
     report: &task_client::TaskReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    write_task_report_with_interrupt(report, None, json, stdout)
+}
+
+fn write_task_report_with_interrupt(
+    report: &task_client::TaskReport,
+    interrupted: Option<&InterruptedTurn>,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
@@ -1833,6 +1940,12 @@ pub(crate) fn write_task_report(
             "events": report.events(),
             "exit_code": report.exit_code(),
         });
+        if let Some(interrupted) = interrupted {
+            response["interrupted"] = serde_json::json!({
+                "turn_id": interrupted.turn_id.to_string(),
+                "outcome": interrupted.outcome,
+            });
+        }
         if !report.warnings().is_empty() {
             response["warnings"] = serde_json::json!(report.warnings());
         }
@@ -1851,6 +1964,13 @@ pub(crate) fn write_task_report(
         insert_receipt_fields(&mut response, report.failure_receipt());
         write_json_line(stdout, &response)
     } else {
+        if let Some(interrupted) = interrupted {
+            writeln!(
+                stdout,
+                "interrupted turn {} ({})",
+                interrupted.turn_number, interrupted.outcome
+            )?;
+        }
         let worker = report.status().worker().unwrap_or("unassigned");
         writeln!(
             stdout,
@@ -4761,9 +4881,15 @@ fn run_enabled_controller_task(
                     message,
                     message_file,
                     wait,
+                    interrupt,
                 },
         } => {
             let message = read_prompt(message, message_file)?;
+            let interrupted = if interrupt {
+                interrupt_controller_turn(runner, paths, config, task_id)?
+            } else {
+                None
+            };
             let ack = persist_and_send_controller(
                 runner,
                 paths,
@@ -4782,11 +4908,21 @@ fn run_enabled_controller_task(
                     None,
                 )?;
                 let report = controller_task_status(runner, config, task_id)?;
-                write_task_report(&report, json, stdout)?;
+                write_task_report_with_interrupt(
+                    &report,
+                    interrupted.as_ref(),
+                    json,
+                    stdout,
+                )?;
                 Ok(waited.exit_code())
             } else {
                 let report = task_report_from_controller_ack(&ack)?;
-                write_task_report(&report, json, stdout)?;
+                write_task_report_with_interrupt(
+                    &report,
+                    interrupted.as_ref(),
+                    json,
+                    stdout,
+                )?;
                 Ok(0)
             }
         }

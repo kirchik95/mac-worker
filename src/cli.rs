@@ -316,6 +316,9 @@ pub enum TaskCommand {
         /// File whose contents are the follow-up
         #[arg(long, conflicts_with = "message", required_unless_present = "message")]
         message_file: Option<PathBuf>,
+        /// Stop the running turn, then continue the same agent session
+        #[arg(long)]
+        interrupt: bool,
         /// Wait until the new turn is quiescent before returning
         #[arg(long)]
         wait: bool,
