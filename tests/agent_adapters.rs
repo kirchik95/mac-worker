@@ -223,20 +223,30 @@ fn claude_first_turn_binds_generated_session_budget_and_turns() {
 }
 
 #[test]
-fn claude_workspace_policy_falls_back_to_unattended() {
-    let mut requested = params(PermissionPolicy::Workspace);
-    requested.kind = AgentKind::Claude;
-    requested.allow_permission_fallback = true;
-    let launch = adapter_for(AgentKind::Claude)
-        .first_turn(&requested)
-        .unwrap();
-    assert!(launch.permission_fallback());
-    assert!(
-        launch
-            .args()
-            .windows(2)
-            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
-    );
+fn workspace_policy_falls_back_to_unattended_for_every_sandboxed_agent() {
+    for kind in [AgentKind::Claude, AgentKind::Cursor, AgentKind::Opencode] {
+        let mut requested = match kind {
+            AgentKind::Claude => {
+                let mut requested = params(PermissionPolicy::Workspace);
+                requested.kind = AgentKind::Claude;
+                requested
+            }
+            AgentKind::Cursor => cursor_params(PermissionPolicy::Workspace),
+            _ => opencode_params(PermissionPolicy::Workspace),
+        };
+        requested.allow_permission_fallback = true;
+        let launch = adapter_for(kind).first_turn(&requested).unwrap();
+        assert!(launch.permission_fallback(), "{kind:?}");
+        let args = launch.args();
+        let unattended = match kind {
+            AgentKind::Claude => args
+                .windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions"),
+            AgentKind::Cursor => args.contains(&"--force".into()),
+            _ => args.contains(&"--auto".into()),
+        };
+        assert!(unattended, "{kind:?}: {args:?}");
+    }
 }
 
 #[test]
@@ -317,68 +327,141 @@ fn resume_without_a_session_reference_is_unbound() {
 }
 
 #[test]
-fn codex_stream_yields_session_ref_and_normalized_events() {
-    let adapter = adapter_for(AgentKind::Codex);
-    let events: Vec<AgentEvent> = fixture_lines("codex-success.jsonl")
-        .filter_map(|line| adapter.parse_event(&line))
-        .collect();
-    assert_eq!(
-        adapter.session_ref(&events).as_deref(),
-        Some(SESSION_PLACEHOLDER)
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::Command {
-            exit_code: Some(0),
-            ..
+fn every_adapter_stream_yields_its_session_ref_and_normalized_events() {
+    for (kind, fixture_name, session, changed_path) in [
+        (
+            AgentKind::Codex,
+            "codex-success.jsonl",
+            SESSION_PLACEHOLDER,
+            "src/agent/mod.rs",
+        ),
+        (
+            AgentKind::Cursor,
+            "cursor-success.jsonl",
+            CURSOR_SESSION,
+            "src/agent/cursor.rs",
+        ),
+        (
+            AgentKind::Opencode,
+            "opencode-success.jsonl",
+            OPENCODE_SESSION,
+            "src/agent/opencode.rs",
+        ),
+    ] {
+        let adapter = adapter_for(kind);
+        let events: Vec<AgentEvent> = fixture_lines(fixture_name)
+            .filter_map(|line| adapter.parse_event(&line))
+            .collect();
+        assert_eq!(
+            adapter.session_ref(&events).as_deref(),
+            Some(session),
+            "{kind:?}"
+        );
+        let has_activity = match kind {
+            AgentKind::Cursor => events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCall { name, .. } if name == "read")),
+            _ => events.iter().any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Command {
+                        exit_code: Some(0),
+                        ..
+                    }
+                )
+            }),
+        };
+        assert!(has_activity, "{kind:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::FileChange { paths } if paths == &[changed_path]
+            )),
+            "{kind:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::TurnEnd { .. })),
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn results_are_extracted_or_unknown_never_an_error_for_every_adapter() {
+    for (kind, success, malformed) in [
+        (
+            AgentKind::Claude,
+            "claude-success.jsonl",
+            "claude-malformed.jsonl",
+        ),
+        (
+            AgentKind::Cursor,
+            "cursor-success.jsonl",
+            "cursor-malformed.jsonl",
+        ),
+        (
+            AgentKind::Opencode,
+            "opencode-success.jsonl",
+            "opencode-malformed.jsonl",
+        ),
+    ] {
+        let adapter = adapter_for(kind);
+        assert_eq!(
+            adapter
+                .extract_result(&fixture(success), None)
+                .unwrap()
+                .status(),
+            ResultStatus::Done,
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter
+                .extract_result(&fixture(malformed), None)
+                .unwrap()
+                .status(),
+            ResultStatus::Unknown,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn results_cover_needs_input_and_blocked_for_every_adapter() {
+    for (kind, needs_input, blocked) in [
+        (AgentKind::Codex, Some("codex-needs-input.jsonl"), None),
+        (AgentKind::Claude, None, Some("claude-blocked.jsonl")),
+        (
+            AgentKind::Cursor,
+            Some("cursor-needs-input.jsonl"),
+            Some("cursor-blocked.jsonl"),
+        ),
+        (
+            AgentKind::Opencode,
+            Some("opencode-needs-input.jsonl"),
+            Some("opencode-blocked.jsonl"),
+        ),
+    ] {
+        let adapter = adapter_for(kind);
+        if let Some(needs_input) = needs_input {
+            let result = adapter.extract_result(&fixture(needs_input), None).unwrap();
+            assert_eq!(result.status(), ResultStatus::NeedsInput, "{kind:?}");
+            assert_eq!(
+                result.questions(),
+                &[Question::open("Which crate should be renamed?")],
+                "{kind:?}"
+            );
         }
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::FileChange { paths } if paths == &["src/agent/mod.rs"]
-    )));
-    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
-}
-
-#[test]
-fn structured_result_is_extracted_or_unknown_never_an_error() {
-    let adapter = adapter_for(AgentKind::Claude);
-    assert_eq!(
-        adapter
-            .extract_result(&fixture("claude-success.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Done
-    );
-    assert_eq!(
-        adapter
-            .extract_result(&fixture("claude-malformed.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Unknown
-    );
-}
-
-#[test]
-fn structured_results_cover_needs_input_and_blocked() {
-    let codex = adapter_for(AgentKind::Codex);
-    let needs_input = codex
-        .extract_result(&fixture("codex-needs-input.jsonl"), None)
-        .unwrap();
-    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(
-        needs_input.questions(),
-        &[Question::open("Which crate should be renamed?")]
-    );
-
-    let claude = adapter_for(AgentKind::Claude);
-    assert_eq!(
-        claude
-            .extract_result(&fixture("claude-blocked.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Blocked
-    );
+        if let Some(blocked) = blocked {
+            assert_eq!(
+                adapter
+                    .extract_result(&fixture(blocked), None)
+                    .unwrap()
+                    .status(),
+                ResultStatus::Blocked,
+                "{kind:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -404,19 +487,26 @@ fn structured_results_reject_schema_violations_as_unknown() {
 }
 
 #[test]
-fn extract_result_prefers_the_last_message_file() {
-    let adapter = adapter_for(AgentKind::Codex);
-    let result = adapter
-        .extract_result(
-            &fixture("codex-success.jsonl"),
-            Some(
-                r#"{"status":"needs_input","summary":"from file","questions":["q"],"files_changed":[]}"#,
-            ),
-        )
-        .unwrap();
-    assert_eq!(result.status(), ResultStatus::NeedsInput);
-    assert_eq!(result.summary(), "from file");
-    assert_eq!(result.questions(), &[Question::open("q")]);
+fn extract_result_prefers_the_last_message_file_in_plain_and_fenced_form() {
+    for (kind, fixture_name, last_message) in [
+        (
+            AgentKind::Codex,
+            "codex-success.jsonl",
+            r#"{"status":"needs_input","summary":"from file","questions":["q"],"files_changed":[]}"#,
+        ),
+        (
+            AgentKind::Cursor,
+            "cursor-success.jsonl",
+            "```mac-worker-result\n{\"status\":\"needs_input\",\"summary\":\"from file\",\"questions\":[\"q\"],\"files_changed\":[]}\n```",
+        ),
+    ] {
+        let result = adapter_for(kind)
+            .extract_result(&fixture(fixture_name), Some(last_message))
+            .unwrap();
+        assert_eq!(result.status(), ResultStatus::NeedsInput, "{kind:?}");
+        assert_eq!(result.summary(), "from file", "{kind:?}");
+        assert_eq!(result.questions(), &[Question::open("q")], "{kind:?}");
+    }
 }
 
 #[test]
@@ -479,22 +569,6 @@ fn turn_limits_reject_zero_timeout_over_day_and_huge_budget() {
 }
 
 #[test]
-fn result_schema_json_has_exactly_the_declared_keys() {
-    let value: serde_json::Value = serde_json::from_str(RESULT_SCHEMA_JSON).unwrap();
-    let mut keys: Vec<_> = value["properties"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    assert_eq!(
-        keys,
-        ["checks", "files_changed", "questions", "status", "summary"]
-    );
-}
-
-#[test]
 fn result_schema_json_is_strict_structured_output_compatible() {
     // Catches a schema that strict backends reject at the API: Codex failed
     // every live turn with `invalid_json_schema ... Missing 'questions'`
@@ -514,6 +588,10 @@ fn result_schema_json_is_strict_structured_output_compatible() {
         .map(|entry| entry.as_str().unwrap().to_owned())
         .collect();
     required.sort();
+    assert_eq!(
+        keys,
+        ["checks", "files_changed", "questions", "status", "summary"]
+    );
     assert_eq!(required, keys);
     assert_eq!(
         value["additionalProperties"],
@@ -684,32 +762,45 @@ fn structured_questions_carry_options_and_plain_strings_still_parse() {
 }
 
 #[test]
-fn classify_maps_exit_and_status_without_guessing() {
-    let adapter = adapter_for(AgentKind::Codex);
-    assert_eq!(
-        adapter.classify(Some(0), ResultStatus::Done),
-        AgentOutcome::Done
-    );
-    assert_eq!(
-        adapter.classify(Some(0), ResultStatus::NeedsInput),
-        AgentOutcome::NeedsInput
-    );
-    assert_eq!(
-        adapter.classify(Some(1), ResultStatus::Done),
-        AgentOutcome::Failed { exit_code: 1 }
-    );
-    assert_eq!(
-        adapter.classify(None, ResultStatus::Done),
-        AgentOutcome::Signalled
-    );
-    assert_eq!(
-        adapter.classify(Some(0), ResultStatus::Blocked),
-        AgentOutcome::Blocked
-    );
-    assert_eq!(
-        adapter.classify(Some(0), ResultStatus::Unknown),
-        AgentOutcome::Unknown
-    );
+fn every_adapter_classifies_exit_and_status_without_guessing() {
+    for kind in [
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Cursor,
+        AgentKind::Opencode,
+    ] {
+        let adapter = adapter_for(kind);
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Done),
+            AgentOutcome::Done,
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::NeedsInput),
+            AgentOutcome::NeedsInput,
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter.classify(Some(1), ResultStatus::Done),
+            AgentOutcome::Failed { exit_code: 1 },
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter.classify(None, ResultStatus::Done),
+            AgentOutcome::Signalled,
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Blocked),
+            AgentOutcome::Blocked,
+            "{kind:?}"
+        );
+        assert_eq!(
+            adapter.classify(Some(0), ResultStatus::Unknown),
+            AgentOutcome::Unknown,
+            "{kind:?}"
+        );
+    }
 }
 
 #[test]
@@ -793,17 +884,6 @@ fn cursor_first_turn_uses_argv_pointer_trust_and_force() {
             .iter()
             .any(|argument| argument.contains("Reply"))
     );
-}
-
-#[test]
-fn cursor_workspace_policy_falls_back_to_unattended() {
-    let mut requested = cursor_params(PermissionPolicy::Workspace);
-    requested.allow_permission_fallback = true;
-    let launch = adapter_for(AgentKind::Cursor)
-        .first_turn(&requested)
-        .unwrap();
-    assert!(launch.permission_fallback());
-    assert!(launch.args().contains(&"--force".into()));
 }
 
 #[test]
@@ -895,17 +975,6 @@ fn opencode_first_turn_uses_argv_pointer_and_auto() {
     assert_eq!(launch.prompt_delivery(), PromptDelivery::ArgvPointer);
     assert!(launch.env_names().is_empty());
     assert!(!launch.permission_fallback());
-}
-
-#[test]
-fn opencode_workspace_policy_falls_back_to_unattended() {
-    let mut requested = opencode_params(PermissionPolicy::Workspace);
-    requested.allow_permission_fallback = true;
-    let launch = adapter_for(AgentKind::Opencode)
-        .first_turn(&requested)
-        .unwrap();
-    assert!(launch.permission_fallback());
-    assert!(launch.args().contains(&"--auto".into()));
 }
 
 #[test]
@@ -1019,51 +1088,6 @@ fn cursor_and_opencode_resume_without_a_session_reference_is_unbound() {
 }
 
 #[test]
-fn cursor_stream_yields_session_ref_and_normalized_events() {
-    let adapter = adapter_for(AgentKind::Cursor);
-    let events: Vec<AgentEvent> = fixture_lines("cursor-success.jsonl")
-        .filter_map(|line| adapter.parse_event(&line))
-        .collect();
-    assert_eq!(
-        adapter.session_ref(&events).as_deref(),
-        Some(CURSOR_SESSION)
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolCall { name, .. } if name == "read"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::FileChange { paths } if paths == &["src/agent/cursor.rs"]
-    )));
-    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
-}
-
-#[test]
-fn opencode_stream_yields_session_ref_and_normalized_events() {
-    let adapter = adapter_for(AgentKind::Opencode);
-    let events: Vec<AgentEvent> = fixture_lines("opencode-success.jsonl")
-        .filter_map(|line| adapter.parse_event(&line))
-        .collect();
-    assert_eq!(
-        adapter.session_ref(&events).as_deref(),
-        Some(OPENCODE_SESSION)
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::Command {
-            exit_code: Some(0),
-            ..
-        }
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::FileChange { paths } if paths == &["src/agent/opencode.rs"]
-    )));
-    assert!(matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
-}
-
-#[test]
 fn opencode_extracts_pure_json_from_the_last_assistant_text_fixture() {
     let result = adapter_for(AgentKind::Opencode)
         .extract_result(&opencode_fixture("run-format-json.jsonl"), None)
@@ -1120,92 +1144,6 @@ fn opencode_live_fixture_captures_the_first_event_session_id() {
 }
 
 #[test]
-fn trailer_result_is_extracted_or_unknown_never_an_error() {
-    let cursor = adapter_for(AgentKind::Cursor);
-    assert_eq!(
-        cursor
-            .extract_result(&fixture("cursor-success.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Done
-    );
-    assert_eq!(
-        cursor
-            .extract_result(&fixture("cursor-malformed.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Unknown
-    );
-
-    let opencode = adapter_for(AgentKind::Opencode);
-    assert_eq!(
-        opencode
-            .extract_result(&fixture("opencode-success.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Done
-    );
-    assert_eq!(
-        opencode
-            .extract_result(&fixture("opencode-malformed.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Unknown
-    );
-}
-
-#[test]
-fn trailer_results_cover_needs_input_and_blocked() {
-    let cursor = adapter_for(AgentKind::Cursor);
-    let needs_input = cursor
-        .extract_result(&fixture("cursor-needs-input.jsonl"), None)
-        .unwrap();
-    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(
-        needs_input.questions(),
-        &[Question::open("Which crate should be renamed?")]
-    );
-    assert_eq!(
-        cursor
-            .extract_result(&fixture("cursor-blocked.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Blocked
-    );
-
-    let opencode = adapter_for(AgentKind::Opencode);
-    let needs_input = opencode
-        .extract_result(&fixture("opencode-needs-input.jsonl"), None)
-        .unwrap();
-    assert_eq!(needs_input.status(), ResultStatus::NeedsInput);
-    assert_eq!(
-        needs_input.questions(),
-        &[Question::open("Which crate should be renamed?")]
-    );
-    assert_eq!(
-        opencode
-            .extract_result(&fixture("opencode-blocked.jsonl"), None)
-            .unwrap()
-            .status(),
-        ResultStatus::Blocked
-    );
-}
-
-#[test]
-fn trailer_extract_prefers_the_last_message_file() {
-    let adapter = adapter_for(AgentKind::Cursor);
-    let result = adapter
-        .extract_result(
-            &fixture("cursor-success.jsonl"),
-            Some("```mac-worker-result\n{\"status\":\"needs_input\",\"summary\":\"from file\",\"questions\":[\"q\"],\"files_changed\":[]}\n```"),
-        )
-        .unwrap();
-    assert_eq!(result.status(), ResultStatus::NeedsInput);
-    assert_eq!(result.summary(), "from file");
-    assert_eq!(result.questions(), &[Question::open("q")]);
-}
-
-#[test]
 fn cursor_and_opencode_truncated_final_line_is_ignored() {
     let cursor = adapter_for(AgentKind::Cursor);
     let events: Vec<AgentEvent> = fixture_lines("cursor-truncated.jsonl")
@@ -1228,37 +1166,6 @@ fn cursor_and_opencode_truncated_final_line_is_ignored() {
         Some(OPENCODE_SESSION)
     );
     assert!(!matches!(events.last(), Some(AgentEvent::TurnEnd { .. })));
-}
-
-#[test]
-fn cursor_and_opencode_classify_like_codex() {
-    for kind in [AgentKind::Cursor, AgentKind::Opencode] {
-        let adapter = adapter_for(kind);
-        assert_eq!(
-            adapter.classify(Some(0), ResultStatus::Done),
-            AgentOutcome::Done
-        );
-        assert_eq!(
-            adapter.classify(Some(0), ResultStatus::NeedsInput),
-            AgentOutcome::NeedsInput
-        );
-        assert_eq!(
-            adapter.classify(Some(1), ResultStatus::Done),
-            AgentOutcome::Failed { exit_code: 1 }
-        );
-        assert_eq!(
-            adapter.classify(None, ResultStatus::Done),
-            AgentOutcome::Signalled
-        );
-        assert_eq!(
-            adapter.classify(Some(0), ResultStatus::Blocked),
-            AgentOutcome::Blocked
-        );
-        assert_eq!(
-            adapter.classify(Some(0), ResultStatus::Unknown),
-            AgentOutcome::Unknown
-        );
-    }
 }
 
 #[test]
