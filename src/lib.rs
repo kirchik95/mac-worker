@@ -78,7 +78,6 @@ pub mod client_state;
 pub mod config;
 pub mod controller;
 #[cfg(test)]
-#[path = "../tests/support/controller_logs.rs"]
 mod controller_logs_tests;
 pub mod cursor_catalog;
 pub mod dag;
