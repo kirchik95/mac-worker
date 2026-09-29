@@ -28,7 +28,6 @@ use mac_worker::{
     },
     lease::{AdmissionFacts, LeaseService},
     process::{ProcessRequest, ProcessResult},
-    protocol::{HealthStatus, PROTOCOL_VERSION},
     run_with_io_in_context,
     task::{BaseOid, TaskId, TurnId},
     transfer::TransferIdentity,
@@ -596,21 +595,14 @@ fn outdated_layout_fails_closed_until_hidden_setup_migrates_it() {
         HOST_LAYOUT_VERSION
     );
     assert!(HostStore::open(&root).is_ok());
-}
 
-#[test]
-fn layout_one_cannot_jump_to_layout_three() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("data/mac-worker/host");
-    fs::create_dir_all(root.parent().unwrap()).unwrap();
-    HostStore::open(&root).unwrap();
-    let layout = root.join("layout.json");
+    // Layouts older than the previous one are never migrated: a layout-1
+    // file stays untouched and the migration fails closed.
     let bytes = fs::read(&layout).unwrap();
-    let current = format!("\"version\":{HOST_LAYOUT_VERSION}");
-    let old = "\"version\":1".to_string();
-    let bytes = String::from_utf8(bytes).unwrap().replace(&current, &old);
+    let bytes = String::from_utf8(bytes)
+        .unwrap()
+        .replace(&current, "\"version\":1");
     fs::write(&layout, bytes).unwrap();
-
     let error = HostStore::migrate_layout(&root).unwrap_err();
     assert_eq!(error.public_code(), "HOST_LAYOUT_OUTDATED");
     assert_eq!(
@@ -714,34 +706,6 @@ fn genuine_layout2_live_heavy_residue_is_refused_and_bytes_are_kept() {
     let layout: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("layout.json")).unwrap()).unwrap();
     assert_eq!(layout["version"], PREVIOUS_HOST_LAYOUT_VERSION);
-}
-
-#[test]
-fn protocol_three_probe_fixture_is_a_protocol_mismatch_and_new_fixtures_derive_from_the_current_protocol()
- {
-    assert_eq!(PROTOCOL_VERSION, 7);
-    let mut old = serde_json::json!({
-        "protocol_version": 3,
-        "supervision_version": 2,
-        "hostname": "mini-1.local",
-        "arch": "arm64",
-        "os_version": "26.2",
-        "free_disk_bytes": 1,
-        "total_disk_bytes": 2,
-        "memory_pressure": "normal",
-        "swap_used_bytes": 0,
-        "available_memory_bytes": null,
-        "cpu_counters": null,
-        "slot_state": "idle",
-        "active_lease": null,
-        "capabilities": []
-    });
-    let decoded: mac_worker::protocol::ProbeResponse = serde_json::from_value(old.clone()).unwrap();
-    assert_eq!(decoded.protocol_version, 3);
-    old["protocol_version"] = serde_json::json!(PROTOCOL_VERSION);
-    let decoded: mac_worker::protocol::ProbeResponse = serde_json::from_value(old).unwrap();
-    assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(HealthStatus::Unavailable, HealthStatus::Unavailable);
 }
 
 #[test]

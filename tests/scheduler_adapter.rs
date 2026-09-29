@@ -77,10 +77,11 @@ fn adapter_projects_only_matching_ready_inventory_probe_into_policy_fact() {
 }
 
 #[test]
-fn protocol_v2_probe_is_ineligible_after_the_single_v3_bump() {
-    // Accepting a prior wire version would silently omit the v3 scheduler/dashboard facts.
+fn previous_protocol_probe_is_ineligible_for_scheduling() {
+    // Accepting the N-1 wire version would silently omit the scheduler and
+    // dashboard facts the current probe carries.
     let mut health = ready_health();
-    health.probe.as_mut().unwrap().protocol_version = 2;
+    health.probe.as_mut().unwrap().protocol_version = mac_worker::protocol::PROTOCOL_VERSION - 1;
 
     assert!(matches!(
         SchedulerProbeAdapter::observations(&config(), &[health]),

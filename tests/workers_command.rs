@@ -966,20 +966,92 @@ fn invalid_structured_probe_fields_are_rejected_before_other_classification() {
 }
 
 #[test]
-fn protocol_mismatch_is_reported_as_unavailable() {
-    let response = br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":[]}"#.to_vec();
-    let runner = RecordingRunner::returning_json(response);
-    let transport = SshTransport::new(runner);
+fn any_advertised_version_other_than_the_current_pair_is_a_protocol_mismatch() {
+    // Every helper that advertises a protocol or supervision version other
+    // than the current pair fails closed as PROTOCOL_MISMATCH, and the decoded
+    // probe still echoes the advertised versions so the operator sees what
+    // the helper runs. Sparse pre-v3 bodies decode with the field defaults
+    // (no supervision_version reads as 0). The N-1 helper is covered in
+    // detail by protocol_six_helper_is_an_explicit_mismatch_before_jobs.
+    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(mac_worker::protocol::SUPERVISION_VERSION, 3);
+    let with_versions = |protocol: Option<u32>, supervision: Option<u32>| {
+        let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
+        if let Some(protocol) = protocol {
+            response["protocol_version"] = serde_json::json!(protocol);
+        }
+        if let Some(supervision) = supervision {
+            response["supervision_version"] = serde_json::json!(supervision);
+        }
+        serde_json::to_vec(&response).unwrap()
+    };
+    let cases: Vec<(&str, Vec<u8>, u32, Option<u32>)> = vec![
+        (
+            "protocol 1, sparse body",
+            br#"{"protocol_version":1,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":134217728,"capabilities":[]}"#.to_vec(),
+            1,
+            None,
+        ),
+        (
+            "protocol 2 without occupancy",
+            br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":0,"capabilities":[]}"#.to_vec(),
+            2,
+            None,
+        ),
+        (
+            "protocol 2 without supervision_version",
+            br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"total_disk_bytes":1073741824,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[]}"#.to_vec(),
+            2,
+            Some(0),
+        ),
+        (
+            "protocol 3 with supervision 2",
+            with_versions(Some(3), Some(2)),
+            3,
+            Some(2),
+        ),
+        ("protocol 8", with_versions(Some(8), None), 8, None),
+        (
+            "supervision 1 on the current protocol",
+            with_versions(None, Some(1)),
+            PROTOCOL_VERSION,
+            Some(1),
+        ),
+    ];
+    for (label, body, protocol, supervision) in cases {
+        let health =
+            SshTransport::new(RecordingRunner::returning_json(body)).probe(&worker("mini-1", "mac1", &[]));
 
-    let health = transport.probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
-    assert!(health.error_message.is_some());
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.protocol_version),
-        Some(1)
-    );
+        assert_eq!(health.status, HealthStatus::Unavailable, "{label}");
+        assert_eq!(
+            health.error_code.as_deref(),
+            Some("PROTOCOL_MISMATCH"),
+            "{label}"
+        );
+        assert!(health.error_message.is_some(), "{label}");
+        if protocol != PROTOCOL_VERSION {
+            assert!(
+                health
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("protocol version")),
+                "{label}: {:?}",
+                health.error_message
+            );
+        }
+        assert_eq!(
+            health.probe.as_ref().map(|probe| probe.protocol_version),
+            Some(protocol),
+            "{label}"
+        );
+        if let Some(supervision) = supervision {
+            assert_eq!(
+                health.probe.as_ref().map(|probe| probe.supervision_version),
+                Some(supervision),
+                "{label}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1023,84 +1095,6 @@ fn protocol_six_helper_is_an_explicit_mismatch_before_jobs() {
                 })
             })),
         "v6 probe mismatch must not issue task or lease host commands"
-    );
-}
-
-#[test]
-fn protocol_two_missing_occupancy_is_an_explicit_version_mismatch() {
-    let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"memory_pressure":"normal","swap_used_bytes":0,"capabilities":[]}"#.to_vec();
-    let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(
-        "mini-1",
-        "mac1",
-        &[],
-    ));
-
-    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.protocol_version),
-        Some(2)
-    );
-}
-
-#[test]
-fn protocol_two_without_supervision_capability_is_an_explicit_version_mismatch() {
-    let response = br#"{"protocol_version":2,"hostname":"mini-1.local","arch":"arm64","os_version":"26.2","free_disk_bytes":536870912,"total_disk_bytes":1073741824,"memory_pressure":"normal","swap_used_bytes":0,"slot_state":"idle","active_lease":null,"capabilities":[]}"#.to_vec();
-    let health = SshTransport::new(RecordingRunner::returning_json(response)).probe(&worker(
-        "mini-1",
-        "mac1",
-        &[],
-    ));
-
-    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
-    assert!(
-        health
-            .error_message
-            .as_deref()
-            .is_some_and(|message| message.contains("protocol version"))
-    );
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.supervision_version),
-        Some(0)
-    );
-}
-
-#[test]
-fn phase_four_protocol_three_probe_with_supervision_remains_a_protocol_mismatch() {
-    let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
-    response["protocol_version"] = serde_json::json!(3);
-    response["supervision_version"] = serde_json::json!(2);
-    let health = SshTransport::new(RecordingRunner::returning_json(
-        serde_json::to_vec(&response).unwrap(),
-    ))
-    .probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.protocol_version),
-        Some(3)
-    );
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.supervision_version),
-        Some(2)
-    );
-}
-
-#[test]
-fn task7_only_supervision_helper_is_rejected_after_query_capability_bump() {
-    // Catches treating a Task 7 helper (supervision v1) as if it implemented
-    // the Task 8 status/log/resolve control surface.
-    let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
-    response["supervision_version"] = serde_json::json!(1);
-    let runner = RecordingRunner::returning_json(serde_json::to_vec(&response).unwrap());
-    let health = SshTransport::new(runner).probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(mac_worker::protocol::SUPERVISION_VERSION, 3);
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("PROTOCOL_MISMATCH"));
-    assert_eq!(
-        health.probe.as_ref().map(|probe| probe.supervision_version),
-        Some(1)
     );
 }
 
