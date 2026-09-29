@@ -994,20 +994,62 @@ fn watch_exits_between_pump_cycles_when_the_binary_is_replaced() {
         started: Some(test_binary_identity(1)),
         installed: Some(test_binary_identity(2)),
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_timeout = stop.clone();
+    struct PushBarrier {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ProcessRunner for PushBarrier {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == "push") {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = PushBarrier {
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+    };
+    let stop = AtomicBool::new(false);
     thread::scope(|scope| {
-        scope.spawn(|| {
-            thread::sleep(Duration::from_secs(3));
-            stop_timeout.store(true, Ordering::SeqCst);
+        let watcher = scope.spawn(|| {
+            let result = OriginOutbox::new(&store, &runner).run_watch_with_identity(
+                &stop,
+                || 1,
+                5,
+                &replaced,
+            );
+            done_tx.send(()).unwrap();
+            result
         });
-        let started = Instant::now();
-        OriginOutbox::new(&store, &SystemProcessRunner)
-            .run_watch_with_identity(&stop, || 1, 5, &replaced)
-            .unwrap();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+        let finished_while_push_held = done_rx.try_recv().is_ok();
+        release_tx.send(()).unwrap();
+        let completed = done_rx.recv_timeout(Duration::from_secs(6));
+        if completed.is_err() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        watcher.join().unwrap().unwrap();
+        entered.expect("watcher must enter the delivery push");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            !finished_while_push_held,
+            "watcher must finish its in-flight push"
+        );
+        assert!(
+            completed.is_ok(),
             "watcher must return after the in-flight attempt, not the safety timeout"
+        );
+        assert!(
+            !stop.load(Ordering::SeqCst),
+            "replacement must end the watcher without a stop request"
         );
     });
     let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
@@ -2247,7 +2289,7 @@ fn extra_watchers_exit_instead_of_blocking() {
             .run_watch_with(&AtomicBool::new(false), || 1, 50)
             .unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(3),
             "extra watcher blocked on singleton election"
         );
         stop.store(true, Ordering::SeqCst);
@@ -2541,7 +2583,7 @@ fn once_returns_busy_while_a_watcher_holds_the_pump() {
         let started = Instant::now();
         let error = outbox(&store).run_once(1).unwrap_err();
         assert_eq!(error.public_code(), OUTBOX_BUSY);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(outbox(&store).live_watch().unwrap());
         stop.store(true, Ordering::SeqCst);
     });

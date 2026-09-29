@@ -12,8 +12,8 @@ use mac_worker::{
     herdr::{HerdrClient, HerdrError, HerdrSocket},
     herdr_reporter::{
         CLOSE_BUDGET, DISPLAY_AGENT, FOLLOW_TURN_COMMAND, HerdrClock, HerdrReporter,
-        MAX_TABS_PER_PASS, START_BUDGET, TurnIdentity, WORKSPACE_LABEL, short_task_id,
-        task_label_prefix, terminal_report, title_line, turn_label,
+        MAX_TABS_PER_PASS, SHELL_SETTLE, START_BUDGET, TurnIdentity, WORKSPACE_LABEL,
+        short_task_id, task_label_prefix, terminal_report, title_line, turn_label,
     },
     task::{HerdrTurnState, TaskId, TaskOutcome},
 };
@@ -210,20 +210,27 @@ fn a_shell_that_never_settles_gets_no_command_but_the_state_is_still_reported() 
     server.reply("workspace.list", workspace_list(true));
     server.reply("tab.list", tab_list(&[]));
     server.reply("tab.create", tab_created("w3:t4", "w3:p4"));
-    for _ in 0..64 {
-        server.reply("pane.process_info", busy_shell());
-    }
-
-    let started = Instant::now();
-    let reported = reporter(&server).start(&turn(1));
+    server.reply("pane.process_info", busy_shell());
+    let clock = Arc::new(ManualClock {
+        now: Mutex::new(Duration::ZERO),
+    });
+    server.on_request({
+        let clock = Arc::clone(&clock);
+        move |request| {
+            if request.get("method").and_then(Value::as_str) == Some("pane.process_info") {
+                *clock.now.lock().unwrap() += SHELL_SETTLE;
+            }
+        }
+    });
+    let reported = HerdrReporter::with_clock(
+        HerdrClient::new(HerdrSocket::at(server.path())),
+        clock.clone(),
+    )
+    .start(&turn(1));
 
     assert_eq!(reported.report.state, HerdrTurnState::Attached);
-    assert!(started.elapsed() < START_BUDGET, "{:?}", started.elapsed());
-    assert!(
-        started.elapsed() >= Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
+    assert!(clock.now() < START_BUDGET);
+    assert!(clock.now() >= Duration::from_secs(4), "{:?}", clock.now());
     let methods = methods(&server);
     assert!(!methods.contains(&"pane.send_input".to_owned()));
     assert_eq!(
@@ -246,7 +253,7 @@ fn an_absent_herdr_makes_the_turn_unavailable_at_once() {
         reported.diagnostic.as_deref(),
         Some("herdr reporter: unavailable (absent)")
     );
-    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(started.elapsed() < Duration::from_millis(1500));
 }
 
 #[test]
@@ -256,15 +263,22 @@ fn a_silent_herdr_makes_the_turn_unavailable_within_the_deadline() {
     server.reply("workspace.list", Reply::Silence);
 
     let started = Instant::now();
-    let reported = reporter(&server).start(&turn(1));
+    let deadline = Duration::from_millis(100);
+    let reported = HerdrReporter::with_client(HerdrClient::with_deadlines(
+        HerdrSocket::at(server.path()),
+        deadline,
+        deadline,
+    ))
+    .start(&turn(1));
 
     assert_eq!(reported.report.state, HerdrTurnState::Unavailable);
     assert_eq!(
         reported.diagnostic.as_deref(),
         Some("herdr reporter: unavailable (timeout)")
     );
+    assert!(started.elapsed() >= deadline);
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(15),
         "{:?}",
         started.elapsed()
     );

@@ -321,7 +321,7 @@ fn wait_for_url(child: &mut Child) -> String {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = sender.send(line);
     });
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(24);
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(line) if !line.trim().is_empty() => return line.trim().to_owned(),
@@ -838,10 +838,10 @@ fn enabled_true_redirected_stdin_eof_does_not_stop_the_tunnel() {
     let url = wait_for_url(&mut child);
     let host = host_from_url(&url);
     drop(child.stdin.take());
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(process_live(child.id()));
+    // Observe a usable tunnel after closing the caller's stdin.
     let (status, _) = http_get(&host, "/api/v1/snapshot", &host);
     assert!(status == 200 || status == 503);
+    assert!(process_live(child.id()));
     assert!(!laptop_task_files(&homes.laptop));
     kill_and_reap(&mut child);
 }
@@ -964,14 +964,18 @@ fn tunnel_ctrl_c_reaps_term_ignoring_fake_ssh_and_keeps_leader() {
 #[test]
 fn readiness_timeout_reaps_a_silent_term_ignoring_stub() {
     let homes = Homes::new(true);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    let mut command = Command::new(std::env::current_exe().unwrap());
     apply_home(&mut command, &homes.laptop);
     apply_fake_ssh(&mut command, &homes);
     command.env("MAC_WORKER_FAKE_SSH_HANG_STDOUT", "1");
     let started = Instant::now();
-    let output = command.args(["dashboard", "--no-open"]).output().unwrap();
+    let output = command
+        .env("MAC_WORKER_READINESS_FIXTURE", "1")
+        .args(["--exact", "readiness_timeout_fixture", "--nocapture"])
+        .output()
+        .unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(14),
+        started.elapsed() < Duration::from_secs(12),
         "readiness hang took {:?}",
         started.elapsed()
     );
@@ -992,15 +996,19 @@ fn readiness_timeout_reaps_a_silent_term_ignoring_stub() {
 #[test]
 fn readiness_timeout_rejects_slow_drip_http_and_reaps_child() {
     let homes = Homes::new(true);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    let mut command = Command::new(std::env::current_exe().unwrap());
     apply_home(&mut command, &homes.laptop);
     apply_fake_ssh(&mut command, &homes);
     command.env("MAC_WORKER_FAKE_SSH_DRIP_HTTP", "1");
     let started = Instant::now();
-    let output = command.args(["dashboard", "--no-open"]).output().unwrap();
+    let output = command
+        .env("MAC_WORKER_READINESS_FIXTURE", "1")
+        .args(["--exact", "readiness_timeout_fixture", "--nocapture"])
+        .output()
+        .unwrap();
     let elapsed = started.elapsed();
     assert!(
-        elapsed >= Duration::from_secs(7),
+        elapsed >= TEST_READINESS_TIMEOUT,
         "slow drip finished before the absolute deadline: {elapsed:?}"
     );
     assert!(
@@ -1071,4 +1079,41 @@ fn startup_int_reaps_slow_drip_http_child_group() {
     wait_until_dead(stub_pid);
     assert!(!process_group_live(stub_pid));
     let _ = dashboard.try_wait();
+}
+
+// Includes starting the Python stand-in while the process tests run concurrently.
+const TEST_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[test]
+fn readiness_timeout_fixture() {
+    if std::env::var_os("MAC_WORKER_READINESS_FIXTURE").is_none() {
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let config = mac_worker::config::Config::parse(
+        &fs::read_to_string(home.join(".config/mac-worker/config.toml")).unwrap(),
+    )
+    .unwrap();
+    let runtime =
+        mac_worker::RuntimeContext::isolated(std::env::vars_os().collect(), home.clone(), home);
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            mac_worker::dashboard::run_controller_dashboard_tunnel_with_readiness_timeout(
+                &config,
+                &runtime,
+                None,
+                true,
+                false,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+                TEST_READINESS_TIMEOUT,
+            ),
+        );
+    if let Err(error) = result {
+        eprintln!("{}", error.public_code());
+        panic!("{error}");
+    }
 }

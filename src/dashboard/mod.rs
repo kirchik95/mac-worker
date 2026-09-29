@@ -8,3 +8,6 @@ pub mod source;
 pub mod task;
 pub(crate) mod tunnel;
 pub mod web;
+
+#[doc(hidden)]
+pub use tunnel::run_controller_dashboard_tunnel_with_readiness_timeout;

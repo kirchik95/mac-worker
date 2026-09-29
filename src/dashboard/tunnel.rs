@@ -32,6 +32,32 @@ pub async fn run_controller_dashboard_tunnel(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), WorkerError> {
+    run_controller_dashboard_tunnel_with_readiness_timeout(
+        config,
+        runtime,
+        port,
+        no_open,
+        no_facts_refresh,
+        stdout,
+        stderr,
+        READINESS_TIMEOUT,
+    )
+    .await
+}
+
+/// Override only the readiness deadline; child reaping retains its production grace.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_controller_dashboard_tunnel_with_readiness_timeout(
+    config: &Config,
+    runtime: &RuntimeContext,
+    port: Option<u16>,
+    no_open: bool,
+    no_facts_refresh: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    readiness_timeout: Duration,
+) -> Result<(), WorkerError> {
     // Register SIGINT/HUP/TERM now. unix::signal() installs the handler
     // immediately; tokio::signal::ctrl_c() would wait until the select arm is polled,
     // leaving a default-terminate window after spawn.
@@ -45,7 +71,7 @@ pub async fn run_controller_dashboard_tunnel(
     let child_stdout = child.stdout.take().ok_or_else(controller_unavailable)?;
 
     tokio::select! {
-        ready = wait_until_ready(port, &mut child, child_stdout) => {
+        ready = wait_until_ready(port, &mut child, child_stdout, readiness_timeout) => {
             let ready = match ready {
                 Ok(url) => url,
                 Err(error) => {
@@ -155,8 +181,9 @@ async fn wait_until_ready(
     port: u16,
     child: &mut Child,
     stdout: std::process::ChildStdout,
+    readiness_timeout: Duration,
 ) -> Result<String, WorkerError> {
-    let deadline = Instant::now() + READINESS_TIMEOUT;
+    let deadline = Instant::now() + readiness_timeout;
     let url = read_first_line_bounded(stdout, STDOUT_LIMIT, deadline).await?;
     let trimmed = url.trim();
     validate_dashboard_url(trimmed)?;

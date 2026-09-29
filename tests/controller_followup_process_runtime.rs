@@ -25,7 +25,6 @@ use serde_json::{Value, json};
 
 const SAMPLE_TASK: &str = "018f0f4a6b5c7d8e9f00112233445566";
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
-const REPLAY_QUIESCE: Duration = Duration::from_secs(2);
 
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
@@ -604,23 +603,23 @@ fn wait_replay_quiescent(
     head: &str,
     turn2: &str,
 ) {
-    let deadline = Instant::now() + REPLAY_QUIESCE;
-    loop {
-        let report = read_status(fixture, cwd, task_id);
-        assert_eq!(turns(&report).len(), 2, "replay must not mint a third turn");
-        assert_eq!(last_turn_id(&report), Some(turn2));
-        assert_eq!(head_oid(&report), Some(head));
-        assert_eq!(
-            fixture.journal_opcode_count("host task-turn"),
-            2,
-            "replay must not mint a third host task-turn; journal={}",
-            fixture.exec_journal()
-        );
-        if Instant::now() > deadline {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let (status, stdout, stderr) = fixture.wait_for_task_quiescence(Some(cwd), task_id);
+    assert!(
+        status.success(),
+        "replayed request did not retire: stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let report = read_status(fixture, cwd, task_id);
+    assert_eq!(turns(&report).len(), 2, "replay must not mint a third turn");
+    assert_eq!(last_turn_id(&report), Some(turn2));
+    assert_eq!(head_oid(&report), Some(head));
+    assert_eq!(
+        fixture.journal_opcode_count("host task-turn"),
+        2,
+        "replay must not mint a third host task-turn; journal={}",
+        fixture.exec_journal()
+    );
 }
 
 fn is_open_done(report: &Value, expected_turns: usize, expected_last_turn: Option<&str>) -> bool {

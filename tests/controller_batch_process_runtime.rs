@@ -541,16 +541,36 @@ fn runtime_dag_from_parent_requires_actual_close() {
         Some("done")
     );
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+    assert_task_quiescent(&fixture, repo.root(), &parent_task);
+    // Complete a DAG eligibility pass after the parent's runner retires.
+    let (reconciled, reconcile_stdout, reconcile_stderr) =
+        fixture.run_laptop(&["--json", "task", "reconcile"], Some(repo.root()));
+    assert!(
+        reconciled.success(),
+        "controller DAG reconciliation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&reconcile_stdout),
+        String::from_utf8_lossy(&reconcile_stderr)
+    );
+    {
+        let state =
+            mac_worker::client_state::ClientStateStore::open(&fixture.controller_state()).unwrap();
+        let dag = state.load_run_dag(body.run_id).unwrap().unwrap();
+        let child = &dag.nodes["child"];
         assert_eq!(
-            fixture.journal_task_turns().len(),
-            1,
-            "child must not execute while close_on=never parent is Open+Done; journal={}",
-            fixture.exec_journal()
+            child.state,
+            mac_worker::dag::DagNodeState::Waiting,
+            "an evaluated Open+Done parent must not admit its child"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(child.bound_oid.is_none());
+        assert!(state.load_task_optional(child.task_id).unwrap().is_none());
     }
+
+    assert_eq!(
+        fixture.journal_task_turns().len(),
+        1,
+        "child must not execute while close_on=never parent is Open+Done; journal={}",
+        fixture.exec_journal()
+    );
     let (child_status_rc, child_stdout, _) = fixture.run_laptop(
         &["--json", "task", "status", &child_task],
         Some(repo.root()),
@@ -635,6 +655,8 @@ fn runtime_batch_envelope_replay_after_controller_restart() {
 
     let mut leader = fixture.spawn_controller_run();
     fixture.wait_until_leader_ready(&mut leader);
+    // Publish the whole envelope before fast fixture turns can retire their rows.
+    assert_controller_drain(&fixture, checkout.repo.root(), true);
     let (first_status, first_stdout, first_stderr) = fixture.run_laptop(
         &["--json", "task", "batch", batch.to_str().unwrap()],
         Some(checkout.repo.root()),
@@ -675,8 +697,11 @@ fn runtime_batch_envelope_replay_after_controller_restart() {
         frozen_oids.values().cloned().collect::<HashSet<_>>(),
         HashSet::from([checkout.alpha_oid.clone(), checkout.beta_oid.clone()])
     );
+    assert!(fixture.journal_task_turns().is_empty());
+    assert_controller_drain(&fixture, checkout.repo.root(), false);
     for (task_id, turn_id) in &turns_by_task {
         wait_for_terminal_turn(&fixture, &checkout.repo, task_id, Some(turn_id));
+        assert_task_quiescent(&fixture, checkout.repo.root(), task_id);
     }
     let executed_before = fixture.journal_task_turns().len();
     assert_eq!(executed_before, 2);
@@ -1228,4 +1253,35 @@ fn frozen_oid_for_task(body: &FrozenBatchBody, task_id: &str) -> String {
         DagBase::Frozen { oid, .. } => oid.as_str().to_owned(),
         other => panic!("expected Frozen base for {task_id}, got {other:?}"),
     }
+}
+
+fn assert_task_quiescent(fixture: &ProcessFixture, cwd: &Path, task_id: &str) {
+    let (status, stdout, stderr) = fixture.wait_for_task_quiescence(Some(cwd), task_id);
+    assert!(
+        status.success(),
+        "task {task_id} did not retire its runner: stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+fn assert_controller_drain(fixture: &ProcessFixture, cwd: &Path, drained: bool) {
+    let args: &[&str] = if drained {
+        &["--json", "controller", "drain"]
+    } else {
+        &["--json", "controller", "drain", "--off"]
+    };
+    let (status, stdout, stderr) = fixture.run_laptop(args, Some(cwd));
+    assert!(
+        status.success(),
+        "controller drain={drained} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        parse_json_value(&stdout)
+            .get("drained")
+            .and_then(Value::as_bool),
+        Some(drained)
+    );
 }
