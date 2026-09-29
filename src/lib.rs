@@ -77,6 +77,9 @@ pub mod cli;
 pub mod client_state;
 pub mod config;
 pub mod controller;
+#[cfg(test)]
+#[path = "../tests/support/controller_logs.rs"]
+mod controller_logs_tests;
 pub mod cursor_catalog;
 pub mod dag;
 pub mod dashboard;
@@ -1343,6 +1346,7 @@ fn run_task_command(
                 &config,
                 json,
                 stdout,
+                stderr,
             );
         }
         let client_state = ClientStateStore::open(&paths.state)?;
@@ -4732,6 +4736,7 @@ fn load_controller_process_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_enabled_controller_task(
     command: Command,
     runner: &dyn ProcessRunner,
@@ -4740,6 +4745,7 @@ fn run_enabled_controller_task(
     config: &Config,
     json: bool,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<u8, WorkerError> {
     match command {
         Command::Task {
@@ -4879,7 +4885,7 @@ fn run_enabled_controller_task(
                     raw,
                 },
         } => {
-            controller_task_logs(runner, config, task_id, turn, follow, raw, stdout)?;
+            controller_task_logs(runner, config, task_id, turn, follow, raw, stdout, stderr)?;
             Ok(0)
         }
         Command::Task {
@@ -5447,6 +5453,7 @@ fn controller_task_list(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn controller_task_logs(
     runner: &dyn ProcessRunner,
     config: &Config,
@@ -5455,13 +5462,63 @@ fn controller_task_logs(
     follow: bool,
     raw: bool,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<(), WorkerError> {
+    controller_task_logs_with_runtime(
+        runner,
+        config,
+        task_id,
+        turn,
+        follow,
+        raw,
+        stdout,
+        stderr,
+        &crate::transfer::SystemResolutionRuntime,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_task_logs_with_runtime(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+    task_id: crate::task::TaskId,
+    turn: Option<u32>,
+    follow: bool,
+    raw: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    runtime: &dyn crate::transfer::ResolutionRuntime,
+) -> Result<(), WorkerError> {
+    use std::time::Duration;
+
+    const IDLE_MIN: Duration = Duration::from_millis(100);
+    const IDLE_MAX: Duration = Duration::from_secs(2);
+    const RETRY_MIN: Duration = Duration::from_secs(1);
+    const RETRY_MAX: Duration = Duration::from_secs(10);
+    const OUTAGE_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+    let long_poll = follow
+        && crate::controller::health_read::fetch_controller_health(runner, &config.controller)
+            .features
+            .is_some_and(|features| {
+                features
+                    .iter()
+                    .any(|feature| feature == "controller.task-logs-wait")
+            });
+    let mut idle_delay = IDLE_MIN;
+    let mut retry_delay = RETRY_MIN;
+    let mut outage: Option<(Duration, WorkerError)> = None;
     let mut offset = 0_u64;
     let mut pending = Vec::new();
     let mut pinned_turn_id: Option<crate::task::TurnId> = None;
     let mut agent: Option<crate::agent::AgentKind> = None;
     let mut reported_failure = None;
     loop {
+        if let Some((started, _)) = &outage
+            && runtime.monotonic_now().saturating_sub(*started) >= OUTAGE_LIMIT
+        {
+            return Err(outage.take().expect("continuous outage").1);
+        }
         let mut body = serde_json::json!({
             "task_id": task_id.to_string(),
             "offset": offset,
@@ -5469,6 +5526,9 @@ fn controller_task_logs(
             "raw": raw,
             "follow": follow,
         });
+        if long_poll {
+            body["wait_ms"] = serde_json::json!(20_000);
+        }
         if let Some(turn) = turn {
             body["turn"] = serde_json::json!(turn);
         }
@@ -5476,9 +5536,43 @@ fn controller_task_logs(
             body["turn_id"] = serde_json::json!(turn_id.to_string());
         }
         let request = controller_read_request("task.logs", body)?;
-        let reply = crate::controller::send_controller_read::<
+        let attempt_started = runtime.monotonic_now();
+        let exchange = ControllerLogsExchange {
+            runner,
+            deadline: outage.as_ref().map_or(OUTAGE_LIMIT, |(started, _)| {
+                OUTAGE_LIMIT.saturating_sub(attempt_started.saturating_sub(*started))
+            }),
+            retryable: std::sync::atomic::AtomicBool::new(false),
+        };
+        let reply = match crate::controller::send_controller_read::<
             crate::controller::ControllerTaskLogsResult,
-        >(runner, &config.controller, &request)?;
+        >(&exchange, &config.controller, &request)
+        {
+            Ok(reply) => reply,
+            Err(error)
+                if follow
+                    && exchange
+                        .retryable
+                        .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                if outage.is_none() {
+                    writeln!(stderr, "controller unreachable; retrying…")?;
+                    stderr.flush()?;
+                    outage = Some((attempt_started, error));
+                }
+                let elapsed = runtime
+                    .monotonic_now()
+                    .saturating_sub(outage.as_ref().unwrap().0);
+                let remaining = OUTAGE_LIMIT.saturating_sub(elapsed);
+                if remaining.is_zero() {
+                    return Err(outage.take().expect("continuous outage").1);
+                }
+                runtime.sleep(retry_delay.min(remaining));
+                retry_delay = (retry_delay * 2).min(RETRY_MAX);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let chunk = reply.into_result();
         let chunk_agent = chunk.agent()?;
         match pinned_turn_id {
@@ -5496,6 +5590,11 @@ fn controller_task_logs(
             None => agent = Some(chunk_agent),
         }
         let bytes = chunk.decode_bytes()?;
+        if outage.take().is_some() {
+            writeln!(stderr, "controller reachable again")?;
+            stderr.flush()?;
+            retry_delay = RETRY_MIN;
+        }
         let finished = chunk.exhausted() && (chunk.complete() || !follow);
         if raw {
             stdout.write_all(&bytes)?;
@@ -5522,11 +5621,51 @@ fn controller_task_logs(
         if finished {
             break;
         }
-        if follow && chunk.exhausted() && !chunk.complete() && !progressed {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if progressed {
+            idle_delay = IDLE_MIN;
+        } else if follow && !long_poll && chunk.exhausted() && !chunk.complete() {
+            runtime.sleep(idle_delay);
+            idle_delay = (idle_delay * 2).min(IDLE_MAX);
         }
     }
     Ok(())
+}
+
+/// Observe the process boundary, before transport and verification failures are
+/// mapped to the same public CONTROLLER_UNAVAILABLE code. Never retry a typed
+/// error frame or an invalid successful reply. Keep the shared RPC path intact.
+struct ControllerLogsExchange<'a> {
+    runner: &'a dyn ProcessRunner,
+    deadline: std::time::Duration,
+    retryable: std::sync::atomic::AtomicBool,
+}
+
+impl ProcessRunner for ControllerLogsExchange<'_> {
+    fn run(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        let mut request = request.clone();
+        request.policy.deadline = request.policy.deadline.min(self.deadline);
+        let result = self.runner.run(&request);
+        let retryable = match &result {
+            Ok(output) if output.stdout.is_empty() => true,
+            Ok(output) if !output.status.success() => {
+                // A failed SSH can leave a partial frame; only a complete typed
+                // controller error is definitive, regardless of its exit code.
+                !crate::controller::decode_frame(&output.stdout)
+                    .is_ok_and(|frame| serde_json::from_slice::<HostControlError>(frame).is_ok())
+            }
+            Err(WorkerError::Process(crate::error::ProcessError::DeadlineExceeded { .. })) => true,
+            Err(error @ WorkerError::Unavailable(_)) => {
+                error.public_code() == "CONTROLLER_UNAVAILABLE"
+            }
+            _ => false,
+        };
+        self.retryable
+            .store(retryable, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
 }
 
 fn controller_task_diff(
@@ -6507,6 +6646,7 @@ mod enabled_submit_freeze_tests {
             &fixture.config,
             true,
             &mut stdout,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(exit, 0, "wait exit code is preserved");
@@ -6600,6 +6740,7 @@ mod enabled_submit_freeze_tests {
                 &fixture.config,
                 true,
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             let bodies = mock.submit_bodies.lock().unwrap();
@@ -6622,6 +6763,7 @@ mod enabled_submit_freeze_tests {
             &fixture.config,
             true,
             &mut stdout,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -6658,6 +6800,7 @@ mod enabled_submit_freeze_tests {
                 &fixture.config,
                 true,
                 &mut stdout,
+                &mut Vec::new(),
             )
             .unwrap();
             assert_eq!(exit, 0, "no-wait ACK path stays exit 0");
@@ -6738,6 +6881,7 @@ mod enabled_submit_freeze_tests {
             &fixture.config,
             true,
             &mut stdout,
+            &mut Vec::new(),
         )
         .unwrap();
         let body = mock.submit_bodies.lock().unwrap()[0].clone();
