@@ -1,0 +1,268 @@
+use clap::Parser;
+use mac_worker::{
+    RuntimeContext,
+    cli::Cli,
+    config::Config,
+    controller::{
+        ControllerRequest, canonical_request_sha256, decode_frame, encode_json_frame,
+        load_operation_envelope, parse_request, persist_operation_envelope,
+    },
+    error::WorkerError,
+    job::HostControlError,
+    paths::PathLayout,
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    protocol::PROTOCOL_VERSION,
+    run_with_io_in_context,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    os::unix::process::ExitStatusExt,
+    process::ExitStatus,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+const TASK: &str = "018f0f4a6b5c7d8e9f00112233445577";
+const TURN: &str = "018f0f4a6b5c7d8e9f00112233445588";
+const RUN: &str = "018f0f4a6b5c7d8e9f00112233445599";
+
+struct Fixture {
+    _temp: tempfile::TempDir,
+    paths: PathLayout,
+    runtime: RuntimeContext,
+}
+impl Fixture {
+    fn new(enabled: bool) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let env: BTreeMap<OsString, OsString> = BTreeMap::from([
+            ("HOME".into(), home.clone().into_os_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                root.join("config").into_os_string(),
+            ),
+            ("XDG_STATE_HOME".into(), root.join("state").into_os_string()),
+            ("XDG_CACHE_HOME".into(), root.join("cache").into_os_string()),
+            ("XDG_DATA_HOME".into(), root.join("data").into_os_string()),
+        ]);
+        let paths = PathLayout::discover(None, &env, &home).unwrap();
+        fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        let contents = format!(
+            "version = 1\n[controller]\nenabled = {enabled}\nssh = 'fakecontroller'\n[[workers]]\nname = 'fixture'\nssh = 'fakeworker'\nslots = 1\n"
+        );
+        Config::parse(&contents).unwrap();
+        fs::write(&paths.config, contents).unwrap();
+        let runtime = RuntimeContext::isolated(env, home, root);
+        Self {
+            _temp: temp,
+            paths,
+            runtime,
+        }
+    }
+    fn run(&self, args: &[&str], runner: &dyn ProcessRunner) -> (u8, String, String) {
+        let cli = Cli::try_parse_from(std::iter::once("worker").chain(args.iter().copied()))
+            .expect("controller recovery grammar");
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let exit = run_with_io_in_context(cli, runner, &self.runtime, &mut stdout, &mut stderr);
+        (
+            exit,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+    fn rewrite(&self, update: impl FnOnce(&mut Value)) {
+        let path = self
+            .paths
+            .controller_cache_root()
+            .join(format!("op-{ID}.json"));
+        let mut value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        update(&mut value);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+}
+fn request() -> ControllerRequest {
+    parse_request(&serde_json::to_vec(&json!({"protocol_version": PROTOCOL_VERSION, "request_id": ID, "command": "task.batch", "body": {"run_id": RUN, "tasks": [{"task_id": TASK, "turn_id": TURN, "prompt": "PRIVATE PROMPT"}]}})).unwrap()).unwrap()
+}
+struct Reply {
+    reject: bool,
+    frames: Mutex<Vec<Vec<u8>>>,
+}
+impl Reply {
+    fn new(reject: bool) -> Self {
+        Self {
+            reject,
+            frames: Mutex::new(Vec::new()),
+        }
+    }
+}
+impl ProcessRunner for Reply {
+    fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let frame = process.stdin.as_ref().unwrap();
+        self.frames.lock().unwrap().push(frame.clone());
+        let parsed = parse_request(decode_frame(frame).unwrap()).unwrap();
+        let value = if self.reject {
+            serde_json::to_value(
+                HostControlError::with_category(
+                    "CAPACITY_BUSY",
+                    "PRIVATE REMOTE DETAIL",
+                    "capacity",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        } else {
+            json!({"protocol_version": PROTOCOL_VERSION, "status": "acked", "request_id": parsed.request_id(), "payload_sha256": parsed.payload_sha256(), "created_at_millis": 1, "result": {"run_id": RUN, "task_ids": [TASK], "turn_id": TURN}})
+        };
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(if self.reject { 75 << 8 } else { 0 }),
+            stdout: encode_json_frame(&value).unwrap(),
+            stderr: Vec::new(),
+        })
+    }
+}
+struct NoTransport;
+impl ProcessRunner for NoTransport {
+    fn run(&self, _: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        panic!("command must remain local")
+    }
+}
+
+#[test]
+fn pending_lists_safe_identifiers_without_prompts_and_honors_all() {
+    let fixture = Fixture::new(true);
+    persist_operation_envelope(&fixture.paths.controller_cache_root(), &request()).unwrap();
+    let (exit, stdout, stderr) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
+    assert_eq!(exit, 0, "{stderr}");
+    let pending: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(pending[0]["request_id"], ID);
+    assert_eq!(pending[0]["command"], "task.batch");
+    assert_eq!(pending[0]["task_ids"], json!([TASK]));
+    assert_eq!(pending[0]["turn_ids"], json!([TURN]));
+    assert_eq!(pending[0]["run_ids"], json!([RUN]));
+    assert!(pending[0]["age_millis"].is_u64());
+    assert!(!stdout.contains("PRIVATE"));
+    let (_, text, _) = fixture.run(&["controller", "pending"], &NoTransport);
+    for value in [ID, "task.batch", TASK, TURN, RUN] {
+        assert!(text.contains(value), "{text}");
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture.rewrite(|value| value["created_at_millis"] = json!(now - 8 * 24 * 60 * 60 * 1000));
+    let (_, stdout, _) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
+    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), json!([]));
+    let (_, stdout, _) = fixture.run(&["controller", "pending", "--all", "--json"], &NoTransport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()[0]["request_id"],
+        ID
+    );
+}
+
+#[test]
+fn retry_reconstructs_frozen_frame_settles_and_prints_ack_result() {
+    let fixture = Fixture::new(true);
+    persist_operation_envelope(&fixture.paths.controller_cache_root(), &request()).unwrap();
+    let runner = Reply::new(false);
+    let (exit, stdout, stderr) = fixture.run(&["controller", "retry", ID, "--json"], &runner);
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        json!({"run_id": RUN, "task_ids": [TASK], "turn_id": TURN})
+    );
+    let sent = runner.frames.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        parse_request(decode_frame(&sent[0]).unwrap()).unwrap(),
+        request()
+    );
+    drop(sent);
+    let envelope = load_operation_envelope(&fixture.paths.controller_cache_root(), ID)
+        .unwrap()
+        .unwrap();
+    assert!(serde_json::to_value(envelope).unwrap()["settled_at_millis"].is_u64());
+    let (_, pending, _) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
+    assert_eq!(serde_json::from_str::<Value>(&pending).unwrap(), json!([]));
+    let (exit, text, stderr) = fixture.run(&["controller", "retry", ID], &runner);
+    assert_eq!(exit, 0, "{stderr}");
+    assert!(text.contains(&format!("request {ID} (task.batch): acknowledged")));
+    for id in [TASK, TURN, RUN] {
+        assert!(text.contains(id), "{text}");
+    }
+}
+
+#[test]
+fn retry_rejection_preserves_exit_category_and_settles() {
+    let fixture = Fixture::new(true);
+    persist_operation_envelope(&fixture.paths.controller_cache_root(), &request()).unwrap();
+    let runner = Reply::new(true);
+    let (exit, _, stderr) = fixture.run(&["controller", "retry", ID, "--json"], &runner);
+    assert_eq!(exit, 75);
+    assert!(stderr.contains("CAPACITY_BUSY"));
+    assert!(!stderr.contains("PRIVATE"));
+    assert_eq!(runner.frames.lock().unwrap().len(), 1);
+    let envelope = load_operation_envelope(&fixture.paths.controller_cache_root(), ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(envelope).unwrap()["outcome"],
+        json!({"kind": "rejected", "code": "CAPACITY_BUSY"})
+    );
+}
+
+#[test]
+fn recovery_requires_controller_mode_and_refuses_missing_or_incompatible_envelopes() {
+    let disabled = Fixture::new(false);
+    for args in [
+        vec!["controller", "pending"],
+        vec!["controller", "retry", ID],
+    ] {
+        let (exit, _, stderr) = disabled.run(&args, &NoTransport);
+        assert_eq!(exit, 64, "{stderr}");
+        assert!(stderr.contains("CONTROLLER_MODE_REQUIRED"));
+    }
+    let enabled = Fixture::new(true);
+    let (exit, _, stderr) = enabled.run(&["controller", "retry", ID], &NoTransport);
+    assert_eq!(exit, 64, "{stderr}");
+    assert!(stderr.contains("CONTROLLER_ENVELOPE_NOT_FOUND"));
+    persist_operation_envelope(&enabled.paths.controller_cache_root(), &request()).unwrap();
+    enabled.rewrite(|value| {
+        value["payload_sha256"] = json!(
+            canonical_request_sha256(PROTOCOL_VERSION - 1, request().command(), request().body())
+                .unwrap()
+        )
+    });
+    let (exit, _, stderr) = enabled.run(&["controller", "retry", ID], &NoTransport);
+    assert_eq!(exit, 64, "{stderr}");
+    assert!(stderr.contains("CONTROLLER_ENVELOPE_INCOMPATIBLE"));
+    assert!(stderr.contains("protocol"));
+}
+
+#[test]
+fn ordinary_mutations_settle_typed_rejections_through_shared_sender() {
+    for args in [
+        vec!["task", "cancel", TASK],
+        vec!["task", "close", TASK],
+        vec!["task", "say", TASK, "--message", "follow up"],
+    ] {
+        let fixture = Fixture::new(true);
+        let runner = Reply::new(true);
+        let (exit, _, stderr) = fixture.run(&args, &runner);
+        assert_eq!(exit, 75, "{args:?}: {stderr}");
+        let frames = runner.frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        let sent = parse_request(decode_frame(&frames[0]).unwrap()).unwrap();
+        assert_eq!(sent.command(), format!("task.{}", args[1]));
+        let envelope =
+            load_operation_envelope(&fixture.paths.controller_cache_root(), sent.request_id())
+                .unwrap()
+                .unwrap();
+        assert!(serde_json::to_value(envelope).unwrap()["settled_at_millis"].is_u64());
+    }
+}

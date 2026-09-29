@@ -378,6 +378,14 @@ pub enum SkillsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ControllerCommand {
+    #[command(about = "List unsettled controller requests saved on this laptop")]
+    Pending {
+        /// Include requests older than seven days.
+        #[arg(long)]
+        all: bool,
+    },
+    #[command(about = "Retry a saved controller request with its original identity and payload")]
+    Retry { request_id: String },
     #[command(about = "Provision and start a supervised remote controller")]
     Init {
         /// Laptop SSH destination of the controller host.

@@ -916,3 +916,70 @@ fn occupied_slot_no_wait_rejection_survives_freed_capacity_and_replay() {
     assert!(tick.failed.is_empty());
     assert!(client_state.load_task(body.task_id).is_err());
 }
+
+#[test]
+fn controller_retry_ack_replays_after_rpc_restart_and_receipt_retirement() {
+    let isolated = Isolated::new();
+    write_enabled_config(&isolated.paths);
+    let repo = GitRepo::init();
+    repo.write("README", b"saved-ack\n");
+    repo.commit_all("init");
+    let (exit, stdout, stderr) = run_cli_submit(&isolated, repo.root(), "original frozen prompt");
+    assert_eq!(exit, 0, "stdout={stdout} stderr={stderr}");
+    let submitted: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let task: TaskId = submitted["task_id"].as_str().unwrap().parse().unwrap();
+    let bind = ProjectRegistry::open(&isolated.paths.controller_state_root())
+        .unwrap()
+        .lookup_task_request(task)
+        .unwrap()
+        .unwrap();
+    let envelope =
+        load_operation_envelope(&isolated.paths.controller_cache_root(), &bind.request_id)
+            .unwrap()
+            .unwrap();
+    let frame = mac_worker::controller::encode_json_frame(&serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION, "request_id": bind.request_id,
+        "command": envelope.command(), "body": envelope.body()
+    }))
+    .unwrap();
+    let state = isolated.paths.controller_state_root();
+    assert!(
+        !state
+            .join("active")
+            .join(format!("{}.json", bind.request_id))
+            .exists()
+    );
+    let before = fs::read(state.join(format!("req-{}.json", bind.request_id))).unwrap();
+    let tasks = ClientStateStore::open(&isolated.paths.state).unwrap();
+    let before_task = tasks.load_task(task).unwrap();
+    // Each child is a new controller process. The durable row and ACK must
+    // remain identical after retire_receipt, without creating another task.
+    let first = controller_rpc_child(&isolated, &frame);
+    let second = controller_rpc_child(&isolated, &frame);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(
+        before,
+        fs::read(state.join(format!("req-{}.json", bind.request_id))).unwrap()
+    );
+    assert_eq!(tasks.list_tasks().unwrap().len(), 1);
+    assert_eq!(tasks.load_task(task).unwrap(), before_task);
+    let retry = worker_child(
+        &isolated,
+        &["controller", "retry", &bind.request_id, "--json"],
+    );
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(replay["task_id"], submitted["task_id"]);
+    assert_eq!(replay["turn_id"], submitted["turn_id"]);
+    assert_eq!(tasks.list_tasks().unwrap().len(), 1);
+}

@@ -1349,6 +1349,193 @@ mod tests {
     }
 
     #[test]
+    fn mutation_retry_lost_acks_recover_through_cli_and_real_rpc_without_second_task() {
+        use crate::controller::{envelope::load_operation_envelope, parse_request};
+        use clap::Parser;
+        use std::{
+            collections::BTreeMap,
+            sync::{
+                Mutex,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+        };
+        struct NoExecution;
+        impl ProcessRunner for NoExecution {
+            fn run(&self, _: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                panic!("saved ACK replay must not re-execute Git or a worker command")
+            }
+        }
+        struct LostAckRpc<'a> {
+            paths: &'a PathLayout,
+            config: &'a Config,
+            lose_ack: AtomicBool,
+            attempts: AtomicUsize,
+            requests: Mutex<Vec<Vec<u8>>>,
+            replies: Mutex<Vec<Vec<u8>>>,
+        }
+        impl ProcessRunner for LostAckRpc<'_> {
+            fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                use std::os::unix::process::ExitStatusExt;
+                let request = process.stdin.clone().unwrap();
+                self.requests.lock().unwrap().push(request.clone());
+                let mut reply = Vec::new();
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                let runner: &dyn ProcessRunner = if attempt == 0 {
+                    &SystemProcessRunner
+                } else {
+                    &NoExecution
+                };
+                // Reopens the store/handler for every RPC, just like a new SSH child.
+                serve_rpc_with_runtime(
+                    self.paths,
+                    self.config,
+                    runner,
+                    &mut io::Cursor::new(request),
+                    &mut reply,
+                    ControllerFault::None,
+                )?;
+                self.replies.lock().unwrap().push(reply.clone());
+                Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(
+                        if self.lose_ack.load(Ordering::SeqCst) {
+                            255 << 8
+                        } else {
+                            0
+                        },
+                    ),
+                    stdout: if self.lose_ack.load(Ordering::SeqCst) {
+                        Vec::new()
+                    } else {
+                        reply
+                    },
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = layout(&root);
+        let config_text = "version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n";
+        let config = Config::parse(config_text).unwrap();
+        fs::write(&paths.config, config_text).unwrap();
+        let (git_dir, oid) = committed_source(&root, "source", b"one task\n");
+        let body = frozen_body(&oid);
+        let request = parse_request(
+            &serde_json::to_vec(&json!({
+                "protocol_version": crate::protocol::PROTOCOL_VERSION,
+                "request_id": REQUEST_A, "command": "task.submit", "body": body
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        seed_pinned_source(&paths, &git_dir, REQUEST_A, &oid);
+        let transfer = ControllerTransfer::open(&paths.controller_state_root()).unwrap();
+        let receive = transfer
+            .prepare_source_receive(
+                &paths.cache,
+                &SystemProcessRunner,
+                REQUEST_A,
+                &RequestFingerprint::new(request.payload_sha256().to_owned()).unwrap(),
+                PROJECT_ID,
+                WORKTREE_ID,
+                &oid,
+            )
+            .unwrap();
+        transfer
+            .finish_source_receive(&paths.cache, &SystemProcessRunner, &receive)
+            .unwrap();
+        let rpc = LostAckRpc {
+            paths: &paths,
+            config: &config,
+            lose_ack: AtomicBool::new(true),
+            attempts: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(Vec::new()),
+        };
+        let mut stderr = Vec::new();
+        let mut delays = Vec::new();
+        let error = send_controller_mutation_with_wait(
+            &rpc,
+            &config.controller,
+            &paths.controller_cache_root(),
+            &request,
+            &mut stderr,
+            &mut |delay| delays.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE");
+        assert_eq!(rpc.attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(delays.len(), 3);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains(&format!("worker controller retry {REQUEST_A}"))
+        );
+        let pending = load_operation_envelope(&paths.controller_cache_root(), REQUEST_A)
+            .unwrap()
+            .unwrap();
+        assert!(pending.settled_at_millis().is_none());
+        assert!(
+            !paths
+                .controller_state_root()
+                .join("active")
+                .join(format!("{REQUEST_A}.json"))
+                .exists()
+        );
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        assert_eq!(state.list_tasks().unwrap().len(), 1);
+        let saved_task = state.load_task(body.task_id).unwrap();
+        let env = BTreeMap::from([
+            (
+                OsString::from("XDG_STATE_HOME"),
+                root.join("state").into_os_string(),
+            ),
+            (
+                OsString::from("XDG_CACHE_HOME"),
+                root.join("cache").into_os_string(),
+            ),
+            (
+                OsString::from("XDG_DATA_HOME"),
+                root.join("data").into_os_string(),
+            ),
+        ]);
+        let runtime = crate::RuntimeContext::isolated(env, root.join("home"), root.clone());
+        let invoke = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(
+                std::iter::once("worker").chain(args.iter().copied()),
+            )
+            .unwrap();
+            let cli = crate::cli::Cli {
+                config: Some(paths.config.clone()),
+                ..cli
+            };
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let exit = crate::run_with_io_in_context(cli, &rpc, &runtime, &mut stdout, &mut stderr);
+            assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+            serde_json::from_slice::<Value>(&stdout).unwrap()
+        };
+        let listed = invoke(&["controller", "pending", "--json"]);
+        assert_eq!(listed[0]["request_id"], REQUEST_A);
+        rpc.lose_ack.store(false, Ordering::SeqCst);
+        let recovered = invoke(&["controller", "retry", REQUEST_A, "--json"]);
+        assert_eq!(recovered["task_id"], body.task_id.to_string());
+        assert_eq!(recovered["turn_id"], body.turn_id.to_string());
+        assert_eq!(invoke(&["controller", "pending", "--json"]), json!([]));
+        assert_eq!(state.list_tasks().unwrap().len(), 1);
+        assert_eq!(state.load_task(body.task_id).unwrap(), saved_task);
+        assert_eq!(rpc.attempts.load(Ordering::SeqCst), 5);
+        for frames in [&rpc.requests, &rpc.replies] {
+            assert!(
+                frames
+                    .lock()
+                    .unwrap()
+                    .windows(2)
+                    .all(|pair| pair[0] == pair[1])
+            );
+        }
+    }
+
+    #[test]
     fn frozen_submit_digest_excludes_token_and_bundle() {
         let oid = "0123456789abcdef0123456789abcdef01234567"
             .parse::<BaseOid>()

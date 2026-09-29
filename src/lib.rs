@@ -1119,6 +1119,51 @@ fn run_controller_command(
     let result = (|| -> Result<(), WorkerError> {
         let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
+        if matches!(
+            &command,
+            ControllerCommand::Pending { .. } | ControllerCommand::Retry { .. }
+        ) {
+            let config = Config::load(&paths.config)?;
+            if !config.controller.enabled {
+                return Err(WorkerError::task(
+                    "CONTROLLER_MODE_REQUIRED",
+                    "controller pending and retry require enabled controller mode",
+                ));
+            }
+            match command {
+                ControllerCommand::Pending { all } => {
+                    let envelopes = crate::controller::list_pending_envelopes(
+                        &paths.controller_cache_root(),
+                        all,
+                    )?;
+                    write_controller_pending(&envelopes, json, stdout)?;
+                }
+                ControllerCommand::Retry { request_id } => {
+                    let envelope = crate::controller::load_operation_envelope(
+                        &paths.controller_cache_root(),
+                        &request_id,
+                    )?
+                    .ok_or_else(|| {
+                        WorkerError::task(
+                            "CONTROLLER_ENVELOPE_NOT_FOUND",
+                            "no saved controller request with this id on this laptop",
+                        )
+                    })?;
+                    let request = envelope.to_request()?;
+                    let ack = crate::controller::send_controller_mutation(
+                        runner,
+                        &config.controller,
+                        &paths.controller_cache_root(),
+                        &request,
+                        stderr,
+                    )?;
+                    write_controller_retry_ack(&request, &ack, json, stdout)?;
+                }
+                _ => unreachable!("recovery command checked above"),
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
         if let ControllerCommand::Init {
             destination,
             worker_ssh,
@@ -2117,6 +2162,7 @@ fn interrupt_controller_turn(
     paths: &PathLayout,
     config: &Config,
     task_id: crate::task::TaskId,
+    stderr: &mut dyn Write,
 ) -> Result<Option<InterruptedTurn>, WorkerError> {
     let current = controller_task_status(runner, config, task_id)?;
     let Some((observed, turn_number)) = interrupt_target(current.status())? else {
@@ -2128,6 +2174,7 @@ fn interrupt_controller_turn(
         config,
         "task.cancel",
         serde_json::json!({ "task_id": task_id.to_string() }),
+        stderr,
     )?;
     task_report_from_controller_ack(&ack)?;
     // Always wait: a terminal cancel ack does not mean the controller's runner
@@ -4994,6 +5041,7 @@ fn run_enabled_controller_task(
                     publish_branch,
                     wait_for_capacity: !no_wait,
                 },
+                stderr,
             )?;
             // `--wait` waits via controller then writes TaskReport.
             // `--no-wait` ACK unchanged.
@@ -5130,7 +5178,7 @@ fn run_enabled_controller_task(
         } => {
             let message = read_prompt(message, message_file)?;
             let interrupted = if interrupt {
-                interrupt_controller_turn(runner, paths, config, task_id)?
+                interrupt_controller_turn(runner, paths, config, task_id, stderr)?
             } else {
                 None
             };
@@ -5143,6 +5191,7 @@ fn run_enabled_controller_task(
                     "task_id": task_id.to_string(),
                     "message": message,
                 }),
+                stderr,
             )?;
             if wait {
                 let waited = crate::controller::wait_via_controller(
@@ -5179,6 +5228,7 @@ fn run_enabled_controller_task(
                 config,
                 "task.cancel",
                 serde_json::json!({ "task_id": task_id.to_string() }),
+                stderr,
             )?;
             let report = task_report_from_controller_ack(&ack)?;
             write_task_report(&report, json, stdout)?;
@@ -5196,6 +5246,7 @@ fn run_enabled_controller_task(
                     "task_id": task_id.to_string(),
                     "discard": discard,
                 }),
+                stderr,
             )?;
             let report = task_report_from_controller_ack(&ack)?;
             write_task_report(&report, json, stdout)?;
@@ -5301,10 +5352,12 @@ fn run_enabled_controller_task(
                     source.git_path(),
                 )?;
             }
-            let ack = crate::controller::send_controller_request(
+            let ack = crate::controller::send_controller_mutation(
                 runner,
                 &config.controller,
+                &paths.controller_cache_root(),
                 &request,
+                stderr,
             )?;
             let report = run_report_from_controller_ack(&ack)?;
             write_run_report(&report, json, stdout)?;
@@ -5335,6 +5388,131 @@ fn run_enabled_controller_task(
             "CONTROLLER_UNAVAILABLE: controller is enabled; this command is not routed to the controller yet".into(),
         )),
     }
+}
+
+#[derive(Default, serde::Serialize)]
+struct ControllerIdentifiers {
+    task_ids: std::collections::BTreeSet<String>,
+    turn_ids: std::collections::BTreeSet<String>,
+    run_ids: std::collections::BTreeSet<String>,
+}
+
+impl ControllerIdentifiers {
+    fn collect(&mut self, value: &serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    let ids = match key.as_str() {
+                        "task_id" | "task_ids" => Some(&mut self.task_ids),
+                        "turn_id" | "turn_ids" => Some(&mut self.turn_ids),
+                        "run_id" | "run_ids" => Some(&mut self.run_ids),
+                        _ => None,
+                    };
+                    if let Some(ids) = ids {
+                        let values: &[Value] = match value {
+                            Value::Array(values) => values,
+                            value => std::slice::from_ref(value),
+                        };
+                        for value in values {
+                            if let Some(id) = value.as_str()
+                                && id.parse::<crate::task::TaskId>().is_ok()
+                            {
+                                ids.insert(id.to_owned());
+                            }
+                        }
+                    }
+                    self.collect(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.collect(value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn write_controller_pending(
+    envelopes: &[crate::controller::OperationEnvelope],
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    #[derive(serde::Serialize)]
+    struct Pending<'a> {
+        request_id: &'a str,
+        command: &'a str,
+        age_millis: u64,
+        #[serde(flatten)]
+        ids: ControllerIdentifiers,
+    }
+    let now = current_time_millis()?;
+    let rows = envelopes
+        .iter()
+        .map(|envelope| {
+            let mut ids = ControllerIdentifiers::default();
+            ids.collect(envelope.body());
+            Pending {
+                request_id: envelope.request_id(),
+                command: envelope.command(),
+                age_millis: now.saturating_sub(envelope.created_at_millis()),
+                ids,
+            }
+        })
+        .collect::<Vec<_>>();
+    if json {
+        write_json_line(stdout, &rows)?;
+    } else {
+        writeln!(
+            stdout,
+            "REQUEST ID\tCOMMAND\tAGE\tTASK IDS\tTURN IDS\tRUN IDS"
+        )?;
+        for row in rows {
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                row.request_id,
+                row.command,
+                humantime::format_duration(std::time::Duration::from_secs(row.age_millis / 1000)),
+                row.ids.task_ids.into_iter().collect::<Vec<_>>().join(","),
+                row.ids.turn_ids.into_iter().collect::<Vec<_>>().join(","),
+                row.ids.run_ids.into_iter().collect::<Vec<_>>().join(",")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_controller_retry_ack(
+    request: &crate::controller::ControllerRequest,
+    ack: &crate::controller::ControllerAck,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(stdout, ack.result().unwrap_or(&serde_json::Value::Null))?;
+    } else {
+        writeln!(
+            stdout,
+            "request {} ({}): acknowledged",
+            request.request_id(),
+            request.command()
+        )?;
+        let mut ids = ControllerIdentifiers::default();
+        ids.collect(&serde_json::to_value(ack).map_err(std::io::Error::other)?);
+        for (kind, values) in [
+            ("task", ids.task_ids),
+            ("turn", ids.turn_ids),
+            ("run", ids.run_ids),
+        ] {
+            for id in values {
+                writeln!(stdout, "{kind}: {id}")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn controller_ack_id(id: Option<&str>) -> &str {
@@ -5368,6 +5546,7 @@ fn freeze_and_submit_via_controller(
     paths: &PathLayout,
     config: &Config,
     cli: ControllerSubmitFields,
+    stderr: &mut dyn Write,
 ) -> Result<crate::controller::ControllerAck, WorkerError> {
     let ControllerSubmitFields {
         questions,
@@ -5487,7 +5666,13 @@ fn freeze_and_submit_via_controller(
         &body.worktree_id,
         captured.oid(),
     )?;
-    crate::controller::send_controller_request(runner, &config.controller, &request)
+    crate::controller::send_controller_mutation(
+        runner,
+        &config.controller,
+        &paths.controller_cache_root(),
+        &request,
+        stderr,
+    )
 }
 
 fn persist_and_send_controller(
@@ -5496,10 +5681,17 @@ fn persist_and_send_controller(
     config: &Config,
     command: &str,
     body: serde_json::Value,
+    stderr: &mut dyn Write,
 ) -> Result<crate::controller::ControllerAck, WorkerError> {
     let request = controller_read_request(command, body)?;
     crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
-    crate::controller::send_controller_request(runner, &config.controller, &request)
+    crate::controller::send_controller_mutation(
+        runner,
+        &config.controller,
+        &paths.controller_cache_root(),
+        &request,
+        stderr,
+    )
 }
 
 fn task_report_from_controller_ack(
