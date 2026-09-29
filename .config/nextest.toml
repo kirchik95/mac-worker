@@ -26,13 +26,6 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 filter = 'binary(supervisor) | binary(job_queries) | binary(task_turn)'
 test-group = 'fork_heavy'
 
-[[profile.default.overrides]]
-# These wait the real 10 s supervisor TERM grace and assert an upper bound on
-# wall-clock time, which a loaded machine can miss. Retry until the grace is
-# injectable in tests.
-filter = 'test(/timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent|successful_leader_cannot_leave_a_background_process_group_after_cleanup|timeout_owns_the_real_exit_to_waitable_transition_after_successful_term|timeout_rechecks_waitable_anchor_when_descendants_vanish_before_kill/)'
-retries = 2
-
 [profile.ci]
 fail-fast = false
 retries = 1
