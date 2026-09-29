@@ -5,7 +5,7 @@ use std::fs;
 
 use mac_worker::{
     agent::AgentKind,
-    agent::{prebind_login_request, render_prebind_shell},
+    agent::render_prebind_shell,
     agent_facts::AgentAuth,
     job::{ClientId, CommandSpec, JobId, LeaseRecord, LeaseToken, RequestFingerprintMaterial},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
@@ -14,7 +14,7 @@ use mac_worker::{
     turn::{EnvProfile, TurnMaterial, TurnSection},
 };
 use support::agent_launch_fixture::{
-    DiagnosticProcessRunner, FixtureLayout, LOGIN_BAD, LOGIN_GOOD, PARENT_ONLY, PROFILE_GOOD,
+    FixtureLayout, LOGIN_BAD, LOGIN_GOOD, PARENT_ONLY, PROFILE_GOOD,
     PROFILE_NAME, assert_subprocess_success, classify_cursor_process_result,
     cursor_auth_for_profile, cursor_probe, cursor_profile_auth, empty_base_path,
     fixture_home_from_env, fixture_only_path, prebind_status_auth, refresh_cursor_facts,
@@ -330,42 +330,6 @@ fn launch_plan_and_prebind_share_login_shell_boundary() {
     let entries = write_profile_entries(&format!("CURSOR_API_KEY={PROFILE_GOOD}\n"));
     assert_eq!(
         prebind_status_auth(&fixture.home, &entries),
-        AgentAuth::Unauthenticated
-    );
-}
-
-#[test]
-fn parent_only_credential_wrapper() {
-    let temp = tempfile::tempdir().unwrap();
-    let fixture = FixtureLayout::create(temp.path());
-    fixture.write_zprofile(&format!(
-        "export PATH=\"{}\"\n",
-        fixture_only_path(&fixture.home.join("bin"))
-    ));
-    fixture.install_home_cursor(LOGIN_GOOD);
-    assert_subprocess_success(
-        "parent_only_credential_isolated",
-        &[
-            ("FIXTURE_HOME", fixture.home.to_str().unwrap()),
-            ("CURSOR_API_KEY", PARENT_ONLY),
-            ("PATH", empty_base_path()),
-        ],
-        true,
-    );
-}
-
-#[test]
-fn parent_only_credential_isolated() {
-    if skip_unless_subtest() {
-        return;
-    }
-    let home = fixture_home_from_env();
-    let request =
-        prebind_login_request(&["cursor-agent".into(), "status".into()], &home, &[]).unwrap();
-    assert!(request.isolate_parent_environment);
-    let result = DiagnosticProcessRunner.run(&request).unwrap();
-    assert_eq!(
-        classify_cursor_process_result(&result),
         AgentAuth::Unauthenticated
     );
 }

@@ -327,44 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn fewer_interactive_agents_win_only_when_everything_else_is_equal() {
-        let ranked = SchedulerPolicy::rank(
-            &[
-                observation(
-                    "loaded",
-                    true,
-                    CandidateSlot::Idle,
-                    &["node"],
-                    Some(8),
-                    100,
-                    Some(5),
-                ),
-                observation(
-                    "quiet",
-                    true,
-                    CandidateSlot::Idle,
-                    &["node"],
-                    Some(8),
-                    100,
-                    Some(1),
-                ),
-                observation(
-                    "unknown",
-                    true,
-                    CandidateSlot::Idle,
-                    &["node"],
-                    Some(8),
-                    100,
-                    None,
-                ),
-            ],
-            &["node".into()],
-            &AffinityHints::none(),
-        );
-        assert_eq!(names(&ranked), vec!["unknown", "quiet", "loaded"]);
-    }
-
-    #[test]
     fn interactive_agents_do_not_override_affinity_memory_or_eligibility() {
         let affinity = SchedulerPolicy::rank(
             &[

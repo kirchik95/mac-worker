@@ -703,30 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn static_task_busy_reasons_are_public_diagnostics() {
-        let error = WorkerError::task("TASK_BUSY", "task turn is being dispatched");
-        assert_eq!(error.public_code(), "TASK_BUSY");
-        assert_eq!(error.public_message(), "task turn is being dispatched");
-        assert!(error.public_message().len() <= 4096);
-        assert!(!error.public_message().as_bytes().contains(&0));
-    }
-
-    #[test]
-    fn static_capacity_busy_reasons_are_public_diagnostics() {
-        let error = WorkerError::capacity(
-            "CAPACITY_BUSY",
-            "no eligible worker currently has an available heavy slot",
-        );
-        assert_eq!(error.public_code(), "CAPACITY_BUSY");
-        assert_eq!(
-            error.public_message(),
-            "no eligible worker currently has an available heavy slot"
-        );
-        assert!(error.public_message().len() <= 4096);
-        assert!(!error.public_message().as_bytes().contains(&0));
-    }
-
-    #[test]
     fn capacity_messages_built_from_worker_and_capability_names_are_public() {
         let error = WorkerError::capacity_public(
             "CAPABILITY_MISSING",

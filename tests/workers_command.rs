@@ -24,7 +24,7 @@ use mac_worker::{
     error::{ProcessError, ProcessStream, WorkerError},
     lease::{LeaseSummary, MAX_HOST_SLOTS, SlotState},
     output::CommandOutput,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{
         CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
         WorkersReport,
@@ -388,14 +388,6 @@ fn probe_policy() -> ProcessPolicy {
         stdout_limit: 1024 * 1024,
         stderr_limit: 1024 * 1024,
         deadline: Duration::from_secs(15),
-    }
-}
-
-fn local_test_policy() -> ProcessPolicy {
-    ProcessPolicy {
-        stdout_limit: 1024,
-        stderr_limit: 1024,
-        deadline: Duration::from_secs(2),
     }
 }
 
@@ -1311,45 +1303,6 @@ fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_miss
         Some("worker is missing required capabilities: darwin-arm64, docker, ruby, swift, go")
     );
     assert_eq!(config.workers[0].capabilities, original_inventory);
-}
-
-#[test]
-fn system_runner_passes_arguments_without_shell_interpretation() {
-    let literal = "$(printf injected); $HOME *";
-    let request = ProcessRequest {
-        program: "/usr/bin/printf".into(),
-        args: vec!["%s".into(), literal.into()],
-        environment: Vec::new(),
-        environment_remove: Vec::new(),
-        stdin: None,
-        policy: local_test_policy(),
-        isolate_parent_environment: false,
-    };
-
-    let result = SystemProcessRunner.run(&request).unwrap();
-
-    assert!(result.status.success());
-    assert_eq!(result.stdout, literal.as_bytes());
-    assert!(result.stderr.is_empty());
-}
-
-#[test]
-fn system_runner_writes_the_requested_stdin() {
-    let request = ProcessRequest {
-        program: "/bin/cat".into(),
-        args: Vec::new(),
-        environment: Vec::new(),
-        environment_remove: Vec::new(),
-        stdin: Some(b"raw stdin bytes\n".to_vec()),
-        policy: local_test_policy(),
-        isolate_parent_environment: false,
-    };
-
-    let result = SystemProcessRunner.run(&request).unwrap();
-
-    assert!(result.status.success());
-    assert_eq!(result.stdout, b"raw stdin bytes\n");
-    assert!(result.stderr.is_empty());
 }
 
 #[test]

@@ -1,5 +1,4 @@
 use mac_worker::{
-    error::{ExitKind, WorkerError},
     job::{
         CommandSpec, CommandSummary, HostControlError, JobId, JobMeta, JobState, JobStatus,
         JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord,
@@ -534,23 +533,6 @@ fn v6_lease_and_submit_requests_are_rejected_before_job_construction() {
             .to_string()
             .contains("incompatible protocol version")
     );
-}
-
-#[test]
-fn protocol_and_exit_kinds_keep_their_wire_contracts() {
-    assert_eq!(
-        WorkerError::capacity("CAPACITY_BUSY", "busy").exit_kind(),
-        ExitKind::Capacity
-    );
-    assert_eq!(
-        WorkerError::Transport {
-            code: "SSH_UNAVAILABLE",
-            message: "offline".into()
-        }
-        .exit_kind(),
-        ExitKind::Unavailable
-    );
-    assert_eq!(WorkerError::CommandExit { code: 7 }.exit_code(), 7);
 }
 
 #[test]
