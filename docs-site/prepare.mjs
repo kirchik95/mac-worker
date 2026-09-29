@@ -83,6 +83,8 @@ async function transform(text, source) {
       continue
     }
     if (!fence) {
+      // GitHub plays README videos from user-attachments only in its own renderer; here they would be dead links.
+      if (/^https:\/\/github\.com\/user-attachments\/assets\/[\w-]+\s*$/.test(line)) continue
       const codeSpans = []
       const masked = line.replace(/(`+)(.*?)\1(?!`)/g, span => {
         codeSpans.push(span)

@@ -8,6 +8,8 @@
 
 Run Codex, Cursor, OpenCode or Claude Code on your spare Macs over SSH. Each task gets its own Git worktree; you review and merge the result on your laptop.
 
+https://github.com/user-attachments/assets/42c5a94c-e1ba-4ecb-a30b-c94fe3417efa
+
 ## What you need
 
 - Two Apple Silicon Macs with Git: your laptop and at least one worker.

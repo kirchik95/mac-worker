@@ -8,6 +8,8 @@
 
 Запускайте Codex, Cursor, OpenCode или Claude Code на свободных Mac через SSH. Каждая задача получает отдельный Git worktree; результат вы проверяете и вливаете на ноутбуке.
 
+https://github.com/user-attachments/assets/b9ae9408-8f45-4da9-b997-b1d851f79283
+
 ## Что нужно
 
 - Два Mac с Apple Silicon и Git: ноутбук и хотя бы один рабочий Mac.
