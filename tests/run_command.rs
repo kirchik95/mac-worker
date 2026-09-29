@@ -271,6 +271,32 @@ impl ProcessInspector for LiveOwnerInspector {
     }
 }
 
+/// Every fixture owner is gone. Fixture owners use made-up pids, so the system
+/// inspector would describe whichever real process holds that pid now; a
+/// root-owned one reads as `Ambiguous`, which never confirms absence.
+#[derive(Clone, Copy)]
+struct AbsentOwnerInspector;
+
+impl ProcessInspector for AbsentOwnerInspector {
+    fn identity_for_pid(&self, _pid: u32) -> Result<ProcessIdentity, WorkerError> {
+        Err(WorkerError::Protocol(
+            "PROCESS_ABSENT: process identity was absent".into(),
+        ))
+    }
+
+    fn observe(&self, _expected: ProcessIdentity) -> ProcessObservation {
+        ProcessObservation::Absent
+    }
+
+    fn observe_group(&self, _process_group: u32) -> ProcessGroupObservation {
+        ProcessGroupObservation::Absent
+    }
+
+    fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
+        ProcessGroupMembership::Ambiguous
+    }
+}
+
 fn config() -> Config {
     Config {
         version: 1,
@@ -5775,7 +5801,8 @@ fn crash_after_local_record_publication_is_recovered_on_the_next_pass() {
     let repo = run_repo(b"version = 1\n");
     let temp = tempfile::tempdir().unwrap();
     let paths = run_paths(&temp);
-    let store = ClientStateStore::open(&paths.state).unwrap();
+    let store =
+        ClientStateStore::open_with_owner_inspector(&paths.state, AbsentOwnerInspector).unwrap();
     let config = config();
     let crashed_runner = RunScriptRunner::new(paths.state.clone(), [RunScriptStep::ProbeReady]);
     let crashed_follower = RecordingFollower::succeeding(0);
