@@ -98,6 +98,7 @@ pub mod keychain;
 pub mod laptop;
 pub mod lease;
 pub mod manifest;
+mod model_catalog;
 pub mod onboarding;
 pub mod outbox;
 pub mod output;
@@ -3714,18 +3715,28 @@ fn run_host_agent_settings_get(
         stdout,
         agent_settings::validate_get_request,
         |request: AgentSettingsGetRequest, store| {
+            let (cursor, codex, opencode) = std::thread::scope(|scope| {
+                let codex = scope.spawn(|| model_catalog::discover_codex(runtime.home(), runner));
+                let opencode =
+                    scope.spawn(|| model_catalog::discover_opencode(runtime.home(), runner));
+                let cursor = cursor_catalog::discover_for_profile(
+                    runtime.home(),
+                    runtime.environment(),
+                    request.env_profile.as_deref(),
+                    runner,
+                );
+                (
+                    cursor,
+                    codex.join().unwrap_or(None),
+                    opencode.join().unwrap_or(None),
+                )
+            });
             Ok(store
                 .clone()
-                .with_cursor_catalog(
-                    cursor_catalog::discover_for_profile(
-                        runtime.home(),
-                        runtime.environment(),
-                        request.env_profile.as_deref(),
-                        runner,
-                    )
-                    .map_err(settings_host_error)?,
-                )
+                .with_cursor_catalog(cursor.map_err(settings_host_error)?)
                 .with_cursor_catalog_profile(request.env_profile)
+                .with_codex_catalog(codex)
+                .with_opencode_catalog(opencode)
                 .read_all())
         },
     )
@@ -3756,6 +3767,10 @@ fn run_host_agent_settings_set(
                         .map_err(settings_host_error)?,
                     )
                     .with_cursor_catalog_profile(request.env_profile.clone())
+            } else if request.agent == "codex" {
+                store
+                    .clone()
+                    .with_codex_catalog(model_catalog::discover_codex(runtime.home(), runner))
             } else {
                 store.clone()
             };

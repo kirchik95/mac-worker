@@ -21,6 +21,10 @@ use mac_worker::{
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+// Bound simultaneous login shells on shared test hosts. Each endpoint still
+// exercises all three catalog discoveries concurrently inside this guard.
+static HOST_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
 struct KeychainRunner {
     requests: Mutex<Vec<ProcessRequest>>,
     succeed: bool,
@@ -66,6 +70,7 @@ impl ProcessRunner for KeychainRunner {
 
 fn fixture(expected_key: &str, catalogue: bool) -> TempDir {
     let home = tempdir().unwrap();
+    fs::write(home.path().join(".zshenv"), "unsetopt GLOBAL_RCS\n").unwrap();
     fs::create_dir_all(home.path().join("bin")).unwrap();
     fs::create_dir_all(home.path().join(".cursor")).unwrap();
     fs::create_dir_all(home.path().join(".config/mac-worker/env")).unwrap();
@@ -107,6 +112,9 @@ fn profile(home: &TempDir, contents: &str, mode: u32) {
 }
 
 fn host(home: &TempDir, runner: &KeychainRunner, operation: &str, body: &[u8]) -> (u8, Value) {
+    let _serial = HOST_SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let runtime = RuntimeContext::isolated(
         BTreeMap::from([
             (
@@ -431,4 +439,241 @@ fn failed_selected_keychain_unlock_does_not_discover_or_save() {
         before
     );
     assert!(!home.path().join("catalogue-called").exists());
+}
+
+fn install_binary(home: &TempDir, name: &str, script: &str) {
+    let path = home.path().join("bin").join(name);
+    fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn settings_get_discovers_all_three_catalogs_concurrently_without_profile_leaks() {
+    let home = fixture("selected-key", true);
+    profile(
+        &home,
+        "CURSOR_API_KEY=selected-key\nOPENAI_API_KEY=unrelated-key\n",
+        0o600,
+    );
+    // Every catalog must start before any one returns. A sequential endpoint
+    // exhausts the fixture barrier and fails the live-source assertions.
+    fs::write(home.path().join("catalogue-barrier.sh"), r#"
+attempt=0
+while [ ! -f "$HOME/catalogue-called" ] || [ ! -f "$HOME/codex-called" ] || [ ! -f "$HOME/opencode-called" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 500 ] || exit 31
+    sleep 0.01
+done
+"#).unwrap();
+    let cursor_path = home.path().join("bin/cursor-agent");
+    let cursor_script = fs::read_to_string(&cursor_path).unwrap().replace(
+        "printf called > \"$HOME/catalogue-called\"",
+        "printf called > \"$HOME/catalogue-called\"\n. \"$HOME/catalogue-barrier.sh\"",
+    );
+    fs::write(cursor_path, cursor_script).unwrap();
+    for (name, arguments, output) in [
+        (
+            "codex",
+            "debug models",
+            r#"{"models":[{"slug":"fresh-codex","visibility":"list","additional_speed_tiers":["fast"]}]}"#,
+        ),
+        ("opencode", "models", "opencode-go/fresh\nzai/fresh"),
+    ] {
+        install_binary(
+            &home,
+            name,
+            &format!(
+                r#"
+[ "$*" = '{arguments}' ] || exit 21
+[ -z "${{OPENAI_API_KEY-}}" ] || exit 22
+[ -z "${{MAC_WORKER_KEYCHAIN_PASSWORD-}}" ] || exit 23
+[ -z "${{MAC_WORKER_KEYCHAIN_PATH-}}" ] || exit 24
+printf called > "$HOME/{name}-called"
+. "$HOME/catalogue-barrier.sh"
+printf '%s\n' '{output}'
+"#
+            ),
+        );
+    }
+    let (exit, response) = host(
+        &home,
+        &KeychainRunner::new(true),
+        "agent-settings-get",
+        br#"{"env_profile":"agents"}"#,
+    );
+    assert_eq!(exit, 0, "{response}");
+    for (agent, expected) in [
+        ("cursor", "catalogue-model"),
+        ("codex", "fresh-codex"),
+        ("opencode", "opencode-go/fresh"),
+    ] {
+        let setting = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["agent"] == agent)
+            .unwrap();
+        assert_eq!(setting["model_catalog_source"], "live", "{setting}");
+        assert_eq!(setting["model_options"][0]["id"], expected);
+        if agent != "cursor" {
+            assert!(setting.get("model_catalog_profile").is_none());
+        }
+    }
+}
+
+#[test]
+fn codex_save_revalidates_fast_against_live_catalog_without_loading_cursor_profile() {
+    let home = fixture("selected-key", true);
+    install_binary(
+        &home,
+        "codex",
+        r#"
+[ "$*" = 'debug models' ] || exit 21
+[ -z "${OPENAI_API_KEY-}" ] || exit 22
+[ -z "${MAC_WORKER_KEYCHAIN_PASSWORD-}" ] || exit 23
+[ -z "${MAC_WORKER_KEYCHAIN_PATH-}" ] || exit 24
+printf called > "$HOME/codex-called"
+printf '%s\n' '{"models":[{"slug":"fresh-codex","visibility":"list","additional_speed_tiers":["fast"]}]}'
+"#,
+    );
+    install_binary(
+        &home,
+        "opencode",
+        "printf unexpected > \"$HOME/opencode-called\"\nexit 1",
+    );
+    let revision = NativeAgentSettingsStore::new(home.path())
+        .read("codex")
+        .unwrap()
+        .revision
+        .unwrap();
+    let request = AgentSettingsSaveRequest {
+        agent: "codex".into(),
+        model: Some("fresh-codex".into()),
+        effort: None,
+        fast: Some(true),
+        revision,
+        env_profile: Some("missing".into()),
+    };
+    let runner = KeychainRunner::new(false);
+    let (exit, response) = host(
+        &home,
+        &runner,
+        "agent-settings-set",
+        &serde_json::to_vec(&request).unwrap(),
+    );
+    assert_eq!(exit, 0, "{response}");
+    assert_eq!(response["model"], "fresh-codex");
+    assert_eq!(response["fast"], true);
+    assert_eq!(response["model_catalog_source"], "live");
+    assert!(response.get("model_catalog_profile").is_none());
+    assert!(runner.requests.lock().unwrap().is_empty());
+    assert!(home.path().join("codex-called").exists());
+    assert!(!home.path().join("catalogue-called").exists());
+    assert!(!home.path().join("opencode-called").exists());
+    assert!(
+        fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .contains("service_tier = \"fast\"")
+    );
+}
+
+#[test]
+fn opencode_save_does_not_discover_or_load_a_profile() {
+    let home = fixture("selected-key", true);
+    for name in ["codex", "opencode"] {
+        install_binary(
+            &home,
+            name,
+            &format!("printf unexpected > \"$HOME/{name}-called\"\nexit 1"),
+        );
+    }
+    let revision = NativeAgentSettingsStore::new(home.path())
+        .read("opencode")
+        .unwrap()
+        .revision
+        .unwrap();
+    let request = AgentSettingsSaveRequest {
+        agent: "opencode".into(),
+        model: Some("provider/custom-model".into()),
+        effort: None,
+        fast: None,
+        revision,
+        env_profile: Some("missing".into()),
+    };
+    let runner = KeychainRunner::new(false);
+    let (exit, response) = host(
+        &home,
+        &runner,
+        "agent-settings-set",
+        &serde_json::to_vec(&request).unwrap(),
+    );
+    assert_eq!(exit, 0, "{response}");
+    assert_eq!(response["model"], "provider/custom-model");
+    assert_eq!(response["model_catalog_source"], "remembered");
+    assert!(runner.requests.lock().unwrap().is_empty());
+    for marker in ["codex-called", "opencode-called", "catalogue-called"] {
+        assert!(!home.path().join(marker).exists());
+    }
+}
+
+#[test]
+fn settings_get_runs_catalogs_outside_the_callers_project_directory() {
+    let _serial = HOST_SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let home = fixture("login-key", true);
+    let project = home.path().join("project");
+    fs::create_dir_all(project.join(".codex")).unwrap();
+    fs::write(project.join("opencode.json"), r#"{"model":"project-only"}"#).unwrap();
+    for (name, output) in [
+        (
+            "codex",
+            r#"{"models":[{"slug":"account-codex","visibility":"list"}]}"#,
+        ),
+        ("opencode", "provider/account-model"),
+    ] {
+        install_binary(
+            &home,
+            name,
+            &format!(
+                r#"
+[ ! -e opencode.json ] && [ ! -e .codex ] || exit 21
+[ -z "$(ls -A)" ] || exit 22
+printf '%s' "$PWD" > "$HOME/{name}-cwd"
+printf '%s\n' '{output}'
+"#
+            ),
+        );
+    }
+    let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_worker"))
+        .args(["host", "agent-settings-get"])
+        .current_dir(&project)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for agent in ["codex", "opencode"] {
+        let settings = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["agent"] == agent)
+            .unwrap();
+        assert_eq!(settings["model_catalog_source"], "live", "{settings}");
+        let cwd = fs::read_to_string(home.path().join(format!("{agent}-cwd"))).unwrap();
+        assert_ne!(std::path::Path::new(&cwd), project);
+        assert!(!std::path::Path::new(&cwd).exists());
+    }
+    assert_eq!(
+        fs::read_to_string(project.join("opencode.json")).unwrap(),
+        r#"{"model":"project-only"}"#
+    );
 }
