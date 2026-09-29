@@ -2703,33 +2703,25 @@ mod exec_inheritance_tests {
     }
 
     #[test]
-    fn production_exec_propagates_child_exit_status() {
-        let fixture = tempdir().unwrap();
-        let store = HostStore::open(&fixture.path().join("host")).unwrap();
-        let request = request();
-        LeaseService::new(&store)
-            .acquire(&request, &healthy(), 1)
-            .unwrap();
-        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
-        let error = HostTransferService::new(&store)
-            .receive(&identity, &stock_server_args(), &Exit23)
-            .unwrap_err();
-        assert!(matches!(error, WorkerError::CommandExit { code: 23 }));
-    }
-
-    #[test]
-    fn production_exec_maps_child_signal_to_shell_status() {
-        let fixture = tempdir().unwrap();
-        let store = HostStore::open(&fixture.path().join("host")).unwrap();
-        let request = request();
-        LeaseService::new(&store)
-            .acquire(&request, &healthy(), 1)
-            .unwrap();
-        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
-        let error = HostTransferService::new(&store)
-            .receive(&identity, &stock_server_args(), &SignalTerm)
-            .unwrap_err();
-        assert!(matches!(error, WorkerError::CommandExit { code: 143 }));
+    fn production_exec_maps_child_exit_and_signal_to_shell_status() {
+        fn assert_receive_reports(executor: &impl RsyncServerExecutor, expected: i32) {
+            let fixture = tempdir().unwrap();
+            let store = HostStore::open(&fixture.path().join("host")).unwrap();
+            let request = request();
+            LeaseService::new(&store)
+                .acquire(&request, &healthy(), 1)
+                .unwrap();
+            let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+            let error = HostTransferService::new(&store)
+                .receive(&identity, &stock_server_args(), executor)
+                .unwrap_err();
+            assert!(
+                matches!(error, WorkerError::CommandExit { code } if i32::from(code) == expected),
+                "expected CommandExit {expected}, got {error:?}"
+            );
+        }
+        assert_receive_reports(&Exit23, 23);
+        assert_receive_reports(&SignalTerm, 143);
     }
 }
 

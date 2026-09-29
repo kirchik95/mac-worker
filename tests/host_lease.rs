@@ -466,55 +466,45 @@ fn mismatched_same_job_abandonment_is_a_conflict_during_lease_acquisition() {
 }
 
 #[test]
-fn accepted_disposition_embedded_job_id_must_match_canonical_filename() {
-    let temp = tempdir().unwrap();
-    let root = temp.path().join("host");
-    let store = HostStore::open(&root).unwrap();
-    let accepted = request(1);
-    store
-        .record_accepted(&accepted, &JobStatus::accepted(100).unwrap(), 100)
+fn disposition_embedded_job_id_must_match_canonical_filename() {
+    // An accepted and an abandoned disposition both fail closed when the
+    // embedded job id disagrees with the canonical index filename, and
+    // neither leaves a lease behind.
+    for disposition in ["accepted", "abandoned"] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let disposed = request(1);
+        match disposition {
+            "accepted" => store
+                .record_accepted(&disposed, &JobStatus::accepted(100).unwrap(), 100)
+                .unwrap(),
+            _ => store.record_abandoned(&disposed, 100).unwrap(),
+        };
+        let requested = disposed.material().job_id();
+        let path = store.job_index(requested).unwrap();
+        let bytes = fs::read_to_string(&path).unwrap();
+        let mismatched = request(2).material().job_id();
+        fs::write(
+            &path,
+            bytes.replacen(&requested.to_string(), &mismatched.to_string(), 1),
+        )
         .unwrap();
-    let requested = accepted.material().job_id();
-    let path = store.job_index(requested).unwrap();
-    let bytes = fs::read_to_string(&path).unwrap();
-    let mismatched = request(2).material().job_id();
-    fs::write(
-        &path,
-        bytes.replacen(&requested.to_string(), &mismatched.to_string(), 1),
-    )
-    .unwrap();
 
-    let error = LeaseService::new(&store)
-        .acquire(&accepted, &healthy(), 200)
-        .unwrap_err();
+        let error = LeaseService::new(&store)
+            .acquire(&disposed, &healthy(), 200)
+            .unwrap_err();
 
-    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
-    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
-}
-
-#[test]
-fn abandoned_disposition_embedded_job_id_must_match_canonical_filename() {
-    let temp = tempdir().unwrap();
-    let root = temp.path().join("host");
-    let store = HostStore::open(&root).unwrap();
-    let abandoned = request(1);
-    store.record_abandoned(&abandoned, 100).unwrap();
-    let requested = abandoned.material().job_id();
-    let path = store.job_index(requested).unwrap();
-    let bytes = fs::read_to_string(&path).unwrap();
-    let mismatched = request(2).material().job_id();
-    fs::write(
-        &path,
-        bytes.replacen(&requested.to_string(), &mismatched.to_string(), 1),
-    )
-    .unwrap();
-
-    let error = LeaseService::new(&store)
-        .acquire(&abandoned, &healthy(), 200)
-        .unwrap_err();
-
-    assert!(matches!(error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")));
-    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+        assert!(
+            matches!(error, WorkerError::Protocol(ref message) if message.contains("JOB_ID_CONFLICT")),
+            "{disposition}: {error:?}"
+        );
+        assert_eq!(
+            LeaseService::new(&store).load().unwrap(),
+            None,
+            "{disposition}"
+        );
+    }
 }
 
 #[test]

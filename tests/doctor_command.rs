@@ -898,33 +898,52 @@ fn executable_doctor_ready_report_goes_to_stdout_and_exits_zero() {
 }
 
 #[test]
-fn executable_doctor_project_blocker_goes_to_stdout_and_exits_usage() {
-    let repo = GitRepo::init();
-    repo.write("README.md", b"tracked\n");
-    repo.commit_all("blocked executable doctor fixture");
-    repo.write("local-input.txt", b"uncovered untracked input\n");
-    let state = tempfile::tempdir().unwrap();
-    let config_path = write_inventory(state.path());
-    let runtime = isolated_runtime(state.path(), repo.root());
-    let runner = DoctorRunner::new(vec![ready_probe(&[])]);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+fn executable_doctor_blockers_go_to_stdout_with_their_exit_category() {
+    // A project blocker is a usage exit (64) and a snapshot change an
+    // infrastructure exit (70); both keep the JSON report on stdout with an
+    // empty stderr.
+    for snapshot_changes in [false, true] {
+        let repo = GitRepo::init();
+        if snapshot_changes {
+            repo.write("tracked.txt", b"initial bytes\n");
+            repo.commit_all("mutating executable doctor fixture");
+        } else {
+            repo.write("README.md", b"tracked\n");
+            repo.commit_all("blocked executable doctor fixture");
+            repo.write("local-input.txt", b"uncovered untracked input\n");
+        }
+        let state = tempfile::tempdir().unwrap();
+        let config_path = write_inventory(state.path());
+        let runtime = isolated_runtime(state.path(), repo.root());
+        let runner = if snapshot_changes {
+            DoctorRunner::mutating_snapshot(repo.root(), vec![ready_probe(&[])])
+        } else {
+            DoctorRunner::new(vec![ready_probe(&[])])
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
 
-    let exit = run_with_io_in_context(
-        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
-        &runner,
-        &runtime.context,
-        &mut stdout,
-        &mut stderr,
-    );
+        let exit = run_with_io_in_context(
+            doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
+            &runner,
+            &runtime.context,
+            &mut stdout,
+            &mut stderr,
+        );
 
-    assert_eq!(exit, 64);
-    assert!(stderr.is_empty());
-    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(value["kind"], "doctor");
-    assert_eq!(value["ready"], false);
-    assert_eq!(value["issues"][0]["code"], "UNTRACKED_INPUT");
-    assert_isolated_snapshot_state(&runtime, false);
+        let (expected_exit, expected_code) = if snapshot_changes {
+            (70, "SNAPSHOT_CHANGED")
+        } else {
+            (64, "UNTRACKED_INPUT")
+        };
+        assert_eq!(exit, expected_exit, "snapshot changes: {snapshot_changes}");
+        assert!(stderr.is_empty(), "snapshot changes: {snapshot_changes}");
+        let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["kind"], "doctor");
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["issues"][0]["code"], expected_code);
+        assert_isolated_snapshot_state(&runtime, snapshot_changes);
+    }
 }
 
 #[test]
@@ -980,35 +999,6 @@ fn executable_doctor_rejects_external_project_policy_without_leaking_diagnostics
         );
     }
     assert_isolated_snapshot_state(&runtime, false);
-}
-
-#[test]
-fn executable_doctor_snapshot_change_goes_to_stdout_and_exits_infrastructure() {
-    let repo = GitRepo::init();
-    repo.write("tracked.txt", b"initial bytes\n");
-    repo.commit_all("mutating executable doctor fixture");
-    let state = tempfile::tempdir().unwrap();
-    let config_path = write_inventory(state.path());
-    let runtime = isolated_runtime(state.path(), repo.root());
-    let runner = DoctorRunner::mutating_snapshot(repo.root(), vec![ready_probe(&[])]);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-
-    let exit = run_with_io_in_context(
-        doctor_cli(config_path, Some(repo.root()), Vec::new(), true),
-        &runner,
-        &runtime.context,
-        &mut stdout,
-        &mut stderr,
-    );
-
-    assert_eq!(exit, 70);
-    assert!(stderr.is_empty());
-    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-    assert_eq!(value["kind"], "doctor");
-    assert_eq!(value["ready"], false);
-    assert_eq!(value["issues"][0]["code"], "SNAPSHOT_CHANGED");
-    assert_isolated_snapshot_state(&runtime, true);
 }
 
 #[test]

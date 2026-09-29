@@ -787,17 +787,32 @@ fn opencode_first_turn_includes_auto_and_the_quoted_prompt_pointer() {
 }
 
 #[test]
-fn opencode_prompt_requires_an_exact_json_final_message() {
+fn cursor_and_opencode_prompts_require_an_exact_json_final_message() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
-    let harness = TaskHarness::opencode();
-    harness.submit_first_turn().unwrap();
-    let prompt = harness.last_prompt();
-    assert!(prompt.contains("OpenCode"));
-    assert!(
-        prompt.contains("end your final message with exactly the JSON object and nothing after it")
-    );
-    assert!(prompt.contains("Do not wrap it in a Markdown code fence or add prose"));
-    assert!(prompt.contains("\"files_changed\""));
+    for (agent, agent_marker, formatting_rule) in [
+        (
+            "opencode",
+            "OpenCode",
+            "Do not wrap it in a Markdown code fence or add prose",
+        ),
+        ("cursor", "Cursor:", "do not render it as Markdown"),
+    ] {
+        let harness = match agent {
+            "opencode" => TaskHarness::opencode(),
+            _ => TaskHarness::cursor(),
+        };
+        harness.submit_first_turn().unwrap();
+        let prompt = harness.last_prompt();
+        assert!(prompt.contains(agent_marker), "{agent}: {prompt}");
+        assert!(
+            prompt.contains(
+                "end your final message with exactly the JSON object and nothing after it"
+            ),
+            "{agent}: {prompt}"
+        );
+        assert!(prompt.contains(formatting_rule), "{agent}: {prompt}");
+        assert!(prompt.contains("\"files_changed\""), "{agent}: {prompt}");
+    }
 }
 
 #[test]
@@ -1040,18 +1055,4 @@ fn cursor_live_fixture_captures_the_session_id() {
         events.first(),
         Some(mac_worker::agent::AgentEvent::SessionStarted { session_ref }) if session_ref == "2df4613a-3015-46d8-9f06-b595b06988f4"
     ));
-}
-
-#[test]
-fn cursor_prompt_requires_an_exact_json_final_message() {
-    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
-    let harness = TaskHarness::cursor();
-    harness.submit_first_turn().unwrap();
-    let prompt = harness.last_prompt();
-    assert!(prompt.contains("Cursor:"));
-    assert!(
-        prompt.contains("end your final message with exactly the JSON object and nothing after it")
-    );
-    assert!(prompt.contains("do not render it as Markdown"));
-    assert!(prompt.contains("\"files_changed\""));
 }

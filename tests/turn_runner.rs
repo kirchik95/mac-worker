@@ -5159,62 +5159,48 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
 }
 
 #[test]
-fn operator_fetch_refuses_an_active_turn() {
+fn operator_fetch_refuses_an_active_or_draining_turn() {
+    // An active turn and a terminal turn whose logs are still being drained
+    // both refuse an operator fetch with TASK_BUSY, and neither reaches the
+    // result fetch.
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = AcceptedThenTerminalFixture::new();
-    let remote = ReplayableLogsRunner::new(&fixture.runner);
-    remote.fail_stderr_once.store(true, Ordering::SeqCst);
-    TurnRunner::new(
-        &remote,
-        &fixture.config,
-        &fixture.paths,
-        &fixture.state,
-        &fixture.executor,
-    )
-    .run(fixture.task_id, fixture.turn_id, None)
-    .unwrap_err();
-    let before = result_fetch_count(&fixture.runner);
-    let error = TaskClient::new(
-        &remote,
-        &fixture.config,
-        &fixture.paths,
-        &fixture.state,
-        &fixture.executor,
-    )
-    .fetch(fixture.task_id)
-    .unwrap_err();
-    assert_eq!(error.public_code(), "TASK_BUSY");
-    assert_eq!(result_fetch_count(&fixture.runner), before);
-}
-
-#[test]
-fn operator_fetch_refuses_a_terminal_turn_still_being_drained() {
-    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fixture = AcceptedThenTerminalFixture::new();
-    let remote = ReplayableLogsRunner::new(&fixture.runner);
-    remote.fail_stderr_once.store(true, Ordering::SeqCst);
-    TurnRunner::new(
-        &remote,
-        &fixture.config,
-        &fixture.paths,
-        &fixture.state,
-        &fixture.executor,
-    )
-    .run(fixture.task_id, fixture.turn_id, None)
-    .unwrap_err();
-    persist_independent_terminal_status(&fixture);
-    let before = result_fetch_count(&fixture.runner);
-    let error = TaskClient::new(
-        &remote,
-        &fixture.config,
-        &fixture.paths,
-        &fixture.state,
-        &fixture.executor,
-    )
-    .fetch(fixture.task_id)
-    .unwrap_err();
-    assert_eq!(error.public_code(), "TASK_BUSY");
-    assert_eq!(result_fetch_count(&fixture.runner), before);
+    for terminal_status_persisted in [false, true] {
+        let fixture = AcceptedThenTerminalFixture::new();
+        let remote = ReplayableLogsRunner::new(&fixture.runner);
+        remote.fail_stderr_once.store(true, Ordering::SeqCst);
+        TurnRunner::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .run(fixture.task_id, fixture.turn_id, None)
+        .unwrap_err();
+        if terminal_status_persisted {
+            persist_independent_terminal_status(&fixture);
+        }
+        let before = result_fetch_count(&fixture.runner);
+        let error = TaskClient::new(
+            &remote,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        )
+        .fetch(fixture.task_id)
+        .unwrap_err();
+        assert_eq!(
+            error.public_code(),
+            "TASK_BUSY",
+            "terminal status persisted: {terminal_status_persisted}"
+        );
+        assert_eq!(
+            result_fetch_count(&fixture.runner),
+            before,
+            "terminal status persisted: {terminal_status_persisted}"
+        );
+    }
 }
 
 struct RefLockContention<'a> {

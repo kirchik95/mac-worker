@@ -75,57 +75,53 @@ fn active_remote_task_status_overrides_local_status_without_a_write() {
 }
 
 #[test]
-fn close_intent_skips_remote_refresh_on_snapshot_and_detail() {
-    let harness = DashboardTaskHarness::open_with_close_intent()
+fn local_intents_skip_remote_refresh_on_snapshot_and_detail() {
+    // A close intent and an unavailable log drain both keep the row on its
+    // local state: no remote status call, no local write, and the close
+    // intent keeps its pending review state.
+    for close_intent in [true, false] {
+        let harness = if close_intent {
+            DashboardTaskHarness::open_with_close_intent()
+        } else {
+            DashboardTaskHarness::open_with_log_drain_unavailable()
+        }
         .with_remote_status(TaskState::Closed, Some(TaskOutcome::Done));
-    let before = harness.local_state_fingerprint();
-    let snapshot = harness.snapshot().unwrap();
-    let row = snapshot
-        .task_view
-        .tasks
-        .iter()
-        .find(|row| row.task_id == harness.task_id())
-        .unwrap();
+        let before = harness.local_state_fingerprint();
+        let snapshot = harness.snapshot().unwrap();
+        let row = snapshot
+            .task_view
+            .tasks
+            .iter()
+            .find(|row| row.task_id == harness.task_id())
+            .unwrap();
 
-    assert_eq!(row.state, TaskState::Open);
-    assert_eq!(row.review_state, ReviewState::ClosePending);
-    assert_ne!(row.review_state, ReviewState::Accepted);
-    assert_eq!(harness.task_status_calls(), 0);
-    assert_eq!(before, harness.local_state_fingerprint());
+        assert_eq!(row.state, TaskState::Open, "close intent: {close_intent}");
+        if close_intent {
+            assert_eq!(row.review_state, ReviewState::ClosePending);
+            assert_ne!(row.review_state, ReviewState::Accepted);
+        }
+        assert_eq!(harness.task_status_calls(), 0, "close intent: {close_intent}");
+        assert_eq!(
+            before,
+            harness.local_state_fingerprint(),
+            "close intent: {close_intent}"
+        );
 
-    let detail = harness
-        .task_source()
-        .task_detail(harness.task_id())
-        .unwrap();
-    assert_eq!(detail.task.state, TaskState::Open);
-    assert_eq!(detail.review_state, ReviewState::ClosePending);
-    assert_ne!(detail.review_state, ReviewState::Accepted);
-    assert_eq!(harness.task_status_calls(), 0);
-}
-
-#[test]
-fn log_drain_unavailable_skips_remote_refresh_on_snapshot_and_detail() {
-    let harness = DashboardTaskHarness::open_with_log_drain_unavailable()
-        .with_remote_status(TaskState::Closed, Some(TaskOutcome::Done));
-    let before = harness.local_state_fingerprint();
-    let snapshot = harness.snapshot().unwrap();
-    let row = snapshot
-        .task_view
-        .tasks
-        .iter()
-        .find(|row| row.task_id == harness.task_id())
-        .unwrap();
-
-    assert_eq!(row.state, TaskState::Open);
-    assert_eq!(harness.task_status_calls(), 0);
-    assert_eq!(before, harness.local_state_fingerprint());
-
-    let detail = harness
-        .task_source()
-        .task_detail(harness.task_id())
-        .unwrap();
-    assert_eq!(detail.task.state, TaskState::Open);
-    assert_eq!(harness.task_status_calls(), 0);
+        let detail = harness
+            .task_source()
+            .task_detail(harness.task_id())
+            .unwrap();
+        assert_eq!(
+            detail.task.state,
+            TaskState::Open,
+            "close intent: {close_intent}"
+        );
+        if close_intent {
+            assert_eq!(detail.review_state, ReviewState::ClosePending);
+            assert_ne!(detail.review_state, ReviewState::Accepted);
+        }
+        assert_eq!(harness.task_status_calls(), 0, "close intent: {close_intent}");
+    }
 }
 
 #[test]

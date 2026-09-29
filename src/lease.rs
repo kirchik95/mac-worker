@@ -1259,37 +1259,31 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn noncanonical_slot_directory_name_is_rejected() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let service = LeaseService::new(&store);
-        acquire(&service, &request(1));
-        fs::rename(root.join("leases/slots/0"), root.join("leases/slots/00")).unwrap();
+    fn noncanonical_slot_directory_names_are_rejected() {
+        // A zero-padded alias of slot 0 and a leading-zero alias of a high slot
+        // are both refused by occupancy and by acquire, and neither alias is
+        // silently rewritten back to the canonical name.
+        for high_slot in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let service = LeaseService::new(&store);
+            let (from, to, next) = if high_slot {
+                occupy_only_slot_one(&service, &store);
+                ("leases/slots/1", "leases/slots/08", 3)
+            } else {
+                acquire(&service, &request(1));
+                ("leases/slots/0", "leases/slots/00", 2)
+            };
+            fs::rename(root.join(from), root.join(to)).unwrap();
 
-        let error = service.occupied_slots().unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
-        let error = service.acquire(&request(2), &healthy(), 1).unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
-        assert!(!root.join("leases/slots/0/lease.json").exists());
-        assert!(root.join("leases/slots/00/lease.json").is_file());
-    }
-
-    #[test]
-    fn noncanonical_leading_zero_alias_for_high_slot_is_rejected() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let service = LeaseService::new(&store);
-        occupy_only_slot_one(&service, &store);
-        fs::rename(root.join("leases/slots/1"), root.join("leases/slots/08")).unwrap();
-
-        let error = service.occupied_slots().unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
-        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID");
-        assert!(!root.join("leases/slots/0/lease.json").exists());
-        assert!(root.join("leases/slots/08/lease.json").is_file());
+            let error = service.occupied_slots().unwrap_err();
+            assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID", "{to}");
+            let error = service.acquire(&request(next), &healthy(), 1).unwrap_err();
+            assert_eq!(error.public_code(), "HOST_SLOT_ID_INVALID", "{to}");
+            assert!(!root.join("leases/slots/0/lease.json").exists(), "{to}");
+            assert!(root.join(to).join("lease.json").is_file(), "{to}");
+        }
     }
 
     #[test]

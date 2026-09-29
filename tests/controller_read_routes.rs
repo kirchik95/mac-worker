@@ -1348,31 +1348,45 @@ fn seeded_missing_nonfollow_log_does_not_succeed_empty() {
 }
 
 #[test]
-fn seeded_missing_task_logs_are_task_not_found() {
-    let controller = IsolatedHome::new();
-    let laptop = IsolatedHome::new();
-    write_enabled_config(&controller.paths);
-    write_enabled_config(&laptop.paths);
-    let runner = ssh_to_controller(&controller);
-    let missing =
-        TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_dead_beef_0001)).to_string();
-    let (exit, stdout, stderr) = run_laptop_task_logs(&laptop, &runner, &[&missing]);
-    assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
-    assert!(
-        stdout.is_empty(),
-        "stdout={}",
-        String::from_utf8_lossy(&stdout)
-    );
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert!(
-        stderr.contains("TASK_NOT_FOUND"),
-        "missing task must stay TASK_NOT_FOUND: {stderr}"
-    );
-    assert!(
-        !stderr.contains("HOST_IO"),
-        "missing task must not look like a missing log: {stderr}"
-    );
-    assert!(!laptop_task_store_exists(&laptop.paths));
+fn seeded_missing_task_reads_are_task_not_found() {
+    // `task logs` and `task wait` on an unknown task stay TASK_NOT_FOUND: no
+    // laptop task store appears, the error never looks like a missing log
+    // file, and no durable request row is allocated.
+    for command in ["logs", "wait"] {
+        let controller = IsolatedHome::new();
+        let laptop = IsolatedHome::new();
+        write_enabled_config(&controller.paths);
+        write_enabled_config(&laptop.paths);
+        let runner = ssh_to_controller(&controller);
+        let missing =
+            TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_dead_beef_0001)).to_string();
+        let (exit, stdout, stderr) = match command {
+            "logs" => run_laptop_task_logs(&laptop, &runner, &[&missing]),
+            _ => run_laptop_task(&laptop, &runner, &["wait", "--task-id", missing.as_str()]),
+        };
+        assert_ne!(
+            exit,
+            0,
+            "{command}: stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            stdout.is_empty(),
+            "{command}: stdout={}",
+            String::from_utf8_lossy(&stdout)
+        );
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            stderr.contains("TASK_NOT_FOUND"),
+            "missing {command} must stay TASK_NOT_FOUND: {stderr}"
+        );
+        assert!(
+            !stderr.contains("HOST_IO"),
+            "missing task must not look like a missing log: {stderr}"
+        );
+        assert!(!laptop_task_store_exists(&laptop.paths), "{command}");
+        assert_eq!(request_row_count(&controller.paths), 0, "{command}");
+    }
 }
 
 #[test]
@@ -1799,32 +1813,6 @@ fn seeded_open_wait_returns_without_laptop_store() {
     assert!(!laptop_task_store_exists(&laptop.paths));
     assert_eq!(request_row_count(&controller.paths), 0);
     assert_eq!(request_row_count(&laptop.paths), 0);
-}
-
-#[test]
-fn seeded_missing_wait_is_task_not_found() {
-    let controller = IsolatedHome::new();
-    let laptop = IsolatedHome::new();
-    write_enabled_config(&controller.paths);
-    write_enabled_config(&laptop.paths);
-    let runner = ssh_to_controller(&controller);
-    let missing =
-        TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_dead_beef_0001)).to_string();
-    let (exit, stdout, stderr) =
-        run_laptop_task(&laptop, &runner, &["wait", "--task-id", missing.as_str()]);
-    assert_ne!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
-    assert!(
-        stdout.is_empty(),
-        "stdout={}",
-        String::from_utf8_lossy(&stdout)
-    );
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert!(
-        stderr.contains("TASK_NOT_FOUND"),
-        "missing wait must stay TASK_NOT_FOUND: {stderr}"
-    );
-    assert!(!laptop_task_store_exists(&laptop.paths));
-    assert_eq!(request_row_count(&controller.paths), 0);
 }
 
 #[test]

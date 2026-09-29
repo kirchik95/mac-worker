@@ -1377,83 +1377,49 @@ fn assert_gc_calls_stay_bounded(requests: &[ProcessRequest]) {
 }
 
 #[test]
-fn fleet_gc_reports_apply_results_when_the_second_host_fails() {
-    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Unavailable, false);
-    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
-    assert!(
-        stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
-        "first host apply result missing from stdout={stdout:?} stderr={stderr:?} exit={exit}"
-    );
-    assert!(
-        stdout.contains("worker mini-2")
-            && stdout.contains("error")
-            && stdout.contains("SSH_UNAVAILABLE"),
-        "second host error missing from {stdout}"
-    );
-    assert!(
-        stdout.contains("worker mini-3") && stdout.contains("applied-on-mini-3"),
-        "third host missing from {stdout}"
-    );
-    assert_gc_calls_stay_bounded(&requests);
+fn fleet_gc_reports_the_second_host_outcome_without_losing_the_others() {
+    // An unavailable second host is an error row and a timed-out one an
+    // unknown row; either way the first and third hosts keep their apply
+    // results and the gc calls stay bounded.
+    for (fault, status, code) in [
+        (SecondHostFault::Unavailable, "error", "SSH_UNAVAILABLE"),
+        (SecondHostFault::Timeout, "unknown", "SSH_TIMEOUT"),
+    ] {
+        let (exit, stdout, stderr, requests) = fleet_gc(fault, false);
+        assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+        assert!(
+            stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
+            "first host apply result missing from stdout={stdout:?} stderr={stderr:?} exit={exit}"
+        );
+        assert!(
+            stdout.contains("worker mini-2") && stdout.contains(status) && stdout.contains(code),
+            "second host {status} missing from {stdout}"
+        );
+        assert!(
+            stdout.contains("worker mini-3") && stdout.contains("applied-on-mini-3"),
+            "third host missing from {stdout}"
+        );
+        assert_gc_calls_stay_bounded(&requests);
 
-    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Unavailable, true);
-    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
-    assert_eq!(report["workers"][0]["status"], "success");
-    assert_eq!(
-        report["workers"][0]["report"]["applied"][0]["identifier"],
-        "applied-on-mini-1"
-    );
-    assert_eq!(report["workers"][1]["worker"], "mini-2");
-    assert_eq!(report["workers"][1]["status"], "error");
-    assert_eq!(report["workers"][1]["error_code"], "SSH_UNAVAILABLE");
-    assert_eq!(report["workers"][2]["status"], "success");
-    assert_eq!(
-        report["workers"][2]["report"]["applied"][0]["identifier"],
-        "applied-on-mini-3"
-    );
-    assert!(report.get("transfer").is_some(), "{report}");
-    assert_gc_calls_stay_bounded(&requests);
-}
-
-#[test]
-fn fleet_gc_reports_unknown_when_the_second_host_times_out() {
-    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Timeout, false);
-    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
-    assert!(
-        stdout.contains("worker mini-1") && stdout.contains("applied-on-mini-1"),
-        "first host apply result missing from stdout={stdout:?} stderr={stderr:?} exit={exit}"
-    );
-    assert!(
-        stdout.contains("worker mini-2")
-            && stdout.contains("unknown")
-            && stdout.contains("SSH_TIMEOUT"),
-        "second host timeout missing from {stdout}"
-    );
-    assert!(
-        stdout.contains("worker mini-3") && stdout.contains("applied-on-mini-3"),
-        "third host missing from {stdout}"
-    );
-    assert_gc_calls_stay_bounded(&requests);
-
-    let (exit, stdout, stderr, requests) = fleet_gc(SecondHostFault::Timeout, true);
-    assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
-    assert_eq!(report["workers"][0]["status"], "success");
-    assert_eq!(
-        report["workers"][0]["report"]["applied"][0]["identifier"],
-        "applied-on-mini-1"
-    );
-    assert_eq!(report["apply"], true);
-    assert_eq!(report["workers"][1]["worker"], "mini-2");
-    assert_eq!(report["workers"][1]["status"], "unknown");
-    assert_eq!(report["workers"][1]["error_code"], "SSH_TIMEOUT");
-    assert!(report["workers"][1].get("report").is_none(), "{report}");
-    assert_eq!(report["workers"][2]["status"], "success");
-    assert_eq!(
-        report["workers"][2]["report"]["applied"][0]["identifier"],
-        "applied-on-mini-3"
-    );
-    assert!(report.get("transfer").is_some(), "{report}");
-    assert_gc_calls_stay_bounded(&requests);
+        let (exit, stdout, stderr, requests) = fleet_gc(fault, true);
+        assert_ne!(exit, 0, "stderr={stderr}\nstdout={stdout}");
+        let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        assert_eq!(report["apply"], true);
+        assert_eq!(report["workers"][0]["status"], "success");
+        assert_eq!(
+            report["workers"][0]["report"]["applied"][0]["identifier"],
+            "applied-on-mini-1"
+        );
+        assert_eq!(report["workers"][1]["worker"], "mini-2");
+        assert_eq!(report["workers"][1]["status"], status);
+        assert_eq!(report["workers"][1]["error_code"], code);
+        assert!(report["workers"][1].get("report").is_none(), "{report}");
+        assert_eq!(report["workers"][2]["status"], "success");
+        assert_eq!(
+            report["workers"][2]["report"]["applied"][0]["identifier"],
+            "applied-on-mini-3"
+        );
+        assert!(report.get("transfer").is_some(), "{report}");
+        assert_gc_calls_stay_bounded(&requests);
+    }
 }

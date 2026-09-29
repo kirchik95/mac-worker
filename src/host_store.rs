@@ -6028,55 +6028,95 @@ mod review_regression_tests {
     fn admission_lock_domain_cannot_split_after_jobs_namespace_replacement() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let first = HostStore::open(&root).unwrap();
-        let second = HostStore::open(&root).unwrap();
-        let job = request(1).material().job_id();
-        let held = first.admission_lock(job).unwrap();
-        fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
-        fs::create_dir(root.join("locks/jobs")).unwrap();
-        fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Whether the contender is a second handle taking the admission lock or
+        // a fresh open of the same root, it must wait behind the held lock and
+        // then fail instead of forming a second lock domain in the replaced
+        // namespace.
+        for reopen in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let first = HostStore::open(&root).unwrap();
+            let second = (!reopen).then(|| HostStore::open(&root).unwrap());
+            let job = request(1).material().job_id();
+            let held = first.admission_lock(job).unwrap();
+            fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
+            fs::create_dir(root.join("locks/jobs")).unwrap();
+            fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
 
-        let (sender, receiver) = mpsc::channel();
-        let contender = thread::spawn(move || {
-            sender.send(second.admission_lock(job).is_err()).unwrap();
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
-        contender.join().unwrap();
-        assert_eq!(fs::read_dir(root.join("locks/jobs")).unwrap().count(), 0);
+            let (sender, receiver) = mpsc::channel();
+            let contender_root = root.clone();
+            let contender = thread::spawn(move || {
+                let failed = match second {
+                    Some(second) => second.admission_lock(job).is_err(),
+                    None => HostStore::open(&contender_root).is_err(),
+                };
+                sender.send(failed).unwrap();
+            });
+            assert!(
+                matches!(
+                    receiver.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "reopen: {reopen}"
+            );
+            drop(held);
+            assert!(
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "reopen: {reopen}"
+            );
+            contender.join().unwrap();
+            assert_eq!(
+                fs::read_dir(root.join("locks/jobs")).unwrap().count(),
+                0,
+                "reopen: {reopen}"
+            );
+        }
     }
 
     #[test]
     fn capacity_lock_domain_cannot_split_after_leases_namespace_replacement() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let first = HostStore::open(&root).unwrap();
-        let second = HostStore::open(&root).unwrap();
-        let held = first.capacity_lock().unwrap();
-        fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
-        fs::create_dir(root.join("leases")).unwrap();
-        fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Same contract for the capacity lock: a second handle and a fresh open
+        // both wait behind the held lock and then fail.
+        for reopen in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let first = HostStore::open(&root).unwrap();
+            let second = (!reopen).then(|| HostStore::open(&root).unwrap());
+            let held = first.capacity_lock().unwrap();
+            fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
+            fs::create_dir(root.join("leases")).unwrap();
+            fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
 
-        let (sender, receiver) = mpsc::channel();
-        let contender = thread::spawn(move || {
-            sender.send(second.capacity_lock().is_err()).unwrap();
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
-        contender.join().unwrap();
-        assert_eq!(fs::read_dir(root.join("leases")).unwrap().count(), 0);
+            let (sender, receiver) = mpsc::channel();
+            let contender_root = root.clone();
+            let contender = thread::spawn(move || {
+                let failed = match second {
+                    Some(second) => second.capacity_lock().is_err(),
+                    None => HostStore::open(&contender_root).is_err(),
+                };
+                sender.send(failed).unwrap();
+            });
+            assert!(
+                matches!(
+                    receiver.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "reopen: {reopen}"
+            );
+            drop(held);
+            assert!(
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "reopen: {reopen}"
+            );
+            contender.join().unwrap();
+            assert_eq!(
+                fs::read_dir(root.join("leases")).unwrap().count(),
+                0,
+                "reopen: {reopen}"
+            );
+        }
     }
 
     #[test]
@@ -6141,65 +6181,6 @@ mod review_regression_tests {
         contender.join().unwrap();
         assert!(detached.is_file());
         assert!(lock.is_file());
-    }
-
-    #[test]
-    fn opening_after_leases_replacement_rejects_the_new_namespace() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let first = HostStore::open(&root).unwrap();
-        let held = first.capacity_lock().unwrap();
-        fs::rename(root.join("leases"), root.join("leases-detached")).unwrap();
-        fs::create_dir(root.join("leases")).unwrap();
-        fs::set_permissions(root.join("leases"), fs::Permissions::from_mode(0o700)).unwrap();
-
-        let (sender, receiver) = mpsc::channel();
-        let contender_root = root.clone();
-        let contender = thread::spawn(move || {
-            sender
-                .send(HostStore::open(&contender_root).is_err())
-                .unwrap();
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
-        contender.join().unwrap();
-        assert_eq!(fs::read_dir(root.join("leases")).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn opening_after_jobs_lock_namespace_replacement_rejects_the_new_namespace() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let first = HostStore::open(&root).unwrap();
-        let job = request(1).material().job_id();
-        let held = first.admission_lock(job).unwrap();
-        fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
-        fs::create_dir(root.join("locks/jobs")).unwrap();
-        fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
-
-        let (sender, receiver) = mpsc::channel();
-        let contender_root = root.clone();
-        let contender = thread::spawn(move || {
-            sender
-                .send(HostStore::open(&contender_root).is_err())
-                .unwrap();
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
-        contender.join().unwrap();
-        assert_eq!(fs::read_dir(root.join("locks/jobs")).unwrap().count(), 0);
     }
 
     #[test]

@@ -17947,63 +17947,41 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_intent_tree_bootstrap_rejects_same_key_different_target() {
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let fault = CleanupFaultOverride::set(CleanupFault::AfterCleanupBootstrap(libc::EIO));
-        assert_eq!(
-            parent
-                .remove_owned_child("root")
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EIO)
-        );
-        drop(fault);
-        let namespace = physical.join(".mac-worker-rooted-fs");
-        let duplicate = install_same_key_cleanup_bootstrap(&namespace);
-        let duplicate_inode = fs::metadata(&duplicate).unwrap().ino();
+    fn cleanup_intent_tree_bootstrap_rejects_same_key_conflicts() {
+        // A bootstrap interrupted either right after publication or after the
+        // target chmod must refuse a planted same-key bootstrap with ESTALE and
+        // leave both the owned tree and the duplicate untouched.
+        for interrupt in [
+            CleanupFault::AfterCleanupBootstrap(libc::EIO),
+            CleanupFault::AfterTargetChmod(libc::EIO),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let physical = fixture.path().canonicalize().unwrap();
+            fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+            let root_path = physical.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("value"), b"owned").unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+            let parent = RootedDir::open(&physical).unwrap();
+            let fault = CleanupFaultOverride::set(interrupt);
+            assert_eq!(
+                parent
+                    .remove_owned_child("root")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+            drop(fault);
+            let namespace = physical.join(".mac-worker-rooted-fs");
+            let duplicate = install_same_key_cleanup_bootstrap(&namespace);
+            let duplicate_inode = fs::metadata(&duplicate).unwrap().ino();
 
-        let error = parent.remove_owned_child("root").unwrap_err();
+            let error = parent.remove_owned_child("root").unwrap_err();
 
-        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(fs::metadata(duplicate).unwrap().ino(), duplicate_inode);
-    }
-
-    #[test]
-    fn cleanup_intent_tree_bootstrap_rejects_canonical_same_key_conflict() {
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let fault = CleanupFaultOverride::set(CleanupFault::AfterTargetChmod(libc::EIO));
-        assert_eq!(
-            parent
-                .remove_owned_child("root")
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EIO)
-        );
-        drop(fault);
-        let namespace = physical.join(".mac-worker-rooted-fs");
-        let duplicate = install_same_key_cleanup_bootstrap(&namespace);
-        let duplicate_inode = fs::metadata(&duplicate).unwrap().ino();
-
-        let error = parent.remove_owned_child("root").unwrap_err();
-
-        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(fs::metadata(duplicate).unwrap().ino(), duplicate_inode);
+            assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+            assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
+            assert_eq!(fs::metadata(duplicate).unwrap().ino(), duplicate_inode);
+        }
     }
 
     #[test]
