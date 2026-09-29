@@ -1823,6 +1823,21 @@ fn write_turn_diagnostics(
     Ok(())
 }
 
+/// How long `say --interrupt` waits for the cancelled turn to be retired. The
+/// status turns terminal when the cancel publishes, but the runner may still
+/// be finalizing the turn; a follow-up sent before that is refused as busy.
+const INTERRUPT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn interrupt_settle_error(error: WorkerError) -> WorkerError {
+    if error.public_code() == "WAIT_TIMEOUT" {
+        return WorkerError::task(
+            "TASK_BUSY",
+            "the interrupted turn is still finalizing; the follow-up was not sent, retry worker task say shortly",
+        );
+    }
+    error
+}
+
 struct InterruptedTurn {
     turn_number: u32,
     turn_id: crate::task::TurnId,
@@ -1869,14 +1884,18 @@ fn interrupt_local_turn(
     if !turn_in_progress(current.status()) {
         return Ok(None);
     }
-    let cancelled = client.cancel(task_id)?;
-    if !turn_is_terminal(cancelled.status()) {
+    client.cancel(task_id)?;
+    client
+        .wait(WaitSelector::Task(task_id), Some(INTERRUPT_SETTLE_TIMEOUT))
+        .map_err(interrupt_settle_error)?;
+    let settled = client.status(task_id)?;
+    if !turn_is_terminal(settled.status()) {
         return Err(WorkerError::task(
             "TASK_BUSY",
             "cancelled turn is not terminal",
         ));
     }
-    Ok(Some(interrupted_from(&cancelled)?))
+    Ok(Some(interrupted_from(&settled)?))
 }
 
 fn interrupt_controller_turn(
@@ -1896,21 +1915,22 @@ fn interrupt_controller_turn(
         "task.cancel",
         serde_json::json!({ "task_id": task_id.to_string() }),
     )?;
-    let mut report = task_report_from_controller_ack(&ack)?;
+    task_report_from_controller_ack(&ack)?;
+    // Always wait: a terminal cancel ack does not mean the controller's runner
+    // has retired the turn yet.
+    crate::controller::wait_via_controller(
+        runner,
+        &config.controller,
+        crate::controller::ControllerWaitSelector::Task(task_id),
+        Some(INTERRUPT_SETTLE_TIMEOUT),
+    )
+    .map_err(interrupt_settle_error)?;
+    let report = controller_task_status(runner, config, task_id)?;
     if !turn_is_terminal(report.status()) {
-        let _ = crate::controller::wait_via_controller(
-            runner,
-            &config.controller,
-            crate::controller::ControllerWaitSelector::Task(task_id),
-            None,
-        )?;
-        report = controller_task_status(runner, config, task_id)?;
-        if !turn_is_terminal(report.status()) {
-            return Err(WorkerError::task(
-                "TASK_BUSY",
-                "cancelled turn is not terminal",
-            ));
-        }
+        return Err(WorkerError::task(
+            "TASK_BUSY",
+            "cancelled turn is not terminal",
+        ));
     }
     Ok(Some(interrupted_from(&report)?))
 }

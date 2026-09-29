@@ -47,7 +47,18 @@ fn controller_interrupt_of_an_active_task_cancels_then_says() {
         stdout.starts_with("interrupted turn 1 (cancelled)\n"),
         "{stdout}"
     );
-    assert_eq!(rpc.commands(), ["task.status", "task.cancel", "task.say"]);
+    // A terminal cancel ack is not enough: the controller's runner may still be
+    // retiring the turn, so the laptop waits for quiescence before the say.
+    assert_eq!(
+        rpc.commands(),
+        [
+            "task.status",
+            "task.cancel",
+            "task.wait.poll",
+            "task.status",
+            "task.say"
+        ]
+    );
 }
 
 #[test]
@@ -65,7 +76,18 @@ fn controller_interrupt_of_an_active_task_json_names_the_turn() {
             "outcome": "cancelled",
         })
     );
-    assert_eq!(rpc.commands(), ["task.status", "task.cancel", "task.say"]);
+    // A terminal cancel ack is not enough: the controller's runner may still be
+    // retiring the turn, so the laptop waits for quiescence before the say.
+    assert_eq!(
+        rpc.commands(),
+        [
+            "task.status",
+            "task.cancel",
+            "task.wait.poll",
+            "task.status",
+            "task.say"
+        ]
+    );
 }
 
 #[test]
@@ -198,6 +220,13 @@ impl ProcessRunner for Rpc {
         let task_id = body["task_id"].as_str().unwrap();
         assert_eq!(task_id, TASK_ID);
         let reply = match command.as_str() {
+            "task.wait.poll" => json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "command": command,
+                "request_id": request_id,
+                "payload_sha256": digest,
+                "result": {"task_ids": [TASK_ID], "quiescent": true, "exit_code": 0},
+            }),
             "task.status" => read_reply(
                 &command,
                 request_id,
