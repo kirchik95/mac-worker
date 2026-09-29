@@ -13,17 +13,14 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
 use controller_process::ProcessFixture;
 use mac_worker::{
-    cli::{Cli, Command as WorkerCommand, TaskCommand},
     controller::{OperationEnvelope, decode_frame, encode_json_frame, load_operation_envelope},
     protocol::PROTOCOL_VERSION,
     transfer_repo::TransferRepo,
 };
 use serde_json::{Value, json};
 
-const SAMPLE_TASK: &str = "018f0f4a6b5c7d8e9f00112233445566";
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
 
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
@@ -38,95 +35,6 @@ const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS",
 ];
-
-#[test]
-fn grammar_followup_cli_is_public() {
-    let submit = Cli::try_parse_from([
-        "worker",
-        "task",
-        "submit",
-        "--prompt",
-        "first turn stays open",
-        "--wip",
-        "--no-wait",
-        "--close-on",
-        "never",
-    ])
-    .unwrap();
-    match submit.command {
-        WorkerCommand::Task {
-            command:
-                TaskCommand::Submit {
-                    wip: true,
-                    no_wait: true,
-                    close_on: Some(ref policy),
-                    ..
-                },
-        } if policy == "never" => {}
-        other => panic!("expected submit --wip --no-wait --close-on never, got {other:?}"),
-    }
-
-    let say = Cli::try_parse_from([
-        "worker",
-        "task",
-        "say",
-        SAMPLE_TASK,
-        "--message",
-        "second turn",
-        "--wait",
-    ])
-    .unwrap();
-    match say.command {
-        WorkerCommand::Task {
-            command:
-                TaskCommand::Say {
-                    wait: true,
-                    message: Some(ref text),
-                    ..
-                },
-        } if text == "second turn" => {}
-        other => panic!("expected say --message --wait, got {other:?}"),
-    }
-
-    for (args, describe) in [
-        (
-            vec![
-                "worker",
-                "task",
-                "wait",
-                "--task-id",
-                SAMPLE_TASK,
-                "--timeout",
-                "30s",
-            ],
-            "task wait --task-id --timeout",
-        ),
-        (vec!["worker", "task", "status", SAMPLE_TASK], "task status"),
-        (vec!["worker", "task", "logs", SAMPLE_TASK], "task logs"),
-        (
-            vec!["worker", "task", "diff", SAMPLE_TASK, "--stat"],
-            "task diff --stat",
-        ),
-        (vec!["worker", "task", "result", SAMPLE_TASK], "task result"),
-        (vec!["worker", "task", "cancel", SAMPLE_TASK], "task cancel"),
-        (vec!["worker", "task", "close", SAMPLE_TASK], "task close"),
-        (vec!["worker", "task", "fetch", SAMPLE_TASK], "task fetch"),
-    ] {
-        Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{describe}: {error}"));
-    }
-}
-
-#[test]
-fn grammar_process_fixture_leader_ready_and_reaps() {
-    let fixture = ProcessFixture::new();
-    let mut leader = fixture.spawn_controller_run();
-    let ready = fixture.wait_until_leader_ready(&mut leader);
-    assert!(
-        ready.contains("controller leader acquired"),
-        "controller run must print the existing fixture ready line; got {ready:?}"
-    );
-    leader.terminate_and_reap();
-}
 
 /// Successful SAY/--wait, terminal cancel no-op, required identical say-envelope
 /// replay, close, then explicit fetch. Red on d545: enabled CLI still opens the

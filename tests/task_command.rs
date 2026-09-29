@@ -1,6 +1,6 @@
 use clap::Parser;
 use mac_worker::{
-    cli::{Cli, Command, TaskCommand},
+    cli::{Cli, Command, ControllerCommand, HostCommand, TaskCommand},
     protocol::PROTOCOL_VERSION,
     task::RunProgress,
     task_client::BatchFile,
@@ -452,4 +452,273 @@ fn task_list_json_envelope_flattens_the_shared_projection() {
     assert!(value.get("runs").is_some());
     assert!(value.get("progress").is_some());
     assert!(value.get("projection").is_none());
+}
+
+#[test]
+fn controller_era_task_forms_parse_with_their_documented_fields() {
+    // Relocated from the controller process harnesses: the public grammar the
+    // runtime tests drive must parse without spawning a controller.
+    const TASK_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
+    const TURN_ID: &str = "118f0f4a6b5c7d8e9f00112233445566";
+    const RUN_ID: &str = "0193f0f4a6b5c7d8e9f00112233445566";
+    const TOKEN: &str = "018f0f4a6b5c7d8e9f00112233445566";
+    const FINGERPRINT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PROJECT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const WORKTREE_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+    let submit = Cli::try_parse_from([
+        "worker",
+        "task",
+        "submit",
+        "--prompt",
+        "first turn stays open",
+        "--wip",
+        "--no-wait",
+        "--close-on",
+        "never",
+    ])
+    .unwrap();
+    match submit.command {
+        Command::Task {
+            command:
+                TaskCommand::Submit {
+                    wip: true,
+                    no_wait: true,
+                    close_on: Some(ref policy),
+                    ..
+                },
+        } if policy == "never" => {}
+        other => panic!("expected submit --wip --no-wait --close-on never, got {other:?}"),
+    }
+
+    let say = Cli::try_parse_from([
+        "worker",
+        "task",
+        "say",
+        TASK_ID,
+        "--message",
+        "second turn",
+        "--wait",
+    ])
+    .unwrap();
+    match say.command {
+        Command::Task {
+            command:
+                TaskCommand::Say {
+                    wait: true,
+                    message: Some(ref text),
+                    ..
+                },
+        } if text == "second turn" => {}
+        other => panic!("expected say --message --wait, got {other:?}"),
+    }
+
+    let list = Cli::try_parse_from(["worker", "task", "list"]).unwrap();
+    assert!(matches!(
+        list.command,
+        Command::Task {
+            command: TaskCommand::List {
+                run: None,
+                state: None,
+                outcome: None,
+                full: false,
+            }
+        }
+    ));
+    let filtered = Cli::try_parse_from([
+        "worker",
+        "task",
+        "list",
+        "--run",
+        RUN_ID,
+        "--state",
+        "open",
+        "--outcome",
+        "done",
+        "--full",
+    ])
+    .unwrap();
+    assert!(matches!(
+        filtered.command,
+        Command::Task {
+            command: TaskCommand::List {
+                run: Some(_),
+                state: Some(_),
+                outcome: Some(_),
+                full: true,
+            }
+        }
+    ));
+
+    let reconcile = Cli::try_parse_from(["worker", "task", "reconcile"]).unwrap();
+    assert!(matches!(
+        reconcile.command,
+        Command::Task {
+            command: TaskCommand::Reconcile,
+        }
+    ));
+
+    let wait_run = Cli::try_parse_from(["worker", "task", "wait", "--run", RUN_ID]).unwrap();
+    assert!(matches!(
+        wait_run.command,
+        Command::Task {
+            command: TaskCommand::Wait {
+                task_id: None,
+                run: Some(_),
+                timeout: None,
+            }
+        }
+    ));
+    let wait_task = Cli::try_parse_from([
+        "worker",
+        "task",
+        "wait",
+        "--task-id",
+        TASK_ID,
+        "--timeout",
+        "45s",
+    ])
+    .unwrap();
+    assert!(matches!(
+        wait_task.command,
+        Command::Task {
+            command: TaskCommand::Wait {
+                task_id: Some(_),
+                run: None,
+                timeout: Some(_),
+            }
+        }
+    ));
+
+    let batch = Cli::try_parse_from(["worker", "task", "batch", "tasks.toml"]).unwrap();
+    assert!(matches!(
+        batch.command,
+        Command::Task {
+            command: TaskCommand::Batch {
+                max_parallel: None,
+                wait: false,
+                preview: false,
+                ..
+            }
+        }
+    ));
+    let omitted = Cli::try_parse_from(["worker", "--json", "task", "batch", "tasks.toml"]).unwrap();
+    assert!(matches!(
+        omitted.command,
+        Command::Task {
+            command: TaskCommand::Batch {
+                max_parallel: None,
+                ..
+            }
+        }
+    ));
+
+    for (args, describe) in [
+        (
+            vec!["worker", "task", "logs", TASK_ID, "--turn", "1", "--raw"],
+            "task logs --turn/--raw",
+        ),
+        (
+            vec!["worker", "task", "logs", TASK_ID, "--follow"],
+            "task logs --follow",
+        ),
+        (
+            vec!["worker", "task", "diff", TASK_ID, "--stat"],
+            "task diff --stat",
+        ),
+        (vec!["worker", "task", "status", TASK_ID], "task status"),
+        (vec!["worker", "task", "result", TASK_ID], "task result"),
+        (vec!["worker", "task", "cancel", TASK_ID], "task cancel"),
+        (vec!["worker", "task", "close", TASK_ID], "task close"),
+        (vec!["worker", "task", "fetch", TASK_ID], "task fetch"),
+    ] {
+        Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{describe}: {error}"));
+    }
+
+    let run = Cli::try_parse_from(["worker", "controller", "run"]).unwrap();
+    assert!(matches!(
+        run.command,
+        Command::Controller {
+            command: ControllerCommand::Run { supervised: false }
+        }
+    ));
+    let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
+    assert!(matches!(
+        rpc.command,
+        Command::Host {
+            command: HostCommand::ControllerRpc
+        }
+    ));
+    let receive = Cli::try_parse_from([
+        "worker",
+        "host",
+        "controller-receive-pack",
+        TOKEN,
+        TOKEN,
+        FINGERPRINT,
+        PROJECT_ID,
+        WORKTREE_ID,
+        OID,
+    ])
+    .unwrap();
+    assert!(matches!(
+        receive.command,
+        Command::Host {
+            command: HostCommand::ControllerReceivePack { .. }
+        }
+    ));
+    let upload = Cli::try_parse_from([
+        "worker",
+        "host",
+        "controller-upload-pack",
+        TOKEN,
+        TOKEN,
+        FINGERPRINT,
+        TASK_ID,
+        TURN_ID,
+        OID,
+    ])
+    .unwrap();
+    assert!(matches!(
+        upload.command,
+        Command::Host {
+            command: HostCommand::ControllerUploadPack { .. }
+        }
+    ));
+}
+
+#[test]
+fn batch_file_parses_per_task_bases_and_rejects_a_project_key() {
+    // Relocated from the batch process harness: per-task committed bases,
+    // `from:<parent>` bases beside `depends_on` and `close_on`, and the
+    // deny_unknown_fields guard against a TOML `project` key.
+    let two_roots: BatchFile = toml::from_str(
+        "version = 1\n\n[[tasks]]\nid = \"alpha\"\nprompt = \"independent root alpha\"\nbase = \"alpha-base\"\n\n[[tasks]]\nid = \"beta\"\nprompt = \"independent root beta\"\nbase = \"beta-base\"\n",
+    )
+    .expect("public two-root batch must parse");
+    assert_eq!(two_roots.tasks.len(), 2);
+    assert_eq!(two_roots.tasks[0].id.as_deref(), Some("alpha"));
+    assert_eq!(two_roots.tasks[0].base.as_deref(), Some("alpha-base"));
+    assert_eq!(two_roots.tasks[1].id.as_deref(), Some("beta"));
+    assert_eq!(two_roots.tasks[1].base.as_deref(), Some("beta-base"));
+    assert!(two_roots.tasks.iter().all(|task| task.wip.is_none()));
+
+    let dag: BatchFile = toml::from_str(
+        "version = 1\n\n[[tasks]]\nid = \"parent\"\nprompt = \"parent root stays open after Done\"\nclose_on = \"never\"\n\n[[tasks]]\nid = \"child\"\ndepends_on = [\"parent\"]\nbase = \"from:parent\"\nprompt = \"child from accepted parent\"\n",
+    )
+    .expect("from:parent batch must parse");
+    assert_eq!(dag.tasks[0].id.as_deref(), Some("parent"));
+    assert_eq!(dag.tasks[0].close_on.as_deref(), Some("never"));
+    assert_eq!(dag.tasks[1].base.as_deref(), Some("from:parent"));
+
+    let error = toml::from_str::<BatchFile>(
+        "version = 1\n[[tasks]]\nid = \"alpha\"\nprompt = \"unknown project key must not parse\"\nproject = \"/tmp/not-public-grammar\"\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("unknown field") && error.contains("project"),
+        "BatchTask deny_unknown_fields must reject project=; got {error}"
+    );
 }

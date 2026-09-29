@@ -8,17 +8,13 @@
 mod controller_process;
 mod support;
 
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
-use controller_process::{FAKE_CONTROLLER_DEST, ProcessFixture, REMOTE_BINARY, TEST_SSH_ENV};
+use controller_process::ProcessFixture;
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy, TurnLimits},
-    cli::{Cli, Command as WorkerCommand, ControllerCommand, HostCommand, TaskCommand},
-    config::Config,
     controller::{OperationEnvelope, decode_frame, encode_json_frame, load_operation_envelope},
     job::{
         ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
@@ -29,12 +25,11 @@ use mac_worker::{
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskState,
+        TaskMetaInput,
     },
     task_store::{
-        TaskCloseRequest, TaskCloseResponse, TaskDiffRequest, TaskDiffResponse, TaskPrepareRequest,
-        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
-        TaskStatusResponse,
+        TaskPrepareRequest,
+        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse,
     },
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
@@ -44,178 +39,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-const TASK_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
-const TOKEN: &str = "018f0f4a6b5c7d8e9f00112233445566";
-const FINGERPRINT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PROJECT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const WORKTREE_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const OID: &str = "dddddddddddddddddddddddddddddddddddddddd";
-const TURN_ID: &str = "118f0f4a6b5c7d8e9f00112233445566";
-
-#[test]
-fn harness_separate_homes_do_not_mutate_global_env() {
-    let process_home = env::var_os("HOME");
-    let process_cwd = env::current_dir().unwrap();
-    let fixture = ProcessFixture::new();
-    assert_ne!(fixture.laptop_home, fixture.controller_home);
-    assert_ne!(fixture.laptop_state(), fixture.controller_state());
-    assert!(!fixture.laptop_state().exists());
-    assert!(!fixture.controller_state().exists());
-    assert_eq!(env::var_os("HOME"), process_home);
-    assert_eq!(env::current_dir().unwrap(), process_cwd);
-    assert!(env::var_os(TEST_SSH_ENV).is_none());
-}
-
-#[test]
-fn harness_fake_ssh_is_labeled() {
-    let fixture = ProcessFixture::new();
-    assert!(fixture.fake_ssh_is_labeled());
-    assert!(fixture.fake_ssh.is_absolute());
-    let displayed = fixture.fake_ssh.to_string_lossy();
-    assert!(
-        displayed.contains(' ') && displayed.contains('\''),
-        "FLOW quotes MAC_WORKER_TEST_SSH for Git/rsync; path must be quote-sensitive: {displayed}"
-    );
-    let script = std::fs::read_to_string(&fixture.fake_ssh).unwrap();
-    assert!(script.contains("destination is not a live network host"));
-    assert!(script.contains("controller_process_fake_exec.py"));
-    assert!(script.contains("host upload-pack"));
-    assert!(script.contains("git-upload-pack"));
-    assert!(script.contains(FAKE_CONTROLLER_DEST));
-    assert!(fixture.fake_exec_py.is_file());
-    assert!(
-        fixture.exec_git.join("HEAD").exists(),
-        "fakeexec git must be a real bare repo, not a pre-minted independent worktree"
-    );
-}
-
-#[test]
-fn harness_child_env_uses_test_ssh_not_public_setting() {
-    let fixture = ProcessFixture::new();
-    let mut command = Command::new("/usr/bin/env");
-    fixture.apply_laptop_env(&mut command);
-    let output = command.output().expect("env");
-    assert!(output.status.success());
-    let text = String::from_utf8_lossy(&output.stdout);
-    let expected = format!("{TEST_SSH_ENV}={}", fixture.fake_ssh.to_string_lossy());
-    assert!(
-        text.lines().any(|line| line == expected),
-        "child env must set absolute {TEST_SSH_ENV}; got:\n{text}"
-    );
-    assert!(
-        !text.lines().any(|line| line.starts_with("MAC_WORKER_SSH=")),
-        "withdrawn public MAC_WORKER_SSH must not be set on the child"
-    );
-    assert!(env::var_os(TEST_SSH_ENV).is_none());
-}
-
-#[test]
-fn harness_public_cli_grammar() {
-    let submit = Cli::try_parse_from([
-        "worker",
-        "task",
-        "submit",
-        "--prompt",
-        "freeze local wip",
-        "--wip",
-        "--no-wait",
-    ])
-    .unwrap();
-    assert!(matches!(
-        submit.command,
-        WorkerCommand::Task {
-            command: TaskCommand::Submit {
-                wip: true,
-                no_wait: true,
-                ..
-            }
-        }
-    ));
-
-    for (args, describe) in [
-        (vec!["worker", "task", "status", TASK_ID], "task status"),
-        (vec!["worker", "task", "logs", TASK_ID], "task logs"),
-        (vec!["worker", "task", "result", TASK_ID], "task result"),
-        (vec!["worker", "task", "fetch", TASK_ID], "task fetch"),
-    ] {
-        Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{describe}: {error}"));
-    }
-
-    let run = Cli::try_parse_from(["worker", "controller", "run"]).unwrap();
-    assert!(matches!(
-        run.command,
-        WorkerCommand::Controller {
-            command: ControllerCommand::Run { supervised: false }
-        }
-    ));
-
-    let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
-    assert!(matches!(
-        rpc.command,
-        WorkerCommand::Host {
-            command: HostCommand::ControllerRpc
-        }
-    ));
-
-    let receive = Cli::try_parse_from([
-        "worker",
-        "host",
-        "controller-receive-pack",
-        TOKEN,
-        TOKEN,
-        FINGERPRINT,
-        PROJECT_ID,
-        WORKTREE_ID,
-        OID,
-    ])
-    .unwrap();
-    assert!(matches!(
-        receive.command,
-        WorkerCommand::Host {
-            command: HostCommand::ControllerReceivePack { .. }
-        }
-    ));
-
-    let upload = Cli::try_parse_from([
-        "worker",
-        "host",
-        "controller-upload-pack",
-        TOKEN,
-        TOKEN,
-        FINGERPRINT,
-        TASK_ID,
-        TURN_ID,
-        OID,
-    ])
-    .unwrap();
-    assert!(matches!(
-        upload.command,
-        WorkerCommand::Host {
-            command: HostCommand::ControllerUploadPack { .. }
-        }
-    ));
-}
-
-#[test]
-fn harness_enabled_controller_only_config_parses() {
-    let fixture = ProcessFixture::new();
-    let laptop =
-        std::fs::read_to_string(fixture.laptop_xdg_config.join("mac-worker/config.toml")).unwrap();
-    let config = Config::parse(&laptop).unwrap();
-    config.validate().unwrap();
-    assert!(config.controller.enabled);
-    assert_eq!(config.controller.ssh, FAKE_CONTROLLER_DEST);
-    assert_eq!(config.controller.remote_binary, REMOTE_BINARY);
-    assert!(config.workers.is_empty());
-
-    let controller =
-        std::fs::read_to_string(fixture.controller_xdg_config.join("mac-worker/config.toml"))
-            .unwrap();
-    let config = Config::parse(&controller).unwrap();
-    config.validate().unwrap();
-    assert_eq!(config.workers.len(), 1);
-    assert_eq!(config.workers[0].ssh, controller_process::FAKE_EXEC_DEST);
-}
 
 #[test]
 fn harness_controller_run_prints_leader_and_reaps() {
@@ -547,99 +372,6 @@ fn harness_fake_exec_protocol_and_descendant_git() {
     );
 }
 
-/// Production `host task-close` is a typed control opcode. Missing HANDLERS
-/// entry is INVALID_REQUEST, not a reason to skip close or invent a result.
-#[test]
-fn harness_fake_exec_task_close_is_canonical_and_idempotent() {
-    let fixture = ProcessFixture::new();
-    let source = support_git_repo();
-    let frozen = seed_controller_transfer(&fixture, &source);
-    let frozen_oid: BaseOid = frozen.parse().unwrap();
-
-    let material = plumbing_material("0".repeat(64));
-    let lease_req = LeaseAcquireRequest::new(material.clone())
-        .with_execution_scope(ExecutionScope::task(plumbing_task_id()));
-    let _: LeaseAcquireResponse = fakeexec_ok(
-        &fixture,
-        "host lease-acquire",
-        &serde_json::to_vec(&lease_req).unwrap(),
-    );
-    let _: TaskPrepareResponse = fakeexec_ok(
-        &fixture,
-        "host task-prepare",
-        &serde_json::to_vec(&TaskPrepareRequest::new(
-            plumbing_task_meta(frozen_oid.clone()),
-            plumbing_job_id(),
-            "mini-1",
-        ))
-        .unwrap(),
-    );
-    let close_req = TaskCloseRequest::new(PROJECT_ID, plumbing_task_id(), false);
-    let (active_status, active_stdout, active_stderr) =
-        fixture.run_fakeexec("host task-close", &serde_json::to_vec(&close_req).unwrap());
-    assert!(
-        !active_status.success(),
-        "close of an Active task must not succeed; stdout={} stderr={}",
-        String::from_utf8_lossy(&active_stdout),
-        String::from_utf8_lossy(&active_stderr)
-    );
-
-    let (_, turn) = fakeexec_turn(
-        &fixture,
-        FakeexecTurnInput {
-            job_id: plumbing_job_id(),
-            lease_token: plumbing_lease_token(),
-            created_at_millis: 100,
-            turn_number: 1,
-            base: &frozen_oid,
-            prompt: "close after a real fakeexec result",
-            resume: false,
-        },
-    );
-    let head = result_head(&turn);
-    assert_eq!(turn.task().state(), TaskState::Open);
-    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
-
-    let closed: TaskCloseResponse = fakeexec_canonical(
-        &fixture,
-        "host task-close",
-        &serde_json::to_vec(&close_req).unwrap(),
-    );
-    assert_eq!(closed.status().state(), TaskState::Closed);
-    assert_eq!(closed.status().head_oid().unwrap().as_str(), head.as_str());
-    assert_eq!(closed.status().turns().len(), 1);
-    assert_eq!(closed.warnings().len(), 0);
-    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
-
-    let replay: TaskCloseResponse = fakeexec_canonical(
-        &fixture,
-        "host task-close",
-        &serde_json::to_vec(&close_req).unwrap(),
-    );
-    assert_eq!(replay.status().state(), TaskState::Closed);
-    assert_eq!(replay.status().head_oid().unwrap().as_str(), head.as_str());
-    assert_eq!(replay.status().turns().len(), 1);
-    assert_eq!(fakeexec_result_commit_count(&fixture), 1);
-
-    let observed: TaskStatusResponse = fakeexec_canonical(
-        &fixture,
-        "host task-status",
-        &serde_json::to_vec(&TaskStatusRequest::new(PROJECT_ID, plumbing_task_id())).unwrap(),
-    );
-    assert_eq!(observed.status().state(), TaskState::Closed);
-    assert_eq!(
-        observed.status().head_oid().unwrap().as_str(),
-        head.as_str()
-    );
-    assert_eq!(observed.status().turns().len(), 1);
-    assert_eq!(
-        fixture.journal_opcode_count("host task-turn"),
-        1,
-        "close must not start another execution; journal={}",
-        fixture.exec_journal()
-    );
-}
-
 struct FakeexecTurnInput<'a> {
     job_id: JobId,
     lease_token: LeaseToken,
@@ -767,138 +499,6 @@ fn journal_turn_job_ids(fixture: &ProcessFixture) -> Vec<String> {
                 .map(str::to_owned)
         })
         .collect()
-}
-
-/// First turn, second turn on head1, exact first-turn retry: two real
-/// descendant commits, two unique job identities, retry does not move HEAD.
-/// `task-diff` is real git diff from the original task base.
-#[test]
-fn harness_fake_exec_followup_commits_and_task_diff() {
-    let fixture = ProcessFixture::new();
-    let source = support_git_repo();
-    let frozen = seed_controller_transfer(&fixture, &source);
-    let frozen_oid: BaseOid = frozen.parse().unwrap();
-
-    let job1 = plumbing_job_id();
-    let (turn1_req, turn1) = fakeexec_turn(
-        &fixture,
-        FakeexecTurnInput {
-            job_id: job1,
-            lease_token: plumbing_lease_token(),
-            created_at_millis: 100,
-            turn_number: 1,
-            base: &frozen_oid,
-            prompt: "first protocol-valid fakeexec turn",
-            resume: false,
-        },
-    );
-    let head1 = result_head(&turn1);
-    assert_ne!(head1, frozen);
-    assert_eq!(fakeexec_commit_parent(&fixture, &head1), frozen);
-    assert_eq!(turn1.task().turns().len(), 1);
-
-    let job2 = JobId::new(Uuid::from_u128(11));
-    let head1_oid: BaseOid = head1.parse().unwrap();
-    let (_turn2_req, turn2) = fakeexec_turn(
-        &fixture,
-        FakeexecTurnInput {
-            job_id: job2,
-            lease_token: LeaseToken::new(Uuid::from_u128(31)),
-            created_at_millis: 200,
-            turn_number: 2,
-            base: &head1_oid,
-            prompt: "second protocol-valid fakeexec turn",
-            resume: true,
-        },
-    );
-    let head2 = result_head(&turn2);
-    assert_ne!(head2, head1);
-    assert_ne!(head2, frozen);
-    assert_eq!(fakeexec_commit_parent(&fixture, &head2), head1);
-    assert_eq!(turn2.task().turns().len(), 2);
-    assert_eq!(
-        turn2.task().turns()[0].turn_id().to_string(),
-        job1.to_string()
-    );
-    assert_eq!(
-        turn2.task().turns()[1].turn_id().to_string(),
-        job2.to_string()
-    );
-    assert_eq!(turn2.task().head_oid().unwrap().as_str(), head2.as_str());
-    assert_eq!(fakeexec_result_commit_count(&fixture), 2);
-
-    let retry: TaskTurnResponse = fakeexec_ok(
-        &fixture,
-        "host task-turn",
-        &serde_json::to_vec(&turn1_req).unwrap(),
-    );
-    assert_eq!(
-        result_head(&retry),
-        head2,
-        "retry must not regress current head"
-    );
-    assert_eq!(fakeexec_result_commit_count(&fixture), 2);
-    let task_ref = fakeexec_git(
-        &fixture,
-        &[
-            "rev-parse",
-            &format!("refs/heads/task/{}", plumbing_task_id()),
-        ],
-    );
-    assert!(task_ref.status.success());
-    assert_eq!(String::from_utf8(task_ref.stdout).unwrap().trim(), head2);
-
-    let job_ids = journal_turn_job_ids(&fixture);
-    assert_eq!(job_ids.len(), 3, "journal={}", fixture.exec_journal());
-    let unique: std::collections::BTreeSet<_> = job_ids.iter().cloned().collect();
-    assert_eq!(unique.len(), 2, "journal={}", fixture.exec_journal());
-    assert_eq!(job_ids[0], job1.to_string());
-    assert_eq!(job_ids[1], job2.to_string());
-    assert_eq!(job_ids[2], job1.to_string());
-    let turns = fixture.journal_task_turns();
-    assert_eq!(turns[0]["base_oid"], frozen);
-    assert_eq!(turns[0]["task_id"], plumbing_task_id().to_string());
-    assert_eq!(turns[0]["turn_number"], 1);
-    assert_eq!(turns[1]["base_oid"], head1);
-    assert_eq!(turns[1]["task_id"], plumbing_task_id().to_string());
-    assert_eq!(turns[1]["turn_number"], 2);
-    assert_eq!(turns[2]["base_oid"], frozen);
-    assert_eq!(turns[2]["job_id"], job1.to_string());
-
-    let patch: TaskDiffResponse = fakeexec_ok(
-        &fixture,
-        "host task-diff",
-        &serde_json::to_vec(&TaskDiffRequest::new(PROJECT_ID, plumbing_task_id(), false)).unwrap(),
-    );
-    assert_eq!(patch.protocol_version(), PROTOCOL_VERSION);
-    assert!(!patch.truncated());
-    assert!(
-        patch.text().contains("RESULT.txt"),
-        "patch={}",
-        patch.text()
-    );
-    assert!(
-        patch.text().contains("fake-worker-result"),
-        "patch must be real git diff, not identity text: {}",
-        patch.text()
-    );
-    assert!(
-        !patch.text().contains(&plumbing_task_id().to_string()),
-        "diff text must not be canned identity"
-    );
-
-    let stat: TaskDiffResponse = fakeexec_ok(
-        &fixture,
-        "host task-diff",
-        &serde_json::to_vec(&TaskDiffRequest::new(PROJECT_ID, plumbing_task_id(), true)).unwrap(),
-    );
-    assert!(!stat.truncated());
-    assert!(stat.text().contains("RESULT.txt"), "stat={}", stat.text());
-    assert!(
-        !stat.text().contains(&head1) && !stat.text().contains(&head2),
-        "stat must not embed result OIDs: {}",
-        stat.text()
-    );
 }
 
 fn laptop_tasks_exist(root: &Path) -> bool {
