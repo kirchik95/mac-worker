@@ -1874,6 +1874,91 @@ impl RunnerExecutor for QuestionsSpawnFailure {
     }
 }
 
+struct QuestionsBoundChildFailure {
+    state: ClientStateStore,
+}
+
+impl RunnerExecutor for QuestionsBoundChildFailure {
+    fn start(
+        &self,
+        _: &mac_worker::paths::PathLayout,
+        _: TaskId,
+        _: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        unreachable!("automatic continuation must reserve a slot")
+    }
+
+    fn start_with_slot(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        token: Option<uuid::Uuid>,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        // Simulate the post-bind failure before complete_runner_spawn has
+        // published child ownership or runner metadata. No real child runs.
+        self.state.bind_runner_slot_child(
+            turn_id,
+            token.unwrap(),
+            InlineRunnerExecutor
+                .start(paths, task_id, turn_id)?
+                .process_identity(),
+        )?;
+        Err(WorkerError::Protocol("post-bind handoff failed".into()))
+    }
+}
+
+#[test]
+fn questions_auto_post_bind_failure_preserves_child_reservation() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    let executor = QuestionsBoundChildFailure {
+        state: fixture.state.clone(),
+    };
+    let report = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    assert_eq!(report.status().state(), TaskState::Active);
+    assert_eq!(report.status().turns().len(), 2);
+    assert_eq!(
+        report.status().turns()[0].outcome(),
+        Some(&TaskOutcome::NeedsInput)
+    );
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert!(
+        record.runner().is_none(),
+        "ownership publication has not happened"
+    );
+    let pending = record.status().turns().last().unwrap();
+    assert!(pending.auto_continue());
+    let entry = fixture
+        .state
+        .queue_entry(pending.turn_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entry.slot_reservation().unwrap().child().as_ref(),
+        entry.owner_opt()
+    );
+    assert!(!entry.is_cancel_requested());
+    assert!(
+        fixture
+            .state
+            .read_turn_prompt(fixture.task_id, pending.turn_id())
+            .is_ok()
+    );
+}
+
 #[test]
 fn questions_auto_spawn_failure_restores_open_finished_turn() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());

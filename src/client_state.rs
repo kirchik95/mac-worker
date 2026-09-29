@@ -1716,7 +1716,9 @@ impl ClientStateStore {
         })
     }
 
-    /// Fence a failed handoff only while its original waiting owner still owns it.
+    /// Fence a failed handoff only while its original waiting owner still owns
+    /// it and no child has been bound to the reservation. Binding precedes
+    /// ownership/runner publication; that child already owns its spawn permit.
     pub(crate) fn cancel_unstarted_handoff(
         &self,
         turn_id: TurnId,
@@ -1729,6 +1731,9 @@ impl ClientStateStore {
             };
             if entry.kind() != QueueEntryKind::TaskTurn
                 || !matches!(entry.state(),QueueState::Waiting{owner:current} if *current==owner)
+                || entry
+                    .slot_reservation()
+                    .is_some_and(|slot| slot.child().is_some())
             {
                 return Ok((None, false));
             }
