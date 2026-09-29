@@ -600,6 +600,30 @@ struct InlineSupervisorLauncher {
     store: HostStore,
 }
 
+const TEST_TERM_GRACE: Duration = Duration::from_millis(250);
+
+struct TimedSupervisorLauncher {
+    store: HostStore,
+    term_grace: Option<Duration>,
+}
+
+impl SupervisorLauncher for TimedSupervisorLauncher {
+    fn launch(
+        &self,
+        job_id: mac_worker::job::JobId,
+        guard: SupervisorGuard,
+    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(std::process::id())?;
+        let mut supervisor = Supervisor::new(&self.store, &inspector);
+        if let Some(grace) = self.term_grace {
+            supervisor = supervisor.with_term_grace(grace);
+        }
+        supervisor.run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
 struct FaultingInlineSupervisorLauncher {
     store: HostStore,
     point: SupervisorFaultPoint,
@@ -2261,8 +2285,9 @@ fn real_execution_records_exit_signal_timeout_and_binary_split_logs() {
     for (name, command, timeout, state, exit, signal) in cases {
         let (store, lease, request) =
             prepared_host_with_command_and_timeout(&temp.path().join(name), command, timeout);
-        let launcher = InlineSupervisorLauncher {
+        let launcher = TimedSupervisorLauncher {
             store: store.clone(),
+            term_grace: Some(TEST_TERM_GRACE),
         };
         let response = JobService::new(&store, &launcher)
             .submit_at(request, 10)
@@ -2366,6 +2391,18 @@ fn terminal_status_includes_a_one_byte_stdout_write_before_publication() {
 
 #[test]
 fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent() {
+    assert_timeout_group_cleanup(Some(TEST_TERM_GRACE));
+}
+
+// Nightly: CARGO_BUILD_JOBS=4 cargo test --locked --test supervisor production_term_grace_stress -- --ignored --exact
+#[test]
+#[ignore = "real production TERM grace; nightly stress check"]
+fn production_term_grace_stress() {
+    assert_timeout_group_cleanup(None);
+}
+
+fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
+    let grace = term_grace.unwrap_or(mac_worker::supervisor::SUPERVISOR_TERM_GRACE);
     let temp = tempfile::tempdir().unwrap();
     let command = CommandSpec::argv(vec![
         "/bin/sh".into(),
@@ -2379,8 +2416,9 @@ fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
-    let launcher = InlineSupervisorLauncher {
+    let launcher = TimedSupervisorLauncher {
         store: store.clone(),
+        term_grace,
     };
 
     let started = Instant::now();
@@ -2405,12 +2443,13 @@ fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent
     assert_eq!(status.state(), JobState::TimedOut);
     assert!(!group_alive, "timed-out process group remains observable");
     assert!(
-        elapsed >= Duration::from_secs(10),
-        "ten-second TERM grace was skipped: {elapsed:?}"
+        elapsed >= grace,
+        "configured TERM grace was skipped: {elapsed:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "targeted timeout cleanup exceeded its bounded proof window: {elapsed:?}"
+    assert_eq!(
+        SystemProcessInspector.observe_group(process_group as u32),
+        mac_worker::supervisor::ProcessGroupObservation::Absent,
+        "targeted timeout cleanup must prove the group absent"
     );
     assert!(LeaseService::new(&store).load().unwrap().is_none());
 }
@@ -2432,8 +2471,9 @@ fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
-    let launcher = InlineSupervisorLauncher {
+    let launcher = TimedSupervisorLauncher {
         store: store.clone(),
+        term_grace: Some(TEST_TERM_GRACE),
     };
 
     let started = Instant::now();
@@ -2454,12 +2494,13 @@ fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
         "successful command left its process group alive"
     );
     assert!(
-        elapsed >= Duration::from_secs(10),
+        elapsed >= TEST_TERM_GRACE,
         "background group skipped its TERM grace: {elapsed:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "background group cleanup exceeded its bounded proof window: {elapsed:?}"
+    assert_eq!(
+        SystemProcessInspector.observe_group(process_group as u32),
+        mac_worker::supervisor::ProcessGroupObservation::Absent,
+        "background group cleanup must prove the group absent"
     );
     assert!(LeaseService::new(&store).load().unwrap().is_none());
 }

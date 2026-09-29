@@ -55,6 +55,37 @@ const SUPERVISOR_IDENTITY_RETRY: Duration = Duration::from_millis(250);
 #[doc(hidden)]
 pub const SUPERVISOR_TERM_GRACE: Duration = Duration::from_secs(10);
 const TERM_GRACE: Duration = SUPERVISOR_TERM_GRACE;
+
+/// In-process supervisor deadlines; defaults retain the production intervals.
+#[derive(Debug, Clone, Copy)]
+pub struct SupervisorTimings {
+    pub term_grace: Duration,
+    pub child_transition_retry: Duration,
+    pub identity_retry: Duration,
+}
+
+impl Default for SupervisorTimings {
+    fn default() -> Self {
+        Self {
+            term_grace: SUPERVISOR_TERM_GRACE,
+            child_transition_retry: CHILD_TRANSITION_RETRY,
+            identity_retry: SUPERVISOR_IDENTITY_RETRY,
+        }
+    }
+}
+
+impl SupervisorTimings {
+    /// Short deadlines for fixtures with controlled child readiness.
+    #[doc(hidden)]
+    pub fn fast() -> Self {
+        Self {
+            term_grace: Duration::from_millis(250),
+            child_transition_retry: Duration::from_millis(50),
+            identity_retry: Duration::from_millis(50),
+        }
+    }
+}
+
 /// After the child exits, wait this long for stdout/stderr EOF before
 /// recording whatever the pumps actually copied. Escaped writers that keep a
 /// pipe open must not block terminal publication forever.
@@ -991,9 +1022,15 @@ pub struct SystemSupervisorLauncher {
     arguments: Vec<CString>,
     environment: Vec<CString>,
     inspector: SystemProcessInspector,
+    timings: SupervisorTimings,
 }
 
 impl SystemSupervisorLauncher {
+    pub fn with_timings(mut self, timings: SupervisorTimings) -> Self {
+        self.timings = timings;
+        self
+    }
+
     pub fn new() -> Result<Self, WorkerError> {
         Self::with_executable(std::env::current_exe()?)
     }
@@ -1055,6 +1092,7 @@ impl SystemSupervisorLauncher {
             arguments,
             environment,
             inspector: SystemProcessInspector,
+            timings: SupervisorTimings::default(),
         })
     }
 }
@@ -1122,7 +1160,7 @@ impl SupervisorLauncher for SystemSupervisorLauncher {
             ));
         }
         let identity =
-            identify_launched_supervisor(pid, &self.inspector, SUPERVISOR_IDENTITY_RETRY)?;
+            identify_launched_supervisor(pid, &self.inspector, self.timings.identity_retry)?;
         drop(guard);
         Ok(LaunchCandidate::new(identity))
     }
@@ -1230,6 +1268,7 @@ pub struct Supervisor<'a> {
     stdout_log_cap: Option<u64>,
     stderr_log_cap: Option<u64>,
     prepare_turn_helper: Option<PathBuf>,
+    timings: SupervisorTimings,
 }
 
 struct SupervisorErrorLog {
@@ -1348,6 +1387,16 @@ pub enum SupervisorFaultPoint {
 }
 
 impl<'a> Supervisor<'a> {
+    pub fn with_timings(mut self, timings: SupervisorTimings) -> Self {
+        self.timings = timings;
+        self
+    }
+
+    pub fn with_term_grace(mut self, term_grace: Duration) -> Self {
+        self.timings.term_grace = term_grace;
+        self
+    }
+
     pub fn new(store: &'a HostStore, inspector: &'a dyn ProcessInspector) -> Self {
         Self {
             store,
@@ -1356,6 +1405,7 @@ impl<'a> Supervisor<'a> {
             stdout_log_cap: None,
             stderr_log_cap: None,
             prepare_turn_helper: None,
+            timings: SupervisorTimings::default(),
         }
     }
 
@@ -1372,6 +1422,7 @@ impl<'a> Supervisor<'a> {
             stdout_log_cap: None,
             stderr_log_cap: None,
             prepare_turn_helper: None,
+            timings: SupervisorTimings::default(),
         }
     }
 
@@ -1882,6 +1933,7 @@ impl<'a> Supervisor<'a> {
                     lease.timeout_millis(),
                     self.inspector,
                     "EXEC_ACK_AMBIGUOUS",
+                    self.timings,
                 )?;
                 drop(guard);
                 return Err(error);
@@ -1924,6 +1976,7 @@ impl<'a> Supervisor<'a> {
                     lease.timeout_millis(),
                     self.inspector,
                     "RUNNING_STATUS_WRITE_FAILED",
+                    self.timings,
                 )?;
                 drop(guard);
                 return Err(error);
@@ -1942,6 +1995,7 @@ impl<'a> Supervisor<'a> {
                 child_identity,
                 remaining_lease_millis(&lease)?,
                 self.inspector,
+                self.timings,
             )?;
             let _ = pumps.stop_and_join();
             return Err(injected_supervisor_fault("running status"));
@@ -1955,6 +2009,7 @@ impl<'a> Supervisor<'a> {
             child_identity,
             remaining_lease_millis(&lease)?,
             self.inspector,
+            self.timings,
         )?;
 
         // Reacquire through the documented admission -> supervisor order.
@@ -2616,6 +2671,7 @@ impl<'a> Supervisor<'a> {
                 child_identity,
                 remaining_lease_millis(lease)?,
                 self.inspector,
+                self.timings,
             )?;
             return Err(injected_supervisor_fault("running status"));
         }
@@ -2627,6 +2683,7 @@ impl<'a> Supervisor<'a> {
             child_identity,
             remaining_lease_millis(lease)?,
             self.inspector,
+            self.timings,
         )?;
         std::thread::sleep(Duration::from_secs(1));
 
@@ -2812,6 +2869,7 @@ impl<'a> Supervisor<'a> {
             child_identity,
             remaining_lease_millis(lease)?,
             self.inspector,
+            self.timings,
         );
         std::thread::sleep(Duration::from_secs(1));
         let pump_result = pump.stop_and_join();
@@ -4133,6 +4191,7 @@ fn wait_for_child(
     identity: ProcessIdentity,
     timeout_millis: u64,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<ChildOutcome, WorkerError> {
     let pid: libc::pid_t = identity
         .pid()
@@ -4143,10 +4202,10 @@ fn wait_for_child(
         .ok_or_else(|| protocol_code("TIMEOUT_INVALID", "child deadline overflow"))?;
     loop {
         if child_is_waitable(pid)? {
-            return complete_waitable_child(identity, inspector);
+            return complete_waitable_child(identity, inspector, timings);
         }
         if Instant::now() >= deadline {
-            return terminate_exact_group(identity, inspector);
+            return terminate_exact_group(identity, inspector, timings);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -4155,6 +4214,7 @@ fn wait_for_child(
 fn complete_waitable_child(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<ChildOutcome, WorkerError> {
     let pid: libc::pid_t = identity
         .pid()
@@ -4171,11 +4231,11 @@ fn complete_waitable_child(
         ProcessGroupMembership::OtherMembers => {
             if unsafe { libc::kill(-pid, libc::SIGTERM) } != 0 {
                 let error = io::Error::last_os_error();
-                if !failed_group_signal_has_only_waitable_leader(identity, inspector)? {
+                if !failed_group_signal_has_only_waitable_leader(identity, inspector, timings)? {
                     return Err(WorkerError::Io(error));
                 }
             } else {
-                let deadline = Instant::now() + TERM_GRACE;
+                let deadline = Instant::now() + timings.term_grace;
                 loop {
                     if !child_is_waitable(pid)? {
                         return Err(protocol_code(
@@ -4192,7 +4252,7 @@ fn complete_waitable_child(
                             if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
                                 let error = io::Error::last_os_error();
                                 if !failed_group_signal_has_only_waitable_leader(
-                                    identity, inspector,
+                                    identity, inspector, timings,
                                 )? {
                                     return Err(WorkerError::Io(error));
                                 }
@@ -4217,25 +4277,26 @@ fn complete_waitable_child(
         }
     }
     let outcome = wait_blocking(pid)?;
-    wait_for_terminated_group_absence(identity, inspector)?;
+    wait_for_terminated_group_absence(identity, inspector, timings)?;
     Ok(outcome)
 }
 
 fn terminate_exact_group(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<ChildOutcome, WorkerError> {
     let pid = identity.pid();
-    match wait_for_owned_child_state(identity, inspector, CHILD_TRANSITION_RETRY)? {
-        OwnedChildState::Waitable => return complete_waitable_child(identity, inspector),
+    match wait_for_owned_child_state(identity, inspector, timings.child_transition_retry)? {
+        OwnedChildState::Waitable => return complete_waitable_child(identity, inspector, timings),
         OwnedChildState::MatchingGroup => {}
         OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     }
     if unsafe { libc::kill(-(pid as i32), libc::SIGTERM) } != 0 {
         let error = WorkerError::Io(io::Error::last_os_error());
-        return reconcile_failed_group_signal(identity, inspector, error);
+        return reconcile_failed_group_signal(identity, inspector, error, timings);
     }
-    let deadline = Instant::now() + TERM_GRACE;
+    let deadline = Instant::now() + timings.term_grace;
     let final_state = loop {
         // An exact waitid(P_PID, ..., WNOWAIT) event retains this child as a
         // waitable zombie. Its PID cannot be reused before we reap it, so the
@@ -4246,7 +4307,7 @@ fn terminate_exact_group(
         if Instant::now() >= deadline {
             break match state {
                 OwnedChildState::Transitioning => {
-                    wait_for_owned_child_state(identity, inspector, CHILD_TRANSITION_RETRY)?
+                    wait_for_owned_child_state(identity, inspector, timings.child_transition_retry)?
                 }
                 observed => observed,
             };
@@ -4269,12 +4330,12 @@ fn terminate_exact_group(
     };
     if should_kill && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
         let error = io::Error::last_os_error();
-        if !failed_group_signal_has_only_waitable_leader(identity, inspector)? {
+        if !failed_group_signal_has_only_waitable_leader(identity, inspector, timings)? {
             return Err(WorkerError::Io(error));
         }
     }
     wait_blocking(pid as libc::pid_t)?;
-    wait_for_terminated_group_absence(identity, inspector)?;
+    wait_for_terminated_group_absence(identity, inspector, timings)?;
     Ok(ChildOutcome::TimedOut)
 }
 
@@ -4282,9 +4343,10 @@ fn reconcile_failed_group_signal(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
     original: WorkerError,
+    timings: SupervisorTimings,
 ) -> Result<ChildOutcome, WorkerError> {
-    match wait_after_failed_group_signal(identity, inspector)? {
-        OwnedChildState::Waitable => complete_waitable_child(identity, inspector),
+    match wait_after_failed_group_signal(identity, inspector, timings)? {
+        OwnedChildState::Waitable => complete_waitable_child(identity, inspector, timings),
         OwnedChildState::MatchingGroup => Err(original),
         OwnedChildState::Transitioning => unreachable!("bounded ownership wait returns a state"),
     }
@@ -4293,8 +4355,9 @@ fn reconcile_failed_group_signal(
 fn failed_group_signal_has_only_waitable_leader(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<bool, WorkerError> {
-    match wait_after_failed_group_signal(identity, inspector)? {
+    match wait_after_failed_group_signal(identity, inspector, timings)? {
         OwnedChildState::Waitable => match inspector.observe_group_members(identity.pid()) {
             ProcessGroupMembership::LeaderOnly => Ok(true),
             ProcessGroupMembership::OtherMembers => Ok(false),
@@ -4311,9 +4374,10 @@ fn failed_group_signal_has_only_waitable_leader(
 fn wait_after_failed_group_signal(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<OwnedChildState, WorkerError> {
     let deadline = Instant::now()
-        .checked_add(CHILD_TRANSITION_RETRY)
+        .checked_add(timings.child_transition_retry)
         .ok_or_else(|| protocol_code("CHILD_IDENTITY_AMBIGUOUS", "identity deadline overflow"))?;
     loop {
         let state = observe_owned_child_state(identity, inspector)?;
@@ -4375,8 +4439,9 @@ fn wait_for_owned_child_state(
 fn wait_for_terminated_group_absence(
     identity: ProcessIdentity,
     inspector: &dyn ProcessInspector,
+    timings: SupervisorTimings,
 ) -> Result<(), WorkerError> {
-    let deadline = Instant::now() + TERM_GRACE;
+    let deadline = Instant::now() + timings.term_grace;
     loop {
         let leader = inspector.observe(identity);
         let group = inspector.observe_group(identity.pid());
@@ -4551,8 +4616,9 @@ fn finish_ambiguous_child(
     timeout_millis: u64,
     inspector: &dyn ProcessInspector,
     code: &str,
+    timings: SupervisorTimings,
 ) -> Result<JobStatus, WorkerError> {
-    let _ = wait_for_child(child_identity, timeout_millis, inspector)?;
+    let _ = wait_for_child(child_identity, timeout_millis, inspector, timings)?;
     let _ = pumps.stop_and_join();
     let stdout = job.open_private_append("stdout.log")?;
     let stderr = job.open_private_append("stderr.log")?;
@@ -5647,7 +5713,11 @@ mod tests {
             }
             wait_blocking(self.leader)?;
             self.armed = false;
-            wait_for_terminated_group_absence(identity, &SystemProcessInspector)
+            wait_for_terminated_group_absence(
+                identity,
+                &SystemProcessInspector,
+                SupervisorTimings::default(),
+            )
         }
 
         fn cleanup_unbound_child(&mut self, anchor: RawChildAnchor) -> Result<(), WorkerError> {
@@ -6731,7 +6801,7 @@ mod tests {
                     triggered: AtomicBool::new(false),
                 };
 
-                let result = wait_for_child(identity, 0, &inspector);
+                let result = wait_for_child(identity, 0, &inspector, SupervisorTimings::default());
                 cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
@@ -6763,12 +6833,12 @@ mod tests {
                 };
                 let started = Instant::now();
 
-                let result = wait_for_child(identity, 0, &inspector);
+                let result = wait_for_child(identity, 0, &inspector, SupervisorTimings::fast());
                 cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
                 assert!(
-                    started.elapsed() >= TERM_GRACE,
+                    started.elapsed() >= SupervisorTimings::fast().term_grace,
                     "full TERM grace was skipped"
                 );
                 assert_eq!(
@@ -6810,13 +6880,13 @@ mod tests {
                 };
                 let started = Instant::now();
 
-                let result = wait_for_child(identity, 0, &inspector);
+                let result = wait_for_child(identity, 0, &inspector, SupervisorTimings::fast());
                 releaser.join().unwrap();
                 cleanup.finish().unwrap();
 
                 assert_eq!(result.unwrap(), ChildOutcome::TimedOut);
                 assert!(
-                    started.elapsed() >= TERM_GRACE,
+                    started.elapsed() >= SupervisorTimings::fast().term_grace,
                     "successful TERM did not retain ownership through the full grace"
                 );
                 assert_eq!(
@@ -6866,6 +6936,7 @@ mod tests {
                     identity,
                     &SystemProcessInspector,
                     WorkerError::Io(io::Error::from_raw_os_error(libc::ESRCH)),
+                    SupervisorTimings::default(),
                 );
                 releaser.join().unwrap();
                 cleanup.finish().unwrap();
@@ -7126,7 +7197,13 @@ mod tests {
 
         assert!(matches!(error, ExecStartError::Ambiguous(_)));
         assert_eq!(
-            wait_for_child(child.identity(), 1_000, &SystemProcessInspector).unwrap(),
+            wait_for_child(
+                child.identity(),
+                1_000,
+                &SystemProcessInspector,
+                SupervisorTimings::default()
+            )
+            .unwrap(),
             ChildOutcome::Exited(0)
         );
         assert!(marker.exists());
@@ -7268,7 +7345,13 @@ mod tests {
         .unwrap();
 
         child.allow_exec(None).unwrap();
-        let outcome = wait_for_child(child.identity(), 1_000, &SystemProcessInspector).unwrap();
+        let outcome = wait_for_child(
+            child.identity(),
+            1_000,
+            &SystemProcessInspector,
+            SupervisorTimings::default(),
+        )
+        .unwrap();
         drop(planted_descriptor);
         planted.sync_all().unwrap();
 
@@ -7432,6 +7515,7 @@ mod tests {
             child.identity(),
             turn_timeout_millis,
             &SystemProcessInspector,
+            SupervisorTimings::default(),
         )
         .unwrap();
         GatedSetupFixture {

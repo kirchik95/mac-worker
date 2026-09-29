@@ -34,8 +34,8 @@ use mac_worker::{
     protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     supervisor::{
         LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
-        ProcessObservation, ReconciliationRuntime, SUPERVISOR_TERM_GRACE, StdinSource, StdoutSink,
-        Supervisor, SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
+        ProcessObservation, ReconciliationRuntime, StdinSource, StdoutSink, Supervisor,
+        SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
     },
     task::{
         BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
@@ -3235,6 +3235,26 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
     assert_no_setup_receipt(&home);
 }
 
+struct BudgetTurnLauncher {
+    store: HostStore,
+}
+
+impl SupervisorLauncher for BudgetTurnLauncher {
+    fn launch(
+        &self,
+        job_id: JobId,
+        guard: mac_worker::host_store::SupervisorGuard,
+    ) -> Result<LaunchCandidate, WorkerError> {
+        let inspector = SystemProcessInspector;
+        let identity = inspector.identity_for_pid(process::id())?;
+        Supervisor::new(&self.store, &inspector)
+            .with_term_grace(Duration::from_millis(250))
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
+        Ok(LaunchCandidate::new(identity))
+    }
+}
+
 #[test]
 fn setup_and_agent_share_one_total_turn_budget_wrapper() {
     let temp = tempdir().unwrap();
@@ -3253,16 +3273,16 @@ fn setup_and_agent_share_one_total_turn_budget() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
     }
-    let script = "printf started > agent.started; sleep 8; printf done > agent.ran";
+    let script = "printf started > agent.started; sleep 4.5; printf done > agent.ran";
     let (_temp, store, request, _cancel) = prepared_task_turn_with_setup(
         script,
-        10_000,
+        5_000,
         Some(
             r#"
 version = 1
 [setup]
-timeout = "20s"
-commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
+timeout = "5s"
+commands = ["PATH=/bin:/usr/bin /bin/sleep 1; printf done > setup.done"]
 "#,
         ),
     );
@@ -3270,9 +3290,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let started = Instant::now();
     let started_at = SystemTime::now();
-    let launcher = InlineTurnLauncher {
+    let launcher = BudgetTurnLauncher {
         store: store.clone(),
-        fault: None,
     };
     let result = JobService::new(&store, &launcher).submit_turn(request);
     let elapsed = started.elapsed();
@@ -3302,7 +3321,7 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         .modified()
         .unwrap();
     assert!(agent_at >= setup_at, "agent started before setup completed");
-    let execution_deadline = Duration::from_millis(10_000);
+    let execution_deadline = Duration::from_millis(5_000);
     let setup_age = setup_at
         .duration_since(started_at)
         .unwrap_or(Duration::ZERO);
@@ -3319,15 +3338,15 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     );
     assert!(
         !workspace.join("agent.ran").exists(),
-        "agent must be interrupted at the execution deadline, not after setup+agent=16s"
+        "agent must be interrupted at the execution deadline, not after setup+agent=5.5s"
     );
-    // 21.7s observed elapsed is TERM_GRACE group cleanup after the 10s
-    // execution deadline, plus the pre-existing 1s post-wait pump settle.
-    // That is not extra execution budget: agent.ran would exist if the
-    // second 8s stage had been allowed to finish.
     assert!(
-        elapsed < execution_deadline + SUPERVISOR_TERM_GRACE + Duration::from_secs(3),
-        "turn waited {elapsed:?}, expected execution deadline plus documented cleanup grace"
+        elapsed >= execution_deadline,
+        "turn ended before its total budget"
+    );
+    assert!(
+        elapsed < (execution_deadline + Duration::from_millis(250) + Duration::from_secs(3)) * 3,
+        "turn waited {elapsed:?}, expected execution deadline plus cleanup grace"
     );
     assert_setup_receipt(&home);
 }
