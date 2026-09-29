@@ -2067,10 +2067,14 @@ fn questions_auto_prompt_failure_keeps_finished_turn_open_and_logs_only_code() {
     .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
     .map(|path| fs::read_to_string(path).unwrap())
     .collect::<Vec<_>>();
-    assert!(
-        diagnostic_logs
-            .iter()
-            .any(|text| text == "AUTO_CONTINUE_FAILED\n")
+    assert_eq!(
+        diagnostic_logs.len(),
+        1,
+        "a prompt failure must not create an unevidenced continuation journal"
+    );
+    assert_eq!(
+        fixture.state.turn_ids_for_task(fixture.task_id).unwrap(),
+        vec![fixture.turn_id]
     );
     assert!(
         fixture
@@ -2082,6 +2086,89 @@ fn questions_auto_prompt_failure_keeps_finished_turn_open_and_logs_only_code() {
 }
 
 struct QuestionsSpawnFailure;
+
+struct QuestionsStagingFailure {
+    state: Mutex<Option<ClientStateStore>>,
+    checkpoint: PathBuf,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for QuestionsStagingFailure {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point != ClientStateConcurrencyPoint::BeforeTaskMutation {
+            return;
+        }
+        let completed = fs::read(&self.checkpoint)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| !value["committed"]["completion"].is_null());
+        if completed && !self.used.swap(true, Ordering::SeqCst) {
+            self.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .inject_write_failure_once(ClientStateWritePoint::BeforeTaskRollbackUpdate);
+        }
+    }
+}
+
+#[test]
+fn questions_auto_staging_failure_does_not_create_unprepared_journal() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    let hook = Arc::new(QuestionsStagingFailure {
+        state: Mutex::new(None),
+        used: AtomicBool::new(false),
+        checkpoint: fixture
+            .paths
+            .state
+            .join("runners")
+            .join(fixture.task_id.to_string())
+            .join(format!("{}.checkpoint.json", fixture.turn_id)),
+    });
+    let state =
+        ClientStateStore::open_with_concurrency_hook(&fixture.paths.state, hook.clone()).unwrap();
+    *hook.state.lock().unwrap() = Some(state.clone());
+    let report = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap();
+    *hook.state.lock().unwrap() = None;
+    assert!(hook.used.load(Ordering::SeqCst));
+    assert_eq!(report.status().state(), TaskState::Open);
+    assert_eq!(report.status().turns().len(), 1);
+    assert_eq!(
+        state.turn_ids_for_task(fixture.task_id).unwrap(),
+        vec![fixture.turn_id]
+    );
+    let paths = fs::read_dir(
+        fixture
+            .paths
+            .state
+            .join("runners")
+            .join(fixture.task_id.to_string()),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.to_string_lossy().ends_with(".checkpoint.json"))
+            .count(),
+        1
+    );
+}
 
 impl RunnerExecutor for QuestionsSpawnFailure {
     fn start(

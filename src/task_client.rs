@@ -159,7 +159,8 @@ pub(crate) fn log_auto_continue_failure(
     finished: TurnId,
     attempted: TurnId,
 ) -> Result<(), WorkerError> {
-    let Some(mut log) = crate::runner_log::RunnerLog::try_open(&paths.state, task_id, attempted)?
+    let Some(mut log) =
+        crate::runner_log::RunnerLog::try_open_existing(&paths.state, task_id, attempted)?
     else {
         return Ok(());
     };
@@ -3675,19 +3676,21 @@ impl<'a> TaskClient<'a> {
     ) -> Result<(), WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
+        // A preparation/prompt failure may precede all turn evidence. Do not
+        // create a journal for such an attempt merely to compensate it.
+        if self
+            .client_state
+            .read_turn_prepared_binding(task_id, turn_id)?
+            != prepared.binding()
+        {
+            return Ok(());
+        }
         let Some(log) =
             crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, turn_id)?
         else {
             return Ok(());
         };
         if log.is_accepted() || log.completion().is_some() {
-            return Ok(());
-        }
-        if self
-            .client_state
-            .read_turn_prepared_binding(task_id, turn_id)?
-            != prepared.binding()
-        {
             return Ok(());
         }
         let current = self.client_state.load_task(task_id)?;
