@@ -2471,6 +2471,7 @@ fn herdr_reporter_marks_the_turn_unavailable_without_a_socket_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn herdr_reporter_marks_the_turn_unavailable_without_a_socket() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -2514,6 +2515,7 @@ fn a_turn_without_the_flag_never_touches_herdr_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn a_turn_without_the_flag_never_touches_herdr() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -2686,6 +2688,7 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -2878,6 +2881,7 @@ fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -3010,6 +3014,7 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -3105,6 +3110,7 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn supervisor_death_during_setup_does_not_start_a_second_heavy_job() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;

@@ -329,6 +329,7 @@ pub fn run_subprocess_test(
     command
         .arg("--exact")
         .arg(test_name)
+        .arg("--include-ignored")
         .arg("--nocapture")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

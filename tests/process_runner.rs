@@ -353,6 +353,7 @@ fn isolate_parent_environment_rejects_parent_only_credentials_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn isolate_parent_environment_rejects_parent_only_credentials() {
     if skip_unless_subtest() {
         return;

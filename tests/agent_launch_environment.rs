@@ -134,6 +134,7 @@ fn refresh_facts_uses_supplied_home_not_process_home_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn refresh_facts_uses_supplied_home_not_process_home() {
     if skip_unless_subtest() {
         return;
@@ -355,6 +356,7 @@ fn non_isolated_runner_still_inherits_parent_credentials_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn non_isolated_runner_still_inherits_parent_credentials() {
     if skip_unless_subtest() {
         return;

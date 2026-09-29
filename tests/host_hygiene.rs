@@ -197,6 +197,7 @@ fn hung_herdr_close_releases_host_locks_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn hung_herdr_close_releases_host_locks() {
     if agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -265,6 +266,7 @@ fn herdr_close_error_does_not_change_the_task_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn herdr_close_error_does_not_change_the_task() {
     if agent_launch_fixture::skip_unless_subtest() {
         return;
@@ -306,6 +308,7 @@ fn hung_herdr_sweep_releases_the_installation_lock_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn hung_herdr_sweep_releases_the_installation_lock() {
     if agent_launch_fixture::skip_unless_subtest() {
         return;
