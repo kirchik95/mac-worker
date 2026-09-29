@@ -230,11 +230,13 @@ printf '%s\n' '{output}'
                 let home = fixture(
                     argv,
                     &format!(
-                        "printf '%s' $$ > \"$HOME/leader.pid\"\nhead -c 8192 /dev/zero{redirect}\nsleep 60"
+                        "printf '%s' $$ > \"$HOME/leader.pid\"\nhead -c 8192 /dev/zero{redirect}\nexec sleep 60"
                     ),
                 );
                 let started = Instant::now();
                 // A long deadline, so returning early proves the overflow killed the group.
+                // `exec` keeps the fixture from forking while the group is killed; a
+                // child forked during killpg could miss the signal and hold the pipes.
                 assert!(
                     discover(
                         home.path(),
