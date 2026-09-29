@@ -2262,9 +2262,7 @@ impl ClientStateConcurrencyHook for QuestionsRetirementFault {
     }
 }
 
-#[test]
-fn questions_auto_recovers_after_finished_row_retirement_crash() {
-    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+fn questions_pending_intent_fixture() -> AcceptedThenTerminalFixture {
     let fixture = questions_fixture(
         mac_worker::task::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
@@ -2292,6 +2290,13 @@ fn questions_auto_recovers_after_finished_row_retirement_crash() {
     assert!(hook.used.load(Ordering::SeqCst));
     *hook.state.lock().unwrap() = None;
     drop(state);
+    fixture
+}
+
+#[test]
+fn questions_auto_recovers_after_finished_row_retirement_crash() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_pending_intent_fixture();
 
     let reopened = ClientStateStore::open(&fixture.paths.state).unwrap();
     assert!(
@@ -2359,6 +2364,190 @@ fn questions_auto_recovers_after_finished_row_retirement_crash() {
             .status()
             .turns(),
         resumed.status().turns()
+    );
+}
+
+#[test]
+fn questions_human_say_overrides_pending_intent_before_reconciliation() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for prepared_path in [false, true] {
+        let fixture = questions_pending_intent_fixture();
+        let before = fixture.state.load_task(fixture.task_id).unwrap();
+        let automatic: mac_worker::prepared_followup::PreparedFollowup = serde_json::from_value(
+            serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
+        )
+        .unwrap();
+        let client = TaskClient::new(
+            &fixture.runner,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        );
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                fixture
+                    .paths
+                    .state
+                    .join("runners")
+                    .join(fixture.task_id.to_string())
+                    .join(format!("{}.log", fixture.turn_id)),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let busy = client
+            .say(
+                fixture.task_id,
+                "human answer".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(busy.public_code(), "TASK_BUSY");
+        assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);
+        drop(held);
+        let report = if prepared_path {
+            let prepared = mac_worker::prepared_followup::PreparedFollowup::prepare(
+                &before,
+                "Use the human's answer".into(),
+                TurnId::generate(),
+                before.status().updated_at_millis() + 1,
+            )
+            .unwrap();
+            client.say_prepared(&prepared, false, &mut Vec::new(), &mut Vec::new())
+        } else {
+            client.say(
+                fixture.task_id,
+                "Use the human's answer".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        }
+        .unwrap();
+        assert_eq!(report.status().state(), TaskState::Active);
+        assert_eq!(report.status().turns().len(), 2);
+        let human = report.status().turns().last().unwrap();
+        assert!(!human.auto_continue());
+        assert_ne!(human.turn_id(), automatic.turn_id());
+        assert_eq!(report.status().turns()[0], before.status().turns()[0]);
+        assert!(
+            fixture
+                .state
+                .read_turn_prompt(fixture.task_id, human.turn_id())
+                .unwrap()
+                .contains("Use the human's answer")
+        );
+        client.reconcile_runners().unwrap();
+        let after = fixture.state.load_task(fixture.task_id).unwrap();
+        assert_eq!(after.status().turns(), report.status().turns());
+        assert!(
+            serde_json::to_value(after)
+                .unwrap()
+                .get("auto_continue_intent")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .queue_entry(automatic.turn_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn questions_human_cancel_clears_pending_intent_and_fences_stale_automatic_say() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for expected_path in [false, true] {
+        let fixture = questions_pending_intent_fixture();
+        let before = fixture.state.load_task(fixture.task_id).unwrap();
+        let automatic: mac_worker::prepared_followup::PreparedFollowup = serde_json::from_value(
+            serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
+        )
+        .unwrap();
+        let client = TaskClient::new(
+            &fixture.runner,
+            &fixture.config,
+            &fixture.paths,
+            &fixture.state,
+            &fixture.executor,
+        );
+        if expected_path {
+            client.cancel_from_expected(&before)
+        } else {
+            client.cancel(fixture.task_id)
+        }
+        .unwrap();
+        let after = fixture.state.load_task(fixture.task_id).unwrap();
+        assert_eq!(after.status(), before.status());
+        assert!(
+            serde_json::to_value(after)
+                .unwrap()
+                .get("auto_continue_intent")
+                .is_none()
+        );
+        assert!(
+            client
+                .say_prepared(&automatic, false, &mut Vec::new(), &mut Vec::new())
+                .is_err(),
+            "cancelled intent must not be revived by a stale preparation"
+        );
+        client.reconcile_runners().unwrap();
+        assert_eq!(
+            fixture.state.load_task(fixture.task_id).unwrap().status(),
+            before.status()
+        );
+        assert!(
+            fixture
+                .state
+                .queue_entry_for_task_turn(fixture.task_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn questions_human_say_racing_after_materialization_is_busy_without_duplicate() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_pending_intent_fixture();
+    let client = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    );
+    client.tick_selected_recovery().unwrap();
+    let before = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(before.status().state(), TaskState::Active);
+    assert!(before.status().turns().last().unwrap().auto_continue());
+    let error = client
+        .say(
+            fixture.task_id,
+            "human answer".into(),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .turns(),
+        before.status().turns()
     );
 }
 

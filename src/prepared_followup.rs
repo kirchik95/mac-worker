@@ -53,9 +53,10 @@ impl PreparedFollowup {
         turn_id: TurnId,
         created_at_millis: u64,
     ) -> Result<Self, WorkerError> {
-        if expected.auto_continue_intent().is_some() {
-            return Err(task_error("TASK_BUSY", "automatic continuation is pending"));
-        }
+        // A human's preparation freezes the finished task, not the automatic
+        // answer it will supersede. Live intent removal belongs to say's CAS.
+        let without_automatic = expected.with_auto_continue_intent(None)?;
+        let expected = &without_automatic;
         match expected.status().state() {
             TaskState::Active => {
                 return Err(task_error("TASK_BUSY", "task has an active turn"));

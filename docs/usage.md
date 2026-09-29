@@ -92,6 +92,8 @@ If a `decide` turn still returns `needs_input`, the runner starts one detached c
 
 Attached `submit --wait` and `say --wait` also wait for any automatic continuation to become quiescent and return its final status and exit code.
 
+Before an automatic continuation has materialized, a human `say` replaces the pending automatic answer, and `task cancel` removes that pending answer while preserving the finished turn. A runner still finalizing the previous turn keeps its ownership fence; retry after it settles. If the automatic turn has already started, ordinary `say` reports that the task is active.
+
 The controller submit field is omitted when no override is configured, preserving default submits to older controllers. Explicit questions overrides require an upgraded controller; an older strict controller rejects that opt-in field. When the field is absent, the composing controller resolves its project setting and default.
 
 When a replacement runner exits, its journal line distinguishes whether the worker accepted the turn. `exited: <code> …` is the pre-acceptance form: the worker did not accept that turn, so `worker task reconcile` can retry the handoff. `exited after acceptance: <code> …` means the journal already records acceptance; `worker task reconcile` resumes that turn from its committed offsets instead of submitting it again. After the post-acceptance form, inspect the worker with `worker workers --refresh`, especially if the job or its logs may have disappeared. Both lines are passed through `worker task logs` verbatim.

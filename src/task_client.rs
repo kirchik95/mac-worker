@@ -3512,6 +3512,11 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
+        let record = self.client_state.load_task(task_id)?;
+        if record.auto_continue_intent().is_some() {
+            // Reconciliation would launch the answer the human is replacing.
+            return self.say_from_expected(&record, message, attached, stdout, stderr);
+        }
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
         self.say_from_expected(&record, message, attached, stdout, stderr)
@@ -3532,6 +3537,92 @@ impl<'a> TaskClient<'a> {
             current_time_millis()?,
         )?;
         self.say_prepared(&prepared, attached, stdout, stderr)
+    }
+
+    fn clear_auto_continue_for_human(
+        &self,
+        expected: &LocalTaskRecord,
+    ) -> Result<Option<LocalTaskRecord>, WorkerError> {
+        let task_id = expected.meta().task_id();
+        let current = self.client_state.load_task(task_id)?;
+        let Some(intent) = current.auto_continue_intent() else {
+            return Ok(None);
+        };
+        let finished = intent
+            .expected()
+            .status()
+            .turns()
+            .last()
+            .map(TurnSummary::turn_id);
+        if !operator_revision_matches(&current, expected)
+            || current.status().turns().last().map(TurnSummary::turn_id) != finished
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before human follow-up",
+            ));
+        }
+        let Some(finished) = finished else {
+            return Err(task_error(
+                "TASK_INCONSISTENT",
+                "automatic continuation has no finished turn",
+            ));
+        };
+        if current.runner().is_some()
+            || self
+                .client_state
+                .queue_entry_for_task_turn(task_id)?
+                .is_some()
+        {
+            return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
+        }
+        let Some(log) =
+            crate::runner_log::RunnerLog::try_open_existing(&self.paths.state, task_id, finished)?
+        else {
+            return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
+        };
+        if log.completion().is_none() {
+            return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
+        }
+        // The same journal fence as the auto runner/reconciler, then the same
+        // expected-turn mutation. Never clear a newer turn or its reservation.
+        let cleared = self
+            .client_state
+            .mutate_task(task_id, Some(finished), |record| {
+                if !operator_revision_matches(record, expected)
+                    || record.auto_continue_intent() != Some(intent)
+                {
+                    return Err(task_error(
+                        "TASK_REVISION_CONFLICT",
+                        "task changed before human follow-up",
+                    ));
+                }
+                record.with_auto_continue_intent(None)
+            })?;
+        Ok(Some(cleared))
+    }
+
+    fn resolve_followup_intent(
+        &self,
+        prepared: &PreparedFollowup,
+        current: LocalTaskRecord,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        if prepared.auto_continue() {
+            if current.auto_continue_intent() != Some(prepared) {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "automatic continuation was superseded",
+                ));
+            }
+            Ok(current)
+        } else if current.auto_continue_intent().is_some() {
+            match self.clear_auto_continue_for_human(prepared.expected())? {
+                Some(cleared) => Ok(cleared),
+                None => self.client_state.load_task(prepared.task_id()),
+            }
+        } else {
+            Ok(current)
+        }
     }
 
     /// Replay the frozen automatic say after publication and queue retirement.
@@ -3652,15 +3743,10 @@ impl<'a> TaskClient<'a> {
         }
         prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
-        if current
-            .auto_continue_intent()
-            .is_some_and(|intent| intent != prepared)
-        {
-            return Err(task_error("TASK_BUSY", "automatic continuation is pending"));
-        }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
+        let current = self.resolve_followup_intent(prepared, current)?;
         if !operator_revision_matches(&current, expected) {
             return Err(task_error(
                 "TASK_REVISION_CONFLICT",
@@ -3732,15 +3818,24 @@ impl<'a> TaskClient<'a> {
                 .with_auto_continue_intent(None)?
                 .with_abandon_code(None)
         };
-        let active_record = build_active(expected)?;
+        // Automatic publication must compare the record WITH its still-live
+        // intent; comparing the frozen intent-free snapshot could resurrect an
+        // answer after a human cancelled it.
+        let cas_base = if prepared.auto_continue() {
+            &current
+        } else {
+            expected
+        };
+        let active_record = build_active(cas_base)?;
         let committed = if self
             .client_state
-            .update_task_if_current(expected, active_record.clone())?
+            .update_task_if_current(cas_base, active_record.clone())?
         {
             active_record
         } else {
             let current = self.client_state.load_task(task_id)?;
             if operator_revision_matches(&current, expected) {
+                let current = self.resolve_followup_intent(prepared, current)?;
                 let rebased = build_active(&current)?;
                 if !self
                     .client_state
@@ -4190,6 +4285,10 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn cancel(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
+        let record = self.client_state.load_task(task_id)?;
+        if record.auto_continue_intent().is_some() {
+            return self.cancel_from_expected(&record);
+        }
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
         self.cancel_from_expected(&record)
@@ -4236,6 +4335,11 @@ impl<'a> TaskClient<'a> {
                 "TASK_REVISION_CONFLICT",
                 "task changed before cancel",
             ));
+        }
+        if current.auto_continue_intent().is_some()
+            && let Some(cleared) = self.clear_auto_continue_for_human(expected)?
+        {
+            return self.report_from_record(&cleared);
         }
         let record = current;
         let turn_id = expected_turn;
