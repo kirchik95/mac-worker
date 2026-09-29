@@ -54,7 +54,7 @@ worker task batch    FILE [--name NAME] [--max-parallel N] [--wait | --preview]
 worker task list     [--run ID|NAME] [--state open] [--outcome needs-input]
 worker task status   <id> [--full]     worker task logs <id> [-f]     worker task diff <id> --stat
 worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
-worker task say      <id> (--message TEXT | --message-file PATH) [--wait]
+worker task say      <id> (--message TEXT | --message-file PATH) [--interrupt] [--wait]
 worker task result   <id>          worker task fetch <id>
 worker task cancel   <id>          worker task close <id> [--discard]
 worker task reconcile              # re-own dead runners, re-queue orphaned turns; may launch already-frozen eligible DAG children
@@ -62,6 +62,8 @@ worker gc [--apply]                # preview, then reclaim old tasks, branches, 
 ```
 
 Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
+
+`worker task say --interrupt` stops a queued or running turn, waits until that turn is terminal, then continues the same agent session and workspace with the new message. Files the cancelled turn already wrote in the workspace stay there for the next turn. With no queued or running turn, `--interrupt` is the same as `say`. If the cancel fails, the follow-up is not sent. `--wait` waits for the new turn.
 
 `worker task batch FILE --preview` validates the file and prints the plan (`dag.status = "enforced"`). It does not open client state or dispatch. `--preview` conflicts with `--wait`. Submit of a named graph (`depends_on` or `base = "from:<id>"`) freezes that run and launches eligible roots; invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run. Independent batches (empty `depends_on` and no `from:`) keep today's create-run-and-submit path.
 
