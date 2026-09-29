@@ -124,7 +124,8 @@ fn discover_with_environment(
     request.policy = ProcessPolicy {
         stdout_limit: 1024 * 1024,
         stderr_limit: 64 * 1024,
-        deadline: Duration::from_secs(10),
+        // mini-3 takes 8.5–9.3 s warm / 10.4 s cold; outer SSH deadline is 30 s.
+        deadline: Duration::from_secs(20),
     };
     exchange(&request, &scratch.0)
 }

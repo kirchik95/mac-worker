@@ -17,6 +17,26 @@ fn store(home: &Path) -> NativeAgentSettingsStore {
 }
 
 #[test]
+fn claude_catalog_includes_haiku_after_sonnet_without_extra_aliases() {
+    let home = tempdir().unwrap();
+    let settings = store(home.path()).read("claude").unwrap();
+    assert_eq!(
+        settings
+            .model_options
+            .iter()
+            .map(|option| (option.id.as_str(), option.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("fable", "Fable"),
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku")
+        ]
+    );
+    assert_eq!(settings.model_catalog_source, None);
+}
+
+#[test]
 fn cursor_preserves_each_native_reasoning_parameter_when_reading_saving_and_clearing() {
     for parameter_id in ["effort", "reasoning", "reasoning_effort"] {
         let home = tempdir().unwrap();
@@ -1282,7 +1302,7 @@ fn codex_catalog_retains_hidden_current_model_at_the_option_bound() {
     )
     .unwrap();
     let mut models = Vec::new();
-    for index in 0..64 {
+    for index in 0..128 {
         models.push(serde_json::json!({
             "slug": format!("visible-{index}"),
             "visibility": "list",
@@ -1304,7 +1324,7 @@ fn codex_catalog_retains_hidden_current_model_at_the_option_bound() {
     .unwrap();
 
     let settings = store(home.path()).read("codex").unwrap();
-    assert_eq!(settings.model_options.len(), 64);
+    assert_eq!(settings.model_options.len(), 128);
     let current = settings.model_options.last().unwrap();
     assert_eq!(current.id, "gpt-hidden");
     assert_eq!(current.effort_options, vec!["max"]);

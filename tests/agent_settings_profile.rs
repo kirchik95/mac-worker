@@ -15,7 +15,7 @@ use mac_worker::{
     agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore},
     cli::Cli,
     error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     run_with_stdio_in_context,
 };
 use serde_json::{Value, json};
@@ -37,6 +37,23 @@ impl KeychainRunner {
 
 impl ProcessRunner for KeychainRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == "/bin/zsh" {
+            // Discovery may only execute inside this test's fixture HOME.
+            let home = request
+                .environment
+                .iter()
+                .find(|(key, _)| key == "HOME")
+                .unwrap();
+            for binary in ["codex", "opencode", "cursor-agent"] {
+                assert!(
+                    std::path::Path::new(&home.1)
+                        .join("bin")
+                        .join(binary)
+                        .is_file()
+                );
+            }
+            return SystemProcessRunner.run(request);
+        }
         assert_eq!(request.program, "/usr/bin/security");
         self.requests.lock().unwrap().push(request.clone());
         Ok(ProcessResult {
@@ -75,6 +92,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"models":[{{"value":"catalogu
 sleep 60
 "#, if catalogue { "" } else { "exit 1" })).unwrap();
     fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["codex", "opencode"] {
+        let binary = home.path().join("bin").join(name);
+        fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     home
 }
 

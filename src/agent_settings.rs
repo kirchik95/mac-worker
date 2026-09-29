@@ -27,7 +27,7 @@ pub const MAX_SETTINGS_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_SETTINGS_MODEL_BYTES: usize = 256;
 pub const MAX_SETTINGS_LABEL_BYTES: usize = 256;
 pub const MAX_SETTINGS_EFFORT_BYTES: usize = 32;
-pub const MAX_SETTINGS_MODEL_OPTIONS: usize = 64;
+pub const MAX_SETTINGS_MODEL_OPTIONS: usize = 128;
 pub const MAX_SETTINGS_EFFORT_OPTIONS: usize = 32;
 pub const MAX_SETTINGS_REVISION_BYTES: usize = 128;
 pub const MAX_OPENCODE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
@@ -724,9 +724,14 @@ impl NativeAgentSettingsStore {
 
     fn claude_model_options(&self, current_model: Option<&str>) -> Vec<ModelOption> {
         let mut entries = Vec::new();
-        for (order, (id, label)) in [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet")]
-            .into_iter()
-            .enumerate()
+        for (order, (id, label)) in [
+            ("fable", "Fable"),
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             entries.push(CatalogEntry {
                 option: ModelOption {
