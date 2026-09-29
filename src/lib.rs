@@ -808,15 +808,15 @@ fn run_dashboard_command(
             .build()
             .map_err(WorkerError::Io)?;
         if controller_viewer {
-            return async_runtime.block_on(run_local_dashboard(
-                config,
-                paths,
-                runtime,
-                request,
-                viewer_shutdown_signal(),
-                stdout,
-                stderr,
+            let (shutdown, heartbeat_lost) = viewer_shutdown_signal();
+            let outcome = async_runtime.block_on(run_local_dashboard(
+                config, paths, runtime, request, shutdown, stdout, stderr,
             ));
+            if heartbeat_lost.load(std::sync::atomic::Ordering::SeqCst) {
+                write_viewer_heartbeat_lost(stderr);
+                return Err(viewer_heartbeat_lost_error());
+            }
+            return outcome;
         }
         if config.controller.enabled {
             return async_runtime.block_on(
@@ -846,6 +846,9 @@ fn run_dashboard_command(
 
     match result {
         Ok(()) => 0,
+        // The viewer already printed the single stable line. The generic
+        // diagnostic would add a second sentence.
+        Err(error) if error.public_code() == VIEWER_HEARTBEAT_LOST => error.exit_code(),
         Err(error) => {
             write_error(stderr, &error);
             error.exit_code()
@@ -853,8 +856,103 @@ fn run_dashboard_command(
     }
 }
 
-fn viewer_shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    Box::pin(async {
+const VIEWER_HEARTBEAT_LOST: &str = "DASHBOARD_VIEWER_HEARTBEAT_LOST";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewerStdinEvent {
+    Eof,
+    HeartbeatLost,
+}
+
+fn viewer_heartbeat_timeout() -> std::time::Duration {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(value) = std::env::var("MAC_WORKER_TEST_VIEWER_HEARTBEAT_MS")
+            && let Ok(millis) = value.parse::<u64>()
+        {
+            return std::time::Duration::from_millis(millis);
+        }
+    }
+    DEFAULT
+}
+
+fn viewer_heartbeat_lost_error() -> WorkerError {
+    WorkerError::capacity(
+        VIEWER_HEARTBEAT_LOST,
+        "controller dashboard viewer lost the laptop heartbeat",
+    )
+}
+
+fn write_viewer_heartbeat_lost(stderr: &mut dyn Write) {
+    let _ = writeln!(stderr, "{VIEWER_HEARTBEAT_LOST}");
+    let _ = stderr.flush();
+}
+
+/// Watch the viewer stdin. No bytes means an older laptop: block until EOF, as
+/// before. The first byte arms heartbeat mode; silence longer than `timeout`
+/// is a lost laptop.
+fn watch_viewer_stdin(fd: i32, heartbeat_timeout: std::time::Duration) -> ViewerStdinEvent {
+    let mut heartbeat = false;
+    let mut last_byte = std::time::Instant::now();
+    let mut buffer = [0u8; 256];
+    loop {
+        let timeout_ms = if heartbeat {
+            let elapsed = last_byte.elapsed();
+            if elapsed >= heartbeat_timeout {
+                return ViewerStdinEvent::HeartbeatLost;
+            }
+            let remaining = heartbeat_timeout - elapsed;
+            i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX)
+        } else {
+            -1
+        };
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let polled = loop {
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return ViewerStdinEvent::Eof;
+            }
+            break ready;
+        };
+        if polled == 0 {
+            if heartbeat {
+                return ViewerStdinEvent::HeartbeatLost;
+            }
+            continue;
+        }
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ViewerStdinEvent::Eof;
+        }
+        if read == 0 {
+            return ViewerStdinEvent::Eof;
+        }
+        heartbeat = true;
+        last_byte = std::time::Instant::now();
+    }
+}
+
+fn viewer_shutdown_signal() -> (
+    Pin<Box<dyn Future<Output = ()> + Send>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lost_flag = std::sync::Arc::clone(&lost);
+    let timeout = viewer_heartbeat_timeout();
+    let future = Box::pin(async move {
         let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
         // Independent thread, not spawn_blocking: Tokio runtime shutdown waits
         // forever for started blocking tasks. Dropping this oneshot lets SIGINT,
@@ -862,16 +960,8 @@ fn viewer_shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let _stdin_thread = std::thread::Builder::new()
             .name("dashboard-viewer-stdin".into())
             .spawn(move || {
-                let mut buffer = [0u8; 256];
-                loop {
-                    let read = unsafe {
-                        libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len())
-                    };
-                    if read <= 0 {
-                        let _ = eof_tx.send(());
-                        return;
-                    }
-                }
+                let event = watch_viewer_stdin(libc::STDIN_FILENO, timeout);
+                let _ = eof_tx.send(event);
             });
         let mut hangup =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
@@ -895,9 +985,110 @@ fn viewer_shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
                     None => std::future::pending::<()>().await,
                 }
             } => {}
-            _ = eof_rx => {}
+            event = eof_rx => {
+                if matches!(event, Ok(ViewerStdinEvent::HeartbeatLost)) {
+                    lost_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
         }
-    })
+    });
+    (future, lost)
+}
+
+#[cfg(test)]
+mod viewer_heartbeat_tests {
+    use super::{
+        ViewerStdinEvent, viewer_heartbeat_lost_error, watch_viewer_stdin,
+        write_viewer_heartbeat_lost,
+    };
+    use std::{sync::mpsc, thread, time::Duration};
+
+    struct OwnedFd(i32);
+
+    impl OwnedFd {
+        fn release(&mut self) -> i32 {
+            let fd = self.0;
+            self.0 = -1;
+            fd
+        }
+    }
+
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe { libc::close(self.0) };
+            }
+        }
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (OwnedFd(fds[0]), OwnedFd(fds[1]))
+    }
+
+    fn watch(mut read: OwnedFd, timeout: Duration) -> mpsc::Receiver<ViewerStdinEvent> {
+        let (sender, receiver) = mpsc::channel();
+        let fd = read.release();
+        thread::spawn(move || {
+            let event = watch_viewer_stdin(fd, timeout);
+            unsafe { libc::close(fd) };
+            let _ = sender.send(event);
+        });
+        receiver
+    }
+
+    #[test]
+    fn silence_without_bytes_never_fires_and_eof_shuts_down() {
+        let (read, write) = pipe();
+        let timeout = Duration::from_millis(40);
+        let receiver = watch(read, timeout);
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a viewer with no heartbeat byte must keep waiting"
+        );
+        drop(write);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ViewerStdinEvent::Eof
+        );
+    }
+
+    #[test]
+    fn bytes_then_silence_past_the_timeout_fires() {
+        let (read, write) = pipe();
+        let timeout = Duration::from_millis(200);
+        let receiver = watch(read, timeout);
+        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a fresh byte must postpone the watchdog"
+        );
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ViewerStdinEvent::HeartbeatLost
+        );
+        assert_eq!(viewer_heartbeat_lost_error().exit_code(), 75);
+        let mut recorded = Vec::new();
+        write_viewer_heartbeat_lost(&mut recorded);
+        assert_eq!(recorded, b"DASHBOARD_VIEWER_HEARTBEAT_LOST\n");
+    }
+
+    #[test]
+    fn eof_after_a_heartbeat_byte_is_a_clean_shutdown() {
+        let (read, write) = pipe();
+        let receiver = watch(read, Duration::from_millis(500));
+        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
+        drop(write);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ViewerStdinEvent::Eof
+        );
+    }
 }
 
 async fn run_local_dashboard(
