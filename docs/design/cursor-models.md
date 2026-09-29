@@ -14,7 +14,7 @@ interactive picker are also hidden here, unless one is the current selection.
 The ACP reader in `src/cursor_catalog.rs` uses the worker account's authentication
 and an isolated temporary Cursor config/data directory. It creates no session,
 sends no prompt, and never initiates login. It limits the complete exchange to
-10 seconds, stdout to 1 MiB and stderr to 64 KiB, then kills and reaps its process
+20 seconds, stdout to 1 MiB and stderr to 64 KiB, then kills and reaps its process
 group and removes the temporary directory. stdin stays open through the response:
 pipelining requests or closing stdin early aborts Cursor's catalogue reply.
 
@@ -56,6 +56,40 @@ unavailable catalogues, keyboard search, empty results, Escape focus return,
 canonical IDs in dashboard save requests, profile propagation through HTTP and
 SSH, post-login environment precedence, safe unlock failure, and profile-specific
 authentication states.
+
+## Catalog sources for all agents
+
+Settings discovers Cursor, Codex, and OpenCode concurrently on the selected Mac,
+so lookup latency follows the slowest discovery. The SSH settings request has a
+30-second deadline. Cursor gets 20 seconds because mini-3 measured 8.5–9.3 seconds
+warm and 10.4 seconds cold; Codex and OpenCode each get 15 seconds.
+
+| Agent | Preferred source | Fallback |
+| --- | --- | --- |
+| Codex | `codex debug models`, with `visibility: list` and native priority order | `~/.codex/models_cache.json`, then the current selection |
+| Cursor | `cursor-agent acp` → `cursor/list_available_models` using the selected environment profile | Native remembered models and the current selection |
+| OpenCode | `opencode models`, preserving usable `provider/model` IDs from every provider in CLI order | The existing current-provider list from `~/.cache/opencode/models.json`, then the current selection |
+| Claude | Built-in `fable`, `opus`, `sonnet`, `haiku`, supplemented by `~/.claude/models.json` and `~/.claude/model-catalog.json` | Built-in aliases and the current selection |
+
+Codex and OpenCode use the adapters' account login shell with no environment-profile
+entries. Their commands run in empty temporary directories after shell startup;
+reserved Keychain variables are removed before the CLI starts. `ProcessRunner`
+bounds stdout to 4 MiB for Codex and 256 KiB for OpenCode, stderr to 64 KiB each,
+and kills the process group on timeout or output overflow. Temporary directories
+are removed after discovery. A failed command, timeout, excessive output,
+malformed output, or empty catalog uses the existing file fallback. Codex may
+refresh its own model cache as a side effect of its catalog command.
+
+OpenCode output is stripped of ANSI sequences, validated, and deduplicated. The
+cache supplies display names only; it cannot add unavailable models to a live
+list. OpenCode still offers no global effort or fast override. Every list retains
+the current selection when absent from its catalog and is bounded to 128 options.
+The SSH response limit remains 1 MiB; readers and the UI impose no 64-option cap.
+
+Codex, Cursor, and OpenCode return `model_catalog_source: live` or `remembered`;
+the UI currently displays this hint only for Cursor. Codex saves fetch a fresh
+catalog to validate fast support, as Cursor already does. OpenCode saves do not
+perform discovery. Only Cursor uses or returns `model_catalog_profile`.
 
 ## Live validation
 
