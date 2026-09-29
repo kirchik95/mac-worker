@@ -19,7 +19,8 @@ const OPERATIONS_LOCK: &str = "operations.lock";
 const MAX_ENVELOPE_BYTES: u64 = crate::controller::protocol::MAX_STORED_REQUEST_BYTES as u64;
 pub const ENVELOPE_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_SCAN_LIMIT: usize = 64;
-const PRUNE_CURSOR: &str = "operations-prune-cursor.json";
+const PRUNE_PAGE_BYTES: usize = 4096;
+const PRUNE_CURSOR: &str = "operations-prune-offset.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -197,18 +198,16 @@ fn is_envelope_name(name: &str) -> bool {
         .is_some_and(|id| validate_request_id(id).is_ok())
 }
 
-/// A directory cookie is only an opportunistic scan hint. Directory changes
-/// may repeat/skip entries; EOF restarts the scan. Each call reads at most 64
-/// dirents and envelopes, without collecting the unbounded cache history.
-/// All reads and deletes still validate the entry through RootedDir.
+/// Read one fixed-size directory page per call. Unlike Darwin's per-DIR
+/// telldir cookies, kernel lseek offsets survive reopening the directory.
+/// Directory changes may repeat/skip entries; EOF starts another sweep. The
+/// 40-byte op filenames occupy at least 64 bytes per dirent, bounding reads
+/// to 64 envelopes per 4 KiB page, even with a large retained pending prefix.
 fn prune_settled(root: &crate::rooted_fs::RootedDir, now: u64) -> Result<(), WorkerError> {
-    use std::{
-        ffi::CStr,
-        os::fd::{FromRawFd, OwnedFd},
-    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     root.verify_bound().map_err(store_io)?;
     let previous = root.read_private_regular(PRUNE_CURSOR, 64).ok();
-    let cookie: libc::c_long = previous
+    let offset: libc::off_t = previous
         .as_deref()
         .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .unwrap_or(0);
@@ -224,47 +223,63 @@ fn prune_settled(root: &crate::rooted_fs::RootedDir, now: u64) -> Result<(), Wor
     if fd < 0 {
         return Err(store_io(std::io::Error::last_os_error()));
     }
-    // SAFETY: fd is a newly owned descriptor; fdopendir takes ownership on success.
-    let stream = unsafe { libc::fdopendir(fd) };
-    if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: fdopendir failed and did not consume fd.
-        drop(unsafe { OwnedFd::from_raw_fd(fd) });
-        return Err(store_io(error));
-    }
-    struct Scan(*mut libc::DIR);
-    impl Drop for Scan {
-        fn drop(&mut self) {
-            // SAFETY: Scan uniquely owns this DIR.
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-    let scan = Scan(stream);
-    // SAFETY: the cookie is an advisory offset for our exclusively owned DIR.
-    if cookie > 0 {
+    // SAFETY: openat returned a newly owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The cursor is advisory. An invalidated offset restarts at zero.
+    // SAFETY: fd is live; lseek does not retain it or access memory.
+    if offset > 0 && unsafe { libc::lseek(fd.as_raw_fd(), offset, libc::SEEK_SET) } < 0 {
         unsafe {
-            libc::seekdir(scan.0, cookie);
+            libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET);
         }
     }
-    let mut names = Vec::new();
-    let mut next = 0;
-    for _ in 0..PRUNE_SCAN_LIMIT {
-        // SAFETY: the DIR is live; dirent is copied before the next call.
-        let entry = unsafe { libc::readdir(scan.0) };
-        if entry.is_null() {
-            next = 0;
-            break;
+    let mut page = [0_u8; PRUNE_PAGE_BYTES];
+    let count = read_directory_page(fd.as_raw_fd(), &mut page).map_err(store_io)?;
+    let next = if count == 0 {
+        0
+    } else {
+        // SAFETY: fd is the live directory description used for the page.
+        let position = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) };
+        if position < 0 {
+            return Err(store_io(std::io::Error::last_os_error()));
         }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if let Ok(name) = name.to_str()
+        position
+    };
+    let mut names = Vec::new();
+    let mut remaining = &page[..count];
+    let name_offset = std::mem::offset_of!(libc::dirent, d_name);
+    let length_offset = std::mem::offset_of!(libc::dirent, d_reclen);
+    while !remaining.is_empty() {
+        let invalid = || {
+            store_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid directory page",
+            ))
+        };
+        let length_bytes: [u8; 2] = remaining
+            .get(length_offset..length_offset + 2)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?;
+        let length = u16::from_ne_bytes(length_bytes) as usize;
+        if length <= name_offset || length > remaining.len() {
+            return Err(invalid());
+        }
+        let name = &remaining[name_offset..length];
+        let end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(invalid)?;
+        if let Ok(name) = std::str::from_utf8(&name[..end])
             && is_envelope_name(name)
         {
             names.push(name.to_owned());
         }
-        // SAFETY: scan owns this live DIR.
-        next = unsafe { libc::telldir(scan.0) }.max(0);
+        remaining = &remaining[length..];
+    }
+    if names.len() > PRUNE_SCAN_LIMIT {
+        return Err(store_io(std::io::Error::other(
+            "directory page exceeds envelope scan bound",
+        )));
     }
     root.verify_bound().map_err(store_io)?;
     for name in names {
@@ -297,6 +312,43 @@ pub fn load_operation_envelope(
         return Ok(None);
     }
     Ok(Some(load_envelope(&root, &name)?))
+}
+
+/// Use the native 64-bit dirent ABI; std/libc readdir buffers a whole page
+/// and exposes stream-local cookies on macOS, which cannot be persisted.
+fn read_directory_page(fd: libc::c_int, page: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(target_os = "macos")]
+    let count = {
+        unsafe extern "C" {
+            #[link_name = "__getdirentries64"]
+            fn getdirentries64(
+                fd: libc::c_int,
+                buf: *mut libc::c_char,
+                size: libc::size_t,
+                base: *mut libc::off_t,
+            ) -> libc::ssize_t;
+        }
+        let mut base = 0;
+        // SAFETY: fd is a live directory; page and base are writable for the
+        // full call. The returned page is parsed with checked slice bounds.
+        unsafe { getdirentries64(fd, page.as_mut_ptr().cast(), page.len(), &mut base) }
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: fd is a live directory and page is writable for its stated size.
+    let count = unsafe { libc::syscall(libc::SYS_getdents64, fd, page.as_mut_ptr(), page.len()) };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let count = {
+        let _ = (fd, page);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bounded directory scan is unavailable",
+        ));
+    };
+    if count < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(count as usize)
+    }
 }
 
 fn lock_operations(root: &crate::rooted_fs::RootedDir) -> Result<File, WorkerError> {
@@ -498,6 +550,51 @@ mod tests {
             load_operation_envelope(&cache, request(150).request_id())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn pruning_reaches_expired_envelopes_behind_a_retained_directory_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        for id in 1..=(PRUNE_SCAN_LIMIT as u128 + 20) {
+            persist_operation_envelope(&cache, &request(id)).unwrap();
+        }
+        let root = open_controller_root(&cache).unwrap();
+        let names = root
+            .list_names()
+            .unwrap()
+            .into_iter()
+            .map(|name| String::from_utf8(name).unwrap())
+            .filter(|name| is_envelope_name(name))
+            .collect::<Vec<_>>();
+        let expired = &names[PRUNE_SCAN_LIMIT..];
+        assert!(!expired.is_empty());
+        for name in expired {
+            let id = u128::from_str_radix(
+                name.strip_prefix("op-")
+                    .unwrap()
+                    .strip_suffix(".json")
+                    .unwrap(),
+                16,
+            )
+            .unwrap();
+            rewrite(&cache, id, |value| {
+                value["settled_at_millis"] = json!(1);
+                value["outcome"] = json!({"kind": "acknowledged"});
+            });
+        }
+        for id in 1000..1010 {
+            persist_operation_envelope(&cache, &request(id)).unwrap();
+        }
+        assert!(
+            expired.iter().all(|name| !cache.join(name).exists()),
+            "an undeletable prefix must not starve expired envelopes"
+        );
+        assert!(
+            names[..PRUNE_SCAN_LIMIT]
+                .iter()
+                .all(|name| cache.join(name).exists())
         );
     }
 
