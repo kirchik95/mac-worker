@@ -3270,6 +3270,7 @@ fn setup_and_agent_share_one_total_turn_budget_wrapper() {
 }
 
 #[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
 fn setup_and_agent_share_one_total_turn_budget() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
