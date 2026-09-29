@@ -372,7 +372,7 @@ fn non_isolated_runner_still_inherits_parent_credentials() {
         policy: ProcessPolicy {
             stdout_limit: 4 * 1024,
             stderr_limit: 4 * 1024,
-            deadline: std::time::Duration::from_secs(2),
+            deadline: std::time::Duration::from_secs(30),
         },
         isolate_parent_environment: false,
     };

@@ -26,10 +26,14 @@ pub const LOGIN_GOOD: &str = "login-good";
 pub const PARENT_ONLY: &str = "parent-only";
 pub const PROFILE_NAME: &str = "fixture";
 
+/// These fixtures prove which binary and credential a login shell resolves, not
+/// how fast it starts; a loaded machine can take seconds to start `zsh -l`.
+const FIXTURE_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 const PROBE_POLICY: ProcessPolicy = ProcessPolicy {
     stdout_limit: 4 * 1024,
     stderr_limit: 4 * 1024,
-    deadline: std::time::Duration::from_secs(2),
+    deadline: FIXTURE_PROBE_DEADLINE,
 };
 
 /// Restrict login-shell PATH to synthetic fixture directories only.
@@ -204,6 +208,11 @@ impl ProcessRunner for DiagnosticProcessRunner {
                 request.args.last().unwrap().to_str().unwrap(),
             ));
         }
+        // Product probes keep their short deadlines in production; here only the
+        // resolved verdict matters, so give login-shell startup room.
+        let mut request = request.clone();
+        request.policy.deadline = request.policy.deadline.max(FIXTURE_PROBE_DEADLINE);
+        let request = &request;
         let started = Instant::now();
         match SystemProcessRunner.run(request) {
             Ok(result) => {

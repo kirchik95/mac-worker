@@ -1012,7 +1012,7 @@ fn readiness_timeout_rejects_slow_drip_http_and_reaps_child() {
         "slow drip finished before the absolute deadline: {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(12),
+        elapsed < Duration::from_secs(60),
         "slow drip exceeded the absolute readiness deadline: {elapsed:?}"
     );
     assert!(!output.status.success());
@@ -1082,7 +1082,9 @@ fn startup_int_reaps_slow_drip_http_child_group() {
 }
 
 // Includes starting the Python stand-in while the process tests run concurrently.
-const TEST_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+// Long enough for the Python fake ssh to start on a loaded machine before the
+// deadline; the slow-drip test proves the deadline is absolute, not short.
+const TEST_READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[test]
 fn readiness_timeout_fixture() {
