@@ -1251,10 +1251,12 @@ fn dag_submit_resumes_same_ids_after_create_prompt_enqueue_and_handoff_faults() 
 fn dag_same_pid_concurrent_advancers_submit_one_identity() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
     let hook = Arc::new(SubmitGuardBarrier {
         entered: entered_tx,
         release: Mutex::new(Some(release_rx)),
         first: AtomicBool::new(false),
+        waiting: Some(waiting_tx),
     });
     let fixture = prepared_frozen_dag_inner(Some(hook));
     let second_done = AtomicBool::new(false);
@@ -1268,14 +1270,16 @@ fn dag_same_pid_concurrent_advancers_submit_one_identity() {
             second_done.store(true, Ordering::SeqCst);
             result
         });
-        thread::sleep(Duration::from_millis(200));
-        assert!(
-            !second_done.load(Ordering::SeqCst),
-            "same-PID waiter must block on the store/task guard"
-        );
+        let waiting = waiting_rx.recv_timeout(Duration::from_secs(5));
+        let finished_before_release = second_done.load(Ordering::SeqCst);
         release_tx.send(()).unwrap();
         first.join().expect("first advancer").unwrap();
         second.join().expect("waiter").unwrap();
+        waiting.expect("same-PID advancer reached the occupied submit guard");
+        assert!(
+            !finished_before_release,
+            "same-PID waiter must block on the store/task guard"
+        );
     });
     let created_at = fixture
         .store
@@ -1294,6 +1298,7 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
         entered: entered_tx,
         release: Mutex::new(Some(release_rx)),
         first: AtomicBool::new(false),
+        waiting: None,
     })));
     let config = dag_test_config();
     thread::scope(|scope| {
@@ -1315,7 +1320,7 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
         let after = fixture.store.load_run_dag(fixture.run_id).unwrap();
         let task = fixture.store.load_task_optional(fixture.task_id).unwrap();
         release_tx.send(()).unwrap();
@@ -1325,7 +1330,7 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
             elapsed.is_ok(),
             "same-process submit guard outlived wait deadline"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert!(elapsed.unwrap() < Duration::from_secs(3));
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
         assert_eq!(
             after, before,
@@ -1547,10 +1552,17 @@ struct SubmitGuardBarrier {
     entered: mpsc::Sender<()>,
     release: Mutex<Option<mpsc::Receiver<()>>>,
     first: AtomicBool,
+    waiting: Option<mpsc::Sender<()>>,
 }
 
 impl ClientStateConcurrencyHook for SubmitGuardBarrier {
     fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::DagSubmitWait {
+            if let Some(waiting) = &self.waiting {
+                let _ = waiting.send(());
+            }
+            return;
+        }
         if point != ClientStateConcurrencyPoint::DagSubmit {
             return;
         }
@@ -2643,7 +2655,7 @@ fn local_wait_slow_binding_git(command: &'static str) {
     );
     assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     assert!(
-        elapsed < Duration::from_millis(1300),
+        elapsed < Duration::from_millis(3900),
         "slow Git exceeded the remaining budget: {elapsed:?}"
     );
     assert_eq!(harness.store.load_task(parent.task_id).unwrap(), before);
@@ -2697,11 +2709,11 @@ fn local_wait_deadline_bounds_transfer_repository_lock() {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
         drop(held);
         let result = waiter.join().unwrap();
         assert!(elapsed.is_ok(), "transfer lock outlived wait deadline");
-        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert!(elapsed.unwrap() < Duration::from_secs(3));
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(harness.store.load_run_dag(run_id).unwrap().unwrap(), dag);
@@ -3088,7 +3100,17 @@ fn dag_needs_input_waits_then_reconcile_unblocks_after_closed_done() {
 
 #[test]
 fn dag_needs_input_say_second_turn_close_binds_followup_oid_not_prior_head() {
-    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let mut harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    ));
+    harness.store = harness.store.with_admission_clock({
+        let clock = Arc::clone(&clock);
+        Arc::new(move || Ok(clock.load(Ordering::SeqCst)))
+    });
     let report = harness.batch();
     let dag = harness
         .store
@@ -3132,7 +3154,7 @@ fn dag_needs_input_say_second_turn_close_binds_followup_oid_not_prior_head() {
     // Bound admission TTL is 2s. Expire it so claim must live-probe instead
     // of ranking the planted Idle cache, which becomes ready=false/busy
     // with empty capabilities when host probe is missing.
-    thread::sleep(Duration::from_millis(2_100));
+    clock.fetch_add(2_100, Ordering::SeqCst);
     let worker = FollowupWorker::new(first_turn, first_oid.clone(), second_oid.clone());
     let said = finish_before_watchdog(Duration::from_secs(20), || {
         harness

@@ -62,7 +62,7 @@ pub(crate) fn observe_workers(
         return Ok(Vec::new());
     }
     let round_deadline = Instant::now() + ADMISSION_ROUND_BUDGET;
-    let now = now_millis()?;
+    let now = client_state.admission_time(now_millis)?;
     let mut slots = (0..workers.len()).map(|_| None).collect::<Vec<_>>();
     let mut miss_indices = Vec::new();
     let mut hit_indices = Vec::new();
@@ -94,7 +94,7 @@ pub(crate) fn observe_workers(
 
     if !miss_indices.is_empty() {
         let mut reprobe = Vec::new();
-        let now = now_millis()?;
+        let now = client_state.admission_time(now_millis)?;
         for index in hit_indices {
             let worker = workers[index];
             match client_state.peek_admission_observation(&worker.name)? {
@@ -123,7 +123,7 @@ pub(crate) fn observe_workers(
         }
     }
 
-    let now = now_millis()?;
+    let now = client_state.admission_time(now_millis)?;
     slots
         .into_iter()
         .zip(workers)
@@ -240,7 +240,7 @@ fn worker_pipeline_inner(
     else {
         return Ok(None);
     };
-    let now = now_millis()?;
+    let now = client_state.admission_time(now_millis)?;
     let expected = client_state.peek_admission_observation(&worker.name)?;
     if let Some(observation) = expected.as_ref()
         && reusable_for_admission(observation, worker, now)
@@ -251,14 +251,14 @@ fn worker_pipeline_inner(
         return Ok(None);
     }
     let probed = catch_unwind(AssertUnwindSafe(|| {
-        probe_bound_observation(runner, config, worker, round_deadline)
+        probe_bound_observation(client_state, runner, config, worker, round_deadline)
     }));
     let (observation, probe_started) = match probed {
         Ok(Ok(Some(sampled))) => sampled,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(error)) => return Err(error),
         Err(_) => {
-            if let Ok(negative) = negative_bound_observation(worker) {
+            if let Ok(negative) = negative_bound_observation(client_state, worker) {
                 let _ = client_state.commit_admission_observation(
                     &worker.name,
                     expected.as_ref(),
@@ -281,10 +281,11 @@ fn worker_pipeline_inner(
         }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    rank_committed(worker, &observation, winner, probe_started)
+    rank_committed(client_state, worker, &observation, winner, probe_started)
 }
 
 fn probe_bound_observation(
+    client_state: &ClientStateStore,
     runner: &dyn ProcessRunner,
     config: &crate::config::Config,
     worker: &WorkerEntry,
@@ -297,7 +298,7 @@ fn probe_bound_observation(
         return Ok(None);
     }
     let (mut health, mut probe_started, mut started_millis) =
-        probe_once(&transport, worker, probe_budget)?;
+        probe_once(client_state, &transport, worker, probe_budget)?;
     if health.status == HealthStatus::Ready && facts_need_refresh(&health, probe_started.elapsed())
     {
         let refresh_budget = request_budget(deadline, REFRESH_CAP);
@@ -310,7 +311,7 @@ fn probe_bound_observation(
                 if reprobe_budget.is_zero() {
                     return Ok(None);
                 }
-                let refreshed = probe_once(&transport, worker, reprobe_budget)?;
+                let refreshed = probe_once(client_state, &transport, worker, reprobe_budget)?;
                 health = refreshed.0;
                 probe_started = refreshed.1;
                 started_millis = refreshed.2;
@@ -352,11 +353,12 @@ fn probe_bound_observation(
 }
 
 fn probe_once(
+    client_state: &ClientStateStore,
     transport: &SshTransport<&dyn ProcessRunner>,
     worker: &WorkerEntry,
     deadline: Duration,
 ) -> Result<(WorkerHealth, Instant, u64), WorkerError> {
-    let started_millis = now_millis()?;
+    let started_millis = client_state.admission_time(now_millis)?;
     let started = Instant::now();
     let health = transport.probe_with_deadline(worker, deadline);
     Ok((health, started, started_millis))
@@ -453,6 +455,7 @@ fn candidate_at_return(
 }
 
 fn rank_committed(
+    client_state: &ClientStateStore,
     worker: &WorkerEntry,
     incoming: &AdmissionObservation,
     winner: AdmissionObservation,
@@ -461,7 +464,7 @@ fn rank_committed(
     if &winner == incoming {
         return Ok(Some((winner, Some(probe_started))));
     }
-    let now = now_millis()?;
+    let now = client_state.admission_time(now_millis)?;
     if reusable_for_admission(&winner, worker, now) {
         Ok(Some((winner, None)))
     } else {
@@ -520,8 +523,11 @@ fn admission_from_health(
     .with_interactive_agents(candidate.interactive_agents()))
 }
 
-fn negative_bound_observation(worker: &WorkerEntry) -> Result<AdmissionObservation, WorkerError> {
-    let started = now_millis()?;
+fn negative_bound_observation(
+    client_state: &ClientStateStore,
+    worker: &WorkerEntry,
+) -> Result<AdmissionObservation, WorkerError> {
+    let started = client_state.admission_time(now_millis)?;
     Ok(AdmissionObservation::new(
         worker.name.clone(),
         false,
@@ -1962,7 +1968,7 @@ mod tests {
             .commit_admission_observation("mini-1", Some(&expected), incoming.clone())
             .unwrap();
         assert_eq!(winner.capabilities(), disk.capabilities());
-        let ranked = rank_committed(&mini1, &incoming, winner, Instant::now())
+        let ranked = rank_committed(&store, &mini1, &incoming, winner, Instant::now())
             .unwrap()
             .expect("strict reusable disk winner");
         assert!(

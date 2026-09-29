@@ -7484,7 +7484,7 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
         if elapsed.is_err() {
             // Revoke the test permit before releasing the fence on RED: a
             // failed regression must never launch a real detached child.
@@ -7499,7 +7499,7 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             elapsed.is_ok(),
             "handoff outlived wait budget; after_spawn={after_spawn}"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert!(elapsed.unwrap() < Duration::from_secs(3));
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);

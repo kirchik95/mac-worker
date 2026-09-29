@@ -87,8 +87,32 @@ const TURNS_NAME: &CStr = c"turns";
 const RUNNERS_NAME: &CStr = c"runners";
 pub(crate) const OBSERVATION_TTL_MILLIS: u64 = 2_000;
 
-/// Second `Absent` must be at least this old before absence is `Exited`.
+/// Default minimum age of the second `Absent` before absence is `Exited`.
 pub const RUNNER_ABSENCE_CONFIRMATION: Duration = Duration::from_millis(750);
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClientStateTimings {
+    pub runner_absence_confirmation: Duration,
+}
+
+impl Default for ClientStateTimings {
+    fn default() -> Self {
+        Self {
+            runner_absence_confirmation: RUNNER_ABSENCE_CONFIRMATION,
+        }
+    }
+}
+
+impl ClientStateTimings {
+    #[doc(hidden)]
+    pub fn fast() -> Self {
+        Self {
+            runner_absence_confirmation: Duration::from_millis(50),
+        }
+    }
+}
+
+type AdmissionClock = dyn Fn() -> Result<u64, WorkerError> + Send + Sync;
 
 /// `task list` shows `RUNNER_UNVERIFIABLE` only after this long without proof.
 pub const RUNNER_UNVERIFIABLE_AFTER: Duration = Duration::from_secs(30);
@@ -121,8 +145,8 @@ pub(crate) fn task_operator_busy_reason(
 ///
 /// * `Live` — the pid still matches the recorded start identity.
 /// * `Exited` — the pid is gone and the start identity cannot match, confirmed
-///   by a second `Absent` at least [`RUNNER_ABSENCE_CONFIRMATION`] later in
-///   this process, or the pid was `Reused` by a different start identity.
+///   by a second `Absent` after the configured confirmation window
+///   (default [`RUNNER_ABSENCE_CONFIRMATION`]) in this process, or the pid was `Reused` by a different start identity.
 /// * `Unverifiable` — `Ambiguous`, a transient lookup error, or a single
 ///   `Absent` that has not been confirmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +237,7 @@ pub enum ClientStateConcurrencyPoint {
     SubmissionIntentReconciliationAfterTransferLock,
     DagClaim,
     DagSubmit,
+    DagSubmitWait,
     SubmissionRollbackRecover,
     ObservationRefreshPublication,
     TaskReplacementPreExchange,
@@ -250,6 +275,9 @@ pub struct ClientStateSyncCounts {
 pub struct ClientStateStore {
     inner: Arc<ClientStateInner>,
     wait_deadline: WaitDeadline,
+    timings: ClientStateTimings,
+    liveness_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    admission_clock: Option<Arc<AdmissionClock>>,
 }
 
 pub(crate) enum ConditionalStatusUpdate {
@@ -451,11 +479,53 @@ struct SyncCounters {
 }
 
 impl ClientStateStore {
+    pub fn with_timings(mut self, timings: ClientStateTimings) -> Self {
+        self.timings = timings;
+        self
+    }
+
+    /// Use a monotonic clock shared by all clones of this handle.
+    #[doc(hidden)]
+    pub fn with_liveness_clock(mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        self.liveness_clock = Some(clock);
+        self
+    }
+
+    /// Use the same clock for admission cache age and fresh probe timestamps.
+    #[doc(hidden)]
+    pub fn with_admission_clock(mut self, clock: Arc<AdmissionClock>) -> Self {
+        self.admission_clock = Some(clock);
+        self
+    }
+
+    pub(crate) fn admission_time(
+        &self,
+        system_now: impl FnOnce() -> Result<u64, WorkerError>,
+    ) -> Result<u64, WorkerError> {
+        match &self.admission_clock {
+            Some(clock) => clock(),
+            None => system_now(),
+        }
+    }
+
+    fn liveness_now(&self) -> Instant {
+        self.liveness_clock
+            .as_ref()
+            .map_or_else(Instant::now, |clock| clock())
+    }
+
+    pub(crate) fn runner_absence_confirmation(&self) -> Duration {
+        self.timings.runner_absence_confirmation
+    }
+
     /// A per-caller budget; cloning does not change concurrent users of the store.
     pub(crate) fn with_wait_deadline(&self, wait_deadline: WaitDeadline) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             wait_deadline,
+            timings: self.timings,
+            liveness_clock: self.liveness_clock.clone(),
+            admission_clock: self.admission_clock.clone(),
         }
     }
 
@@ -750,6 +820,9 @@ impl ClientStateStore {
 
         Ok(Self {
             wait_deadline,
+            timings: ClientStateTimings::default(),
+            liveness_clock: None,
+            admission_clock: None,
             inner: Arc::new(ClientStateInner {
                 state_root: state_root.to_path_buf(),
                 root,
@@ -2191,6 +2264,7 @@ impl ClientStateStore {
     where
         F: FnOnce() -> Result<AdmissionObservation, WorkerError>,
     {
+        let now_millis = self.admission_time(|| Ok(now_millis))?;
         validate_state_worker_name(worker)?;
         let cached = {
             let _lock = self.acquire_state_lock()?;
@@ -3313,7 +3387,7 @@ impl ClientStateStore {
             .liveness
             .lock()
             .expect("liveness tracking mutex poisoned");
-        let now = Instant::now() + tracking.clock_offset;
+        let now = self.liveness_now() + tracking.clock_offset;
         let key = identity_key(identity);
         match observation {
             ProcessObservation::Matching { .. } => {
@@ -3339,7 +3413,8 @@ impl ClientStateStore {
                         RunnerLivenessVerdict::Unverifiable
                     }
                     Some(first)
-                        if now.saturating_duration_since(first) >= RUNNER_ABSENCE_CONFIRMATION =>
+                        if now.saturating_duration_since(first)
+                            >= self.runner_absence_confirmation() =>
                     {
                         // Keep first-seen so later looks in this pass stay Exited.
                         RunnerLivenessVerdict::Exited
@@ -3363,8 +3438,8 @@ impl ClientStateStore {
         else {
             return false;
         };
-        let now = Instant::now() + tracking.clock_offset;
-        now.saturating_duration_since(first) < RUNNER_ABSENCE_CONFIRMATION
+        let now = self.liveness_now() + tracking.clock_offset;
+        now.saturating_duration_since(first) < self.runner_absence_confirmation()
     }
 
     pub(crate) fn unverifiable_elapsed(&self, identity: ProcessIdentity) -> Duration {
@@ -3380,7 +3455,7 @@ impl ClientStateStore {
         else {
             return Duration::ZERO;
         };
-        (Instant::now() + tracking.clock_offset).saturating_duration_since(since)
+        (self.liveness_now() + tracking.clock_offset).saturating_duration_since(since)
     }
 
     /// Treat a prior `Absent` as already older than the confirmation window.
@@ -3394,8 +3469,10 @@ impl ClientStateStore {
             .liveness
             .lock()
             .expect("liveness tracking mutex poisoned");
-        let now = Instant::now() + tracking.clock_offset;
-        let first = now.checked_sub(RUNNER_ABSENCE_CONFIRMATION).unwrap_or(now);
+        let now = self.liveness_now() + tracking.clock_offset;
+        let first = now
+            .checked_sub(self.runner_absence_confirmation())
+            .unwrap_or(now);
         tracking
             .absence_first_seen
             .insert(identity_key(identity), first);

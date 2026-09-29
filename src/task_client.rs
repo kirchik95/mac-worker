@@ -13,8 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::{
     agent::{AgentKind, PermissionPolicy, TurnLimits, result_instruction},
     client_state::{
-        ActiveTaskConfig, ClientStateConcurrencyPoint, ClientStateStore,
-        RUNNER_ABSENCE_CONFIRMATION, RunnerLivenessVerdict,
+        ActiveTaskConfig, ClientStateConcurrencyPoint, ClientStateStore, RunnerLivenessVerdict,
     },
     config::{Config, WorkerEntry},
     dag::{
@@ -267,10 +266,11 @@ impl Drop for InProcessSubmitGuard {
 /// unrelated stores and ordinary unique-ID submits do not wait. Acquire
 /// before TransferRepo; drop before attached runner reentry.
 fn acquire_in_process_submit_guard(
-    client_id: ClientId,
+    client_state: &ClientStateStore,
     task_id: TaskId,
     deadline: WaitDeadline,
 ) -> Result<InProcessSubmitGuard, WorkerError> {
+    let client_id = client_state.client_id();
     let locks = in_process_submit_locks();
     let mut held = locks.held.lock().expect("in-process submit guard");
     loop {
@@ -278,6 +278,7 @@ fn acquire_in_process_submit_guard(
         if held.insert((client_id, task_id)) {
             break;
         }
+        client_state.reach_concurrency_point(ClientStateConcurrencyPoint::DagSubmitWait);
         held = match remaining {
             Some(remaining) => {
                 locks
@@ -1654,7 +1655,7 @@ impl<'a> TaskClient<'a> {
         let now = current_time_millis()?;
         let created_at = original_created_at.unwrap_or(now);
         let submit_guard = acquire_in_process_submit_guard(
-            self.client_state.client_id(),
+            self.client_state,
             task_id,
             self.client_state.wait_deadline(),
         )?;
@@ -2857,7 +2858,7 @@ impl<'a> TaskClient<'a> {
     ///
     /// Absence of evidence is not death. This path adopts, restarts, or
     /// finalizes a row only on a positive [`RunnerLivenessVerdict::Exited`]
-    /// (a confirmed `Absent` after [`RUNNER_ABSENCE_CONFIRMATION`], or an
+    /// (a confirmed `Absent` after [`crate::client_state::RUNNER_ABSENCE_CONFIRMATION`], or an
     /// immediate `Reused`). An `Unverifiable` owner is left alone. When this
     /// invocation sees an unconfirmed `Absent`, it waits the confirmation
     /// window so a second look in the same pass can prove `Exited`.
@@ -3349,7 +3350,7 @@ impl<'a> TaskClient<'a> {
             }
         }
         if saw_unconfirmed {
-            std::thread::sleep(RUNNER_ABSENCE_CONFIRMATION);
+            std::thread::sleep(self.client_state.runner_absence_confirmation());
         }
         Ok(())
     }

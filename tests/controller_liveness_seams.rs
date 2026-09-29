@@ -9,7 +9,7 @@ use std::{
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
-    client_state::{ClientStateStore, RUNNER_ABSENCE_CONFIRMATION, RunnerSlotDecision},
+    client_state::{ClientStateStore, ClientStateTimings, RunnerSlotDecision},
     dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref},
     error::WorkerError,
     job::{CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
@@ -82,7 +82,11 @@ fn owner(pid: u32) -> ProcessIdentity {
 fn open_store(inspector: MappedInspector) -> (tempfile::TempDir, ClientStateStore) {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().canonicalize().unwrap().join("state");
-    let store = ClientStateStore::open_with_owner_inspector(&state, inspector).unwrap();
+    let now = std::time::Instant::now();
+    let store = ClientStateStore::open_with_owner_inspector(&state, inspector)
+        .unwrap()
+        .with_timings(ClientStateTimings::fast())
+        .with_liveness_clock(Arc::new(move || now));
     (dir, store)
 }
 
@@ -252,7 +256,7 @@ fn first_absent_runner_cannot_free_a_slot_until_absence_is_confirmed() {
             .unwrap(),
         RunnerSlotDecision::Saturated
     ));
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     assert_eq!(store.live_runner_slot_count().unwrap(), 0);
     assert!(matches!(
         store
@@ -286,7 +290,7 @@ fn ambiguous_runner_stays_occupied_after_the_absence_window() {
     plant_task_turn(&store, 830, occupying, Some(occupying));
     let extra = plant_task_turn(&store, 831, occupying, None);
     assert_eq!(store.live_runner_slot_count().unwrap(), 1);
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     store.advance_liveness_clock(Duration::from_secs(30));
     assert_eq!(store.live_runner_slot_count().unwrap(), 1);
     assert!(matches!(
@@ -320,7 +324,7 @@ fn first_absent_reservation_cannot_be_stolen_until_absence_is_confirmed() {
         ),
         "first Absent must keep the reservation"
     );
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     let RunnerSlotDecision::Acquired { token: new } =
         store.reserve_runner_slot(turn_id, child, 1, false).unwrap()
     else {
@@ -346,7 +350,7 @@ fn first_absent_foreign_dag_claim_cannot_be_retaken_until_absence_is_confirmed()
     assert_eq!(dag.nodes["root"].claimed_by, Some(foreign));
     assert_eq!(dag.nodes["root"].state, DagNodeState::Claimed);
 
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     let claim = store
         .claim_next_eligible_dag_node(run_id, caller, 32)
         .unwrap()
@@ -379,7 +383,7 @@ fn ambiguous_foreign_dag_claim_is_not_retaken() {
     let inspector = MappedInspector::new(ProcessObservation::Ambiguous);
     let (_dir, store) = open_store(inspector);
     let (run_id, _, _) = plant_claimed_run(&store, foreign);
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     assert!(
         store
             .claim_next_eligible_dag_node(run_id, caller, 31)

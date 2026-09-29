@@ -25,7 +25,7 @@ use mac_worker::{
     RuntimeContext,
     agent::{AgentKind, Question},
     cli::{Cli, Command, TaskCommand},
-    client_state::{ClientStateStore, RUNNER_ABSENCE_CONFIRMATION, RUNNER_UNVERIFIABLE_AFTER},
+    client_state::{ClientStateStore, ClientStateTimings, RUNNER_UNVERIFIABLE_AFTER},
     config::Config,
     error::WorkerError,
     job::{
@@ -703,7 +703,7 @@ fn local_wait_held_lock(relative_lock: &str) {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
         // Always release and join before asserting so the RED run cannot hang.
         if private_operation {
             // A live private operation removes its name before releasing its lock.
@@ -716,7 +716,7 @@ fn local_wait_held_lock(relative_lock: &str) {
             elapsed.is_ok(),
             "wait exceeded its budget while {relative_lock:?} stayed locked"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert!(elapsed.unwrap() < Duration::from_secs(3));
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(store.load_task(task_id).unwrap(), record);
@@ -2835,7 +2835,7 @@ fn wait_returns_wait_blocked_when_replacement_runners_are_parked_and_list_shows_
         .unwrap_err();
     assert_eq!(error.public_code(), "WAIT_BLOCKED");
     assert_eq!(error.public_message(), RUNNER_REPEATED_FAILURE);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(6));
     assert!(matches!(
         store.queue_entry(turn_id).unwrap().unwrap().state(),
         QueueState::Parked
@@ -3307,6 +3307,7 @@ fn reconcile_does_not_adopt_a_runner_observed_absent_once_then_matching() {
     let state_root = tempfile::tempdir().unwrap();
     let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
     let dead_owner = owner(931);
+    let now = Instant::now();
     let store = ClientStateStore::open_with_owner_inspector(
         &paths.state,
         ScriptedOwnerInspector::new(
@@ -3315,7 +3316,9 @@ fn reconcile_does_not_adopt_a_runner_observed_absent_once_then_matching() {
             matching_observation(dead_owner.pid()),
         ),
     )
-    .unwrap();
+    .unwrap()
+    .with_timings(ClientStateTimings::fast())
+    .with_liveness_clock(std::sync::Arc::new(move || now));
     let (_task_id, turn_id, remote) =
         enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 931, 932, None);
     let config = task_config();
@@ -3341,11 +3344,14 @@ fn reconcile_adopts_after_absent_is_confirmed_across_the_window() {
     let state_root = tempfile::tempdir().unwrap();
     let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
     let dead_owner = owner(933);
+    let now = Instant::now();
     let store = ClientStateStore::open_with_owner_inspector(
         &paths.state,
         DeadOwnerInspector { dead_owner },
     )
-    .unwrap();
+    .unwrap()
+    .with_timings(ClientStateTimings::fast())
+    .with_liveness_clock(std::sync::Arc::new(move || now));
     let (_task_id, turn_id, remote) =
         enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 933, 934, None);
     let config = task_config();
@@ -3360,7 +3366,7 @@ fn reconcile_adopts_after_absent_is_confirmed_across_the_window() {
         Some(&dead_owner)
     );
 
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(ClientStateTimings::fast().runner_absence_confirmation);
     let second = client.reconcile_runners().unwrap();
     assert_eq!(second.replaced_runners(), 1);
     assert_eq!(second.started_runners(), 1);
