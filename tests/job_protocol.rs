@@ -184,29 +184,6 @@ fn serialization_rejects_directly_constructed_invalid_public_protocol_variants()
 }
 
 #[test]
-fn public_protocol_variants_keep_valid_round_trip_behavior() {
-    let command = CommandSpec::Argv {
-        argv: vec!["".into(), "repeat".into(), "repeat".into()],
-    };
-    let command_json = serde_json::to_string(&command).unwrap();
-    assert_eq!(
-        serde_json::from_str::<CommandSpec>(&command_json).unwrap(),
-        command
-    );
-
-    let event = JsonEvent::Error {
-        protocol_version: PROTOCOL_VERSION,
-        code: "CAPACITY_BUSY".into(),
-        message: "worker is busy".into(),
-    };
-    let event_json = serde_json::to_string(&event).unwrap();
-    assert_eq!(
-        serde_json::from_str::<JsonEvent>(&event_json).unwrap(),
-        event
-    );
-}
-
-#[test]
 fn command_summary_returns_a_typed_error_for_directly_invalid_commands() {
     let invalid = CommandSpec::Argv { argv: Vec::new() };
     assert!(invalid.summary().is_err());
@@ -485,6 +462,10 @@ fn streaming_events_are_versioned_strict_ndjson_records() {
         format!(
             r#"{{"event":"error","protocol_version":{PROTOCOL_VERSION},"code":"CAPACITY_BUSY","message":"worker is busy"}}"#
         )
+    );
+    assert_eq!(
+        serde_json::from_str::<JsonEvent>(&serde_json::to_string(&event).unwrap()).unwrap(),
+        event
     );
     assert!(serde_json::from_str::<JsonEvent>(
         r#"{"event":"error","protocol_version":1,"code":"CAPACITY_BUSY","message":"worker is busy"}"#

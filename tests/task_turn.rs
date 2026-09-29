@@ -593,6 +593,10 @@ fn turn_material_commits_prompt_through_the_digest_slot_without_v1_fields() {
     assert!(json.get("session_ref").is_none());
     assert_eq!(PROTOCOL_VERSION, 7);
     assert_eq!(SUPERVISION_VERSION, 3);
+    let bytes = serde_json::to_vec(&first).unwrap();
+    let decoded: TurnMaterial = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, first);
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }
 
 #[test]
@@ -923,15 +927,6 @@ fn a_non_auth_agent_exit_does_not_record_an_incident() {
             .exists(),
         "non-auth failures must not write auth-incidents.json"
     );
-}
-
-#[test]
-fn turn_material_round_trips_canonically() {
-    let original = material("prompt");
-    let bytes = serde_json::to_vec(&original).unwrap();
-    let decoded: TurnMaterial = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(decoded, original);
-    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }
 
 #[test]
