@@ -1752,6 +1752,8 @@ fn questions_auto_skips_ask_other_outcomes_and_exhausted_budget() {
         (Decide, TaskOutcome::Blocked, 10),
         (Decide, TaskOutcome::failed("TEST_FAILURE"), 10),
         (Decide, TaskOutcome::Cancelled, 10),
+        (Decide, TaskOutcome::TimedOut, 10),
+        (Decide, TaskOutcome::Lost, 10),
         (Decide, TaskOutcome::Done, 10),
         (Decide, TaskOutcome::Unknown, 10),
         (Decide, TaskOutcome::NeedsInput, 0),
@@ -2014,6 +2016,130 @@ fn questions_auto_reconcile_completed_dead_runner_starts_one_continuation() {
     assert_eq!(record.status().turns().len(), 2);
     assert_eq!(record.status().state(), TaskState::Active);
     assert!(record.status().turns()[1].auto_continue());
+}
+
+struct QuestionsRetirementFault {
+    state: Mutex<Option<ClientStateStore>>,
+    task_id: TaskId,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for QuestionsRetirementFault {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point != ClientStateConcurrencyPoint::QueuePublication {
+            return;
+        }
+        let guard = self.state.lock().unwrap();
+        let Some(state) = guard.as_ref() else { return };
+        let record = state.load_task(self.task_id).unwrap();
+        if record.status().state() == TaskState::Open
+            && record.status().last_outcome() == Some(&TaskOutcome::NeedsInput)
+            && record.runner().is_none()
+            && !self.used.swap(true, Ordering::SeqCst)
+        {
+            state.inject_write_failure_once(ClientStateWritePoint::AfterPublish);
+        }
+    }
+}
+
+#[test]
+fn questions_auto_recovers_after_finished_row_retirement_crash() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    fixture.state.bootstrap_active_task_index().unwrap();
+    let hook = Arc::new(QuestionsRetirementFault {
+        state: Mutex::new(None),
+        task_id: fixture.task_id,
+        used: AtomicBool::new(false),
+    });
+    let state =
+        ClientStateStore::open_with_concurrency_hook(&fixture.paths.state, hook.clone()).unwrap();
+    *hook.state.lock().unwrap() = Some(state.clone());
+    let error = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None)
+    .unwrap_err();
+    assert!(error.to_string().contains("after publication"), "{error}");
+    assert!(hook.used.load(Ordering::SeqCst));
+    *hook.state.lock().unwrap() = None;
+    drop(state);
+
+    let reopened = ClientStateStore::open(&fixture.paths.state).unwrap();
+    assert!(
+        reopened
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let finished = reopened.load_task(fixture.task_id).unwrap();
+    assert!(finished.runner().is_none());
+    assert_eq!(finished.status().state(), TaskState::Open);
+    assert_eq!(finished.status().turns().len(), 1);
+    let wire = serde_json::to_value(&finished).unwrap();
+    let prepared: mac_worker::prepared_followup::PreparedFollowup =
+        serde_json::from_value(wire["auto_continue_intent"].clone()).unwrap();
+    // Recreate a later crash boundary too: evidence durable, Active CAS absent.
+    reopened
+        .write_turn_prompt(
+            fixture.task_id,
+            prepared.turn_id(),
+            prepared.composed_prompt(),
+        )
+        .unwrap();
+    reopened
+        .write_turn_prepared_binding(fixture.task_id, prepared.turn_id(), &prepared.binding())
+        .unwrap();
+    // Observation-only sidecar changes must not regenerate the preparation.
+    reopened
+        .replace_task_fixture(finished.with_status_observed_at(Some(999_999)).unwrap())
+        .unwrap();
+    let client = TaskClient::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &reopened,
+        &fixture.executor,
+    );
+    client.tick_selected_recovery().unwrap();
+    let resumed = reopened.load_task(fixture.task_id).unwrap();
+    assert_eq!(
+        resumed.status().turns().len(),
+        2,
+        "row-less continuation intent must survive restart"
+    );
+    assert!(resumed.status().turns()[1].auto_continue());
+    assert_eq!(resumed.status().turns()[1].turn_id(), prepared.turn_id());
+    assert_eq!(
+        reopened
+            .read_turn_prepared_binding(fixture.task_id, prepared.turn_id())
+            .unwrap(),
+        prepared.binding()
+    );
+    assert!(
+        serde_json::to_value(&resumed)
+            .unwrap()
+            .get("auto_continue_intent")
+            .is_none()
+    );
+    assert_eq!(resumed.status().turns()[0], finished.status().turns()[0]);
+    client.tick_selected_recovery().unwrap();
+    assert_eq!(
+        reopened
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .turns(),
+        resumed.status().turns()
+    );
 }
 
 #[test]

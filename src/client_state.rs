@@ -101,6 +101,8 @@ pub(crate) fn task_operator_busy_reason(
 ) -> Option<&'static str> {
     if record.close_intent().is_some() {
         Some(TASK_CLOSE_IN_PROGRESS)
+    } else if record.auto_continue_intent().is_some() {
+        Some("automatic continuation is pending")
     } else if record.status().state() == crate::task::TaskState::Active {
         Some("task has an active turn")
     } else if entry.is_some_and(|entry| matches!(entry.state(), QueueState::Dispatching { .. })) {

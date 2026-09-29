@@ -1624,6 +1624,7 @@ impl TaskCloseIntent {
 pub struct LocalTaskRecord {
     meta: TaskMeta,
     questions_policy: Option<QuestionsPolicy>,
+    auto_continue_intent: Option<Box<crate::prepared_followup::PreparedFollowup>>,
     status: TaskStatus,
     status_observed_at_millis: Option<u64>,
     runner: Option<RunnerIdentity>,
@@ -1657,6 +1658,7 @@ impl LocalTaskRecord {
         let record = Self {
             meta,
             questions_policy: None,
+            auto_continue_intent: None,
             status,
             status_observed_at_millis,
             runner,
@@ -1687,6 +1689,22 @@ impl LocalTaskRecord {
     pub fn with_questions_policy(mut self, policy: QuestionsPolicy) -> Self {
         self.questions_policy = Some(policy);
         self
+    }
+
+    pub(crate) fn auto_continue_intent(
+        &self,
+    ) -> Option<&crate::prepared_followup::PreparedFollowup> {
+        self.auto_continue_intent.as_deref()
+    }
+
+    pub(crate) fn with_auto_continue_intent(
+        &self,
+        intent: Option<crate::prepared_followup::PreparedFollowup>,
+    ) -> Result<Self, WorkerError> {
+        let mut replacement = self.clone();
+        replacement.auto_continue_intent = intent.map(Box::new);
+        replacement.validate()?;
+        Ok(replacement)
     }
 
     pub fn status(&self) -> &TaskStatus {
@@ -1955,6 +1973,7 @@ impl LocalTaskRecord {
 
     fn with_local_fields(&self, mut replacement: Self) -> Result<Self, WorkerError> {
         replacement.questions_policy = self.questions_policy;
+        replacement.auto_continue_intent = self.auto_continue_intent.clone();
         replacement.submission_intent_turn_id = self.submission_intent_turn_id;
         replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
         replacement.close_intent = self.close_intent.clone();
@@ -2040,6 +2059,13 @@ impl LocalTaskRecord {
     fn validate(&self) -> Result<(), WorkerError> {
         self.meta.validate()?;
         self.status.validate()?;
+        if let Some(intent) = self.auto_continue_intent()
+            && (!intent.auto_continue()
+                || intent.task_id() != self.meta.task_id()
+                || intent.expected().auto_continue_intent().is_some())
+        {
+            return Err(task_config("invalid automatic continuation intent"));
+        }
         validate_hex_component(&self.repo_id, "repo ID")?;
         if let Some(worker) = &self.pinned_worker {
             validate_pinned_worker(worker)?;
@@ -2082,7 +2108,9 @@ impl LocalTaskRecord {
 impl Serialize for LocalTaskRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut field_count = 9 + usize::from(self.questions_policy.is_some());
+        let mut field_count = 9
+            + usize::from(self.questions_policy.is_some())
+            + usize::from(self.auto_continue_intent.is_some());
         if self.submission_intent_turn_id.is_some() {
             field_count += 1;
         }
@@ -2105,6 +2133,9 @@ impl Serialize for LocalTaskRecord {
         record.serialize_field("meta", &self.meta)?;
         if let Some(policy) = self.questions_policy {
             record.serialize_field("questions_policy", &policy)?;
+        }
+        if let Some(intent) = &self.auto_continue_intent {
+            record.serialize_field("auto_continue_intent", intent)?;
         }
         record.serialize_field("status", &self.status)?;
         record.serialize_field("status_observed_at_millis", &self.status_observed_at_millis)?;
@@ -2145,6 +2176,8 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             meta: TaskMeta,
             #[serde(default)]
             questions_policy: Option<QuestionsPolicy>,
+            #[serde(default)]
+            auto_continue_intent: Option<Box<crate::prepared_followup::PreparedFollowup>>,
             status: TaskStatus,
             status_observed_at_millis: Option<u64>,
             runner: Option<RunnerIdentity>,
@@ -2182,6 +2215,7 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
         )
         .map_err(de::Error::custom)?;
         record.questions_policy = wire.questions_policy;
+        record.auto_continue_intent = wire.auto_continue_intent;
         record.submission_intent_turn_id = wire.submission_intent_turn_id;
         record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
         record.close_intent = wire.close_intent;

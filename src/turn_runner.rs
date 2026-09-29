@@ -1559,10 +1559,7 @@ impl<'a> TurnRunner<'a> {
         append_event(log, follow, event.clone())?;
         transfer.release_base(self.runner, task_id)?;
         drop(transfer);
-        self.client_state.record_runner(task_id, None)?;
-        self.client_state
-            .remove_task_turn_after_terminal(turn_id, owner)?;
-        self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        retire_completed_turn(self.client_state, self.paths, turn_id, owner, task_id)?;
         self.auto_continue_after_terminal(task_id, turn_id, follow);
         self.advance_pending_dags_after_transfer_drop()?;
         let status = self.client_state.load_task(task_id)?.status().clone();
@@ -2228,11 +2225,11 @@ pub(crate) fn finalize_completed_turn(
         if imported.is_some() {
             transfer.release_base(runner, task_id)?;
         }
-        retire_completed_turn(client_state, turn_id, owner, task_id)?;
+        retire_completed_turn(client_state, paths, turn_id, owner, task_id)?;
         return Ok(published.status().clone());
     }
     transfer.release_base(runner, task_id)?;
-    retire_completed_turn(client_state, turn_id, owner, task_id)?;
+    retire_completed_turn(client_state, paths, turn_id, owner, task_id)?;
     Ok(client_state.load_task(task_id)?.status().clone())
 }
 
@@ -2302,10 +2299,24 @@ fn try_import_completed_result(
 
 fn retire_completed_turn(
     client_state: &ClientStateStore,
+    paths: &PathLayout,
     turn_id: TurnId,
     owner: ProcessIdentity,
     task_id: TaskId,
 ) -> Result<(), WorkerError> {
+    if crate::task_client::stage_auto_continue_before_retirement(client_state, task_id, turn_id)
+        .is_err()
+    {
+        // Preparing a continuation must never undo the completed turn.
+        let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
+        let _ = crate::task_client::log_auto_continue_failure(
+            client_state,
+            paths,
+            task_id,
+            turn_id,
+            crate::prepared_followup::PreparedFollowup::automatic_turn_id(turn_id),
+        );
+    }
     client_state.record_runner(task_id, None)?;
     client_state.remove_task_turn_after_terminal(turn_id, owner)?;
     client_state.remove_turn_prompt(task_id, turn_id)?;

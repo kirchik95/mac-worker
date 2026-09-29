@@ -134,6 +134,48 @@ fn operator_revision_matches(current: &LocalTaskRecord, expected: &LocalTaskReco
             == expected.status().turns().last().map(TurnSummary::turn_id)
 }
 
+/// Freeze the exact say intent while the completed turn still owns its journal
+/// and queue row. Retirement may crash; the Open record remains discoverable
+/// by the existing active-task index until this intent is materialized.
+pub(crate) fn stage_auto_continue_before_retirement(
+    state: &ClientStateStore,
+    task_id: TaskId,
+    finished: TurnId,
+) -> Result<(), WorkerError> {
+    state.mutate_task(task_id, Some(finished), |current| {
+        if current.auto_continue_intent().is_some() {
+            return Ok(current.clone());
+        }
+        let expected = current.with_runner(None)?;
+        current.with_auto_continue_intent(PreparedFollowup::automatic(&expected)?)
+    })?;
+    Ok(())
+}
+
+pub(crate) fn log_auto_continue_failure(
+    state: &ClientStateStore,
+    paths: &PathLayout,
+    task_id: TaskId,
+    finished: TurnId,
+    attempted: TurnId,
+) -> Result<(), WorkerError> {
+    let Some(mut log) = crate::runner_log::RunnerLog::try_open(&paths.state, task_id, attempted)?
+    else {
+        return Ok(());
+    };
+    let current = state.load_task(task_id)?;
+    if current.status().turns().last().map(TurnSummary::turn_id) == Some(finished)
+        && state.queue_entry(attempted)?.is_none()
+        && !log.is_accepted()
+        && log.completion().is_none()
+    {
+        // Completed journals are immutable. Use the attempted turn's own
+        // rooted, fsynced log, never questions or error details.
+        log.append_bytes(b"AUTO_CONTINUE_FAILED\n")?;
+    }
+    Ok(())
+}
+
 fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
     current.meta().task_id() == expected.meta().task_id()
         && current.status().head_oid() == expected.status().head_oid()
@@ -2987,6 +3029,55 @@ impl<'a> TaskClient<'a> {
             }
         }
 
+        // Retirement can remove the completed row before automatic say has
+        // published its Active record. Keep the frozen intent discoverable and
+        // replay it only after acquiring the original finalizer's journal fence.
+        selection = self.reload_reconcile_selection(&selection)?;
+        for record in &selection.records {
+            let Some(intent) = record.auto_continue_intent() else {
+                continue;
+            };
+            let task_id = record.meta().task_id();
+            let Some(finished) = intent
+                .expected()
+                .status()
+                .turns()
+                .last()
+                .map(TurnSummary::turn_id)
+            else {
+                continue;
+            };
+            if self
+                .client_state
+                .queue_entry_for_task_turn(task_id)?
+                .is_some()
+            {
+                continue;
+            }
+            let Some(log) = crate::runner_log::RunnerLog::try_open_existing(
+                &self.paths.state,
+                task_id,
+                finished,
+            )?
+            else {
+                continue;
+            };
+            if log.completion().is_none()
+                || self
+                    .client_state
+                    .queue_entry_for_task_turn(task_id)?
+                    .is_some()
+            {
+                continue;
+            }
+            if self
+                .auto_continue_after_terminal(task_id, finished)
+                .is_err()
+            {
+                let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
+            }
+        }
+
         // Refresh only the task records referenced by the local queue.  This
         // is intentionally a mutating-command path; status/list remain
         // read-only projections.  Probe failures are not evidence that a
@@ -2996,7 +3087,7 @@ impl<'a> TaskClient<'a> {
             if submission_recovery_pending(record) {
                 continue;
             }
-            if record.close_intent().is_some() {
+            if record.close_intent().is_some() || record.auto_continue_intent().is_some() {
                 continue;
             }
             if matches!(
@@ -3445,65 +3536,46 @@ impl<'a> TaskClient<'a> {
         self.say_prepared(&prepared, attached, stdout, stderr)
     }
 
-    /// Best-effort automatic say after publication and queue retirement. The
-    /// finished turn is fenced by identity; a human's newer turn always wins.
+    /// Replay the frozen automatic say after publication and queue retirement.
+    /// Caller holds the finished turn's journal fence, including during recovery.
     pub(crate) fn auto_continue_after_terminal(
         &self,
         task_id: TaskId,
         finished: TurnId,
     ) -> Result<(), WorkerError> {
         let expected = self.client_state.load_task(task_id)?;
-        let turn_id = PreparedFollowup::automatic_turn_id(finished);
-        if expected
-            .status()
-            .turns()
-            .iter()
-            .any(|turn| turn.turn_id() == turn_id)
-            || expected.status().turns().last().map(TurnSummary::turn_id) != Some(finished)
-        {
+        if expected.status().turns().last().map(TurnSummary::turn_id) != Some(finished) {
             return Ok(());
         }
-        let prepared = match PreparedFollowup::automatic(&expected) {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => return Ok(()),
-            Err(error) => {
-                let _ = self.log_auto_continue_failure(task_id, finished, turn_id);
-                return Err(error);
-            }
+        let Some(prepared) = expected.auto_continue_intent().cloned() else {
+            return Ok(());
         };
+        let turn_id = prepared.turn_id();
         if let Err(error) =
             self.say_prepared(&prepared, false, &mut std::io::sink(), &mut std::io::sink())
         {
             // Only compensate a provably unstarted turn owned by this process.
             // A spawned/adopted child or a concurrent operator revokes that right.
             let _ = self.rollback_unstarted_auto_continue(&prepared);
-            let _ = self.log_auto_continue_failure(task_id, finished, turn_id);
+            // Prompt/preparation errors can precede the Active CAS. Clear only
+            // this exact pending intent; a newer turn or close wins the fence.
+            let _ = self
+                .client_state
+                .mutate_task(task_id, Some(finished), |current| {
+                    if current.auto_continue_intent() == Some(&prepared) {
+                        current.with_auto_continue_intent(None)
+                    } else {
+                        Ok(current.clone())
+                    }
+                });
+            let _ = log_auto_continue_failure(
+                self.client_state,
+                self.paths,
+                task_id,
+                finished,
+                turn_id,
+            );
             return Err(error);
-        }
-        Ok(())
-    }
-
-    fn log_auto_continue_failure(
-        &self,
-        task_id: TaskId,
-        finished: TurnId,
-        attempted: TurnId,
-    ) -> Result<(), WorkerError> {
-        let Some(mut log) =
-            crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, attempted)?
-        else {
-            return Ok(());
-        };
-        let current = self.client_state.load_task(task_id)?;
-        if current.status().turns().last().map(TurnSummary::turn_id) == Some(finished)
-            && current.runner().is_none()
-            && self.client_state.queue_entry(attempted)?.is_none()
-            && !log.is_accepted()
-            && log.completion().is_none()
-        {
-            // The completed turn's journal stays immutable. The attempted
-            // continuation owns this separate, rooted and fsynced runner log.
-            log.append_bytes(b"AUTO_CONTINUE_FAILED\n")?;
         }
         Ok(())
     }
@@ -3582,6 +3654,12 @@ impl<'a> TaskClient<'a> {
         }
         prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
+        if current
+            .auto_continue_intent()
+            .is_some_and(|intent| intent != prepared)
+        {
+            return Err(task_error("TASK_BUSY", "automatic continuation is pending"));
+        }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
@@ -3653,6 +3731,7 @@ impl<'a> TaskClient<'a> {
             .copying_reported_checks(base.status())?;
             base.with_status(active)?
                 .with_runner(None)?
+                .with_auto_continue_intent(None)?
                 .with_abandon_code(None)
         };
         let active_record = build_active(expected)?;
@@ -6881,6 +6960,119 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn questions_wait_stays_pending_while_finalizer_owns_rowless_intent() {
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("a fenced pending intent must not refresh or launch remotely");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root_path.join("config.toml"),
+            state: root_path.join("state"),
+            cache: root_path.join("cache"),
+            data: root_path.join("data"),
+        };
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"never-connect\"\nslots = 1\n",
+        )
+        .unwrap();
+        let task_id = TaskId::generate();
+        let finished = TurnId::generate();
+        let base: BaseOid = "a".repeat(40).parse().unwrap();
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: crate::agent::PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: base.clone(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: crate::task::GitIdentity::new("test", "test@example.test").unwrap(),
+            title: None,
+            prompt: "fixture".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let turn = TurnSummary::new(
+            1,
+            finished,
+            Some(crate::task::TurnTerminal::Succeeded),
+            Some(TaskOutcome::NeedsInput),
+            Some(true),
+            false,
+            Some(1),
+            Some(2),
+        );
+        let record = LocalTaskRecord::new(
+            meta,
+            TaskStatus::new(
+                TaskState::Open,
+                Some(TaskOutcome::NeedsInput),
+                Some("mini-1".into()),
+                true,
+                Some(base),
+                None,
+                vec![],
+                vec![],
+                None,
+                vec![turn],
+                2,
+            )
+            .unwrap(),
+            None,
+            None,
+            None,
+            "a".repeat(64),
+            None,
+            true,
+            None,
+        )
+        .unwrap()
+        .with_questions_policy(QuestionsPolicy::Decide);
+        store.create_task(record).unwrap();
+        stage_auto_continue_before_retirement(&store, task_id, finished).unwrap();
+        // Hold the same journal fence as a live finalizer after queue retirement.
+        let _finalizer = crate::runner_log::RunnerLog::try_open(&paths.state, task_id, finished)
+            .unwrap()
+            .unwrap();
+        let client = TaskClient::new(
+            &NoProcesses,
+            &config,
+            &paths,
+            &store,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        let pending = store.load_task(task_id).unwrap();
+        assert!(!client.tasks_are_quiescent(&[pending]).unwrap());
+        assert!(
+            !client
+                .wait_poll(WaitSelector::Task(task_id))
+                .unwrap()
+                .quiescent()
+        );
+        assert!(store.queue_entry_for_task_turn(task_id).unwrap().is_none());
+        assert_eq!(store.load_task(task_id).unwrap().status().turns().len(), 1);
+    }
 
     #[test]
     fn questions_batch_resolves_node_over_defaults_over_project() {

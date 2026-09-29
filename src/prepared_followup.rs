@@ -53,6 +53,9 @@ impl PreparedFollowup {
         turn_id: TurnId,
         created_at_millis: u64,
     ) -> Result<Self, WorkerError> {
+        if expected.auto_continue_intent().is_some() {
+            return Err(task_error("TASK_BUSY", "automatic continuation is pending"));
+        }
         match expected.status().state() {
             TaskState::Active => {
                 return Err(task_error("TASK_BUSY", "task has an active turn"));
