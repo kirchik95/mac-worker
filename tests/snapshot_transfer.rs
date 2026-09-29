@@ -2465,7 +2465,7 @@ fn remote_status_accepts_only_an_exact_positive_bounded_stage_deadline() {
         .unwrap();
     assert_eq!(runner.requests()[0].policy.deadline, Duration::from_secs(7));
 
-    for invalid in [Duration::ZERO, Duration::from_secs(31)] {
+    for invalid in [Duration::ZERO, Duration::from_secs(91)] {
         let runner = RecordingRunner::returning(Vec::new());
         let error = RemoteJobClient::new(&runner)
             .status_with_deadline(&worker(), submit.material().job_id(), invalid)

@@ -288,10 +288,9 @@ pub fn initialize_with_wait(
             return Ok(());
         }
         write_pending(&pending_root, &request.destination, "installing")?;
-        let installed: ServiceStatus = controller_host_request(
+        let installed = super::service::service_change_request(
             runner,
             &host,
-            HostOperation::ControllerService,
             &ControllerServiceRequest {
                 action: ServiceAction::Install,
                 include_details: true,
@@ -305,16 +304,23 @@ pub fn initialize_with_wait(
                 identity.uid,
             )?);
         }
-        write_pending(&pending_root, &request.destination, "restarting")?;
-        let restarted: ServiceStatus = controller_host_request(
-            runner,
-            &host,
-            HostOperation::ControllerService,
-            &ControllerServiceRequest {
-                action: ServiceAction::Restart,
-                include_details: true,
-            },
-        )?;
+        // A fresh install already started a new leader through RunAtLoad and
+        // reports when. Restarting it at once would only wait out launchd's
+        // throttle. A job that was already loaded restarts to reload the
+        // inventory and SSH settings configure just wrote.
+        let restarted = if installed.restart_started_at_millis.is_some() {
+            installed
+        } else {
+            write_pending(&pending_root, &request.destination, "restarting")?;
+            super::service::service_change_request(
+                runner,
+                &host,
+                &ControllerServiceRequest {
+                    action: ServiceAction::Restart,
+                    include_details: true,
+                },
+            )?
+        };
         write_pending(&pending_root, &request.destination, "verifying")?;
         let observed: WorkersReport = controller_host_request(
             runner,
@@ -615,10 +621,10 @@ pub fn disable(
         ..Default::default()
     };
     let worker = super::controller_worker_entry(&controller)?;
-    let service: ServiceStatus = controller_host_request(
+    // bootout waits for the leader to exit; allow for it like any service change.
+    let service = super::service::service_change_request(
         runner,
         &worker,
-        HostOperation::ControllerService,
         &ControllerServiceRequest {
             action: ServiceAction::Uninstall,
             include_details: false,

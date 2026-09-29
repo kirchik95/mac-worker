@@ -24,11 +24,16 @@ const MAX_PLIST_BYTES: u64 = 64 * 1024;
 // launchctl's missing-service code. Other failures (including an unavailable
 // GUI domain) are unknown observations and must not authorize unload/reinstall.
 const SERVICE_NOT_FOUND: i32 = 113;
+// A bootout waits for the leader to exit, and a kickstart soon after a start
+// waits out ThrottleInterval (30 s) before launchd respawns the job.
 const LAUNCHCTL_POLICY: ProcessPolicy = ProcessPolicy {
     stdout_limit: 1024 * 1024,
     stderr_limit: 64 * 1024,
-    deadline: Duration::from_secs(30),
+    deadline: Duration::from_secs(75),
 };
+/// The laptop's wait for a service change must outlast the launchctl calls
+/// inside it, including a throttled respawn.
+pub(crate) const SERVICE_CHANGE_DEADLINE: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,7 +193,16 @@ pub fn manage(
                     status.loaded = false;
                 }
             }
-            if !status.loaded {
+            // RunAtLoad starts the job on bootstrap. A kickstart right after it
+            // would kill that fresh instance, and launchd would hold the
+            // respawn for ThrottleInterval. Only restart a job that was
+            // already loaded. Either way a new leader starts after this time.
+            let started_by_bootstrap = !status.loaded;
+            let starts = action == ServiceAction::Restart || started_by_bootstrap;
+            if starts {
+                status.restart_started_at_millis = Some(super::leader::now_millis()?);
+            }
+            if started_by_bootstrap {
                 agents.verify_bound()?;
                 run_checked(
                     runner,
@@ -200,12 +214,10 @@ pub fn manage(
                             .into_os_string(),
                     ],
                 )?;
-            }
-            if action == ServiceAction::Restart || !status.loaded {
-                status.restart_started_at_millis = (action == ServiceAction::Restart)
-                    .then(super::leader::now_millis)
-                    .transpose()?;
+            } else if action == ServiceAction::Restart {
                 run_checked(runner, &["kickstart".into(), "-k".into(), target.into()])?;
+            }
+            if starts {
                 let observed = observe(runner, uid)?;
                 status.pid = observed.pid;
                 status.running = observed.running;
@@ -763,6 +775,24 @@ pub fn fetch_status(
     }
 }
 
+/// Install, restart or uninstall the controller service through its host
+/// helper, allowing for launchd's waits (see [`SERVICE_CHANGE_DEADLINE`]).
+pub(crate) fn service_change_request(
+    runner: &dyn ProcessRunner,
+    host: &crate::config::WorkerEntry,
+    request: &crate::protocol::ControllerServiceRequest,
+) -> Result<ServiceStatus, WorkerError> {
+    crate::transfer::SshJsonTransport::new(runner).request(
+        host,
+        crate::transfer::HostOperation::ControllerService,
+        request,
+        ProcessPolicy {
+            deadline: SERVICE_CHANGE_DEADLINE,
+            ..super::provision::PROCESS_POLICY
+        },
+    )
+}
+
 pub fn restart_and_verify(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,
@@ -770,10 +800,9 @@ pub fn restart_and_verify(
     wait: &dyn Fn(Duration),
 ) -> Result<(), WorkerError> {
     let host = super::controller_worker_entry(controller)?;
-    let restarted: ServiceStatus = crate::transfer::controller_host_request(
+    let restarted = service_change_request(
         runner,
         &host,
-        crate::transfer::HostOperation::ControllerService,
         &crate::protocol::ControllerServiceRequest {
             action: ServiceAction::Restart,
             include_details: true,

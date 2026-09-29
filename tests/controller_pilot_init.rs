@@ -99,6 +99,8 @@ struct Fake {
     trust: bool,
     conflict: bool,
     service_actions: Mutex<Vec<String>>,
+    /// launchd starts the job on its first bootstrap only (RunAtLoad).
+    service_loaded: Mutex<bool>,
     host_alias: bool,
     jump: String,
     /// ProxyJump reported for the `controller-route` hop itself.
@@ -121,6 +123,7 @@ impl Fake {
             trust: true,
             conflict: false,
             service_actions: Mutex::new(vec![]),
+            service_loaded: Mutex::new(false),
             host_alias: false,
             jump: "mac1".into(),
             hop_jump: "none".into(),
@@ -221,11 +224,25 @@ impl ProcessRunner for Fake {
             "~/.local/bin/worker host authorize-controller-key" => result(json!({"changed":false})),
             "~/.local/bin/worker host controller-service" => {
                 let body: Value = serde_json::from_slice(req.stdin.as_ref().unwrap()).unwrap();
+                // Service changes wait out launchd (bootout, throttled respawn);
+                // reads keep the ordinary control deadline.
+                let change = body["action"] != "status";
+                assert_eq!(
+                    req.policy.deadline,
+                    std::time::Duration::from_secs(if change { 90 } else { 30 }),
+                    "{body}"
+                );
                 self.service_actions
                     .lock()
                     .unwrap()
                     .push(body["action"].as_str().unwrap().into());
                 let mut status = json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":remote_paths()});
+                let mut loaded = self.service_loaded.lock().unwrap();
+                if body["action"] == "install" && *loaded {
+                    // An already loaded job is left running; only a restart reloads it.
+                    status["restart_started_at_millis"] = Value::Null;
+                }
+                *loaded = body["action"] != "uninstall";
                 if body["action"] == "uninstall" {
                     status["installed"] = json!(false);
                     status["loaded"] = json!(false);
@@ -504,9 +521,11 @@ fn rerun_restarts_a_loaded_controller_to_reload_inventory_and_ssh_settings() {
                 .ready
         );
     }
+    // The first init's install starts the job through RunAtLoad and needs no
+    // restart; the rerun finds it loaded and restarts it to reload settings.
     assert_eq!(
         *fake.service_actions.lock().unwrap(),
-        ["install", "restart", "install", "restart"]
+        ["install", "install", "restart"]
     );
 }
 
@@ -558,7 +577,7 @@ fn init_waits_for_new_leader_health_with_an_injected_waiter() {
         waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     })
     .unwrap();
-    assert!(report.ready);
+    assert!(report.ready, "{report:?}");
     assert_eq!(waits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 

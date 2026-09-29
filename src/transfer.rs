@@ -49,6 +49,9 @@ pub use crate::host_store::TransferGuard;
 const MAX_CONTROL_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_DEADLINE: Duration = Duration::from_secs(30);
+/// Upper bound a caller may choose. Controller service changes wait out
+/// launchd, see `controller::service::SERVICE_CHANGE_DEADLINE`.
+const MAX_CONTROL_POLICY_DEADLINE: Duration = Duration::from_secs(90);
 const RSYNC_PROGRAM: &str = "/usr/bin/rsync";
 const RSYNC_POLICY: ProcessPolicy = ProcessPolicy {
     stdout_limit: 256 * 1024,
@@ -1535,7 +1538,7 @@ fn validate_control_policy(policy: ProcessPolicy) -> Result<(), WorkerError> {
         || policy.stderr_limit == 0
         || policy.stderr_limit > MAX_CONTROL_STDERR_BYTES
         || policy.deadline.is_zero()
-        || policy.deadline > MAX_CONTROL_DEADLINE
+        || policy.deadline > MAX_CONTROL_POLICY_DEADLINE
     {
         return Err(transport_error(
             "INVALID_REQUEST",

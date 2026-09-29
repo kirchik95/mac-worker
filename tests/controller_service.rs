@@ -69,7 +69,7 @@ impl ProcessRunner for Launchctl {
         assert!(request.isolate_parent_environment);
         assert!(request.policy.stdout_limit <= 1024 * 1024);
         assert!(request.policy.stderr_limit <= 64 * 1024);
-        assert!(request.policy.deadline.as_secs() <= 30);
+        assert!(request.policy.deadline.as_secs() <= 75);
         let args: Vec<_> = request
             .args
             .iter()
@@ -148,6 +148,8 @@ fn install_bootstraps_supervised_fixed_home_plist_and_is_idempotent() {
     let runner = Launchctl::default();
     let result = manage(&home, 501, &runner, ServiceAction::Install).unwrap();
     assert!(result.installed && result.loaded);
+    // RunAtLoad started the job on bootstrap; the install reports that start.
+    assert!(result.restart_started_at_millis.is_some());
     assert_eq!(result.label, "com.mac-worker.controller");
     assert_eq!(result.domain, "gui/501");
     let path = home.join(PLIST);
@@ -185,15 +187,21 @@ fn install_bootstraps_supervised_fixed_home_plist_and_is_idempotent() {
         runner.calls(),
         expected_calls(&[
             &["print", TARGET],
+            // A kickstart here would kill the instance RunAtLoad just started
+            // and wait out launchd's ThrottleInterval before the respawn.
             &["bootstrap", "gui/501", path.to_str().unwrap()],
-            &["kickstart", "-k", TARGET],
             &["print", TARGET],
         ])
     );
 
+    let rerun = manage(&home, 501, &runner, ServiceAction::Install).unwrap();
+    assert_eq!(rerun.restart_started_at_millis, None);
     assert_eq!(
-        manage(&home, 501, &runner, ServiceAction::Install).unwrap(),
-        result
+        ServiceStatus {
+            restart_started_at_millis: None,
+            ..result
+        },
+        rerun
     );
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     assert_eq!(runner.calls(), expected_calls(&[&["print", TARGET]]));
@@ -222,7 +230,6 @@ fn restart_kickstarts_live_service_and_bootstraps_unloaded_service() {
         expected_calls(&[
             &["print", TARGET],
             &["bootstrap", "gui/501", home.join(PLIST).to_str().unwrap()],
-            &["kickstart", "-k", TARGET],
             &["print", TARGET],
         ])
     );
@@ -440,7 +447,7 @@ fn changed_service_plist_reloads_in_an_existing_public_launchagents_directory() 
             .iter()
             .map(|a| a[0].as_str())
             .collect::<Vec<_>>(),
-        ["print", "bootout", "bootstrap", "kickstart", "print"]
+        ["print", "bootout", "bootstrap", "print"]
     );
 }
 
