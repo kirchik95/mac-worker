@@ -562,9 +562,10 @@ fn enabled_laptop_status_uses_ssh_stub_and_does_not_open_laptop_store() {
         &mut stderr,
     );
     assert_eq!(exit, 0, "stderr={}", String::from_utf8_lossy(&stderr));
-    // The last seeded turn finished `done`; status prints its outcome.
+    // The last seeded turn finished `done`; status prints its outcome and,
+    // for this legacy record without a stored policy, `ask`.
     let expected = format!(
-        "task {}: open (mini-1)\noutcome: done\n",
+        "task {}: open (mini-1)\noutcome: done\nquestions policy: ask\n",
         record.meta().task_id()
     );
     assert_eq!(String::from_utf8(stdout).unwrap(), expected);
@@ -802,7 +803,7 @@ slots = 1
     assert_eq!(
         String::from_utf8(stdout).unwrap(),
         format!(
-            "task {}: open (mini-1)\noutcome: done\n",
+            "task {}: open (mini-1)\noutcome: done\nquestions policy: ask\n",
             record.meta().task_id()
         )
     );
