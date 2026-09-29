@@ -60,6 +60,7 @@ fn settings_including(patterns: &[&str]) -> ProjectSettings {
             max_total_bytes: None,
         },
         task: TaskSettings {
+            questions: None,
             model: None,
             effort: None,
             source: "local".into(),

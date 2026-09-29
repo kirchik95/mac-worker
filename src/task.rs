@@ -274,6 +274,25 @@ pub enum ClosePolicy {
     Never,
 }
 
+/// How the coordinator handles ambiguity. New submissions default to Decide;
+/// missing policy on a pre-upgrade task record is resolved separately as Ask.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionsPolicy {
+    #[default]
+    Decide,
+    Ask,
+}
+
+impl QuestionsPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Decide => "decide",
+            Self::Ask => "ask",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -1579,6 +1598,7 @@ impl TaskCloseIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTaskRecord {
     meta: TaskMeta,
+    questions_policy: Option<QuestionsPolicy>,
     status: TaskStatus,
     status_observed_at_millis: Option<u64>,
     runner: Option<RunnerIdentity>,
@@ -1611,6 +1631,7 @@ impl LocalTaskRecord {
     ) -> Result<Self, WorkerError> {
         let record = Self {
             meta,
+            questions_policy: None,
             status,
             status_observed_at_millis,
             runner,
@@ -1632,6 +1653,15 @@ impl LocalTaskRecord {
 
     pub fn meta(&self) -> &TaskMeta {
         &self.meta
+    }
+
+    pub fn questions_policy(&self) -> QuestionsPolicy {
+        self.questions_policy.unwrap_or(QuestionsPolicy::Ask)
+    }
+
+    pub fn with_questions_policy(mut self, policy: QuestionsPolicy) -> Self {
+        self.questions_policy = Some(policy);
+        self
     }
 
     pub fn status(&self) -> &TaskStatus {
@@ -1889,6 +1919,7 @@ impl LocalTaskRecord {
     }
 
     fn with_local_fields(&self, mut replacement: Self) -> Result<Self, WorkerError> {
+        replacement.questions_policy = self.questions_policy;
         replacement.submission_intent_turn_id = self.submission_intent_turn_id;
         replacement.submission_rollback_turn_id = self.submission_rollback_turn_id;
         replacement.close_intent = self.close_intent.clone();
@@ -2016,7 +2047,7 @@ impl LocalTaskRecord {
 impl Serialize for LocalTaskRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let mut field_count = 9;
+        let mut field_count = 9 + usize::from(self.questions_policy.is_some());
         if self.submission_intent_turn_id.is_some() {
             field_count += 1;
         }
@@ -2037,6 +2068,9 @@ impl Serialize for LocalTaskRecord {
         }
         let mut record = serializer.serialize_struct("LocalTaskRecord", field_count)?;
         record.serialize_field("meta", &self.meta)?;
+        if let Some(policy) = self.questions_policy {
+            record.serialize_field("questions_policy", &policy)?;
+        }
         record.serialize_field("status", &self.status)?;
         record.serialize_field("status_observed_at_millis", &self.status_observed_at_millis)?;
         record.serialize_field("runner", &self.runner)?;
@@ -2074,6 +2108,8 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
         #[serde(deny_unknown_fields)]
         struct Wire {
             meta: TaskMeta,
+            #[serde(default)]
+            questions_policy: Option<QuestionsPolicy>,
             status: TaskStatus,
             status_observed_at_millis: Option<u64>,
             runner: Option<RunnerIdentity>,
@@ -2110,6 +2146,7 @@ impl<'de> Deserialize<'de> for LocalTaskRecord {
             wire.abandon_code,
         )
         .map_err(de::Error::custom)?;
+        record.questions_policy = wire.questions_policy;
         record.submission_intent_turn_id = wire.submission_intent_turn_id;
         record.submission_rollback_turn_id = wire.submission_rollback_turn_id;
         record.close_intent = wire.close_intent;

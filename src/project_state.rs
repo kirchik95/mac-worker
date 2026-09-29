@@ -175,6 +175,7 @@ impl ProjectState {
                 max_total_bytes: None,
             },
             task: TaskSettings {
+                questions: None,
                 source: prepared.source.clone(),
                 publish: prepared.publish.clone(),
                 env_profile: prepared.env_profile.clone(),
@@ -210,6 +211,7 @@ impl ProjectState {
                 max_total_bytes: None,
             },
             task: TaskSettings {
+                questions: None,
                 source: spec.source.clone(),
                 publish: spec.publish.clone(),
                 env_profile: spec.env_profile.clone(),

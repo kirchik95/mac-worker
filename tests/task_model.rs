@@ -47,6 +47,46 @@ fn task_id() -> TaskId {
     TaskId::new(Uuid::from_u128(1))
 }
 
+#[test]
+fn questions_policy_record_roundtrips_without_changing_host_meta() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(LEGACY_FETCH_ONLY_LOCAL_RECORD).unwrap();
+    value["questions_policy"] = serde_json::json!("decide");
+    let record: LocalTaskRecord =
+        serde_json::from_value(value.clone()).expect("new questions policy");
+    assert_eq!(
+        record.questions_policy(),
+        mac_worker::task::QuestionsPolicy::Decide
+    );
+    assert_eq!(
+        record
+            .with_status(record.status().clone())
+            .unwrap()
+            .questions_policy(),
+        mac_worker::task::QuestionsPolicy::Decide
+    );
+    assert_eq!(serde_json::to_value(&record).unwrap(), value);
+    assert!(
+        serde_json::to_value(record.meta())
+            .unwrap()
+            .get("questions_policy")
+            .is_none()
+    );
+}
+
+#[test]
+fn questions_legacy_record_stays_ask_and_byte_identical() {
+    let record: LocalTaskRecord = serde_json::from_str(LEGACY_FETCH_ONLY_LOCAL_RECORD).unwrap();
+    assert_eq!(
+        record.questions_policy(),
+        mac_worker::task::QuestionsPolicy::Ask
+    );
+    assert_eq!(
+        serde_json::to_string(&record).unwrap(),
+        LEGACY_FETCH_ONLY_LOCAL_RECORD
+    );
+}
+
 fn run_id() -> RunId {
     RunId::new(Uuid::from_u128(2))
 }

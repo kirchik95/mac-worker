@@ -39,6 +39,7 @@ pub struct ProjectSettings {
 /// task enums after all project policy has been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSettings {
+    pub questions: Option<crate::task::QuestionsPolicy>,
     pub source: String,
     pub publish: Vec<String>,
     pub env_profile: Option<String>,
@@ -147,6 +148,8 @@ struct RawSetupSettings {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTaskSettings {
+    #[serde(default)]
+    questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default = "default_task_source")]
     source: String,
     #[serde(default = "default_task_publish")]
@@ -172,6 +175,7 @@ struct RawTaskSettings {
 impl Default for RawTaskSettings {
     fn default() -> Self {
         Self {
+            questions: None,
             source: default_task_source(),
             publish: default_task_publish(),
             env_profile: None,
@@ -532,6 +536,7 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
         }
     }
     Ok(TaskSettings {
+        questions: raw.questions,
         source: raw.source,
         publish,
         env_profile: raw.env_profile,

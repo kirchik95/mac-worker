@@ -1703,6 +1703,7 @@ impl<'a> TaskClient<'a> {
                     request.wait_for_capacity,
                     None,
                 )?
+                .with_questions_policy(settings.task.questions.unwrap_or_default())
                 // The intent is written in the initial task-record creation, before
                 // any prompt, queue, report, or marker update can fail. Reconciliation
                 // may compensate only while this marker remains present.
@@ -1724,6 +1725,7 @@ impl<'a> TaskClient<'a> {
                         branch,
                         &request.prompt,
                         false,
+                        record_for_rollback.questions_policy(),
                     );
                     if existing != expected {
                         let _ = transfer.release_base(self.runner, task_id);
@@ -1743,6 +1745,7 @@ impl<'a> TaskClient<'a> {
                         branch,
                         &request.prompt,
                         false,
+                        record_for_rollback.questions_policy(),
                     )
                 }
                 Err(error) => {
@@ -6059,6 +6062,7 @@ pub(crate) fn effective_task_limits(
     TaskLimits::new(turn, max_followups)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_turn_prompt(
     task_id: TaskId,
     turn_number: u32,
@@ -6067,6 +6071,7 @@ pub(crate) fn compose_turn_prompt(
     branch: Option<&str>,
     user_prompt: &str,
     resume: bool,
+    questions: crate::task::QuestionsPolicy,
 ) -> String {
     let branch = branch.unwrap_or("(detached HEAD)");
     let continuation = if resume {
@@ -6077,8 +6082,14 @@ pub(crate) fn compose_turn_prompt(
     let result_instruction = result_instruction(agent)
         .map(|instruction| format!("\n\n{instruction}"))
         .unwrap_or_default();
+    let autonomy = match questions {
+        crate::task::QuestionsPolicy::Ask => "",
+        crate::task::QuestionsPolicy::Decide => {
+            "\n\nNo human is available to answer questions while you work. Do not stop to ask. When something is ambiguous, choose the most reasonable option, continue, and list the decisions and assumptions you made in your final summary. Use status \"blocked\" only for something you cannot work around (missing access, a missing secret, an unavailable service); do not use \"needs_input\"."
+        }
+    };
     format!(
-        "mac-worker task context\n\nTask ID: {task_id}\nTurn: {turn_number}\nBase commit: {base_oid}\nBase branch: {branch}\n\n{continuation}You are working in an isolated task worktree. Make changes only there. Do not switch branches, push, or modify the user's repository. Leave your changes in the task worktree for publication.\n\nUser request:\n{user_prompt}{result_instruction}\n"
+        "mac-worker task context\n\nTask ID: {task_id}\nTurn: {turn_number}\nBase commit: {base_oid}\nBase branch: {branch}\n\n{continuation}You are working in an isolated task worktree. Make changes only there. Do not switch branches, push, or modify the user's repository. Leave your changes in the task worktree for publication.\n\nUser request:\n{user_prompt}{autonomy}{result_instruction}\n"
     )
 }
 
@@ -6691,6 +6702,79 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn questions_decide_prompt_instructs_every_agent_on_every_turn() {
+        for agent in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Cursor,
+            AgentKind::Opencode,
+        ] {
+            for resume in [false, true] {
+                let prompt = compose_turn_prompt(
+                    TaskId::generate(),
+                    if resume { 2 } else { 1 },
+                    agent,
+                    &"a".repeat(40).parse().unwrap(),
+                    Some("main"),
+                    "do work",
+                    resume,
+                    crate::task::QuestionsPolicy::Decide,
+                );
+                assert!(
+                    prompt.contains("No human is available to answer questions"),
+                    "{agent:?} resume={resume}: {prompt}"
+                );
+                assert!(prompt.contains("do not use \"needs_input\""));
+                if let Some(instruction) = result_instruction(agent) {
+                    assert!(
+                        prompt.find("No human is available").unwrap()
+                            < prompt.find(instruction).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn questions_ask_prompt_is_byte_identical_to_legacy() {
+        for agent in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Cursor,
+            AgentKind::Opencode,
+        ] {
+            for resume in [false, true] {
+                let id = TaskId::generate();
+                let base = "a".repeat(40).parse().unwrap();
+                let continuation = if resume {
+                    "This is a follow-up turn. Continue from the existing task workspace and bound agent session.\n\n"
+                } else {
+                    ""
+                };
+                let instruction = result_instruction(agent)
+                    .map(|text| format!("\n\n{text}"))
+                    .unwrap_or_default();
+                let expected = format!(
+                    "mac-worker task context\n\nTask ID: {id}\nTurn: 1\nBase commit: {base}\nBase branch: main\n\n{continuation}You are working in an isolated task worktree. Make changes only there. Do not switch branches, push, or modify the user's repository. Leave your changes in the task worktree for publication.\n\nUser request:\ndo work{instruction}\n"
+                );
+                assert_eq!(
+                    compose_turn_prompt(
+                        id,
+                        1,
+                        agent,
+                        &base,
+                        Some("main"),
+                        "do work",
+                        resume,
+                        crate::task::QuestionsPolicy::Ask
+                    ),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn drain_admission_checks_expired_deadline_before_reading_gate() {

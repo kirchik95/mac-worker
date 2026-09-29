@@ -95,6 +95,7 @@ impl PreparedFollowup {
             None,
             &message,
             true,
+            expected.questions_policy(),
         );
         validate_prompt(&composed_prompt)?;
         Ok(Self {

@@ -33,6 +33,31 @@ use tempfile::tempdir;
 use support::GitRepo;
 
 #[test]
+fn questions_project_setting_accepts_ask_and_decide() {
+    for policy in ["ask", "decide"] {
+        let repo = GitRepo::init();
+        repo.write(
+            ".worker.toml",
+            format!("[task]\nquestions = \"{policy}\"\n").as_bytes(),
+        );
+        let settings = ProjectSettings::load(repo.root(), &[]).expect("valid questions policy");
+        assert_eq!(settings.task.questions.unwrap().as_str(), policy);
+    }
+}
+
+#[test]
+fn questions_project_setting_rejects_invalid_policy() {
+    let repo = GitRepo::init();
+    repo.write(".worker.toml", b"[task]\nquestions = \"sometimes\"\n");
+    assert_eq!(
+        ProjectSettings::load(repo.root(), &[])
+            .unwrap_err()
+            .public_code(),
+        "TASK_CONFIG_INVALID"
+    );
+}
+
+#[test]
 fn absent_project_settings_file_uses_v1_defaults() {
     // This catches treating optional project configuration as mandatory, or
     // changing a default that controls unconfigured projects.
