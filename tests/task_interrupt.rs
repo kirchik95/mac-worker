@@ -192,46 +192,38 @@ fn interrupt_without_an_active_turn_json_omits_interrupted() {
 }
 
 #[test]
-fn cancel_failure_sends_no_follow_up() {
-    let fixture = plant(Script::CancelFails);
-    let (exit, stdout, stderr) = run_say(&fixture, false);
-    assert_ne!(exit, 0, "stdout={stdout}");
-    assert!(stderr.contains("HOST_IO"), "{stderr}");
-    assert!(!stdout.contains("interrupted"), "{stdout}");
-    assert_eq!(
-        fixture.remote.cancel_count(),
-        1,
-        "{:?}",
-        fixture.remote.ops()
-    );
-    let store = ClientStateStore::open(&fixture.home.paths.state).unwrap();
-    let record = store.load_task(fixture.task_id).unwrap();
-    assert_eq!(record.status().state(), TaskState::Active);
-    assert_eq!(record.status().turns().len(), 1);
-    assert!(
-        store
-            .read_turn_prompt(fixture.task_id, fixture.turn_id)
-            .is_err()
-    );
-}
-
-#[test]
-fn task_closed_between_cancel_and_say_sends_no_follow_up() {
-    let fixture = plant(Script::CloseAfter);
-    let (exit, stdout, stderr) = run_say(&fixture, false);
-    assert_ne!(exit, 0, "stdout={stdout}");
-    assert!(stderr.contains("TASK_CLOSED"), "{stderr}");
-    assert!(!stdout.contains("interrupted"), "{stdout}");
-    assert_eq!(
-        fixture.remote.cancel_count(),
-        1,
-        "{:?}",
-        fixture.remote.ops()
-    );
-    let store = ClientStateStore::open(&fixture.home.paths.state).unwrap();
-    let record = store.load_task(fixture.task_id).unwrap();
-    assert_eq!(record.status().state(), TaskState::Closed);
-    assert_eq!(record.status().turns().len(), 1);
+fn a_failed_cancel_or_a_closing_task_sends_no_follow_up() {
+    // A cancel that fails at the host and a task that closes between the
+    // cancel and the say both stop before the follow-up: one cancel request,
+    // no "interrupted" line, no follow-up turn.
+    for (script, code, state) in [
+        (Script::CancelFails, "HOST_IO", TaskState::Active),
+        (Script::CloseAfter, "TASK_CLOSED", TaskState::Closed),
+    ] {
+        let fixture = plant(script);
+        let (exit, stdout, stderr) = run_say(&fixture, false);
+        assert_ne!(exit, 0, "{code}: stdout={stdout}");
+        assert!(stderr.contains(code), "{stderr}");
+        assert!(!stdout.contains("interrupted"), "{stdout}");
+        assert_eq!(
+            fixture.remote.cancel_count(),
+            1,
+            "{code}: {:?}",
+            fixture.remote.ops()
+        );
+        let store = ClientStateStore::open(&fixture.home.paths.state).unwrap();
+        let record = store.load_task(fixture.task_id).unwrap();
+        assert_eq!(record.status().state(), state, "{code}");
+        assert_eq!(record.status().turns().len(), 1, "{code}");
+        if state == TaskState::Active {
+            assert!(
+                store
+                    .read_turn_prompt(fixture.task_id, fixture.turn_id)
+                    .is_err(),
+                "{code}"
+            );
+        }
+    }
 }
 
 #[test]

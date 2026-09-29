@@ -3354,21 +3354,15 @@ fn questions_legacy_frozen_dag_resolves_project_policy_and_retains_it_on_replay(
 }
 
 #[test]
-fn dag_prepared_resume_conflicts_when_close_policy_changes() {
+fn dag_prepared_resume_conflicts_when_frozen_fields_change() {
+    // The frozen close policy, title and prompt are all part of the prepared
+    // node identity; a changed publish branch is covered separately below.
     assert_prepared_resume_conflict(|node| {
         node.frozen.close_on = ClosePolicy::Never;
     });
-}
-
-#[test]
-fn dag_prepared_resume_conflicts_when_title_changes() {
     assert_prepared_resume_conflict(|node| {
         node.frozen.title = Some("hijacked title".into());
     });
-}
-
-#[test]
-fn dag_prepared_resume_conflicts_when_prompt_changes() {
     assert_prepared_resume_conflict(|node| {
         node.frozen.prompt = "hijacked prompt".into();
     });
@@ -3485,90 +3479,60 @@ fn dag_corrupt_pending_bootstrap_rebuilds_index_and_exact_receipt() {
 }
 
 #[test]
-fn dag_cancelled_parent_blocks_descendants_without_host_prepare() {
-    let harness = BatchHarness::new(ROOT_FROM_CHILD);
-    let report = harness.batch();
-    let dag = harness
-        .store
-        .load_run_dag(report.run_id())
-        .unwrap()
-        .unwrap();
-    let root_task = dag.nodes["root"].task_id;
-    let root_turn = dag.nodes["root"].turn_id;
-    let child_id = dag.nodes["child"].task_id;
-    drop(dag);
-    let result = harness.commit_result(b"cancelled parent\n");
-    plant_parent_status(
-        &harness.store,
-        root_task,
-        root_turn,
-        result,
-        TaskState::Closed,
-        TaskOutcome::Cancelled,
-        TurnTerminal::Cancelled,
-    );
-    harness.client().advance_pending_dags().unwrap();
-    let dag = harness
-        .store
-        .load_run_dag(report.run_id())
-        .unwrap()
-        .unwrap();
-    assert_eq!(dag.nodes["child"].state, DagNodeState::Blocked);
-    assert_eq!(
-        dag.nodes["child"].blocked_by.as_deref(),
-        Some(DAG_PARENT_FAILED)
-    );
-    assert!(
-        harness
+fn dag_cancelled_or_failed_parent_blocks_descendants_without_host_prepare() {
+    for (result_bytes, outcome, terminal) in [
+        (
+            &b"cancelled parent\n"[..],
+            TaskOutcome::Cancelled,
+            TurnTerminal::Cancelled,
+        ),
+        (
+            &b"failed parent\n"[..],
+            TaskOutcome::failed("parent failed"),
+            TurnTerminal::Failed,
+        ),
+    ] {
+        let harness = BatchHarness::new(ROOT_FROM_CHILD);
+        let report = harness.batch();
+        let dag = harness
             .store
-            .load_task_optional(child_id)
+            .load_run_dag(report.run_id())
             .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
-fn dag_failed_parent_blocks_descendants_without_host_prepare() {
-    let harness = BatchHarness::new(ROOT_FROM_CHILD);
-    let report = harness.batch();
-    let dag = harness
-        .store
-        .load_run_dag(report.run_id())
-        .unwrap()
-        .unwrap();
-    let root_task = dag.nodes["root"].task_id;
-    let root_turn = dag.nodes["root"].turn_id;
-    let child_id = dag.nodes["child"].task_id;
-    drop(dag);
-    let result = harness.commit_result(b"failed parent\n");
-    plant_parent_status(
-        &harness.store,
-        root_task,
-        root_turn,
-        result,
-        TaskState::Closed,
-        TaskOutcome::failed("parent failed"),
-        TurnTerminal::Failed,
-    );
-    harness.client().advance_pending_dags().unwrap();
-    let dag = harness
-        .store
-        .load_run_dag(report.run_id())
-        .unwrap()
-        .unwrap();
-    assert_eq!(dag.nodes["child"].state, DagNodeState::Blocked);
-    assert_eq!(
-        dag.nodes["child"].blocked_by.as_deref(),
-        Some(DAG_PARENT_FAILED)
-    );
-    assert!(
-        harness
+            .unwrap();
+        let root_task = dag.nodes["root"].task_id;
+        let root_turn = dag.nodes["root"].turn_id;
+        let child_id = dag.nodes["child"].task_id;
+        drop(dag);
+        let result = harness.commit_result(result_bytes);
+        plant_parent_status(
+            &harness.store,
+            root_task,
+            root_turn,
+            result,
+            TaskState::Closed,
+            outcome,
+            terminal,
+        );
+        harness.client().advance_pending_dags().unwrap();
+        let dag = harness
             .store
-            .load_task_optional(child_id)
+            .load_run_dag(report.run_id())
             .unwrap()
-            .is_none()
-    );
-    assert!(harness.store.list_pending_run_ids().unwrap().is_empty());
+            .unwrap();
+        assert_eq!(dag.nodes["child"].state, DagNodeState::Blocked);
+        assert_eq!(
+            dag.nodes["child"].blocked_by.as_deref(),
+            Some(DAG_PARENT_FAILED)
+        );
+        assert!(
+            harness
+                .store
+                .load_task_optional(child_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(harness.store.list_pending_run_ids().unwrap().is_empty());
+    }
 }
 
 #[test]

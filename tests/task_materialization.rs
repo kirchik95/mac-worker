@@ -1377,65 +1377,49 @@ fn v6_host_request(value: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn v6_task_status_request_is_refused_before_store_writes() {
-    let temp = tempfile::tempdir().unwrap();
-    let host = temp.path().join("host");
-    let store = HostStore::open(&host).unwrap();
-    let marker = host
-        .join("tasks")
-        .join(PROJECT_ID)
-        .join(task_id().to_string());
-    fs::create_dir_all(&marker).unwrap();
-    let sentinel = marker.join("do-not-touch");
-    fs::write(&sentinel, b"persisted-task").unwrap();
-    let request: TaskStatusRequest = serde_json::from_value(v6_host_request(
-        serde_json::to_value(TaskStatusRequest::new(PROJECT_ID, task_id())).unwrap(),
-    ))
-    .unwrap();
-    let error = TaskStore::new(&store, &SystemProcessRunner)
-        .status(&request)
-        .unwrap_err();
-    match error {
-        WorkerError::Protocol(message) => {
-            assert!(
-                message.contains("INCOMPATIBLE_PROTOCOL"),
-                "unexpected protocol error: {message}"
-            )
+fn v6_task_requests_are_refused_before_store_writes() {
+    // A status or close request carrying the previous protocol version is
+    // refused as INCOMPATIBLE_PROTOCOL before the task store writes anything.
+    for command in ["status", "close"] {
+        let temp = tempfile::tempdir().unwrap();
+        let host = temp.path().join("host");
+        let store = HostStore::open(&host).unwrap();
+        let marker = host
+            .join("tasks")
+            .join(PROJECT_ID)
+            .join(task_id().to_string());
+        fs::create_dir_all(&marker).unwrap();
+        let sentinel = marker.join("do-not-touch");
+        fs::write(&sentinel, b"persisted-task").unwrap();
+        let task_store = TaskStore::new(&store, &SystemProcessRunner);
+        let error = match command {
+            "status" => {
+                let request: TaskStatusRequest = serde_json::from_value(v6_host_request(
+                    serde_json::to_value(TaskStatusRequest::new(PROJECT_ID, task_id())).unwrap(),
+                ))
+                .unwrap();
+                task_store.status(&request).unwrap_err()
+            }
+            _ => {
+                let request: TaskCloseRequest = serde_json::from_value(v6_host_request(
+                    serde_json::to_value(TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+                        .unwrap(),
+                ))
+                .unwrap();
+                task_store.close(&request).unwrap_err()
+            }
+        };
+        match error {
+            WorkerError::Protocol(message) => {
+                assert!(
+                    message.contains("INCOMPATIBLE_PROTOCOL"),
+                    "{command}: unexpected protocol error: {message}"
+                )
+            }
+            other => panic!("{command}: expected protocol mismatch, got {other:?}"),
         }
-        other => panic!("expected protocol mismatch, got {other:?}"),
+        assert_eq!(fs::read(&sentinel).unwrap(), b"persisted-task", "{command}");
     }
-    assert_eq!(fs::read(&sentinel).unwrap(), b"persisted-task");
-}
-
-#[test]
-fn v6_task_close_request_is_refused_before_store_writes() {
-    let temp = tempfile::tempdir().unwrap();
-    let host = temp.path().join("host");
-    let store = HostStore::open(&host).unwrap();
-    let marker = host
-        .join("tasks")
-        .join(PROJECT_ID)
-        .join(task_id().to_string());
-    fs::create_dir_all(&marker).unwrap();
-    let sentinel = marker.join("do-not-touch");
-    fs::write(&sentinel, b"persisted-task").unwrap();
-    let request: TaskCloseRequest = serde_json::from_value(v6_host_request(
-        serde_json::to_value(TaskCloseRequest::new(PROJECT_ID, task_id(), false)).unwrap(),
-    ))
-    .unwrap();
-    let error = TaskStore::new(&store, &SystemProcessRunner)
-        .close(&request)
-        .unwrap_err();
-    match error {
-        WorkerError::Protocol(message) => {
-            assert!(
-                message.contains("INCOMPATIBLE_PROTOCOL"),
-                "unexpected protocol error: {message}"
-            )
-        }
-        other => panic!("expected protocol mismatch, got {other:?}"),
-    }
-    assert_eq!(fs::read(&sentinel).unwrap(), b"persisted-task");
 }
 
 #[test]
