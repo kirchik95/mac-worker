@@ -84,3 +84,32 @@ fn questions_status_roundtrips_through_strict_f59e56a_dto() {
             .into_report();
     assert_eq!(report.questions_policy(), QuestionsPolicy::Decide);
 }
+
+#[test]
+fn questions_auto_history_is_carried_in_events_compatible_with_f59e56a() {
+    use mac_worker::controller::ControllerTaskStatusResult;
+    let turn = "00000000000000000000000000000002";
+    let wire = json!({
+        "task_id":"00000000000000000000000000000001", "run_id":null,
+        "status": {"state":"open", "last_outcome":{"kind":"needs_input"}, "worker":"mini-1",
+            "session_present":true, "head_oid":null, "summary":null, "questions":[],
+            "files_changed":[], "diff_stat":null, "turns":[{
+                "turn_id":turn, "turn_number":1, "terminal":"succeeded", "outcome":{"kind":"needs_input"},
+                "agent_committed":false, "log_truncated":false, "started_at_millis":1, "ended_at_millis":2
+            }], "updated_at_millis":2},
+        "warnings":[], "events":[{"type":"questions_policy", "policy":"decide", "auto_continue_turns":[turn]}],
+        "runner":null, "exit_code":null
+    });
+    let report = serde_json::from_value::<ControllerTaskStatusResult>(wire)
+        .unwrap()
+        .into_report();
+    assert!(report.status().turns()[0].auto_continue());
+    let value = serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).unwrap();
+    assert!(value["status"]["turns"][0].get("auto_continue").is_none());
+    let old: v7::ControllerTaskStatusResult = serde_json::from_value(value).unwrap();
+    let report =
+        serde_json::from_value::<ControllerTaskStatusResult>(serde_json::to_value(old).unwrap())
+            .unwrap()
+            .into_report();
+    assert!(report.status().turns()[0].auto_continue());
+}

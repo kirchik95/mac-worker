@@ -141,11 +141,13 @@ impl ControllerTaskStatusResult {
         events.retain(|event| event["type"] != "questions_policy");
         events.push(serde_json::json!({
             "type": "questions_policy", "policy": report.questions_policy(),
+            "auto_continue_turns": report.status().turns().iter()
+                .filter(|turn| turn.auto_continue()).map(|turn| turn.turn_id()).collect::<Vec<_>>(),
         }));
         Self {
             task_id: report.task_id(),
             run_id: report.run_id(),
-            status: report.status().clone(),
+            status: report.status().clone().with_auto_continue_turns(&[]),
             warnings: report.warnings().to_vec(),
             events,
             runner: report.runner(),
@@ -553,7 +555,7 @@ fn result_reply(
         request,
         ControllerTaskResult {
             task_id: report.task_id(),
-            status: report.status().clone(),
+            status: report.status().clone().with_auto_continue_turns(&[]),
             branch: report.branch().to_owned(),
             fetch: report.fetch_instruction().to_owned(),
             stage: report

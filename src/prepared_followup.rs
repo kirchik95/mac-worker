@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::WorkerError,
-    task::{BaseOid, LocalTaskRecord, TaskId, TaskState, TurnId},
+    task::{BaseOid, LocalTaskRecord, QuestionsPolicy, TaskId, TaskOutcome, TaskState, TurnId},
     task_client::{compose_turn_prompt, task_error, validate_prompt},
 };
 
@@ -26,6 +26,8 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedFollowup {
+    #[serde(default, skip_serializing_if = "crate::task::is_false")]
+    auto_continue: bool,
     expected: LocalTaskRecord,
     turn_id: TurnId,
     turn_number: u32,
@@ -99,6 +101,7 @@ impl PreparedFollowup {
         );
         validate_prompt(&composed_prompt)?;
         Ok(Self {
+            auto_continue: false,
             expected: expected.clone(),
             turn_id,
             turn_number,
@@ -118,12 +121,21 @@ impl PreparedFollowup {
     /// A replayed turn with different input for the same turn id is a
     /// `TASK_REVISION_CONFLICT`, never a silent second meaning.
     pub fn validate_self_consistency(&self) -> Result<(), WorkerError> {
-        let rebuilt = Self::prepare(
-            &self.expected,
-            self.message.clone(),
-            self.turn_id,
-            self.created_at_millis,
-        )?;
+        let rebuilt = if self.auto_continue {
+            Self::automatic(&self.expected)?.ok_or_else(|| {
+                task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task is not eligible for automatic continuation",
+                )
+            })?
+        } else {
+            Self::prepare(
+                &self.expected,
+                self.message.clone(),
+                self.turn_id,
+                self.created_at_millis,
+            )?
+        };
         if rebuilt != *self {
             return Err(task_error(
                 "TASK_REVISION_CONFLICT",
@@ -131,6 +143,55 @@ impl PreparedFollowup {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn automatic(expected: &LocalTaskRecord) -> Result<Option<Self>, WorkerError> {
+        let Some(finished) = expected.status().turns().last() else {
+            return Ok(None);
+        };
+        if expected.questions_policy() != QuestionsPolicy::Decide
+            || expected.status().state() != TaskState::Open
+            || expected.status().last_outcome() != Some(&TaskOutcome::NeedsInput)
+            || finished.outcome() != Some(&TaskOutcome::NeedsInput)
+            || finished.terminal().is_none()
+            || finished.auto_continue()
+            || expected.close_intent().is_some()
+            || expected.status().turns().len().saturating_sub(1) as u32
+                >= expected.meta().limits().max_followups
+        {
+            return Ok(None);
+        }
+        let questions = serde_json::to_string_pretty(expected.status().questions())
+            .map_err(|_| task_error("TASK_CONFIG_INVALID", "questions could not be encoded"))?;
+        let message = format!(
+            "Your questions and options:\n{questions}\n\nNo answer will come. For each question choose the option you recommend (the first option if you listed them by preference), finish the task, and list your choices in the summary."
+        );
+        let mut prepared = Self::prepare(
+            expected,
+            message,
+            Self::automatic_turn_id(finished.turn_id()),
+            finished
+                .ended_at_millis()
+                .unwrap_or(expected.status().updated_at_millis()),
+        )?;
+        prepared.auto_continue = true;
+        Ok(Some(prepared))
+    }
+
+    pub(crate) fn automatic_turn_id(finished: TurnId) -> TurnId {
+        let mut digest = Sha256::new();
+        digest.update(b"mac-worker/auto-continue/v1\x00");
+        digest.update(finished.as_uuid().as_bytes());
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest.finalize()[..16]);
+        // RFC 9562 UUIDv8: domain-separated, deterministic SHA-256 identity.
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        TurnId::new(uuid::Uuid::from_bytes(bytes))
+    }
+
+    pub fn auto_continue(&self) -> bool {
+        self.auto_continue
     }
 
     pub fn expected(&self) -> &LocalTaskRecord {

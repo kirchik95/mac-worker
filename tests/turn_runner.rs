@@ -191,6 +191,9 @@ struct AcceptedThenTerminalRunner {
     first_probe_fresh: bool,
     base_release_failures: Mutex<u8>,
     worker: Mutex<String>,
+    terminal_outcome: Mutex<TaskOutcome>,
+    prior_turns: Mutex<Vec<TurnSummary>>,
+    next_outcome: Mutex<Option<TaskOutcome>>,
 }
 
 /// A remote with immutable, seekable logs. Unlike a once-only byte supplier,
@@ -975,6 +978,9 @@ impl AcceptedThenTerminalRunner {
             first_probe_fresh: true,
             base_release_failures: Mutex::new(0),
             worker: Mutex::new("mini-1".into()),
+            terminal_outcome: Mutex::new(TaskOutcome::Done),
+            prior_turns: Mutex::new(Vec::new()),
+            next_outcome: Mutex::new(None),
         }
     }
 
@@ -1004,9 +1010,10 @@ impl AcceptedThenTerminalRunner {
             )
         })?;
         assert_eq!(meta.task_id(), task_id);
-        let outcome = terminal.then_some(TaskOutcome::Done);
+        let outcome = terminal.then(|| self.terminal_outcome.lock().unwrap().clone());
+        let mut turns = self.prior_turns.lock().unwrap().clone();
         let turn = TurnSummary::new(
-            1,
+            turns.len() as u32 + 1,
             *turn_id,
             terminal.then_some(TurnTerminal::Succeeded),
             outcome.clone(),
@@ -1015,9 +1022,22 @@ impl AcceptedThenTerminalRunner {
             Some(meta.created_at_millis()),
             terminal.then_some(meta.created_at_millis() + 1),
         );
+        turns.push(turn);
+        let questions = if outcome == Some(TaskOutcome::NeedsInput) {
+            vec![mac_worker::agent::Question::new(
+                "Which approach?",
+                vec!["Recommended: small change".into(), "Rewrite".into()],
+            )]
+        } else {
+            Vec::new()
+        };
         TaskStatus::new(
             if terminal {
-                TaskState::Closed
+                if outcome == Some(TaskOutcome::Done) {
+                    TaskState::Closed
+                } else {
+                    TaskState::Open
+                }
             } else {
                 TaskState::Active
             },
@@ -1026,10 +1046,10 @@ impl AcceptedThenTerminalRunner {
             true,
             Some(meta.base_oid().clone()),
             terminal.then_some("finished".into()),
-            Vec::new(),
+            questions,
             Vec::new(),
             None,
-            vec![turn],
+            turns,
             meta.created_at_millis() + u64::from(terminal),
         )
     }
@@ -1276,6 +1296,15 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
             value if value == HostOperation::TaskTurn.command() => {
                 let turn: TaskTurnRequest = decode_request(request)?;
                 let material = turn.submit().material();
+                if turn.turn().turn_number() > 1 {
+                    let prior = self.task_status(turn.turn().task_id(), true)?;
+                    *self.prior_turns.lock().unwrap() = prior.turns().to_vec();
+                    if let Some(outcome) = self.next_outcome.lock().unwrap().take() {
+                        *self.terminal_outcome.lock().unwrap() = outcome;
+                    }
+                    self.task.lock().unwrap().as_mut().unwrap().1 = material.job_id();
+                    *self.stdout_log_sent.lock().unwrap() = false;
+                }
                 let active = self.task_status(turn.turn().task_id(), false)?;
                 *self.turn_submitted.lock().unwrap() = true;
                 let job_meta = JobMeta::new(material, material.fingerprint())?;
@@ -1284,6 +1313,15 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                     status: JobStatus::accepted(material.created_at_millis() + 1)?,
                 };
                 canonical_process(&TaskTurnResponse::new(submit, active))
+            }
+            value if value == HostOperation::TaskSession.command() => {
+                canonical_process(&mac_worker::task_store::TaskSessionResponse::new(
+                    mac_worker::task_store::SessionBinding::new(
+                        AgentKind::Codex,
+                        "018f0f4a-6b5c-7d8e-9f00-112233445566",
+                        1,
+                    )?,
+                ))
             }
             value if value == HostOperation::Status.command() => {
                 fixture_terminal_job(&self.requests(), request, 13, 0)
@@ -1577,6 +1615,359 @@ fn questions_submit_resolves_flag_over_project_over_default() {
             .unwrap();
         assert_eq!(prompt.contains("No human is available"), expected == Decide);
     }
+}
+
+fn questions_fixture(
+    policy: mac_worker::task::QuestionsPolicy,
+    outcome: TaskOutcome,
+    budget: u32,
+) -> AcceptedThenTerminalFixture {
+    let fixture = AcceptedThenTerminalFixture::new();
+    *fixture.runner.terminal_outcome.lock().unwrap() = outcome;
+    let record = fixture
+        .state
+        .load_task(fixture.task_id)
+        .unwrap()
+        .with_questions_policy(policy);
+    let mut wire = serde_json::to_value(record).unwrap();
+    wire["meta"]["limits"]["max_followups"] = serde_json::json!(budget);
+    wire["meta"]["close_policy"] = serde_json::json!("done");
+    fixture
+        .state
+        .replace_task_fixture(serde_json::from_value(wire).unwrap())
+        .unwrap();
+    fixture
+}
+
+#[test]
+fn questions_auto_continues_once_detached_with_questions_and_same_session() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    let report = fixture.run(&mut Vec::new()).unwrap();
+    assert_eq!(report.status().state(), TaskState::Active);
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().turns().len(), 2);
+    assert_eq!(
+        record.status().turns()[0].outcome(),
+        Some(&TaskOutcome::NeedsInput)
+    );
+    let second = record.status().turns()[1].turn_id();
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["status"]["turns"][1]["auto_continue"],
+        true
+    );
+    let prompt = fixture
+        .state
+        .read_turn_prompt(fixture.task_id, second)
+        .unwrap();
+    for text in [
+        "Which approach?",
+        "Recommended: small change",
+        "Rewrite",
+        "No answer will come",
+        "No human is available",
+        "bound agent session",
+    ] {
+        assert!(prompt.contains(text), "missing {text}: {prompt}");
+    }
+    // A detached continuation is queued, never executed inline by terminal cleanup.
+    assert_eq!(
+        fixture
+            .runner
+            .requests()
+            .iter()
+            .filter(|r| r
+                .args
+                .iter()
+                .any(|a| a == HostOperation::TaskTurn.command()))
+            .count(),
+        1
+    );
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(fixture.state.queue_entry(second).unwrap().is_some());
+    TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, second, None)
+    .unwrap();
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().state(), TaskState::Open);
+    assert_eq!(
+        record.status().turns().len(),
+        2,
+        "second needs_input must stop"
+    );
+    assert_eq!(
+        serde_json::to_value(record).unwrap()["status"]["turns"][1]["auto_continue"],
+        true
+    );
+    assert!(
+        fixture
+            .state
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let calls = fixture.runner.requests();
+    let resumed: TaskTurnRequest = calls
+        .iter()
+        .rev()
+        .find(|r| {
+            r.args
+                .iter()
+                .any(|a| a == HostOperation::TaskTurn.command())
+        })
+        .map(|r| decode_request(r).unwrap())
+        .unwrap();
+    assert!(resumed.turn().resume());
+    assert_eq!(resumed.turn().task_id(), fixture.task_id);
+    assert_eq!(resumed.turn().turn_number(), 2);
+    assert!(calls.iter().any(|r| {
+        r.args
+            .iter()
+            .any(|a| a == HostOperation::TaskSession.command())
+    }));
+}
+
+#[test]
+fn questions_auto_skips_ask_other_outcomes_and_exhausted_budget() {
+    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (policy, outcome, budget) in [
+        (Ask, TaskOutcome::NeedsInput, 10),
+        (Decide, TaskOutcome::Blocked, 10),
+        (Decide, TaskOutcome::failed("TEST_FAILURE"), 10),
+        (Decide, TaskOutcome::Cancelled, 10),
+        (Decide, TaskOutcome::Done, 10),
+        (Decide, TaskOutcome::Unknown, 10),
+        (Decide, TaskOutcome::NeedsInput, 0),
+    ] {
+        let fixture = questions_fixture(policy, outcome.clone(), budget);
+        fixture.run(&mut Vec::new()).unwrap();
+        let record = fixture.state.load_task(fixture.task_id).unwrap();
+        assert_eq!(record.status().turns().len(), 1, "{policy:?}: {outcome:?}");
+        assert!(
+            fixture
+                .state
+                .queue_entry_for_task_turn(fixture.task_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn questions_auto_retries_terminal_cleanup_without_duplicate_continuation() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    *fixture.runner.base_release_failures.lock().unwrap() = 1;
+    assert!(fixture.run(&mut Vec::new()).is_err());
+    assert_eq!(
+        fixture
+            .state
+            .load_task(fixture.task_id)
+            .unwrap()
+            .status()
+            .turns()
+            .len(),
+        1
+    );
+    fixture.run(&mut Vec::new()).unwrap();
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().turns().len(), 2);
+    let second = record.status().turns()[1].turn_id();
+    let _ = fixture.run(&mut Vec::new());
+    let after = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(after.status().turns(), record.status().turns());
+    assert_eq!(
+        fixture
+            .state
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .job_id(),
+        second
+    );
+}
+
+#[test]
+fn questions_auto_prompt_failure_keeps_finished_turn_open_and_logs_only_code() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    fixture
+        .state
+        .inject_write_failure_once(ClientStateWritePoint::BeforeTurnPromptWrite);
+    let mut diagnostics = Vec::new();
+    let report = fixture.run(&mut diagnostics).unwrap();
+    assert_eq!(report.status().state(), TaskState::Open);
+    assert_eq!(report.status().turns().len(), 1);
+    assert_eq!(
+        report.status().last_outcome(),
+        Some(&TaskOutcome::NeedsInput)
+    );
+    let log = String::from_utf8(diagnostics).unwrap();
+    assert!(
+        log.lines().any(|line| line == "AUTO_CONTINUE_FAILED"),
+        "{log}"
+    );
+    assert!(!log.contains("Which approach?"));
+    let diagnostic_logs = fs::read_dir(
+        fixture
+            .paths
+            .state
+            .join("runners")
+            .join(fixture.task_id.to_string()),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+    .map(|path| fs::read_to_string(path).unwrap())
+    .collect::<Vec<_>>();
+    assert!(
+        diagnostic_logs
+            .iter()
+            .any(|text| text == "AUTO_CONTINUE_FAILED\n")
+    );
+    assert!(
+        fixture
+            .state
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+struct QuestionsSpawnFailure;
+
+impl RunnerExecutor for QuestionsSpawnFailure {
+    fn start(
+        &self,
+        _: &mac_worker::paths::PathLayout,
+        _: TaskId,
+        _: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        Err(WorkerError::Protocol(
+            "private spawn error must not escape".into(),
+        ))
+    }
+}
+
+#[test]
+fn questions_auto_spawn_failure_restores_open_finished_turn() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    let mut diagnostics = Vec::new();
+    let report = TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &QuestionsSpawnFailure,
+    )
+    .run(fixture.task_id, fixture.turn_id, Some(&mut diagnostics))
+    .unwrap();
+    assert_eq!(report.status().state(), TaskState::Open);
+    assert_eq!(
+        report.status().last_outcome(),
+        Some(&TaskOutcome::NeedsInput)
+    );
+    assert_eq!(report.status().turns().len(), 1);
+    let record = fixture.state.load_task(fixture.task_id).unwrap();
+    assert!(record.fetched_head().is_some());
+    assert!(record.runner().is_none());
+    assert!(
+        fixture
+            .state
+            .queue_entry_for_task_turn(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let text = String::from_utf8(diagnostics).unwrap();
+    assert!(text.lines().any(|line| line == "AUTO_CONTINUE_FAILED"));
+    assert!(!text.contains("private spawn error"));
+}
+
+#[test]
+fn questions_auto_reconcile_completed_dead_runner_starts_one_continuation() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        10,
+    );
+    *fixture.runner.base_release_failures.lock().unwrap() = 1;
+    assert!(fixture.run(&mut Vec::new()).is_err());
+    let dead = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    let (store, _) = adopt_dead_owner_and_reconcile(&fixture, &fixture.runner, dead);
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().turns().len(), 2);
+    assert_eq!(record.status().state(), TaskState::Active);
+    assert!(record.status().turns()[1].auto_continue());
+}
+
+#[test]
+fn questions_auto_done_closes_only_after_continuation_and_keeps_dag_waiting_until_then() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = questions_fixture(
+        mac_worker::task::QuestionsPolicy::Decide,
+        TaskOutcome::NeedsInput,
+        1,
+    );
+    fixture.run(&mut Vec::new()).unwrap();
+    let pending = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(pending.status().state(), TaskState::Active);
+    assert_eq!(
+        mac_worker::dag::parent_gate(&pending),
+        mac_worker::dag::ParentGate::Waiting
+    );
+    *fixture.runner.next_outcome.lock().unwrap() = Some(TaskOutcome::Done);
+    TurnRunner::new(
+        &fixture.runner,
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, pending.status().turns()[1].turn_id(), None)
+    .unwrap();
+    let finished = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(finished.status().state(), TaskState::Closed);
+    assert_eq!(finished.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(
+        finished.status().turns()[0].outcome(),
+        Some(&TaskOutcome::NeedsInput)
+    );
+    assert_eq!(finished.status().turns().len(), 2);
+    assert_eq!(
+        mac_worker::dag::parent_gate(&finished),
+        mac_worker::dag::ParentGate::Ready
+    );
 }
 
 #[test]

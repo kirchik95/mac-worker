@@ -87,6 +87,24 @@ fn questions_legacy_record_stays_ask_and_byte_identical() {
     );
 }
 
+#[test]
+fn questions_auto_marker_survives_worker_status_without_local_fields() {
+    let mut wire = serde_json::to_value(sample_record()).unwrap();
+    wire["status"]["turns"][0]["auto_continue"] = serde_json::json!(true);
+    let record: LocalTaskRecord = serde_json::from_value(wire).expect("automatic turn marker");
+    let merged = record.with_status(sample_status()).unwrap();
+    assert_eq!(
+        serde_json::to_value(merged).unwrap()["status"]["turns"][0]["auto_continue"],
+        true
+    );
+    let ordinary = serde_json::to_value(sample_record()).unwrap();
+    assert!(
+        ordinary["status"]["turns"][0]
+            .get("auto_continue")
+            .is_none()
+    );
+}
+
 fn run_id() -> RunId {
     RunId::new(Uuid::from_u128(2))
 }

@@ -1187,6 +1187,8 @@ impl Serialize for TaskSummary {
 pub struct TurnSummary {
     turn_number: u32,
     turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "is_false")]
+    auto_continue: bool,
     terminal: Option<TurnTerminal>,
     outcome: Option<TaskOutcome>,
     agent_committed: Option<bool>,
@@ -1238,6 +1240,7 @@ impl TurnSummary {
         Self {
             turn_number,
             turn_id,
+            auto_continue: false,
             terminal,
             outcome: outcome.map(|outcome| outcome.redact(&boundary)),
             agent_committed,
@@ -1291,6 +1294,15 @@ impl TurnSummary {
         self.turn_id
     }
 
+    pub fn auto_continue(&self) -> bool {
+        self.auto_continue
+    }
+
+    pub fn with_auto_continue(mut self, auto_continue: bool) -> Self {
+        self.auto_continue = auto_continue;
+        self
+    }
+
     pub fn terminal(&self) -> Option<TurnTerminal> {
         self.terminal
     }
@@ -1342,7 +1354,20 @@ pub struct TaskStatus {
     reported_checks: Vec<ReportedCheck>,
 }
 
+pub(crate) fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl TaskStatus {
+    /// Coordinator annotations travel in extensible controller events, not
+    /// the strict v7 worker/status DTO consumed by older peers.
+    pub(crate) fn with_auto_continue_turns(mut self, turn_ids: &[TurnId]) -> Self {
+        for turn in &mut self.turns {
+            turn.auto_continue = turn_ids.contains(&turn.turn_id);
+        }
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: TaskState,
@@ -1809,7 +1834,17 @@ impl LocalTaskRecord {
         serde_json::to_vec(self)
     }
 
-    pub fn with_status(&self, status: TaskStatus) -> Result<Self, WorkerError> {
+    pub fn with_status(&self, mut status: TaskStatus) -> Result<Self, WorkerError> {
+        for turn in &mut status.turns {
+            if self
+                .status
+                .turns
+                .iter()
+                .any(|old| old.turn_id == turn.turn_id && old.auto_continue)
+            {
+                turn.auto_continue = true;
+            }
+        }
         // Keep fetched_head as last successful import history. Presence is not
         // proof the current turn's result was imported; follow-up recovery
         // must fetch this turn before releasing its base pin.

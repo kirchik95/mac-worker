@@ -1792,6 +1792,9 @@ fn write_turn_diagnostics(
     stdout: &mut dyn Write,
     status: &crate::task::TaskStatus,
 ) -> Result<(), WorkerError> {
+    for turn in status.turns().iter().filter(|turn| turn.auto_continue()) {
+        writeln!(stdout, "turn {} (auto-continue)", turn.turn_number())?;
+    }
     if let Some(identity) = status.turns().last().and_then(|turn| turn.agent_identity()) {
         writeln!(
             stdout,

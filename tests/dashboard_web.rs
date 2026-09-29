@@ -1087,6 +1087,7 @@ fn fixture_detail() -> TaskDetailProjection {
         .parse()
         .expect("valid run ID fixture");
     let turn = TaskTurnProjection {
+        auto_continue: false,
         agent_identity: None,
         result_parse_reason: None,
         turn_number: 1,
@@ -1151,6 +1152,7 @@ fn fixture_detail() -> TaskDetailProjection {
         review_commands: vec![format!("worker task fetch {task_id}")],
         turns: vec![turn.clone()],
         timeline: vec![TaskTimelineEvent {
+            auto_continue: false,
             turn_number: turn.turn_number,
             turn_id: turn.turn_id,
             outcome: turn.outcome.clone(),

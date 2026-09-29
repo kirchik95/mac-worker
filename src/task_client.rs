@@ -401,11 +401,18 @@ impl TaskReport {
             .find(|event| event["type"] == "questions_policy")
             .and_then(|event| serde_json::from_value(event["policy"].clone()).ok())
             .unwrap_or(QuestionsPolicy::Ask);
+        let automatic: Vec<TurnId> = projection
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "questions_policy")
+            .and_then(|event| serde_json::from_value(event["auto_continue_turns"].clone()).ok())
+            .unwrap_or_default();
         Self {
             questions_policy,
             task_id: projection.task_id,
             run_id: projection.run_id,
-            status: projection.status,
+            status: projection.status.with_auto_continue_turns(&automatic),
             warnings: projection.warnings,
             events: projection.events,
             runner: projection.runner,
@@ -2970,6 +2977,12 @@ impl<'a> TaskClient<'a> {
                     owner,
                     completion,
                 )?;
+                if self
+                    .auto_continue_after_terminal(task_id, entry.job_id())
+                    .is_err()
+                {
+                    let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
+                }
                 report.repaired_rows += 1;
             }
         }
@@ -3432,6 +3445,123 @@ impl<'a> TaskClient<'a> {
         self.say_prepared(&prepared, attached, stdout, stderr)
     }
 
+    /// Best-effort automatic say after publication and queue retirement. The
+    /// finished turn is fenced by identity; a human's newer turn always wins.
+    pub(crate) fn auto_continue_after_terminal(
+        &self,
+        task_id: TaskId,
+        finished: TurnId,
+    ) -> Result<(), WorkerError> {
+        let expected = self.client_state.load_task(task_id)?;
+        let turn_id = PreparedFollowup::automatic_turn_id(finished);
+        if expected
+            .status()
+            .turns()
+            .iter()
+            .any(|turn| turn.turn_id() == turn_id)
+            || expected.status().turns().last().map(TurnSummary::turn_id) != Some(finished)
+        {
+            return Ok(());
+        }
+        let prepared = match PreparedFollowup::automatic(&expected) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                let _ = self.log_auto_continue_failure(task_id, finished, turn_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            self.say_prepared(&prepared, false, &mut std::io::sink(), &mut std::io::sink())
+        {
+            // Only compensate a provably unstarted turn owned by this process.
+            // A spawned/adopted child or a concurrent operator revokes that right.
+            let _ = self.rollback_unstarted_auto_continue(&prepared);
+            let _ = self.log_auto_continue_failure(task_id, finished, turn_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn log_auto_continue_failure(
+        &self,
+        task_id: TaskId,
+        finished: TurnId,
+        attempted: TurnId,
+    ) -> Result<(), WorkerError> {
+        let Some(mut log) =
+            crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, attempted)?
+        else {
+            return Ok(());
+        };
+        let current = self.client_state.load_task(task_id)?;
+        if current.status().turns().last().map(TurnSummary::turn_id) == Some(finished)
+            && current.runner().is_none()
+            && self.client_state.queue_entry(attempted)?.is_none()
+            && !log.is_accepted()
+            && log.completion().is_none()
+        {
+            // The completed turn's journal stays immutable. The attempted
+            // continuation owns this separate, rooted and fsynced runner log.
+            log.append_bytes(b"AUTO_CONTINUE_FAILED\n")?;
+        }
+        Ok(())
+    }
+
+    fn rollback_unstarted_auto_continue(
+        &self,
+        prepared: &PreparedFollowup,
+    ) -> Result<(), WorkerError> {
+        let task_id = prepared.task_id();
+        let turn_id = prepared.turn_id();
+        let Some(log) =
+            crate::runner_log::RunnerLog::try_open(&self.paths.state, task_id, turn_id)?
+        else {
+            return Ok(());
+        };
+        if log.is_accepted() || log.completion().is_some() {
+            return Ok(());
+        }
+        if self
+            .client_state
+            .read_turn_prepared_binding(task_id, turn_id)?
+            != prepared.binding()
+        {
+            return Ok(());
+        }
+        let current = self.client_state.load_task(task_id)?;
+        if current.status().state() != TaskState::Active
+            || current.runner().is_some()
+            || !current.status().turns().last().is_some_and(|turn| {
+                turn.turn_id() == turn_id && turn.terminal().is_none() && turn.auto_continue()
+            })
+        {
+            return Ok(());
+        }
+        let owner = current_process_identity()?;
+        if self.client_state.queue_entry(turn_id)?.is_some() {
+            if self
+                .client_state
+                .cancel_unstarted_handoff(turn_id, owner, current_time_millis()?)?
+                .is_none()
+            {
+                return Ok(());
+            }
+            self.client_state
+                .remove_task_turn_after_terminal(turn_id, owner)?;
+        }
+        let restored = current
+            .with_status(prepared.expected().status().clone())?
+            .with_runner(None)?;
+        if self
+            .client_state
+            .update_task_if_current(&current, restored)?
+        {
+            self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        }
+        Ok(())
+    }
+
     /// Performs one prepared follow-up, converging to a single new turn across
     /// replays of the same value.
     pub fn say_prepared(
@@ -3500,7 +3630,8 @@ impl<'a> TaskClient<'a> {
                 false,
                 Some(prepared.created_at_millis()),
                 None,
-            );
+            )
+            .with_auto_continue(prepared.auto_continue());
             let active = TaskStatus::new(
                 TaskState::Active,
                 base.status().last_outcome().cloned(),
@@ -3560,6 +3691,7 @@ impl<'a> TaskClient<'a> {
                 false
             }
             Err(error) if attached && error.public_code() == "WAIT_TIMEOUT" => return Err(error),
+            Err(error) if prepared.auto_continue() => return Err(error),
             Err(error) => {
                 return Err(self.fail_handoff(
                     task_id,
@@ -3608,6 +3740,7 @@ impl<'a> TaskClient<'a> {
             ));
         };
         if live_last.turn_number() != prepared.turn_number()
+            || live_last.auto_continue() != prepared.auto_continue()
             || current.meta().agent().as_str() != prepared.agent()
             || current.meta().model() != prepared.model()
             || current.meta().limits().max_followups != prepared.max_followups()
@@ -3690,6 +3823,7 @@ impl<'a> TaskClient<'a> {
                 false
             }
             Err(error) if attached && error.public_code() == "WAIT_TIMEOUT" => return Err(error),
+            Err(error) if prepared.auto_continue() => return Err(error),
             Err(error) => {
                 return Err(self.fail_handoff(
                     task_id,

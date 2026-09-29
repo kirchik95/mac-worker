@@ -985,7 +985,8 @@ impl<'a> TurnRunner<'a> {
         {
             if let Some(completion) = log.completion() {
                 let exit_code = turn_exit_code(&completion.outcome);
-                let status = finalize_completed_turn(
+                drop(transfer);
+                finalize_completed_turn(
                     self.client_state,
                     self.runner,
                     self.config,
@@ -995,6 +996,9 @@ impl<'a> TurnRunner<'a> {
                     owner,
                     completion,
                 )?;
+                self.auto_continue_after_terminal(task_id, turn_id, follow);
+                self.advance_pending_dags_after_transfer_drop()?;
+                let status = self.client_state.load_task(task_id)?.status().clone();
                 return Ok(TurnOutcomeReport {
                     status,
                     events: vec![],
@@ -1559,6 +1563,7 @@ impl<'a> TurnRunner<'a> {
         self.client_state
             .remove_task_turn_after_terminal(turn_id, owner)?;
         self.client_state.remove_turn_prompt(task_id, turn_id)?;
+        self.auto_continue_after_terminal(task_id, turn_id, follow);
         self.advance_pending_dags_after_transfer_drop()?;
         let status = self.client_state.load_task(task_id)?.status().clone();
         Ok(TurnOutcomeReport {
@@ -2096,6 +2101,29 @@ impl<'a> TurnRunner<'a> {
             self.executor,
         )
         .advance_pending_dags()
+    }
+
+    fn auto_continue_after_terminal(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        follow: &mut Option<&mut dyn Write>,
+    ) {
+        let result = crate::task_client::TaskClient::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            self.executor,
+        )
+        .with_herdr_notifier(self.notifier.clone())
+        .auto_continue_after_terminal(task_id, turn_id);
+        if result.is_err() {
+            // Completed journals are immutable. Emit only a fixed code to
+            // diagnostics; failure cannot roll back the completed turn.
+            let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
+            write_follower(follow, b"AUTO_CONTINUE_FAILED\n");
+        }
     }
 
     fn load_project_for_record(

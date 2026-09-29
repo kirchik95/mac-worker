@@ -232,6 +232,8 @@ pub struct TaskDetailProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskTurnProjection {
+    #[serde(skip_serializing_if = "crate::task::is_false")]
+    pub auto_continue: bool,
     pub turn_number: u32,
     pub turn_id: TurnId,
     pub terminal: Option<TurnTerminal>,
@@ -248,6 +250,8 @@ pub struct TaskTurnProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskTimelineEvent {
+    #[serde(skip_serializing_if = "crate::task::is_false")]
+    pub auto_continue: bool,
     pub turn_number: u32,
     pub turn_id: TurnId,
     pub outcome: Option<TaskOutcome>,
@@ -454,6 +458,7 @@ pub fn project_task_detail(
         .turns()
         .iter()
         .map(|turn| TaskTimelineEvent {
+            auto_continue: turn.auto_continue(),
             turn_number: turn.turn_number(),
             turn_id: turn.turn_id(),
             outcome: turn
@@ -641,6 +646,7 @@ fn review_commands(record: &LocalTaskRecord, status: &TaskStatus) -> Vec<String>
 
 fn project_turn(turn: &TurnSummary, boundary: &RedactionBoundary) -> TaskTurnProjection {
     TaskTurnProjection {
+        auto_continue: turn.auto_continue(),
         turn_number: turn.turn_number(),
         turn_id: turn.turn_id(),
         terminal: turn.terminal(),
