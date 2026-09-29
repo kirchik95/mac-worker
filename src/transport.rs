@@ -661,6 +661,7 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
     }
 
     let without_supervision = |legacy: ProbeWithoutSupervision| ProbeResponse {
+        features: None,
         protocol_version: legacy.protocol_version,
         supervision_version: 0,
         hostname: legacy.hostname,
@@ -688,6 +689,7 @@ fn decode_probe_response(response: &str) -> Result<ProbeResponse, serde_json::Er
             Ok(legacy) => Ok(without_supervision(legacy)),
             Err(_) => match serde_json::from_str::<LegacyProbe>(response) {
                 Ok(legacy) => Ok(ProbeResponse {
+                    features: None,
                     protocol_version: legacy.protocol_version,
                     supervision_version: 0,
                     hostname: legacy.hostname,

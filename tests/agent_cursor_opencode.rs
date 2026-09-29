@@ -625,6 +625,7 @@ fn probe_response(agent: AgentKind) -> ProbeResponse {
         AgentKind::Claude => "claude",
     };
     ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini-1.local".into(),

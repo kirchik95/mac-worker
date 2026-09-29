@@ -1694,6 +1694,7 @@ fn worker_with_facts(collected_at_millis: u64, facts_age_millis: u64) -> ProbeWo
         ssh: "operator@mini-1.internal".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),

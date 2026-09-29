@@ -178,6 +178,7 @@ fn ready_health(probe: ProbeResponse) -> WorkerHealth {
 
 fn probe_with_counters(total_ticks: u64, idle_ticks: u64) -> ProbeResponse {
     ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini-1.local".into(),

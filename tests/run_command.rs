@@ -2615,6 +2615,7 @@ fn canonical_process(value: &impl serde::Serialize) -> Result<ProcessResult, Wor
 
 fn ready_probe() -> ProbeResponse {
     ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini-1.local".into(),

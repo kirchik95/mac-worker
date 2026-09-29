@@ -264,6 +264,7 @@ impl ProcessRunner for CompletingHost {
                 stderr: Vec::new(),
             }),
             "~/.local/bin/worker host probe" => canonical_process(&ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),

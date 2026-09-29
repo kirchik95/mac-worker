@@ -83,6 +83,7 @@ pub mod dashboard;
 pub mod doctor;
 pub mod error;
 pub mod failure_receipt;
+pub mod features;
 pub mod follow_turn;
 pub mod gc;
 pub mod git_transport;
@@ -1093,6 +1094,14 @@ fn run_controller_command(
                 writeln!(stdout)?;
             } else {
                 writeln!(stdout, "{}", status.summary())?;
+                writeln!(
+                    stdout,
+                    "features: {}",
+                    status
+                        .features
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_owned(), |features| features.join(", "))
+                )?;
                 match service {
                     Ok(service) => writeln!(
                         stdout,

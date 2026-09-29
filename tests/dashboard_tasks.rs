@@ -1232,6 +1232,7 @@ fn config_with_workers(names: &[&str]) -> Config {
 
 fn probe(slot_state: SlotState, active_turn: Option<TurnId>) -> ProbeResponse {
     ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini.local".into(),

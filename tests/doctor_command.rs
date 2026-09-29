@@ -445,6 +445,7 @@ fn ready_output_report() -> DoctorReport {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -505,6 +506,7 @@ fn blocked_output_report(code: &str) -> DoctorReport {
             ssh: "mac2".into(),
             status: HealthStatus::Unavailable,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-2.local".into(),

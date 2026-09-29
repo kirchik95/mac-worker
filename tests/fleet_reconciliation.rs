@@ -126,6 +126,7 @@ impl ProcessRunner for FleetRunner {
             }
             return Self::success(
                 serde_json::to_vec(&ProbeResponse {
+                    features: None,
                     protocol_version: PROTOCOL_VERSION,
                     supervision_version: SUPERVISION_VERSION,
                     hostname: host,

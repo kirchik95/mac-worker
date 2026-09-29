@@ -60,6 +60,10 @@ pub struct ProbeResponse {
     pub slot_state: crate::lease::SlotState,
     pub active_lease: Option<crate::lease::LeaseSummary>,
     pub capabilities: Vec<String>,
+    /// Wire features of the serving helper, independent of scheduling facts.
+    /// None is an older helper; Some (including an empty list) is authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
     #[serde(default)]
     pub agent_facts: Option<AgentFacts>,
     #[serde(default)]
@@ -296,6 +300,7 @@ mod tests {
     impl ProbeResponse {
         fn fixture() -> Self {
             Self {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),

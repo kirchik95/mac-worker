@@ -35,6 +35,7 @@ fn ready_health() -> WorkerHealth {
         ssh: "mac1".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: 2,
             hostname: "mini-1.local".into(),

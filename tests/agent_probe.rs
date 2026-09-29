@@ -247,6 +247,7 @@ fn health_with_facts(facts: AgentFacts) -> WorkerHealth {
         ssh: "mac1".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),

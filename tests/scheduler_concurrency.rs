@@ -311,6 +311,7 @@ impl ProcessRunner for ProductionLeaseRunner {
             "~/.local/bin/worker host probe" => {
                 let occupancy = LeaseService::new(&self.host).occupancy()?;
                 canonical_process(&ProbeResponse {
+                    features: None,
                     protocol_version: PROTOCOL_VERSION,
                     supervision_version: SUPERVISION_VERSION,
                     hostname: "scheduler-test-host".into(),

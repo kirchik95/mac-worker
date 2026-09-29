@@ -361,6 +361,12 @@ impl ProbeCollector {
         let capabilities = collect_capabilities(executor, search_paths, os, &arch, cached_tools);
 
         Ok(ProbeResponse {
+            features: Some(
+                crate::features::HOST_FEATURES
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            ),
             protocol_version: PROTOCOL_VERSION,
             supervision_version: SUPERVISION_VERSION,
             hostname,
@@ -1339,8 +1345,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(
+            serde_json::to_value(&response).unwrap()["features"],
+            serde_json::json!(["host.outbox-retry", "host.status-logs"])
+        );
+
+        assert_eq!(
             response,
             ProbeResponse {
+                features: Some(
+                    crate::features::HOST_FEATURES
+                        .iter()
+                        .map(|feature| (*feature).to_owned())
+                        .collect()
+                ),
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),

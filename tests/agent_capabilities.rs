@@ -184,6 +184,7 @@ impl ProcessRunner for RecordingRunner {
 
 fn probe_bytes() -> Vec<u8> {
     serde_json::to_vec(&ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini-1.local".into(),
@@ -235,6 +236,7 @@ fn raw_health_without_origin() -> WorkerHealth {
         ssh: "mac1".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),

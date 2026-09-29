@@ -47,6 +47,9 @@ pub enum HealthReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerHealthStatus {
+    /// Features of the binary serving this read, not of the leader process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
     pub state: HealthState,
     pub reason: HealthReason,
     #[serde(default)]
@@ -91,6 +94,7 @@ impl ControllerHealthStatus {
 
     pub fn unavailable(error: &WorkerError) -> Self {
         Self {
+            features: None,
             state: HealthState::Unavailable,
             reason: HealthReason::ReadFailed,
             leader_running: None,
@@ -111,6 +115,7 @@ pub fn assess_health(
     now: u64,
 ) -> ControllerHealthStatus {
     let mut status = ControllerHealthStatus {
+        features: None,
         state: HealthState::Stale,
         reason: HealthReason::Missing,
         leader_running: None,
@@ -155,7 +160,16 @@ pub fn read_health_status(path: &Path) -> Result<ControllerHealthStatus, WorkerE
         Some(record) => observe_leader(path, record.leader)?,
         None => ProcessObservation::Ambiguous,
     };
-    Ok(assess_health(health, observation, now_millis()?))
+    let mut status = assess_health(health, observation, now_millis()?);
+    status.features = Some(serving_features());
+    Ok(status)
+}
+
+fn serving_features() -> Vec<String> {
+    crate::features::CONTROLLER_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect()
 }
 
 fn observe_leader(
@@ -220,8 +234,9 @@ pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec
     }
     // Return an additive typed diagnostic even for unreadable health. The old
     // host's unsupported-command code stays distinguishable from record damage.
-    let status = read_health_status(path)
+    let mut status = read_health_status(path)
         .unwrap_or_else(|error| ControllerHealthStatus::unavailable(&error));
+    status.features = Some(serving_features());
     super::encode_json_frame(&ControllerReadReply::from_request(request, status))
 }
 
@@ -264,6 +279,7 @@ pub fn fetch_controller_health(
             ) =>
         {
             ControllerHealthStatus {
+                features: None,
                 state: HealthState::Unsupported,
                 reason: HealthReason::HealthUnsupported,
                 leader_running: None,

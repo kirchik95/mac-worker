@@ -174,6 +174,7 @@ pub struct RemoteJobClient<'a> {
     transport: SshJsonTransport<'a>,
     retry: &'a dyn ResolutionRuntime,
     status_logs: Mutex<HashMap<(String, String), u8>>,
+    host_features: HashMap<(String, String, String), Vec<String>>,
 }
 
 /// Process-local authority proving that one exact remote resolution returned
@@ -782,6 +783,28 @@ impl<'a> SshJsonTransport<'a> {
 }
 
 impl<'a> RemoteJobClient<'a> {
+    /// Reuse an already available probe; never probe solely for optional commands.
+    /// Callers without a probe retain the legacy command-discovery heuristic.
+    pub fn with_probe(
+        mut self,
+        worker: &WorkerEntry,
+        probe: &crate::protocol::ProbeResponse,
+    ) -> Self {
+        let key = (
+            worker.name.clone(),
+            worker.ssh.clone(),
+            worker.remote_binary.clone(),
+        );
+        if probe.protocol_version == crate::protocol::PROTOCOL_VERSION
+            && let Some(features) = &probe.features
+        {
+            self.host_features.insert(key, features.clone());
+        } else {
+            self.host_features.remove(&key);
+        }
+        self
+    }
+
     pub fn new(runner: &'a dyn ProcessRunner) -> Self {
         Self::new_with_runtime(runner, &SYSTEM_RESOLUTION_RUNTIME)
     }
@@ -795,6 +818,7 @@ impl<'a> RemoteJobClient<'a> {
             transport: SshJsonTransport::new(runner),
             retry,
             status_logs: Mutex::new(HashMap::new()),
+            host_features: HashMap::new(),
         }
     }
 
@@ -1120,18 +1144,30 @@ impl<'a> RemoteJobClient<'a> {
         stderr_offset: u64,
         stderr_limit: u32,
     ) -> Result<Option<(StatusResponse, LogChunk, LogChunk)>, WorkerError> {
-        match self.transport.request_optional::<_, StatusLogsResponse>(
-            worker,
-            HostOperation::StatusLogs,
-            &StatusLogsRequest::new(
-                job_id,
-                stdout_offset,
-                stdout_limit,
-                stderr_offset,
-                stderr_limit,
-            ),
-            control_policy(MAX_CONTROL_DEADLINE),
-        )? {
+        let request = StatusLogsRequest::new(
+            job_id,
+            stdout_offset,
+            stdout_limit,
+            stderr_offset,
+            stderr_limit,
+        );
+        let policy = control_policy(MAX_CONTROL_DEADLINE);
+        let response = if self.host_feature(worker, "host.status-logs") == Some(true) {
+            OptionalHostResponse::Supported(self.transport.request::<_, StatusLogsResponse>(
+                worker,
+                HostOperation::StatusLogs,
+                &request,
+                policy,
+            )?)
+        } else {
+            self.transport.request_optional::<_, StatusLogsResponse>(
+                worker,
+                HostOperation::StatusLogs,
+                &request,
+                policy,
+            )?
+        };
+        match response {
             OptionalHostResponse::Unsupported => Ok(None),
             OptionalHostResponse::Supported(response) => {
                 let (status, stdout, stderr) = response.into_parts();
@@ -1173,6 +1209,13 @@ impl<'a> RemoteJobClient<'a> {
     }
 
     fn status_logs_mode(&self, worker: &WorkerEntry) -> u8 {
+        if let Some(supported) = self.host_feature(worker, "host.status-logs") {
+            return if supported {
+                STATUS_LOGS_SUPPORTED
+            } else {
+                STATUS_LOGS_UNSUPPORTED
+            };
+        }
         self.status_logs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1186,6 +1229,16 @@ impl<'a> RemoteJobClient<'a> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert((worker.name.clone(), worker.ssh.clone()), mode);
+    }
+
+    fn host_feature(&self, worker: &WorkerEntry, feature: &str) -> Option<bool> {
+        self.host_features
+            .get(&(
+                worker.name.clone(),
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+            ))
+            .map(|features| features.iter().any(|candidate| candidate == feature))
     }
 
     pub fn resolve_preacceptance(
@@ -1328,13 +1381,19 @@ impl<'a> RemoteJobClient<'a> {
         worker: &WorkerEntry,
         task_id: TaskId,
     ) -> Result<crate::outbox::OutboxRetryResponse, WorkerError> {
+        let supported = self.host_feature(worker, "host.outbox-retry");
+        if supported == Some(false) {
+            return Err(WorkerError::Protocol(
+                "HOST_COMMAND_UNSUPPORTED: host helper does not support outbox-retry".into(),
+            ));
+        }
         let policy = control_policy(MAX_CONTROL_DEADLINE);
         let command = format!("{} {task_id}", HostOperation::OutboxRetry.command());
         let result = self
             .transport
             .run_named_command(worker, command, Vec::new(), policy)?;
         if !result.status.success() {
-            if is_unrecognized_host_subcommand("outbox-retry", &result) {
+            if supported.is_none() && is_unrecognized_host_subcommand("outbox-retry", &result) {
                 return Err(WorkerError::Protocol(
                     "HOST_COMMAND_UNSUPPORTED: host helper does not support outbox-retry".into(),
                 ));

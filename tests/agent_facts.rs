@@ -678,6 +678,7 @@ fn unverified_cursor_login_reaches_facts_and_is_not_an_agent_capability() {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -1592,6 +1593,7 @@ fn advertised_agent_capabilities(facts: AgentFacts) -> Vec<String> {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),

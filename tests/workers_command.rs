@@ -1296,6 +1296,7 @@ fn human_workers_output_includes_all_parsed_health_facts() {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -1361,6 +1362,7 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
             ssh: "mac1".into(),
             status: HealthStatus::Unavailable,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -1415,6 +1417,7 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -1490,6 +1493,7 @@ fn workers_render_a_turn_auth_failure_reason() {
             ssh: "mac1".into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
@@ -1841,6 +1845,7 @@ fn herdr_health(facts: Option<AgentFacts>, facts_age_millis: Option<u64>) -> Wor
         ssh: "mac1".into(),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),

@@ -77,6 +77,7 @@ fn host(name: &str, build_id: Option<&str>, binary_sha256: Option<String>) -> Wo
         ssh: format!("{name}-ssh"),
         status: HealthStatus::Ready,
         probe: Some(ProbeResponse {
+            features: None,
             protocol_version: PROTOCOL_VERSION,
             supervision_version: SUPERVISION_VERSION,
             hostname: format!("{name}.local"),

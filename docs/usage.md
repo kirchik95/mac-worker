@@ -431,6 +431,15 @@ Set `multiplex = true` on a machine that makes many SSH calls, especially the co
 
 ## Remote controller
 
+Protocol features are separate from worker scheduling capabilities. Host probes and controller
+health advertise an optional `features` list; a missing list means an older peer with unknown
+features, while an empty list explicitly advertises none. Additive commands and request fields
+are used only when advertised (legacy optional host commands retain their discovery fallback).
+Only breaking changes require a protocol-version bump; this remains protocol 7.
+`worker workers --json` includes each worker's features, and `worker controller status` prints
+`features: a, b` or `features: unknown` (`--json` includes the list when known). Controller features
+describe the installed helper serving the RPC, independently of the running leader's build.
+
 Opt-in. Default remains the laptop-owned queue: omit `[controller]`, or keep `enabled = false`. Confirm flags with `worker controller --help` and `worker dashboard --help`. Do not treat a missing table as a second store.
 
 Use this when an always-on Mac should keep the queue after the laptop sleeps or disconnects. The laptop still freezes the prompt and Git objects. Execution workers stay ordinary `host` helpers. There is one task store — on the controller host — not a laptop copy that silently takes over.

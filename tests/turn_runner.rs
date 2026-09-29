@@ -1211,6 +1211,7 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 // refresh facts before claiming the turn.
                 let fresh = self.facts_are_fresh_for_probe();
                 canonical_process(&ProbeResponse {
+                    features: None,
                     protocol_version: PROTOCOL_VERSION,
                     supervision_version: SUPERVISION_VERSION,
                     hostname: "mini-1.local".into(),
@@ -4920,6 +4921,7 @@ impl ProcessRunner for FetchFailingRunner {
             .unwrap_or_default();
         match operation {
             "~/.local/bin/worker host probe" => canonical_process(&ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),

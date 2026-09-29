@@ -33,10 +33,26 @@ impl CommandOutput {
             Self::Doctor(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
             _ => Vec::new(),
         };
-        if warnings.is_empty() && agent_warnings.is_empty() {
+        if warnings.is_empty() && agent_warnings.is_empty() && !matches!(self, Self::Workers(_)) {
             return serde_json::to_string(self).map_err(serialize);
         }
         let mut value = serde_json::to_value(self).map_err(serialize)?;
+        if let Self::Workers(report) = self {
+            for (worker, health) in value["workers"]
+                .as_array_mut()
+                .expect("workers report")
+                .iter_mut()
+                .zip(&report.workers)
+            {
+                worker["features"] = serde_json::to_value(
+                    health
+                        .probe
+                        .as_ref()
+                        .and_then(|probe| probe.features.as_ref()),
+                )
+                .map_err(serialize)?;
+            }
+        }
         if !warnings.is_empty() {
             value["build_warnings"] = serde_json::Value::Array(warnings);
         }

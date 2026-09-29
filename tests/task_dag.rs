@@ -2305,6 +2305,7 @@ impl ProcessRunner for FollowupWorker {
 
 fn ready_host_probe() -> ProbeResponse {
     ProbeResponse {
+        features: None,
         protocol_version: PROTOCOL_VERSION,
         supervision_version: SUPERVISION_VERSION,
         hostname: "mini-1.local".into(),

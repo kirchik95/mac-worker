@@ -738,6 +738,7 @@ fn ready_report(active_job_id: JobId) -> WorkersReport {
             ssh: REMOTE_SSH.into(),
             status: HealthStatus::Ready,
             probe: Some(ProbeResponse {
+                features: None,
                 protocol_version: PROTOCOL_VERSION,
                 supervision_version: SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
