@@ -18,9 +18,7 @@ use crate::{
 const OPERATIONS_LOCK: &str = "operations.lock";
 const MAX_ENVELOPE_BYTES: u64 = crate::controller::protocol::MAX_STORED_REQUEST_BYTES as u64;
 pub const ENVELOPE_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
-const PRUNE_SCAN_LIMIT: usize = 64;
-const PRUNE_PAGE_BYTES: usize = 4096;
-const PRUNE_CURSOR: &str = "operations-prune-offset.json";
+const PRUNE_SCAN_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -198,105 +196,43 @@ fn is_envelope_name(name: &str) -> bool {
         .is_some_and(|id| validate_request_id(id).is_ok())
 }
 
-/// Read one fixed-size directory page per call. Unlike Darwin's per-DIR
-/// telldir cookies, kernel lseek offsets survive reopening the directory.
-/// Directory changes may repeat/skip entries; EOF starts another sweep. The
-/// 40-byte op filenames occupy at least 64 bytes per dirent, bounding reads
-/// to 64 envelopes per 4 KiB page, even with a large retained pending prefix.
+/// Bound envelope reads while giving every entry a chance to be pruned,
+/// even when a large pending prefix is retained indefinitely.
 fn prune_settled(root: &crate::rooted_fs::RootedDir, now: u64) -> Result<(), WorkerError> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    root.verify_bound().map_err(store_io)?;
-    let previous = root.read_private_regular(PRUNE_CURSOR, 64).ok();
-    let offset: libc::off_t = previous
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice(bytes).ok())
-        .unwrap_or(0);
-    // SAFETY: root owns the directory fd. Opening "." yields an independent
-    // directory offset and never resolves a caller-controlled path.
-    let fd = unsafe {
-        libc::openat(
-            root.raw_directory_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(store_io(std::io::Error::last_os_error()));
+    prune_settled_from(root, now, uuid::Uuid::new_v4().as_u128() as usize)
+}
+
+fn prune_settled_from(
+    root: &crate::rooted_fs::RootedDir,
+    now: u64,
+    start: usize,
+) -> Result<(), WorkerError> {
+    let mut names = root
+        .list_names()
+        .map_err(store_io)?
+        .into_iter()
+        .filter_map(|name| String::from_utf8(name).ok())
+        .filter(|name| is_envelope_name(name))
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    if names.is_empty() {
+        return Ok(());
     }
-    // SAFETY: openat returned a newly owned descriptor.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // The cursor is advisory. An invalidated offset restarts at zero.
-    // SAFETY: fd is live; lseek does not retain it or access memory.
-    if offset > 0 && unsafe { libc::lseek(fd.as_raw_fd(), offset, libc::SEEK_SET) } < 0 {
-        unsafe {
-            libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET);
-        }
-    }
-    let mut page = [0_u8; PRUNE_PAGE_BYTES];
-    let count = read_directory_page(fd.as_raw_fd(), &mut page).map_err(store_io)?;
-    let next = if count == 0 {
-        0
-    } else {
-        // SAFETY: fd is the live directory description used for the page.
-        let position = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) };
-        if position < 0 {
-            return Err(store_io(std::io::Error::last_os_error()));
-        }
-        position
-    };
-    let mut names = Vec::new();
-    let mut remaining = &page[..count];
-    let name_offset = std::mem::offset_of!(libc::dirent, d_name);
-    let length_offset = std::mem::offset_of!(libc::dirent, d_reclen);
-    while !remaining.is_empty() {
-        let invalid = || {
-            store_io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid directory page",
-            ))
-        };
-        let length_bytes: [u8; 2] = remaining
-            .get(length_offset..length_offset + 2)
-            .ok_or_else(invalid)?
-            .try_into()
-            .map_err(|_| invalid())?;
-        let length = u16::from_ne_bytes(length_bytes) as usize;
-        if length <= name_offset || length > remaining.len() {
-            return Err(invalid());
-        }
-        let name = &remaining[name_offset..length];
-        let end = name
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(invalid)?;
-        if let Ok(name) = std::str::from_utf8(&name[..end])
-            && is_envelope_name(name)
-        {
-            names.push(name.to_owned());
-        }
-        remaining = &remaining[length..];
-    }
-    if names.len() > PRUNE_SCAN_LIMIT {
-        return Err(store_io(std::io::Error::other(
-            "directory page exceeds envelope scan bound",
-        )));
-    }
-    root.verify_bound().map_err(store_io)?;
-    for name in names {
-        if let Ok(envelope) = load_envelope(root, &name)
+    let start = start % names.len();
+    for name in names[start..]
+        .iter()
+        .chain(&names[..start])
+        .take(PRUNE_SCAN_LIMIT)
+    {
+        if let Ok(envelope) = load_envelope(root, name)
             && envelope
                 .settled_at_millis
                 .is_some_and(|settled| now.saturating_sub(settled) > ENVELOPE_WINDOW_MILLIS)
         {
-            let _ = root.remove_owned_regular(&name);
+            let _ = root.remove_owned_regular(name);
         }
     }
-    let bytes = serde_json::to_vec(&next).map_err(std::io::Error::other)?;
-    match previous {
-        Some(previous) => root.replace_private_regular_exact(PRUNE_CURSOR, &previous, &bytes),
-        None => root.write_private_atomic_no_replace(PRUNE_CURSOR, &bytes),
-    }
-    .map_err(store_io)
+    Ok(())
 }
 
 /// Read-only lookup. Does not create a missing cache directory.
@@ -312,43 +248,6 @@ pub fn load_operation_envelope(
         return Ok(None);
     }
     Ok(Some(load_envelope(&root, &name)?))
-}
-
-/// Use the native 64-bit dirent ABI; std/libc readdir buffers a whole page
-/// and exposes stream-local cookies on macOS, which cannot be persisted.
-fn read_directory_page(fd: libc::c_int, page: &mut [u8]) -> std::io::Result<usize> {
-    #[cfg(target_os = "macos")]
-    let count = {
-        unsafe extern "C" {
-            #[link_name = "__getdirentries64"]
-            fn getdirentries64(
-                fd: libc::c_int,
-                buf: *mut libc::c_char,
-                size: libc::size_t,
-                base: *mut libc::off_t,
-            ) -> libc::ssize_t;
-        }
-        let mut base = 0;
-        // SAFETY: fd is a live directory; page and base are writable for the
-        // full call. The returned page is parsed with checked slice bounds.
-        unsafe { getdirentries64(fd, page.as_mut_ptr().cast(), page.len(), &mut base) }
-    };
-    #[cfg(target_os = "linux")]
-    // SAFETY: fd is a live directory and page is writable for its stated size.
-    let count = unsafe { libc::syscall(libc::SYS_getdents64, fd, page.as_mut_ptr(), page.len()) };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let count = {
-        let _ = (fd, page);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "bounded directory scan is unavailable",
-        ));
-    };
-    if count < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(count as usize)
-    }
 }
 
 fn lock_operations(root: &crate::rooted_fs::RootedDir) -> Result<File, WorkerError> {
@@ -440,6 +339,24 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
+    fn seed_envelope(root: &crate::rooted_fs::RootedDir, id: u128, settled: Option<u64>) {
+        let request = request(id);
+        let envelope = OperationEnvelope {
+            request_id: request.request_id().to_owned(),
+            payload_sha256: request.payload_sha256().to_owned(),
+            command: request.command().to_owned(),
+            body: request.body().clone(),
+            created_at_millis: 1,
+            settled_at_millis: settled,
+            outcome: settled.map(|_| OperationOutcome::Acknowledged),
+        };
+        root.write_private_atomic_no_replace(
+            &envelope_file_name(request.request_id()).unwrap(),
+            &serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn legacy_envelopes_and_settlement_preserve_frozen_request() {
         let temp = tempfile::tempdir().unwrap();
@@ -514,88 +431,132 @@ mod tests {
     }
 
     #[test]
-    fn new_envelope_prunes_only_expired_settlements_with_bounded_progress() {
+    fn new_envelope_prunes_only_expired_settlements() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("cache");
-        for id in 1..=150 {
+        for id in 1..=3 {
             persist_operation_envelope(&cache, &request(id)).unwrap();
         }
         // Age records after persistence, so setup itself cannot prune them.
-        for id in 1..=148 {
-            rewrite(&cache, id, |value| {
-                value["created_at_millis"] = json!(1);
-                value["settled_at_millis"] = json!(1);
-                value["outcome"] = json!({"kind": "acknowledged"});
-            });
-        }
-        rewrite(&cache, 149, |value| value["created_at_millis"] = json!(1));
-        settle_operation_envelope(&cache, &request(150), OperationOutcome::Acknowledged).unwrap();
-        let old_count = || {
-            (1..=148)
-                .filter(|id| cache.join(format!("op-{id:032x}.json")).exists())
-                .count()
-        };
-        persist_operation_envelope(&cache, &request(151)).unwrap();
-        assert!(old_count() >= 148 - PRUNE_SCAN_LIMIT);
-        for id in 152..=180 {
-            persist_operation_envelope(&cache, &request(id)).unwrap();
-        }
-        assert_eq!(old_count(), 0);
+        rewrite(&cache, 1, |value| {
+            value["created_at_millis"] = json!(1);
+            value["settled_at_millis"] = json!(1);
+            value["outcome"] = json!({"kind": "acknowledged"});
+        });
+        rewrite(&cache, 2, |value| value["created_at_millis"] = json!(1));
+        settle_operation_envelope(&cache, &request(3), OperationOutcome::Acknowledged).unwrap();
+        persist_operation_envelope(&cache, &request(4)).unwrap();
         assert!(
-            load_operation_envelope(&cache, request(149).request_id())
+            load_operation_envelope(&cache, request(1).request_id())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_operation_envelope(&cache, request(2).request_id())
                 .unwrap()
                 .is_some()
         );
         assert!(
-            load_operation_envelope(&cache, request(150).request_id())
+            load_operation_envelope(&cache, request(3).request_id())
                 .unwrap()
                 .is_some()
         );
     }
 
     #[test]
-    fn pruning_reaches_expired_envelopes_behind_a_retained_directory_prefix() {
+    fn pruning_reaches_expired_settlement_behind_more_than_256_pending_envelopes() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("cache");
-        for id in 1..=(PRUNE_SCAN_LIMIT as u128 + 20) {
-            persist_operation_envelope(&cache, &request(id)).unwrap();
-        }
         let root = open_controller_root(&cache).unwrap();
-        let names = root
-            .list_names()
-            .unwrap()
-            .into_iter()
-            .map(|name| String::from_utf8(name).unwrap())
-            .filter(|name| is_envelope_name(name))
-            .collect::<Vec<_>>();
-        let expired = &names[PRUNE_SCAN_LIMIT..];
-        assert!(!expired.is_empty());
-        for name in expired {
-            let id = u128::from_str_radix(
-                name.strip_prefix("op-")
-                    .unwrap()
-                    .strip_suffix(".json")
-                    .unwrap(),
-                16,
-            )
+        for id in (1..=300).rev() {
+            seed_envelope(&root, id, None);
+        }
+        seed_envelope(&root, 301, Some(1));
+        let expired = cache.join(format!("op-{:032x}.json", 301));
+        let now = ENVELOPE_WINDOW_MILLIS + 2;
+
+        prune_settled_from(&root, now, 0).unwrap();
+        assert!(expired.exists(), "the first 256 entries are pending");
+        prune_settled_from(&root, now, 256).unwrap();
+        assert!(!expired.exists(), "a later start must reach the settlement");
+        assert!((1..=300).all(|id| cache.join(format!("op-{id:032x}.json")).is_file()));
+    }
+
+    #[test]
+    fn pruning_wraps_and_limits_each_call_to_256_envelopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        for id in (1..=300).rev() {
+            seed_envelope(&root, id, Some(1));
+        }
+        // Start with the final two entries, then wrap to the first 254.
+        prune_settled_from(&root, ENVELOPE_WINDOW_MILLIS + 2, 298).unwrap();
+        for id in 1..=300 {
+            assert_eq!(
+                cache.join(format!("op-{id:032x}.json")).exists(),
+                (255..=298).contains(&id),
+                "unexpected pruning result for envelope {id}",
+            );
+        }
+    }
+
+    #[test]
+    fn pruning_preserves_pending_recent_corrupt_and_unsafe_entries() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        seed_envelope(&root, 1, Some(1));
+        seed_envelope(&root, 2, None);
+        seed_envelope(&root, 3, Some(2)); // Exactly seven days old: retain it.
+        for id in 4..=8 {
+            seed_envelope(&root, id, Some(1));
+        }
+        let path = |id| cache.join(format!("op-{id:032x}.json"));
+        std::fs::write(path(4), b"invalid json").unwrap();
+        rewrite(&cache, 5, |value| {
+            value["payload_sha256"] = json!("0".repeat(64))
+        });
+        rewrite(&cache, 6, |value| value["outcome"] = Value::Null);
+        let outside = temp.path().join("outside.json");
+        std::fs::rename(path(7), &outside).unwrap();
+        let outside_bytes = std::fs::read(&outside).unwrap();
+        symlink(&outside, path(7)).unwrap();
+        std::fs::set_permissions(path(8), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir(path(9)).unwrap();
+        root.write_private_atomic_no_replace("op-not-an-id.json", b"invalid filename")
             .unwrap();
-            rewrite(&cache, id, |value| {
-                value["settled_at_millis"] = json!(1);
-                value["outcome"] = json!({"kind": "acknowledged"});
-            });
+
+        prune_settled_from(&root, ENVELOPE_WINDOW_MILLIS + 2, 0).unwrap();
+        assert!(!path(1).exists());
+        for id in 2..=9 {
+            assert!(
+                path(id).symlink_metadata().is_ok(),
+                "entry {id} must be retained"
+            );
         }
-        for id in 1000..1010 {
-            persist_operation_envelope(&cache, &request(id)).unwrap();
-        }
-        assert!(
-            expired.iter().all(|name| !cache.join(name).exists()),
-            "an undeletable prefix must not starve expired envelopes"
-        );
-        assert!(
-            names[..PRUNE_SCAN_LIMIT]
-                .iter()
-                .all(|name| cache.join(name).exists())
-        );
+        assert_eq!(std::fs::read_link(path(7)).unwrap(), outside);
+        assert_eq!(std::fs::read(outside).unwrap(), outside_bytes);
+        assert!(cache.join("op-not-an-id.json").exists());
+    }
+
+    #[test]
+    fn review_pruning_does_not_create_or_change_legacy_cursor_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        prune_settled(&root, ENVELOPE_WINDOW_MILLIS + 2).unwrap();
+        let cursor = cache.join("operations-prune-offset.json");
+        assert!(!cursor.exists(), "pruning must not create a cursor file");
+        root.write_private_atomic_no_replace(
+            "operations-prune-offset.json",
+            b"legacy cursor is opaque",
+        )
+        .unwrap();
+        prune_settled(&root, ENVELOPE_WINDOW_MILLIS + 2).unwrap();
+        assert_eq!(std::fs::read(cursor).unwrap(), b"legacy cursor is opaque");
     }
 
     #[test]
