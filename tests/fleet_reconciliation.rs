@@ -333,7 +333,9 @@ fn reconciliation_response_handoff_is_observable_without_changing_authority() {
 fn reconciliation_response_handoff_matrix_preserves_one_authoritative_update_per_case() {
     // Break caught: reconciliation response handling bypasses the durable
     // status CAS or processes a response more than once for a known row.
-    for case in 0..100 {
+    // The fixture, observer, and durable update do not vary with the index.
+    // Five runs still prove one authoritative update per reconciliation.
+    for case in 0..5 {
         let (_directory, store, config, runner, ids) = fleet_fixture();
         let observer = CountingFleetObserver::default();
         let report = FleetReconciler {
@@ -361,9 +363,10 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
     // owner record, applies a response for the wrong job, or duplicates a
     // durable status update.
     let mut schedule_counts = [0usize; 4];
-    for case in 0..100 {
-        let schedule = case % 4;
+    #[allow(clippy::needless_range_loop)]
+    for schedule in 0..4 {
         schedule_counts[schedule] += 1;
+        let case = schedule;
         let (directory, store, config, runner, ids) = fleet_fixture();
         let first_job_id = ids[0];
         let unavailable = match case % 4 {
@@ -528,7 +531,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
             );
         }
     }
-    assert_eq!(schedule_counts, [25, 25, 25, 25]);
+    assert_eq!(schedule_counts, [1, 1, 1, 1]);
 }
 
 #[test]
