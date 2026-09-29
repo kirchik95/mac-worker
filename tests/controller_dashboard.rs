@@ -712,9 +712,19 @@ fn fake_ssh_argv_includes_viewer_flag_and_same_port_forward() {
     let host = host_from_url(&url);
     let args: Vec<String> = serde_json::from_slice(&fs::read(&homes.argv_log).unwrap()).unwrap();
     assert!(args.contains(&"ExitOnForwardFailure=yes".to_owned()));
+    assert!(args.contains(&"-T".to_owned()));
+    assert!(args.contains(&"ControlMaster=no".to_owned()));
+    assert!(args.contains(&"ControlPath=none".to_owned()));
+    assert!(args.contains(&"ServerAliveInterval=15".to_owned()));
+    assert!(args.contains(&"ServerAliveCountMax=3".to_owned()));
     assert!(args.iter().any(|arg| arg.starts_with("127.0.0.1:")
         && arg.ends_with(&format!(":127.0.0.1:{}", host.split(':').nth(1).unwrap()))));
     assert!(!args.iter().any(|arg| arg.contains("ClearAllForwardings")));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "ControlMaster=auto" || arg == "ControlPersist=60")
+    );
     assert!(args.last().unwrap().contains("dashboard --port"));
     assert!(args.last().unwrap().contains("--controller-viewer"));
     kill_and_reap(&mut child);

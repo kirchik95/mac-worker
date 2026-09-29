@@ -865,16 +865,7 @@ enum ViewerStdinEvent {
 }
 
 fn viewer_heartbeat_timeout() -> std::time::Duration {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var("MAC_WORKER_TEST_VIEWER_HEARTBEAT_MS")
-            && let Ok(millis) = value.parse::<u64>()
-        {
-            return std::time::Duration::from_millis(millis);
-        }
-    }
-    DEFAULT
+    crate::dashboard::tunnel::DashboardTunnelTimings::resolved().viewer_heartbeat_timeout
 }
 
 fn viewer_heartbeat_lost_error() -> WorkerError {

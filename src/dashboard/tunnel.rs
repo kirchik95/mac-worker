@@ -17,11 +17,85 @@ use crate::{
     process::ProcessRequest,
 };
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 const REAP_GRACE: Duration = Duration::from_secs(2);
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 const STDOUT_LIMIT: usize = 64 * 1024;
 const SNAPSHOT_LIMIT: usize = 64 * 1024;
+
+/// Durations for the controller dashboard tunnel. Production values are the
+/// defaults. Debug builds may shrink them with `MAC_WORKER_TEST_TUNNEL_*_MS`
+/// and `MAC_WORKER_TEST_VIEWER_HEARTBEAT_MS` so tests stay deterministic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DashboardTunnelTimings {
+    pub readiness_timeout: Duration,
+    pub heartbeat_interval: Duration,
+    pub viewer_heartbeat_timeout: Duration,
+    pub backoff_initial: Duration,
+    pub backoff_cap: Duration,
+    pub port_rotation_after: Duration,
+}
+
+impl DashboardTunnelTimings {
+    pub(crate) fn production() -> Self {
+        Self {
+            readiness_timeout: Duration::from_secs(8),
+            heartbeat_interval: Duration::from_secs(5),
+            viewer_heartbeat_timeout: Duration::from_secs(30),
+            backoff_initial: Duration::from_secs(1),
+            backoff_cap: Duration::from_secs(30),
+            port_rotation_after: Duration::from_secs(60),
+        }
+    }
+
+    pub(crate) fn resolved() -> Self {
+        let mut timings = Self::production();
+        #[cfg(debug_assertions)]
+        apply_debug_timing_overrides(&mut timings);
+        timings
+    }
+}
+
+#[cfg(debug_assertions)]
+fn apply_debug_timing_overrides(timings: &mut DashboardTunnelTimings) {
+    override_millis(
+        "MAC_WORKER_TEST_TUNNEL_READINESS_MS",
+        &mut timings.readiness_timeout,
+    );
+    override_millis(
+        "MAC_WORKER_TEST_TUNNEL_HEARTBEAT_MS",
+        &mut timings.heartbeat_interval,
+    );
+    override_millis(
+        "MAC_WORKER_TEST_VIEWER_HEARTBEAT_MS",
+        &mut timings.viewer_heartbeat_timeout,
+    );
+    override_millis(
+        "MAC_WORKER_TEST_TUNNEL_BACKOFF_INITIAL_MS",
+        &mut timings.backoff_initial,
+    );
+    override_millis(
+        "MAC_WORKER_TEST_TUNNEL_BACKOFF_CAP_MS",
+        &mut timings.backoff_cap,
+    );
+    override_millis(
+        "MAC_WORKER_TEST_TUNNEL_PORT_ROTATION_MS",
+        &mut timings.port_rotation_after,
+    );
+}
+
+#[cfg(debug_assertions)]
+fn override_millis(name: &str, slot: &mut Duration) {
+    if let Ok(value) = std::env::var(name)
+        && let Some(parsed) = parse_millis(&value)
+    {
+        *slot = parsed;
+    }
+}
+
+#[cfg(debug_assertions)]
+fn parse_millis(value: &str) -> Option<Duration> {
+    value.parse::<u64>().ok().map(Duration::from_millis)
+}
 
 pub async fn run_controller_dashboard_tunnel(
     config: &Config,
@@ -32,20 +106,19 @@ pub async fn run_controller_dashboard_tunnel(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), WorkerError> {
-    run_controller_dashboard_tunnel_with_readiness_timeout(
+    run_controller_dashboard_tunnel_with_timings(
         config,
         runtime,
         port,
         no_open,
         no_facts_refresh,
+        DashboardTunnelTimings::resolved(),
         stdout,
         stderr,
-        READINESS_TIMEOUT,
     )
     .await
 }
 
-/// Override only the readiness deadline; child reaping retains its production grace.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_controller_dashboard_tunnel_with_readiness_timeout(
@@ -58,54 +131,154 @@ pub async fn run_controller_dashboard_tunnel_with_readiness_timeout(
     stderr: &mut dyn Write,
     readiness_timeout: Duration,
 ) -> Result<(), WorkerError> {
+    let mut timings = DashboardTunnelTimings::resolved();
+    timings.readiness_timeout = readiness_timeout;
+    run_controller_dashboard_tunnel_with_timings(
+        config,
+        runtime,
+        port,
+        no_open,
+        no_facts_refresh,
+        timings,
+        stdout,
+        stderr,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_controller_dashboard_tunnel_with_timings(
+    config: &Config,
+    runtime: &RuntimeContext,
+    requested_port: Option<u16>,
+    no_open: bool,
+    no_facts_refresh: bool,
+    timings: DashboardTunnelTimings,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<(), WorkerError> {
     // Register SIGINT/HUP/TERM now. unix::signal() installs the handler
     // immediately; tokio::signal::ctrl_c() would wait until the select arm is polled,
     // leaving a default-terminate window after spawn.
     let mut signals = arm_tunnel_signals();
+    let mut port = allocate_loopback_port(requested_port)?;
+    let mut ever_ready = false;
+    let mut announced = false;
+    let mut failing_since: Option<Instant> = None;
+    let mut failed_attempts = 0u32;
+    let mut nominal_backoff = timings.backoff_initial;
+    let mut published_port: Option<u16> = None;
 
-    let port = allocate_loopback_port(port)?;
-    let mut request = controller_dashboard_ssh_request(&config.controller, port, no_facts_refresh)?;
-    apply_labelled_fake_ssh(&mut request, runtime);
-    let mut child = spawn_held_stdin_ssh(&request)?;
-    let mut stdin = Some(child.stdin.take().ok_or_else(controller_unavailable)?);
-    let child_stdout = child.stdout.take().ok_or_else(controller_unavailable)?;
+    loop {
+        if ever_ready {
+            let failing_for = failing_since.map(|start| start.elapsed());
+            if should_rotate_port(failed_attempts, failing_for, timings.port_rotation_after) {
+                port = allocate_fresh_port(port)?;
+                failed_attempts = 0;
+                failing_since = None;
+            }
+            if interruptible_sleep(&mut signals, equal_jitter(nominal_backoff, random_u64())).await
+            {
+                return Ok(());
+            }
+            nominal_backoff = next_backoff(nominal_backoff, timings.backoff_cap);
+        }
 
-    tokio::select! {
-        ready = wait_until_ready(port, &mut child, child_stdout, readiness_timeout) => {
-            let ready = match ready {
-                Ok(url) => url,
-                Err(error) => {
-                    reap_with_escalation(&mut child, stdin.take());
+        let mut request =
+            controller_dashboard_ssh_request(&config.controller, port, no_facts_refresh)?;
+        apply_labelled_fake_ssh(&mut request, runtime);
+        let mut child = match spawn_held_stdin_ssh(&request) {
+            Ok(child) => child,
+            Err(error) => {
+                if !ever_ready {
                     return Err(error);
                 }
-            };
-            if let Err(error) = write_url(stdout, &ready) {
-                reap_with_escalation(&mut child, stdin.take());
-                return Err(error);
+                note_failed_attempt(
+                    &mut announced,
+                    &mut failing_since,
+                    &mut failed_attempts,
+                    stderr,
+                );
+                continue;
             }
-            if !no_open {
-                let opener = SystemBrowserOpener;
-                if opener.open(&ready).is_err() {
-                    let _ = writeln!(
-                        stderr,
-                        "DASHBOARD_BROWSER_OPEN_FAILED: dashboard browser could not be opened"
-                    );
-                    let _ = stderr.flush();
+        };
+        let mut stdin = Some(child.stdin.take().ok_or_else(controller_unavailable)?);
+        let Some(child_stdout) = child.stdout.take() else {
+            reap_with_escalation(&mut child, stdin.take());
+            if !ever_ready {
+                return Err(controller_unavailable());
+            }
+            note_failed_attempt(
+                &mut announced,
+                &mut failing_since,
+                &mut failed_attempts,
+                stderr,
+            );
+            continue;
+        };
+
+        let ready = tokio::select! {
+            ready = wait_until_ready(port, &mut child, child_stdout, timings.readiness_timeout) => ready,
+            _ = recv_signal(&mut signals.interrupt) => {
+                reap_with_escalation(&mut child, stdin.take());
+                return Ok(());
+            }
+            _ = recv_signal(&mut signals.hangup) => {
+                reap_with_escalation(&mut child, stdin.take());
+                return Ok(());
+            }
+            _ = recv_signal(&mut signals.terminate) => {
+                reap_with_escalation(&mut child, stdin.take());
+                return Ok(());
+            }
+        };
+
+        match ready {
+            Ok(url) => {
+                if published_port != Some(port) {
+                    if let Err(error) = write_url(stdout, &url) {
+                        reap_with_escalation(&mut child, stdin.take());
+                        return Err(error);
+                    }
+                    if !no_open {
+                        open_dashboard(&url, stderr);
+                    }
+                    published_port = Some(port);
+                }
+                if ever_ready {
+                    announce_tunnel_restored(stderr);
+                }
+                ever_ready = true;
+                announced = false;
+                failing_since = None;
+                failed_attempts = 0;
+                nominal_backoff = timings.backoff_initial;
+                match supervise_ready_tunnel(
+                    &mut child,
+                    &mut stdin,
+                    &mut signals,
+                    timings.heartbeat_interval,
+                )
+                .await
+                {
+                    SteadyStop::Signal => return Ok(()),
+                    SteadyStop::Lost => {
+                        note_outage(&mut announced, &mut failing_since, stderr);
+                    }
                 }
             }
-            wait_for_tunnel_exit(child, stdin.take(), signals).await
-        }
-        _ = recv_signal(&mut signals.interrupt) => {
-            reap_with_escalation(&mut child, stdin.take());
-            Ok(())
-        }
-        _ = recv_signal(&mut signals.hangup) => {
-            reap_with_escalation(&mut child, stdin.take());
-            Ok(())
-        }
-        _ = recv_signal(&mut signals.terminate) => {
-            reap_with_escalation(&mut child, stdin.take());
-            Ok(())
+            Err(error) => {
+                reap_with_escalation(&mut child, stdin.take());
+                if !ever_ready {
+                    return Err(error);
+                }
+                note_failed_attempt(
+                    &mut announced,
+                    &mut failing_since,
+                    &mut failed_attempts,
+                    stderr,
+                );
+            }
         }
     }
 }
@@ -121,6 +294,187 @@ fn arm_tunnel_signals() -> TunnelSignals {
         interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok(),
         hangup: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok(),
         terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok(),
+    }
+}
+
+fn should_rotate_port(
+    failed_attempts: u32,
+    failing_for: Option<Duration>,
+    threshold: Duration,
+) -> bool {
+    failed_attempts > 0 && failing_for.is_some_and(|elapsed| elapsed >= threshold)
+}
+
+fn next_backoff(current: Duration, cap: Duration) -> Duration {
+    match current.checked_mul(2) {
+        Some(doubled) if doubled < cap => doubled,
+        Some(_) => cap,
+        None => cap,
+    }
+}
+
+/// Equal jitter: a delay in `[d/2, d]`, inclusive on both ends for millisecond values.
+fn equal_jitter(base: Duration, roll: u64) -> Duration {
+    let Ok(high) = u64::try_from(base.as_millis()) else {
+        return base;
+    };
+    if high == 0 {
+        return Duration::ZERO;
+    }
+    let low = high / 2;
+    let span = high - low + 1;
+    Duration::from_millis(low + roll % span)
+}
+
+fn random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom")
+        && file.read_exact(&mut bytes).is_ok()
+    {
+        return u64::from_ne_bytes(bytes);
+    }
+    0xA5A5_A5A5_A5A5_A5A5
+}
+
+fn allocate_fresh_port(avoid: u16) -> Result<u16, WorkerError> {
+    for _ in 0..16 {
+        let port = allocate_loopback_port(None)?;
+        if port != avoid {
+            return Ok(port);
+        }
+    }
+    Err(bind_failed())
+}
+
+fn note_outage(announced: &mut bool, failing_since: &mut Option<Instant>, stderr: &mut dyn Write) {
+    announce_tunnel_lost(stderr, announced);
+    if failing_since.is_none() {
+        *failing_since = Some(Instant::now());
+    }
+}
+
+fn note_failed_attempt(
+    announced: &mut bool,
+    failing_since: &mut Option<Instant>,
+    failed_attempts: &mut u32,
+    stderr: &mut dyn Write,
+) {
+    note_outage(announced, failing_since, stderr);
+    *failed_attempts = failed_attempts.saturating_add(1);
+}
+
+fn announce_tunnel_lost(stderr: &mut dyn Write, announced: &mut bool) {
+    if *announced {
+        return;
+    }
+    *announced = true;
+    let _ = writeln!(stderr, "dashboard: controller tunnel lost; reconnecting…");
+    let _ = stderr.flush();
+}
+
+fn announce_tunnel_restored(stderr: &mut dyn Write) {
+    let _ = writeln!(stderr, "dashboard: controller tunnel restored");
+    let _ = stderr.flush();
+}
+
+fn open_dashboard(url: &str, stderr: &mut dyn Write) {
+    let opener = SystemBrowserOpener;
+    if opener.open(url).is_err() {
+        let _ = writeln!(
+            stderr,
+            "DASHBOARD_BROWSER_OPEN_FAILED: dashboard browser could not be opened"
+        );
+        let _ = stderr.flush();
+    }
+}
+
+enum SteadyStop {
+    Signal,
+    Lost,
+}
+
+async fn supervise_ready_tunnel(
+    child: &mut Child,
+    stdin: &mut Option<std::process::ChildStdin>,
+    signals: &mut TunnelSignals,
+    heartbeat_interval: Duration,
+) -> SteadyStop {
+    let mut next_heartbeat = Instant::now();
+    loop {
+        let until_heartbeat = next_heartbeat.saturating_duration_since(Instant::now());
+        tokio::select! {
+            _ = recv_signal(&mut signals.interrupt) => {
+                reap_with_escalation(child, stdin.take());
+                return SteadyStop::Signal;
+            }
+            _ = recv_signal(&mut signals.hangup) => {
+                reap_with_escalation(child, stdin.take());
+                return SteadyStop::Signal;
+            }
+            _ = recv_signal(&mut signals.terminate) => {
+                reap_with_escalation(child, stdin.take());
+                return SteadyStop::Signal;
+            }
+            _ = tokio::time::sleep(until_heartbeat) => {
+                let wrote = stdin.as_mut().is_some_and(write_heartbeat);
+                if !wrote {
+                    finish_lost_child(child, stdin);
+                    return SteadyStop::Lost;
+                }
+                next_heartbeat = Instant::now() + heartbeat_interval;
+            }
+            _ = tokio::time::sleep(WAIT_SLICE) => {
+                match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        drop(stdin.take());
+                        return SteadyStop::Lost;
+                    }
+                    Err(_) => {
+                        finish_lost_child(child, stdin);
+                        return SteadyStop::Lost;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn finish_lost_child(child: &mut Child, stdin: &mut Option<std::process::ChildStdin>) {
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            drop(stdin.take());
+        }
+        _ => reap_with_escalation(child, stdin.take()),
+    }
+}
+
+fn write_heartbeat(stdin: &mut std::process::ChildStdin) -> bool {
+    if set_nonblocking(stdin.as_raw_fd()).is_err() {
+        return false;
+    }
+    let mut bytes = &b"\n"[..];
+    while !bytes.is_empty() {
+        match stdin.write(bytes) {
+            Ok(0) => return false,
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+async fn interruptible_sleep(signals: &mut TunnelSignals, delay: Duration) -> bool {
+    if delay.is_zero() {
+        return false;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        _ = recv_signal(&mut signals.interrupt) => true,
+        _ = recv_signal(&mut signals.hangup) => true,
+        _ = recv_signal(&mut signals.terminate) => true,
     }
 }
 
@@ -406,42 +760,6 @@ fn dashboard_snapshot_response(raw: &[u8]) -> bool {
     }
 }
 
-async fn wait_for_tunnel_exit(
-    mut child: Child,
-    mut stdin: Option<std::process::ChildStdin>,
-    mut signals: TunnelSignals,
-) -> Result<(), WorkerError> {
-    loop {
-        tokio::select! {
-            _ = recv_signal(&mut signals.interrupt) => {
-                reap_with_escalation(&mut child, stdin.take());
-                return Ok(());
-            }
-            _ = recv_signal(&mut signals.hangup) => {
-                reap_with_escalation(&mut child, stdin.take());
-                return Ok(());
-            }
-            _ = recv_signal(&mut signals.terminate) => {
-                reap_with_escalation(&mut child, stdin.take());
-                return Ok(());
-            }
-            _ = tokio::time::sleep(WAIT_SLICE) => {
-                match child.try_wait() {
-                    Ok(None) => {}
-                    Ok(Some(status)) if status.success() => {
-                        drop(stdin.take());
-                        return Ok(());
-                    }
-                    _ => {
-                        drop(stdin.take());
-                        return Err(controller_unavailable());
-                    }
-                }
-            }
-        }
-    }
-}
-
 async fn recv_signal(signal: &mut Option<tokio::signal::unix::Signal>) {
     match signal.as_mut() {
         Some(signal) => {
@@ -485,4 +803,86 @@ fn bind_failed() -> WorkerError {
 
 fn controller_unavailable() -> WorkerError {
     WorkerError::Unavailable("CONTROLLER_UNAVAILABLE: controller dashboard tunnel failed".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DashboardTunnelTimings, equal_jitter, next_backoff, should_rotate_port};
+    use std::time::Duration;
+
+    #[test]
+    fn production_timings_match_the_operator_defaults() {
+        let timings = DashboardTunnelTimings::production();
+        assert_eq!(timings.readiness_timeout, Duration::from_secs(8));
+        assert_eq!(timings.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(timings.viewer_heartbeat_timeout, Duration::from_secs(30));
+        assert_eq!(timings.backoff_initial, Duration::from_secs(1));
+        assert_eq!(timings.backoff_cap, Duration::from_secs(30));
+        assert_eq!(timings.port_rotation_after, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn equal_jitter_stays_inside_half_to_full() {
+        let second = Duration::from_secs(1);
+        assert_eq!(equal_jitter(second, 0), Duration::from_millis(500));
+        assert_eq!(equal_jitter(second, 500), Duration::from_millis(1_000));
+        assert_eq!(equal_jitter(second, 501), Duration::from_millis(500));
+        let cap = Duration::from_secs(30);
+        assert_eq!(equal_jitter(cap, 0), Duration::from_millis(15_000));
+        assert_eq!(equal_jitter(cap, 15_000), Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn backoff_doubles_until_the_cap() {
+        let cap = Duration::from_secs(30);
+        let mut delay = Duration::from_secs(1);
+        let mut seen = vec![delay];
+        for _ in 0..8 {
+            delay = next_backoff(delay, cap);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn port_rotates_only_after_failed_attempts_cross_the_threshold() {
+        let threshold = Duration::from_secs(60);
+        assert!(!should_rotate_port(
+            0,
+            Some(Duration::from_secs(120)),
+            threshold
+        ));
+        assert!(!should_rotate_port(
+            2,
+            Some(Duration::from_secs(59)),
+            threshold
+        ));
+        assert!(should_rotate_port(
+            1,
+            Some(Duration::from_secs(60)),
+            threshold
+        ));
+        assert!(!should_rotate_port(4, None, threshold));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_millis_parser_rejects_blank_and_words() {
+        assert_eq!(super::parse_millis("40"), Some(Duration::from_millis(40)));
+        assert_eq!(super::parse_millis(""), None);
+        assert_eq!(super::parse_millis("fast"), None);
+    }
 }
