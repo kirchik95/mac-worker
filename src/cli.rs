@@ -385,7 +385,10 @@ pub enum ControllerCommand {
         all: bool,
     },
     #[command(about = "Retry a saved controller request with its original identity and payload")]
-    Retry { request_id: String },
+    Retry {
+        /// Request id from the failed command's hint or from `worker controller pending`.
+        request_id: String,
+    },
     #[command(about = "Provision and start a supervised remote controller")]
     Init {
         /// Laptop SSH destination of the controller host.
