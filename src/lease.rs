@@ -1206,37 +1206,28 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn missing_capacity_on_installed_layout3_refuses_acquire_and_probe() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let service = LeaseService::new(&store);
-        occupy_only_slot_one(&service, &store);
-        fs::remove_file(root.join("leases/capacity.json")).unwrap();
+    fn missing_or_corrupt_capacity_on_installed_layout3_refuses_acquire_and_probe() {
+        for corrupt in [false, true] {
+            let label = if corrupt { "corrupt" } else { "missing" };
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let service = LeaseService::new(&store);
+            occupy_only_slot_one(&service, &store);
+            if corrupt {
+                private_file(root.join("leases/capacity.json").as_path(), b"{not-json");
+            } else {
+                fs::remove_file(root.join("leases/capacity.json")).unwrap();
+            }
 
-        let error = service.occupancy().unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
-        let error = service.slot_count().unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
-        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
-        assert_no_slot_zero_lease(&root);
-    }
-
-    #[test]
-    fn corrupt_capacity_on_installed_layout3_refuses_acquire_and_probe() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let service = LeaseService::new(&store);
-        occupy_only_slot_one(&service, &store);
-        private_file(root.join("leases/capacity.json").as_path(), b"{not-json");
-
-        let error = service.occupancy().unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
-        let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
-        assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID");
-        assert_no_slot_zero_lease(&root);
+            let error = service.occupancy().unwrap_err();
+            assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID", "{label}");
+            let error = service.slot_count().unwrap_err();
+            assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID", "{label}");
+            let error = service.acquire(&request(3), &healthy(), 1).unwrap_err();
+            assert_eq!(error.public_code(), "HOST_SLOT_CAPACITY_INVALID", "{label}");
+            assert_no_slot_zero_lease(&root);
+        }
     }
 
     #[test]

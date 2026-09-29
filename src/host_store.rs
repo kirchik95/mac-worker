@@ -6041,7 +6041,8 @@ mod review_regression_tests {
             let held = first.admission_lock(job).unwrap();
             fs::rename(root.join("locks/jobs"), root.join("locks/jobs-detached")).unwrap();
             fs::create_dir(root.join("locks/jobs")).unwrap();
-            fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(root.join("locks/jobs"), fs::Permissions::from_mode(0o700))
+                .unwrap();
 
             let (sender, receiver) = mpsc::channel();
             let contender_root = root.clone();

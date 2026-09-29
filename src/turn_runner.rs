@@ -3493,73 +3493,79 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
     }
 
     #[test]
-    fn handoff_spawn_helper_refuses_cancel_after_confirmed_contention() {
-        let owner = current_process_identity().unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let (_root, paths) = isolated_handoff_paths();
-        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
-            &paths.state,
-            std::sync::Arc::new(JournalContentionHook {
-                entered: std::sync::Mutex::new(Some(entered_tx)),
-                resume: std::sync::Mutex::new(resume_rx),
-            }),
-        )
-        .unwrap();
-        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
-        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
-        std::thread::scope(|scope| {
-            let resume = ResumeOnDrop(Some(resume_tx));
-            let helper = scope.spawn(|| {
-                open_handoff_journal_for_spawn(&store, &paths, task_id, turn_id, Some(token))
-            });
-            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
-                store.retain_task_turn_cancel(turn_id, 11).unwrap();
-            });
-            expect_task_busy(helper.join().unwrap());
-            assert!(
-                store
-                    .queue_entry(turn_id)
-                    .unwrap()
-                    .unwrap()
-                    .is_cancel_requested(),
-                "retained cancel must survive the refused spawn helper"
-            );
-        });
-    }
-
-    #[test]
-    fn handoff_spawn_helper_refuses_adopt_after_confirmed_contention() {
-        let owner = current_process_identity().unwrap();
-        let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let (_root, paths) = isolated_handoff_paths();
-        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
-            &paths.state,
-            std::sync::Arc::new(JournalContentionHook {
-                entered: std::sync::Mutex::new(Some(entered_tx)),
-                resume: std::sync::Mutex::new(resume_rx),
-            }),
-        )
-        .unwrap();
-        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
-        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
-        std::thread::scope(|scope| {
-            let resume = ResumeOnDrop(Some(resume_tx));
-            let helper = scope.spawn(|| {
-                open_handoff_journal_for_spawn(&store, &paths, task_id, turn_id, Some(token))
-            });
-            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
-                store.adopt_row(turn_id, replacement).unwrap();
-            });
-            expect_task_busy(helper.join().unwrap());
-            assert_eq!(
-                store.queue_entry(turn_id).unwrap().unwrap().owner_opt(),
-                Some(&replacement),
-                "adopted owner must survive the refused spawn helper"
-            );
-        });
+    fn handoff_helpers_refuse_cancel_and_adopt_after_confirmed_contention() {
+        // The spawn helper and the post-bind helper both answer TASK_BUSY once
+        // contention is confirmed, the row mutation that raced them (a retained
+        // cancel or an adoption) survives, and after bind the bound child
+        // reservation survives as well.
+        for after_bind in [false, true] {
+            for adopt in [false, true] {
+                let label = format!("after_bind={after_bind} adopt={adopt}");
+                let owner = current_process_identity().unwrap();
+                let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
+                let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                let (_root, paths) = isolated_handoff_paths();
+                let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
+                    &paths.state,
+                    std::sync::Arc::new(JournalContentionHook {
+                        entered: std::sync::Mutex::new(Some(entered_tx)),
+                        resume: std::sync::Mutex::new(resume_rx),
+                    }),
+                )
+                .unwrap();
+                let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
+                let expected = after_bind
+                    .then(|| store.bind_runner_slot_child(turn_id, token, child).unwrap());
+                let held =
+                    crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
+                std::thread::scope(|scope| {
+                    let resume = ResumeOnDrop(Some(resume_tx));
+                    let helper = scope.spawn(|| match expected.as_ref() {
+                        Some(expected) => open_handoff_journal_after_bind(
+                            &store, &paths, task_id, turn_id, token, owner, expected,
+                        ),
+                        None => open_handoff_journal_for_spawn(
+                            &store,
+                            &paths,
+                            task_id,
+                            turn_id,
+                            Some(token),
+                        ),
+                    });
+                    wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
+                        if adopt {
+                            store.adopt_row(turn_id, replacement).unwrap();
+                        } else {
+                            store.retain_task_turn_cancel(turn_id, 11).unwrap();
+                        }
+                    });
+                    expect_task_busy(helper.join().unwrap());
+                    let row = store.queue_entry(turn_id).unwrap().unwrap();
+                    if adopt {
+                        assert_eq!(
+                            row.owner_opt(),
+                            Some(&replacement),
+                            "{label}: adopted owner must survive the refused helper"
+                        );
+                    } else {
+                        assert!(
+                            row.is_cancel_requested(),
+                            "{label}: retained cancel must survive the refused helper"
+                        );
+                    }
+                    if after_bind {
+                        assert_eq!(
+                            row.slot_reservation()
+                                .and_then(|reservation| reservation.child()),
+                            Some(child),
+                            "{label}: bound reservation must remain after post-bind TASK_BUSY"
+                        );
+                    }
+                });
+            }
+        }
     }
 
     #[test]
@@ -3583,87 +3589,6 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             store.queue_entry(turn_id).unwrap().is_some(),
             "mapping refusal must not delete the reserved row"
         );
-    }
-
-    #[test]
-    fn handoff_after_bind_helper_refuses_cancel_after_confirmed_contention() {
-        let owner = current_process_identity().unwrap();
-        let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let (_root, paths) = isolated_handoff_paths();
-        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
-            &paths.state,
-            std::sync::Arc::new(JournalContentionHook {
-                entered: std::sync::Mutex::new(Some(entered_tx)),
-                resume: std::sync::Mutex::new(resume_rx),
-            }),
-        )
-        .unwrap();
-        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
-        let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
-        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
-        std::thread::scope(|scope| {
-            let resume = ResumeOnDrop(Some(resume_tx));
-            let helper = scope.spawn(|| {
-                open_handoff_journal_after_bind(
-                    &store, &paths, task_id, turn_id, token, owner, &expected,
-                )
-            });
-            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
-                store.retain_task_turn_cancel(turn_id, 11).unwrap();
-            });
-            expect_task_busy(helper.join().unwrap());
-            let row = store.queue_entry(turn_id).unwrap().unwrap();
-            assert!(row.is_cancel_requested());
-            assert_eq!(
-                row.slot_reservation()
-                    .and_then(|reservation| reservation.child()),
-                Some(child),
-                "bound reservation must remain after post-bind TASK_BUSY"
-            );
-        });
-    }
-
-    #[test]
-    fn handoff_after_bind_helper_refuses_adopt_after_confirmed_contention() {
-        let owner = current_process_identity().unwrap();
-        let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
-        let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let (_root, paths) = isolated_handoff_paths();
-        let store = crate::client_state::ClientStateStore::open_with_concurrency_hook(
-            &paths.state,
-            std::sync::Arc::new(JournalContentionHook {
-                entered: std::sync::Mutex::new(Some(entered_tx)),
-                resume: std::sync::Mutex::new(resume_rx),
-            }),
-        )
-        .unwrap();
-        let (task_id, turn_id, token) = plant_reserved_turn(&store, owner, true);
-        let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
-        let held = crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
-        std::thread::scope(|scope| {
-            let resume = ResumeOnDrop(Some(resume_tx));
-            let helper = scope.spawn(|| {
-                open_handoff_journal_after_bind(
-                    &store, &paths, task_id, turn_id, token, owner, &expected,
-                )
-            });
-            wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
-                store.adopt_row(turn_id, replacement).unwrap();
-            });
-            expect_task_busy(helper.join().unwrap());
-            let row = store.queue_entry(turn_id).unwrap().unwrap();
-            assert_eq!(row.owner_opt(), Some(&replacement));
-            assert_eq!(
-                row.slot_reservation()
-                    .and_then(|reservation| reservation.child()),
-                Some(child),
-                "bound reservation must remain after post-bind TASK_BUSY"
-            );
-        });
     }
 
     use super::{

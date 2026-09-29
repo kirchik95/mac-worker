@@ -2963,87 +2963,43 @@ mod tests {
     }
 
     #[test]
-    fn scan_stdout_protocol_does_not_treat_a_capped_incomplete_line_as_a_result() {
+    fn scan_stdout_protocol_reports_truncation_and_never_parses_partial_records() {
+        let adapter = crate::agent::adapter_for(AgentKind::Codex);
+
+        // A capped incomplete line is truncation, never a result.
         let (_temp, turn_dir) = open_scan_dir();
         let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
         stdout.extend(vec![b'x'; 1024]);
         stdout.extend(b"{\"status\":\"done\"");
         write_stdout(&turn_dir, &stdout);
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
         let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
         assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
         assert!(scan.truncated);
         assert_unknown_result(adapter, &scan);
-    }
 
-    #[test]
-    fn scan_stdout_protocol_discards_an_oversized_line_instead_of_parsing_its_suffix() {
+        // An oversized line is discarded whole; its suffix is never parsed.
         let (_temp, turn_dir) = open_scan_dir();
         let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
         stdout.extend(vec![b'x'; MAX_NDJSON_RECORD_BYTES + 1]);
         stdout.extend(codex_result_record("ok").as_bytes());
         stdout.push(b'\n');
         write_stdout(&turn_dir, &stdout);
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
         let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
         assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
         assert!(!scan.truncated);
         assert_unknown_result(adapter, &scan);
-    }
 
-    #[test]
-    fn scan_stdout_protocol_accepts_a_complete_final_json_record_without_a_newline() {
+        // Incomplete JSON at EOF is truncation.
         let (_temp, turn_dir) = open_scan_dir();
-        let stdout = format!("{}\n{}", codex_session_line(), codex_result_record("ok"));
+        let stdout = format!("{}\n{{\"status\":\"done\"", codex_session_line());
         write_stdout(&turn_dir, stdout.as_bytes());
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
         let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
         assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
-        assert!(!scan.truncated);
-        assert_done_result(adapter, &scan);
-    }
+        assert!(scan.truncated);
+        assert_unknown_result(adapter, &scan);
 
-    #[test]
-    fn scan_stdout_protocol_keeps_a_unicode_result_beyond_the_display_tail() {
-        let (_temp, turn_dir) = open_scan_dir();
-        let filler = "{\"type\":\"item.updated\",\"delta\":\"привет\"}\n";
-        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
-        while stdout.len() <= LOG_TAIL_BYTES {
-            stdout.extend_from_slice(filler.as_bytes());
-        }
-        stdout.extend_from_slice(codex_result_record("готово").as_bytes());
-        stdout.push(b'\n');
-        write_stdout(&turn_dir, &stdout);
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
-        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
-        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
-        assert!(!scan.truncated);
-        assert_done_result(adapter, &scan);
-        assert!(scan.result_text.contains("готово"));
-    }
-
-    #[test]
-    fn scan_stdout_protocol_keeps_a_result_larger_than_the_display_tail() {
-        let (_temp, turn_dir) = open_scan_dir();
-        let summary = "я".repeat((LOG_TAIL_BYTES / 2) + 8);
-        assert!(summary.len() > LOG_TAIL_BYTES);
-        assert!(summary.len() < crate::task::MAX_PROMPT_BYTES);
-        let stdout = format!(
-            "{}\n{}\n",
-            codex_session_line(),
-            codex_result_record(&summary)
-        );
-        write_stdout(&turn_dir, stdout.as_bytes());
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
-        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
-        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
-        assert!(!scan.truncated);
-        assert_done_result(adapter, &scan);
-        assert!(scan.result_text.len() > LOG_TAIL_BYTES);
-    }
-
-    #[test]
-    fn scan_stdout_protocol_marks_truncated_when_log_cap_cuts_the_stream() {
+        // A log cap that cuts the stream marks truncation even though a
+        // complete result follows the cap.
         let (_temp, turn_dir) = open_scan_dir();
         let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
         stdout.extend(vec![b'x'; 4096]);
@@ -3051,7 +3007,6 @@ mod tests {
         stdout.extend(codex_result_record("ok").as_bytes());
         stdout.push(b'\n');
         write_stdout(&turn_dir, &stdout);
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
         let scan = scan_stdout_protocol_with(
             &turn_dir,
             adapter,
@@ -3068,19 +3023,52 @@ mod tests {
     }
 
     #[test]
-    fn scan_stdout_protocol_treats_incomplete_json_at_eof_as_truncated() {
-        let (_temp, turn_dir) = open_scan_dir();
-        let stdout = format!("{}\n{{\"status\":\"done\"", codex_session_line());
-        write_stdout(&turn_dir, stdout.as_bytes());
+    fn scan_stdout_protocol_keeps_complete_results_beyond_tails_and_record_limits() {
         let adapter = crate::agent::adapter_for(AgentKind::Codex);
+
+        // A complete final record without a trailing newline is a result.
+        let (_temp, turn_dir) = open_scan_dir();
+        let stdout = format!("{}\n{}", codex_session_line(), codex_result_record("ok"));
+        write_stdout(&turn_dir, stdout.as_bytes());
         let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
         assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
-        assert!(scan.truncated);
-        assert_unknown_result(adapter, &scan);
-    }
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
 
-    #[test]
-    fn scan_stdout_protocol_keeps_a_near_limit_record_when_later_lines_share_the_chunk() {
+        // A unicode result beyond the display tail survives intact.
+        let (_temp, turn_dir) = open_scan_dir();
+        let filler = "{\"type\":\"item.updated\",\"delta\":\"привет\"}\n";
+        let mut stdout = format!("{}\n", codex_session_line()).into_bytes();
+        while stdout.len() <= LOG_TAIL_BYTES {
+            stdout.extend_from_slice(filler.as_bytes());
+        }
+        stdout.extend_from_slice(codex_result_record("готово").as_bytes());
+        stdout.push(b'\n');
+        write_stdout(&turn_dir, &stdout);
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+        assert!(scan.result_text.contains("готово"));
+
+        // A result larger than the display tail is kept whole.
+        let (_temp, turn_dir) = open_scan_dir();
+        let summary = "я".repeat((LOG_TAIL_BYTES / 2) + 8);
+        assert!(summary.len() > LOG_TAIL_BYTES);
+        assert!(summary.len() < crate::task::MAX_PROMPT_BYTES);
+        let stdout = format!(
+            "{}\n{}\n",
+            codex_session_line(),
+            codex_result_record(&summary)
+        );
+        write_stdout(&turn_dir, stdout.as_bytes());
+        let scan = scan_stdout_protocol(&turn_dir, adapter).unwrap();
+        assert_eq!(scan.session_ref.as_deref(), Some("session-1"));
+        assert!(!scan.truncated);
+        assert_done_result(adapter, &scan);
+        assert!(scan.result_text.len() > LOG_TAIL_BYTES);
+
+        // A near-limit record is kept when later lines share its read chunk.
         let (_temp, turn_dir) = open_scan_dir();
         let session = format!("{}\n", codex_session_line());
         let result = format!("{}\n", codex_result_record("ok"));
@@ -3089,7 +3077,6 @@ mod tests {
         assert!(result.trim_end().len() < max_record);
         assert!(session.len() + result.len() > max_record);
         write_stdout(&turn_dir, format!("{session}{result}").as_bytes());
-        let adapter = crate::agent::adapter_for(AgentKind::Codex);
         let scan = scan_stdout_protocol_with(
             &turn_dir,
             adapter,
@@ -3150,17 +3137,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_stdout_protocol_prefers_cursor_result_records_over_later_assistants() {
-        assert_result_beats_later_assistant(AgentKind::Cursor);
-    }
+    fn scan_stdout_protocol_prefers_result_records_over_later_assistant_and_malformed_records() {
+        for kind in [AgentKind::Cursor, AgentKind::Claude] {
+            assert_result_beats_later_assistant(kind);
+        }
 
-    #[test]
-    fn scan_stdout_protocol_prefers_claude_result_records_over_later_assistants() {
-        assert_result_beats_later_assistant(AgentKind::Claude);
-    }
-
-    #[test]
-    fn scan_stdout_protocol_skips_a_malformed_later_result_and_keeps_the_earlier_one() {
         let (_temp, turn_dir) = open_scan_dir();
         let stdout = format!(
             "{}\n{}\n{}\n",

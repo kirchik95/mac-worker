@@ -15688,117 +15688,72 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_live_restore_error_survives_retryable_rollback() {
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let target = fs::metadata(&root_path).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let validation_fault =
-            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
-        let rollback_fault = CleanupDecisionFaultOverride::set(
-            CleanupDecisionFault::DuringRestoreRollback(libc::EAGAIN),
-        );
+    fn cleanup_live_restore_error_survives_retryable_decision_faults() {
+        // The live EPERM from acquisition validation stays the caller's error
+        // when the restore's rollback, decision publication or intent retirement
+        // hits a retryable fault, and the owned root comes back byte for byte
+        // with an empty namespace.
+        let cases: [(&str, CleanupDecisionFault, bool); 3] = [
+            (
+                "rollback",
+                CleanupDecisionFault::DuringRestoreRollback(libc::EAGAIN),
+                true,
+            ),
+            (
+                "decision publication",
+                CleanupDecisionFault::AfterRename(libc::EAGAIN),
+                true,
+            ),
+            (
+                "intent retirement",
+                CleanupDecisionFault::AfterIntentRetire(libc::EAGAIN),
+                false,
+            ),
+        ];
+        for (label, decision_fault, fault_consumed) in cases {
+            let fixture = tempfile::tempdir().unwrap();
+            let physical = fixture.path().canonicalize().unwrap();
+            fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
+            let root_path = physical.join("root");
+            fs::create_dir(&root_path).unwrap();
+            fs::write(root_path.join("value"), b"owned").unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
+            let target = fs::metadata(&root_path).unwrap();
+            let parent = RootedDir::open(&physical).unwrap();
+            let validation_fault =
+                CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
+            let decision_override = CleanupDecisionFaultOverride::set(decision_fault);
 
-        let error = parent.remove_owned_child("root").unwrap_err();
+            let error = parent.remove_owned_child("root").unwrap_err();
 
-        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-        assert!(
-            super::TEST_CLEANUP_DECISION_FAULT
-                .with(std::cell::Cell::get)
-                .is_none()
-        );
-        let restored = fs::metadata(&root_path).unwrap();
-        assert_eq!(restored.dev(), target.dev());
-        assert_eq!(restored.ino(), target.ino());
-        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(
-            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
-                .unwrap()
-                .count(),
-            0
-        );
-        drop(rollback_fault);
-        drop(validation_fault);
-    }
-
-    #[test]
-    fn cleanup_live_restore_error_survives_retryable_decision_publication() {
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let target = fs::metadata(&root_path).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let validation_fault =
-            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
-        let publication_fault =
-            CleanupDecisionFaultOverride::set(CleanupDecisionFault::AfterRename(libc::EAGAIN));
-
-        let error = parent.remove_owned_child("root").unwrap_err();
-
-        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-        assert!(
-            super::TEST_CLEANUP_DECISION_FAULT
-                .with(std::cell::Cell::get)
-                .is_none()
-        );
-        let restored = fs::metadata(&root_path).unwrap();
-        assert_eq!(restored.dev(), target.dev());
-        assert_eq!(restored.ino(), target.ino());
-        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(
-            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
-                .unwrap()
-                .count(),
-            0
-        );
-        drop(publication_fault);
-        drop(validation_fault);
-    }
-
-    #[test]
-    fn cleanup_live_restore_error_survives_retryable_intent_retirement() {
-        let fixture = tempfile::tempdir().unwrap();
-        let physical = fixture.path().canonicalize().unwrap();
-        fs::set_permissions(&physical, fs::Permissions::from_mode(0o700)).unwrap();
-        let root_path = physical.join("root");
-        fs::create_dir(&root_path).unwrap();
-        fs::write(root_path.join("value"), b"owned").unwrap();
-        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o500)).unwrap();
-        let target = fs::metadata(&root_path).unwrap();
-        let parent = RootedDir::open(&physical).unwrap();
-        let validation_fault =
-            CleanupFaultOverride::set(CleanupFault::AfterAcquisitionValidation(libc::EPERM));
-        let retirement_fault = CleanupDecisionFaultOverride::set(
-            CleanupDecisionFault::AfterIntentRetire(libc::EAGAIN),
-        );
-
-        let error = parent.remove_owned_child("root").unwrap_err();
-
-        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-        let restored = fs::metadata(&root_path).unwrap();
-        assert_eq!(restored.dev(), target.dev());
-        assert_eq!(restored.ino(), target.ino());
-        assert_eq!(restored.permissions().mode() & 0o777, 0o500);
-        assert_eq!(fs::read(root_path.join("value")).unwrap(), b"owned");
-        assert_eq!(
-            fs::read_dir(physical.join(".mac-worker-rooted-fs"))
-                .unwrap()
-                .count(),
-            0
-        );
-        drop(retirement_fault);
-        drop(validation_fault);
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{label}");
+            if fault_consumed {
+                assert!(
+                    super::TEST_CLEANUP_DECISION_FAULT
+                        .with(std::cell::Cell::get)
+                        .is_none(),
+                    "{label}"
+                );
+            }
+            let restored = fs::metadata(&root_path).unwrap();
+            assert_eq!(restored.dev(), target.dev(), "{label}");
+            assert_eq!(restored.ino(), target.ino(), "{label}");
+            assert_eq!(restored.permissions().mode() & 0o777, 0o500, "{label}");
+            assert_eq!(
+                fs::read(root_path.join("value")).unwrap(),
+                b"owned",
+                "{label}"
+            );
+            assert_eq!(
+                fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                    .unwrap()
+                    .count(),
+                0,
+                "{label}"
+            );
+            drop(decision_override);
+            drop(validation_fault);
+        }
     }
 
     #[test]
@@ -17207,79 +17162,52 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_retrier_converges_when_bound_bootstrap_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::AfterCleanupBootstrap(libc::ENOENT),
-        );
-    }
-
-    #[test]
-    fn cleanup_retrier_converges_when_find_cleanup_intent_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        interrupt_owned_child_tree_cleanup(
-            &physical,
-            CleanupFault::AfterCleanupBootstrap(libc::EIO),
-        );
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::AfterFindCleanupIntent(libc::ENOENT),
-        );
-    }
-
-    #[test]
-    fn cleanup_retrier_converges_when_cleanup_generation_from_loaded_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        interrupt_owned_child_tree_cleanup(
-            &physical,
-            CleanupFault::AfterCleanupIntentPublish(libc::EIO),
-        );
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::AfterCleanupGenerationFromLoaded(libc::ENOENT),
-        );
-    }
-
-    #[test]
-    fn cleanup_retrier_converges_when_complete_bound_cleanup_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        interrupt_owned_child_tree_cleanup(
-            &physical,
-            CleanupFault::AfterCleanupBootstrap(libc::EIO),
-        );
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::BeforeBoundCompletion(libc::ENOENT),
-        );
-    }
-
-    #[test]
-    fn cleanup_retrier_converges_when_bound_complete_bound_cleanup_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::BeforeBoundCompletion(libc::ENOENT),
-        );
-    }
-
-    #[test]
-    fn cleanup_retrier_converges_when_find_unpublished_bootstrap_reports_enoent() {
-        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
-        interrupt_owned_child_tree_cleanup(
-            &physical,
-            CleanupFault::AfterCleanupBootstrap(libc::EIO),
-        );
-        assert_leaderless_retrier_converges_after_peer_progress_fault(
-            &physical,
-            &root_path,
-            CleanupFault::AfterFindUnpublishedCleanupBootstrap(libc::ENOENT),
-        );
+    fn cleanup_retrier_converges_when_peer_progress_reports_enoent() {
+        // A leaderless retrier converges whichever cleanup step a peer's progress
+        // makes look like ENOENT, on a fresh tree and on one whose earlier
+        // cleanup was interrupted at bootstrap or at intent publication.
+        let cases: [(&str, Option<CleanupFault>, CleanupFault); 6] = [
+            (
+                "bound bootstrap",
+                None,
+                CleanupFault::AfterCleanupBootstrap(libc::ENOENT),
+            ),
+            (
+                "find cleanup intent",
+                Some(CleanupFault::AfterCleanupBootstrap(libc::EIO)),
+                CleanupFault::AfterFindCleanupIntent(libc::ENOENT),
+            ),
+            (
+                "cleanup generation from loaded",
+                Some(CleanupFault::AfterCleanupIntentPublish(libc::EIO)),
+                CleanupFault::AfterCleanupGenerationFromLoaded(libc::ENOENT),
+            ),
+            (
+                "complete bound cleanup",
+                Some(CleanupFault::AfterCleanupBootstrap(libc::EIO)),
+                CleanupFault::BeforeBoundCompletion(libc::ENOENT),
+            ),
+            (
+                "bound complete bound cleanup",
+                None,
+                CleanupFault::BeforeBoundCompletion(libc::ENOENT),
+            ),
+            (
+                "find unpublished bootstrap",
+                Some(CleanupFault::AfterCleanupBootstrap(libc::EIO)),
+                CleanupFault::AfterFindUnpublishedCleanupBootstrap(libc::ENOENT),
+            ),
+        ];
+        for (label, interrupt, progress) in cases {
+            eprintln!("case: {label}");
+            let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+            if let Some(interrupt) = interrupt {
+                interrupt_owned_child_tree_cleanup(&physical, interrupt);
+            }
+            assert_leaderless_retrier_converges_after_peer_progress_fault(
+                &physical, &root_path, progress,
+            );
+        }
     }
 
     #[test]

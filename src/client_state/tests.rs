@@ -344,88 +344,71 @@ fn open_with_script(
 }
 
 #[test]
-fn runner_identity_verdict_treats_matching_as_live() {
-    let (_dir, store, identity) =
-        open_with_script([], ProcessObservation::Matching { process_group: 42 });
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Live
-    );
-}
-
-#[test]
-fn runner_identity_verdict_treats_reused_as_exited_immediately() {
-    let (_dir, store, identity) = open_with_script([], ProcessObservation::Reused);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Exited
-    );
-}
-
-#[test]
-fn runner_identity_verdict_keeps_a_single_absent_unverifiable() {
-    let (_dir, store, identity) = open_with_script([], ProcessObservation::Absent);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-}
-
-#[test]
-fn runner_identity_verdict_confirms_absent_after_the_window() {
-    let (_dir, store, identity) = open_with_script([], ProcessObservation::Absent);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Exited
-    );
-}
-
-#[test]
-fn runner_identity_verdict_clears_absence_when_the_pid_matches_again() {
-    let (_dir, store, identity) = open_with_script(
-        [
-            ProcessObservation::Absent,
+fn runner_identity_verdicts_follow_the_absence_confirmation_window() {
+    use RunnerLivenessVerdict::{Exited, Live, Unverifiable};
+    enum Step {
+        Expect(RunnerLivenessVerdict),
+        Advance,
+    }
+    use Step::{Advance, Expect};
+    let cases: Vec<(&str, Vec<ProcessObservation>, ProcessObservation, Vec<Step>)> = vec![
+        (
+            "a matching pid is live",
+            vec![],
             ProcessObservation::Matching { process_group: 42 },
+            vec![Expect(Live)],
+        ),
+        (
+            "a reused pid has exited immediately",
+            vec![],
+            ProcessObservation::Reused,
+            vec![Expect(Exited)],
+        ),
+        (
+            "a single absence stays unverifiable",
+            vec![],
             ProcessObservation::Absent,
-        ],
-        ProcessObservation::Absent,
-    );
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Live
-    );
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-}
-
-#[test]
-fn runner_identity_verdict_treats_ambiguous_as_unverifiable() {
-    let (_dir, store, identity) = open_with_script([], ProcessObservation::Ambiguous);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
-    store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION);
-    assert_eq!(
-        store.runner_identity_verdict(identity),
-        RunnerLivenessVerdict::Unverifiable
-    );
+            vec![Expect(Unverifiable), Expect(Unverifiable)],
+        ),
+        (
+            "absence is confirmed after the window",
+            vec![],
+            ProcessObservation::Absent,
+            vec![Expect(Unverifiable), Advance, Expect(Exited)],
+        ),
+        (
+            "a matching pid clears the absence",
+            vec![
+                ProcessObservation::Absent,
+                ProcessObservation::Matching { process_group: 42 },
+                ProcessObservation::Absent,
+            ],
+            ProcessObservation::Absent,
+            vec![
+                Expect(Unverifiable),
+                Advance,
+                Expect(Live),
+                Expect(Unverifiable),
+            ],
+        ),
+        (
+            "ambiguous stays unverifiable past the window",
+            vec![],
+            ProcessObservation::Ambiguous,
+            vec![Expect(Unverifiable), Advance, Expect(Unverifiable)],
+        ),
+    ];
+    for (label, script, exhausted, steps) in cases {
+        let (_dir, store, identity) = open_with_script(script, exhausted);
+        for step in steps {
+            match step {
+                Expect(verdict) => {
+                    assert_eq!(store.runner_identity_verdict(identity), verdict, "{label}")
+                }
+                Advance => store.advance_liveness_clock(RUNNER_ABSENCE_CONFIRMATION),
+            }
+        }
+    }
 }
 
 #[test]
