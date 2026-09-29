@@ -199,8 +199,9 @@ impl TaskSubmitHandler<'_> {
         if let PreparedTaskMutation::Close { expected, .. } = &prepared {
             let current = self.client_state.load_task(expected.meta().task_id())?;
             if let Err(error) = validate_close_target(&current, expected) {
-                // Settle only the read-only stale-target fence. Errors from
-                // execution below may follow side effects and remain retryable.
+                // Preserve the read-only close rejection, including terminal
+                // targets. Execution keeps unfinished effects retryable and
+                // the store settles definitive typed revision conflicts.
                 return Ok(rejection_result(&error));
             }
         }
@@ -211,7 +212,24 @@ impl TaskSubmitHandler<'_> {
             self.client_state,
             &DETACHED_EXECUTOR,
         );
-        let report = execute_task_mutation(&client, &prepared)?;
+        let report = match execute_task_mutation(&client, &prepared) {
+            Err(
+                error @ WorkerError::Task {
+                    code: "TASK_REVISION_CONFLICT",
+                    ..
+                },
+            ) => {
+                if let PreparedTaskMutation::Say { prepared } = &prepared {
+                    match client.completed_prepared_followup(prepared)? {
+                        Some(report) => report,
+                        None => return Err(error),
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+            result => result?,
+        };
         serde_json::to_value(ControllerTaskStatusResult::from_report(&report)).map_err(|_| {
             WorkerError::Protocol(
                 "CONTROLLER_TRANSPORT: mutation result could not be encoded".into(),

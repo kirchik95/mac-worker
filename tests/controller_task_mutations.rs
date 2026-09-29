@@ -43,7 +43,7 @@ use mac_worker::{
         TurnSummary, TurnTerminal,
     },
     task_client::TaskClient,
-    task_store::{TaskCloseRequest, TaskCloseResponse},
+    task_store::{TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse},
     transfer::HostOperation,
     transfer_repo::repo_id_for,
     turn_runner::RunnerExecutor,
@@ -943,6 +943,143 @@ struct GatedCloseHost {
     entered: mpsc::Sender<()>,
     release: Mutex<mpsc::Receiver<()>>,
     used: AtomicBool,
+}
+
+struct GatedCancelHost {
+    task_id: TaskId,
+    turn_id: TurnId,
+    status: Mutex<TaskStatus>,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    calls: AtomicUsize,
+}
+
+impl ProcessRunner for GatedCancelHost {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            return SystemProcessRunner.run(request);
+        }
+        assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+        assert_eq!(
+            request.args.last().unwrap(),
+            HostOperation::TaskCancel.command()
+        );
+        let cancel: TaskCancelRequest =
+            serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(cancel.task_id(), self.task_id);
+        assert_eq!(cancel.turn_id(), self.turn_id);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut wire = serde_json::to_value(self.status.lock().unwrap().clone()).unwrap();
+            wire["state"] = json!("open");
+            wire["last_outcome"] = json!({"kind": "cancelled"});
+            wire["turns"][0]["terminal"] = json!("cancelled");
+            wire["turns"][0]["outcome"] = json!({"kind": "cancelled"});
+            wire["turns"][0]["ended_at_millis"] = json!(3);
+            wire["updated_at_millis"] = json!(3);
+            *self.status.lock().unwrap() = serde_json::from_value(wire).unwrap();
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&TaskCancelResponse::new(
+                self.status.lock().unwrap().clone(),
+            ))
+            .unwrap(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[test]
+fn questions_cancel_conflict_after_host_effect_stays_retryable() {
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(131, 132);
+    let task_id = expected.meta().task_id();
+    let turn_id = expected.status().turns()[0].turn_id();
+    let mut wire = serde_json::to_value(expected).unwrap();
+    wire["status"]["state"] = json!("active");
+    wire["status"]["last_outcome"] = Value::Null;
+    wire["status"]["turns"][0]["terminal"] = Value::Null;
+    wire["status"]["turns"][0]["outcome"] = Value::Null;
+    wire["status"]["turns"][0]["ended_at_millis"] = Value::Null;
+    let expected: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    harness
+        .store
+        .replace_task_fixture(expected.clone())
+        .unwrap();
+    let envelope = request(REQUEST_ID, "task.cancel", json!({"task_id": task_id}));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let host = GatedCancelHost {
+        task_id,
+        turn_id,
+        status: Mutex::new(expected.status().clone()),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        calls: AtomicUsize::new(0),
+    };
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let journal = ControllerStore::open(&harness.paths.controller_state_root()).unwrap();
+    journal
+        .handle_with(&envelope, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let error = std::thread::scope(|scope| {
+        let operation =
+            scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            host.status.lock().unwrap().last_outcome(),
+            Some(&TaskOutcome::Cancelled)
+        );
+        assert!(
+            harness
+                .store
+                .update_task_if_current(
+                    &expected,
+                    expected.with_status_observed_at(Some(999)).unwrap()
+                )
+                .unwrap()
+        );
+        release_tx.send(()).unwrap();
+        operation.join().unwrap().unwrap_err()
+    });
+    assert_eq!(
+        error.public_code(),
+        "TASK_BUSY",
+        "same-turn cancellation still needs local completion"
+    );
+    assert_eq!(
+        journal.load(REQUEST_ID).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    let pending = journal.pending_health(u64::MAX).unwrap();
+    assert_eq!(pending.active_count, 1);
+    assert!(pending.oldest_pending_age_millis.is_some());
+    let tick = journal
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(tick.failed.is_empty(), "{:?}", tick.failed);
+    assert_eq!(tick.completed.len(), 1);
+    let cancelled = harness.store.load_task(task_id).unwrap();
+    assert_eq!(cancelled.status().state(), TaskState::Open);
+    assert_eq!(
+        cancelled.status().turns()[0].terminal(),
+        Some(TurnTerminal::Cancelled)
+    );
+    assert_eq!(cancelled.status_observed_at_millis(), Some(999));
+    let ack = journal
+        .handle_with(&envelope, &handler, ControllerFault::None)
+        .unwrap();
+    assert_eq!(ack.status(), "acked");
+    assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+    let health = journal.pending_health(u64::MAX).unwrap();
+    assert_eq!(health.active_count, 0);
+    assert_eq!(health.oldest_pending_age_millis, None);
 }
 
 impl ProcessRunner for GatedCloseHost {

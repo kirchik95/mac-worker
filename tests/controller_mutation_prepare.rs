@@ -15,8 +15,12 @@ use task_state_fixture::TaskStateFixture;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    os::{fd::AsRawFd, unix::fs::PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{fs::PermissionsExt, process::ExitStatusExt},
+    },
     path::PathBuf,
+    process::ExitStatus,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -50,6 +54,8 @@ use mac_worker::{
         TurnId, TurnSummary, TurnTerminal,
     },
     task_client::TaskClient,
+    task_store::{TaskCloseRequest, TaskCloseResponse},
+    transfer::HostOperation,
     turn_runner::InlineRunnerExecutor,
 };
 use serde_json::{Value, json};
@@ -67,6 +73,38 @@ impl ProcessRunner for LocalGitOnly {
             "no external worker calls"
         );
         RUNNER.run(request)
+    }
+}
+
+struct QuestionsCloseHost(TaskStatus);
+
+impl ProcessRunner for QuestionsCloseHost {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program == OsStr::new("/usr/bin/git") {
+            return RUNNER.run(request);
+        }
+        assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+        assert_eq!(
+            request.args.last().unwrap(),
+            HostOperation::TaskClose.command()
+        );
+        let close: TaskCloseRequest =
+            serde_json::from_slice(request.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(close.task_id(), task_n(0x5001));
+        let mut status = serde_json::to_value(&self.0).unwrap();
+        status["state"] = json!(if close.discard() {
+            "abandoned"
+        } else {
+            "closed"
+        });
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&TaskCloseResponse::new(
+                serde_json::from_value(status).unwrap(),
+            ))
+            .unwrap(),
+            stderr: Vec::new(),
+        })
     }
 }
 
@@ -432,6 +470,83 @@ impl Fixture {
         assert_eq!(row_entry(&plain, 0x5002).is_some(), keep_row);
         plain
     }
+
+    fn finish_human_questions(&self, state: &ClientStateStore, human: TurnId) {
+        let record = state.load_task(task_n(0x5001)).unwrap();
+        let mut wire = serde_json::to_value(
+            record
+                .with_runner(Some(RunnerIdentity::new(dead_owner())))
+                .unwrap(),
+        )
+        .unwrap();
+        wire["status"]["state"] = json!("open");
+        wire["status"]["last_outcome"] = json!({"kind": "needs_input"});
+        wire["status"]["turns"][1]["terminal"] = json!("succeeded");
+        wire["status"]["turns"][1]["outcome"] = json!({"kind": "needs_input"});
+        wire["status"]["turns"][1]["ended_at_millis"] = json!(1_900_000_000_000_u64);
+        state
+            .replace_task_fixture(serde_json::from_value(wire).unwrap())
+            .unwrap();
+        state.adopt_row(human, dead_owner()).unwrap();
+        let observation = AdmissionObservation::new(
+            "mini-1".to_owned(),
+            true,
+            CandidateSlot::Idle,
+            state
+                .queue_entry(human)
+                .unwrap()
+                .unwrap()
+                .requirements()
+                .to_vec(),
+            Some(8 * 1024 * 1024 * 1024),
+            64 * 1024 * 1024 * 1024,
+            1_900_000_000_000,
+        )
+        .unwrap();
+        state
+            .admission_observation("mini-1", 1_900_000_000_000, || Ok(observation))
+            .unwrap();
+        let claimed = state
+            .claim_next(dead_owner(), &["mini-1".into()], 1_900_000_000_001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.entry().job_id(), human);
+        drop(state.open_runner_log(task_n(0x5001), human).unwrap());
+        let checkpoint = self
+            .paths
+            .state
+            .join("runners")
+            .join(task_n(0x5001).to_string())
+            .join(format!("{human}.checkpoint.json"));
+        std::fs::write(
+            &checkpoint,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "task_id": task_n(0x5001),
+                "turn_id": human,
+                "committed": {
+                    "offsets": [0, 0], "len": 0, "accepted": true,
+                    "completion": {"outcome": {"kind": "needs_input"}, "drained": true},
+                },
+                "pending": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(checkpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+        TaskClient::new(
+            &LocalGitOnly,
+            &questions_config(),
+            &self.paths,
+            state,
+            &InlineRunnerExecutor,
+        )
+        .reconcile_selected(&[task_n(0x5001)])
+        .unwrap();
+        let automatic = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(automatic.status().turns().len(), 3);
+        assert!(automatic.status().turns().last().unwrap().auto_continue());
+    }
 }
 
 fn questions_request(command: &str) -> mac_worker::controller::ControllerRequest {
@@ -530,26 +645,129 @@ fn questions_controller_say_wins_pending_intent_and_retires_request() {
 }
 
 #[test]
-fn questions_controller_close_prepare_preserves_pending_intent_after_dead_row() {
+fn questions_controller_close_wins_pending_intent_after_dead_row() {
+    for keep_row in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.pending_questions(keep_row);
+        let config = questions_config();
+        let host = QuestionsCloseHost(state.load_task(task_n(0x5001)).unwrap().status().clone());
+        let handler = TaskSubmitHandler::new(&host, &config, &fixture.paths, &state);
+        let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+        let request = questions_request("task.close");
+        journal
+            .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+            .unwrap();
+        let current = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(current.status().turns().len(), 1);
+        assert!(serde_json::to_value(&current).unwrap()["auto_continue_intent"].is_object());
+        assert!(row_entry(&state, 0x5002).is_none());
+        let frozen = journal.load(request.request_id()).unwrap().unwrap();
+        assert_eq!(
+            frozen.prepared()["expected"],
+            serde_json::to_value(current).unwrap()
+        );
+        questions_health(&journal, 1);
+        let ack = journal
+            .handle_with(&request, &handler, ControllerFault::None)
+            .unwrap();
+        assert_eq!(ack.status(), "acked");
+        let closed = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(closed.status().state(), TaskState::Closed);
+        assert_eq!(closed.status().turns().len(), 1);
+        assert!(
+            serde_json::to_value(&closed)
+                .unwrap()
+                .get("auto_continue_intent")
+                .is_none()
+        );
+        assert!(state.queue_snapshot().unwrap().entries().is_empty());
+        questions_health(&journal, 0);
+        assert_eq!(
+            journal
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap(),
+            ack
+        );
+    }
+}
+
+fn questions_historical_say(binding: &str) {
     let fixture = Fixture::new();
-    let state = fixture.pending_questions(true);
+    let state = fixture.pending_questions(false);
     let config = questions_config();
     let handler = TaskSubmitHandler::new(&LocalGitOnly, &config, &fixture.paths, &state);
     let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
-    let request = questions_request("task.close");
+    let request = questions_request("task.say");
     journal
-        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .handle_with(
+            &request,
+            &handler,
+            ControllerFault::StopAfterExecuteBeforeResult,
+        )
         .unwrap();
-    let current = state.load_task(task_n(0x5001)).unwrap();
-    assert_eq!(current.status().turns().len(), 1);
-    assert!(serde_json::to_value(&current).unwrap()["auto_continue_intent"].is_object());
-    assert!(row_entry(&state, 0x5002).is_none());
     let frozen = journal.load(request.request_id()).unwrap().unwrap();
-    assert_eq!(
-        frozen.prepared()["expected"],
-        serde_json::to_value(current).unwrap()
-    );
+    assert_eq!(frozen.phase(), RequestPhase::Published);
+    assert!(frozen.result().is_none());
     questions_health(&journal, 1);
+    let human = state.load_task(task_n(0x5001)).unwrap().status().turns()[1].turn_id();
+    fixture.finish_human_questions(&state, human);
+    let automatic = state.load_task(task_n(0x5001)).unwrap();
+    let queue = state.queue_snapshot().unwrap();
+    let evidence = state.turn_ids_for_task(task_n(0x5001)).unwrap();
+    match binding {
+        "missing" => state
+            .remove_turn_prepared_binding(task_n(0x5001), human)
+            .unwrap(),
+        "mismatched" => {
+            state
+                .remove_turn_prepared_binding(task_n(0x5001), human)
+                .unwrap();
+            state
+                .write_turn_prepared_binding(task_n(0x5001), human, "different preparation")
+                .unwrap();
+        }
+        "exact" => {}
+        _ => unreachable!(),
+    }
+    let result = journal.handle_with(&request, &handler, ControllerFault::None);
+    match binding {
+        "exact" => {
+            let ack = result
+                .expect("a completed, bound human turn must replay successfully after advancement");
+            assert_eq!(ack.status(), "acked");
+            assert_eq!(ack.turn_id(), Some(human.to_string()).as_deref());
+            assert_eq!(
+                journal
+                    .handle_with(&request, &handler, ControllerFault::None)
+                    .unwrap(),
+                ack
+            );
+            questions_health(&journal, 0);
+        }
+        "missing" => {
+            assert_eq!(result.unwrap_err().public_code(), "TASK_INCONSISTENT");
+            questions_health(&journal, 1);
+        }
+        "mismatched" => {
+            assert_eq!(result.unwrap_err().public_code(), "TASK_REVISION_CONFLICT");
+            questions_health(&journal, 0);
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(state.load_task(task_n(0x5001)).unwrap(), automatic);
+    assert_eq!(state.queue_snapshot().unwrap(), queue);
+    assert_eq!(state.turn_ids_for_task(task_n(0x5001)).unwrap(), evidence);
+}
+
+#[test]
+fn questions_controller_completed_say_replays_after_automatic_turn() {
+    questions_historical_say("exact");
+}
+
+#[test]
+fn questions_controller_historical_say_requires_exact_binding() {
+    questions_historical_say("missing");
+    questions_historical_say("mismatched");
 }
 
 #[test]

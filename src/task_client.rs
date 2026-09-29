@@ -2687,6 +2687,14 @@ impl<'a> TaskClient<'a> {
         let task_id = expected.meta().task_id();
         let record = self.client_state.load_task(task_id)?;
         validate_close_target(&record, expected)?;
+        let record = if record.auto_continue_intent().is_some() {
+            self.clear_auto_continue_for_human(expected)?;
+            let current = self.client_state.load_task(task_id)?;
+            validate_close_target(&current, expected)?;
+            current
+        } else {
+            record
+        };
         if matches!(
             record.status().state(),
             TaskState::Closed | TaskState::Abandoned
@@ -2776,15 +2784,16 @@ impl<'a> TaskClient<'a> {
             if expected.status().state() != TaskState::Open {
                 return Err(task_error("TASK_BUSY", "task is not ready to close"));
             }
-            let intent = TaskCloseIntent::from_record(expected, discard)?;
-            let fenced = expected.with_close_intent(intent)?;
+            let intent = TaskCloseIntent::from_record(&record, discard)?;
+            let fenced = record.with_close_intent(intent)?;
             if !self
                 .client_state
-                .update_task_if_current(expected, fenced.clone())?
+                .update_task_if_current(&record, fenced.clone())?
             {
+                validate_close_target(&self.client_state.load_task(task_id)?, expected)?;
                 return Err(task_error(
-                    "TASK_REVISION_CONFLICT",
-                    "task changed before close",
+                    "TASK_BUSY",
+                    "task changed while preparing close",
                 ));
             }
             fenced
@@ -3961,38 +3970,7 @@ impl<'a> TaskClient<'a> {
                 "prepared follow-up turn is missing",
             ));
         };
-        if live_last.turn_number() != prepared.turn_number()
-            || live_last.auto_continue() != prepared.auto_continue()
-            || current.meta().agent().as_str() != prepared.agent()
-            || current.meta().model() != prepared.model()
-            || current.meta().limits().max_followups != prepared.max_followups()
-            || current.status().worker() != Some(prepared.worker())
-        {
-            return Err(task_error(
-                "TASK_REVISION_CONFLICT",
-                "prepared follow-up does not match the materialized turn",
-            ));
-        }
-        match self
-            .client_state
-            .read_turn_prepared_binding(task_id, turn_id)
-        {
-            Ok(binding) => {
-                if binding != prepared.binding() {
-                    return Err(task_error(
-                        "TASK_REVISION_CONFLICT",
-                        "prepared follow-up does not match the materialized turn",
-                    ));
-                }
-            }
-            Err(error) if is_not_found(&error) => {
-                return Err(task_error(
-                    "TASK_INCONSISTENT",
-                    "prepared follow-up binding is missing",
-                ));
-            }
-            Err(error) => return Err(error),
-        }
+        self.validate_materialized_followup(prepared, current, live_last)?;
         if live_last.terminal().is_some() {
             let mut report = self.report_from_record(current)?;
             if attached {
@@ -4077,6 +4055,70 @@ impl<'a> TaskClient<'a> {
             self.finish_attached_report(&mut report, entry.job_id(), outcome)?;
         }
         Ok(report)
+    }
+
+    fn validate_materialized_followup(
+        &self,
+        prepared: &PreparedFollowup,
+        current: &LocalTaskRecord,
+        turn: &TurnSummary,
+    ) -> Result<(), WorkerError> {
+        if current.meta().task_id() != prepared.task_id()
+            || turn.turn_id() != prepared.turn_id()
+            || turn.turn_number() != prepared.turn_number()
+            || turn.auto_continue() != prepared.auto_continue()
+            || current.meta().agent().as_str() != prepared.agent()
+            || current.meta().model() != prepared.model()
+            || current.meta().limits().max_followups != prepared.max_followups()
+            || current.status().worker() != Some(prepared.worker())
+        {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "prepared follow-up does not match the materialized turn",
+            ));
+        }
+        match self
+            .client_state
+            .read_turn_prepared_binding(prepared.task_id(), prepared.turn_id())
+        {
+            Ok(binding) => {
+                if binding != prepared.binding() {
+                    return Err(task_error(
+                        "TASK_REVISION_CONFLICT",
+                        "prepared follow-up does not match the materialized turn",
+                    ));
+                }
+            }
+            Err(error) if is_not_found(&error) => {
+                return Err(task_error(
+                    "TASK_INCONSISTENT",
+                    "prepared follow-up binding is missing",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    /// A durable controller request can outlive its completed human turn.
+    /// Recover its successful execution only from the terminal history plus
+    /// the exact preparation binding, which survives prompt retirement.
+    pub(crate) fn completed_prepared_followup(
+        &self,
+        prepared: &PreparedFollowup,
+    ) -> Result<Option<TaskReport>, WorkerError> {
+        prepared.validate_self_consistency()?;
+        let current = self.client_state.load_task(prepared.task_id())?;
+        let Some(turn) = current
+            .status()
+            .turns()
+            .iter()
+            .find(|turn| turn.turn_id() == prepared.turn_id() && turn.terminal().is_some())
+        else {
+            return Ok(None);
+        };
+        self.validate_materialized_followup(prepared, &current, turn)?;
+        self.report_from_record(&current).map(Some)
     }
 
     fn finish_attached_report(
@@ -4290,6 +4332,18 @@ impl<'a> TaskClient<'a> {
                 turn.terminal() == Some(TurnTerminal::Cancelled)
                     && turn.outcome() == Some(&TaskOutcome::Cancelled)
             });
+        if same
+            && current
+                .status()
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.terminal().is_none())
+        {
+            return Err(task_error(
+                "TASK_BUSY",
+                "task cancellation still needs local completion",
+            ));
+        }
         if !cancelled {
             return Err(task_error(
                 "TASK_REVISION_CONFLICT",

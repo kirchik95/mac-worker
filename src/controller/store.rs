@@ -1280,8 +1280,8 @@ const REJECTION_VERSION: u64 = 1;
 
 /// Classify definitive execution rejections. Frozen mutations cannot be
 /// retargeted after a revision conflict; TASK_BUSY and ambiguous failures keep
-/// their retry semantics. Close completion conflicts after a durable intent
-/// or retained cancellation use TASK_BUSY so cleanup is not lost.
+/// their retry semantics. Unfinished close/cancel effects use TASK_BUSY so
+/// cleanup is not lost; the handler recovers already-completed say results.
 /// Admission rejections remain deliberately narrow:
 ///
 /// * only `task.submit`, the one command whose rejection sites are proven to
