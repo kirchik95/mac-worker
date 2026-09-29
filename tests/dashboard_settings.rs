@@ -626,3 +626,88 @@ fn request(
         body: raw[split + 4..].to_vec(),
     }
 }
+
+struct LargeCatalogTransportFixture {
+    response: AgentSettingsList,
+}
+
+impl ProcessRunner for LargeCatalogTransportFixture {
+    fn run(
+        &self,
+        request: &ProcessRequest,
+    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+        assert_eq!(request.program, "/usr/bin/ssh");
+        assert_eq!(
+            request.args.last().unwrap(),
+            &HostOperation::AgentSettingsGet.command()
+        );
+        let stdout = serde_json::to_vec(&self.response).unwrap();
+        assert!(
+            stdout.len() < request.policy.stdout_limit,
+            "128-model catalogs exceeded the SSH response budget: {} bytes",
+            stdout.len()
+        );
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(0),
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_128_model_catalogs_and_additive_sources_cross_ssh_and_http() {
+    let response = AgentSettingsList {
+        agents: ["codex", "cursor", "opencode", "claude"]
+            .into_iter()
+            .map(|agent| {
+                let mut settings = entry();
+                settings.agent = agent.into();
+                settings.model_catalog_source = (agent != "claude").then(|| "live".into());
+                settings.model_options = (0..128)
+                    .map(|index| mac_worker::agent_settings::ModelOption {
+                        id: format!("{agent}/{}-{index:03}", "m".repeat(251 - agent.len())),
+                        label: "L".repeat(256),
+                        effort_options: if matches!(agent, "codex" | "cursor") {
+                            (0..32)
+                                .map(|effort| format!("{}-{effort:02}", "e".repeat(29)))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        fast_supported: false,
+                        capabilities_known: agent == "cursor",
+                    })
+                    .collect();
+                settings
+            })
+            .collect(),
+    };
+    let expected = serde_json::to_value(&response).unwrap();
+    let config =
+        Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mini-1\"\nslots = 1\n")
+            .unwrap();
+    let source = Arc::new(SystemDashboardSettingsSource::new(
+        Arc::new(config),
+        Arc::new(LargeCatalogTransportFixture { response }),
+    ));
+    let server = server_for_source(source).await;
+    let address = server
+        .local_url()
+        .strip_prefix("http://")
+        .unwrap()
+        .to_owned();
+    let read = request(
+        &address,
+        "GET",
+        "/api/v1/workers/mini-1/agent-settings",
+        &[],
+        b"",
+    );
+    assert_eq!(read.status, 200);
+    let actual: serde_json::Value = serde_json::from_slice(&read.body).unwrap();
+    assert_eq!(actual, expected);
+    for agent in actual["agents"].as_array().unwrap() {
+        assert_eq!(agent["model_options"].as_array().unwrap().len(), 128);
+    }
+}
