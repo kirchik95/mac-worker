@@ -2044,9 +2044,7 @@ impl<'a> TaskClient<'a> {
             )
             .with_notifier(self.herdr_notifier.clone())
             .run(task_id, turn_id, Some(&mut follow))?;
-            report.status = outcome.status().clone();
-            report.events.extend(outcome.events().iter().cloned());
-            report.exit_code = Some(outcome.exit_code());
+            self.finish_attached_report(&mut report, turn_id, outcome)?;
         }
         Ok(report)
     }
@@ -3795,9 +3793,7 @@ impl<'a> TaskClient<'a> {
             )
             .with_notifier(self.herdr_notifier.clone())
             .run(task_id, entry.job_id(), Some(stdout))?;
-            report.status = outcome.status().clone();
-            report.events.extend(outcome.events().iter().cloned());
-            report.exit_code = Some(outcome.exit_code());
+            self.finish_attached_report(&mut report, entry.job_id(), outcome)?;
         }
         Ok(report)
     }
@@ -3851,7 +3847,11 @@ impl<'a> TaskClient<'a> {
             Err(error) => return Err(error),
         }
         if live_last.terminal().is_some() {
-            return self.report_from_record(current);
+            let mut report = self.report_from_record(current)?;
+            if attached {
+                self.wait_for_attached_continuation(&mut report, turn_id)?;
+            }
+            return Ok(report);
         }
         if current.status().head_oid() != Some(prepared.base_oid()) {
             return Err(task_error(
@@ -3927,11 +3927,60 @@ impl<'a> TaskClient<'a> {
             )
             .with_notifier(self.herdr_notifier.clone())
             .run(task_id, entry.job_id(), Some(stdout))?;
-            report.status = outcome.status().clone();
-            report.events.extend(outcome.events().iter().cloned());
-            report.exit_code = Some(outcome.exit_code());
+            self.finish_attached_report(&mut report, entry.job_id(), outcome)?;
         }
         Ok(report)
+    }
+
+    fn finish_attached_report(
+        &self,
+        report: &mut TaskReport,
+        finished: TurnId,
+        outcome: crate::turn_runner::TurnOutcomeReport,
+    ) -> Result<(), WorkerError> {
+        report.status = outcome.status().clone();
+        report.events.extend(outcome.events().iter().cloned());
+        report.exit_code = Some(outcome.exit_code());
+        self.wait_for_attached_continuation(report, finished)
+    }
+
+    fn wait_for_attached_continuation(
+        &self,
+        report: &mut TaskReport,
+        finished: TurnId,
+    ) -> Result<(), WorkerError> {
+        let record = self.client_state.load_task(report.task_id())?;
+        let has_continuation = |status: &TaskStatus| {
+            status
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.turn_id() != finished && turn.auto_continue())
+        };
+        // Include an already-finished automatic turn: a fast child can finish
+        // before this read, but its outcome must still replace the first exit.
+        if record.auto_continue_intent().is_some()
+            || has_continuation(report.status())
+            || has_continuation(record.status())
+        {
+            self.wait(WaitSelector::Task(report.task_id()), None)?;
+            let mut final_report =
+                self.report_from_record(&self.client_state.load_task(report.task_id())?)?;
+            final_report.events = std::mem::take(&mut report.events);
+            for warning in &report.warnings {
+                if !final_report.warnings.contains(warning) {
+                    final_report.warnings.push(warning.clone());
+                }
+            }
+            final_report.exit_code = Some(
+                final_report
+                    .status()
+                    .last_outcome()
+                    .map(|outcome| crate::task::classify_task_outcome(outcome).runner)
+                    .unwrap_or(0),
+            );
+            *report = final_report;
+        }
+        Ok(())
     }
 
     fn publish_prepared_evidence(&self, prepared: &PreparedFollowup) -> Result<(), WorkerError> {

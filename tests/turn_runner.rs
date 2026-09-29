@@ -1639,6 +1639,226 @@ fn questions_fixture(
     fixture
 }
 
+struct QuestionsAttachedExecutor<'a> {
+    state: &'a ClientStateStore,
+    runner: &'a AcceptedThenTerminalRunner,
+    automatic_outcome: TaskOutcome,
+    starts: mpsc::Sender<Option<(TaskId, TurnId, TurnId)>>,
+}
+
+impl RunnerExecutor for QuestionsAttachedExecutor<'_> {
+    fn start(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        let record = self.state.load_task(task)?;
+        if record
+            .status()
+            .turns()
+            .last()
+            .is_some_and(TurnSummary::auto_continue)
+        {
+            *self.runner.next_outcome.lock().unwrap() = Some(self.automatic_outcome.clone());
+            let previous = record.status().turns()[record.status().turns().len() - 2].turn_id();
+            self.starts.send(Some((task, turn, previous))).unwrap();
+        }
+        InlineRunnerExecutor.start(paths, task, turn)
+    }
+}
+
+#[test]
+fn questions_attached_wait_returns_automatic_outcome_for_submit_say_and_resume() {
+    questions_assert_attached_wait(
+        &["submit", "say", "resume"],
+        TaskOutcome::failed("agent exited 42"),
+        42,
+    );
+}
+
+#[test]
+fn questions_attached_wait_preserves_automatic_infrastructure_exit_code() {
+    questions_assert_attached_wait(&["submit"], TaskOutcome::failed("RESULT_FETCH_FAILED"), 70);
+}
+
+#[test]
+fn questions_attached_wait_replays_terminal_followup_with_pending_intent() {
+    questions_assert_attached_wait(
+        &["terminal_resume"],
+        TaskOutcome::failed("agent exited 42"),
+        42,
+    );
+}
+
+fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome, exit_code: u8) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for mode in modes.iter().copied() {
+        let repo = support::GitRepo::init();
+        repo.write("base.txt", b"base\n");
+        repo.commit_all("base");
+        let _cwd = CurrentDirGuard::enter(repo.root());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let config = Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\"]\n").unwrap();
+        let runner = AcceptedThenTerminalRunner::new();
+        *runner.terminal_outcome.lock().unwrap() = TaskOutcome::NeedsInput;
+        let (starts, receive) = mpsc::channel();
+        let executor = QuestionsAttachedExecutor {
+            state: &state,
+            runner: &runner,
+            automatic_outcome: automatic_outcome.clone(),
+            starts: starts.clone(),
+        };
+        let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
+        let mut request = submit_request(repo.root(), None, WorkerPreference::Automatic, true);
+        request.questions = Some(if mode == "submit" {
+            mac_worker::task::QuestionsPolicy::Decide
+        } else {
+            mac_worker::task::QuestionsPolicy::Ask
+        });
+        request.attached = mode == "submit";
+        let report = thread::scope(|scope| {
+            let child = {
+                let (runner, config, paths, state) = (&runner, &config, &paths, &state);
+                scope.spawn(move || {
+                    if let Some((task, turn, previous)) = receive.recv().unwrap() {
+                        // Wait on the original finalizer's journal, so the first
+                        // run necessarily returns an Active automatic turn.
+                        let journal = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(
+                                paths
+                                    .state
+                                    .join("runners")
+                                    .join(task.to_string())
+                                    .join(format!("{previous}.log")),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            unsafe { libc::flock(journal.as_raw_fd(), libc::LOCK_EX) },
+                            0
+                        );
+                        drop(journal);
+                        let run =
+                            TurnRunner::new(runner, config, paths, state, &InlineRunnerExecutor);
+                        loop {
+                            match run.run(task, turn, None) {
+                                Err(WorkerError::Io(error))
+                                    if error.kind() == io::ErrorKind::WouldBlock =>
+                                {
+                                    thread::yield_now()
+                                }
+                                result => {
+                                    result.unwrap();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+            let report = if mode == "submit" {
+                client.submit(request, &mut Vec::new(), &mut Vec::new())
+            } else {
+                let submitted = client
+                    .submit(request, &mut Vec::new(), &mut Vec::new())
+                    .unwrap();
+                let task = submitted.task_id();
+                let first = state
+                    .queue_entry_for_task_turn(task)
+                    .unwrap()
+                    .unwrap()
+                    .job_id();
+                TurnRunner::new(&runner, &config, &paths, &state, &executor)
+                    .run(task, first, None)
+                    .unwrap();
+                let expected = state
+                    .load_task(task)
+                    .unwrap()
+                    .with_questions_policy(mac_worker::task::QuestionsPolicy::Decide);
+                state.replace_task_fixture(expected.clone()).unwrap();
+                if mode == "say" {
+                    client.say(
+                        task,
+                        "human follow-up".into(),
+                        true,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                    )
+                } else {
+                    let prepared = mac_worker::prepared_followup::PreparedFollowup::prepare(
+                        &expected,
+                        "human follow-up".into(),
+                        TurnId::generate(),
+                        expected.status().updated_at_millis() + 1,
+                    )
+                    .unwrap();
+                    client
+                        .say_prepared(&prepared, false, &mut Vec::new(), &mut Vec::new())
+                        .unwrap();
+                    if mode == "terminal_resume" {
+                        state.bootstrap_active_task_index().unwrap();
+                        let hook = Arc::new(QuestionsRetirementFault {
+                            state: Mutex::new(None),
+                            task_id: task,
+                            used: AtomicBool::new(false),
+                        });
+                        let fault_state = ClientStateStore::open_with_concurrency_hook(
+                            &paths.state,
+                            hook.clone(),
+                        )
+                        .unwrap();
+                        *hook.state.lock().unwrap() = Some(fault_state.clone());
+                        let error =
+                            TurnRunner::new(&runner, &config, &paths, &fault_state, &executor)
+                                .run(task, prepared.turn_id(), None)
+                                .unwrap_err();
+                        assert!(error.to_string().contains("after publication"), "{error}");
+                        assert!(hook.used.load(Ordering::SeqCst));
+                        *hook.state.lock().unwrap() = None;
+                        let pending = state.load_task(task).unwrap();
+                        assert!(
+                            serde_json::to_value(&pending).unwrap()["auto_continue_intent"]
+                                .is_object()
+                        );
+                        assert!(
+                            pending
+                                .status()
+                                .turns()
+                                .last()
+                                .unwrap()
+                                .terminal()
+                                .is_some()
+                        );
+                        assert!(state.queue_entry_for_task_turn(task).unwrap().is_none());
+                    }
+                    client.say_prepared(&prepared, true, &mut Vec::new(), &mut Vec::new())
+                }
+            };
+            let _ = starts.send(None);
+            child.join().unwrap();
+            report.unwrap()
+        });
+        assert_eq!(report.status().state(), TaskState::Open, "{mode}");
+        assert_eq!(
+            report.status().last_outcome(),
+            Some(&automatic_outcome),
+            "{mode}"
+        );
+        assert_eq!(report.exit_code(), Some(exit_code), "{mode}");
+        assert!(report.status().turns().last().unwrap().auto_continue());
+        assert!(
+            state
+                .queue_entry_for_task_turn(report.task_id())
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[test]
 fn questions_auto_continues_once_detached_with_questions_and_same_session() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
