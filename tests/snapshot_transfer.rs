@@ -3620,43 +3620,99 @@ fn status_and_logs_falls_back_once_for_matching_protocol_missing_command() {
 }
 
 #[test]
-fn truncated_json_status_logs_does_not_fallback() {
-    let submit = remote_submit(80_002, 10);
-    let job_id = submit.material().job_id();
-    let runner =
-        RecordingRunner::returning(vec![Ok(result(status(1), b"{\"protocol_version\":", b""))]);
-    let client = RemoteJobClient::new(&runner);
+fn status_logs_failures_never_fall_back_to_separate_queries() {
+    // A combined status-logs reply that is truncated, a typed host error, a
+    // malformed body, a protocol mismatch, an ssh 255 or invalid JSON on a
+    // zero exit is reported as is: exactly one status-logs request, never a
+    // fallback to the separate queries.
+    enum Expected {
+        Transport(&'static str),
+        Protocol(&'static str),
+    }
+    let cases = vec![
+        (
+            "truncated json",
+            80_002,
+            result(status(1), b"{\"protocol_version\":", b""),
+            Expected::Transport("HOST_REQUEST_FAILED"),
+        ),
+        (
+            "host json error",
+            80_003,
+            result(
+                status(1),
+                &canonical_line(
+                    &HostControlError::new("JOB_NOT_FOUND", "exact job has no queryable status")
+                        .unwrap(),
+                ),
+                b"",
+            ),
+            Expected::Protocol("JOB_NOT_FOUND:"),
+        ),
+        (
+            "nonempty malformed stdout",
+            80_005,
+            result(
+                status(2),
+                b"not-a-json-object",
+                b"error: unrecognized subcommand 'status-logs'\n",
+            ),
+            Expected::Transport("HOST_REQUEST_FAILED"),
+        ),
+        (
+            "protocol mismatch",
+            80_006,
+            result(
+                status(1),
+                &canonical_line(
+                    &HostControlError::new("PROTOCOL_MISMATCH", "helper protocol version differs")
+                        .unwrap(),
+                ),
+                b"error: unrecognized subcommand 'status-logs'\n",
+            ),
+            Expected::Protocol("PROTOCOL_MISMATCH:"),
+        ),
+        (
+            "ssh 255",
+            80_007,
+            result(
+                status(255),
+                b"",
+                b"error: unrecognized subcommand 'status-logs'\n",
+            ),
+            Expected::Transport("SSH_UNAVAILABLE"),
+        ),
+        (
+            "successful invalid json",
+            80_008,
+            result(status(0), b"{not-json", b""),
+            Expected::Transport("INVALID_RESPONSE"),
+        ),
+    ];
+    for (label, seed, reply, expected) in cases {
+        let submit = remote_submit(seed, 10);
+        let job_id = submit.material().job_id();
+        let runner = RecordingRunner::returning(vec![Ok(reply)]);
+        let client = RemoteJobClient::new(&runner);
 
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(matches!(
-        error,
-        WorkerError::Transport {
-            code: "HOST_REQUEST_FAILED",
-            ..
+        let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
+        match expected {
+            Expected::Transport(code) => assert!(
+                matches!(error, WorkerError::Transport { code: actual, .. } if actual == code),
+                "{label}: {error:?}"
+            ),
+            Expected::Protocol(prefix) => assert!(
+                matches!(error, WorkerError::Protocol(ref message) if message.starts_with(prefix)),
+                "{label}: {error:?}"
+            ),
         }
-    ));
-    assert_eq!(runner.requests().len(), 1);
-    assert_eq!(
-        host_command(&runner.requests()[0]),
-        HostOperation::StatusLogs.command()
-    );
-}
-
-#[test]
-fn host_json_error_status_logs_does_not_fallback() {
-    let submit = remote_submit(80_003, 10);
-    let job_id = submit.material().job_id();
-    let stdout = canonical_line(
-        &HostControlError::new("JOB_NOT_FOUND", "exact job has no queryable status").unwrap(),
-    );
-    let runner = RecordingRunner::returning(vec![Ok(result(status(1), &stdout, b""))]);
-    let client = RemoteJobClient::new(&runner);
-
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(
-        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("JOB_NOT_FOUND:"))
-    );
-    assert_eq!(runner.requests().len(), 1);
+        assert_eq!(runner.requests().len(), 1, "{label}");
+        assert_eq!(
+            host_command(&runner.requests()[0]),
+            HostOperation::StatusLogs.command(),
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -3673,89 +3729,6 @@ fn request_optional_reports_unsupported_only_for_clap_missing_status_logs() {
         )
         .unwrap();
     assert_eq!(response, OptionalHostResponse::Unsupported);
-}
-
-#[test]
-fn nonempty_malformed_status_logs_stdout_does_not_fallback() {
-    let submit = remote_submit(80_005, 10);
-    let job_id = submit.material().job_id();
-    let runner = RecordingRunner::returning(vec![Ok(result(
-        status(2),
-        b"not-a-json-object",
-        b"error: unrecognized subcommand 'status-logs'\n",
-    ))]);
-    let client = RemoteJobClient::new(&runner);
-
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(matches!(
-        error,
-        WorkerError::Transport {
-            code: "HOST_REQUEST_FAILED",
-            ..
-        }
-    ));
-    assert_eq!(runner.requests().len(), 1);
-}
-
-#[test]
-fn protocol_mismatch_status_logs_does_not_fallback() {
-    let submit = remote_submit(80_006, 10);
-    let job_id = submit.material().job_id();
-    let stdout = canonical_line(
-        &HostControlError::new("PROTOCOL_MISMATCH", "helper protocol version differs").unwrap(),
-    );
-    let runner = RecordingRunner::returning(vec![Ok(result(
-        status(1),
-        &stdout,
-        b"error: unrecognized subcommand 'status-logs'\n",
-    ))]);
-    let client = RemoteJobClient::new(&runner);
-
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(
-        matches!(error, WorkerError::Protocol(ref message) if message.starts_with("PROTOCOL_MISMATCH:"))
-    );
-    assert_eq!(runner.requests().len(), 1);
-}
-
-#[test]
-fn ssh_255_status_logs_does_not_fallback() {
-    let submit = remote_submit(80_007, 10);
-    let job_id = submit.material().job_id();
-    let runner = RecordingRunner::returning(vec![Ok(result(
-        status(255),
-        b"",
-        b"error: unrecognized subcommand 'status-logs'\n",
-    ))]);
-    let client = RemoteJobClient::new(&runner);
-
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(matches!(
-        error,
-        WorkerError::Transport {
-            code: "SSH_UNAVAILABLE",
-            ..
-        }
-    ));
-    assert_eq!(runner.requests().len(), 1);
-}
-
-#[test]
-fn successful_invalid_json_status_logs_does_not_fallback() {
-    let submit = remote_submit(80_008, 10);
-    let job_id = submit.material().job_id();
-    let runner = RecordingRunner::returning(vec![Ok(result(status(0), b"{not-json", b""))]);
-    let client = RemoteJobClient::new(&runner);
-
-    let error = poll_status_and_logs(&client, &worker(), job_id).unwrap_err();
-    assert!(matches!(
-        error,
-        WorkerError::Transport {
-            code: "INVALID_RESPONSE",
-            ..
-        }
-    ));
-    assert_eq!(runner.requests().len(), 1);
 }
 
 #[test]

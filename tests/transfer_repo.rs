@@ -1834,89 +1834,82 @@ fn failed_build_retries(inject: Result<ProcessResult, WorkerError>, code: &str) 
 }
 
 #[test]
-fn wip_fast_import_nonzero_does_not_publish_and_retries() {
-    failed_build_retries(
-        Ok(ProcessResult {
-            status: ExitStatus::from_raw(1 << 8),
-            stdout: fake_oid_lines(2),
-            stderr: b"injected fast-import failure\n".to_vec(),
-        }),
-        "BASE_UNAVAILABLE",
-    );
-}
-
-#[test]
-fn wip_fast_import_truncated_stdout_does_not_publish_and_retries() {
-    let mut stdout = fake_oid_lines(1);
-    stdout.extend_from_slice(fake_oid_hex());
-    stdout.push(b'\r');
-    failed_build_retries(
-        Ok(ProcessResult {
-            status: ExitStatus::from_raw(0),
-            stdout,
-            stderr: Vec::new(),
-        }),
-        "BASE_UNAVAILABLE",
-    );
-}
-
-#[test]
-fn wip_fast_import_too_few_oids_does_not_publish_and_retries() {
-    failed_build_retries(
-        Ok(ProcessResult {
-            status: ExitStatus::from_raw(0),
-            stdout: fake_oid_lines(1),
-            stderr: Vec::new(),
-        }),
-        "BASE_UNAVAILABLE",
-    );
-}
-
-#[test]
-fn wip_fast_import_too_many_oids_does_not_publish_and_retries() {
-    failed_build_retries(
-        Ok(ProcessResult {
-            status: ExitStatus::from_raw(0),
-            stdout: fake_oid_lines(3),
-            stderr: Vec::new(),
-        }),
-        "BASE_UNAVAILABLE",
-    );
-}
-
-#[test]
-fn wip_fast_import_noncanonical_stdout_does_not_publish_and_retries() {
-    let mut stdout = fake_oid_lines(1);
-    stdout.extend_from_slice(b"E69DE29BB2D1D6434B8B29AE775AD8C2E48C5391\n");
-    failed_build_retries(
-        Ok(ProcessResult {
-            status: ExitStatus::from_raw(0),
-            stdout,
-            stderr: Vec::new(),
-        }),
-        "BASE_UNAVAILABLE",
-    );
-}
-
-#[test]
-fn wip_fast_import_timeout_keeps_process_error_and_retries() {
-    failed_build_retries(
-        Err(ProcessError::DeadlineExceeded {
-            deadline: Duration::from_secs(30),
-        }
-        .into()),
-        "PROCESS",
-    );
-}
-
-#[test]
-fn wip_fast_import_output_limit_keeps_process_error_and_retries() {
-    failed_build_retries(
-        Err(ProcessError::OutputLimitExceeded {
-            stream: ProcessStream::Stdout,
-            limit: 64 * 1024 * 1024,
-        }
-        .into()),
-        "PROCESS",
-    );
+fn wip_fast_import_failures_do_not_publish_and_retry() {
+    // Every importer failure shape leaves no published base, keeps the
+    // rejected output away from update-index/write-tree, and the next build
+    // succeeds: process failures keep their PROCESS code, bad output is
+    // BASE_UNAVAILABLE.
+    let mut truncated = fake_oid_lines(1);
+    truncated.extend_from_slice(fake_oid_hex());
+    truncated.push(b'\r');
+    let mut noncanonical = fake_oid_lines(1);
+    noncanonical.extend_from_slice(b"E69DE29BB2D1D6434B8B29AE775AD8C2E48C5391\n");
+    let cases: Vec<(&str, Result<ProcessResult, WorkerError>, &str)> = vec![
+        (
+            "nonzero exit",
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(1 << 8),
+                stdout: fake_oid_lines(2),
+                stderr: b"injected fast-import failure\n".to_vec(),
+            }),
+            "BASE_UNAVAILABLE",
+        ),
+        (
+            "truncated stdout",
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: truncated,
+                stderr: Vec::new(),
+            }),
+            "BASE_UNAVAILABLE",
+        ),
+        (
+            "too few oids",
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: fake_oid_lines(1),
+                stderr: Vec::new(),
+            }),
+            "BASE_UNAVAILABLE",
+        ),
+        (
+            "too many oids",
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: fake_oid_lines(3),
+                stderr: Vec::new(),
+            }),
+            "BASE_UNAVAILABLE",
+        ),
+        (
+            "noncanonical stdout",
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: noncanonical,
+                stderr: Vec::new(),
+            }),
+            "BASE_UNAVAILABLE",
+        ),
+        (
+            "timeout",
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into()),
+            "PROCESS",
+        ),
+        (
+            "output limit",
+            Err(ProcessError::OutputLimitExceeded {
+                stream: ProcessStream::Stdout,
+                limit: 64 * 1024 * 1024,
+            }
+            .into()),
+            "PROCESS",
+        ),
+    ];
+    for (label, inject, code) in cases {
+        eprintln!("case: {label}");
+        failed_build_retries(inject, code);
+    }
 }

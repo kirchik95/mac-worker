@@ -716,34 +716,41 @@ fn process_launch_failure_is_reported_as_unavailable() {
 }
 
 #[test]
-fn stdout_probe_response_overflow_is_reported_as_an_invalid_response() {
-    // This catches classifying an oversized protocol response as a transport outage.
-    let runner = RecordingRunner::returning_result(Err(WorkerError::Process(
-        ProcessError::OutputLimitExceeded {
-            stream: ProcessStream::Stdout,
-            limit: 1024 * 1024,
-        },
-    )));
-    let transport = SshTransport::new(runner);
+fn undecodable_probe_output_is_reported_as_an_invalid_response() {
+    // An over-limit, non-JSON, non-UTF-8 or oversized probe reply is an
+    // INVALID_RESPONSE, never a transport outage, and never yields a probe.
+    let cases: Vec<(&str, RecordingRunner)> = vec![
+        (
+            "stdout overflow",
+            RecordingRunner::returning_result(Err(WorkerError::Process(
+                ProcessError::OutputLimitExceeded {
+                    stream: ProcessStream::Stdout,
+                    limit: 1024 * 1024,
+                },
+            ))),
+        ),
+        (
+            "malformed json",
+            RecordingRunner::returning_json(b"not JSON".to_vec()),
+        ),
+        ("invalid utf-8", RecordingRunner::returning_json(vec![0xff])),
+        (
+            "larger than one MiB",
+            RecordingRunner::returning_json(vec![b' '; 1024 * 1024 + 1]),
+        ),
+    ];
+    for (label, runner) in cases {
+        let health = SshTransport::new(runner).probe(&worker("mini-1", "mac1", &[]));
 
-    let health = transport.probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
-    assert!(health.error_message.is_some());
-}
-
-#[test]
-fn malformed_json_is_reported_as_an_invalid_response() {
-    let runner = RecordingRunner::returning_json(b"not JSON".to_vec());
-    let transport = SshTransport::new(runner);
-
-    let health = transport.probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
-    assert!(health.error_message.is_some());
-    assert!(health.probe.is_none());
+        assert_eq!(health.status, HealthStatus::Unavailable, "{label}");
+        assert_eq!(
+            health.error_code.as_deref(),
+            Some("INVALID_RESPONSE"),
+            "{label}"
+        );
+        assert!(health.error_message.is_some(), "{label}");
+        assert!(health.probe.is_none(), "{label}");
+    }
 }
 
 #[test]
@@ -763,30 +770,6 @@ fn additive_unknown_probe_and_facts_fields_stay_ready() {
     assert_eq!(health.status, HealthStatus::Ready, "{health:?}");
     assert_eq!(health.error_code, None);
     assert!(health.probe.as_ref().unwrap().agent_facts.is_some());
-}
-
-#[test]
-fn invalid_utf8_is_reported_as_an_invalid_response() {
-    let runner = RecordingRunner::returning_json(vec![0xff]);
-    let transport = SshTransport::new(runner);
-
-    let health = transport.probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
-    assert!(health.error_message.is_some());
-}
-
-#[test]
-fn output_larger_than_one_mib_is_reported_as_an_invalid_response() {
-    let runner = RecordingRunner::returning_json(vec![b' '; 1024 * 1024 + 1]);
-    let transport = SshTransport::new(runner);
-
-    let health = transport.probe(&worker("mini-1", "mac1", &[]));
-
-    assert_eq!(health.status, HealthStatus::Unavailable);
-    assert_eq!(health.error_code.as_deref(), Some("INVALID_RESPONSE"));
-    assert!(health.error_message.is_some());
 }
 
 #[test]
@@ -1019,8 +1002,11 @@ fn any_advertised_version_other_than_the_current_pair_is_a_protocol_mismatch() {
         ),
     ];
     for (label, body, protocol, supervision) in cases {
-        let health =
-            SshTransport::new(RecordingRunner::returning_json(body)).probe(&worker("mini-1", "mac1", &[]));
+        let health = SshTransport::new(RecordingRunner::returning_json(body)).probe(&worker(
+            "mini-1",
+            "mac1",
+            &[],
+        ));
 
         assert_eq!(health.status, HealthStatus::Unavailable, "{label}");
         assert_eq!(
