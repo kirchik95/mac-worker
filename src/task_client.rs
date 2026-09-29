@@ -6496,7 +6496,7 @@ pub(crate) fn compose_turn_prompt(
     let autonomy = match questions {
         crate::task::QuestionsPolicy::Ask => "",
         crate::task::QuestionsPolicy::Decide => {
-            "\n\nNo human is available to answer questions while you work. Do not stop to ask. When something is ambiguous, choose the most reasonable option, continue, and list the decisions and assumptions you made in your final summary. Use status \"blocked\" only for something you cannot work around (missing access, a missing secret, an unavailable service); do not use \"needs_input\"."
+            "\n\nNo human is available to answer questions while you work. Do not stop to ask. When something is ambiguous, choose the most reasonable option, continue, and list the decisions and assumptions you made in your final summary. Use status \"blocked\" only for something you cannot work around (missing access, a missing secret, an unavailable service); do not use \"needs_input\", even though the result format lists it."
         }
     };
     format!(
@@ -7283,6 +7283,12 @@ mod tests {
                 );
                 assert!(
                     prompt.contains("No human is available to answer questions"),
+                    "{agent:?} resume={resume}: {prompt}"
+                );
+                assert!(
+                    prompt.contains(
+                        "do not use \"needs_input\", even though the result format lists it."
+                    ),
                     "{agent:?} resume={resume}: {prompt}"
                 );
                 assert!(prompt.contains("do not use \"needs_input\""));
