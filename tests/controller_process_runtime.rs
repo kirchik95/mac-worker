@@ -9,7 +9,6 @@ mod controller_process;
 mod support;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use controller_process::ProcessFixture;
@@ -24,12 +23,10 @@ use mac_worker::{
     protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput,
+        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
     },
     task_store::{
-        TaskPrepareRequest,
-        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse,
+        TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse,
     },
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
@@ -370,135 +367,6 @@ fn harness_fake_exec_protocol_and_descendant_git() {
         "journal={}",
         fixture.exec_journal()
     );
-}
-
-struct FakeexecTurnInput<'a> {
-    job_id: JobId,
-    lease_token: LeaseToken,
-    created_at_millis: u64,
-    turn_number: u32,
-    base: &'a BaseOid,
-    prompt: &'a str,
-    resume: bool,
-}
-
-fn fakeexec_turn(
-    fixture: &ProcessFixture,
-    input: FakeexecTurnInput<'_>,
-) -> (TaskTurnRequest, TaskTurnResponse) {
-    let FakeexecTurnInput {
-        job_id,
-        lease_token,
-        created_at_millis,
-        turn_number,
-        base,
-        prompt,
-        resume,
-    } = input;
-    let turn = TurnMaterial::from_prompt(
-        plumbing_task_id(),
-        turn_number,
-        AgentKind::Codex,
-        None,
-        None,
-        PermissionPolicy::Workspace,
-        TurnLimits::new(30_000, None, None).unwrap(),
-        base.clone(),
-        prompt,
-        None,
-        Uuid::from_u128(2),
-        resume,
-    )
-    .unwrap();
-    let material = plumbing_material_for(job_id, lease_token, created_at_millis, turn.digest());
-    let lease_req = LeaseAcquireRequest::new(material.clone())
-        .with_execution_scope(ExecutionScope::task(plumbing_task_id()));
-    let lease: LeaseAcquireResponse = fakeexec_ok(
-        fixture,
-        "host lease-acquire",
-        &serde_json::to_vec(&lease_req).unwrap(),
-    );
-    match lease {
-        LeaseAcquireResponse::Acquired { lease } => {
-            assert_eq!(lease.job_id(), job_id);
-        }
-        other => panic!("expected acquired lease, got {other:?}"),
-    }
-    let prepare: TaskPrepareResponse = fakeexec_ok(
-        fixture,
-        "host task-prepare",
-        &serde_json::to_vec(&TaskPrepareRequest::new(
-            plumbing_task_meta(base.clone()),
-            job_id,
-            "mini-1",
-        ))
-        .unwrap(),
-    );
-    assert!(!prepare.reused());
-    let submit = mac_worker::job::SubmitRequest::new(material)
-        .with_execution_scope(ExecutionScope::task(plumbing_task_id()));
-    let turn_req = TaskTurnRequest::new(submit, turn, prompt);
-    let turn_resp: TaskTurnResponse = fakeexec_ok(
-        fixture,
-        "host task-turn",
-        &serde_json::to_vec(&turn_req).unwrap(),
-    );
-    (turn_req, turn_resp)
-}
-
-fn result_head(turn: &TaskTurnResponse) -> String {
-    turn.task()
-        .head_oid()
-        .expect("task-turn TaskStatus must carry a result head")
-        .as_str()
-        .to_owned()
-}
-
-fn fakeexec_git(fixture: &ProcessFixture, args: &[&str]) -> std::process::Output {
-    Command::new("/usr/bin/git")
-        .arg(format!("--git-dir={}", fixture.exec_git.display()))
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("fakeexec git")
-}
-
-fn fakeexec_result_commit_count(fixture: &ProcessFixture) -> usize {
-    let output = fakeexec_git(fixture, &["log", "--all", "--pretty=%s"]);
-    assert!(
-        output.status.success(),
-        "git log failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .filter(|line| *line == "fake worker result")
-        .count()
-}
-
-fn fakeexec_commit_parent(fixture: &ProcessFixture, oid: &str) -> String {
-    let spec = format!("{oid}^");
-    let output = fakeexec_git(fixture, &["rev-parse", &spec]);
-    assert!(
-        output.status.success(),
-        "rev-parse {oid}^ failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-fn journal_turn_job_ids(fixture: &ProcessFixture) -> Vec<String> {
-    fixture
-        .journal_task_turns()
-        .into_iter()
-        .filter_map(|row| {
-            row.get("job_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
-        .collect()
 }
 
 fn laptop_tasks_exist(root: &Path) -> bool {

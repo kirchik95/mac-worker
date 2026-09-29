@@ -12,38 +12,21 @@ mod controller_process;
 mod support;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use controller_process::ProcessFixture;
 use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
     controller::{
         BatchKind, FrozenBatchBody, OperationEnvelope, canonical_request_sha256, decode_frame,
         encode_json_frame, load_operation_envelope,
     },
     dag::DagBase,
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseToken, RequestFingerprintMaterial, StatusLogsRequest, StatusLogsResponse,
-        SubmitResponse,
-    },
     process::SystemProcessRunner,
     project_state::ProjectState,
     protocol::PROTOCOL_VERSION,
-    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
-    task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
-    },
-    task_store::{
-        TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse,
-    },
-    transfer_repo::TransferRepo,
-    turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
 };
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 const RUNNER: SystemProcessRunner = SystemProcessRunner;
 
@@ -525,8 +508,6 @@ fn runtime_batch_envelope_replay_after_controller_restart() {
     drop(leader);
 }
 
-const TASK_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
-
 /// Public grammar: two independent roots in one checkout via `base` refs.
 /// `project` is not a BatchTask field (`deny_unknown_fields`).
 fn write_independent_two_root_batch(path: &Path) {
@@ -606,227 +587,6 @@ fn head_oid(repo: &support::GitRepo) -> String {
         .unwrap()
         .trim()
         .to_owned()
-}
-
-fn seed_controller_transfer(
-    fixture: &ProcessFixture,
-    source: &support::GitRepo,
-    project_id: &str,
-    worktree_id: &str,
-) -> PathBuf {
-    let cache_root = fixture.controller_xdg_cache.join("mac-worker");
-    let dest =
-        TransferRepo::controller_transfer_git_path(&cache_root, project_id, worktree_id).unwrap();
-    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    let clone = source.git(["clone", "--bare", ".", dest.to_str().unwrap()].as_slice());
-    assert!(
-        clone.status.success(),
-        "bare clone into controller-transfer failed: {}",
-        String::from_utf8_lossy(&clone.stderr)
-    );
-    dest
-}
-
-fn task_id_n(n: u128) -> TaskId {
-    TaskId::new(Uuid::from_u128(n))
-}
-
-fn job_id_n(n: u128) -> JobId {
-    JobId::new(Uuid::from_u128(n))
-}
-
-fn client_id_n(n: u128) -> ClientId {
-    ClientId::new(Uuid::from_u128(n))
-}
-
-fn lease_token_n(n: u128) -> LeaseToken {
-    LeaseToken::new(Uuid::from_u128(n))
-}
-
-fn plumbing_task_meta(
-    task_id: TaskId,
-    project_id: &str,
-    worktree_id: &str,
-    base_oid: BaseOid,
-) -> TaskMeta {
-    TaskMeta::new(TaskMetaInput {
-        task_id,
-        run_id: None,
-        project_id: project_id.into(),
-        worktree_id: worktree_id.into(),
-        agent: AgentKind::Codex,
-        model: None,
-        effort: None,
-        policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local {
-            wip: false,
-            push_target: None,
-        },
-        publish: vec![PublishMode::Fetch],
-        publish_branch: None,
-        base_oid,
-        limits: TaskLimits::default(),
-        close_policy: ClosePolicy::Never,
-        env_profile: None,
-        git_identity: GitIdentity::new("Ada Lovelace", "ada@example.test").unwrap(),
-        title: None,
-        prompt: "make the requested change".into(),
-        created_at_millis: 100,
-    })
-    .unwrap()
-}
-
-fn plumbing_material(
-    job_id: JobId,
-    client_id: ClientId,
-    token: LeaseToken,
-    project_id: &str,
-    worktree_id: &str,
-    manifest_digest: String,
-) -> RequestFingerprintMaterial {
-    RequestFingerprintMaterial::new(
-        job_id,
-        client_id,
-        token,
-        100,
-        "mini-1".into(),
-        project_id.into(),
-        worktree_id.into(),
-        manifest_digest,
-        String::new(),
-        30_000,
-        "heavy".into(),
-        CommandSpec::shell("true".into()).unwrap(),
-    )
-    .unwrap()
-}
-
-fn fakeexec_ok<T: DeserializeOwned>(fixture: &ProcessFixture, opcode: &str, stdin: &[u8]) -> T {
-    let (status, stdout, stderr) = fixture.run_fakeexec(opcode, stdin);
-    assert!(
-        status.success(),
-        "fakeexec {opcode} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
-    decode_protocol_json(&stdout, &stderr)
-}
-
-fn fakeexec_one_turn(
-    fixture: &ProcessFixture,
-    task_id: TaskId,
-    project_id: &str,
-    worktree_id: &str,
-    base_oid: &str,
-    n: u128,
-    prompt: &str,
-) -> String {
-    let base: BaseOid = base_oid.parse().unwrap();
-    let job_id = job_id_n(n);
-    let client_id = client_id_n(n);
-    let token = lease_token_n(n);
-    let turn = TurnMaterial::from_prompt(
-        task_id,
-        1,
-        AgentKind::Codex,
-        None,
-        None,
-        PermissionPolicy::Workspace,
-        TurnLimits::new(30_000, None, None).unwrap(),
-        base.clone(),
-        prompt,
-        None,
-        Uuid::from_u128(n + 1),
-        false,
-    )
-    .unwrap();
-    let material = plumbing_material(
-        job_id,
-        client_id,
-        token,
-        project_id,
-        worktree_id,
-        turn.digest(),
-    );
-    let lease_req = LeaseAcquireRequest::new(material.clone())
-        .with_execution_scope(ExecutionScope::task(task_id));
-    let lease: LeaseAcquireResponse = fakeexec_ok(
-        fixture,
-        "host lease-acquire",
-        &serde_json::to_vec(&lease_req).unwrap(),
-    );
-    match lease {
-        LeaseAcquireResponse::Acquired { .. } => {}
-        other => panic!("expected acquired lease, got {other:?}"),
-    }
-    let snapshot = SnapshotVerifyRequest::new(
-        job_id,
-        client_id,
-        token,
-        material.fingerprint(),
-        project_id.into(),
-        worktree_id.into(),
-        material.manifest_digest().to_owned(),
-    )
-    .unwrap();
-    let _: VerifiedSnapshotResponse = fakeexec_ok(
-        fixture,
-        "host snapshot-verify",
-        &serde_json::to_vec(&snapshot).unwrap(),
-    );
-    let prepare_req = TaskPrepareRequest::new(
-        plumbing_task_meta(task_id, project_id, worktree_id, base.clone()),
-        job_id,
-        "mini-1",
-    );
-    let prepare: TaskPrepareResponse = fakeexec_ok(
-        fixture,
-        "host task-prepare",
-        &serde_json::to_vec(&prepare_req).unwrap(),
-    );
-    assert_eq!(prepare.head().as_str(), base_oid);
-    let _: TaskSessionResponse = fakeexec_ok(
-        fixture,
-        "host task-session",
-        &serde_json::to_vec(&TaskSessionRequest::new(project_id, task_id)).unwrap(),
-    );
-    let submit = mac_worker::job::SubmitRequest::new(material)
-        .with_execution_scope(ExecutionScope::task(task_id));
-    let turn_req = TaskTurnRequest::new(submit, turn, prompt);
-    let turn_resp: TaskTurnResponse = fakeexec_ok(
-        fixture,
-        "host task-turn",
-        &serde_json::to_vec(&turn_req).unwrap(),
-    );
-    match turn_resp.submit() {
-        SubmitResponse::Accepted { .. } => {}
-        other => panic!("expected accepted submit, got {other:?}"),
-    }
-    let _: StatusLogsResponse = fakeexec_ok(
-        fixture,
-        "host status-logs",
-        &serde_json::to_vec(&StatusLogsRequest::new(job_id, 0, 32, 0, 32)).unwrap(),
-    );
-    turn_resp
-        .task()
-        .head_oid()
-        .expect("task-turn TaskStatus must carry a result head")
-        .as_str()
-        .to_owned()
-}
-
-fn decode_protocol_json<T: DeserializeOwned>(stdout: &[u8], stderr: &[u8]) -> T {
-    let text = String::from_utf8_lossy(stdout);
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    serde_json::from_str(line).unwrap_or_else(|error| {
-        panic!(
-            "expected protocol JSON ({error}); stdout={text} stderr={}",
-            String::from_utf8_lossy(stderr)
-        )
-    })
 }
 
 fn parse_json_value(stdout: &[u8]) -> Value {

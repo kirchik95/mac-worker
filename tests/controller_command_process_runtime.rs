@@ -27,14 +27,12 @@ use std::time::{Duration, Instant};
 use controller_process::{OwnedChild, ProcessFixture, TEST_SSH_ENV};
 use mac_worker::{
     controller::{
-        BatchKind, FrozenBatchBody, OperationEnvelope, decode_frame,
-        load_operation_envelope,
+        BatchKind, FrozenBatchBody, OperationEnvelope, decode_frame, load_operation_envelope,
     },
     dag::DagBase,
     protocol::PROTOCOL_VERSION,
 };
 use serde_json::Value;
-
 
 /// Enabled submit, then `task list` must return the actual task identity and
 /// status and `task reconcile` must succeed without another host execution.
