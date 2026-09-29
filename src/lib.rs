@@ -1838,42 +1838,67 @@ fn interrupt_settle_error(error: WorkerError) -> WorkerError {
     error
 }
 
+#[derive(Debug)]
 struct InterruptedTurn {
     turn_number: u32,
     turn_id: crate::task::TurnId,
     outcome: String,
 }
 
-fn turn_in_progress(status: &crate::task::TaskStatus) -> bool {
-    matches!(
-        status.state(),
-        crate::task::TaskState::Queued | crate::task::TaskState::Active
-    )
+/// The running turn `say --interrupt` stops, or `None` for a plain say.
+/// A queued turn has not started an agent session yet: cancelling it would
+/// abandon the task, and there is nothing to continue. Refuse instead.
+fn interrupt_target(
+    status: &crate::task::TaskStatus,
+) -> Result<Option<(crate::task::TurnId, u32)>, WorkerError> {
+    match status.state() {
+        crate::task::TaskState::Active => {
+            let turn = status.turns().last().ok_or_else(|| {
+                WorkerError::task("TASK_INCONSISTENT", "active task has no turn record")
+            })?;
+            Ok(Some((turn.turn_id(), turn.turn_number())))
+        }
+        crate::task::TaskState::Queued => Err(WorkerError::task(
+            "TASK_BUSY",
+            "the task's turn has not started yet, so there is no session to interrupt; wait for it to start, or use worker task cancel",
+        )),
+        _ => Ok(None),
+    }
 }
 
-fn turn_is_terminal(status: &crate::task::TaskStatus) -> bool {
-    !turn_in_progress(status)
-        && status
-            .turns()
-            .last()
-            .is_none_or(|turn| turn.terminal().is_some())
-}
-
-fn interrupted_from(report: &task_client::TaskReport) -> Result<InterruptedTurn, WorkerError> {
-    let turn = report
-        .status()
+/// After the cancel settles, the task's last turn must be the observed turn
+/// and it must have been cancelled. A turn that finished on its own in the
+/// meantime was not interrupted: do not send the follow-up as if it had been.
+fn interrupted_turn(
+    status: &crate::task::TaskStatus,
+    observed: crate::task::TurnId,
+    turn_number: u32,
+) -> Result<InterruptedTurn, WorkerError> {
+    let turn = status
         .turns()
         .last()
-        .ok_or_else(|| WorkerError::task("TASK_INCONSISTENT", "cancelled turn is missing"))?;
-    let outcome = turn
-        .outcome()
-        .or(report.status().last_outcome())
-        .ok_or_else(|| WorkerError::task("TASK_INCONSISTENT", "cancelled turn has no outcome"))?;
-    Ok(InterruptedTurn {
-        turn_number: turn.turn_number(),
-        turn_id: turn.turn_id(),
-        outcome: outcome.kind().to_owned(),
-    })
+        .filter(|turn| turn.turn_id() == observed)
+        .ok_or_else(|| {
+            WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "a newer turn started before the interrupt settled; the follow-up was not sent",
+            )
+        })?;
+    match (status.state(), turn.outcome()) {
+        (crate::task::TaskState::Queued | crate::task::TaskState::Active, _) => Err(
+            WorkerError::task("TASK_BUSY", "cancelled turn is not terminal"),
+        ),
+        (_, Some(crate::task::TaskOutcome::Cancelled)) => Ok(InterruptedTurn {
+            turn_number,
+            turn_id: observed,
+            outcome: crate::task::TaskOutcome::Cancelled.kind().to_owned(),
+        }),
+        // A 'static message is operator-facing; an owned one would be redacted.
+        (_, _) => Err(WorkerError::task(
+            "TASK_REVISION_CONFLICT",
+            "the turn finished before it could be interrupted; the follow-up was not sent, use worker task say without --interrupt",
+        )),
+    }
 }
 
 fn interrupt_local_turn(
@@ -1881,21 +1906,15 @@ fn interrupt_local_turn(
     task_id: crate::task::TaskId,
 ) -> Result<Option<InterruptedTurn>, WorkerError> {
     let current = client.status(task_id)?;
-    if !turn_in_progress(current.status()) {
+    let Some((observed, turn_number)) = interrupt_target(current.status())? else {
         return Ok(None);
-    }
+    };
     client.cancel(task_id)?;
     client
         .wait(WaitSelector::Task(task_id), Some(INTERRUPT_SETTLE_TIMEOUT))
         .map_err(interrupt_settle_error)?;
     let settled = client.status(task_id)?;
-    if !turn_is_terminal(settled.status()) {
-        return Err(WorkerError::task(
-            "TASK_BUSY",
-            "cancelled turn is not terminal",
-        ));
-    }
-    Ok(Some(interrupted_from(&settled)?))
+    interrupted_turn(settled.status(), observed, turn_number).map(Some)
 }
 
 fn interrupt_controller_turn(
@@ -1905,9 +1924,9 @@ fn interrupt_controller_turn(
     task_id: crate::task::TaskId,
 ) -> Result<Option<InterruptedTurn>, WorkerError> {
     let current = controller_task_status(runner, config, task_id)?;
-    if !turn_in_progress(current.status()) {
+    let Some((observed, turn_number)) = interrupt_target(current.status())? else {
         return Ok(None);
-    }
+    };
     let ack = persist_and_send_controller(
         runner,
         paths,
@@ -1926,13 +1945,7 @@ fn interrupt_controller_turn(
     )
     .map_err(interrupt_settle_error)?;
     let report = controller_task_status(runner, config, task_id)?;
-    if !turn_is_terminal(report.status()) {
-        return Err(WorkerError::task(
-            "TASK_BUSY",
-            "cancelled turn is not terminal",
-        ));
-    }
-    Ok(Some(interrupted_from(&report)?))
+    interrupted_turn(report.status(), observed, turn_number).map(Some)
 }
 
 pub(crate) fn write_task_report(
@@ -6024,6 +6037,99 @@ mod tests {
         .expect_err("unknown configuration fields must be rejected");
 
         assert!(matches!(error, WorkerError::Config(_)));
+    }
+}
+
+#[cfg(test)]
+mod interrupt_target_tests {
+    use crate::task::{
+        BaseOid, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+    };
+
+    fn status(state: TaskState, turns: Vec<TurnSummary>) -> TaskStatus {
+        let base: BaseOid = "a".repeat(40).parse().unwrap();
+        TaskStatus::new(
+            state,
+            None,
+            None,
+            false,
+            Some(base),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            turns,
+            1,
+        )
+        .unwrap()
+    }
+
+    fn turn(
+        turn_id: TurnId,
+        terminal: Option<TurnTerminal>,
+        outcome: Option<TaskOutcome>,
+    ) -> TurnSummary {
+        TurnSummary::new(1, turn_id, terminal, outcome, None, false, Some(1), None)
+    }
+
+    #[test]
+    fn a_queued_turn_is_refused_before_any_cancel() {
+        let error = super::interrupt_target(&status(TaskState::Queued, Vec::new())).unwrap_err();
+        assert_eq!(error.public_code(), "TASK_BUSY");
+        assert!(error.public_message().contains("has not started yet"));
+    }
+
+    #[test]
+    fn only_an_active_turn_is_interrupted() {
+        let id = TurnId::generate();
+        let active = status(TaskState::Active, vec![turn(id, None, None)]);
+        assert_eq!(super::interrupt_target(&active).unwrap(), Some((id, 1)));
+        let open = status(
+            TaskState::Open,
+            vec![turn(
+                id,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+            )],
+        );
+        assert_eq!(super::interrupt_target(&open).unwrap(), None);
+    }
+
+    #[test]
+    fn only_the_observed_cancelled_turn_counts_as_interrupted() {
+        let id = TurnId::generate();
+        let cancelled = status(
+            TaskState::Open,
+            vec![turn(
+                id,
+                Some(TurnTerminal::Cancelled),
+                Some(TaskOutcome::Cancelled),
+            )],
+        );
+        assert_eq!(
+            super::interrupted_turn(&cancelled, id, 1).unwrap().turn_id,
+            id
+        );
+        let finished = status(
+            TaskState::Open,
+            vec![turn(
+                id,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+            )],
+        );
+        assert_eq!(
+            super::interrupted_turn(&finished, id, 1)
+                .unwrap_err()
+                .public_code(),
+            "TASK_REVISION_CONFLICT"
+        );
+        assert_eq!(
+            super::interrupted_turn(&cancelled, TurnId::generate(), 1)
+                .unwrap_err()
+                .public_code(),
+            "TASK_REVISION_CONFLICT"
+        );
     }
 }
 

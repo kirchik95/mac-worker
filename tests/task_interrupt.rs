@@ -51,6 +51,8 @@ enum Script {
     Idle,
     CancelFails,
     CloseAfter,
+    /// The turn finishes on its own before the cancel lands.
+    FinishedFirst,
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +232,26 @@ fn task_closed_between_cancel_and_say_sends_no_follow_up() {
     let record = store.load_task(fixture.task_id).unwrap();
     assert_eq!(record.status().state(), TaskState::Closed);
     assert_eq!(record.status().turns().len(), 1);
+}
+
+#[test]
+fn a_turn_that_finished_before_the_cancel_gets_no_follow_up() {
+    let fixture = plant(Script::FinishedFirst);
+    let (exit, stdout, stderr) = run_say(&fixture, false);
+    assert_ne!(exit, 0, "stdout={stdout}");
+    assert!(stderr.contains("TASK_REVISION_CONFLICT"), "{stderr}");
+    assert!(
+        stderr.contains("finished before it could be interrupted"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("interrupted turn"), "{stdout}");
+    let store = ClientStateStore::open(&fixture.home.paths.state).unwrap();
+    let record = store.load_task(fixture.task_id).unwrap();
+    assert_eq!(record.status().turns().len(), 1, "no follow-up turn");
+    assert_eq!(
+        record.status().turns()[0].outcome(),
+        Some(&TaskOutcome::Done)
+    );
 }
 
 fn run_say(fixture: &Fixture, json: bool) -> (u8, String, String) {
@@ -529,6 +551,9 @@ impl Remote {
             if self.script == Script::CloseAfter {
                 return self.closed.clone();
             }
+            if self.script == Script::FinishedFirst {
+                return self.idle.clone();
+            }
             return self.open_cancelled.clone();
         }
         self.active.clone()
@@ -574,6 +599,9 @@ impl ProcessRunner for Remote {
             }
             self.retire_running_turn();
             *self.phase.lock().unwrap() = Phase::After;
+            if self.script == Script::FinishedFirst {
+                return canonical(&TaskCancelResponse::new(self.idle.clone()));
+            }
             return canonical(&TaskCancelResponse::new(self.open_cancelled.clone()));
         }
         panic!("unexpected fixture worker operation: {operation}");

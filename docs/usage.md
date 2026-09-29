@@ -63,7 +63,7 @@ worker gc [--apply]                # preview, then reclaim old tasks, branches, 
 
 Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
 
-`worker task say --interrupt` stops a queued or running turn, waits until that turn is terminal, then continues the same agent session and workspace with the new message. Files the cancelled turn already wrote in the workspace stay there for the next turn. With no queued or running turn, `--interrupt` is the same as `say`. If the cancel fails, the follow-up is not sent. `--wait` waits for the new turn.
+`worker task say --interrupt` stops a running turn, waits up to 60 seconds for it to be cancelled and retired, then continues the same agent session and workspace with the new message. Files the cancelled turn already wrote in the workspace stay there for the next turn. A turn that is still queued has no agent session yet: `--interrupt` refuses it with `TASK_BUSY` instead of cancelling, which would abandon the task. With no running turn, `--interrupt` is the same as `say`. The follow-up is not sent if the cancel fails (its error), if the turn does not settle in time (`TASK_BUSY`), or if the turn finished on its own before the cancel landed (`TASK_REVISION_CONFLICT`; use a plain `say`). `--wait` waits for the new turn.
 
 `worker task batch FILE --preview` validates the file and prints the plan (`dag.status = "enforced"`). It does not open client state or dispatch. `--preview` conflicts with `--wait`. Submit of a named graph (`depends_on` or `base = "from:<id>"`) freezes that run and launches eligible roots; invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run. Independent batches (empty `depends_on` and no `from:`) keep today's create-run-and-submit path.
 
@@ -599,7 +599,7 @@ When `worker run` finishes, the process status is the remote command's own exit 
 | `TASK_NOT_FOUND` | 64 | check the id with `worker task list` |
 | `TASK_CONFIG_INVALID` | 64 | fix the task options and submit again |
 | `FOLLOWUP_LIMIT` | 64 | close the task, or submit a new one with a higher follow-up limit |
-| `TASK_REVISION_CONFLICT` | 64 | refresh the task status and retry the close |
+| `TASK_REVISION_CONFLICT` | 64 | refresh the task status, then retry the command |
 | `RESULT_NOT_RETAINED` | 64 | the closed workspace is no longer retained |
 | `AGENT_UNSUPPORTED` | 64 | choose codex, cursor, opencode, or claude |
 | `NOT_A_WORKTREE` | 64 | run the command inside a Git worktree |

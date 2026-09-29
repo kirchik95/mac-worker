@@ -31,8 +31,18 @@ struct IsolatedHome {
     paths: PathLayout,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Active,
+    Idle,
+    /// The first turn is still queued: no session exists to interrupt.
+    Queued,
+    /// The turn finishes on its own before the cancel lands.
+    FinishedFirst,
+}
+
 struct Rpc {
-    active: bool,
+    mode: Mode,
     commands: Mutex<Vec<String>>,
 }
 
@@ -113,6 +123,43 @@ fn controller_interrupt_of_an_idle_task_json_omits_interrupted() {
     assert_eq!(rpc.commands(), ["task.status", "task.say"]);
 }
 
+#[test]
+fn controller_interrupt_refuses_a_queued_first_turn_without_cancelling() {
+    // Cancelling a queued task abandons it, and there is no session to continue.
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let rpc = Rpc::with(Mode::Queued);
+    let (exit, stdout, stderr) = run_say(&laptop, &rpc, false);
+    assert_ne!(exit, 0, "stdout={stdout}");
+    assert!(stderr.contains("TASK_BUSY"), "{stderr}");
+    assert!(stderr.contains("has not started yet"), "{stderr}");
+    assert_eq!(rpc.commands(), ["task.status"]);
+}
+
+#[test]
+fn controller_interrupt_does_not_follow_up_a_turn_that_finished_first() {
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let rpc = Rpc::with(Mode::FinishedFirst);
+    let (exit, stdout, stderr) = run_say(&laptop, &rpc, false);
+    assert_ne!(exit, 0, "stdout={stdout}");
+    assert!(stderr.contains("TASK_REVISION_CONFLICT"), "{stderr}");
+    assert!(
+        stderr.contains("finished before it could be interrupted"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("interrupted turn"), "{stdout}");
+    assert_eq!(
+        rpc.commands(),
+        [
+            "task.status",
+            "task.cancel",
+            "task.wait.poll",
+            "task.status"
+        ]
+    );
+}
+
 fn run_say(laptop: &IsolatedHome, rpc: &Rpc, json: bool) -> (u8, String, String) {
     let mut args = vec![
         "worker",
@@ -181,18 +228,19 @@ fn write_enabled_config(paths: &PathLayout) {
 }
 
 impl Rpc {
-    fn active() -> Self {
+    fn with(mode: Mode) -> Self {
         Self {
-            active: true,
+            mode,
             commands: Mutex::new(Vec::new()),
         }
     }
 
+    fn active() -> Self {
+        Self::with(Mode::Active)
+    }
+
     fn idle() -> Self {
-        Self {
-            active: false,
-            commands: Mutex::new(Vec::new()),
-        }
+        Self::with(Mode::Idle)
     }
 
     fn commands(&self) -> Vec<String> {
@@ -227,26 +275,24 @@ impl ProcessRunner for Rpc {
                 "payload_sha256": digest,
                 "result": {"task_ids": [TASK_ID], "quiescent": true, "exit_code": 0},
             }),
-            "task.status" => read_reply(
-                &command,
-                request_id,
-                &digest,
-                if self.active && !self.commands().iter().any(|seen| seen == "task.cancel") {
-                    active_status()
-                } else if self.active {
-                    cancelled_status()
-                } else {
-                    idle_status()
-                },
-            ),
+            "task.status" => {
+                let cancelled = self.commands().iter().any(|seen| seen == "task.cancel");
+                let status = match self.mode {
+                    Mode::Active | Mode::FinishedFirst if !cancelled => active_status(),
+                    Mode::Active => cancelled_status(),
+                    Mode::FinishedFirst | Mode::Idle => idle_status(),
+                    Mode::Queued => queued_status(),
+                };
+                read_reply(&command, request_id, &digest, status)
+            }
             "task.cancel" | "task.say" => ack(
                 request_id,
                 &digest,
                 task_id,
-                if command == "task.cancel" {
-                    cancelled_status()
-                } else {
-                    follow_up_status()
+                match (command.as_str(), self.mode) {
+                    ("task.cancel", Mode::FinishedFirst) => idle_status(),
+                    ("task.cancel", _) => cancelled_status(),
+                    _ => follow_up_status(),
                 },
             ),
             other => panic!("unexpected controller command {other}"),
@@ -313,6 +359,24 @@ fn idle_status() -> TaskStatus {
         Some(TaskOutcome::Done),
         4,
     )
+}
+
+fn queued_status() -> TaskStatus {
+    let base: BaseOid = "a".repeat(40).parse().unwrap();
+    TaskStatus::new(
+        TaskState::Queued,
+        None,
+        None,
+        false,
+        Some(base),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Vec::new(),
+        1,
+    )
+    .unwrap()
 }
 
 fn follow_up_status() -> TaskStatus {

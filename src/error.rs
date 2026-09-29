@@ -366,7 +366,7 @@ static CATALOG: &[PublicDiagnostic] = &[
     PublicDiagnostic {
         code: "TASK_REVISION_CONFLICT",
         exit: 64,
-        hint: Some("refresh the task status and retry the close"),
+        hint: Some("refresh the task status, then retry the command"),
     },
     PublicDiagnostic {
         code: "RESULT_NOT_RETAINED",
