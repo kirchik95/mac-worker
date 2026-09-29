@@ -323,6 +323,206 @@ fn seed_active_runner_log(paths: &PathLayout, bytes: &[u8]) {
     seed_runner_log_checkpoint(paths, bytes, None);
 }
 
+struct LogWaitClock<'a> {
+    elapsed: std::sync::Mutex<Duration>,
+    sleeps: std::sync::Mutex<Vec<Duration>>,
+    on_sleep: Box<dyn Fn(Duration) + Send + Sync + 'a>,
+}
+
+impl<'a> LogWaitClock<'a> {
+    fn new(on_sleep: impl Fn(Duration) + Send + Sync + 'a) -> Self {
+        Self {
+            elapsed: Default::default(),
+            sleeps: Default::default(),
+            on_sleep: Box::new(on_sleep),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        *self.elapsed.lock().unwrap()
+    }
+}
+
+impl mac_worker::transfer::ResolutionRuntime for LogWaitClock<'_> {
+    fn monotonic_now(&self) -> Duration {
+        self.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        let elapsed = {
+            let mut elapsed = self.elapsed.lock().unwrap();
+            *elapsed += duration;
+            *elapsed
+        };
+        self.sleeps.lock().unwrap().push(duration);
+        (self.on_sleep)(elapsed);
+    }
+}
+
+fn log_wait_fixture() -> IsolatedHome {
+    let fixture = IsolatedHome::new();
+    seed_controller_task_with(&fixture.paths, TaskState::Active, None, None, None);
+    seed_active_runner_log(&fixture.paths, b"");
+    fixture
+}
+
+fn log_wait_reply(
+    fixture: &IsolatedHome,
+    extra: Value,
+    clock: &LogWaitClock<'_>,
+) -> Result<ControllerTaskLogsResult, WorkerError> {
+    let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+    let config =
+        Config::parse("version=1\n[[workers]]\nname='mini-1'\nssh='test'\nslots=1\n").unwrap();
+    struct NoProcess;
+    impl ProcessRunner for NoProcess {
+        fn run(&self, _: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            panic!("log long-poll must use only local read-only state");
+        }
+    }
+    let client = mac_worker::task_client::TaskClient::new(
+        &NoProcess,
+        &config,
+        &fixture.paths,
+        &state,
+        &mac_worker::turn_runner::DetachedRunnerExecutor,
+    );
+    let mut body =
+        json!({"task_id": seeded_ids().0, "offset": 0, "follow": true, "raw": true, "limit": 64});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let request = mac_worker::controller::parse_request(&serde_json::to_vec(&json!({
+        "protocol_version": PROTOCOL_VERSION, "request_id": STATUS_REQUEST, "command": "task.logs", "body": body,
+    })).unwrap()).unwrap();
+    let reply = mac_worker::controller::read::logs_reply_with_runtime(&request, &client, clock)?;
+    reply.verify_envelope(&request).unwrap();
+    mac_worker::controller::ControllerReadIdentity::verify_payload(reply.result(), &request)
+        .unwrap();
+    Ok(reply.into_result())
+}
+
+#[test]
+fn logs_wait_returns_when_bytes_arrive_without_holding_state_locks() {
+    let fixture = log_wait_fixture();
+    let clock = LogWaitClock::new(|elapsed| {
+        if elapsed == Duration::from_millis(400) {
+            // Taking the state lock while sleeping would deadlock this callback.
+            let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+            let record = state.load_task(seeded_ids().0).unwrap();
+            assert!(
+                state
+                    .update_task_if_current(&record, record.clone())
+                    .unwrap()
+            );
+            seed_active_runner_log(&fixture.paths, b"arrived\n");
+        }
+    });
+    let reply = log_wait_reply(&fixture, json!({"wait_ms": 20_000}), &clock).unwrap();
+    assert_eq!(clock.elapsed(), Duration::from_millis(400));
+    assert_eq!(reply.decode_bytes().unwrap(), b"arrived\n");
+    assert_eq!(reply.turn_id(), seeded_ids().1);
+    assert_eq!(request_row_count(&fixture.paths), 0);
+}
+
+#[test]
+fn logs_wait_caps_requested_time_and_shortens_the_last_tick() {
+    for (requested, expected) in [(450_u64, 450), (20_000, 20_000), (u64::MAX, 20_000)] {
+        let fixture = log_wait_fixture();
+        let clock = LogWaitClock::new(|_| {});
+        let reply = log_wait_reply(&fixture, json!({"wait_ms": requested}), &clock).unwrap();
+        assert_eq!(clock.elapsed(), Duration::from_millis(expected));
+        assert!(
+            clock
+                .sleeps
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sleep| *sleep <= Duration::from_millis(200))
+        );
+        assert!(reply.exhausted());
+        assert!(!reply.complete());
+        assert!(reply.decode_bytes().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn logs_wait_returns_early_on_completion_and_terminal_state() {
+    for terminal_only in [false, true] {
+        let fixture = log_wait_fixture();
+        let clock = LogWaitClock::new(|elapsed| {
+            if elapsed == Duration::from_millis(200) {
+                if terminal_only {
+                    let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+                    let old = state.load_task(seeded_ids().0).unwrap();
+                    let terminal = seeded_record_with(
+                        None,
+                        TaskState::Lost,
+                        Some(TaskOutcome::Lost),
+                        Some(TurnTerminal::Lost),
+                        Some(TaskOutcome::Lost),
+                    );
+                    assert!(state.update_task_if_current(&old, terminal).unwrap());
+                } else {
+                    seed_runner_log(&fixture.paths, b"");
+                }
+            }
+        });
+        let reply = log_wait_reply(&fixture, json!({"wait_ms": 20_000}), &clock).unwrap();
+        assert_eq!(clock.elapsed(), Duration::from_millis(200));
+        assert_eq!(
+            reply.complete(),
+            !terminal_only,
+            "preserve checkpoint completion semantics"
+        );
+    }
+}
+
+#[test]
+fn logs_wait_keeps_immediate_reads_and_returns_available_bytes_immediately() {
+    for extra in [
+        json!({}),
+        json!({"wait_ms": 0}),
+        json!({"wait_ms": 20_000, "follow": false}),
+    ] {
+        let fixture = log_wait_fixture();
+        let clock = LogWaitClock::new(|_| panic!("this request must not sleep"));
+        let reply = log_wait_reply(&fixture, extra, &clock).unwrap();
+        assert!(reply.decode_bytes().unwrap().is_empty());
+    }
+    for bytes in [b"short\n".as_slice(), &[b'a'; 100]] {
+        let fixture = log_wait_fixture();
+        seed_active_runner_log(&fixture.paths, bytes);
+        let clock = LogWaitClock::new(|_| panic!("available bytes must return immediately"));
+        let reply = log_wait_reply(&fixture, json!({"wait_ms": 20_000}), &clock).unwrap();
+        assert_eq!(reply.decode_bytes().unwrap(), bytes[..bytes.len().min(64)]);
+    }
+}
+
+#[test]
+fn logs_wait_rejects_unknown_keys_and_invalid_wait_values() {
+    let fixture = log_wait_fixture();
+    for extra in [
+        json!({"future_wait": 1}),
+        json!({"wait_ms": -1}),
+        json!({"wait_ms": "100"}),
+        json!({"wait_ms": 1.5}),
+    ] {
+        let clock = LogWaitClock::new(|_| panic!("invalid request must not sleep"));
+        let expected = if extra.get("future_wait").is_some() {
+            "INVALID_REQUEST"
+        } else {
+            "CONTROLLER_TRANSPORT"
+        };
+        assert_eq!(
+            log_wait_reply(&fixture, extra, &clock)
+                .unwrap_err()
+                .public_code(),
+            expected
+        );
+    }
+}
+
 fn seed_runner_log_checkpoint(paths: &PathLayout, bytes: &[u8], completion: Option<TaskOutcome>) {
     let (task_id, turn_id) = seeded_ids();
     let store = ClientStateStore::open(&paths.state).unwrap();

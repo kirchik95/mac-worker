@@ -486,10 +486,20 @@ fn logs_reply(
     request: &ControllerRequest,
     client: &TaskClient<'_>,
 ) -> Result<ControllerReadReply<ControllerTaskLogsResult>, WorkerError> {
+    logs_reply_with_runtime(request, client, &crate::transfer::SystemResolutionRuntime)
+}
+
+/// Clock injection for deterministic long-poll tests. Production uses a monotonic clock.
+#[doc(hidden)]
+pub fn logs_reply_with_runtime(
+    request: &ControllerRequest,
+    client: &TaskClient<'_>,
+    runtime: &dyn crate::transfer::ResolutionRuntime,
+) -> Result<ControllerReadReply<ControllerTaskLogsResult>, WorkerError> {
     reject_unknown_keys(
         request.body(),
         &[
-            "task_id", "turn", "turn_id", "offset", "limit", "raw", "follow",
+            "task_id", "turn", "turn_id", "offset", "limit", "raw", "follow", "wait_ms",
         ],
         "task.logs",
     )?;
@@ -503,7 +513,14 @@ fn logs_reply(
         .clamp(1, MAX_LOG_CHUNK_BYTES);
     let raw = optional_bool(request.body(), "raw", "task.logs")?.unwrap_or(false);
     let follow = optional_bool(request.body(), "follow", "task.logs")?.unwrap_or(false);
-    let chunk = client.log_chunk(TaskLogChunkQuery {
+    // Stay below the 30-second SSH RPC deadline, including the last read.
+    let wait = std::time::Duration::from_millis(
+        optional_u64(request.body(), "wait_ms", "task.logs")?
+            .unwrap_or(0)
+            .min(20_000),
+    );
+    let started = runtime.monotonic_now();
+    let mut query = TaskLogChunkQuery {
         task_id,
         turn,
         pinned_turn_id,
@@ -511,7 +528,27 @@ fn logs_reply(
         limit,
         raw,
         follow,
-    })?;
+    };
+    let chunk = loop {
+        // log_chunk opens only local read-only projections; all guards are
+        // dropped before it returns. Never hold a store lock while sleeping.
+        let chunk = client.log_chunk(query.clone())?;
+        let elapsed = runtime.monotonic_now().saturating_sub(started);
+        let remaining = wait.saturating_sub(elapsed);
+        if !follow
+            || !chunk.exhausted()
+            || !chunk.bytes().is_empty()
+            || chunk.complete()
+            || chunk.terminal()
+            || remaining.is_zero()
+        {
+            break chunk;
+        }
+        // A follow-up can become the latest turn during this RPC. Keep the
+        // first selected turn even before the laptop receives its identity.
+        query.pinned_turn_id = Some(chunk.turn_id());
+        runtime.sleep(remaining.min(std::time::Duration::from_millis(200)));
+    };
     Ok(reply(
         request,
         ControllerTaskLogsResult::from_chunk(&chunk, raw),
