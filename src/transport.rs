@@ -1165,6 +1165,8 @@ pub(crate) fn ssh_program() -> Result<OsString, WorkerError> {
     }
 }
 
+// Release builds never read the test override; only tests call this there.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn ssh_program_from_override(value: Option<OsString>) -> Result<OsString, WorkerError> {
     #[cfg(debug_assertions)]
     {
