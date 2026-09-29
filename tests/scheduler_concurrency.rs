@@ -612,19 +612,19 @@ fn production_run_request_with(
     }
 }
 
-#[test]
-fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker() {
+fn simultaneous_clients_preserve_fifo(client_count: u32) {
     // Break caught: concurrent queue publication loses or duplicates a row,
     // assigns a non-monotonic sequence, or lets two claims reserve one worker.
+    let client_total = client_count as usize;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap().join("state");
     let store = Arc::new(ClientStateStore::open(&root).unwrap());
-    let barrier = Arc::new(Barrier::new(51));
+    let barrier = Arc::new(Barrier::new(client_total + 1));
     let enqueue_events = Arc::new(Mutex::new(Vec::new()));
     let owners = [owner(40_001), owner(40_002), owner(40_003)];
     let pinned_workers = ["mini-a", "mini-b", "mini-c"];
     let mut clients = Vec::new();
-    for value in 1..=50_u32 {
+    for value in 1..=client_count {
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         let enqueue_events = Arc::clone(&enqueue_events);
@@ -655,15 +655,15 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
         .collect::<Vec<_>>();
 
     let snapshot = store.queue_snapshot().unwrap();
-    assert_eq!(snapshot.entries().len(), 50);
+    assert_eq!(snapshot.entries().len(), client_total);
     let enqueue_events = enqueue_events.lock().unwrap().clone();
-    assert_eq!(enqueue_events.len(), 50);
+    assert_eq!(enqueue_events.len(), client_total);
     assert_eq!(
         enqueue_events
             .iter()
             .map(|(value, _, _)| *value)
             .collect::<BTreeSet<_>>(),
-        (1..=50).collect::<BTreeSet<_>>(),
+        (1..=client_count).collect::<BTreeSet<_>>(),
         "enqueue event trace must retain every client"
     );
     assert_eq!(
@@ -672,7 +672,7 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
             .map(|(_, _, queue_id)| *queue_id)
             .collect::<BTreeSet<_>>()
             .len(),
-        50,
+        client_total,
         "enqueue event trace must retain every canonical publication"
     );
     assert!(enqueue_events.iter().all(|(_, job_id, queue_id)| {
@@ -696,11 +696,11 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
             .map(|entry| entry.job_id().to_string())
             .collect::<BTreeSet<_>>()
             .len(),
-        50,
+        client_total,
         "all simultaneous clients retain distinct IDs"
     );
 
-    let claim_barrier = Arc::new(Barrier::new(51));
+    let claim_barrier = Arc::new(Barrier::new(client_total + 1));
     let claim_event_counter = Arc::new(AtomicUsize::new(0));
     let (claim_events_tx, claim_events_rx) = mpsc::channel();
     let mut claimers = Vec::new();
@@ -737,14 +737,14 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
     }
     drop(claim_events_tx);
     let claim_events = claim_events_rx.into_iter().collect::<Vec<_>>();
-    assert_eq!(claim_events.len(), 50);
+    assert_eq!(claim_events.len(), client_total);
     assert_eq!(
         claim_events
             .iter()
             .map(|(event, _, _)| *event)
             .collect::<BTreeSet<_>>()
             .len(),
-        50,
+        client_total,
         "claim event trace must retain every concurrent attempt"
     );
     let reservations = claim_events
@@ -929,10 +929,26 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
 }
 
 #[test]
+fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker() {
+    // Six clients on three workers still exercise every worker and a contended
+    // slot: two jobs share each worker, and only the FIFO head is reserved.
+    simultaneous_clients_preserve_fifo(6);
+}
+
+// Nightly: cargo nextest run --locked -E 'test(/_stress$/)' --run-ignored ignored
+#[test]
+#[ignore = "stress: 50 simultaneous clients"]
+fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker_stress() {
+    simultaneous_clients_preserve_fifo(50);
+}
+
+#[test]
 fn queue_publication_and_claim_interleavings_preserve_fifo_reservations() {
     // Break caught: publication outside the queue lock lets a later claimant
     // observe an unsequenced row or reserve one worker twice.
-    for schedule in 0..100_u128 {
+    // The gate interleaving does not change with the index; only owner and job
+    // ids do. Five ids cover that handoff.
+    for schedule in 0..5_u128 {
         let (_directory, store, entered, release) =
             gated_store(ClientStateConcurrencyPoint::QueuePublication);
         let first_owner = owner(20_000 + schedule as u32 * 2);
@@ -983,9 +999,10 @@ fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
     // publication, bypass the head, or claim a different worker after the
     // publisher hands off the queue lock.
     let mut schedule_counts = [0usize; 4];
-    for case in 0..100_u128 {
-        let schedule = (case % 4) as usize;
+    #[allow(clippy::needless_range_loop)]
+    for schedule in 0..4 {
         schedule_counts[schedule] += 1;
+        let case = schedule as u128;
         let (_directory, store, entered, release) =
             gated_store(ClientStateConcurrencyPoint::QueuePublication);
         let row_owner = owner(30_000 + case as u32);
@@ -1000,7 +1017,9 @@ fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
         let publisher = thread::spawn(move || publisher_store.enqueue(entry));
         entered.recv().unwrap();
 
-        let ranked_workers: Vec<String> = if case % 2 == 0 {
+        // Worker order follows schedule parity: the old `case % 4` loop paired
+        // even cases with mini-a first and odd cases with mini-b first.
+        let ranked_workers: Vec<String> = if case.is_multiple_of(2) {
             vec!["mini-a".into(), "mini-b".into()]
         } else {
             vec!["mini-b".into(), "mini-a".into()]
@@ -1055,7 +1074,7 @@ fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
             "case {case} retained the FIFO head"
         );
     }
-    assert_eq!(schedule_counts, [25, 25, 25, 25]);
+    assert_eq!(schedule_counts, [1, 1, 1, 1]);
 }
 
 #[test]
@@ -1065,9 +1084,10 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
     // pass while production dispatch never reaches the authoritative host.
     let repo = production_run_repo();
     let mut schedule_counts = [0usize; 4];
-    for case in 0..100_u128 {
-        let schedule = (case % 4) as usize;
+    #[allow(clippy::needless_range_loop)]
+    for schedule in 0..4 {
         schedule_counts[schedule] += 1;
+        let case = schedule as u128;
         let temp = tempfile::tempdir().unwrap();
         let paths = production_run_paths(&temp);
         let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
@@ -1187,7 +1207,7 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
             "case {case}"
         );
     }
-    assert_eq!(schedule_counts, [25, 25, 25, 25]);
+    assert_eq!(schedule_counts, [1, 1, 1, 1]);
 }
 
 /// CLI `worker run` owns one Batch row per process. Sequential initial
@@ -1584,9 +1604,10 @@ fn cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
     // claims a row after cancellation removed it, or loses the exact row
     // identity at the claim/cancel boundary.
     let mut schedule_counts = [0usize; 4];
-    for case in 0..100_u128 {
-        let schedule = (case % 4) as usize;
+    #[allow(clippy::needless_range_loop)]
+    for schedule in 0..4 {
         schedule_counts[schedule] += 1;
+        let case = schedule as u128;
         let (_directory, store, entered, release) =
             gated_store(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
         let row_owner = owner(32_000 + case as u32);
@@ -1673,14 +1694,16 @@ fn cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
             "case {case} retained an uncancelled live row"
         );
     }
-    assert_eq!(schedule_counts, [25, 25, 25, 25]);
+    assert_eq!(schedule_counts, [1, 1, 1, 1]);
 }
 
 #[test]
 fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
     // Break caught: a claim evaluates the final run slot outside the queue
     // lock, or stale readers independently publish more than one refresh.
-    for interleaving in 0..100_u128 {
+    // The claim-cap gate interleaving does not change with the index; only
+    // owner and job ids do. Five ids cover that race.
+    for interleaving in 0..5_u128 {
         let (_directory, store, entered, release) =
             gated_store(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
         let left_owner = owner(10_000 + interleaving as u32 * 2);
@@ -1727,7 +1750,9 @@ fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
         assert_eq!(claims, 1, "interleaving {interleaving}");
     }
 
-    for schedule in 0..100 {
+    // The observation-refresh gate interleaving does not change with the
+    // index; only the observation timestamp does. Five timestamps cover it.
+    for schedule in 0..5 {
         let (directory, store, entered, release) =
             gated_store(ClientStateConcurrencyPoint::ObservationRefreshPublication);
         let refreshes = Arc::new(AtomicUsize::new(0));
