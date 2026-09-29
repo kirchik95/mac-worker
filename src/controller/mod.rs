@@ -41,10 +41,13 @@ pub use batch::{
     PreparedBatchSource, PreparedTaskBatch, execute_task_batch, prepare_task_batch,
 };
 pub use batch_freeze::{LaptopBatchSourceStream, LaptopFrozenBatch, freeze_laptop_batch};
-pub use envelope::{OperationEnvelope, load_operation_envelope, persist_operation_envelope};
+pub use envelope::{
+    OperationEnvelope, OperationOutcome, list_pending_envelopes, load_operation_envelope,
+    persist_operation_envelope,
+};
 pub use execute::{
-    TaskSubmitHandler, send_controller_read, send_controller_request, serve_rpc_with_runtime,
-    tick_controller_leader,
+    TaskSubmitHandler, send_controller_mutation, send_controller_read, send_controller_request,
+    serve_rpc_with_runtime, tick_controller_leader,
 };
 pub use leader::ControllerLeader;
 pub use lifecycle::{

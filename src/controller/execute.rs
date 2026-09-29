@@ -597,6 +597,126 @@ pub fn send_controller_request(
     Ok(ack)
 }
 
+enum MutationOutcome {
+    Acknowledged(ControllerAck),
+    Rejected(WorkerError),
+    Ambiguous(WorkerError),
+    UnverifiedAck(WorkerError),
+}
+
+/// Classify evidence, not public error strings: a typed remote rejection can
+/// have the same code as a lost connection. Runner errors have no send-stage
+/// information (including I/O), so absence of a reply is conservatively unknown.
+fn classify_mutation_exchange(
+    request: &ControllerRequest,
+    result: Result<ProcessResult, WorkerError>,
+) -> MutationOutcome {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => return MutationOutcome::Ambiguous(error),
+    };
+    if result.stdout.is_empty() {
+        return MutationOutcome::Ambiguous(WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller host did not complete the request".into(),
+        ));
+    }
+    let reply = match crate::controller::decode_frame(&result.stdout) {
+        Ok(reply) => reply,
+        Err(_) => return MutationOutcome::Ambiguous(invalid_controller_reply()),
+    };
+    if let Ok(error) = serde_json::from_slice::<HostControlError>(reply) {
+        return MutationOutcome::Rejected(host_control_to_worker(&error));
+    }
+    let ack: ControllerAck = match serde_json::from_slice(reply) {
+        Ok(ack) => ack,
+        Err(_) => return MutationOutcome::Ambiguous(invalid_controller_reply()),
+    };
+    match verify_controller_ack(&ack, request) {
+        Ok(()) => MutationOutcome::Acknowledged(ack),
+        Err(error) => MutationOutcome::UnverifiedAck(error),
+    }
+}
+
+/// Persist once, retry only the final RPC with byte-identical input, and mark
+/// definitive replies. Source streaming is deliberately the caller's job.
+pub fn send_controller_mutation(
+    runner: &dyn ProcessRunner,
+    controller: &crate::config::ControllerConfig,
+    cache_root: &Path,
+    request: &ControllerRequest,
+    stderr: &mut dyn Write,
+) -> Result<ControllerAck, WorkerError> {
+    send_controller_mutation_with_wait(
+        runner,
+        controller,
+        cache_root,
+        request,
+        stderr,
+        &mut std::thread::sleep,
+    )
+}
+
+fn send_controller_mutation_with_wait(
+    runner: &dyn ProcessRunner,
+    controller: &crate::config::ControllerConfig,
+    cache_root: &Path,
+    request: &ControllerRequest,
+    stderr: &mut dyn Write,
+    wait: &mut dyn FnMut(Duration),
+) -> Result<ControllerAck, WorkerError> {
+    use crate::controller::envelope::{
+        OperationOutcome, persist_operation_envelope, settle_operation_envelope,
+    };
+
+    // Local preparation failures are definitive: no process has been started.
+    let ssh = controller_rpc_request(controller, request)?;
+    persist_operation_envelope(cache_root, request)?;
+    for attempt in 0..=3 {
+        match classify_mutation_exchange(request, runner.run(&ssh)) {
+            MutationOutcome::Acknowledged(ack) => {
+                settle_operation_envelope(cache_root, request, OperationOutcome::Acknowledged)?;
+                return Ok(ack);
+            }
+            MutationOutcome::Rejected(error) => {
+                settle_operation_envelope(
+                    cache_root,
+                    request,
+                    OperationOutcome::Rejected {
+                        code: error.public_code(),
+                    },
+                )?;
+                return Err(error);
+            }
+            MutationOutcome::UnverifiedAck(error) => return Err(error),
+            MutationOutcome::Ambiguous(error) if attempt < 3 => {
+                // Diagnostics must not stop recovery if stderr is closed.
+                let _ = writeln!(
+                    stderr,
+                    "controller request {}: outcome unknown ({}); retrying {}/3",
+                    request.request_id(),
+                    error.public_code(),
+                    attempt + 1
+                );
+                let _ = stderr.flush();
+                let base_millis = [1000, 3000, 9000][attempt];
+                let jitter = (uuid::Uuid::new_v4().as_u128() % 501) as u64 + 750;
+                wait(Duration::from_millis(base_millis * jitter / 1000));
+            }
+            MutationOutcome::Ambiguous(error) => {
+                let _ = writeln!(
+                    stderr,
+                    "controller request {} outcome is unknown; check `worker task list` or run `worker controller retry {}`",
+                    request.request_id(),
+                    request.request_id()
+                );
+                let _ = stderr.flush();
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("the final attempt returns its outcome")
+}
+
 pub fn send_controller_read<T: DeserializeOwned + ControllerReadIdentity>(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,
@@ -647,6 +767,15 @@ fn exchange_controller_rpc(
     controller: &crate::config::ControllerConfig,
     request: &ControllerRequest,
 ) -> Result<Vec<u8>, WorkerError> {
+    let ssh = controller_rpc_request(controller, request)?;
+    let result = runner.run(&ssh)?;
+    decode_controller_stdout(&result)
+}
+
+fn controller_rpc_request(
+    controller: &crate::config::ControllerConfig,
+    request: &ControllerRequest,
+) -> Result<ProcessRequest, WorkerError> {
     let mut ssh = crate::controller::controller_rpc_ssh_request(controller)?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "protocol_version": crate::protocol::PROTOCOL_VERSION,
@@ -660,8 +789,7 @@ fn exchange_controller_rpc(
         )
     })?;
     ssh.stdin = Some(crate::controller::encode_frame(&payload)?);
-    let result = runner.run(&ssh)?;
-    decode_controller_stdout(&result)
+    Ok(ssh)
 }
 
 fn decode_controller_stdout(result: &ProcessResult) -> Result<Vec<u8>, WorkerError> {
@@ -1535,5 +1663,287 @@ mod read_route_identity_tests {
         assert!(
             send_controller_request(&AckReply { mutate: |_| {} }, &controller, &request,).is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod mutation_retry_tests {
+    use super::*;
+    use crate::{
+        controller::{
+            encode_json_frame,
+            envelope::{OperationOutcome, load_operation_envelope},
+            parse_request,
+        },
+        error::{ExitKind, ProcessError},
+        protocol::PROTOCOL_VERSION,
+    };
+    use std::{
+        collections::VecDeque, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex,
+    };
+
+    fn request() -> ControllerRequest {
+        parse_request(
+            &serde_json::to_vec(&json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": "018f0f4a6b5c7d8e9f00112233445566",
+                "command": "task.cancel",
+                "body": {"task_id": "018f0f4a6b5c7d8e9f00112233445577"}
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn ack(request: &ControllerRequest) -> Value {
+        json!({"protocol_version": PROTOCOL_VERSION, "status": "acked",
+            "request_id": request.request_id(), "payload_sha256": request.payload_sha256(),
+            "task_id": request.body()["task_id"], "created_at_millis": 1,
+            "result": {"task_id": request.body()["task_id"]}})
+    }
+
+    fn output(stdout: Vec<u8>, exit: i32) -> Result<ProcessResult, WorkerError> {
+        Ok(ProcessResult {
+            status: ExitStatus::from_raw(exit << 8),
+            stdout,
+            stderr: b"secret remote detail".to_vec(),
+        })
+    }
+
+    fn missing() -> Result<ProcessResult, WorkerError> {
+        output(Vec::new(), 255)
+    }
+
+    struct Replies {
+        replies: Mutex<VecDeque<Result<ProcessResult, WorkerError>>>,
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+    impl Replies {
+        fn new(replies: Vec<Result<ProcessResult, WorkerError>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                frames: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl ProcessRunner for Replies {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.frames
+                .lock()
+                .unwrap()
+                .push(request.stdin.clone().unwrap());
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected retry")
+        }
+    }
+
+    #[test]
+    fn classification_table_distinguishes_rejections_and_unverified_acks() {
+        let request = request();
+        let good = ack(&request);
+        let mut wrong = good.clone();
+        wrong["request_id"] = json!("018f0f4a6b5c7d8e9f00112233445599");
+        let rejection = HostControlError::new("CONTROLLER_UNAVAILABLE", "typed rejection").unwrap();
+        for (name, result, expected) in [
+            ("ack", output(encode_json_frame(&good).unwrap(), 0), "ack"),
+            (
+                "ack despite exit",
+                output(encode_json_frame(&good).unwrap(), 255),
+                "ack",
+            ),
+            (
+                "typed unavailable",
+                output(encode_json_frame(&rejection).unwrap(), 69),
+                "rejected",
+            ),
+            ("empty", missing(), "ambiguous"),
+            ("truncated", output(vec![0, 0, 0, 5, b'{'], 0), "ambiguous"),
+            (
+                "invalid json",
+                output(crate::controller::encode_frame(b"no json").unwrap(), 0),
+                "ambiguous",
+            ),
+            (
+                "wrong identity",
+                output(encode_json_frame(&wrong).unwrap(), 0),
+                "unverified",
+            ),
+            (
+                "deadline",
+                Err(ProcessError::DeadlineExceeded {
+                    deadline: Duration::from_secs(30),
+                }
+                .into()),
+                "ambiguous",
+            ),
+            (
+                "io stage unknown",
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe").into()),
+                "ambiguous",
+            ),
+        ] {
+            let actual = match classify_mutation_exchange(&request, result) {
+                MutationOutcome::Acknowledged(_) => "ack",
+                MutationOutcome::Rejected(_) => "rejected",
+                MutationOutcome::Ambiguous(_) => "ambiguous",
+                MutationOutcome::UnverifiedAck(_) => "unverified",
+            };
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    fn send(
+        runner: &Replies,
+        cache: &Path,
+        stderr: &mut Vec<u8>,
+        delays: &mut Vec<Duration>,
+    ) -> Result<ControllerAck, WorkerError> {
+        let config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n")
+                .unwrap();
+        send_controller_mutation_with_wait(
+            runner,
+            &config.controller,
+            cache,
+            &request(),
+            stderr,
+            &mut |delay| delays.push(delay),
+        )
+    }
+
+    #[test]
+    fn ambiguous_then_ack_retries_identical_frames_and_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Replies::new(vec![
+            missing(),
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(30),
+            }
+            .into()),
+            output(encode_json_frame(&ack(&request())).unwrap(), 0),
+        ]);
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        send(
+            &runner,
+            &temp.path().join("cache"),
+            &mut stderr,
+            &mut delays,
+        )
+        .unwrap();
+        let frames = runner.frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(frames.windows(2).all(|pair| pair[0] == pair[1]));
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(text.contains(&format!(
+            "controller request {}: outcome unknown (CONTROLLER_UNAVAILABLE); retrying 1/3",
+            request().request_id()
+        )));
+        assert!(text.contains("outcome unknown (PROCESS); retrying 2/3"));
+        assert!(!text.contains("secret"));
+        for (delay, seconds) in delays.iter().zip([1., 3.]) {
+            assert!((seconds * 0.75..=seconds * 1.25).contains(&delay.as_secs_f64()));
+        }
+        let envelope = load_operation_envelope(&temp.path().join("cache"), request().request_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.outcome(), Some(&OperationOutcome::Acknowledged));
+    }
+
+    #[test]
+    fn rejection_is_not_retried_and_preserves_category() {
+        let temp = tempfile::tempdir().unwrap();
+        let rejection =
+            HostControlError::with_category("CAPACITY_BUSY", "redacted", "capacity").unwrap();
+        let runner = Replies::new(vec![output(encode_json_frame(&rejection).unwrap(), 75)]);
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        let cache = temp.path().join("cache");
+        let error = send(&runner, &cache, &mut stderr, &mut delays).unwrap_err();
+        assert_eq!(error.exit_kind(), ExitKind::Capacity);
+        assert!(delays.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(
+            load_operation_envelope(&cache, request().request_id())
+                .unwrap()
+                .unwrap()
+                .outcome(),
+            Some(&OperationOutcome::Rejected {
+                code: "CAPACITY_BUSY".into()
+            })
+        );
+    }
+
+    #[test]
+    fn exhausted_retries_print_recovery_hint_and_remain_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Replies::new((0..4).map(|_| missing()).collect());
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        let cache = temp.path().join("cache");
+        assert_eq!(
+            send(&runner, &cache, &mut stderr, &mut delays)
+                .unwrap_err()
+                .public_code(),
+            "CONTROLLER_UNAVAILABLE"
+        );
+        assert_eq!(runner.frames.lock().unwrap().len(), 4);
+        assert_eq!(delays.len(), 3);
+        for (delay, seconds) in delays.iter().zip([1., 3., 9.]) {
+            assert!((seconds * 0.75..=seconds * 1.25).contains(&delay.as_secs_f64()));
+        }
+        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.contains(&format!("controller request {} outcome is unknown; check `worker task list` or run `worker controller retry {}`", request().request_id(), request().request_id())));
+        assert!(
+            load_operation_envelope(&cache, request().request_id())
+                .unwrap()
+                .unwrap()
+                .settled_at_millis()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_ack_identity_is_not_retried_or_settled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut wrong = ack(&request());
+        wrong["payload_sha256"] = json!("0".repeat(64));
+        let runner = Replies::new(vec![output(encode_json_frame(&wrong).unwrap(), 0)]);
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        let cache = temp.path().join("cache");
+        assert!(send(&runner, &cache, &mut stderr, &mut delays).is_err());
+        assert!(delays.is_empty());
+        assert!(
+            load_operation_envelope(&cache, request().request_id())
+                .unwrap()
+                .unwrap()
+                .settled_at_millis()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_configuration_failure_never_sends_or_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Replies::new(Vec::new());
+        let config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n")
+                .unwrap();
+        let mut controller = config.controller;
+        controller.enabled = false;
+        let mut stderr = Vec::new();
+        let error = send_controller_mutation_with_wait(
+            &runner,
+            &controller,
+            &temp.path().join("cache"),
+            &request(),
+            &mut stderr,
+            &mut |_| panic!("local failures must not wait"),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE");
+        assert!(runner.frames.lock().unwrap().is_empty());
+        assert!(stderr.is_empty());
     }
 }
