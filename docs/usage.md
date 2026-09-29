@@ -542,6 +542,9 @@ prints `controller reachable again` on recovery. After 10 minutes of continuous 
 the original error; each retry's SSH deadline is capped by the remaining outage budget.
 Invalid successful replies, identity mismatches, and typed controller errors still stop
 the command. Without `-f`, reads retain their immediate behavior.
+Terminal task status may arrive before log draining finishes. Follow continues bounded waits
+until the durable log checkpoint completes, so trailing bytes are retained; a persistently
+incomplete checkpoint keeps polling at the same bounded rate.
 
 Without `--wait`, `submit` / `batch` / `say` return after that accept. Autonomous progress on the controller still needs `worker controller run`. With `--wait`, the same command follows until the selected task or run is quiescent. `worker task wait --task-id` waits for one task; `worker task wait --run` waits until that run is quiescent, including DAG children that become eligible after a parent `close`.
 

@@ -539,13 +539,15 @@ pub fn logs_reply_with_runtime(
             || !chunk.exhausted()
             || !chunk.bytes().is_empty()
             || chunk.complete()
-            || chunk.terminal()
             || remaining.is_zero()
         {
             break chunk;
         }
         // A follow-up can become the latest turn during this RPC. Keep the
         // first selected turn even before the laptop receives its identity.
+        // Terminal task status can precede log drain/publication. Only durable
+        // log completion ends follow; otherwise retain the bounded wait so a
+        // terminal-but-incomplete checkpoint cannot cause an immediate SSH loop.
         query.pinned_turn_id = Some(chunk.turn_id());
         runtime.sleep(remaining.min(std::time::Duration::from_millis(200)));
     };

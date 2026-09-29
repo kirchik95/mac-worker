@@ -632,17 +632,11 @@ pub struct TaskLogChunkReport {
     next_offset: u64,
     exhausted: bool,
     complete: bool,
-    // Local task/turn terminal state, separate from durable log completion.
-    terminal: bool,
     bytes: Vec<u8>,
     failure: Option<String>,
 }
 
 impl TaskLogChunkReport {
-    pub(crate) fn terminal(&self) -> bool {
-        self.terminal
-    }
-
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -2543,12 +2537,6 @@ impl<'a> TaskClient<'a> {
                 end >= committed_len
             },
             complete,
-            terminal: record.status().state().is_terminal()
-                || record
-                    .status()
-                    .turns()
-                    .iter()
-                    .any(|turn| turn.turn_id() == turn_id && turn.terminal().is_some()),
             bytes: slice.to_vec(),
             failure,
         })

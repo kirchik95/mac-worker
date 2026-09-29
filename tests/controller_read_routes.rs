@@ -447,7 +447,7 @@ fn logs_wait_caps_requested_time_and_shortens_the_last_tick() {
 }
 
 #[test]
-fn logs_wait_returns_early_on_completion_and_terminal_state() {
+fn logs_wait_returns_on_log_completion_even_when_terminal_status_arrives_first() {
     for terminal_only in [false, true] {
         let fixture = log_wait_fixture();
         let clock = LogWaitClock::new(|elapsed| {
@@ -467,15 +467,113 @@ fn logs_wait_returns_early_on_completion_and_terminal_state() {
                     seed_runner_log(&fixture.paths, b"");
                 }
             }
+            if terminal_only && elapsed == Duration::from_millis(600) {
+                seed_runner_log_checkpoint(
+                    &fixture.paths,
+                    b"last bytes\n",
+                    Some(TaskOutcome::Lost),
+                );
+            }
         });
         let reply = log_wait_reply(&fixture, json!({"wait_ms": 20_000}), &clock).unwrap();
-        assert_eq!(clock.elapsed(), Duration::from_millis(200));
         assert_eq!(
-            reply.complete(),
-            !terminal_only,
-            "preserve checkpoint completion semantics"
+            clock.elapsed(),
+            Duration::from_millis(if terminal_only { 600 } else { 200 })
         );
+        assert!(
+            reply.complete(),
+            "only the durable checkpoint proves log completion"
+        );
+        if terminal_only {
+            assert_eq!(reply.decode_bytes().unwrap(), b"last bytes\n");
+        }
     }
+}
+
+#[test]
+fn logs_wait_terminal_follow_remains_bounded_until_checkpoint_completion() {
+    let controller = IsolatedHome::new();
+    seed_controller_task_with(
+        &controller.paths,
+        TaskState::Lost,
+        Some(TaskOutcome::Lost),
+        Some(TurnTerminal::Lost),
+        Some(TaskOutcome::Lost),
+    );
+    seed_active_runner_log(&controller.paths, b"");
+    let clock = LogWaitClock::new(|_| {});
+    struct ClockedRpc<'a> {
+        controller: &'a IsolatedHome,
+        clock: &'a LogWaitClock<'a>,
+        calls: std::sync::Mutex<usize>,
+    }
+    impl ProcessRunner for ClockedRpc<'_> {
+        fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let request = mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())?;
+            let stdout = if mac_worker::controller::health_read::is_health_read(&request) {
+                mac_worker::controller::health_read::serve_health_read(
+                    &request,
+                    &self.controller.paths.controller_state_root(),
+                )?
+            } else {
+                let call = {
+                    let mut count = self.calls.lock().unwrap();
+                    *count += 1;
+                    *count
+                };
+                assert!(call <= 3, "terminal logs must eventually finish");
+                assert_eq!(request.body()["wait_ms"], 20_000);
+                if call == 3 {
+                    seed_runner_log_checkpoint(
+                        &self.controller.paths,
+                        b"drained tail\n",
+                        Some(TaskOutcome::Lost),
+                    );
+                }
+                let state = ClientStateStore::open(&self.controller.paths.state)?;
+                let config =
+                    Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n")?;
+                let client = mac_worker::task_client::TaskClient::new(
+                    &FailingSsh,
+                    &config,
+                    &self.controller.paths,
+                    &state,
+                    &mac_worker::turn_runner::DetachedRunnerExecutor,
+                );
+                let reply = mac_worker::controller::read::logs_reply_with_runtime(
+                    &request, &client, self.clock,
+                )?;
+                assert_eq!(
+                    self.clock.elapsed(),
+                    Duration::from_secs((call.min(2) * 20) as u64),
+                    "a terminal incomplete checkpoint must not cause immediate SSH repolling"
+                );
+                assert_eq!(reply.result().complete(), call == 3);
+                encode_json_frame(&reply)?
+            };
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+    let rpc = ClockedRpc {
+        controller: &controller,
+        clock: &clock,
+        calls: std::sync::Mutex::new(0),
+    };
+    let laptop = IsolatedHome::new();
+    write_enabled_config(&laptop.paths);
+    let (exit, stdout, stderr) = run_laptop_task_logs(
+        &laptop,
+        &rpc,
+        &[&seeded_ids().0.to_string(), "--follow", "--raw"],
+    );
+    assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"drained tail\n");
+    assert_eq!(*rpc.calls.lock().unwrap(), 3);
+    assert!(!laptop_task_store_exists(&laptop.paths));
 }
 
 #[test]
