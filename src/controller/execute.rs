@@ -674,17 +674,28 @@ fn send_controller_mutation_with_wait(
     for attempt in 0..=3 {
         match classify_mutation_exchange(request, runner.run(&ssh)) {
             MutationOutcome::Acknowledged(ack) => {
-                settle_operation_envelope(cache_root, request, OperationOutcome::Acknowledged)?;
+                if let Err(error) =
+                    settle_operation_envelope(cache_root, request, OperationOutcome::Acknowledged)
+                {
+                    let _ = writeln!(
+                        stderr,
+                        "controller request {}: acknowledged; the local envelope could not be marked settled ({})",
+                        request.request_id(),
+                        error.public_code(),
+                    );
+                    let _ = stderr.flush();
+                }
                 return Ok(ack);
             }
             MutationOutcome::Rejected(error) => {
-                settle_operation_envelope(
+                // Cache failures must not replace the controller's definitive rejection.
+                let _ = settle_operation_envelope(
                     cache_root,
                     request,
                     OperationOutcome::Rejected {
                         code: error.public_code(),
                     },
-                )?;
+                );
                 return Err(error);
             }
             MutationOutcome::UnverifiedAck(error) => return Err(error),
@@ -2060,6 +2071,93 @@ mod mutation_retry_tests {
                 code: "CAPACITY_BUSY".into()
             })
         );
+    }
+
+    struct SettlementFailure {
+        replies: Replies,
+        cache: std::path::PathBuf,
+    }
+
+    impl ProcessRunner for SettlementFailure {
+        fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let reply = self.replies.run(process)?;
+            let envelope = self
+                .cache
+                .join(format!("op-{}.json", request().request_id()));
+            assert!(
+                envelope.is_file(),
+                "the request must be persisted before sending"
+            );
+            // Replace only this test's private envelope after the reply has
+            // been produced. RootedDir must refuse to settle a directory.
+            std::fs::remove_file(&envelope).unwrap();
+            std::fs::create_dir(&envelope).unwrap();
+            Ok(reply)
+        }
+    }
+
+    #[test]
+    fn review_settlement_failure_preserves_verified_ack_and_prints_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n")
+                .unwrap();
+        let expected = ack(&request());
+        let runner = SettlementFailure {
+            replies: Replies::new(vec![output(encode_json_frame(&expected).unwrap(), 0)]),
+            cache: temp.path().join("cache"),
+        };
+        let mut stderr = Vec::new();
+        let result = send_controller_mutation_with_wait(
+            &runner,
+            &config.controller,
+            &runner.cache,
+            &request(),
+            &mut stderr,
+            &mut |_| panic!("a definitive ACK must not be retried"),
+        )
+        .expect("settlement failure must not replace a verified ACK");
+        assert_eq!(serde_json::to_value(result).unwrap(), expected);
+        assert_eq!(runner.replies.frames.lock().unwrap().len(), 1);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "controller request {}: acknowledged; the local envelope could not be marked settled (IO)\n",
+                request().request_id(),
+            )
+        );
+    }
+
+    #[test]
+    fn review_settlement_failure_preserves_typed_rejection_and_exit_category() {
+        let temp = tempfile::tempdir().unwrap();
+        let config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n")
+                .unwrap();
+        let rejection =
+            HostControlError::with_category("CAPACITY_BUSY", "PRIVATE REMOTE DETAIL", "capacity")
+                .unwrap();
+        let expected = host_control_to_worker(&rejection);
+        let runner = SettlementFailure {
+            replies: Replies::new(vec![output(encode_json_frame(&rejection).unwrap(), 75)]),
+            cache: temp.path().join("cache"),
+        };
+        let mut stderr = Vec::new();
+        let error = send_controller_mutation_with_wait(
+            &runner,
+            &config.controller,
+            &runner.cache,
+            &request(),
+            &mut stderr,
+            &mut |_| panic!("a typed rejection must not be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), expected.public_code());
+        assert_eq!(error.public_message(), expected.public_message());
+        assert_eq!(error.exit_kind(), ExitKind::Capacity);
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(runner.replies.frames.lock().unwrap().len(), 1);
+        assert!(!String::from_utf8(stderr).unwrap().contains("PRIVATE"));
     }
 
     #[test]
