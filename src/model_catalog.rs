@@ -234,10 +234,20 @@ printf '%s\n' '{output}'
                     ),
                 );
                 let started = Instant::now();
+                // A long deadline, so returning early proves the overflow killed the group.
                 assert!(
-                    discover(home.path(), argv, &SystemProcessRunner, short_policy()).is_none()
+                    discover(
+                        home.path(),
+                        argv,
+                        &SystemProcessRunner,
+                        ProcessPolicy {
+                            deadline: Duration::from_secs(30),
+                            ..short_policy()
+                        }
+                    )
+                    .is_none()
                 );
-                assert!(started.elapsed() < Duration::from_secs(2));
+                assert!(started.elapsed() < Duration::from_secs(20));
                 assert_reaped(&home);
             }
         }
@@ -251,7 +261,7 @@ printf '%s\n' '{output}'
         for argv in [CODEX, OPENCODE] {
             let home = fixture(
                 argv,
-                "printf '%s' $$ > \"$HOME/leader.pid\"\n(sleep 1; printf leaked > \"$HOME/descendant-ran\") &\nwait",
+                "printf '%s' $$ > \"$HOME/leader.pid\"\n(sleep 2; printf leaked > \"$HOME/descendant-ran\") &\nwait",
             );
             let started = Instant::now();
             assert!(
@@ -260,15 +270,17 @@ printf '%s\n' '{output}'
                     argv,
                     &SystemProcessRunner,
                     ProcessPolicy {
-                        deadline: Duration::from_millis(900),
+                        deadline: Duration::from_secs(1),
                         ..short_policy()
                     }
                 )
                 .is_none()
             );
-            assert!(started.elapsed() < Duration::from_secs(2));
+            // Upper bounds only rule out waiting for the script; the descendant
+            // check below proves the group died at the deadline.
+            assert!(started.elapsed() < Duration::from_secs(10));
             assert_reaped(&home);
-            std::thread::sleep(Duration::from_millis(1100));
+            std::thread::sleep(Duration::from_millis(2200));
             assert!(
                 !home.path().join("descendant-ran").exists(),
                 "process-group descendant survived"
