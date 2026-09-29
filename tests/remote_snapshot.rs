@@ -585,6 +585,9 @@ fn semantic_manifest_and_live_tree_mutation_matrix_100_never_publishes() {
     use std::ffi::CString;
     use std::os::unix::fs::symlink;
 
+    // Each of the 100 rows is a distinct mutation: ten semantic classes and
+    // ten live-tree classes, five slots each. The index selects the mutation,
+    // so this matrix stays fully enumerated.
     let mut executed_rows = 0;
     for row in 0..100 {
         let fixture = tempfile::tempdir().unwrap();
