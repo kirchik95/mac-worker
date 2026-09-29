@@ -69,6 +69,11 @@ concurrent clients, and the real 10 s supervisor TERM grace.
   concurrency hook, or a public status.
 - **Lower bounds are fine** (for example, the TERM grace elapsed). **Upper bounds on elapsed time fail on a loaded
   machine.** Prove the outcome instead, such as the process group being gone.
+- **When only time tells two outcomes apart, make the slow outcome much slower.** Give the fixture a long sleep or
+  timeout, and put the bound well between the two. For example, a cancel test gives setup a 120 s timeout and allows
+  60 s.
+- **`exec` the last long-running command in a fixture script** (`exec sleep 60`). A fork that races the kill of the
+  process group can survive it and hold the output pipes open.
 - **Inject time instead of waiting for it:**
   - `SupervisorTimings::fast()`, `Supervisor::with_term_grace`;
   - `ClientStateTimings::fast()`;
