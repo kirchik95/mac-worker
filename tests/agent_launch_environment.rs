@@ -14,11 +14,11 @@ use mac_worker::{
     turn::{EnvProfile, TurnMaterial, TurnSection},
 };
 use support::agent_launch_fixture::{
-    FixtureLayout, LOGIN_BAD, LOGIN_GOOD, PARENT_ONLY, PROFILE_GOOD,
-    PROFILE_NAME, assert_subprocess_success, classify_cursor_process_result,
-    cursor_auth_for_profile, cursor_probe, cursor_profile_auth, empty_base_path,
-    fixture_home_from_env, fixture_only_path, prebind_status_auth, refresh_cursor_facts,
-    run_launch_plan_cursor_auth, skip_unless_subtest, write_profile_entries,
+    FixtureLayout, LOGIN_BAD, LOGIN_GOOD, PARENT_ONLY, PROFILE_GOOD, PROFILE_NAME,
+    assert_subprocess_success, classify_cursor_process_result, cursor_auth_for_profile,
+    cursor_probe, cursor_profile_auth, empty_base_path, fixture_home_from_env, fixture_only_path,
+    prebind_status_auth, refresh_cursor_facts, run_launch_plan_cursor_auth, skip_unless_subtest,
+    write_profile_entries,
 };
 
 fn cursor_status_launch_plan(fixture: &FixtureLayout, profile_name: &str) -> LaunchPlan {

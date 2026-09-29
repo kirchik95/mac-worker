@@ -100,7 +100,11 @@ fn local_intents_skip_remote_refresh_on_snapshot_and_detail() {
             assert_eq!(row.review_state, ReviewState::ClosePending);
             assert_ne!(row.review_state, ReviewState::Accepted);
         }
-        assert_eq!(harness.task_status_calls(), 0, "close intent: {close_intent}");
+        assert_eq!(
+            harness.task_status_calls(),
+            0,
+            "close intent: {close_intent}"
+        );
         assert_eq!(
             before,
             harness.local_state_fingerprint(),
@@ -120,7 +124,11 @@ fn local_intents_skip_remote_refresh_on_snapshot_and_detail() {
             assert_eq!(detail.review_state, ReviewState::ClosePending);
             assert_ne!(detail.review_state, ReviewState::Accepted);
         }
-        assert_eq!(harness.task_status_calls(), 0, "close intent: {close_intent}");
+        assert_eq!(
+            harness.task_status_calls(),
+            0,
+            "close intent: {close_intent}"
+        );
     }
 }
 
