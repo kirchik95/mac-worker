@@ -11,7 +11,7 @@ on:
       - 'ui/README.md'
       - 'ui/public/favicon.svg'
       - 'ui/src/assets/fonts/OFL.txt'
-      - 'src/dashboard/static/app/assets/*.ttf'
+      - 'ui/src/assets/fonts/*.ttf'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
@@ -22,7 +22,7 @@ on:
       - 'ui/README.md'
       - 'ui/public/favicon.svg'
       - 'ui/src/assets/fonts/OFL.txt'
-      - 'src/dashboard/static/app/assets/*.ttf'
+      - 'ui/src/assets/fonts/*.ttf'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 

@@ -122,7 +122,7 @@ await writeFile(path.join(content, 'archive.md'), '# Documentation index\n\nAll 
 await writeFile(path.join(content, 'license.md'), '# MIT License\n\n```text\n' + await readFile(path.join(repo, 'LICENSE'), 'utf8') + '\n```\n')
 await mkdir(path.join(content, 'public/assets'), { recursive: true })
 for (const font of ['plex-sans-regular.ttf', 'plex-sans-medium.ttf', 'plex-mono-regular.ttf']) {
-  await copyFile(path.join(repo, 'src/dashboard/static/app/assets', font), path.join(content, 'public/assets', font))
+  await copyFile(path.join(repo, 'ui/src/assets/fonts', font), path.join(content, 'public/assets', font))
 }
 await copyFile(path.join(repo, 'ui/public/favicon.svg'), path.join(content, 'public/favicon.svg'))
 await copyFile(path.join(repo, 'ui/src/assets/fonts/OFL.txt'), path.join(content, 'public/assets/OFL.txt'))
