@@ -60,7 +60,7 @@ const GIT_DEADLINE: Duration = Duration::from_secs(60);
 static DETACHED_EXECUTOR: DetachedRunnerExecutor = DetachedRunnerExecutor;
 
 // Bounded selected recovery at prepare: retire a completed dead runner
-// before freezing say/close expected.
+// before freezing say/close expected, without starting an automatic answer.
 fn recover_selected_task_before_prepare(
     handler: &TaskSubmitHandler<'_>,
     task_id: crate::task::TaskId,
@@ -72,7 +72,7 @@ fn recover_selected_task_before_prepare(
         handler.client_state,
         &DETACHED_EXECUTOR,
     );
-    let _ = client.reconcile_selected(&[task_id])?;
+    let _ = client.reconcile_selected_before_mutation(&[task_id])?;
     Ok(())
 }
 

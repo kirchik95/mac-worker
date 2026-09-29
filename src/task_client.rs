@@ -772,6 +772,12 @@ enum ReconcileScope<'a> {
     Selected(&'a [TaskId]),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconcileAutomatic {
+    Materialize,
+    Preserve,
+}
+
 struct ReconcileSelection {
     ids: Vec<TaskId>,
     records: Vec<LocalTaskRecord>,
@@ -2721,6 +2727,8 @@ impl<'a> TaskClient<'a> {
             if matches!(retained.state(), QueueState::Dispatching { .. }) {
                 return Err(task_error("TASK_BUSY", "task turn is being dispatched"));
             }
+            self.client_state
+                .reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
             let status = TaskStatus::new(
                 if discard {
                     TaskState::Abandoned
@@ -2747,8 +2755,8 @@ impl<'a> TaskClient<'a> {
                 .update_task_if_current(&record, closed.clone())?
             {
                 return Err(task_error(
-                    "TASK_REVISION_CONFLICT",
-                    "task changed before close",
+                    "TASK_BUSY",
+                    "task changed while completing retained cancellation",
                 ));
             }
             self.finish_waiting_cancellation_locked(task_id, &retained, &mut log)?;
@@ -2820,7 +2828,7 @@ impl<'a> TaskClient<'a> {
                 return self.report_for(task_id);
             }
             return Err(task_error(
-                "TASK_REVISION_CONFLICT",
+                "TASK_BUSY",
                 "task changed before close completed",
             ));
         }
@@ -2832,7 +2840,7 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(false, ReconcileScope::All)
+        self.reconcile_runners_inner(false, ReconcileScope::All, ReconcileAutomatic::Materialize)
     }
 
     /// Operator-driven `worker task reconcile`: clears the restart budget and
@@ -2845,11 +2853,28 @@ impl<'a> TaskClient<'a> {
     /// invocation sees an unconfirmed `Absent`, it waits the confirmation
     /// window so a second look in the same pass can prove `Exited`.
     pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(true, ReconcileScope::All)
+        self.reconcile_runners_inner(true, ReconcileScope::All, ReconcileAutomatic::Materialize)
     }
 
     pub fn reconcile_selected(&self, ids: &[TaskId]) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(false, ReconcileScope::Selected(ids))
+        self.reconcile_runners_inner(
+            false,
+            ReconcileScope::Selected(ids),
+            ReconcileAutomatic::Materialize,
+        )
+    }
+
+    /// Retire completed dead owners before a human mutation, preserving any
+    /// automatic answer so that recovery cannot outrun the human's request.
+    pub(crate) fn reconcile_selected_before_mutation(
+        &self,
+        ids: &[TaskId],
+    ) -> Result<ReconcileReport, WorkerError> {
+        self.reconcile_runners_inner(
+            false,
+            ReconcileScope::Selected(ids),
+            ReconcileAutomatic::Preserve,
+        )
     }
 
     /// One leader tick: bootstrap the derived index, recover the current
@@ -2875,6 +2900,7 @@ impl<'a> TaskClient<'a> {
         &self,
         reset_failure_budget: bool,
         scope: ReconcileScope<'_>,
+        automatic: ReconcileAutomatic,
     ) -> Result<ReconcileReport, WorkerError> {
         let mut report = ReconcileReport::default();
         let owner = current_process_identity()?;
@@ -3022,9 +3048,10 @@ impl<'a> TaskClient<'a> {
                     owner,
                     completion,
                 )?;
-                if self
-                    .auto_continue_after_terminal(task_id, entry.job_id())
-                    .is_err()
+                if automatic == ReconcileAutomatic::Materialize
+                    && self
+                        .auto_continue_after_terminal(task_id, entry.job_id())
+                        .is_err()
                 {
                     let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
                 }
@@ -3037,6 +3064,9 @@ impl<'a> TaskClient<'a> {
         // replay it only after acquiring the original finalizer's journal fence.
         selection = self.reload_reconcile_selection(&selection)?;
         for record in &selection.records {
+            if automatic == ReconcileAutomatic::Preserve {
+                break;
+            }
             let Some(intent) = record.auto_continue_intent() else {
                 continue;
             };
@@ -3549,6 +3579,19 @@ impl<'a> TaskClient<'a> {
         expected: &LocalTaskRecord,
     ) -> Result<Option<LocalTaskRecord>, WorkerError> {
         let task_id = expected.meta().task_id();
+        let before = self.client_state.load_task(task_id)?;
+        if before.auto_continue_intent().is_some()
+            && operator_revision_matches(&before, expected)
+            && (before.runner().is_some()
+                || self
+                    .client_state
+                    .queue_entry_for_task_turn(task_id)?
+                    .is_some())
+        {
+            self.reconcile_selected_before_mutation(&[task_id])?;
+        }
+        // Recovery can race the original finalizer. Re-read and apply the
+        // same revision, intent and journal fences after retiring its row.
         let current = self.client_state.load_task(task_id)?;
         let Some(intent) = current.auto_continue_intent() else {
             return Ok(None);
@@ -3788,6 +3831,8 @@ impl<'a> TaskClient<'a> {
             ));
         }
         self.publish_prepared_evidence(prepared)?;
+        self.client_state
+            .reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
         let build_active = |base: &LocalTaskRecord| -> Result<LocalTaskRecord, WorkerError> {
             let worker = task_worker(self.config, base.status())?.name.clone();
             let pending = TurnSummary::new(

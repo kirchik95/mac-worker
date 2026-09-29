@@ -14,14 +14,16 @@ use std::{
     path::PathBuf,
     process::ExitStatus,
     sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
+    time::Duration,
 };
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
-    client_state::ClientStateStore,
+    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
     config::Config,
     controller::{
         ActiveResumeConfig, ControllerFault, ControllerStore, PreparedTaskMutation, RequestPhase,
@@ -914,4 +916,309 @@ fn journal_close_failure_after_intent_stays_pending_and_recovers() {
         .handle_with(&fresh_close, &handler, ControllerFault::None)
         .expect("a fresh close of the same terminal target remains idempotent");
     assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+}
+
+struct MutationGate {
+    point: ClientStateConcurrencyPoint,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for MutationGate {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == self.point && !self.used.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+    }
+}
+
+struct GatedCloseHost {
+    host: CloseHost,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    used: AtomicBool,
+}
+
+impl ProcessRunner for GatedCloseHost {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.program != OsStr::new("/usr/bin/git") && !self.used.swap(true, Ordering::SeqCst)
+        {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        self.host.run(request)
+    }
+}
+
+#[test]
+fn questions_close_conflict_after_host_effect_stays_retryable() {
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(101, 102);
+    let task_id = expected.meta().task_id();
+    let envelope = request(REQUEST_ID, "task.close", json!({"task_id": task_id}));
+    let preparation_host = UnavailableCloseHost {
+        calls: AtomicUsize::new(0),
+    };
+    let preparation = TaskSubmitHandler::new(
+        &preparation_host,
+        &harness.config,
+        &harness.paths,
+        &harness.store,
+    );
+    let journal = ControllerStore::open(&harness.paths.controller_state_root()).unwrap();
+    journal
+        .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let (host_entered_tx, host_entered_rx) = mpsc::channel();
+    let (host_release_tx, host_release_rx) = mpsc::channel();
+    let host = GatedCloseHost {
+        host: CloseHost::new(expected.status().clone()),
+        entered: host_entered_tx,
+        release: Mutex::new(host_release_rx),
+        used: AtomicBool::new(false),
+    };
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = mpsc::channel();
+    let writer_state = ClientStateStore::open_with_concurrency_hook(
+        &harness.paths.state,
+        Arc::new(MutationGate {
+            point: ClientStateConcurrencyPoint::TaskReplacementPreExchange,
+            entered: writer_entered_tx,
+            release: Mutex::new(writer_release_rx),
+            used: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    let error = std::thread::scope(|scope| {
+        let operation =
+            scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
+        host_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let current = harness.store.load_task(task_id).unwrap();
+        assert!(current.close_intent().is_some());
+        let changed = current.with_status_observed_at(Some(999)).unwrap();
+        let writer = scope.spawn(move || writer_state.update_task_if_current(&current, changed));
+        writer_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let contention = harness.store.observe_next_lock_contention();
+        host_release_tx.send(()).unwrap();
+        let contended = contention.confirmed_within(Duration::from_secs(5));
+        writer_release_tx.send(()).unwrap();
+        assert!(writer.join().unwrap().unwrap());
+        assert!(
+            contended,
+            "close must compare the pre-observation snapshot after its host effect"
+        );
+        operation.join().unwrap().unwrap_err()
+    });
+    assert_eq!(
+        error.public_code(),
+        "TASK_BUSY",
+        "a post-effect CAS conflict needs completion retry"
+    );
+    assert_eq!(
+        journal.load(REQUEST_ID).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    assert_eq!(journal.pending_health(u64::MAX).unwrap().active_count, 1);
+    assert!(
+        harness
+            .store
+            .load_task(task_id)
+            .unwrap()
+            .close_intent()
+            .is_some()
+    );
+    let tick = journal
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(tick.failed.is_empty(), "{:?}", tick.failed);
+    assert_eq!(tick.completed.len(), 1);
+    let closed = harness.store.load_task(task_id).unwrap();
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert!(closed.close_intent().is_none());
+    let health = journal.pending_health(u64::MAX).unwrap();
+    assert_eq!(health.active_count, 0);
+    assert_eq!(health.oldest_pending_age_millis, None);
+}
+
+#[test]
+fn questions_controller_say_cas_loser_resumes_published_evidence() {
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(111, 112);
+    let task_id = expected.meta().task_id();
+    let envelope = request(
+        REQUEST_ID,
+        "task.say",
+        json!({"task_id": task_id, "message": "one human turn"}),
+    );
+    let host = UnavailableCloseHost {
+        calls: AtomicUsize::new(0),
+    };
+    let preparation =
+        TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let journal = ControllerStore::open(&harness.paths.controller_state_root()).unwrap();
+    mac_worker::controller::drain::set_drained(&harness.paths.controller_state_root(), true)
+        .unwrap();
+    journal
+        .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let frozen = journal.load(REQUEST_ID).unwrap().unwrap();
+    let PreparedTaskMutation::Say { prepared } =
+        serde_json::from_value(frozen.prepared().clone()).unwrap()
+    else {
+        panic!("say preparation")
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let state = ClientStateStore::open_with_concurrency_hook(
+        &harness.paths.state,
+        Arc::new(MutationGate {
+            point: ClientStateConcurrencyPoint::BeforeTaskMutation,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            used: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &state);
+    let ack = std::thread::scope(|scope| {
+        let operation =
+            scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            state
+                .read_turn_prepared_binding(task_id, prepared.turn_id())
+                .unwrap(),
+            prepared.binding()
+        );
+        let peer = harness.client(&SystemProcessRunner).say_prepared(
+            &prepared,
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        release_tx.send(()).unwrap();
+        peer.unwrap();
+        operation.join().unwrap().unwrap()
+    });
+    assert_eq!(ack.status(), "acked");
+    assert!(ack.result().unwrap().get("controller_rejection").is_none());
+    let current = state.load_task(task_id).unwrap();
+    assert_eq!(current.status().turns().len(), 2);
+    assert_eq!(
+        current.status().turns().last().unwrap().turn_id(),
+        prepared.turn_id()
+    );
+    assert_eq!(state.queue_snapshot().unwrap().entries().len(), 1);
+    assert_eq!(journal.pending_health(u64::MAX).unwrap().active_count, 0);
+}
+
+#[test]
+fn questions_close_conflict_after_retained_cancel_stays_retryable() {
+    let harness = Harness::new();
+    let expected = harness.plant_open_task(121, 122);
+    let task_id = expected.meta().task_id();
+    let turn_id = expected.status().turns()[0].turn_id();
+    let envelope = request(REQUEST_ID, "task.close", json!({"task_id": task_id}));
+    let host = UnavailableCloseHost {
+        calls: AtomicUsize::new(0),
+    };
+    let preparation =
+        TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let journal = ControllerStore::open(&harness.paths.controller_state_root()).unwrap();
+    journal
+        .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let owner = mac_worker::supervisor::SystemProcessInspector
+        .identity_for_pid(std::process::id())
+        .unwrap();
+    harness
+        .store
+        .write_turn_prompt(task_id, turn_id, "retained turn")
+        .unwrap();
+    harness
+        .store
+        .enqueue(
+            mac_worker::job::QueueEntry::new(
+                turn_id,
+                harness.store.client_id(),
+                harness.project_id.clone(),
+                harness.worktree_id.clone(),
+                mac_worker::job::CommandSummary::argv(2).unwrap(),
+                Vec::new(),
+                mac_worker::scheduler::WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                mac_worker::job::QueueEntryKind::TaskTurn,
+                None,
+                owner,
+                3,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let state = ClientStateStore::open_with_concurrency_hook(
+        &harness.paths.state,
+        Arc::new(MutationGate {
+            point: ClientStateConcurrencyPoint::BeforeTaskMutation,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            used: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &state);
+    let error = std::thread::scope(|scope| {
+        let operation =
+            scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            harness
+                .store
+                .queue_entry(turn_id)
+                .unwrap()
+                .unwrap()
+                .is_cancel_requested()
+        );
+        let current = harness.store.load_task(task_id).unwrap();
+        let changed = current.with_status_observed_at(Some(999)).unwrap();
+        harness.store.replace_task_fixture(changed).unwrap();
+        release_tx.send(()).unwrap();
+        operation.join().unwrap().unwrap_err()
+    });
+    assert_eq!(error.public_code(), "TASK_BUSY");
+    assert_eq!(
+        journal.load(REQUEST_ID).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    assert_eq!(journal.pending_health(u64::MAX).unwrap().active_count, 1);
+    let tick = journal
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(tick.failed.is_empty(), "{:?}", tick.failed);
+    assert_eq!(tick.completed.len(), 1);
+    assert_eq!(
+        state.load_task(task_id).unwrap().status().state(),
+        TaskState::Closed
+    );
+    assert!(state.queue_entry(turn_id).unwrap().is_none());
+    let health = journal.pending_health(u64::MAX).unwrap();
+    assert_eq!(health.active_count, 0);
+    assert_eq!(health.oldest_pending_age_millis, None);
 }

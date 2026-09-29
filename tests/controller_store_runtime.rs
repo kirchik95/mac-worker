@@ -1153,7 +1153,7 @@ impl SwitchableExecutor {
 
 impl ControllerCommandHandler for SwitchableExecutor {
     fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
-        if request.command() == "task.close" {
+        if matches!(request.command(), "task.say" | "task.cancel" | "task.close") {
             // Kernel-only fixture: preparation is irrelevant to the execution
             // error classifier, but the durable row must retain the command.
             return Ok(OperationMeta {
@@ -1436,17 +1436,21 @@ fn infrastructure_failure_stays_pending_and_recovers() {
 }
 
 #[test]
-fn close_execution_errors_with_fence_codes_remain_retryable() {
-    // Unlike the read-only preflight, execution may already have retained a
-    // cancellation or sent host writes. Its error code alone cannot settle it.
-    for (code, message) in [
-        ("TASK_REVISION_CONFLICT", "task changed before close"),
-        ("TASK_CLOSED", "task is terminal"),
+fn mutation_busy_and_close_terminal_execution_errors_remain_retryable() {
+    for (command, code, message) in [
+        ("task.say", "TASK_BUSY", "previous turn is still finalizing"),
+        (
+            "task.cancel",
+            "TASK_BUSY",
+            "previous turn is still finalizing",
+        ),
+        ("task.close", "TASK_BUSY", "task close is in progress"),
+        ("task.close", "TASK_CLOSED", "task is terminal"),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let (state, store) = open_store(&temp);
         let executor = SwitchableExecutor::rejecting(WorkerError::task(code, message));
-        let request = request_for(ID_R5, "task.close", json!({"task_id": REJECT_TASK_ID}));
+        let request = request_for(ID_R5, command, json!({"task_id": REJECT_TASK_ID}));
         let error = store
             .handle_with(&request, &executor, ControllerFault::None)
             .unwrap_err();
@@ -1471,6 +1475,49 @@ fn close_execution_errors_with_fence_codes_remain_retryable() {
             RequestPhase::Acked
         );
         assert!(active_entries(&state).is_empty());
+    }
+}
+
+#[test]
+fn questions_mutation_revision_conflicts_are_saved_and_replayed() {
+    for (command, message) in [
+        ("task.say", "task changed before follow-up"),
+        ("task.cancel", "task changed before cancel"),
+        ("task.close", "task changed before close"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = SwitchableExecutor::rejecting(WorkerError::task(
+            "TASK_REVISION_CONFLICT",
+            "private execution detail",
+        ));
+        let request = request_for(ID_R5, command, json!({"task_id": REJECT_TASK_ID}));
+        let error = store
+            .handle_with(&request, &executor, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "TASK_REVISION_CONFLICT");
+        assert_eq!(
+            store.load(ID_R5).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
+        assert_eq!(error.public_message(), message);
+        assert!(active_entries(&state).is_empty());
+        let health = store.pending_health(u64::MAX).unwrap();
+        assert_eq!(health.active_count, 0);
+        assert_eq!(health.oldest_pending_age_millis, None);
+        drop(store);
+        let reopened = ControllerStore::open(&state).unwrap();
+        executor.stop_rejecting();
+        let tick = reopened
+            .resume_active_bounded(&executor, &ActiveResumeConfig::default())
+            .unwrap();
+        assert!(tick.failed.is_empty() && tick.completed.is_empty());
+        let replay = reopened
+            .handle_with(&request, &executor, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(replay.public_code(), "TASK_REVISION_CONFLICT");
+        assert_eq!(replay.public_message(), message);
+        assert_eq!(executor.calls_for(ID_R5), 1);
     }
 }
 

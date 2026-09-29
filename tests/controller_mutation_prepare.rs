@@ -8,22 +8,36 @@
 
 mod support;
 
+#[path = "support/task_state.rs"]
+mod task_state_fixture;
+use task_state_fixture::TaskStateFixture;
+
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
-    os::unix::fs::PermissionsExt,
+    ffi::{OsStr, OsString},
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::PathBuf,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use mac_worker::{
     agent::{AgentKind, PermissionPolicy},
-    client_state::ClientStateStore,
+    client_state::{
+        ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
+        ClientStateWritePoint,
+    },
     config::Config,
-    controller::TaskSubmitHandler,
+    controller::{
+        ActiveResumeConfig, ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler,
+        drain::set_drained,
+    },
+    error::WorkerError,
     job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
     paths::PathLayout,
-    process::SystemProcessRunner,
+    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project_state::ProjectState,
     protocol::PROTOCOL_VERSION,
     scheduler::{CandidateSlot, WorkerPreference},
@@ -35,12 +49,58 @@ use mac_worker::{
         TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
         TurnId, TurnSummary, TurnTerminal,
     },
+    task_client::TaskClient,
+    turn_runner::InlineRunnerExecutor,
 };
 use serde_json::{Value, json};
 use support::GitRepo;
 use uuid::Uuid;
 
 const RUNNER: SystemProcessRunner = SystemProcessRunner;
+
+struct LocalGitOnly;
+impl ProcessRunner for LocalGitOnly {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        assert_eq!(
+            request.program,
+            OsStr::new("/usr/bin/git"),
+            "no external worker calls"
+        );
+        RUNNER.run(request)
+    }
+}
+
+struct StopQuestionsRetirement {
+    state: Mutex<Option<ClientStateStore>>,
+    keep_row: bool,
+    used: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for StopQuestionsRetirement {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point != ClientStateConcurrencyPoint::QueuePublication {
+            return;
+        }
+        let guard = self.state.lock().unwrap();
+        let Some(state) = guard.as_ref() else { return };
+        let record = state.load_task(task_n(0x5001)).unwrap();
+        if record.runner().is_none()
+            && serde_json::to_value(record).unwrap()["auto_continue_intent"].is_object()
+            && !self.used.swap(true, Ordering::SeqCst)
+        {
+            state.inject_write_failure_once(if self.keep_row {
+                ClientStateWritePoint::BeforePublish
+            } else {
+                ClientStateWritePoint::AfterPublish
+            });
+        }
+    }
+}
+
+fn questions_config() -> Config {
+    Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"unused\"\nslots = 1\n")
+        .unwrap()
+}
 
 fn task_n(n: u128) -> TaskId {
     TaskId::new(Uuid::from_u128(n))
@@ -313,6 +373,335 @@ impl Fixture {
         )
         .unwrap();
         (store, record)
+    }
+
+    /// Let the real finalizer stage its preparation, then crash immediately
+    /// before or after retiring the queue row. Drain prevents any child spawn.
+    fn pending_questions(&self, keep_row: bool) -> ClientStateStore {
+        let (plain, record) = self.finalized_dead_row(0x5001, 0x5002);
+        let mut wire = serde_json::to_value(record).unwrap();
+        wire["questions_policy"] = json!("decide");
+        wire["status"]["last_outcome"] = json!({"kind": "needs_input"});
+        wire["status"]["turns"][0]["outcome"] = json!({"kind": "needs_input"});
+        plain
+            .replace_task_fixture(serde_json::from_value(wire).unwrap())
+            .unwrap();
+        let checkpoint = self
+            .paths
+            .state
+            .join("runners")
+            .join(task_n(0x5001).to_string())
+            .join(format!("{}.checkpoint.json", turn_n(0x5002)));
+        let mut wire: Value = serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+        wire["committed"]["completion"]["outcome"] = json!({"kind": "needs_input"});
+        std::fs::write(checkpoint, serde_json::to_vec(&wire).unwrap()).unwrap();
+        ControllerStore::open(&self.paths.controller_state_root()).unwrap();
+        set_drained(&self.paths.controller_state_root(), true).unwrap();
+        let hook = Arc::new(StopQuestionsRetirement {
+            state: Mutex::new(None),
+            keep_row,
+            used: AtomicBool::new(false),
+        });
+        let state = ClientStateStore::open_with_owner_inspector_and_concurrency_hook(
+            &self.paths.state,
+            DeadOwnerReusedInspector {
+                dead_owner: dead_owner(),
+            },
+            hook.clone(),
+        )
+        .unwrap();
+        *hook.state.lock().unwrap() = Some(state.clone());
+        let config = questions_config();
+        TaskClient::new(
+            &LocalGitOnly,
+            &config,
+            &self.paths,
+            &state,
+            &InlineRunnerExecutor,
+        )
+        .reconcile_selected(&[task_n(0x5001)])
+        .unwrap_err();
+        assert!(hook.used.load(Ordering::SeqCst));
+        *hook.state.lock().unwrap() = None;
+        if keep_row {
+            plain.adopt_row(turn_n(0x5002), dead_owner()).unwrap();
+        }
+        let pending = plain.load_task(task_n(0x5001)).unwrap();
+        assert!(serde_json::to_value(&pending).unwrap()["auto_continue_intent"].is_object());
+        assert_eq!(pending.status().turns().len(), 1);
+        assert_eq!(row_entry(&plain, 0x5002).is_some(), keep_row);
+        plain
+    }
+}
+
+fn questions_request(command: &str) -> mac_worker::controller::ControllerRequest {
+    let extra = if command == "task.say" {
+        json!({"message": "human choice"})
+    } else {
+        json!({})
+    };
+    mac_worker::controller::parse_request(&mutation_request(
+        command,
+        &request_hex(0x51),
+        task_body(0x5001, extra),
+    ))
+    .unwrap()
+}
+
+fn questions_health(journal: &ControllerStore, active: u64) {
+    let health = journal.pending_health(u64::MAX).unwrap();
+    assert_eq!(health.active_count, active);
+    assert_eq!(health.oldest_pending_age_millis.is_some(), active != 0);
+    assert!(!health.age_incomplete);
+}
+
+fn questions_journal_lock(fixture: &Fixture) -> std::fs::File {
+    let log = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            fixture
+                .paths
+                .state
+                .join("runners")
+                .join(task_n(0x5001).to_string())
+                .join(format!("{}.log", turn_n(0x5002))),
+        )
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(log.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    log
+}
+
+#[test]
+fn questions_controller_say_wins_pending_intent_and_retires_request() {
+    for keep_row in [false, true] {
+        let fixture = Fixture::new();
+        let state = fixture.pending_questions(keep_row);
+        let config = questions_config();
+        let handler = TaskSubmitHandler::new(&LocalGitOnly, &config, &fixture.paths, &state);
+        let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+        let request = questions_request("task.say");
+        journal
+            .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+            .unwrap();
+        let pending = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(
+            pending.status().turns().len(),
+            1,
+            "prepare must preserve the human's target"
+        );
+        assert!(serde_json::to_value(&pending).unwrap()["auto_continue_intent"].is_object());
+        assert!(
+            row_entry(&state, 0x5002).is_none(),
+            "dead finalizer must be retired"
+        );
+        questions_health(&journal, 1);
+        let tick = journal
+            .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+            .unwrap();
+        assert!(tick.failed.is_empty(), "{:?}", tick.failed);
+        assert_eq!(tick.completed.len(), 1);
+        let ack = journal
+            .handle_with(&request, &handler, ControllerFault::None)
+            .unwrap();
+        assert_eq!(ack.status(), "acked");
+        let human = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(human.status().turns().len(), 2);
+        let last = human.status().turns().last().unwrap();
+        assert!(!last.auto_continue());
+        assert_eq!(Some(last.turn_id().to_string()).as_deref(), ack.turn_id());
+        assert!(
+            state
+                .read_turn_prompt(task_n(0x5001), last.turn_id())
+                .unwrap()
+                .contains("human choice")
+        );
+        assert!(
+            serde_json::to_value(human)
+                .unwrap()
+                .get("auto_continue_intent")
+                .is_none()
+        );
+        questions_health(&journal, 0);
+    }
+}
+
+#[test]
+fn questions_controller_close_prepare_preserves_pending_intent_after_dead_row() {
+    let fixture = Fixture::new();
+    let state = fixture.pending_questions(true);
+    let config = questions_config();
+    let handler = TaskSubmitHandler::new(&LocalGitOnly, &config, &fixture.paths, &state);
+    let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+    let request = questions_request("task.close");
+    journal
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let current = state.load_task(task_n(0x5001)).unwrap();
+    assert_eq!(current.status().turns().len(), 1);
+    assert!(serde_json::to_value(&current).unwrap()["auto_continue_intent"].is_object());
+    assert!(row_entry(&state, 0x5002).is_none());
+    let frozen = journal.load(request.request_id()).unwrap().unwrap();
+    assert_eq!(
+        frozen.prepared()["expected"],
+        serde_json::to_value(current).unwrap()
+    );
+    questions_health(&journal, 1);
+}
+
+#[test]
+fn questions_controller_say_retries_dead_finalizer_within_one_tick() {
+    let fixture = Fixture::new();
+    let state = fixture.pending_questions(true);
+    let config = questions_config();
+    let handler = TaskSubmitHandler::new(&LocalGitOnly, &config, &fixture.paths, &state);
+    let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+    let request = questions_request("task.say");
+    let lock = questions_journal_lock(&fixture);
+    let busy = journal
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(busy.public_code(), "TASK_BUSY");
+    questions_health(&journal, 1);
+    drop(lock);
+    let client = TaskClient::new(
+        &LocalGitOnly,
+        &config,
+        &fixture.paths,
+        &state,
+        &InlineRunnerExecutor,
+    );
+    let tick = mac_worker::controller::health::ControllerTickReport::collect(
+        &journal,
+        &handler,
+        || client.tick_selected_recovery(),
+        || Ok(u64::MAX),
+    );
+    let health = tick.pending.unwrap();
+    assert_eq!(
+        health.active_count, 0,
+        "a crashed finalizer must not strand the human request"
+    );
+    assert_eq!(health.oldest_pending_age_millis, None);
+    assert!(!health.age_incomplete);
+    let result = journal.handle_with(&request, &handler, ControllerFault::None);
+    if let Err(error) = result {
+        assert_eq!(error.public_code(), "TASK_REVISION_CONFLICT");
+    } else {
+        let human = state.load_task(task_n(0x5001)).unwrap();
+        assert_eq!(human.status().turns().len(), 2);
+        assert!(!human.status().turns().last().unwrap().auto_continue());
+    }
+}
+
+fn questions_stale_controller_mutation(command: &str) {
+    let fixture = Fixture::new();
+    let state = fixture.pending_questions(false);
+    let config = questions_config();
+    let handler = TaskSubmitHandler::new(&LocalGitOnly, &config, &fixture.paths, &state);
+    let journal = ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+    let request = questions_request(command);
+    let lock = questions_journal_lock(&fixture);
+    let busy = journal
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(busy.public_code(), "TASK_BUSY");
+    assert_eq!(
+        journal.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    questions_health(&journal, 1);
+    drop(lock);
+    TaskClient::new(
+        &LocalGitOnly,
+        &config,
+        &fixture.paths,
+        &state,
+        &InlineRunnerExecutor,
+    )
+    .reconcile_selected(&[task_n(0x5001)])
+    .unwrap();
+    let automatic = state.load_task(task_n(0x5001)).unwrap();
+    assert!(automatic.status().turns().last().unwrap().auto_continue());
+    let queue = state.queue_snapshot().unwrap();
+    let evidence = state.turn_ids_for_task(task_n(0x5001)).unwrap();
+    let tick = journal
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert_eq!(tick.failed.len(), 1);
+    let error = journal
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_REVISION_CONFLICT");
+    assert_eq!(
+        journal.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    questions_health(&journal, 0);
+    assert_eq!(state.load_task(task_n(0x5001)).unwrap(), automatic);
+    assert_eq!(state.queue_snapshot().unwrap(), queue);
+    assert_eq!(state.turn_ids_for_task(task_n(0x5001)).unwrap(), evidence);
+    let idle = journal
+        .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+        .unwrap();
+    assert!(idle.completed.is_empty() && idle.failed.is_empty());
+}
+
+#[test]
+fn questions_controller_stale_say_is_definitive() {
+    questions_stale_controller_mutation("task.say");
+}
+
+#[test]
+fn questions_controller_stale_cancel_is_definitive() {
+    questions_stale_controller_mutation("task.cancel");
+}
+
+#[test]
+fn questions_controller_stale_close_is_definitive() {
+    questions_stale_controller_mutation("task.close");
+}
+
+#[test]
+fn questions_local_human_mutations_retire_dead_row_without_automatic_answer() {
+    for command in ["say", "cancel"] {
+        let fixture = Fixture::new();
+        let state = fixture.pending_questions(true);
+        let config = questions_config();
+        let client = TaskClient::new(
+            &LocalGitOnly,
+            &config,
+            &fixture.paths,
+            &state,
+            &InlineRunnerExecutor,
+        );
+        let report = if command == "say" {
+            client.say(
+                task_n(0x5001),
+                "human choice".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+        } else {
+            client.cancel(task_n(0x5001))
+        }
+        .unwrap();
+        assert_eq!(
+            report.status().turns().len(),
+            if command == "say" { 2 } else { 1 }
+        );
+        assert!(!report.status().turns().last().unwrap().auto_continue());
+        assert!(row_entry(&state, 0x5002).is_none());
+        assert!(
+            serde_json::to_value(state.load_task(task_n(0x5001)).unwrap())
+                .unwrap()
+                .get("auto_continue_intent")
+                .is_none()
+        );
     }
 }
 

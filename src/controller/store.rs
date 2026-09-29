@@ -766,7 +766,20 @@ impl ControllerStore {
             let value = match executor.execute(&current) {
                 Ok(value) => value,
                 Err(error) if terminal_rejection_code(current.command(), &error).is_some() => {
-                    rejection_result(&error)
+                    // Keep saved diagnostics static for mutation conflicts;
+                    // execution details must not become durable public text.
+                    let message = match current.command() {
+                        "task.say" => Some("task changed before follow-up"),
+                        "task.cancel" => Some("task changed before cancel"),
+                        "task.close" => Some("task changed before close"),
+                        _ => None,
+                    };
+                    match message {
+                        Some(message) => {
+                            rejection_result(&WorkerError::task("TASK_REVISION_CONFLICT", message))
+                        }
+                        None => rejection_result(&error),
+                    }
                 }
                 Err(error) => return Err(error),
             };
@@ -1265,10 +1278,11 @@ fn validate_record(name: &str, record: &DurableRequest) -> Result<(), WorkerErro
 const REJECTION_KEY: &str = "controller_rejection";
 const REJECTION_VERSION: u64 = 1;
 
-/// Classify errors returned by execution. Close-target preflight rejections
-/// are encoded explicitly by TaskSubmitHandler before any execution effects;
-/// the same error codes from execution must remain retryable here.
-/// Definitive, no-effect admission rejections are deliberately narrow:
+/// Classify definitive execution rejections. Frozen mutations cannot be
+/// retargeted after a revision conflict; TASK_BUSY and ambiguous failures keep
+/// their retry semantics. Close completion conflicts after a durable intent
+/// or retained cancellation use TASK_BUSY so cleanup is not lost.
+/// Admission rejections remain deliberately narrow:
 ///
 /// * only `task.submit`, the one command whose rejection sites are proven to
 ///   precede any task row (`TaskClient::submit_with_ids` returns
@@ -1281,13 +1295,20 @@ const REJECTION_VERSION: u64 = 1;
 /// Infrastructure and ambiguous failures are never settled here: the executor
 /// may have completed a side effect before failing.
 fn terminal_rejection_code(command: &str, error: &WorkerError) -> Option<&'static str> {
-    if command != "task.submit" {
-        return None;
-    }
-    match error {
-        WorkerError::Capacity {
-            code, public: true, ..
-        } if matches!(*code, "CAPACITY_BUSY" | "CAPABILITY_MISSING") => Some(code),
+    match (command, error) {
+        (
+            "task.say" | "task.cancel" | "task.close",
+            WorkerError::Task {
+                code: "TASK_REVISION_CONFLICT",
+                ..
+            },
+        ) => Some("TASK_REVISION_CONFLICT"),
+        (
+            "task.submit",
+            WorkerError::Capacity {
+                code, public: true, ..
+            },
+        ) if matches!(*code, "CAPACITY_BUSY" | "CAPABILITY_MISSING") => Some(code),
         _ => None,
     }
 }
@@ -1332,13 +1353,19 @@ fn saved_rejection(result: Option<&Value>) -> Result<Option<WorkerError>, Worker
         "TASK_REVISION_CONFLICT" if message == "task changed before close" => {
             WorkerError::task(code, "task changed before close")
         }
+        "TASK_REVISION_CONFLICT" if message == "task changed before follow-up" => {
+            WorkerError::task(code, "task changed before follow-up")
+        }
+        "TASK_REVISION_CONFLICT" if message == "task changed before cancel" => {
+            WorkerError::task(code, "task changed before cancel")
+        }
         "TASK_CLOSED" if message == "task is terminal" => {
             WorkerError::task(code, "task is terminal")
         }
         "CAPACITY_BUSY" | "CAPABILITY_MISSING" => {
             WorkerError::capacity_public(code, message.to_owned())
         }
-        // Close preflight messages are static literals; do not turn arbitrary
+        // Mutation rejection messages are static literals; do not turn arbitrary
         // stored task text into a public diagnostic or change its exit kind.
         _ => return Err(invalid_rejection()),
     };
