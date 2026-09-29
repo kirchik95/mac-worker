@@ -360,6 +360,52 @@ depends_on = ["login"]
 }
 
 #[test]
+fn task_say_accepts_interrupt_only_with_the_say_message_forms() {
+    let id = "018f0f4a6b5c7d8e9f00112233445566";
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "say",
+            id,
+            "--interrupt",
+            "--message",
+            "steer",
+            "--wait",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "say",
+            id,
+            "--interrupt",
+            "--message-file",
+            "note.md",
+        ])
+        .is_ok()
+    );
+    assert!(Cli::try_parse_from(["worker", "task", "say", id, "--interrupt"]).is_err());
+    assert!(Cli::try_parse_from(["worker", "task", "cancel", id, "--interrupt"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "worker",
+            "task",
+            "submit",
+            "--agent",
+            "codex",
+            "--prompt",
+            "x",
+            "--interrupt",
+        ])
+        .is_err()
+    );
+    assert!(Cli::try_parse_from(["worker", "task", "status", id, "--interrupt"]).is_err());
+}
+
+#[test]
 fn task_list_json_envelope_flattens_the_shared_projection() {
     let projection = TaskListProjection {
         tasks: Vec::new(),
