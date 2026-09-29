@@ -867,18 +867,51 @@ fn ssh_exec_args(
 
 fn ssh_option_args(target: SshTarget, clear_forwardings: bool) -> Vec<OsString> {
     let settings = current_ssh_settings();
-    let mut args = Vec::new();
-    if target == SshTarget::Worker
-        && let Some(path) = &settings.config_file
-    {
-        args.extend([OsString::from("-F"), path.as_os_str().to_owned()]);
-    }
+    let mut args = ssh_config_file_args(target, &settings);
     args.extend(
         option_values(&settings, target, clear_forwardings)
             .into_iter()
             .flat_map(|value| [OsString::from("-o"), OsString::from(value)]),
     );
     args
+}
+
+/// Dashboard local-forward options. Always a dedicated connection: multiplexing
+/// would hide a dead path inside a shared ControlMaster, and the forward has
+/// its own server keepalives.
+fn ssh_forward_option_args(target: SshTarget) -> Vec<OsString> {
+    let settings = current_ssh_settings();
+    let mut args = ssh_config_file_args(target, &settings);
+    args.push("-T".into());
+    args.extend(
+        forward_option_values()
+            .into_iter()
+            .flat_map(|value| [OsString::from("-o"), OsString::from(value)]),
+    );
+    args
+}
+
+fn ssh_config_file_args(target: SshTarget, settings: &SshSettings) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if target == SshTarget::Worker
+        && let Some(path) = &settings.config_file
+    {
+        args.extend([OsString::from("-F"), path.as_os_str().to_owned()]);
+    }
+    args
+}
+
+fn forward_option_values() -> Vec<String> {
+    vec![
+        "BatchMode=yes".to_owned(),
+        "ConnectTimeout=5".to_owned(),
+        "ForwardAgent=no".to_owned(),
+        "ExitOnForwardFailure=yes".to_owned(),
+        "ControlMaster=no".to_owned(),
+        "ControlPath=none".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
+    ]
 }
 
 fn ssh_shell_options(target: SshTarget, clear_forwardings: bool) -> Result<String, WorkerError> {
@@ -1086,7 +1119,9 @@ pub(crate) fn ssh_exec_request(
 
 /// SSH argv for a same-port local forward. Unlike [`ssh_request`], this keeps
 /// local forwards (`ExitOnForwardFailure=yes`, no `ClearAllForwardings`) so the
-/// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`.
+/// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`. The forward is always
+/// its own connection (`-T`, `ControlMaster=no`, `ControlPath=none`) with
+/// server keepalives, even when `[ssh] multiplex` is on.
 pub(crate) fn ssh_local_forward_request(
     target: SshTarget,
     destination: &str,
@@ -1095,7 +1130,7 @@ pub(crate) fn ssh_local_forward_request(
     policy: ProcessPolicy,
 ) -> Result<ProcessRequest, WorkerError> {
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{port}");
-    let mut args = ssh_option_args(target, false);
+    let mut args = ssh_forward_option_args(target);
     args.push("-L".into());
     args.push(forward.into());
     args.push("--".into());
@@ -1411,32 +1446,6 @@ mod tests {
                     "true",
                 ]
             );
-            let forward = ssh_local_forward_request(
-                SshTarget::Worker,
-                "mac1",
-                9,
-                "true".into(),
-                tiny_policy(),
-            )
-            .unwrap();
-            assert_eq!(
-                arg_strings(&forward.args),
-                [
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "ForwardAgent=no",
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-L",
-                    "127.0.0.1:9:127.0.0.1:9",
-                    "--",
-                    "mac1",
-                    "true",
-                ]
-            );
             assert_eq!(
                 git_ssh_command_line(SshTarget::Worker, OsStr::new("/usr/bin/ssh")).unwrap(),
                 "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
@@ -1447,7 +1456,97 @@ mod tests {
                     "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
                 )
             );
+            let forward = ssh_local_forward_request(
+                SshTarget::Worker,
+                "mac1",
+                9,
+                "true".into(),
+                tiny_policy(),
+            )
+            .unwrap();
+            assert_dedicated_forward(&arg_strings(&forward.args));
         });
+    }
+
+    #[test]
+    fn dashboard_forward_stays_dedicated_when_multiplex_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        with_ssh_settings(
+            SshSettings {
+                multiplex: true,
+                config_file: None,
+                control_dir: Some(dir.path().to_path_buf()),
+            },
+            || {
+                let forward = ssh_local_forward_request(
+                    SshTarget::Worker,
+                    "mac1",
+                    9173,
+                    "true".into(),
+                    tiny_policy(),
+                )
+                .unwrap();
+                let forward_args = arg_strings(&forward.args);
+                assert_dedicated_forward(&forward_args);
+                assert!(
+                    !forward_args.iter().any(|arg| {
+                        arg == "ControlMaster=auto"
+                            || arg == "ControlPersist=60"
+                            || arg == "ServerAliveInterval=10"
+                            || (arg.starts_with("ControlPath=") && arg != "ControlPath=none")
+                    }),
+                    "forward joined the multiplex master: {forward_args:?}"
+                );
+
+                let worker = WorkerEntry {
+                    name: "mini-1".into(),
+                    ssh: "mac1".into(),
+                    slots: 1,
+                    capabilities: Vec::new(),
+                    remote_binary: "~/.local/bin/worker".into(),
+                    herdr: false,
+                };
+                let rpc = ssh_request(&worker, "true".into(), tiny_policy()).unwrap();
+                let rpc_args = arg_strings(&rpc.args);
+                assert!(rpc_args.iter().any(|arg| arg == "ControlMaster=auto"));
+                assert!(rpc_args.iter().any(|arg| arg == "ControlPersist=60"));
+                assert!(rpc_args.iter().any(|arg| arg == "ServerAliveInterval=10"));
+                assert!(rpc_args.iter().any(|arg| arg == "ClearAllForwardings=yes"));
+                assert!(
+                    !rpc_args
+                        .iter()
+                        .any(|arg| arg == "-T" || arg == "ControlMaster=no")
+                );
+                assert!(
+                    rpc_args
+                        .iter()
+                        .any(|arg| arg.starts_with("ControlPath=") && arg != "ControlPath=none")
+                );
+            },
+        );
+    }
+
+    fn assert_dedicated_forward(args: &[String]) {
+        assert!(args.iter().any(|arg| arg == "-T"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "-L"), "{args:?}");
+        for option in [
+            "BatchMode=yes",
+            "ConnectTimeout=5",
+            "ForwardAgent=no",
+            "ExitOnForwardFailure=yes",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=3",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == option),
+                "missing {option} in {args:?}"
+            );
+        }
+        assert!(!args.iter().any(|arg| arg.contains("ClearAllForwardings")));
+        assert!(!args.iter().any(|arg| arg == "ControlMaster=auto"));
+        assert!(!args.iter().any(|arg| arg == "ControlPersist=60"));
     }
 
     #[test]
