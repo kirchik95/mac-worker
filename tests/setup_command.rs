@@ -1255,87 +1255,64 @@ fn generated_verification_rejects_a_swapped_symlinked_bin_without_running_its_ta
 }
 
 #[test]
-fn generated_cleanup_rejects_every_unexpected_direct_entry_before_mutation() {
-    // Catches partial cleanup before direct-entry validation, including names
-    // that cannot be represented safely as newline-delimited text.
+fn generated_cleanup_and_rollback_reject_every_unexpected_direct_entry_before_mutation() {
+    // Catches partial cleanup, or restoring/removing the active helper,
+    // before every transaction and lock entry is validated with
+    // pathname-safe argv semantics, including names that cannot be
+    // represented safely as newline-delimited text.
     let commands = generated_setup_commands();
-    let cases = [
-        (false, "unexpected", UnexpectedEntryKind::File),
-        (false, ".unexpected", UnexpectedEntryKind::File),
-        (false, "unexpected-dir", UnexpectedEntryKind::Directory),
-        (false, "unexpected-link", UnexpectedEntryKind::Symlink),
-        (false, "embedded\nnewline", UnexpectedEntryKind::File),
-        (false, "trailing-newline\n", UnexpectedEntryKind::File),
-        (true, "unexpected", UnexpectedEntryKind::File),
-        (true, ".unexpected", UnexpectedEntryKind::File),
-        (true, "unexpected-dir", UnexpectedEntryKind::Directory),
-        (true, "unexpected-link", UnexpectedEntryKind::Symlink),
-        (true, "embedded\nnewline", UnexpectedEntryKind::File),
-        (true, "trailing-newline\n", UnexpectedEntryKind::File),
-    ];
+    for rollback in [false, true] {
+        let command_name = if rollback { "rollback" } else { "cleanup" };
+        let cases = [
+            (false, "unexpected", UnexpectedEntryKind::File),
+            (false, ".unexpected", UnexpectedEntryKind::File),
+            (false, "unexpected-dir", UnexpectedEntryKind::Directory),
+            (false, "unexpected-link", UnexpectedEntryKind::Symlink),
+            (false, "embedded\nnewline", UnexpectedEntryKind::File),
+            (false, "trailing-newline\n", UnexpectedEntryKind::File),
+            (true, "unexpected", UnexpectedEntryKind::File),
+            (true, ".unexpected", UnexpectedEntryKind::File),
+            (true, "unexpected-dir", UnexpectedEntryKind::Directory),
+            (true, "unexpected-link", UnexpectedEntryKind::Symlink),
+            (true, "embedded\nnewline", UnexpectedEntryKind::File),
+            (true, "trailing-newline\n", UnexpectedEntryKind::File),
+        ];
 
-    for (in_lock, name, kind) in cases {
-        let directory = tempdir().unwrap();
-        let home = directory.path().join("home");
-        let (active, lock, transaction) = promoted_fixture(&home, None);
-        let root = if in_lock { &lock } else { &transaction };
-        let unexpected = plant_unexpected_entry(root, name, kind);
-        let output = run_remote_command(&commands.cleanup, &home);
+        for (in_lock, name, kind) in cases {
+            let directory = tempdir().unwrap();
+            let home = directory.path().join("home");
+            let previous: Option<&[u8]> = if rollback {
+                Some(b"previous worker")
+            } else {
+                None
+            };
+            let (active, lock, transaction) = promoted_fixture(&home, previous);
+            let root = if in_lock { &lock } else { &transaction };
+            let unexpected = plant_unexpected_entry(root, name, kind);
+            let command = if rollback {
+                &commands.rollback
+            } else {
+                &commands.cleanup
+            };
+            let output = run_remote_command(command, &home);
 
-        assert!(
-            !output.status.success(),
-            "cleanup accepted {kind:?} entry {name:?} in {}",
-            root.display()
-        );
-        assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
-        assert!(lock.join("owner").is_file());
-        assert!(transaction.join("candidate.sha256").is_file());
-        assert!(transaction.join("no-previous").is_file());
-        assert!(transaction.join("state").is_file());
-        assert!(fs::symlink_metadata(&unexpected).is_ok());
-    }
-}
-
-#[test]
-fn generated_rollback_rejects_every_unexpected_direct_entry_before_mutation() {
-    // Catches restoring/removing the active helper before validating every
-    // transaction and lock entry with pathname-safe argv semantics.
-    let commands = generated_setup_commands();
-    let cases = [
-        (false, "unexpected", UnexpectedEntryKind::File),
-        (false, ".unexpected", UnexpectedEntryKind::File),
-        (false, "unexpected-dir", UnexpectedEntryKind::Directory),
-        (false, "unexpected-link", UnexpectedEntryKind::Symlink),
-        (false, "embedded\nnewline", UnexpectedEntryKind::File),
-        (false, "trailing-newline\n", UnexpectedEntryKind::File),
-        (true, "unexpected", UnexpectedEntryKind::File),
-        (true, ".unexpected", UnexpectedEntryKind::File),
-        (true, "unexpected-dir", UnexpectedEntryKind::Directory),
-        (true, "unexpected-link", UnexpectedEntryKind::Symlink),
-        (true, "embedded\nnewline", UnexpectedEntryKind::File),
-        (true, "trailing-newline\n", UnexpectedEntryKind::File),
-    ];
-
-    for (in_lock, name, kind) in cases {
-        let directory = tempdir().unwrap();
-        let home = directory.path().join("home");
-        let (active, lock, transaction) = promoted_fixture(&home, Some(b"previous worker"));
-        let root = if in_lock { &lock } else { &transaction };
-        let unexpected = plant_unexpected_entry(root, name, kind);
-        let output = run_remote_command(&commands.rollback, &home);
-
-        assert!(
-            !output.status.success(),
-            "rollback accepted {kind:?} entry {name:?} in {}",
-            root.display()
-        );
-        assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
-        assert!(lock.join("owner").is_file());
-        assert!(transaction.join("candidate.sha256").is_file());
-        assert!(transaction.join("worker.previous").is_file());
-        assert!(transaction.join("previous.sha256").is_file());
-        assert!(transaction.join("state").is_file());
-        assert!(fs::symlink_metadata(&unexpected).is_ok());
+            assert!(
+                !output.status.success(),
+                "{command_name} accepted {kind:?} entry {name:?} in {}",
+                root.display()
+            );
+            assert_eq!(fs::read(&active).unwrap(), CANDIDATE_BYTES);
+            assert!(lock.join("owner").is_file());
+            assert!(transaction.join("candidate.sha256").is_file());
+            if rollback {
+                assert!(transaction.join("worker.previous").is_file());
+                assert!(transaction.join("previous.sha256").is_file());
+            } else {
+                assert!(transaction.join("no-previous").is_file());
+            }
+            assert!(transaction.join("state").is_file());
+            assert!(fs::symlink_metadata(&unexpected).is_ok());
+        }
     }
 }
 
@@ -1713,52 +1690,77 @@ fn failed_verification_restores_owned_backup_and_releases_lock() {
 }
 
 #[test]
-fn a_failed_or_stalled_warmup_does_not_fail_setup_when_verification_passes() {
-    // Warm-up exists only to absorb Gatekeeper's first launch; verification
-    // still decides, and a diagnostic warning is the only leftover.
+fn a_failed_or_stalled_warmup_or_facts_refresh_does_not_fail_setup_when_verification_passes() {
+    // Warm-up exists only to absorb Gatekeeper's first launch and facts
+    // collection may miss its generous deadline; verification still decides,
+    // and a diagnostic warning is the only leftover. Facts refresh tells the
+    // operator to retry with --refresh.
     let (_directory, current_exe) = executable_fixture();
-    for (label, warmup) in [
+    for (step, index, code, deadline, nonzero_stderr) in [
         (
-            "nonzero",
-            Ok(result(1, b"", b"gatekeeper assessment failed")),
+            "warmup",
+            7,
+            SetupWarningCode::WarmupFailed,
+            90,
+            "gatekeeper assessment failed",
         ),
         (
-            "deadline",
-            Err(WorkerError::Process(ProcessError::DeadlineExceeded {
-                deadline: Duration::from_secs(90),
-            })),
+            "facts refresh",
+            8,
+            SetupWarningCode::FactsRefreshFailed,
+            120,
+            "agent version probe failed",
         ),
     ] {
-        let mut results = success_results();
-        results[7] = warmup;
-        let runner = RecordingRunner::returning_results(results);
-        let installer =
-            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+        for (label, outcome) in [
+            ("nonzero", Ok(result(1, b"", nonzero_stderr.as_bytes()))),
+            (
+                "deadline",
+                Err(WorkerError::Process(ProcessError::DeadlineExceeded {
+                    deadline: Duration::from_secs(deadline),
+                })),
+            ),
+        ] {
+            let mut results = success_results();
+            results[index] = outcome;
+            let runner = RecordingRunner::returning_results(results);
+            let installer =
+                Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
 
-        let installed = installer.install(&current_exe, &worker());
+            let installed = installer.install(&current_exe, &worker());
 
-        assert!(installed.installed, "{label}");
-        assert_eq!(
-            installed.protocol_version,
-            Some(PROTOCOL_VERSION),
-            "{label}"
-        );
-        assert_eq!(installed.error_code, None, "{label}");
-        assert_eq!(installed.warnings.len(), 1, "{label}");
-        assert_eq!(
-            installed.warnings[0].code,
-            SetupWarningCode::WarmupFailed,
-            "{label}"
-        );
-        let requests = runner.requests();
-        let commands = generated_setup_commands();
-        assert_remote_command(&requests[7], &commands.warmup);
-        assert_remote_command(&requests[8], &commands.facts_refresh);
-        assert_remote_command(&requests[9], &commands.verification);
-        assert_remote_command(&requests[10], &commands.success_cleanup);
-        assert_remote_command(&requests[11], &commands.outbox_wake);
-        assert!(!contains_remote_command(&requests, &commands.rollback));
-        assert_eq!(installed.outbox.as_deref(), Some("not_enabled"), "{label}");
+            assert!(installed.installed, "{step} {label}");
+            assert_eq!(
+                installed.protocol_version,
+                Some(PROTOCOL_VERSION),
+                "{step} {label}"
+            );
+            assert_eq!(installed.error_code, None, "{step} {label}");
+            assert_eq!(installed.warnings.len(), 1, "{step} {label}");
+            assert_eq!(installed.warnings[0].code, code, "{step} {label}");
+            if code == SetupWarningCode::FactsRefreshFailed {
+                assert!(
+                    installed.warnings[0]
+                        .message
+                        .contains("worker workers --refresh"),
+                    "{step} {label}: {}",
+                    installed.warnings[0].message
+                );
+            }
+            let requests = runner.requests();
+            let commands = generated_setup_commands();
+            assert_remote_command(&requests[7], &commands.warmup);
+            assert_remote_command(&requests[8], &commands.facts_refresh);
+            assert_remote_command(&requests[9], &commands.verification);
+            assert_remote_command(&requests[10], &commands.success_cleanup);
+            assert_remote_command(&requests[11], &commands.outbox_wake);
+            assert!(!contains_remote_command(&requests, &commands.rollback));
+            assert_eq!(
+                installed.outbox.as_deref(),
+                Some("not_enabled"),
+                "{step} {label}"
+            );
+        }
     }
 }
 
@@ -1804,60 +1806,6 @@ fn failed_verification_after_warmup_failure_still_rolls_back_and_keeps_warmup_on
     assert_remote_command(&requests[8], &commands.facts_refresh);
     assert_remote_command(&requests[9], &commands.verification);
     assert_remote_command(&requests[10], &commands.rollback);
-}
-
-#[test]
-fn a_failed_or_stalled_facts_refresh_does_not_fail_setup_when_verification_passes() {
-    // Facts collection is allowed to miss its generous deadline; verification
-    // still decides, and the operator is told to retry with --refresh.
-    let (_directory, current_exe) = executable_fixture();
-    for (label, facts_refresh) in [
-        ("nonzero", Ok(result(1, b"", b"agent version probe failed"))),
-        (
-            "deadline",
-            Err(WorkerError::Process(ProcessError::DeadlineExceeded {
-                deadline: Duration::from_secs(120),
-            })),
-        ),
-    ] {
-        let mut results = success_results();
-        results[8] = facts_refresh;
-        let runner = RecordingRunner::returning_results(results);
-        let installer =
-            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
-
-        let installed = installer.install(&current_exe, &worker());
-
-        assert!(installed.installed, "{label}");
-        assert_eq!(
-            installed.protocol_version,
-            Some(PROTOCOL_VERSION),
-            "{label}"
-        );
-        assert_eq!(installed.error_code, None, "{label}");
-        assert_eq!(installed.warnings.len(), 1, "{label}");
-        assert_eq!(
-            installed.warnings[0].code,
-            SetupWarningCode::FactsRefreshFailed,
-            "{label}"
-        );
-        assert!(
-            installed.warnings[0]
-                .message
-                .contains("worker workers --refresh"),
-            "{label}: {}",
-            installed.warnings[0].message
-        );
-        let requests = runner.requests();
-        let commands = generated_setup_commands();
-        assert_remote_command(&requests[7], &commands.warmup);
-        assert_remote_command(&requests[8], &commands.facts_refresh);
-        assert_remote_command(&requests[9], &commands.verification);
-        assert_remote_command(&requests[10], &commands.success_cleanup);
-        assert_remote_command(&requests[11], &commands.outbox_wake);
-        assert!(!contains_remote_command(&requests, &commands.rollback));
-        assert_eq!(installed.outbox.as_deref(), Some("not_enabled"), "{label}");
-    }
 }
 
 #[test]
@@ -2183,103 +2131,54 @@ fn setup_wakes_the_outbox_after_a_successful_install_and_renders_the_outcome() {
 }
 
 #[test]
-fn setup_human_output_surfaces_cleanup_warning_after_verified_success() {
+fn setup_human_output_surfaces_each_warning_after_verified_success() {
     // Catches showing only "installed" while hiding that the owned lock or
-    // installation-scoped state could not be removed.
-    let output = CommandOutput::Setup(SetupReport {
-        protocol_version: PROTOCOL_VERSION,
-        workers: vec![SetupHostResult {
-            name: "mini-1".into(),
-            ssh: "mac1".into(),
-            installed: true,
-            protocol_version: Some(PROTOCOL_VERSION),
-            error_code: None,
-            error_message: None,
-            failure_kind: None,
-            warnings: vec![SetupWarning {
-                code: SetupWarningCode::CleanupFailed,
-                message: "lock release failed".into(),
+    // installation-scoped state could not be removed, that the warm-up
+    // failed, or that agent facts were not refreshed.
+    for (code, message, rendered) in [
+        (
+            SetupWarningCode::CleanupFailed,
+            "lock release failed",
+            "warning [CLEANUP_FAILED]: lock release failed",
+        ),
+        (
+            SetupWarningCode::WarmupFailed,
+            "process exceeded its 90s execution deadline",
+            "warning [WARMUP_FAILED]: process exceeded its 90s execution deadline",
+        ),
+        (
+            SetupWarningCode::FactsRefreshFailed,
+            "agent facts were not refreshed during setup; run `worker workers --refresh`",
+            "warning [FACTS_REFRESH_FAILED]: agent facts were not refreshed during setup; run `worker workers --refresh`",
+        ),
+    ] {
+        let output = CommandOutput::Setup(SetupReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers: vec![SetupHostResult {
+                name: "mini-1".into(),
+                ssh: "mac1".into(),
+                installed: true,
+                protocol_version: Some(PROTOCOL_VERSION),
+                error_code: None,
+                error_message: None,
+                failure_kind: None,
+                warnings: vec![SetupWarning {
+                    code,
+                    message: message.into(),
+                }],
+                outbox: None,
+                controller_service: None,
+                build_id: None,
+                binary_sha256: None,
             }],
-            outbox: None,
-            controller_service: None,
-            build_id: None,
-            binary_sha256: None,
-        }],
-        warnings: Vec::new(),
-    });
+            warnings: Vec::new(),
+        });
 
-    assert_eq!(
-        output.render_human(),
-        format!(
-            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [CLEANUP_FAILED]: lock release failed"
-        )
-    );
-}
-
-#[test]
-fn setup_human_output_surfaces_warmup_warning_after_verified_success() {
-    let output = CommandOutput::Setup(SetupReport {
-        protocol_version: PROTOCOL_VERSION,
-        workers: vec![SetupHostResult {
-            name: "mini-1".into(),
-            ssh: "mac1".into(),
-            installed: true,
-            protocol_version: Some(PROTOCOL_VERSION),
-            error_code: None,
-            error_message: None,
-            failure_kind: None,
-            warnings: vec![SetupWarning {
-                code: SetupWarningCode::WarmupFailed,
-                message: "process exceeded its 90s execution deadline".into(),
-            }],
-            outbox: None,
-            controller_service: None,
-            build_id: None,
-            binary_sha256: None,
-        }],
-        warnings: Vec::new(),
-    });
-
-    assert_eq!(
-        output.render_human(),
-        format!(
-            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [WARMUP_FAILED]: process exceeded its 90s execution deadline"
-        )
-    );
-}
-
-#[test]
-fn setup_human_output_surfaces_facts_refresh_warning_after_verified_success() {
-    let output = CommandOutput::Setup(SetupReport {
-        protocol_version: PROTOCOL_VERSION,
-        workers: vec![SetupHostResult {
-            name: "mini-1".into(),
-            ssh: "mac1".into(),
-            installed: true,
-            protocol_version: Some(PROTOCOL_VERSION),
-            error_code: None,
-            error_message: None,
-            failure_kind: None,
-            warnings: vec![SetupWarning {
-                code: SetupWarningCode::FactsRefreshFailed,
-                message:
-                    "agent facts were not refreshed during setup; run `worker workers --refresh`"
-                        .into(),
-            }],
-            outbox: None,
-            controller_service: None,
-            build_id: None,
-            binary_sha256: None,
-        }],
-        warnings: Vec::new(),
-    });
-
-    assert_eq!(
-        output.render_human(),
-        format!(
-            "mini-1: installed (protocol {PROTOCOL_VERSION})\n  warning [FACTS_REFRESH_FAILED]: agent facts were not refreshed during setup; run `worker workers --refresh`"
-        )
-    );
+        assert_eq!(
+            output.render_human(),
+            format!("mini-1: installed (protocol {PROTOCOL_VERSION})\n  {rendered}")
+        );
+    }
 }
 
 #[test]
