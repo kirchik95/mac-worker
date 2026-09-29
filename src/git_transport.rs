@@ -927,11 +927,18 @@ fn origin_push_error(stderr: &[u8]) -> WorkerError {
 
 fn origin_auth_failed(stderr: &[u8]) -> bool {
     let stderr = String::from_utf8_lossy(stderr);
-    stderr.contains("could not read Username")
-        || stderr.contains("Authentication failed")
-        || stderr.contains("401")
-        || stderr.contains("403")
-        || stderr.contains("Permission denied (publickey)")
+    // Match Git's own messages, never bare status digits: repository paths,
+    // object ids and hook output routinely contain "401" or "403".
+    [
+        "could not read Username",
+        "Authentication failed",
+        "returned error: 401",
+        "returned error: 403",
+        "HTTP Basic: Access denied",
+        "Permission denied (publickey)",
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
 }
 
 fn origin_request(origin: String) -> Result<ProcessRequest, WorkerError> {
@@ -1707,6 +1714,25 @@ mod tests {
             ]
         );
         assert_eq!(env(push, GIT_CONFIG_GLOBAL), "/dev/null");
+    }
+
+    #[test]
+    fn origin_auth_needs_git_auth_messages_not_status_digits() {
+        for stderr in [
+            "fatal: unable to access 'https://example.test/r.git/': The requested URL returned error: 403\n",
+            "fatal: unable to access 'https://example.test/r.git/': The requested URL returned error: 401\n",
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://example.test/r.git/'\n",
+            "git@example.test: Permission denied (publickey).\n",
+        ] {
+            assert!(origin_auth_failed(stderr.as_bytes()), "{stderr}");
+        }
+        // A hook rejection whose temporary path and object id contain the digits.
+        let rejected = "remote: rejected by policy\nTo /private/var/folders/x/T/.tmp403Ab1/origin.git\n ! [remote rejected] 4015c0de -> release (pre-receive hook declined)\nerror: failed to push some refs\n";
+        assert!(!origin_auth_failed(rejected.as_bytes()));
+        assert_eq!(
+            origin_push_error(rejected.as_bytes()).public_code(),
+            "PUBLISH_FAILED"
+        );
     }
 
     #[test]
