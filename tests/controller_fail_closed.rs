@@ -5,7 +5,7 @@
 //! runtime (`MAC_WORKER_TEST_SSH` + `run_enabled_controller_task`); tests
 //! stay un-ignored.
 
-#[path = "controller_fail_closed_harness.rs"]
+#[path = "support/controller_fail_closed_harness.rs"]
 mod harness;
 
 use harness::{
