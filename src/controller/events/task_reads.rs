@@ -826,7 +826,10 @@ pub fn record_facts(
         close_intent: record.close_intent().is_some(),
         auto_continue_intent: record.auto_continue_intent().is_some(),
         queue_dispatching: dispatching,
-        result_imported: record.fetched_head().is_some(),
+        result_imported: record
+            .status()
+            .head_oid()
+            .is_some_and(|head| record.fetched_head() == Some(head)),
         busy,
         quiescent,
         fact_digest: digest(&record.canonical_bytes().map_err(|_| invalid_state())?),

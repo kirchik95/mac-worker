@@ -1158,6 +1158,47 @@ mod state_reads {
         assert_eq!(facts.busy, Some(true));
         assert_eq!(facts.quiescent, Some(false));
     }
+
+    #[test]
+    fn review_result_imported_requires_current_host_head() {
+        let (_root, paths, runtime) = fixture();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        for (head, fetched, imported) in [
+            (Some("a"), None, false),
+            (Some("a"), Some("a"), true),
+            (Some("b"), Some("a"), false),
+            (None, Some("a"), false),
+            (None, None, false),
+        ] {
+            let mut wire =
+                serde_json::to_value(record(1, TaskState::Open, TaskOutcome::Done)).unwrap();
+            wire["status"]["head_oid"] =
+                serde_json::to_value(head.map(|value| value.repeat(40))).unwrap();
+            wire["fetched_head"] =
+                serde_json::to_value(fetched.map(|value| value.repeat(40))).unwrap();
+            let task: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+            write_record(&paths, &task);
+            let addressed = reader
+                .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
+                .unwrap()
+                .value;
+            let repair = reader
+                .repair_read(None, 64, Duration::from_secs(30))
+                .unwrap()
+                .value;
+            assert!(repair.complete);
+            for facts in [&addressed.rows[0], &repair.rows[0]] {
+                assert_eq!(
+                    facts.result_imported, imported,
+                    "head={head:?}, fetched={fetched:?}"
+                );
+                // Import status remains informational, without affecting wait proof.
+                assert_eq!(facts.busy, Some(false));
+                assert_eq!(facts.quiescent, Some(true));
+            }
+        }
+    }
+
     #[test]
     fn unsafe_root_and_changed_task_binding_fail_closed() {
         let (_root, paths, runtime) = fixture();
