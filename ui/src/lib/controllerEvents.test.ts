@@ -102,10 +102,16 @@ function makeEventHarness() {
   }
 }
 
-function eventFrame(seq: string, kind: string, data: Record<string, unknown>, schema = 1) {
+function eventFrame(
+  seq: string,
+  kind: string,
+  data: Record<string, unknown>,
+  schema = 1,
+  journal = JOURNAL,
+) {
   return {
     schema_version: schema,
-    journal_id: JOURNAL,
+    journal_id: journal,
     seq,
     time_millis: 5,
     kind,
@@ -241,26 +247,118 @@ describe('controller events client', () => {
     expect(reopened.lastHealth()).toBe(false)
   })
 
-  it('reset_controls_never_skip_cursor', () => {
+  it('bootstrap then ready then a future event stays healthy on one source', () => {
     const h = makeEventHarness()
     h.client.start()
-    h.emit(
-      'controller.event',
-      eventFrame('3', 'task.changed', { task_id: TASK, state: 'active' }),
-      `${JOURNAL}:3`,
-    )
-    h.emit('ready', {
-      journal_id: JOURNAL,
-      oldest_seq: '1',
-      head_seq: '9007199254740993',
+    const window = fixtures.bootstrap.data.window
+    for (const delay of [1_000, 2_000, 4_000, 5_000]) {
+      h.emitFixture('bootstrap')
+      h.emit('ready', window)
+      expect(h.closedSources()).toBe(0)
+      h.advance(delay)
+      expect(h.sourceCount()).toBe(1)
+    }
+    expect(h.lastHealth()).toBe(true)
+    expect(h.lastReconnectUrl()).toBe('/api/v1/events')
+    h.emit('controller.event', eventFrame('4', 'queue.changed', {}), `${JOURNAL}:4`)
+    expect(h.sourceCount()).toBe(1)
+    expect(h.closedSources()).toBe(0)
+    h.error()
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).toContain(`${JOURNAL}:4`)
+    expect(h.lastReconnectUrl()).not.toContain(window.head_seq)
+  })
+
+  it('cursor_expired rebaselines without the stale cursor', () => {
+    const h = makeEventHarness()
+    h.client.start()
+    h.emit('controller.event', eventFrame('3', 'queue.changed', {}), `${JOURNAL}:3`)
+    h.emit('snapshot_required', {
+      reason: 'cursor_expired',
+      window: { journal_id: JOURNAL, oldest_seq: '10', head_seq: '42' },
     })
     expect(h.closedSources()).toBe(0)
-    h.emitFixture('bootstrap')
+    expect(h.sourceCount()).toBe(1)
+    h.emit('ready', { journal_id: JOURNAL, oldest_seq: '10', head_seq: '42' })
+    expect(h.lastHealth()).toBe(true)
+    expect(h.sourceCount()).toBe(1)
+    h.error()
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).toBe('/api/v1/events')
+    expect(h.lastReconnectUrl()).not.toContain(':3')
+    expect(h.lastReconnectUrl()).not.toContain(':42')
+  })
+
+  it('lag repair reconnects without the stale cursor when the server closes', () => {
+    const h = makeEventHarness()
+    h.client.start()
+    h.emit('controller.event', eventFrame('3', 'queue.changed', {}), `${JOURNAL}:3`)
+    h.emit('snapshot_required', {
+      reason: 'lagged',
+      window: { journal_id: JOURNAL, oldest_seq: '1', head_seq: '42' },
+    })
+    expect(h.closedSources()).toBe(0)
+    h.error()
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).toBe('/api/v1/events')
+    expect(h.lastReconnectUrl()).not.toContain(':3')
+    expect(h.lastReconnectUrl()).not.toContain(':42')
+  })
+
+  it('repeats journal_changed epoch repair on the open stream', () => {
+    const next = '00000000-0000-0000-0000-000000000009'
+    const third = '11111111-1111-4111-8111-111111111111'
+    const h = makeEventHarness()
+    h.client.start()
+    h.emit('controller.event', eventFrame('3', 'queue.changed', {}), `${JOURNAL}:3`)
+    for (const journal of [next, third]) {
+      const window = { journal_id: journal, oldest_seq: '1', head_seq: '0' }
+      h.emit('snapshot_required', { reason: 'journal_changed', window })
+      expect(h.closedSources()).toBe(0)
+      h.emit('ready', window)
+      h.emit(
+        'controller.event',
+        eventFrame('1', 'queue.changed', {}, 1, journal),
+        `${journal}:1`,
+      )
+    }
+    expect(h.sourceCount()).toBe(1)
+    expect(h.closedSources()).toBe(0)
+    expect(h.lastHealth()).toBe(true)
+    h.error()
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).toContain(`${third}:1`)
+    expect(h.lastReconnectUrl()).not.toContain(JOURNAL)
+  })
+
+  it('does not lose an event when replay follows ready', () => {
+    const h = makeEventHarness()
+    h.client.start()
+    h.emit('controller.event', eventFrame('3', 'queue.changed', {}), `${JOURNAL}:3`)
+    h.emit('ready', { journal_id: JOURNAL, oldest_seq: '1', head_seq: '10' })
+    expect(h.closedSources()).toBe(0)
+    expect(h.sourceCount()).toBe(1)
+    h.emit('controller.event', eventFrame('4', 'queue.changed', {}), `${JOURNAL}:4`)
+    h.advance(100)
+    expect(h.closedSources()).toBe(0)
+    h.error()
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).toContain(`${JOURNAL}:4`)
+    expect(h.lastReconnectUrl()).not.toContain(':10')
+  })
+
+  it('unavailable still closes and keeps the event cursor', () => {
+    const h = makeEventHarness()
+    h.client.start()
+    h.emit('controller.event', eventFrame('3', 'queue.changed', {}), `${JOURNAL}:3`)
+    h.emit('snapshot_required', {
+      reason: 'unavailable',
+      code: 'CONTROLLER_EVENTS_UNAVAILABLE',
+      window: null,
+    })
     expect(h.closedSources()).toBeGreaterThan(0)
     h.advance(1_000)
-    const url = h.lastReconnectUrl()
-    expect(url).toContain(`${JOURNAL}:3`)
-    expect(url).not.toContain('9007199254740993')
+    expect(h.lastReconnectUrl()).toContain(`${JOURNAL}:3`)
   })
 
   it('unsubscribe_closes_timer_and_source', () => {

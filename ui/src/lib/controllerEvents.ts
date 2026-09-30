@@ -59,7 +59,8 @@ type Frame =
   | { type: 'malformed' }
   | { type: 'heartbeat' }
   | { type: 'ready' }
-  | { type: 'snapshot_required' }
+  | { type: 'unavailable' }
+  | { type: 'repair' }
   | { type: 'snapshot_ready' }
   | { type: 'event'; cursor: EventCursor; taskIds: string[] | null }
 
@@ -239,8 +240,18 @@ export function createControllerEvents(options: EventClientOptions): EventClient
       return
     }
     const frame = interpretFrame(name, raw, event.lastEventId)
-    if (frame.type === 'malformed' || frame.type === 'snapshot_required') {
+    if (frame.type === 'malformed' || frame.type === 'unavailable') {
       fail(false)
+      return
+    }
+    if (frame.type === 'repair') {
+      // The window is a repair baseline, not an event cursor. Drop it so a
+      // close after lag repair reconnects without the stale after query.
+      // Bootstrap, expiry, and epoch controls stay on this stream until ready.
+      cursor = null
+      setHealthy(false)
+      clearDebounce()
+      options.invalidate(null)
       return
     }
     if (frame.type === 'event') cursor = frame.cursor
@@ -294,11 +305,11 @@ function interpretFrame(name: string, raw: string, lastEventId: string): Frame {
 function interpretRepair(parsed: Record<string, unknown>): Frame {
   if (parsed.reason === 'unavailable' && parsed.window === null) {
     return typeof parsed.code === 'string' && UNAVAILABLE_CODES.has(parsed.code)
-      ? { type: 'snapshot_required' }
+      ? { type: 'unavailable' }
       : { type: 'malformed' }
   }
   if (typeof parsed.reason !== 'string' || !REASON.test(parsed.reason)) return { type: 'malformed' }
-  return parseWindow(parsed.window) ? { type: 'snapshot_required' } : { type: 'malformed' }
+  return parseWindow(parsed.window) ? { type: 'repair' } : { type: 'malformed' }
 }
 
 function interpretEvent(parsed: Record<string, unknown>, lastEventId: string): Frame {
