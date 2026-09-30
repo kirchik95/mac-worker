@@ -1163,10 +1163,12 @@ fn run_controller_command(
                         let _ = stderr.flush();
                     }
                     if !envelopes.unreadable.is_empty() {
+                        let count = envelopes.unreadable.len();
                         let _ = writeln!(
                             stderr,
-                            "{} saved controller requests could not be read",
-                            envelopes.unreadable.len()
+                            "{} saved controller request{} could not be read",
+                            count,
+                            if count == 1 { "" } else { "s" }
                         );
                         let _ = stderr.flush();
                     }

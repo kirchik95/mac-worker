@@ -445,7 +445,7 @@ fn pending_rejects_duplicate_envelope_fields_like_explicit_retry() {
         let (exit, stdout, stderr) =
             fixture.run(&["controller", "pending", "--json"], &NoTransport);
         assert_eq!(exit, 0, "{stderr}");
-        assert_eq!(stderr, "1 saved controller requests could not be read\n");
+        assert_eq!(stderr, "1 saved controller request could not be read\n");
         let report: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(report["pending"], json!([]));
         assert_eq!(
