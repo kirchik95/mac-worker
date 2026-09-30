@@ -63,6 +63,10 @@ impl EventSink for CheckingSink {
 }
 
 fn task_record() -> LocalTaskRecord {
+    task_record_with_base("0123456789abcdef0123456789abcdef01234567".parse().unwrap())
+}
+
+fn task_record_with_base(base_oid: mac_worker::task::BaseOid) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
         task_id: TaskId::generate(),
         run_id: None,
@@ -78,7 +82,7 @@ fn task_record() -> LocalTaskRecord {
         },
         publish: vec![PublishMode::Fetch],
         publish_branch: None,
-        base_oid: "0123456789abcdef0123456789abcdef01234567".parse().unwrap(),
+        base_oid,
         limits: TaskLimits::default(),
         close_policy: ClosePolicy::Never,
         env_profile: None,
@@ -1022,4 +1026,368 @@ fn finalizer_changes_terminal_outcome() {
             .any(|event| matches!(event, NewEvent::TurnFinished(_)))
     );
     assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+}
+
+mod runner_events {
+    use super::*;
+    use mac_worker::{
+        config::Config,
+        controller::registry::ProjectRegistry,
+        error::WorkerError,
+        herdr::HerdrSocket,
+        job::{
+            CommandSpec, CommandSummary, JobMeta, JobState, JobStatus, LeaseToken, LogChunk,
+            LogStream, QueueEntry, QueueEntryKind, QueueState, RequestFingerprintMaterial,
+            StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
+        },
+        paths::PathLayout,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        scheduler::WorkerPreference,
+        task_store::{TaskStatusRequest, TaskStatusResponse},
+        transfer::HostOperation,
+        turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
+    };
+    use std::{ffi::OsStr, os::unix::process::ExitStatusExt, sync::Mutex};
+
+    struct TerminalWorker {
+        task: TaskId,
+        terminal: TaskStatus,
+        job: StatusResponse,
+        source: std::path::PathBuf,
+        fail_result_fetch: bool,
+        result_fetches: AtomicUsize,
+    }
+
+    fn reply(value: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(value).unwrap(),
+            stderr: Vec::new(),
+        })
+    }
+
+    impl ProcessRunner for TerminalWorker {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == OsStr::new("/usr/bin/git") {
+                if let Some(index) = request
+                    .args
+                    .iter()
+                    .position(|arg| arg.to_string_lossy().starts_with("--upload-pack="))
+                {
+                    self.result_fetches.fetch_add(1, Ordering::Relaxed);
+                    if self.fail_result_fetch {
+                        return Ok(ProcessResult {
+                            status: std::process::ExitStatus::from_raw(1 << 8),
+                            stdout: Vec::new(),
+                            stderr: b"fixture result unavailable".to_vec(),
+                        });
+                    }
+                    // Fetch the real result object from the temporary repository.
+                    // No Git or SSH request can reach the configured fake host.
+                    let mut local = request.clone();
+                    local.args.remove(index);
+                    let remote = local
+                        .args
+                        .iter_mut()
+                        .find(|arg| arg.to_string_lossy().starts_with("event-fixture:"))
+                        .unwrap();
+                    *remote = self.source.as_os_str().to_owned();
+                    return SystemProcessRunner.run(&local);
+                }
+                assert!(!request.args.iter().any(|arg| {
+                    let arg = arg.to_string_lossy();
+                    arg.starts_with("--receive-pack=") || arg.starts_with("event-fixture:")
+                }));
+                return SystemProcessRunner.run(request);
+            }
+            assert_eq!(request.program, OsStr::new("/usr/bin/ssh"));
+            let operation = request.args.last().and_then(|arg| arg.to_str());
+            let input = request.stdin.as_deref().unwrap();
+            if operation == Some(HostOperation::TaskStatus.command()) {
+                let query: TaskStatusRequest = serde_json::from_slice(input).unwrap();
+                assert_eq!(query.task_id(), self.task);
+                return reply(&TaskStatusResponse::new(self.terminal.clone()));
+            }
+            if operation == Some(HostOperation::StatusLogs.command()) {
+                let query: StatusLogsRequest = serde_json::from_slice(input).unwrap();
+                assert_eq!(query.job_id(), self.job.meta().job_id());
+                return reply(&StatusLogsResponse::new(
+                    self.job.clone(),
+                    LogChunk::new(LogStream::Stdout, query.stdout_offset(), Vec::new())?,
+                    LogChunk::new(LogStream::Stderr, query.stderr_offset(), Vec::new())?,
+                )?);
+            }
+            if operation == Some(HostOperation::Status.command()) {
+                let query: StatusRequest = serde_json::from_slice(input).unwrap();
+                assert_eq!(query.job_id(), self.job.meta().job_id());
+                return reply(&self.job);
+            }
+            panic!("unexpected fake worker operation: {operation:?}");
+        }
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        _repo: super::super::support::GitRepo,
+        paths: PathLayout,
+        config: Config,
+        store: ClientStateStore,
+        sink: Arc<CheckingSink>,
+        worker: TerminalWorker,
+        task: TaskId,
+        turn: TurnId,
+    }
+
+    impl Fixture {
+        fn new(fail_result_fetch: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let canonical = root.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                state: canonical.join("state"),
+                config: canonical.join("config.toml"),
+                cache: canonical.join("cache"),
+                data: canonical.join("data"),
+            };
+            let repo = super::super::support::GitRepo::init();
+            repo.write("base.txt", b"fixture\n");
+            repo.commit_all("base");
+            let head = repo.git(&["rev-parse", "HEAD"]);
+            assert!(head.status.success());
+            let record = task_record_with_base(
+                std::str::from_utf8(&head.stdout)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap(),
+            );
+            let task = record.meta().task_id();
+            let turn = record.status().turns()[0].turn_id();
+            let runner = InlineRunnerExecutor.start(&paths, task, turn).unwrap();
+            let owner = runner.process_identity();
+            let active = TaskStatus::new(
+                TaskState::Active,
+                None,
+                Some("mini-1".into()),
+                false,
+                None,
+                None,
+                vec![],
+                vec![],
+                None,
+                vec![TurnSummary::new(
+                    1,
+                    turn,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(110),
+                    None,
+                )],
+                110,
+            )
+            .unwrap();
+            let record = record
+                .with_status(active)
+                .unwrap()
+                .with_runner(Some(runner))
+                .unwrap();
+            let plain = ClientStateStore::open(&paths.state).unwrap();
+            ProjectRegistry::open(&paths.controller_state_root())
+                .unwrap()
+                .register(
+                    record.meta().project_id(),
+                    record.meta().worktree_id(),
+                    repo.root(),
+                )
+                .unwrap();
+            plain.create_task(record.clone()).unwrap();
+            plain.write_task_project_path(&record, repo.root()).unwrap();
+            plain
+                .write_turn_prompt(task, turn, "PRIVATE_PROMPT")
+                .unwrap();
+            enqueue(&plain, &record);
+            plain
+                .claim_next(owner, &["mini-1".into()], 110)
+                .unwrap()
+                .unwrap();
+            drop(plain.open_runner_log(task, turn).unwrap());
+            // Resume a durably accepted turn, without a completion checkpoint,
+            // so run() must drain the fake host and reach finish_terminal.
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+            let mut checkpoint = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    paths
+                        .state
+                        .join(format!("runners/{task}/{turn}.checkpoint.json")),
+                )
+                .unwrap();
+            checkpoint.write_all(&serde_json::to_vec(&serde_json::json!({
+                "version": 1, "task_id": task, "turn_id": turn,
+                "committed": { "offsets": [0, 0], "len": 0, "accepted": true, "completion": null },
+                "pending": null
+            })).unwrap()).unwrap();
+            checkpoint.sync_all().unwrap();
+            drop(checkpoint);
+            assert!(
+                repo.git(&["update-ref", &format!("refs/heads/task/{task}"), "HEAD"])
+                    .status
+                    .success()
+            );
+            let locked = vec![
+                paths.state.clone(),
+                paths.state.join("jobs.lock"),
+                paths.state.join("queue/lock"),
+                paths.state.join(format!("runners/{task}/{turn}.log")),
+            ];
+            let sink = Arc::new(CheckingSink::checking(move || locks_are_free(&locked)));
+            let material = RequestFingerprintMaterial::new(
+                turn,
+                plain.client_id(),
+                LeaseToken::new(turn.as_uuid()),
+                110,
+                "mini-1".into(),
+                record.meta().project_id().into(),
+                record.meta().worktree_id().into(),
+                "c".repeat(64),
+                String::new(),
+                60_000,
+                "heavy".into(),
+                CommandSpec::argv(vec!["true".into()]).unwrap(),
+            )
+            .unwrap();
+            let worker = TerminalWorker {
+                task,
+                terminal: terminal_record(&record, TaskOutcome::Done).status().clone(),
+                job: StatusResponse::new(
+                    JobMeta::new(&material, material.fingerprint()).unwrap(),
+                    JobStatus::new(
+                        JobState::Succeeded,
+                        120,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(0),
+                        None,
+                        Some(0),
+                        Some(0),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                source: repo.root().to_owned(),
+                fail_result_fetch,
+                result_fetches: AtomicUsize::new(0),
+            };
+            Self {
+                root, _repo: repo, paths,
+                config: Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"event-fixture\"\nslots = 1\n").unwrap(),
+                store: plain.with_event_sink(sink.clone()), sink, worker, task, turn,
+            }
+        }
+
+        fn runner(&self) -> TurnRunner<'_> {
+            TurnRunner::new(
+                &self.worker,
+                &self.config,
+                &self.paths,
+                &self.store,
+                &InlineRunnerExecutor,
+            )
+        }
+    }
+
+    fn enqueue(store: &ClientStateStore, record: &LocalTaskRecord) {
+        store
+            .enqueue(
+                QueueEntry::new(
+                    record.status().turns().last().unwrap().turn_id(),
+                    store.client_id(),
+                    record.meta().project_id().into(),
+                    record.meta().worktree_id().into(),
+                    CommandSummary::argv(1).unwrap(),
+                    vec![],
+                    WorkerPreference::Pinned {
+                        worker: "mini-1".into(),
+                    },
+                    QueueEntryKind::TaskTurn,
+                    None,
+                    owner(),
+                    100,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn finished_hint_precedes_notifier_and_parked_handoff() {
+        let fixture = Fixture::new(false);
+        let parked = task_record();
+        let parked_turn = parked.status().turns()[0].turn_id();
+        let server = super::super::support::fake_herdr::FakeHerdr::start_at(
+            fixture.root.path().join("herdr.sock"),
+        );
+        let observed = Arc::new(Mutex::new(None));
+        let hook_observed = observed.clone();
+        let store = fixture.store.clone();
+        let sink = fixture.sink.clone();
+        let turn = fixture.turn;
+        let log = fixture
+            .paths
+            .state
+            .join(format!("runners/{}/{turn}.log", fixture.task));
+        server.on_request(move |request| {
+            assert_eq!(request["method"], "notification.show");
+            let finished = sink
+                .events()
+                .iter()
+                .filter(
+                    |event| matches!(event, NewEvent::TurnFinished(hint) if hint.turn_id == turn),
+                )
+                .count();
+            // execute() also advances DAGs and may start existing parked rows.
+            // Introduce this recipient only now to isolate start_next_parked.
+            store.create_task(parked.clone()).unwrap();
+            store
+                .write_turn_prompt(parked.meta().task_id(), parked_turn, "PRIVATE_PROMPT")
+                .unwrap();
+            enqueue(&store, &parked);
+            store.park_row(parked_turn).unwrap();
+            let parked = store.queue_entry(parked_turn).unwrap().unwrap();
+            *hook_observed.lock().unwrap() = Some((
+                finished,
+                matches!(parked.state(), QueueState::Parked),
+                locks_are_free(std::slice::from_ref(&log)),
+            ));
+        });
+        let report = fixture
+            .runner()
+            .with_notifier(Some(HerdrSocket::at(server.path())))
+            .run(fixture.task, fixture.turn, None)
+            .unwrap();
+        assert_eq!(report.status().last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((1, true, true)),
+            "turn.finished must be on the sink during notification, before start_next_parked"
+        );
+        assert!(!matches!(
+            fixture
+                .store
+                .queue_entry(parked_turn)
+                .unwrap()
+                .unwrap()
+                .state(),
+            QueueState::Parked
+        ));
+        assert_eq!(fixture.worker.result_fetches.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
 }

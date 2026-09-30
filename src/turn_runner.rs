@@ -463,7 +463,6 @@ impl<'a> TurnRunner<'a> {
         mut follow: Option<&mut dyn Write>,
         allow_reassignment: bool,
     ) -> Result<TurnOutcomeReport, WorkerError> {
-        let _hints = self.client_state.event_scope();
         ignore_sigpipe();
         // Legacy batch dispatch recovery deliberately skips task-turn rows,
         // but keeping the call here preserves the runner's recovery stage
