@@ -26,6 +26,7 @@ pub const REPAIR_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const REPAIR_WORK_BUDGET: Duration = Duration::from_millis(50);
 pub const REPAIR_MAX_ROWS: usize = 128;
 pub const MAX_CONTINUATION_BYTES: usize = 2048;
+pub const SAME_BINDING_ESTALE_RETRIES: usize = 3;
 
 /// Validate the names-only registry before reading any task or queue record.
 pub fn sorted_task_ids(names: Vec<Vec<u8>>) -> Result<Vec<TaskId>, WorkerError> {
@@ -157,38 +158,151 @@ impl TaskEventReadStore {
                 .iter()
                 .enumerate()
                 .any(|(index, id)| ids[..index].contains(id))
-            || proof_after.is_some()
         {
             return Err(WorkerError::Protocol("CONTROLLER_EVENTS_INVALID".into()));
         }
+        let token = proof_after.map(decode_token::<ProofToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
-        let started = self.runtime.now();
+        let started = Instant::now();
+        let binding = ProofBinding {
+            state: self.repair_binding()?,
+            queue: directory_identity(&self.queue)?,
+            turns: directory_identity(&self.turns)?,
+        };
+        if token.as_ref().is_some_and(|token| {
+            token.version != 1 || token.kind != "proof" || token.binding != binding
+        }) {
+            return Err(invalid_cursor());
+        }
         let mut stats = TaskReadStats::default();
-        let (queue, _) = self.read_queue(&mut stats)?;
+        let (queue, queue_digest) = self.read_queue(deadline, &mut stats)?;
         let mut result = AddressedFacts {
             rows: Vec::new(),
             missing: Vec::new(),
             proof_after: None,
         };
+        let mut snapshots = Vec::new();
         for &id in ids {
             self.check_deadline(deadline)?;
-            let Some(record) = self.read_task(id, &mut stats)? else {
+            let Some(record) = self.read_task(id, deadline, &mut stats)? else {
                 result.missing.push(id);
                 continue;
             };
-            let dispatching =
-                if crate::client_state::task_operator_busy_reason(&record, None).is_some() {
-                    None
-                } else {
-                    self.dispatching(id, &queue, &mut stats)?
-                };
-            result
-                .rows
-                .push(record_facts(&record, dispatching, include_titles)?);
+            let facts = record_facts(&record, None, include_titles)?;
+            let known_busy = facts.busy == Some(true);
+            let namespace = if known_busy {
+                None
+            } else {
+                self.turn_namespace(id, deadline)?
+            };
+            let generation = namespace.as_ref().map(directory_generation).transpose()?;
+            snapshots.push(TaskSnapshot {
+                facts,
+                known_busy,
+                namespace,
+                generation,
+            });
+        }
+        let proofs = snapshots
+            .iter()
+            .map(|snapshot| {
+                (
+                    &snapshot.facts.task_id,
+                    &snapshot.facts.fact_digest,
+                    &snapshot.generation,
+                )
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = digest(
+            &serde_json::to_vec(&(&binding, &queue_digest, ids, proofs))
+                .map_err(|_| invalid_state())?,
+        );
+        let mut progress = match token {
+            Some(token) if token.fingerprint == fingerprint => token,
+            _ => ProofToken {
+                version: 1,
+                kind: "proof".into(),
+                binding,
+                fingerprint,
+                next_task: 0,
+                next_queue: 0,
+                matched: 0,
+            },
+        };
+        let mask = ((1_u32 << snapshots.len()) - 1) as u16;
+        if progress.next_task > snapshots.len()
+            || progress.next_queue > queue.entries().len()
+            || (progress.next_task == snapshots.len() && progress.next_queue != 0)
+            || progress.matched & !mask != 0
+        {
+            return Err(invalid_cursor());
+        }
+        for (index, snapshot) in snapshots.iter_mut().enumerate() {
+            let dispatching = if snapshot.known_busy {
+                if index == progress.next_task {
+                    progress.next_task += 1;
+                    progress.next_queue = 0;
+                }
+                None
+            } else if index < progress.next_task {
+                Some(progress.matched & (1 << index) != 0)
+            } else if index == progress.next_task {
+                let (dispatching, next) = self.scan_associations(
+                    snapshot.namespace.as_ref(),
+                    &queue,
+                    progress.next_queue,
+                    deadline,
+                    &mut stats,
+                )?;
+                match dispatching {
+                    Some(found) => {
+                        if found {
+                            progress.matched |= 1 << index;
+                        }
+                        progress.next_task += 1;
+                        progress.next_queue = 0;
+                    }
+                    None => progress.next_queue = next,
+                }
+                dispatching
+            } else if snapshot.namespace.is_none() {
+                Some(false)
+            } else {
+                None
+            };
+            snapshot.facts.queue_dispatching = dispatching;
+            if !snapshot.known_busy {
+                snapshot.facts.busy = dispatching;
+                snapshot.facts.quiescent = dispatching.map(|busy| {
+                    !busy
+                        && matches!(
+                            snapshot.facts.state.as_str(),
+                            "open" | "closed" | "abandoned" | "lost"
+                        )
+                });
+            }
+            self.check_deadline(deadline)?;
+            if !snapshot.known_busy {
+                let current = self.turn_namespace(snapshot.facts.task_id, deadline)?;
+                if current.as_ref().map(directory_generation).transpose()? != snapshot.generation {
+                    return Err(invalid_state());
+                }
+            }
+            if serde_json::to_vec(&snapshot.facts)
+                .map_err(|_| invalid_state())?
+                .len()
+                > 2048
+            {
+                return Err(invalid_state());
+            }
+            result.rows.push(snapshot.facts.clone());
+        }
+        if progress.next_task < snapshots.len() {
+            result.proof_after = Some(encode_token(&progress)?);
         }
         self.verify_bindings()?;
         self.check_deadline(deadline)?;
-        stats.work_elapsed = self.runtime.now().saturating_sub(started);
+        stats.work_elapsed = started.elapsed();
         Ok(TaskReadResult {
             value: result,
             stats,
@@ -220,6 +334,27 @@ impl TaskEventReadStore {
         (value, stats)
     }
 
+    fn retry_same_binding<T>(
+        &self,
+        deadline: Duration,
+        mut operation: impl FnMut() -> Result<T, WorkerError>,
+    ) -> Result<T, WorkerError> {
+        for attempt in 0..=SAME_BINDING_ESTALE_RETRIES {
+            self.check_deadline(deadline)?;
+            match operation() {
+                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {
+                    self.check_deadline(deadline)?;
+                    self.verify_bindings()?;
+                    if attempt == SAME_BINDING_ESTALE_RETRIES {
+                        return Err(invalid_state());
+                    }
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last ESTALE attempt returns unavailable")
+    }
+
     fn repair_inner(
         &self,
         after: Option<&str>,
@@ -238,7 +373,7 @@ impl TaskEventReadStore {
         self.check_deadline(deadline)?;
         let names_started = Instant::now();
         stats.names_calls += 1;
-        let names = self.tasks.list_names()?;
+        let names = self.retry_same_binding(deadline, || Ok(self.tasks.list_names()?))?;
         stats.directory_entries = names.len();
         stats.name_bytes = names.iter().map(Vec::len).sum();
         self.check_deadline(deadline)?;
@@ -272,7 +407,7 @@ impl TaskEventReadStore {
         stats: &mut TaskReadStats,
     ) -> Result<RepairFacts, WorkerError> {
         let work_started = self.runtime.now();
-        let (queue, _) = self.read_queue(stats)?;
+        let (queue, _) = self.read_queue(deadline, stats)?;
         let mut rows = Vec::new();
         let mut processed = 0;
         for &id in ids {
@@ -284,12 +419,12 @@ impl TaskEventReadStore {
                 break;
             }
             self.check_deadline(deadline)?;
-            if let Some(record) = self.read_task(id, stats)? {
+            if let Some(record) = self.read_task(id, deadline, stats)? {
                 let dispatching =
                     if crate::client_state::task_operator_busy_reason(&record, None).is_some() {
                         None
                     } else {
-                        self.dispatching(id, &queue, stats)?
+                        self.dispatching(id, &queue, deadline, stats)?
                     };
                 rows.push(record_facts(&record, dispatching, false)?);
             }
@@ -347,6 +482,7 @@ impl TaskEventReadStore {
     }
 
     fn acquire(&self, deadline: Duration) -> Result<ReadFence, WorkerError> {
+        self.check_deadline(deadline)?;
         self.verify_bindings()?;
         let directory = self.root.reopen()?;
         loop {
@@ -374,16 +510,20 @@ impl TaskEventReadStore {
     fn read_task(
         &self,
         id: TaskId,
+        deadline: Duration,
         stats: &mut TaskReadStats,
     ) -> Result<Option<LocalTaskRecord>, WorkerError> {
         stats.record_reads += 1;
-        let bytes = match self
-            .tasks
-            .read_private_regular(&format!("{id}.json"), MAX_TASK_RECORD_BYTES as u64)
-        {
+        let bytes = match self.retry_same_binding(deadline, || {
+            Ok(self
+                .tasks
+                .read_private_regular(&format!("{id}.json"), MAX_TASK_RECORD_BYTES as u64)?)
+        }) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
         stats.input_bytes += bytes.len();
         let record: LocalTaskRecord =
@@ -398,12 +538,15 @@ impl TaskEventReadStore {
 
     fn read_queue(
         &self,
+        deadline: Duration,
         stats: &mut TaskReadStats,
     ) -> Result<(QueueSnapshot, String), WorkerError> {
         stats.queue_reads += 1;
-        let bytes = self
-            .queue
-            .read_private_regular("state.json", MAX_TASK_RECORD_BYTES as u64)?;
+        let bytes = self.retry_same_binding(deadline, || {
+            Ok(self
+                .queue
+                .read_private_regular("state.json", MAX_TASK_RECORD_BYTES as u64)?)
+        })?;
         let snapshot: QueueSnapshot =
             serde_json::from_slice(&bytes).map_err(|_| invalid_state())?;
         let mut canonical = serde_json::to_vec(&snapshot).map_err(|_| invalid_state())?;
@@ -423,32 +566,73 @@ impl TaskEventReadStore {
         &self,
         task_id: TaskId,
         queue: &QueueSnapshot,
+        deadline: Duration,
         stats: &mut TaskReadStats,
     ) -> Result<Option<bool>, WorkerError> {
-        let task_turns = match open_directory(&self.turns, &task_id.to_string()) {
-            Ok(directory) => Some(directory),
-            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        let Some(task_turns) = task_turns else {
-            return Ok(Some(false));
-        };
-        for entry in queue.entries().iter().filter(|entry| {
-            entry.kind() == QueueEntryKind::TaskTurn
-                && matches!(entry.state(), QueueState::Dispatching { .. })
-        }) {
-            if stats.association_checks == MAX_DISPATCH_ASSOCIATIONS {
-                return Ok(None);
-            }
-            stats.association_checks += 1;
-            match open_directory(&task_turns, &entry.job_id().to_string()) {
-                Ok(_) => return Ok(Some(true)),
-                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        let namespace = self.turn_namespace(task_id, deadline)?;
+        Ok(self
+            .scan_associations(namespace.as_ref(), queue, 0, deadline, stats)?
+            .0)
+    }
+
+    fn turn_namespace(
+        &self,
+        task_id: TaskId,
+        deadline: Duration,
+    ) -> Result<Option<RootedDir>, WorkerError> {
+        Ok(
+            match self.retry_same_binding(deadline, || {
+                open_directory(&self.turns, &task_id.to_string())
+            }) {
+                Ok(directory) => Some(directory),
+                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error),
+            },
+        )
+    }
+
+    fn scan_associations(
+        &self,
+        namespace: Option<&RootedDir>,
+        queue: &QueueSnapshot,
+        after: usize,
+        deadline: Duration,
+        stats: &mut TaskReadStats,
+    ) -> Result<(Option<bool>, usize), WorkerError> {
+        let Some(task_turns) = namespace else {
+            return Ok((Some(false), 0));
+        };
+        for (index, entry) in queue.entries().iter().enumerate().skip(after) {
+            if entry.kind() != QueueEntryKind::TaskTurn
+                || !matches!(entry.state(), QueueState::Dispatching { .. })
+            {
+                continue;
+            }
+            if stats.association_checks == MAX_DISPATCH_ASSOCIATIONS {
+                return Ok((None, index));
+            }
+            self.check_deadline(deadline)?;
+            let found = self.retry_same_binding(deadline, || {
+                if stats.association_checks == MAX_DISPATCH_ASSOCIATIONS {
+                    return Ok(None);
+                }
+                stats.association_checks += 1;
+                match open_directory(task_turns, &entry.job_id().to_string()) {
+                    Ok(_) => Ok(Some(true)),
+                    Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        Ok(Some(false))
+                    }
+                    Err(error) => Err(error),
+                }
+            })?;
+            match found {
+                Some(true) => return Ok((Some(true), 0)),
+                None => return Ok((None, index)),
+                Some(false) => {}
             }
         }
         task_turns.verify_bound()?;
-        Ok(Some(false))
+        Ok((Some(false), 0))
     }
 }
 
@@ -474,6 +658,56 @@ struct RepairToken {
     kind: String,
     binding: RepairBinding,
     after_task_id: TaskId,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProofBinding {
+    state: RepairBinding,
+    queue: DirectoryIdentity,
+    turns: DirectoryIdentity,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProofToken {
+    version: u8,
+    kind: String,
+    binding: ProofBinding,
+    fingerprint: String,
+    next_task: usize,
+    next_queue: usize,
+    matched: u16,
+}
+
+struct TaskSnapshot {
+    facts: TaskRecordFacts,
+    known_busy: bool,
+    namespace: Option<RootedDir>,
+    generation: Option<DirectoryGeneration>,
+}
+
+#[derive(Serialize, PartialEq, Eq)]
+struct DirectoryGeneration {
+    identity: DirectoryIdentity,
+    modified: (libc::time_t, libc::c_long),
+    changed: (libc::time_t, libc::c_long),
+    links: libc::nlink_t,
+    bytes: libc::off_t,
+}
+
+fn directory_generation(directory: &RootedDir) -> Result<DirectoryGeneration, WorkerError> {
+    let metadata = directory.root_metadata()?;
+    Ok(DirectoryGeneration {
+        identity: DirectoryIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino,
+        },
+        modified: (metadata.st_mtime, metadata.st_mtime_nsec),
+        changed: (metadata.st_ctime, metadata.st_ctime_nsec),
+        links: metadata.st_nlink,
+        bytes: metadata.st_size,
+    })
 }
 
 fn directory_identity(directory: &RootedDir) -> Result<DirectoryIdentity, WorkerError> {
@@ -1302,5 +1536,365 @@ mod tests {
                 stats.association_checks
             );
         }
+    }
+
+    fn private_directory(path: &std::path::Path) {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn dispatching_queue(paths: &PathLayout, count: usize) -> Vec<TurnId> {
+        use crate::{
+            job::{CommandSummary, QueueEntry, QueueId},
+            scheduler::WorkerPreference,
+        };
+
+        let client_id: ClientId = fs::read_to_string(paths.state.join("client-id"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let owner = ProcessIdentity::new(2_000_000_001, 1).unwrap();
+        let mut entries = Vec::new();
+        let mut jobs = Vec::new();
+        for index in 0..count {
+            let job_id = TurnId::new(uuid::Uuid::from_u128(100_000 + index as u128));
+            let mut entry = QueueEntry::new(
+                job_id,
+                client_id,
+                "a".repeat(64),
+                "b".repeat(64),
+                CommandSummary::argv(1).unwrap(),
+                vec![],
+                WorkerPreference::Automatic,
+                QueueEntryKind::TaskTurn,
+                None,
+                owner,
+                1,
+            )
+            .unwrap();
+            entry.assign_queue_id(QueueId::new(index as u64 + 1).unwrap());
+            entry.dispatch(owner, "mini-1".into(), 2).unwrap();
+            entries.push(entry);
+            jobs.push(job_id);
+        }
+        let snapshot = QueueSnapshot {
+            next_id: QueueId::new(count as u64 + 1).unwrap(),
+            entries,
+        };
+        let mut bytes = serde_json::to_vec(&snapshot).unwrap();
+        bytes.push(b'\n');
+        fs::write(paths.state.join("queue/state.json"), bytes).unwrap();
+        jobs
+    }
+
+    #[test]
+    fn dispatch_proof_resumes_without_repeating_completed_associations() {
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        private_directory(&paths.state.join("turns").join(id(1).to_string()));
+        dispatching_queue(&paths, 70);
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(first.stats.association_checks, 32);
+        assert_eq!(first.value.rows[0].quiescent, None);
+        let cursor = first.value.proof_after.unwrap();
+        assert!(cursor.len() <= 2048);
+        let second = reader
+            .addressed(&[id(1)], false, Some(&cursor), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(second.stats.association_checks, 32);
+        assert_eq!(second.value.rows[0].busy, None);
+        let final_page = reader
+            .addressed(
+                &[id(1)],
+                false,
+                second.value.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(final_page.stats.association_checks, 6);
+        assert_eq!(final_page.value.rows[0].quiescent, Some(true));
+        assert!(final_page.value.proof_after.is_none());
+    }
+
+    #[test]
+    fn namespace_insertion_behind_proof_cursor_restarts_dispatch_checks() {
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        let turns = paths.state.join("turns").join(id(1).to_string());
+        private_directory(&turns);
+        let jobs = dispatching_queue(&paths, 70);
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert!(first.proof_after.is_some());
+        private_directory(&turns.join(jobs[0].to_string()));
+        // Prompt contents are never inspected to establish this association.
+        std::os::unix::fs::symlink("missing", turns.join(jobs[0].to_string()).join("prompt"))
+            .unwrap();
+        let updated = reader
+            .addressed(
+                &[id(1)],
+                false,
+                first.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(updated.stats.association_checks, 1);
+        assert_eq!(updated.value.rows[0].queue_dispatching, Some(true));
+        assert_eq!(updated.value.rows[0].busy, Some(true));
+        assert_eq!(updated.value.rows[0].quiescent, Some(false));
+    }
+
+    #[test]
+    fn task_and_queue_digest_changes_restart_dispatch_proof() {
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        private_directory(&paths.state.join("turns").join(id(1).to_string()));
+        dispatching_queue(&paths, 70);
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        let second = reader
+            .addressed(
+                &[id(1)],
+                false,
+                first.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .value;
+        assert!(second.proof_after.is_some());
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::NeedsInput));
+        let changed_task = reader
+            .addressed(
+                &[id(1)],
+                false,
+                second.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(changed_task.stats.association_checks, 32);
+        assert_eq!(changed_task.value.rows[0].quiescent, None);
+        assert_eq!(
+            changed_task.value.rows[0].outcome.as_deref(),
+            Some("needs_input")
+        );
+        dispatching_queue(&paths, 35);
+        let changed_queue = reader
+            .addressed(
+                &[id(1)],
+                false,
+                changed_task.value.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(changed_queue.stats.association_checks, 32);
+        assert_eq!(changed_queue.value.rows[0].quiescent, None);
+    }
+
+    #[test]
+    fn sixteen_task_proof_group_is_bounded_and_eventually_confirmed() {
+        let (_root, paths, runtime) = fixture();
+        let ids = (1..=16).map(id).collect::<Vec<_>>();
+        for number in 1..=16 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+            private_directory(&paths.state.join("turns").join(id(number).to_string()));
+        }
+        dispatching_queue(&paths, 33);
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let mut cursor = None;
+        let mut associations = 0;
+        let mut calls = 0;
+        loop {
+            let result = reader
+                .addressed(&ids, false, cursor.as_deref(), Duration::from_secs(30))
+                .unwrap();
+            calls += 1;
+            assert_eq!(result.value.rows.len(), 16);
+            assert_eq!(result.stats.queue_reads, 1);
+            assert!(result.stats.association_checks <= 32);
+            associations += result.stats.association_checks;
+            cursor = result.value.proof_after;
+            if cursor.is_none() {
+                assert!(
+                    result
+                        .value
+                        .rows
+                        .iter()
+                        .all(|row| row.quiescent == Some(true))
+                );
+                break;
+            }
+            assert!(cursor.as_ref().unwrap().len() <= 2048);
+            assert!(calls <= 17);
+        }
+        assert_eq!(associations, 528);
+        assert_eq!(calls, 17);
+    }
+
+    #[test]
+    fn repair_commits_unknown_dispatch_row_without_restarting_its_key() {
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        private_directory(&paths.state.join("turns").join(id(1).to_string()));
+        dispatching_queue(&paths, 70);
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let page = reader.repair(None, 64, Duration::from_secs(30)).unwrap();
+        assert_eq!(page.stats.association_checks, 32);
+        assert_eq!(page.value.rows[0].quiescent, None);
+        assert!(page.value.complete);
+        assert!(page.value.next.is_none());
+    }
+
+    #[test]
+    fn estale_retries_three_times_within_the_same_binding() {
+        let (_root, paths, runtime) = fixture();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let mut calls = 0;
+        let bytes = reader
+            .retry_same_binding(Duration::from_secs(30), || {
+                calls += 1;
+                if calls <= 3 {
+                    Err(io::Error::from_raw_os_error(libc::ESTALE).into())
+                } else {
+                    Ok(reader.root.read_private_regular("client-id", 33)?)
+                }
+            })
+            .unwrap();
+        assert_eq!(calls, 4);
+        assert_eq!(bytes, fs::read(paths.state.join("client-id")).unwrap());
+    }
+
+    #[test]
+    fn persistent_estale_is_bounded_and_non_estale_errors_are_not_retried() {
+        let (_root, paths, runtime) = fixture();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let mut calls = 0;
+        let error = reader
+            .retry_same_binding::<()>(Duration::from_secs(30), || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(libc::ESTALE).into())
+            })
+            .unwrap_err();
+        assert_eq!(calls, 4);
+        assert!(error.to_string().contains("CONTROLLER_EVENTS_UNAVAILABLE"));
+        calls = 0;
+        assert!(
+            reader
+                .retry_same_binding::<()>(Duration::from_secs(30), || {
+                    calls += 1;
+                    Err(io::Error::from_raw_os_error(libc::EACCES).into())
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn estale_retry_never_adopts_a_replacement_root() {
+        let (_root, paths, runtime) = fixture();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let mut calls = 0;
+        assert!(
+            reader
+                .retry_same_binding::<()>(Duration::from_secs(30), || {
+                    calls += 1;
+                    if calls == 1 {
+                        fs::rename(&paths.state, paths.state.with_file_name("retired-state"))
+                            .unwrap();
+                        private_directory(&paths.state);
+                        Err(io::Error::from_raw_os_error(libc::ESTALE).into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn cancellation_and_expired_deadline_precede_state_binding_io() {
+        let (_root, paths, runtime) = fixture();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        let (result, stats) = reader.repair_measured(None, 1, Duration::ZERO);
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+        assert_eq!(stats.names_calls, 0);
+        fs::rename(paths.state.join("tasks"), paths.state.join("retired-tasks")).unwrap();
+        runtime.cancelled.store(true, Ordering::SeqCst);
+        let error = reader
+            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            WorkerError::Process(crate::error::ProcessError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn known_busy_row_does_not_open_its_turn_namespace() {
+        let (_root, paths, runtime) = fixture();
+        let busy = record(1, TaskState::Open, TaskOutcome::Done)
+            .with_runner(Some(RunnerIdentity::new(
+                ProcessIdentity::new(2_000_000_001, 1).unwrap(),
+            )))
+            .unwrap();
+        write_record(&paths, &busy);
+        std::os::unix::fs::symlink("missing", paths.state.join("turns").join(id(1).to_string()))
+            .unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let result = reader
+            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(result.stats.association_checks, 0);
+        assert_eq!(result.value.rows[0].busy, Some(true));
+        assert_eq!(result.value.rows[0].quiescent, Some(false));
+        assert!(result.value.proof_after.is_none());
+    }
+
+    #[test]
+    fn completed_dispatch_match_survives_group_proof_continuation() {
+        let (_root, paths, runtime) = fixture();
+        for number in 1..=2 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+            private_directory(&paths.state.join("turns").join(id(number).to_string()));
+        }
+        let jobs = dispatching_queue(&paths, 33);
+        private_directory(
+            &paths
+                .state
+                .join("turns")
+                .join(id(1).to_string())
+                .join(jobs[0].to_string()),
+        );
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .addressed(&[id(1), id(2)], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert_eq!(first.rows[0].busy, Some(true));
+        assert_eq!(first.rows[1].quiescent, None);
+        let second = reader
+            .addressed(
+                &[id(1), id(2)],
+                false,
+                first.proof_after.as_deref(),
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .value;
+        assert_eq!(second.rows[0].queue_dispatching, Some(true));
+        assert_eq!(second.rows[0].busy, Some(true));
+        assert_eq!(second.rows[1].quiescent, Some(true));
+        assert!(second.proof_after.is_none());
     }
 }
