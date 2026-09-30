@@ -790,6 +790,48 @@ mod policy {
     }
 
     #[test]
+    fn same_epoch_restart_coalesces_two_to_five_decisions() {
+        let journal = Uuid::from_u128(9);
+        let saved = NotifyState {
+            last_complete_repair_millis: Some(1_000),
+            consumed_after: Some(EventCursor {
+                journal_id: journal,
+                seq: Seq::new(4),
+            }),
+            attention_overflow: Some("a".repeat(64)),
+            ..NotifyState::empty()
+        };
+        let mut changes = Vec::new();
+        let mut confirmed = Vec::new();
+        for index in 0..3_u128 {
+            let facts = done_facts(
+                TaskId::new(Uuid::from_u128(800 + index)),
+                TurnId::new(Uuid::from_u128(900 + index)),
+            );
+            changes.push(change(facts.clone()));
+            confirmed.push(facts);
+        }
+        let mut result = warm_complete(journal, 5, changes, confirmed);
+        result.repair = RepairProgress::Restarted;
+        result.repair_needed = true;
+        result.attention = Some(AttentionSummary {
+            count: 9,
+            fingerprint: "b".repeat(64),
+        });
+        let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 2_000);
+        assert_eq!(plan.notices.len(), 1);
+        assert_eq!(plan.notices[0].title, "Tasks finished");
+        assert_eq!(plan.notices[0].body, "3 tasks");
+        assert_eq!(plan.notices[0].sound, NoticeSound::Done);
+        assert_eq!(plan.next.decisions.len(), 3);
+        assert_eq!(
+            plan.next.attention_overflow.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert!(plan.next.repair_needed);
+    }
+
+    #[test]
     fn mixed_and_attention_summaries_use_request_otherwise_none() {
         let mut changes = Vec::new();
         let mut confirmed = Vec::new();

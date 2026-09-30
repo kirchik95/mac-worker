@@ -99,7 +99,9 @@ pub fn plan_notifications(
         let disconnected = saved
             .last_complete_repair_millis
             .is_some_and(|then| now_millis.saturating_sub(then) > COALESCE_GAP_MILLIS);
-        let batch = epoch_changed || disconnected || fresh.len() > NOTIFY_COALESCE_COUNT;
+        let cursor_repair = result.repair == RepairProgress::Restarted || result.repair_needed;
+        let batch =
+            epoch_changed || disconnected || fresh.len() > NOTIFY_COALESCE_COUNT || cursor_repair;
         let attention_new = fingerprint_changed && attention_count > 0;
         let summarize_attention = attention_new
             && (result.baseline == BaselineKind::Cold || attention_count > NOTIFY_PENDING_CAPACITY);
