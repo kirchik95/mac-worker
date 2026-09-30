@@ -719,13 +719,22 @@ fn wait_for_terminal_turn(
             fixture.run_laptop(&["--json", "task", "status", task_id], Some(repo.root()));
         let last_status = String::from_utf8_lossy(&stdout);
         let last_stderr = String::from_utf8_lossy(&stderr);
+        // The controller materializes batch tasks on its own tick, so a status
+        // read right after submission can precede the task. Only that answer
+        // from the controller is retried; any other failure (including a
+        // laptop-store fallback) still fails at once.
+        let not_yet_materialized = !status.success()
+            && serde_json::from_slice::<Value>(&stdout)
+                .is_ok_and(|event| event["event"] == "error" && event["code"] == "TASK_NOT_FOUND");
         assert!(
-            status.success(),
+            status.success() || not_yet_materialized,
             "reconnect status must not open a laptop store; stdout={last_status} stderr={last_stderr}"
         );
-        let report = parse_json_value(&stdout);
-        if terminal_head_oid(&report, expected_turn).is_some() {
-            return report;
+        if !not_yet_materialized {
+            let report = parse_json_value(&stdout);
+            if terminal_head_oid(&report, expected_turn).is_some() {
+                return report;
+            }
         }
         if Instant::now() > deadline {
             panic!(
