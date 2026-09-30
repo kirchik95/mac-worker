@@ -14,7 +14,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{TurnParams, adapter_for, render_shell},
+    agent::{AgentKind, TurnParams, adapter_for_launch, has_dialects, render_shell},
     client_state::{ClientStateStore, ReservedSlotTakeover, RunnerSlotDecision},
     config::{Config, WorkerEntry},
     error::WorkerError,
@@ -962,6 +962,28 @@ impl<'a> TurnRunner<'a> {
         }
     }
 
+    /// The version of `agent` in the selected worker's recorded facts. Read
+    /// only for an agent whose launch argv depends on its CLI generation, at
+    /// the cost of one probe.
+    ///
+    /// The admission cache keeps capabilities, not versions, so the facts
+    /// come from the worker. An unreachable worker or facts without the
+    /// version leave it unknown, which keeps the default argv: the worker
+    /// checks the argv against its installed generation before exec.
+    fn recorded_agent_version(&self, worker: &WorkerEntry, agent: AgentKind) -> Option<String> {
+        if !has_dialects(agent) {
+            return None;
+        }
+        crate::transport::SshTransport::new(self.runner)
+            .probe(worker)
+            .probe?
+            .agent_facts?
+            .agents
+            .into_iter()
+            .find(|probe| probe.name == agent.as_str())?
+            .version
+    }
+
     fn execute(
         &self,
         task_id: TaskId,
@@ -1130,7 +1152,10 @@ impl<'a> TurnRunner<'a> {
             session_seed: turn.session_seed(),
             allow_permission_fallback: turn.effective_policy().is_some(),
         };
-        let adapter = adapter_for(turn.agent());
+        let adapter = adapter_for_launch(
+            turn.agent(),
+            self.recorded_agent_version(worker, turn.agent()).as_deref(),
+        );
         let remote = RemoteJobClient::new(self.runner);
         let prebound = if !turn.resume() && adapter.prebind_session().is_some() {
             Some(
@@ -3915,5 +3940,144 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         assert_eq!(pace.status_logs, 11);
         assert_eq!(pace.statuses, 1);
         assert_eq!(pace.task_statuses, 2);
+    }
+
+    /// Answers `host probe` like a worker, or like an unreachable one.
+    struct FactsProbe {
+        stdout: Option<Vec<u8>>,
+        probes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProcessRunner for FactsProbe {
+        fn run(
+            &self,
+            request: &crate::process::ProcessRequest,
+        ) -> Result<ProcessResult, WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                request.args.last().and_then(|arg| arg.to_str()),
+                Some("~/.local/bin/worker host probe")
+            );
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match &self.stdout {
+                Some(stdout) => ProcessResult {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: stdout.clone(),
+                    stderr: Vec::new(),
+                },
+                None => ProcessResult {
+                    status: std::process::ExitStatus::from_raw(255 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"ssh: connect to host mac1: Operation timed out\n".to_vec(),
+                },
+            })
+        }
+    }
+
+    /// A probe reply as a helper sends it. Written as JSON and not as a
+    /// `ProbeResponse` literal, so a field added to the probe later does not
+    /// have to be listed here.
+    fn probe_with_agents(agents: Option<Vec<(&str, Option<&str>)>>) -> Vec<u8> {
+        let agent_facts = agents.map(|agents| {
+            let agents = agents
+                .into_iter()
+                .map(|(name, version)| {
+                    serde_json::json!({
+                        "name": name,
+                        "version": version,
+                        "auth": "authenticated",
+                        "auth_by_profile": [],
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "agents": agents,
+                "env_profiles": [],
+                "git_identity": true,
+                "collected_at_millis": 1,
+            })
+        });
+        serde_json::to_vec(&serde_json::json!({
+            "protocol_version": crate::protocol::PROTOCOL_VERSION,
+            "supervision_version": crate::protocol::SUPERVISION_VERSION,
+            "hostname": "mini-1.local",
+            "arch": "arm64",
+            "os_version": "26.2",
+            "free_disk_bytes": 500,
+            "total_disk_bytes": 1_000,
+            "memory_pressure": "normal",
+            "swap_used_bytes": null,
+            "slot_state": "idle",
+            "active_lease": null,
+            "capabilities": [],
+            "facts_age_millis": agent_facts.as_ref().map(|_| 0),
+            "agent_facts": agent_facts,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn launch_version_is_read_from_the_selected_workers_facts_for_dialect_agents_only() {
+        use crate::agent::AgentKind;
+        use std::sync::atomic::Ordering;
+
+        let (_root, paths) = isolated_handoff_paths();
+        let store = super::ClientStateStore::open(&paths.state).unwrap();
+        let config = super::Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let worker = config.worker("mini-1").unwrap();
+        let recorded = |stdout: Option<Vec<u8>>, agent: AgentKind| {
+            let probe = FactsProbe {
+                stdout,
+                probes: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let version = TurnRunner::new(
+                &probe,
+                &config,
+                &paths,
+                &store,
+                &super::InlineRunnerExecutor,
+            )
+            .recorded_agent_version(worker, agent);
+            (version, probe.probes.load(Ordering::Relaxed))
+        };
+
+        for (version, expected) in [
+            (Some("2.0.18"), Some("2.0.18")),
+            (Some("1.18.32"), Some("1.18.32")),
+            (None, None),
+        ] {
+            let facts = probe_with_agents(Some(vec![
+                ("codex", Some("0.154.0")),
+                ("opencode", version),
+            ]));
+            assert_eq!(
+                recorded(Some(facts), AgentKind::Opencode),
+                (expected.map(str::to_owned), 1),
+                "{version:?}"
+            );
+        }
+        // Facts without the agent, a probe without facts, a reply that is not
+        // a probe and an unreachable worker all leave the version unknown.
+        for stdout in [
+            Some(probe_with_agents(Some(vec![("codex", Some("2.0.18"))]))),
+            Some(probe_with_agents(None)),
+            Some(b"not a probe response".to_vec()),
+            None,
+        ] {
+            assert_eq!(recorded(stdout, AgentKind::Opencode), (None, 1));
+        }
+        // The other agents have one dialect: no probe is spent on them.
+        for agent in [AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor] {
+            let facts = probe_with_agents(Some(vec![
+                ("codex", Some("2.0.18")),
+                ("claude", Some("2.0.18")),
+                ("cursor", Some("2.0.18")),
+            ]));
+            assert_eq!(recorded(Some(facts), agent), (None, 0), "{agent:?}");
+        }
     }
 }

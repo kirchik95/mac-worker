@@ -78,6 +78,8 @@ struct HostState {
     stream_session: Option<String>,
     profile_home: Option<PathBuf>,
     error_text: String,
+    /// The agent version in the worker's facts, as the probe reports it.
+    agent_version: Option<String>,
 }
 
 struct RecordingHost {
@@ -102,6 +104,7 @@ impl RecordingHost {
                 stream_session: None,
                 profile_home: None,
                 error_text: String::new(),
+                agent_version: Some("0.1.0".into()),
             }),
             agent,
         }
@@ -145,6 +148,10 @@ impl RecordingHost {
 
     fn record_error(&self, error: &WorkerError) {
         self.state.lock().unwrap().error_text = error.to_string();
+    }
+
+    fn set_agent_version(&self, version: Option<&str>) {
+        self.state.lock().unwrap().agent_version = version.map(str::to_owned);
     }
 
     fn task_status(&self, terminal: bool) -> Result<TaskStatus, WorkerError> {
@@ -245,7 +252,10 @@ impl ProcessRunner for RecordingHost {
             .and_then(|argument| argument.to_str())
             .unwrap_or_default();
         match operation {
-            "~/.local/bin/worker host probe" => canonical_process(&probe_response(self.agent)),
+            "~/.local/bin/worker host probe" => {
+                let version = self.state.lock().unwrap().agent_version.clone();
+                canonical_process(&probe_response(self.agent, version))
+            }
             value if value == HostOperation::RefreshFacts.command() => Ok(success(Vec::new())),
             value if value == HostOperation::LeaseAcquire.command() => {
                 let acquire: LeaseAcquireRequest = decode_request(request)?;
@@ -441,6 +451,12 @@ impl TaskHarness {
         self
     }
 
+    /// The agent version the worker's facts record; `None` leaves it out.
+    fn with_agent_version(self, version: Option<&str>) -> Self {
+        self.runner.set_agent_version(version);
+        self
+    }
+
     fn with_profile(mut self, name: &str, key: &str, value: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let env_dir = root.path().join(".config/mac-worker/env");
@@ -616,7 +632,7 @@ impl TaskHarness {
     }
 }
 
-fn probe_response(agent: AgentKind) -> ProbeResponse {
+fn probe_response(agent: AgentKind, version: Option<String>) -> ProbeResponse {
     let name = match agent {
         AgentKind::Cursor => "cursor",
         AgentKind::Opencode => "opencode",
@@ -648,7 +664,7 @@ fn probe_response(agent: AgentKind) -> ProbeResponse {
             agents: vec![AgentProbe {
                 autoupdate: None,
                 name: name.into(),
-                version: Some("0.1.0".into()),
+                version,
                 auth: AgentAuth::Authenticated,
                 auth_by_profile: vec![
                     ("secure".into(), AgentAuth::Authenticated),
@@ -1055,4 +1071,83 @@ fn cursor_live_fixture_captures_the_session_id() {
         events.first(),
         Some(mac_worker::agent::AgentEvent::SessionStarted { session_ref }) if session_ref == "2df4613a-3015-46d8-9f06-b595b06988f4"
     ));
+}
+
+const POINTER_ARGUMENT: &str =
+    "\"Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.\"";
+
+#[test]
+fn opencode_launch_is_standalone_when_the_workers_facts_record_v2() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let harness = TaskHarness::opencode()
+        .with_agent_version(Some("2.0.18"))
+        .with_stream("ses0001");
+    harness.submit_first_turn().unwrap();
+    assert_eq!(
+        harness.last_shell(),
+        format!(
+            "exec 'opencode' 'run' '--standalone' '--format' 'json' '--auto' {POINTER_ARGUMENT}"
+        )
+    );
+    assert_eq!(harness.persisted_session(), Some("ses0001".into()));
+
+    harness.say("continue the migration").unwrap();
+    assert_eq!(
+        harness.last_shell(),
+        format!(
+            "exec 'opencode' 'run' '--standalone' '--format' 'json' '--auto' '--session' 'ses0001' {POINTER_ARGUMENT}"
+        )
+    );
+}
+
+/// Runs a first turn and a follow-up against a worker whose facts record
+/// `version` for OpenCode, and expects today's v1 argv for both.
+fn assert_v1_launch_for(version: Option<&str>) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let harness = TaskHarness::opencode()
+        .with_agent_version(version)
+        .with_stream("ses0001");
+    harness.submit_first_turn().unwrap();
+    assert_eq!(
+        harness.last_shell(),
+        format!("exec 'opencode' 'run' '--format' 'json' '--auto' {POINTER_ARGUMENT}"),
+        "{version:?}"
+    );
+
+    harness.say("continue the migration").unwrap();
+    assert_eq!(
+        harness.last_shell(),
+        format!(
+            "exec 'opencode' 'run' '--format' 'json' '--auto' '--session' 'ses0001' {POINTER_ARGUMENT}"
+        ),
+        "{version:?}"
+    );
+}
+
+#[test]
+fn opencode_launch_keeps_the_v1_form_when_the_workers_facts_record_v1() {
+    assert_v1_launch_for(Some("1.18.32"));
+}
+
+#[test]
+fn opencode_launch_keeps_the_v1_form_when_the_facts_have_no_version() {
+    assert_v1_launch_for(None);
+}
+
+#[test]
+fn opencode_launch_keeps_the_v1_form_when_the_recorded_version_is_garbage() {
+    assert_v1_launch_for(Some("not-a-version"));
+}
+
+#[test]
+fn a_recorded_version_does_not_change_another_agents_launch() {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let mut shells = Vec::new();
+    for version in [Some("1.3.0"), Some("2.0.18")] {
+        let harness = TaskHarness::cursor().with_agent_version(version);
+        harness.submit_first_turn().unwrap();
+        assert!(!harness.last_shell().contains("--standalone"));
+        shells.push(harness.last_shell());
+    }
+    assert_eq!(shells[0], shells[1]);
 }
