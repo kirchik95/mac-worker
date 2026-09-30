@@ -488,12 +488,7 @@ impl ControllerStore {
             // A saved success still needs recovery if ACK/receipt cleanup fails.
             // An unreadable row cannot prove a definitive rejection either.
             if self.load(request.request_id()).map_or(true, |row| {
-                row.is_some_and(|row| {
-                    saved_rejection(row.result.as_ref())
-                        .ok()
-                        .flatten()
-                        .is_none()
-                })
+                row.is_some_and(|row| matches!(saved_rejection(row.result.as_ref()), Ok(None)))
             }) {
                 WorkerError::ControllerResumable(Box::new(error))
             } else {
@@ -1801,6 +1796,62 @@ mod tests {
                 .unwrap_err();
             assert_eq!(rejection.public_code(), "CAPACITY_BUSY");
             assert_eq!(rejection.exit_code(), 75);
+        }
+    }
+
+    #[test]
+    fn corrupt_saved_rejections_remain_definitive_after_ack_or_retirement_io_failure() {
+        for fault in [
+            ControllerFault::CrashBeforeAckExchange,
+            ControllerFault::CrashAfterAckExchangeBeforeSync,
+            ControllerFault::CrashAfterAckBeforeRetire,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+            let request = submit_request(json!({}));
+            let handler = FailingHandler {
+                prepare_fails: false,
+                terminal: true,
+            };
+            store
+                .handle_with(
+                    &request,
+                    &handler,
+                    ControllerFault::StopAfterResultBeforeAck,
+                )
+                .unwrap();
+            let mut row = store.load(request.request_id()).unwrap().unwrap();
+            let expected = encode_record(&row).unwrap();
+            row.result.as_mut().unwrap()["controller_rejection"]["version"] = json!(0);
+            store
+                .root
+                .replace_private_regular_exact(
+                    &request_file_name(request.request_id()).unwrap(),
+                    &expected,
+                    &encode_record(&row).unwrap(),
+                )
+                .unwrap();
+
+            let error = store.handle_with(&request, &handler, fault).unwrap_err();
+            assert_eq!(error.public_code(), "IO");
+            assert_eq!(error.exit_code(), 74);
+            let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+            assert!(wire["error"].get("resumable").is_none(), "{fault:?}");
+
+            let error = store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap_err();
+            assert_eq!(error.public_code(), "CONTROLLER_TRANSPORT");
+            assert_eq!(error.exit_code(), 70);
+            let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+            assert!(
+                wire["error"].get("resumable").is_none(),
+                "{fault:?}: corrupted rejection must fail closed"
+            );
+            assert_eq!(
+                store.load(request.request_id()).unwrap().unwrap().result(),
+                row.result()
+            );
         }
     }
 
