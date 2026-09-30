@@ -1341,7 +1341,11 @@ pub(super) fn acquire_lock(
     deadline: Duration,
     clock: &dyn FsClock,
 ) -> io::Result<File> {
-    let admission_end = deadline.min(clock.now().saturating_add(JOURNAL_ADMISSION_BUDGET));
+    let admission_end = if shared {
+        deadline
+    } else {
+        deadline.min(clock.now().saturating_add(JOURNAL_ADMISSION_BUDGET))
+    };
     if binding.mode != 0o600
         || Binding::from(root.private_entry_identity("journal.lock")?) != binding
     {
@@ -1353,8 +1357,11 @@ pub(super) fn acquire_lock(
         return Err(unavailable());
     }
     loop {
-        if clock.cancelled() || clock.now() >= admission_end {
+        if clock.cancelled() {
             return Err(unavailable());
+        }
+        if clock.now() >= admission_end {
+            return Err(io::ErrorKind::TimedOut.into());
         }
         let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
         if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
@@ -1367,7 +1374,7 @@ pub(super) fn acquire_lock(
         }
         let remaining = admission_end.saturating_sub(clock.now());
         if remaining.is_zero() {
-            return Err(unavailable());
+            return Err(io::ErrorKind::TimedOut.into());
         }
         clock.sleep(remaining.min(Duration::from_millis(1)));
     }

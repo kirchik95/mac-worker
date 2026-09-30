@@ -58,6 +58,7 @@ pub enum JournalFaultPoint {
     PendingRemoved,
     Retired,
     ReadAttempt,
+    RecoveryAttempt,
     AppendPrepared,
     SegmentRead { first_seq: u64 },
 }
@@ -315,9 +316,18 @@ impl ControllerJournal {
     fn with_manifest<T>(
         &self,
         deadline: Duration,
-        mut read: impl FnMut(&fs::Manifest) -> io::Result<T>,
+        read: impl FnMut(&fs::Manifest) -> io::Result<T>,
     ) -> Result<T, WorkerError> {
         check(self.clock.0.as_ref(), deadline)?;
+        self.with_manifest_io(deadline, read)
+            .map_err(|error| runtime_io(&self.clock, error))
+    }
+
+    fn with_manifest_io<T>(
+        &self,
+        deadline: Duration,
+        mut read: impl FnMut(&fs::Manifest) -> io::Result<T>,
+    ) -> io::Result<T> {
         fs::retry_same_binding(&self.root, self.binding, deadline, &self.clock, || {
             let shared = fs::acquire_lock(&self.root, self.lock, true, deadline, &self.clock)?;
             self.validate_epoch()?;
@@ -326,12 +336,12 @@ impl ControllerJournal {
                 return read(&manifest);
             }
             drop(shared);
+            self.hooks.at(JournalFaultPoint::RecoveryAttempt)?;
             let _exclusive = fs::acquire_lock(&self.root, self.lock, false, deadline, &self.clock)?;
             self.validate_epoch()?;
             let manifest = fs::recover_append(&self.root, &self.hooks)?;
             read(&manifest)
         })
-        .map_err(|error| runtime_io(&self.clock, error))
     }
 
     fn manifest_window(&self, manifest: &fs::Manifest) -> JournalWindow {
@@ -420,7 +430,7 @@ impl JournalReader for ControllerJournal {
         );
         loop {
             check(self.clock.0.as_ref(), deadline)?;
-            let result = self.with_manifest(deadline, |manifest| {
+            let result = self.with_manifest_io(deadline, |manifest| {
                 let window = self.manifest_window(manifest);
                 let epoch = query
                     .after
@@ -464,11 +474,20 @@ impl JournalReader for ControllerJournal {
                     .validate()
                     .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
                 Ok(result)
-            })?;
-            if !matches!(&result, EventReadResult::Batch(batch) if batch.events.is_empty())
-                || self.clock.0.now() >= wait_until
-            {
-                return Ok(result);
+            });
+            match result {
+                Ok(result) => {
+                    if !matches!(&result, EventReadResult::Batch(batch) if batch.events.is_empty())
+                        || self.clock.0.now() >= wait_until
+                    {
+                        return Ok(result);
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        && !self.clock.0.cancelled()
+                        && self.clock.0.now() < wait_until => {}
+                Err(error) => return Err(runtime_io(&self.clock, error)),
             }
             // All SH/EX guards have dropped before the injected wait.
             self.clock.0.sleep(

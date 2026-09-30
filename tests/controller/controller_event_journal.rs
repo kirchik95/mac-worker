@@ -515,6 +515,139 @@ fn real_committed_cursor_matches_memory_contract_and_wakes_outside_lock() {
 }
 
 #[test]
+fn long_poll_waits_for_writer_beyond_exclusive_admission_budget() {
+    use mac_worker::controller::events::EventRuntime;
+    use std::sync::mpsc;
+
+    let h = JournalHarness::new();
+    let before = h.head().cursor();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let writer = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        Arc::new(move |point| {
+            if point == JournalFaultPoint::SegmentSynced {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let helper = std::thread::spawn(move || {
+        let result = writer.append(drain_batch(1), DEADLINE);
+        // A failed reader can close its sleep hook before the writer finishes.
+        let _ = completed_tx.send(());
+        result
+    });
+    entered_rx.recv().unwrap();
+
+    let release = Arc::new(Mutex::new(Some(release_tx)));
+    let release_at_200 = release.clone();
+    let runtime = h.runtime.clone();
+    let completed_rx = Mutex::new(completed_rx);
+    h.runtime.on_sleep(move |_| {
+        if runtime.now() >= Duration::from_millis(200)
+            && let Some(sender) = release_at_200.lock().unwrap().take()
+        {
+            sender.send(()).unwrap();
+            completed_rx.lock().unwrap().recv().unwrap();
+        }
+    });
+    let result = h.journal.read(
+        ReadQuery {
+            after: Some(before),
+            limit: 1,
+            wait_ms: 1000,
+        },
+        DEADLINE,
+    );
+    h.runtime.clear_sleep_hook();
+    // Release and join even when the old 50 ms reader admission fails.
+    if let Some(sender) = release.lock().unwrap().take() {
+        sender.send(()).unwrap();
+    }
+    assert_eq!(helper.join().unwrap().unwrap().seq, Seq::new(1));
+    let EventReadResult::Batch(batch) = result.expect("reader must wait within its own deadline")
+    else {
+        panic!("expected committed batch after writer releases EX");
+    };
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.next_after.seq, Seq::new(1));
+    assert_eq!(h.runtime.now(), Duration::from_millis(200));
+}
+
+#[test]
+fn long_poll_retries_exclusive_recovery_admission_timeout() {
+    use mac_worker::controller::events::EventRuntime;
+    use std::os::fd::AsRawFd;
+
+    let h = JournalHarness::new();
+    let before = h.head().cursor();
+    let held = Arc::new(Mutex::new(None));
+    let hold_on_recovery = held.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let recovery_attempts = attempts.clone();
+    let lock_path = h.root().join("journal.lock");
+    let reader = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        Arc::new(move |point| {
+            if point == JournalFaultPoint::RecoveryAttempt
+                && recovery_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                let lock = fs::File::open(&lock_path).unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                *hold_on_recovery.lock().unwrap() = Some(lock);
+            }
+            Ok(())
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let release = held.clone();
+    let runtime = h.runtime.clone();
+    h.runtime.on_sleep(move |_| {
+        if runtime.now() >= Duration::from_millis(200) {
+            release.lock().unwrap().take();
+        }
+    });
+    let result = reader.read(
+        ReadQuery {
+            after: Some(before),
+            limit: 1,
+            wait_ms: 1000,
+        },
+        DEADLINE,
+    );
+    h.runtime.clear_sleep_hook();
+    held.lock().unwrap().take();
+    let EventReadResult::Batch(batch) =
+        result.expect("long poll must retry the 50 ms EX recovery timeout")
+    else {
+        panic!("expected recovered batch");
+    };
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.next_after.seq, Seq::new(1));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(h.runtime.sleeps().contains(&Duration::from_millis(200)));
+    assert_eq!(h.runtime.now(), Duration::from_millis(250));
+}
+
+#[test]
 fn committed_batch_exposes_last_delivered_cursor() {
     let journal = MemoryJournal::new();
     let deadline = Duration::from_secs(60);
