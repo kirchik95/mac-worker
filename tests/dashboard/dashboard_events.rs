@@ -230,10 +230,10 @@ async fn eight_streams_are_admitted_and_cancellation_closes_every_receiver() {
     let mut streams = (0..SSE_MAX_STREAMS)
         .map(|_| h.source.subscribe(Some(cursor(0))).unwrap())
         .collect::<Vec<_>>();
-    assert!(h.source.subscribe(None).is_err());
     for stream in &mut streams {
         assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
     }
+    assert!(h.source.subscribe(None).is_err());
     h.source.stop();
     for stream in &mut streams {
         assert!(stream.recv().await.is_none());
@@ -1691,4 +1691,179 @@ fn superseded_local_work_is_requeued_without_publishing_its_old_projection() {
     assert_eq!(visible.revision, local_revision);
     assert_eq!(local_revision, full.revision + 1);
     assert!(publications.try_recv().is_err());
+}
+
+struct HeldJournalRead {
+    release: mpsc::Sender<()>,
+    viewer_executor: bool,
+}
+struct GatedJournal {
+    journal: MemoryJournal,
+    enabled: AtomicBool,
+    gate_replay: bool,
+    started: tokio::sync::mpsc::Sender<HeldJournalRead>,
+    outstanding: AtomicUsize,
+    peak: AtomicUsize,
+}
+impl GatedJournal {
+    fn new(gate_replay: bool) -> (Arc<Self>, tokio::sync::mpsc::Receiver<HeldJournalRead>) {
+        let (started, receiver) = tokio::sync::mpsc::channel(SSE_MAX_STREAMS + 1);
+        let journal = MemoryJournal::new();
+        if gate_replay {
+            append(&journal);
+        }
+        (
+            Arc::new(Self {
+                journal,
+                enabled: AtomicBool::new(false),
+                gate_replay,
+                started,
+                outstanding: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }),
+            receiver,
+        )
+    }
+    fn hold(&self) {
+        let outstanding = self.outstanding.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(outstanding, Ordering::SeqCst);
+        let (release, waiting) = mpsc::channel();
+        self.started
+            .try_send(HeldJournalRead {
+                release,
+                viewer_executor: thread::current().name() == Some("held-reader-viewer-runtime"),
+            })
+            .unwrap();
+        let _ = waiting.recv();
+        self.outstanding.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl JournalReader for GatedJournal {
+    fn window(&self, deadline: Duration) -> Result<JournalWindow, WorkerError> {
+        if self.enabled.load(Ordering::SeqCst) && !self.gate_replay {
+            self.hold();
+        }
+        self.journal.window(deadline)
+    }
+    fn read(&self, query: ReadQuery, deadline: Duration) -> Result<EventReadResult, WorkerError> {
+        if self.enabled.load(Ordering::SeqCst)
+            && self.gate_replay
+            && thread::current().name() != Some("dashboard-event-tailer")
+        {
+            self.hold();
+        }
+        self.journal.read(query, deadline)
+    }
+}
+
+#[tokio::test]
+async fn disconnects_do_not_admit_more_than_eight_unfinished_journal_jobs() {
+    for gate_replay in [false, true] {
+        let (reader, mut started) = GatedJournal::new(gate_replay);
+        let ticks = Ticks::new(ManualEventRuntime::new());
+        let source = LocalViewerEventSource::new(
+            reader.clone(),
+            Arc::new(ticks.runtime.clone()),
+            Arc::new(FakeLocalProjectionRefresh::new()),
+        );
+        reader.enabled.store(true, Ordering::SeqCst);
+        let mut held = Vec::new();
+        for _ in 0..SSE_MAX_STREAMS {
+            let stream = source.subscribe(Some(cursor(0))).unwrap();
+            held.push(started.recv().await.unwrap());
+            drop(stream);
+            tokio::task::yield_now().await;
+        }
+        let mut overflow = source.subscribe(Some(cursor(0))).unwrap();
+        let message = tokio::select! {
+            biased;
+            message = overflow.recv() => message,
+            extra = started.recv() => {
+                held.push(extra.unwrap());
+                None
+            }
+        };
+        source.stop();
+        ticks.cancel();
+        for read in held {
+            let _ = read.release.send(());
+        }
+        assert!(
+            reader.peak.load(Ordering::SeqCst) <= SSE_MAX_STREAMS,
+            "disconnected readers exceeded the work bound (replay={gate_replay})"
+        );
+        assert_eq!(
+            message,
+            Some(ViewerMessage::Unavailable {
+                code: "CONTROLLER_EVENTS_UNAVAILABLE".into(),
+            })
+        );
+        assert!(overflow.recv().await.is_none());
+    }
+}
+
+#[test]
+fn viewer_shutdown_does_not_join_a_held_journal_read() {
+    let (reader, mut started) = GatedJournal::new(false);
+    let (address_tx, address_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let (exited_tx, exited_rx) = mpsc::channel();
+    let viewer_reader = reader.clone();
+    let viewer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_name("held-reader-viewer-runtime")
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let ticks = Ticks::new(ManualEventRuntime::new());
+            let source = LocalViewerEventSource::new(
+                viewer_reader.clone(),
+                Arc::new(ticks.runtime.clone()),
+                Arc::new(FakeLocalProjectionRefresh::new()),
+            );
+            viewer_reader.enabled.store(true, Ordering::SeqCst);
+            let server = DashboardHttpServer::bind_with_events(None, state(), source)
+                .await
+                .unwrap();
+            address_tx
+                .send(
+                    server
+                        .local_url()
+                        .trim_start_matches("http://")
+                        .parse::<SocketAddr>()
+                        .unwrap(),
+                )
+                .unwrap();
+            stop_rx.await.unwrap();
+            server.shutdown().await.unwrap();
+            ticks.cancel();
+            stopped_tx.send(()).unwrap();
+        });
+        drop(runtime);
+        exited_tx.send(()).unwrap();
+    });
+    let mut connection = SseConnection::open(address_rx.recv().unwrap(), Some(cursor(0)));
+    let held = started.blocking_recv().unwrap();
+    stop_tx.send(()).unwrap();
+    stopped_rx.recv().unwrap();
+    let closed = connection.next_frame().is_none();
+    let still_held = reader.outstanding.load(Ordering::SeqCst) == 1;
+    // Release executor-owned work before asserting the regression, so the old
+    // joined blocking pool can finish without a timeout or a hanging red run.
+    if held.viewer_executor {
+        let _ = held.release.send(());
+    }
+    exited_rx.recv().unwrap();
+    if !held.viewer_executor {
+        let _ = held.release.send(());
+    }
+    viewer.join().unwrap();
+    assert!(closed);
+    assert!(still_held);
+    assert!(
+        !held.viewer_executor,
+        "viewer runtime teardown owns a held journal read"
+    );
 }

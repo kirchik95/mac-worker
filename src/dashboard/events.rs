@@ -16,8 +16,12 @@ use std::{
     thread,
     time::Duration,
 };
-use tokio::sync::{Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 
+/// Local replay work has admission separate from live response slots. Started
+/// replay reads retain their permits until they return, even after disconnect.
+/// Reads run on detached OS threads, so stopping a viewer or its Tokio runtime
+/// never joins a stalled journal call. Unstarted reads observe cancellation.
 pub struct LocalViewerEventSource {
     reader: Arc<dyn JournalReader>,
     runtime: Arc<dyn EventRuntime>,
@@ -25,6 +29,7 @@ pub struct LocalViewerEventSource {
     stopped: Arc<AtomicBool>,
     shutdown: watch::Sender<bool>,
     streams: Arc<Semaphore>,
+    journal_work: Arc<Semaphore>,
 }
 
 impl LocalViewerEventSource {
@@ -52,6 +57,7 @@ impl LocalViewerEventSource {
             stopped: Arc::clone(&stopped),
             shutdown: shutdown.clone(),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+            journal_work: Arc::new(Semaphore::new(MAX_STREAMS)),
         });
         let publications = refresh.subscribe_publications();
         let spawn = thread::Builder::new()
@@ -94,6 +100,23 @@ impl ViewerEventSource for LocalViewerEventSource {
         {
             return Err(unavailable());
         }
+        let work = match Arc::clone(&self.journal_work).try_acquire_owned() {
+            Ok(permit) => ReplayWork {
+                reader: Arc::clone(&self.reader),
+                runtime: Arc::clone(&self.runtime),
+                stopped: Arc::clone(&self.stopped),
+                _permit: permit,
+            },
+            Err(_) => {
+                let (sender, receiver) = mpsc::channel(1);
+                if !self.stopped.load(Ordering::SeqCst) {
+                    let _ = sender.try_send(ViewerMessage::Unavailable {
+                        code: UNAVAILABLE.into(),
+                    });
+                }
+                return Ok(receiver);
+            }
+        };
         let permit = Arc::clone(&self.streams).try_acquire_owned().map_err(|_| {
             WorkerError::Unavailable(
                 "CONTROLLER_EVENTS_STREAM_LIMIT: viewer stream limit reached".into(),
@@ -103,8 +126,6 @@ impl ViewerEventSource for LocalViewerEventSource {
         // The live receiver is registered BEFORE the replay window is read.
         let live = self.live.subscribe();
         let (sender, receiver) = mpsc::channel(CAPACITY);
-        let reader = Arc::clone(&self.reader);
-        let runtime = Arc::clone(&self.runtime);
         let mut shutdown = self.shutdown.subscribe();
         handle.spawn(async move {
             let _permit = permit;
@@ -113,13 +134,14 @@ impl ViewerEventSource for LocalViewerEventSource {
                 biased;
                 _ = cancelled(&mut shutdown) => {},
                 _ = disconnect.closed() => {},
-                _ = replay_and_follow(reader, runtime, after, live, sender) => {},
+                _ = replay_and_follow(work, after, live, sender) => {},
             }
         });
         Ok(receiver)
     }
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.journal_work.close();
         self.shutdown.send_replace(true);
     }
 }
@@ -236,17 +258,48 @@ impl Tailer {
     }
 }
 
-async fn replay_and_follow(
+// One permit travels with the whole replay, including into each queued or
+// running closure. Dropping an async receiver cannot release an active read's
+// admission. There is no executor queue: at most eight detached jobs can exist.
+struct ReplayWork {
     reader: Arc<dyn JournalReader>,
     runtime: Arc<dyn EventRuntime>,
+    stopped: Arc<AtomicBool>,
+    _permit: OwnedSemaphorePermit,
+}
+impl ReplayWork {
+    async fn run<T: Send + 'static>(
+        self,
+        read: impl FnOnce(&dyn JournalReader, Duration) -> Result<T, WorkerError> + Send + 'static,
+    ) -> Result<(T, Self), WorkerError> {
+        let read_deadline = deadline(self.runtime.as_ref());
+        let (reply, result) = oneshot::channel();
+        thread::Builder::new()
+            .name("dashboard-event-replay".into())
+            .spawn(move || {
+                if self.stopped.load(Ordering::SeqCst)
+                    || self.runtime.cancelled()
+                    || self.stopped.load(Ordering::SeqCst)
+                    || reply.is_closed()
+                {
+                    return;
+                }
+                let value = read(self.reader.as_ref(), read_deadline);
+                let _ = reply.send((value, self));
+            })
+            .map_err(|_| unavailable())?;
+        let (value, work) = result.await.map_err(|_| unavailable())?;
+        Ok((value?, work))
+    }
+}
+
+async fn replay_and_follow(
+    work: ReplayWork,
     requested: Option<EventCursor>,
     mut live: broadcast::Receiver<ViewerMessage>,
     sender: mpsc::Sender<ViewerMessage>,
 ) {
-    let window_reader = Arc::clone(&reader);
-    let read_deadline = deadline(runtime.as_ref());
-    let Ok(Ok(mut window)) =
-        tokio::task::spawn_blocking(move || window_reader.window(read_deadline)).await
+    let Ok((mut window, mut work)) = work.run(|reader, deadline| reader.window(deadline)).await
     else {
         let _ = sender.try_send(ViewerMessage::Unavailable {
             code: UNAVAILABLE.into(),
@@ -282,16 +335,16 @@ async fn replay_and_follow(
             limit: CAPACITY,
             wait_ms: 0,
         };
-        let replay_reader = Arc::clone(&reader);
-        let read_deadline = deadline(runtime.as_ref());
-        let Ok(Ok(result)) =
-            tokio::task::spawn_blocking(move || replay_reader.read(query, read_deadline)).await
+        let Ok((result, continued)) = work
+            .run(move |reader, deadline| reader.read(query, deadline))
+            .await
         else {
             let _ = sender.try_send(ViewerMessage::Unavailable {
                 code: UNAVAILABLE.into(),
             });
             return;
         };
+        work = continued;
         match result {
             EventReadResult::SnapshotRequired(repair) => {
                 if !send(
@@ -330,6 +383,8 @@ async fn replay_and_follow(
             }
         }
     }
+    // Live delivery holds a response slot, but no journal work admission.
+    drop(work);
     loop {
         let message = match live.recv().await {
             Ok(message) => message,
@@ -460,6 +515,95 @@ fn invalid_cursor() -> WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::events::testing::{ManualEventRuntime, MemoryJournal};
+    use std::sync::{Mutex, atomic::AtomicUsize, mpsc as std_mpsc};
+
+    struct BeforeReadRuntime {
+        clock: ManualEventRuntime,
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: Mutex<Option<std_mpsc::Receiver<()>>>,
+    }
+    impl EventRuntime for BeforeReadRuntime {
+        fn now(&self) -> Duration {
+            self.clock.now()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.clock.sleep(duration);
+        }
+        fn cancelled(&self) -> bool {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = self.release.lock().unwrap().take().unwrap().recv();
+            }
+            self.clock.cancelled()
+        }
+    }
+    struct CountingReader {
+        journal: MemoryJournal,
+        calls: AtomicUsize,
+    }
+    impl JournalReader for CountingReader {
+        fn window(&self, deadline: Duration) -> Result<JournalWindow, WorkerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.journal.window(deadline)
+        }
+        fn read(
+            &self,
+            query: ReadQuery,
+            deadline: Duration,
+        ) -> Result<EventReadResult, WorkerError> {
+            self.journal.read(query, deadline)
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_unstarted_journal_work_never_calls_the_reader() {
+        for stop in [true, false] {
+            let admission = Arc::new(Semaphore::new(1));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let reader = Arc::new(CountingReader {
+                journal: MemoryJournal::new(),
+                calls: AtomicUsize::new(0),
+            });
+            let (entered, entering) = oneshot::channel();
+            let (release, waiting) = std_mpsc::channel();
+            let work = ReplayWork {
+                reader: reader.clone(),
+                runtime: Arc::new(BeforeReadRuntime {
+                    clock: ManualEventRuntime::new(),
+                    entered: Mutex::new(Some(entered)),
+                    release: Mutex::new(Some(waiting)),
+                }),
+                stopped: stopped.clone(),
+                _permit: admission.clone().try_acquire_owned().unwrap(),
+            };
+            let task = tokio::spawn(work.run(|reader, deadline| reader.window(deadline)));
+            entering.await.unwrap();
+            let task = if stop {
+                stopped.store(true, Ordering::SeqCst);
+                Some(task)
+            } else {
+                task.abort();
+                let error = match task.await {
+                    Err(error) => error,
+                    Ok(_) => panic!("cancelled replay task completed"),
+                };
+                assert!(error.is_cancelled());
+                None
+            };
+            assert_eq!(admission.available_permits(), 0);
+            release.send(()).unwrap();
+            if let Some(task) = task {
+                drop(task.await.unwrap());
+            }
+            let _returned = admission.acquire_owned().await.unwrap();
+            assert_eq!(
+                reader.calls.load(Ordering::SeqCst),
+                0,
+                "cancelled work entered the journal (stop={stop})"
+            );
+        }
+    }
+
     #[test]
     fn cursor_sources_validate_canonical_sequences_and_conflicts() {
         let id = "00000000-0000-0000-0000-000000000001";

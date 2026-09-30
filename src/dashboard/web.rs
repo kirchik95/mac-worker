@@ -194,6 +194,12 @@ impl DashboardHttpServer {
         format!("http://{}", self.local_addr)
     }
 
+    /// Stop event admission, streams and collectors before joining HTTP.
+    /// Queued replay work is cancelled. Already-started local replay reads
+    /// retain their bounded permits on detached OS threads until they return;
+    /// this method does not join them. The caller may tear down its Tokio
+    /// runtime after this returns even while a journal syscall is stalled.
+    /// The fixed tailer also runs on its existing detached OS thread.
     pub async fn shutdown(self) -> Result<(), ApiError> {
         self.events.stop();
         if let Some(handle) = &self.local_refresh {
