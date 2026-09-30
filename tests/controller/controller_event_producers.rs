@@ -863,9 +863,7 @@ fn serialize_hints(events: &[NewEvent]) -> String {
                 )
                 .unwrap();
             let encoded = serde_json::to_string(&wire).unwrap();
-            assert!(
-                encoded.len() + 1 <= mac_worker::controller::events::contracts::MAX_EVENT_BYTES
-            );
+            assert!(encoded.len() < mac_worker::controller::events::contracts::MAX_EVENT_BYTES);
             encoded
         })
         .collect::<Vec<_>>()

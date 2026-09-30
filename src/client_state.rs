@@ -3460,13 +3460,18 @@ impl ClientStateStore {
                 ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
             ));
         }
-        match tasks.remove_owned_regular(&task_name) {
+        // The rooted Delete decision is durable before residue cleanup, which
+        // can still fail. Capture here so an absent retry need not reconstruct it.
+        let after_durable_delete = || {
+            if let Some(record) = &removed {
+                self.capture_hint(crate::controller::events::NewEvent::TaskRemoved(
+                    events::task_hint(record),
+                ));
+            }
+            Ok(())
+        };
+        match tasks.remove_owned_regular_with_cleanup_hook(&task_name, &after_durable_delete) {
             Ok(()) => {
-                if let Some(record) = removed {
-                    self.capture_hint(crate::controller::events::NewEvent::TaskRemoved(
-                        events::task_hint(&record),
-                    ));
-                }
                 if self.take_fault(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval) {
                     return Err(injected_failure(
                         ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,

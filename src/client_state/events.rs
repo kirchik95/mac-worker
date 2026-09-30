@@ -250,7 +250,7 @@ pub(crate) fn capture_task_diff(
             .find(|previous| previous.turn_id() == turn.turn_id())
             .and_then(|previous| previous.terminal().and_then(|_| previous.outcome()))
             .map(outcome_hint);
-        if previous.as_ref() == Some(&(outcome.clone(), code.clone())) {
+        if previous.as_ref() == Some(&(outcome, code.clone())) {
             continue;
         }
         let hint = TurnHint {
@@ -447,13 +447,14 @@ pub(crate) mod tests {
 
     #[test]
     fn durable_hints_survive_error_unwinding() {
-        let sink = Arc::new(CheckingSink::default());
-        let result: Result<(), ()> = (|| {
-            let scope = DeferredHints::begin(sink.clone());
+        fn fail(sink: Arc<CheckingSink>) -> Result<(), ()> {
+            let scope = DeferredHints::begin(sink);
             let _state = TestFence::enter("state");
             scope.capture(NewEvent::ControllerDrainChanged { drained: true });
             Err(())
-        })();
+        }
+        let sink = Arc::new(CheckingSink::default());
+        let result = fail(sink.clone());
         assert!(result.is_err());
         assert_eq!(sink.events().len(), 1);
     }
@@ -732,6 +733,41 @@ pub(crate) mod tests {
             time,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn removed_task_hint_survives_rooted_cleanup_error() {
+        let (_dir, bare, _) = store_with_sink();
+        let locked = vec![
+            bare.inner.state_root.clone(),
+            bare.inner.state_root.join("jobs.lock"),
+        ];
+        let sink = Arc::new(CheckingSink::checking(move || locks_are_free(&locked)));
+        let store = bare.with_event_sink(sink.clone());
+        let record = task_record();
+        let task = record.meta().task_id();
+        store.create_task(record).unwrap();
+        sink.clear();
+        let fault = crate::rooted_fs::fail_next_cleanup_before_final_root_removal(libc::EIO);
+        let error = store.remove_task_submission_record(task).unwrap_err();
+        assert!(
+            matches!(error, crate::error::WorkerError::Io(ref error) if error.raw_os_error() == Some(libc::EIO))
+        );
+        assert!(
+            store.load_task_optional(task).unwrap().is_none(),
+            "deletion committed before cleanup failed"
+        );
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TaskRemoved(hint) if hint.task_id == task)),
+            "committed tombstone survives rooted cleanup failure"
+        );
+        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+        drop(fault);
+        sink.clear();
+        store.remove_task_submission_record(task).unwrap();
+        assert!(sink.events().is_empty(), "an absent retry is silent");
     }
 
     #[test]
