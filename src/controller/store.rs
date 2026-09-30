@@ -1658,17 +1658,18 @@ mod tests {
         // ESTALE against its retained root and return the current record.
         let observed = store
             .load_with_hook(request.request_id(), || {
-                if !peer_acquired {
-                    if let Some(_lock) = peer.try_lock_request(request.request_id()).unwrap() {
-                        peer_acquired = true;
-                        peer.drive_to_ack(
-                            published.clone(),
-                            &FakeControllerExecutor,
-                            ControllerFault::None,
-                            0,
-                        )
-                        .unwrap();
-                    }
+                if peer_acquired {
+                    return;
+                }
+                if let Some(_lock) = peer.try_lock_request(request.request_id()).unwrap() {
+                    peer_acquired = true;
+                    peer.drive_to_ack(
+                        published.clone(),
+                        &FakeControllerExecutor,
+                        ControllerFault::None,
+                        0,
+                    )
+                    .unwrap();
                 }
             })
             .unwrap()
