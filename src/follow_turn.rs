@@ -249,16 +249,42 @@ fn resolve_turn(
     project_id: &str,
     job_id: JobId,
 ) -> Result<FollowedTurn, WorkerError> {
-    if job.entry_exists("execution.json")? {
-        let payload: ExecutionPayload = read_canonical_json(job, "execution.json")?;
-        let section = payload.turn().ok_or_else(not_a_turn)?;
-        if section.project_id() != project_id {
-            return Err(not_a_turn());
+    resolve_turn_with_payload_reader(store, job, project_id, job_id, || {
+        read_canonical_json(job, "execution.json")
+    })
+}
+
+fn resolve_turn_with_payload_reader(
+    store: &HostStore,
+    job: &RootedDir,
+    project_id: &str,
+    job_id: JobId,
+    read_payload: impl FnOnce() -> Result<ExecutionPayload, WorkerError>,
+) -> Result<FollowedTurn, WorkerError> {
+    match read_payload() {
+        Ok(payload) => {
+            let section = payload.turn().ok_or_else(not_a_turn)?;
+            if section.project_id() != project_id {
+                return Err(not_a_turn());
+            }
+            return Ok(FollowedTurn {
+                task_id: section.turn().task_id(),
+                agent: section.turn().agent(),
+            });
         }
-        return Ok(FollowedTurn {
-            task_id: section.turn().task_id(),
-            agent: section.turn().agent(),
-        });
+        Err(WorkerError::Io(error))
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESTALE) =>
+        {
+            // Publication retires the immutable payload after its task
+            // history is durable. Only that missing leaf permits fallback;
+            // a replaced job directory or a still-present payload stays strict.
+            job.verify_bound()?;
+            if job.entry_exists("execution.json")? {
+                return Err(WorkerError::Io(error));
+            }
+        }
+        Err(error) => return Err(error),
     }
     find_published_turn(store, project_id, job_id)?.ok_or_else(not_a_turn)
 }
@@ -303,11 +329,20 @@ fn terminal_turn(
     task_id: TaskId,
     job_id: JobId,
 ) -> Result<Option<(TurnSummary, TaskStatus)>, WorkerError> {
-    let status = match tasks.load_status(project_id, task_id) {
+    terminal_turn_with_status_reader(job_id, || tasks.load_status(project_id, task_id))
+}
+
+fn terminal_turn_with_status_reader(
+    job_id: JobId,
+    read_status: impl FnOnce() -> Result<TaskStatus, WorkerError>,
+) -> Result<Option<(TurnSummary, TaskStatus)>, WorkerError> {
+    let status = match read_status() {
         Ok(status) => status,
-        // The publisher replaces the record atomically; a read that raced the
-        // replacement is retried on the next poll.
-        Err(WorkerError::Io(error)) if is_transient(&error) => return Ok(None),
+        // TaskStore retries mutable status reads within the bound task.
+        // A remaining stale error must not reopen a replaced directory.
+        Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     let turn = status
@@ -448,4 +483,151 @@ fn invalid_component(label: &str) -> WorkerError {
 
 fn not_a_turn() -> WorkerError {
     WorkerError::Protocol("NOT_A_TURN: job is not a task turn".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agent::PermissionPolicy,
+        task::{
+            ClosePolicy, GitIdentity, PublishMode, TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+            TaskState,
+        },
+    };
+    use uuid::Uuid;
+
+    const PROJECT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const WORKTREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn published_turn_fixture() -> (tempfile::TempDir, HostStore, RootedDir, TaskId, JobId) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let job_id = JobId::new(Uuid::from_u128(2));
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id: PROJECT.into(),
+            worktree_id: WORKTREE.into(),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: "c".repeat(40).parse().unwrap(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Test", "test@example.test").unwrap(),
+            title: Some("Published turn".into()),
+            prompt: "private prompt".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Done),
+            Some("mini-1".into()),
+            true,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                job_id,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(false),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        let task = store.open_task_directory(PROJECT, task_id, true).unwrap();
+        task.write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        task.write_new_private_file("status.json", &serde_json::to_vec(&status).unwrap())
+            .unwrap();
+        let job = store
+            .open_directory(&format!("jobs/{PROJECT}/{WORKTREE}/{job_id}"), true)
+            .unwrap();
+        // The injected reader retires this private leaf before decoding it.
+        job.write_new_private_file("execution.json", b"private execution payload")
+            .unwrap();
+        (temp, store, job, task_id, job_id)
+    }
+
+    #[test]
+    fn published_turn_is_found_when_execution_payload_retires_during_read() {
+        for errno in [libc::ENOENT, libc::ESTALE] {
+            let (_temp, store, job, task_id, job_id) = published_turn_fixture();
+            let followed = resolve_turn_with_payload_reader(&store, &job, PROJECT, job_id, || {
+                store
+                    .remove_owned_regular_committed(&job, "execution.json")
+                    .unwrap();
+                Err(WorkerError::Io(io::Error::from_raw_os_error(errno)))
+            })
+            .unwrap();
+            assert_eq!(followed.task_id, task_id);
+            assert_eq!(followed.agent, AgentKind::Codex);
+        }
+    }
+
+    #[test]
+    fn stale_execution_payload_read_does_not_follow_a_replaced_job() {
+        let (_temp, store, job, _task_id, job_id) = published_turn_fixture();
+        let job_path = store.job(PROJECT, WORKTREE, job_id).unwrap();
+        let result = resolve_turn_with_payload_reader(&store, &job, PROJECT, job_id, || {
+            std::fs::rename(&job_path, job_path.with_extension("retired")).unwrap();
+            store
+                .open_directory(&format!("jobs/{PROJECT}/{WORKTREE}/{job_id}"), true)
+                .unwrap();
+            Err(WorkerError::Io(io::Error::from_raw_os_error(libc::ESTALE)))
+        });
+        assert!(matches!(
+            result,
+            Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE)
+        ));
+    }
+
+    #[test]
+    fn stale_execution_payload_read_with_a_present_leaf_stays_an_error() {
+        let (_temp, store, job, _task_id, job_id) = published_turn_fixture();
+        let result = resolve_turn_with_payload_reader(&store, &job, PROJECT, job_id, || {
+            Err(WorkerError::Io(io::Error::from_raw_os_error(libc::ESTALE)))
+        });
+        assert!(matches!(
+            result,
+            Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE)
+        ));
+    }
+
+    #[test]
+    fn stale_task_status_is_not_silently_retried() {
+        let result = terminal_turn_with_status_reader(JobId::new(Uuid::from_u128(2)), || {
+            Err(WorkerError::Io(io::Error::from_raw_os_error(libc::ESTALE)))
+        });
+        assert!(matches!(
+            result,
+            Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE)
+        ));
+    }
+
+    #[test]
+    fn interrupted_task_status_remains_retryable() {
+        let result = terminal_turn_with_status_reader(JobId::new(Uuid::from_u128(2)), || {
+            Err(WorkerError::Io(io::Error::from_raw_os_error(libc::EINTR)))
+        });
+        assert!(result.unwrap().is_none());
+    }
 }
