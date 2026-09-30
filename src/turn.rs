@@ -2609,6 +2609,10 @@ mod tests {
     }
 
     fn publication_fixture(stdout: Option<&str>) -> PublicationFixture {
+        publication_fixture_for(AgentKind::Codex, stdout)
+    }
+
+    fn publication_fixture_for(agent: AgentKind, stdout: Option<&str>) -> PublicationFixture {
         let temp = tempdir().unwrap();
         let store = HostStore::open(&temp.path().join("host")).unwrap();
         let task_id = TaskId::generate();
@@ -2621,7 +2625,7 @@ mod tests {
             run_id: None,
             project_id: PROJECT_ID.into(),
             worktree_id: worktree.clone(),
-            agent: AgentKind::Codex,
+            agent,
             model: None,
             effort: None,
             policy: PermissionPolicy::Workspace,
@@ -2644,7 +2648,7 @@ mod tests {
         let turn = TurnMaterial::from_prompt(
             task_id,
             1,
-            AgentKind::Codex,
+            agent,
             None,
             None,
             PermissionPolicy::Workspace,
@@ -2961,6 +2965,54 @@ mod tests {
             assert_eq!(wire["last_outcome"]["reason"], reason, "{code}");
             assert_eq!(wire["turns"][0]["terminal"], "failed", "{code}");
             assert!(!wire.to_string().contains("private helper detail"));
+        }
+    }
+
+    #[test]
+    fn opencode_v2_stream_without_a_closing_step_finish_publishes_like_v1() {
+        // Captured from OpenCode 2.0.18: the stream ends on the last `text`
+        // and v2 prints no closing `step_finish`. The turn still ends with
+        // the process, binds its session and publishes the result.
+        for (stdout, outcome, summary, parse_reason) in [
+            (
+                include_str!("../tests/fixtures/opencode/v2-final-json.jsonl"),
+                "done",
+                serde_json::json!("hello.txt created"),
+                serde_json::Value::Null,
+            ),
+            (
+                include_str!("../tests/fixtures/opencode/v2-run-standalone-json.jsonl"),
+                "unknown",
+                serde_json::Value::Null,
+                serde_json::json!("no_result_json"),
+            ),
+        ] {
+            let fixture = publication_fixture_for(AgentKind::Opencode, Some(stdout));
+            invoke_publication(
+                &fixture,
+                TurnTerminal::Succeeded,
+                TerminalPath::ChildExit(0),
+                Some(0),
+            )
+            .unwrap();
+            let task_id = fixture.section.turn().task_id();
+            let tasks = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner);
+            let session = tasks.session(PROJECT_ID, task_id).unwrap().unwrap();
+            assert_eq!(session.agent(), AgentKind::Opencode);
+            assert_eq!(session.session_ref(), "ses_f0ea2018effeLWl2cU5BkMIijI");
+            let wire =
+                serde_json::to_value(tasks.load_status(PROJECT_ID, task_id).unwrap()).unwrap();
+            assert_eq!(wire["turns"][0]["terminal"], "succeeded", "{outcome}");
+            assert_eq!(wire["turns"][0]["outcome"]["kind"], outcome);
+            assert_eq!(wire["summary"], summary, "{outcome}");
+            assert_eq!(
+                wire["turns"][0]
+                    .get("result_parse_reason")
+                    .cloned()
+                    .unwrap_or_default(),
+                parse_reason,
+                "{outcome}"
+            );
         }
     }
 
