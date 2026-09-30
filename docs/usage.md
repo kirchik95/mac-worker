@@ -402,7 +402,7 @@ Loopback `Host` / matching `Origin`, `Content-Type: application/json`, `X-Mac-Wo
 
 Public CLI `say` / `close` do not take these fields. Snapshot GET JSON remains at `GET /api/v1/snapshot`, `GET /api/v1/tasks/<id>`, and `GET /api/v1/tasks/<id>/turns/<turn>/logs`.
 
-The interface is a React application in `ui/`, built with Tailwind and shadcn/ui and embedded into the binary at build time, so `cargo build` needs no JavaScript toolchain.
+The interface is a React application in `ui/`, built with Tailwind and shadcn/ui and embedded into the binary at build time, so `cargo build` needs no JavaScript toolchain. Rebuild those files only from `ui/`; `ui/README.md` is the one place that describes that build. When this page is the controller viewer and the host has an event journal, it follows [Live dashboard](#live-dashboard) instead of waiting out the poll.
 
 ### Herdr
 
@@ -410,7 +410,7 @@ If you run [herdr](https://herdr.dev) on the workers and on your laptop, the poo
 
 - **Sidebar rows on the worker's herdr.** A worker with `herdr = true` in `config.toml` opens a `mac-worker` workspace in its own herdr and one tab per running turn, labelled `task <id> · turn <n>`. `worker task close` and garbage collection update the task record first, then ask herdr to remove the task tab. A herdr that accepts and does not answer is abandoned after the 5 second close budget, without holding the host installation or session lock; leftover tabs are removed on a later pass. `--close-on done` auto-close releases the pane the same way. When it was the last task tab and no operator tab remains, the reporter removes the workspace too. The row carries the task title, the agent's icon, and the turn's state: `working` while the agent runs, `blocked` when it needs input, `done` when it finished, `unknown` with the reason when it failed, was cancelled, timed out, or was lost. Herdr 0.9's machine link brings those rows to your laptop next to your local agents. A follow-up turn replaces the tab.
 - **A readable log in the pane.** The tab's pane runs `worker host follow-turn`, a read-only command that renders the turn's event stream the way `worker task logs -f` does and prints the outcome line when the turn ends. You cannot type to the agent there: the turn stays headless.
-- **Notifications on the laptop.** With `[notifications] herdr = true` (the default) the turn runner tells the herdr you started the command in that a turn ended: `task <id>: done` with the `done` sound, `needs_input` and `blocked` with the `request` sound. Without a reachable herdr socket nothing happens.
+- **Notifications on the laptop.** With `[notifications] herdr = true` (the default) the turn runner tells the herdr you started the command in that a turn ended: `task <id>: done` with the `done` sound, `needs_input` and `blocked` with the `request` sound. Without a reachable herdr socket nothing happens. Those notices come from the worker's turn runner. `worker notify` is a separate foreground command on the laptop; see [Laptop notifications](#laptop-notifications).
 - **Where to check.** `worker workers` and `worker doctor` print a `herdr:` line per worker (`available (0.9.0)`, `not installed`, `installed, no socket`, `installed, no response`, or `unknown` when facts are missing); a known fact older than the TTL is printed with a `stale` suffix (`available (0.9.0), stale 69m`) rather than `unknown`; `doctor` and `setup` warn with `HERDR_UNAVAILABLE` when a worker has `herdr = true` but its herdr cannot be reached. Turns still run without the reporter, and `worker task status --json` records `herdr: attached`, `unavailable`, or nothing for each turn.
 - **Dashboard chip and scheduling.** When the count is known and non-zero, the `herdr:` line from `worker workers` or `worker doctor` ends with `, N interactive agents`. The worker card and capabilities view show the same herdr fact in a chip (`herdr 0.9.0`, `herdr 0.9.0 · 2 agents`, `no herdr`, `herdr: no socket`, …), not counting mac-worker's own reporter tabs. Scheduling uses the count only as a last tie-breaker among otherwise equal workers; it never excludes a worker.
 
@@ -430,6 +430,8 @@ ssh = "yourname@mini.local"
 slots = 1         # per-worker client ceiling; default 1, max 8; combined cap is the sum
 herdr = false     # default false: show this worker's turns in its own herdr sidebar
 ```
+
+`[notifications] herdr` is also what `worker notify --channel auto` consults. Auto uses the laptop's Herdr socket only when the flag is true and that socket accepts a connection; otherwise the command uses a macOS banner. The turn-runner notices under [Herdr](#herdr) do not fall back to macOS.
 
 The design behind both keys is in [the herdr reporter design](superpowers/specs/2026-09-08-herdr-reporter-design.md).
 
@@ -614,6 +616,144 @@ Protocol 7 stays the version: a host may add fields to facts and probe JSON; a l
 A saved `task.close` request whose target has changed is rejected before any close action with `TASK_REVISION_CONFLICT` or `TASK_CLOSED`. The controller saves that rejection and removes the request from the active retry index. Replaying the same request returns the saved rejection; it does not close a newer turn. Existing stale requests are settled when the updated controller next processes them, including through its recovery tick. Their journal records remain available for diagnosis.
 
 Errors from an already-started close, including transport failures after retaining the close intent, remain retryable. A repeated close of the same completed target is still idempotent. Wait for `worker task wait --task-id <id>` before closing an active task.
+
+### Controller events
+
+With an enabled controller, the leader keeps a small journal of lifecycle hints: task created, changed, removed, closed, or abandoned; turn started or finished; a corrected turn outcome; a scheduled automatic continuation; queue, run, and DAG-child changes; a committed worker observation; and drain on or off. An event is identifiers, states, and stable codes. Prompts, paths, titles, questions, summaries, failure prose, and secrets never enter the journal.
+
+Treat the journal as hints, not a log of record. Task, queue, run, DAG, admission, and drain records stay authoritative. A consumer reconciles a hint against saved state, so a missed or dropped hint cannot produce a wrong decision. It only delays confirmation until the next repair sweep re-reads that state. Sequence numbers order publication inside one journal. Timestamps are diagnostic. The journal is bounded and retires the oldest data (see [Controller events limits and failure states](#controller-events-limits-and-failure-states)); it is not an audit trail.
+
+Protocol stays 7. An integrated helper advertises `controller.events` beside `controller.task-logs-wait`. `worker controller status` prints `features: controller.events, controller.task-logs-wait`, or `features: unknown` when the peer sends no list. Host features stay `host.outbox-retry` and `host.status-logs`.
+
+`worker task wait` is unchanged. It still polls `task.wait.poll` about every 100 ms. A wait never sends a `controller_events` selector, and events never make it return earlier or later. Exit codes, including `WAIT_BLOCKED` (70), stay as in [Task lifecycle](#task-lifecycle).
+
+To watch hints for debugging, confirm the installed grammar with `worker events --help`:
+
+```sh
+worker events -f            # human-readable tail
+worker events -f --json     # one object per line
+```
+
+`-f` is required. There is no one-shot and no historical inspection. `--since` is not a flag; passing it is a usage error (exit 64). The command reads the current journal head, prints a ready line, and then tails records that commit after that head. It does not replay past work and it does not poll an older controller to imitate a feed.
+
+The human ready line is `ready journal_id=<uuid> oldest_seq=<n> head_seq=<n>`. Each later line is `<journal-id>:<seq> <kind>` plus the safe payload when the kind is known. With `--json`, the ready line and a rebaseline are objects `{"event":"ready","data":{...}}` and `{"event":"snapshot_required","data":{...}}`. Each event line is the safe envelope: `schema_version`, `journal_id`, `seq` (a decimal string, never a JSON number), `time_millis`, `kind`, and `data` only for a known kind. An unknown kind or a newer schema prints that envelope metadata and omits `data`. It never prints raw bytes.
+
+When the journal is replaced, the cursor falls before the retained window, or the cursor is ahead of the head, the command prints `snapshot_required reason=journal_changed`, `cursor_expired`, or `cursor_ahead`, then a new ready line, and continues from that head. It does not backfill. Ctrl-C stops the tail and exits 0.
+
+Both `worker events` and `worker notify` require `[controller] enabled = true`. Otherwise they exit 64. The public line is `CONFIG: configuration error`, followed by the catalog hint to check configuration syntax; that line does not itself say "controller mode". Against a controller that does not advertise `controller.events` — including an older helper whose feature list is missing — `worker events -f` prints `CONTROLLER_EVENTS_UNSUPPORTED: worker unavailable` and exits 69. It does not emulate the feed. A tail batch that does not follow its cursor exits 70 (`CONTROLLER_EVENTS_INVALID: protocol error`).
+
+### Laptop notifications
+
+```sh
+worker notify [--follow] [--quiet] [--no-titles] [--channel auto|macos|herdr|both]
+```
+
+Confirm the installed grammar with `worker notify --help`. `worker notify` turns confirmed task outcomes into notifications on your laptop. It complements the worker-side reporter under [Herdr](#herdr); it does not replace it. This command is foreground only. This wave installs no LaunchAgent and no background registration for it. Run it where you can see it, for example in a pane of the herdr you already use on the laptop.
+
+- `worker notify` reconciles the current attention set once and exits. It allows 30 seconds. Exit 0 means that baseline finished. Exit 69 means it did not, with one explicit line: `eligibility unknown: controller events unsupported`, `eligibility unknown: controller discovery unavailable; baseline incomplete`, `notification baseline incomplete: confirmation or repair unavailable`, or `notification baseline incomplete: deadline exhausted`.
+- `worker notify --follow` keeps running until Ctrl-C. Ctrl-C stops further reads and new banners and exits 0, including when the baseline is not finished yet. A banner already being handed to a channel can use the rest of its 2 second budget.
+- One notifier owns a given controller. A second copy prints `CONTROLLER_EVENTS_NOTIFY_LOCK_HELD: protocol error` and exits 70 instead of posting a second set of banners.
+- Diagnostics are text on stderr. Global `--json` is accepted and does not change that text.
+- There is no reset and no delete command for the notifier cache.
+
+**Which outcomes notify.** A banner is sent only after the controller confirms that the latest turn is terminally finished and nothing further is attached: no scheduled or running automatic continuation, no close intent, no active runner, and no queued dispatch. A dead runner that has not been retired still counts as a runner, so it does not notify. A dispatching queue row does not notify. All eight terminal outcomes can confirm: `done`, `needs_input`, `blocked`, `unknown`, `failed`, `cancelled`, `timed_out`, and `lost`. An abandoned task with no terminal turn notifies too, from the task state and its stable code, with no sound. A `needs_input` that the questions policy answers by automatic continuation does not notify; the follow-up turn's own outcome does. Historical state is not current attention. Busy or unproved tasks stay candidates and are re-read on later hints and repair sweeps. Queue, turn-start, drain, and worker hints never notify by themselves.
+
+**Titles.** The banner title is the outcome label (`Done`, `Needs input`, `Blocked`, `Unknown`, `Failed`, `Cancelled`, `Timed out`, `Lost`, or `Abandoned`). The body is the task id, then the task title when one is shown. The title is fetched from the controller, control characters are escaped, home paths and tokens are redacted, and the display is capped at 120 bytes, the same limit as other titles the CLI shows. An empty redaction leaves the id alone. Titles are fetched for the cold baseline and for confirmations woken by new events. A periodic repair page does not fetch titles. `--no-titles` fetches none and the body is the task id only. Banners never include summaries, questions, or failure prose.
+
+**Sounds and channels.** Sounds apply on Herdr. A macOS banner is `osascript` display text with the same title and body and no sound.
+
+| Outcome | Herdr sound |
+|---|---|
+| `done` | `done` |
+| `needs_input`, `blocked` | `request` |
+| `unknown`, `failed`, `cancelled`, `timed_out`, `lost`, abandonment without a terminal turn | none |
+
+`--channel auto` (the default) probes the Herdr socket on the laptop, not a socket on the controller. It uses Herdr when `[notifications] herdr = true` (the default) and that socket accepts a connection. Otherwise it uses macOS. `--channel macos` is macOS only. `--channel herdr` is Herdr only: if the socket is not reachable it prints `herdr notification channel is unavailable` and still attempts Herdr, so a miss notifies nothing. `--channel both` attempts Herdr and then macOS, once each, for one saved decision. One attempt can fail while the other succeeds. Each attempt is bounded by 2 seconds.
+
+**Coalescing.** The notifier posts one summary instead of one banner per decision in these cases:
+
+- A one-shot, and the first start with no saved baseline, summarizes the tasks waiting for you now: `needs_input` and `blocked` once they are confirmed quiescent. That is one notice, not one banner per task, and it is not silent. Completions that are already history stay silent. Nothing waiting means no notice.
+- A cursor repair does the same for the fresh decisions that repair confirms. The cursor may have expired inside the same journal, moved ahead of the head, or belonged to a journal that was replaced. Those decisions are one summary, not one banner each.
+- The last complete repair was more than 60 seconds ago, more than 5 fresh decisions arrive in one reconciliation, or the journal epoch changed.
+
+The summary title is `Tasks need attention` with the `request` sound when it includes current attention, `Tasks finished` with the `done` sound when every fresh decision is `done`, and otherwise `Tasks updated` with no sound. The body is `1 task` or `N tasks`. After a restart the summary is current attention, not every completion since the notifier stopped.
+
+**`--quiet`.** The same reconciliation runs and the same dedup state is saved. Nothing is sent to a channel and no sound is played. Use it to seed the notifier before you want banners.
+
+**Delivery is at-most-once.** The notifier writes the decision to its private cache before it sends the banner. The cache holds cursors and decision fingerprints, not titles and not a copy of the task registry. A crash or a channel failure after that write can lose the banner and will not replay it. A failed channel prints `notification channel failed; saved decision will not be retried` and the command continues. Two consequences you can observe:
+
+- A completion whose hint was dropped, or that fell outside the retained window before this notifier baselined it, is recorded as already seen. There is no banner for that history. Later outcomes still notify.
+- `--channel both` is two delivery attempts for one saved decision.
+
+A corrupt cache, or one larger than 1 MiB, prints `notification cache corrupt: rebuilding baseline with display suppressed`, replaces the cache with an empty baseline, and suppresses banners until that baseline is saved. An unsafe cache (not an owner-only directory) does not rebuild: `CONTROLLER_EVENTS_NOTIFY_CACHE_UNSAFE: protocol error`, exit 70.
+
+The saved state also remembers an overflow fingerprint, so a summary that was already consumed stays consumed across a restart and a journal epoch change. Pending candidates are capped at 256 and remembered decisions at 4,096. Past those caps the notifier sets repair-needed and summarizes instead of growing without a bound.
+
+**With an older controller.** If discovery does not find `controller.events`, the notifier prints `eligibility unknown: controller events unsupported` and raises no banners. It does not list candidate tasks and it does not guess completions. With `--follow` it retries discovery every 2 seconds and starts notifying on its own after the helper is upgraded. Without `--follow` it exits 69. A discovery failure that is not "unsupported" — the controller could not be asked — prints `eligibility unknown: controller discovery unavailable; baseline incomplete` and, with `--follow`, retries after 1, 2, 4, then 5 seconds, and further waits stay at 5 seconds. That backoff is not the 2 second unsupported poll. A later confirmation or repair failure prints `notification baseline incomplete: confirmation or repair unavailable` and backs off the same way, but never longer than the wait until the next 15 second sweep.
+
+A new controller whose journal is unavailable is a different state. The notifier prints `event journal unavailable: state-only confirmation` once, keeps a null cursor, and still confirms from task state. It does not treat that as an old controller.
+
+### Live dashboard
+
+When the dashboard is the controller viewer ([Dashboard](#dashboard), or the hidden `--controller-viewer` mode) and the controller host has an initialized journal, the browser follows `GET /api/v1/events` (SSE). An ordinary laptop-local dashboard, or a viewer without an initialized journal, answers 404 and the page keeps polling. Laptop-local commands do not create a journal.
+
+Stream events are named. Only `controller.event` carries a replay cursor. Its `id:` is `<journal-uuid>:<sequence>`, and the sequence stays a decimal string so values past 2^53 are not rounded. Control events carry no `id:` and do not advance your position: `ready`, `snapshot_required`, `snapshot.ready`, and `heartbeat`. A heartbeat is an empty object plus a `keepalive` comment, every 10 seconds, including while idle. `snapshot_required` is how the viewer asks the page to rebaseline (reset, expired cursor, cursor ahead, a slow tab, or an unavailable journal). It never invents events. `snapshot.ready` carries the cache revision after a fresh local projection is visible.
+
+The page does not render event payloads as the task view. A hint invalidates the view, and the cards come from a fresh snapshot fetch. On a healthy stream the background refresh stretches to 15 seconds, with a 100 ms debounce before that fetch. The controller still collects snapshots on a 2 second cadence; idle unchanged workers are probed at 10 seconds. Those remain the ceiling. On a stream error, a parse failure, an explicit repair, a 404, or 30 seconds of silence, the page returns to 2 second polling and reconnects with the last validated cursor, waiting 1, then 2, then 4, then 5 seconds, and further attempts stay at 5 seconds. Reconnects and tab visibility changes refetch so a hidden tab does not stay stale. A slow tab is told to rebaseline rather than skip ahead.
+
+**Logs keep their own polling.** The stream is a lifecycle hint, not log bytes. Task detail log panes keep polling about every 1 second. A `turn.finished` hint does not prove that the final log bytes have arrived, and it does not stop `worker task logs -f`.
+
+The viewer admits at most 8 journal replays and 8 live streams. A further replay is an SSE `snapshot_required` with `reason` `unavailable` and code `CONTROLLER_EVENTS_UNAVAILABLE`; the page falls back to polling. A further live stream, once a replay slot was free, is HTTP 503 with that same code and the message `viewer event stream is unavailable`. The route stays loopback-only. A wrong `Host` is HTTP 400 `INVALID_HOST`. A foreign `Origin` or `Sec-Fetch-Site: cross-site` is HTTP 403 `INVALID_ORIGIN`. A conflicting or malformed cursor (`after` versus `Last-Event-ID`) is HTTP 400 `INVALID_EVENT_CURSOR`. A missing `Origin` is accepted, which is what the browser's `EventSource` sends.
+
+The SSH tunnel heartbeat is independent of SSE. The laptop renews it every 5 seconds. The viewer exits after 30 seconds without a tunnel heartbeat, which closes SSE; heartbeats on the event stream do not keep the viewer alive, and the tunnel heartbeat is not an event-stream heartbeat. `worker dashboard` reconnects as described under [Dashboard](#dashboard) in this section. The browser has already fallen back to polling, keeps the last good snapshot and an unsent reply draft, and resumes the stream with its last validated cursor after the tunnel returns.
+
+### Controller events limits and failure states
+
+None of these limits change authoritative task state. A full publisher or an unreadable journal drops or withholds hints. The task write that produced a hint still commits.
+
+**Size and retention.** Retained history is at most 64 segments of 256 KiB, 16 MiB, plus at most one 256 KiB recovery segment. The directory, including residue, stays within 18 MiB and 128 regular files. Each event is at most 1 KiB, counting its newline. A batch is at most 32 events. The per-process publisher holds at most 128 batches. When the cap is reached, the oldest segments are retired and consumers rebaseline from state. A cursor older than `oldest − 1` is `cursor_expired`.
+
+**Drops.** Publication is best effort. A full queue, a publisher that is stopping, a write failure, or an unavailable journal drops the hint and does not fail the task write. When that controller process exits, if any hint was dropped, it prints one stderr line: `CONTROLLER_EVENT_HINTS_DROPPED count=<n> publisher=[CODE=<n>,...]`. The codes are `CONTROLLER_EVENTS_DROPPED_FULL`, `CONTROLLER_EVENTS_DROPPED_STOPPING`, `CONTROLLER_EVENTS_UNAVAILABLE`, `CONTROLLER_EVENTS_WRITE_FAILED`, and `CONTROLLER_EVENTS_PUBLISHER_PANIC`. A supervised restart truncates `controller.log` at the next start, so that line is visible on the exiting process. Repair converges from saved state. The consumer does not advance its cursor to a head it never received.
+
+**Unavailable, not empty.** If the event directory, lock, or journal metadata is unreadable, unsafe, or damaged, readers fail with `CONTROLLER_EVENTS_UNAVAILABLE` rather than showing a healthy empty feed. `worker events -f` prints `CONTROLLER_EVENTS_UNAVAILABLE: worker unavailable` and exits 69. Ordinary task reads never touch the journal and keep working. On leader start, an empty evidence-less stage is removed and initialization continues: a zero-length, owner-only, mode `0600` regular file named `initialization.stage`, `manifest.stage`, `pending.stage`, `segment.stage`, or `retirement.stage`, with no matching `.role` file. That removal does not mint a new journal id and does not rewind the head. Any other residue stays in place. The error names the role (`unproved manifest stage unavailable`, and the same form for `initialization`, `pending`, `segment`, and `retirement`) and includes no path. The public command line is still `CONTROLLER_EVENTS_UNAVAILABLE: worker unavailable`. The leader keeps serving task state without publishing hints. There is no reset, replay, or delete command. Do not delete journal files by hand.
+
+**Repair cap and paging.** The notifier sweeps the controller's task registry about every 15 seconds. Busy hint traffic cannot postpone that sweep: a long poll ends at the next sweep. Each page asks for 64 task records (the selector allows at most 128), after a whole-directory name listing, and then spends at most 50 ms of cooperative work and at most 8 MiB of task input. Kernel I/O can overrun the 50 ms. The page then yields and the next sweep continues. If the 50 ms or 8 MiB budget runs out after at least one row, the page stops and the next sweep continues after the last visited id. Dispatch proof checks at most 32 associations; a row that is still unproved is saved with unknown quiescence and is not restarted from the first association. `complete=true` means every canonical task id strictly after the cursor in the current sorted name list was visited. It is not a point-in-time snapshot of the directory. A task inserted at or below the cursor is picked up on the next sweep, which starts from the beginning of the names again.
+
+**Who captures the repair baseline.** The controller does not choose the journal position a sweep is checked against, and it does not read the journal to invent one. Before the first page, the notifier reads the journal and captures the head at that moment. Every repair page sends that cursor as `baseline_after`. The controller echoes the cursor it was given. A page that comes back with a different cursor is rejected. The head is captured before the names are listed, so replaying events after it cannot miss a change that commits during the sweep. If the journal cannot be read, the sweep still reads task state and sends no baseline. Damage to the journal does not fail those state reads.
+
+The sweep admits at most 100,000 directory entries, counting private residue and `.mac-worker-rooted-fs`. One more entry returns `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE` (`repair unavailable, registry too large`, public line `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE: worker unavailable`, exit 69) before any task record, queue, or fact read, and before name validation and sort. The name listing still allocates the whole directory first; that cost is separate from record work. Addressed reads of specific task ids are a different selector and are not blocked by the cap. The laptop keeps this code. It is not rewritten as a generic `CONTROLLER_EVENTS_UNAVAILABLE`. The notifier keeps its last saved cache when a sweep cannot finish, and a one-shot exits 69. Shrinking the registry (close tasks, then `worker gc`) is what makes a full sweep possible again.
+
+These name-listing and record-work times were measured by T4 on 2026-10-01 in `real_names_cost_cap_and_independent_addressed_reads`. They are observations from that run, not guarantees. Times are microseconds. The fixture is about 10% private residue, and each admitted page reads one record on purpose so the record column stays the bounded work rather than the whole registry.
+
+| Entries | Name bytes | Names (µs) | Record and fact work (µs) | Records | Task input bytes | Queue reads | Associations |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 37,677 | 7,390 | 9,073 | 1 | 1,357 | 1 | 0 |
+| 10,000 | 376,977 | 30,463 | 4,086 | 1 | 1,357 | 1 | 0 |
+| 100,000 | 3,769,977 | 176,736 | 1,170 | 1 | 1,357 | 1 | 0 |
+| 100,001 | 3,770,021 | 46,120 | 0 | 0 | 0 | 0 | 0 |
+
+The 100,001 row is collection and the count only. Rejection happens before validation, sort, and every record read, which is why that names time is lower than the 100,000 row. Do not read it as a cheaper listing.
+
+**What does not emit a hint.** A worker observation that only expires its TTL writes nothing; `worker.changed` comes from a committed observation. Leader health ticks and `health.json` are not journal events. Stale health remains the failover signal. A host `worker gc` close is silent until the controller persists that lifecycle. Runner logs, log sidecars, and byte followers are not woken by the journal.
+
+**What an operator should do.**
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `CONTROLLER_EVENTS_UNSUPPORTED: worker unavailable` (events, exit 69) or `eligibility unknown: controller events unsupported` (notify) | the helper does not advertise `controller.events` | upgrade and restart the helper with `worker setup`; notify raises no banners until it does |
+| `CONTROLLER_EVENTS_UNAVAILABLE: worker unavailable` | the journal is unsafe or damaged; readers refuse an empty feed | task state is unaffected; check `worker controller status` and disk space; do not delete the journal |
+| `event journal unavailable: state-only confirmation` | the notifier is confirming from task state with no cursor | none required; this is not an old controller |
+| `notification baseline incomplete: …` and exit 69 | a one-shot did not finish in 30 seconds, or confirmation failed | rerun, or use `--follow` |
+| `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE: worker unavailable` | the registry directory is above 100,000 entries; the fixed message is `repair unavailable, registry too large` | the last saved projection remains; shrink the registry. Addressed reads of specific ids are a separate selector and are not capped |
+| `CONTROLLER_EVENT_HINTS_DROPPED count=…` as the controller exits | hints were dropped after the task write committed | none required; the next sweep reads state |
+| `CONTROLLER_EVENTS_NOTIFY_LOCK_HELD: protocol error` (exit 70) | another notifier owns this controller | stop the other one; do not run two |
+| a finished task and no banner | the decision was saved before display, or the hint was already lost at cold baseline | that banner is not repeated; a later `worker notify` stays silent for a decision already saved |
+
+### Not in this wave
+
+This wave does not change `worker task wait`, does not add run-level banners or run settlement, and does not treat worker TTL expiry as availability. There is no `worker events --since`, no snapshot of every subsystem, and no emulation of the feed on an old controller. The notifier is not a LaunchAgent. The CLI has no reset command and no journal delete.
+
+A later design may add a same-account Unix socket on the controller, forwarded with `ssh -N -L` and checked for protocol 7, identity, and generation before use, falling back to today's per-request SSH. That socket is not implemented. Phone access, Tailscale, and a daemon on every mini are outside this design. Build it only after a separate measurement and an authenticated identity design; this wave does not create socket files.
 
 ## What the pool will and will not do
 
