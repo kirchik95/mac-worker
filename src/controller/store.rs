@@ -485,8 +485,15 @@ impl ControllerStore {
         result.map_err(|error| {
             // Inspect the durable outcome while still holding the request lock.
             // Preparation and replay-identity failures return before this point.
-            if self.load(request.request_id()).is_ok_and(|row| {
-                row.is_some_and(|row| row.phase == RequestPhase::Published && row.result.is_none())
+            // A saved success still needs recovery if ACK/receipt cleanup fails.
+            // An unreadable row cannot prove a definitive rejection either.
+            if self.load(request.request_id()).map_or(true, |row| {
+                row.is_some_and(|row| {
+                    saved_rejection(row.result.as_ref())
+                        .ok()
+                        .flatten()
+                        .is_none()
+                })
             }) {
                 WorkerError::ControllerResumable(Box::new(error))
             } else {
@@ -1653,6 +1660,148 @@ mod tests {
         let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
         assert_eq!(wire["error"]["code"], "CONTROLLER_REQUEST_CONFLICT");
         assert!(wire["error"].get("resumable").is_none());
+    }
+
+    #[test]
+    fn saved_success_is_resumable_after_ack_or_retirement_io_failure() {
+        struct SuccessfulHandler(std::cell::Cell<usize>);
+        impl ControllerCommandHandler for SuccessfulHandler {
+            fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
+                FailingHandler {
+                    prepare_fails: false,
+                    terminal: false,
+                }
+                .prepare(request)
+            }
+            fn execute(&self, _: &DurableRequest) -> Result<Value, WorkerError> {
+                self.0.set(self.0.get() + 1);
+                Ok(json!({"saved": "success"}))
+            }
+        }
+        for (fault, phase) in [
+            (
+                ControllerFault::CrashBeforeAckExchange,
+                RequestPhase::Published,
+            ),
+            (
+                ControllerFault::CrashAfterAckExchangeBeforeSync,
+                RequestPhase::Acked,
+            ),
+            (
+                ControllerFault::CrashAfterAckBeforeRetire,
+                RequestPhase::Acked,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("controller");
+            let store = ControllerStore::open(&root).unwrap();
+            let request = submit_request(json!({}));
+            let handler = SuccessfulHandler(std::cell::Cell::new(0));
+            // A replay of an Acked row can also fail during receipt retirement.
+            for _ in 0..2 {
+                let error = store.handle_with(&request, &handler, fault).unwrap_err();
+                assert_eq!(error.public_code(), "IO");
+                assert_eq!(error.exit_code(), 74);
+                let row = store.load(request.request_id()).unwrap().unwrap();
+                assert_eq!(row.phase(), phase);
+                assert_eq!(row.result(), Some(&json!({"saved": "success"})));
+                let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+                assert_eq!(wire["error"]["resumable"], true, "{fault:?}");
+                // Only retirement faults recur once the ACK exchange has succeeded.
+                if fault == ControllerFault::CrashAfterAckExchangeBeforeSync {
+                    break;
+                }
+            }
+            let store = ControllerStore::open(&root).unwrap();
+            let ack = store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap();
+            assert_eq!(ack.result(), Some(&json!({"saved": "success"})));
+            assert_eq!(handler.0.get(), 1, "saved success must not execute again");
+            assert_eq!(store.request_count().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn unreadable_row_after_execution_keeps_the_original_error_resumable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct UnreadableRow(std::path::PathBuf);
+        impl ControllerCommandHandler for UnreadableRow {
+            fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
+                FailingHandler {
+                    prepare_fails: false,
+                    terminal: false,
+                }
+                .prepare(request)
+            }
+            fn execute(&self, record: &DurableRequest) -> Result<Value, WorkerError> {
+                std::fs::set_permissions(
+                    self.0.join(format!("req-{}.json", record.request_id())),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+                Err(WorkerError::task("TASK_BUSY", "task is busy"))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("controller");
+        let store = ControllerStore::open(&root).unwrap();
+        let request = submit_request(json!({}));
+        let error = store
+            .handle_with(
+                &request,
+                &UnreadableRow(root.clone()),
+                ControllerFault::None,
+            )
+            .unwrap_err();
+        assert!(store.load(request.request_id()).is_err());
+        assert_eq!(error.public_code(), "TASK_BUSY");
+        assert_eq!(error.public_message(), "task is busy");
+        assert_eq!(error.exit_code(), 64);
+        let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+        assert_eq!(wire["error"]["resumable"], true);
+        std::fs::set_permissions(
+            root.join(format!("req-{}.json", request.request_id())),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let row = store.load(request.request_id()).unwrap().unwrap();
+        assert_eq!(row.phase(), RequestPhase::Published);
+        assert!(row.result().is_none());
+    }
+
+    #[test]
+    fn saved_rejections_remain_definitive_after_ack_or_retirement_io_failure() {
+        for fault in [
+            ControllerFault::CrashBeforeAckExchange,
+            ControllerFault::CrashAfterAckExchangeBeforeSync,
+            ControllerFault::CrashAfterAckBeforeRetire,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+            let request = submit_request(json!({}));
+            let handler = FailingHandler {
+                prepare_fails: false,
+                terminal: true,
+            };
+            let error = store.handle_with(&request, &handler, fault).unwrap_err();
+            let row = store.load(request.request_id()).unwrap().unwrap();
+            assert_eq!(
+                saved_rejection(row.result())
+                    .unwrap()
+                    .unwrap()
+                    .public_code(),
+                "CAPACITY_BUSY"
+            );
+            let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+            assert!(wire["error"].get("resumable").is_none(), "{fault:?}");
+            let rejection = store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap_err();
+            assert_eq!(rejection.public_code(), "CAPACITY_BUSY");
+            assert_eq!(rejection.exit_code(), 75);
+        }
     }
 
     #[test]
