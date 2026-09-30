@@ -239,6 +239,32 @@ fn first_controller_mode_run_writes_a_private_adoption_marker_once() {
 }
 
 #[test]
+fn controller_process_roles_skip_laptop_adoption_even_with_enabled_config() {
+    for args in [
+        vec!["host", "controller-rpc"],
+        vec!["controller", "run"],
+        vec!["controller", "run", "--supervised"],
+        vec![
+            "dashboard",
+            "--controller-viewer",
+            "--no-open",
+            "--no-facts-refresh",
+        ],
+    ] {
+        let fixture = Fixture::new(true);
+        // Stop local service startup before any listener, loop, or worker access.
+        fs::create_dir_all(fixture.paths.state.parent().unwrap()).unwrap();
+        fs::write(&fixture.paths.state, b"not a state directory").unwrap();
+        let (exit, _, stderr) = fixture.run(&args, &NoTransport);
+        assert_ne!(exit, 0, "{args:?}: {stderr}");
+        assert!(
+            !fixture.paths.controller_cache_root().exists(),
+            "{args:?} must not initialize the laptop recovery cache"
+        );
+    }
+}
+
+#[test]
 fn pending_lists_legacy_requests_and_warns_once_when_adoption_marker_is_invalid() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 

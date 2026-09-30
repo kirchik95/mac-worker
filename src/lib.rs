@@ -750,8 +750,17 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    if !matches!(&cli.command, Command::Host { .. })
-        && let Ok(paths) = discover_paths(cli.config.clone(), runtime)
+    if !matches!(
+        &cli.command,
+        Command::Host { .. }
+            | Command::Dashboard {
+                controller_viewer: true,
+                ..
+            }
+            | Command::Controller {
+                command: ControllerCommand::Run { .. }
+            }
+    ) && let Ok(paths) = discover_paths(cli.config.clone(), runtime)
         && let Ok(config) = Config::load(&paths.config)
         && config.controller.enabled
     {
