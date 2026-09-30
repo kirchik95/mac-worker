@@ -275,6 +275,7 @@ pub struct ClientStateSyncCounts {
 #[derive(Clone)]
 pub struct ClientStateStore {
     inner: Arc<ClientStateInner>,
+    event_sink: Option<Arc<dyn crate::controller::events::EventSink>>,
     wait_deadline: WaitDeadline,
     timings: ClientStateTimings,
     liveness_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
@@ -480,6 +481,31 @@ struct SyncCounters {
 }
 
 impl ClientStateStore {
+    /// Attach only after the caller has opened an initialized host journal.
+    /// Bare stores deliberately remain silent, including laptop-local mode.
+    pub fn with_event_sink(mut self, sink: Arc<dyn crate::controller::events::EventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    pub(crate) fn event_scope(&self) -> Option<events::DeferredHints> {
+        self.event_sink
+            .as_ref()
+            .map(|sink| events::DeferredHints::begin(sink.clone()))
+    }
+
+    fn capture_hint(&self, event: crate::controller::events::NewEvent) {
+        if let Some(sink) = &self.event_sink {
+            events::DeferredHints::capture_for(sink, event);
+        }
+    }
+
+    fn capture_task_change(&self, old: &LocalTaskRecord, next: &LocalTaskRecord) {
+        if self.event_sink.is_some() {
+            events::capture_task_diff(old, next, |event| self.capture_hint(event));
+        }
+    }
+
     pub fn with_timings(mut self, timings: ClientStateTimings) -> Self {
         self.timings = timings;
         self
@@ -523,6 +549,7 @@ impl ClientStateStore {
     pub(crate) fn with_wait_deadline(&self, wait_deadline: WaitDeadline) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            event_sink: self.event_sink.clone(),
             wait_deadline,
             timings: self.timings,
             liveness_clock: self.liveness_clock.clone(),
@@ -534,21 +561,31 @@ impl ClientStateStore {
         self.wait_deadline
     }
 
-    fn acquire_state_lock(&self) -> Result<StateLock, WorkerError> {
-        StateLock::acquire(
+    fn acquire_state_lock(&self) -> Result<EventStateLock, WorkerError> {
+        let hints = self.event_scope();
+        let lock = StateLock::acquire(
             self.inner.root.as_raw_fd(),
             &self.inner.sync_counts,
             self.wait_deadline,
-        )
+        )?;
+        Ok(EventStateLock {
+            _lock: lock,
+            _hints: hints,
+        })
     }
 
-    fn acquire_queue_lock(&self) -> Result<QueueLock, WorkerError> {
-        QueueLock::acquire(
+    fn acquire_queue_lock(&self) -> Result<EventQueueLock, WorkerError> {
+        let hints = self.event_scope();
+        let lock = QueueLock::acquire(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),
             &self.inner.sync_counts,
             self.wait_deadline,
-        )
+        )?;
+        Ok(EventQueueLock {
+            _lock: lock,
+            _hints: hints,
+        })
     }
 
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
@@ -821,6 +858,7 @@ impl ClientStateStore {
 
         Ok(Self {
             wait_deadline,
+            event_sink: None,
             timings: ClientStateTimings::default(),
             liveness_clock: None,
             admission_clock: None,
@@ -1021,6 +1059,7 @@ impl ClientStateStore {
         token: Uuid,
         reserver: ProcessIdentity,
     ) -> Result<QueueEntry, WorkerError> {
+        let _hints = self.event_scope();
         let _lock = QueueLock::acquire_inner(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),
@@ -2933,7 +2972,11 @@ impl ClientStateStore {
         }
         tasks
             .write_private_atomic_no_replace(&name, &bytes)
-            .map_err(WorkerError::Io)
+            .map_err(WorkerError::Io)?;
+        self.capture_hint(crate::controller::events::NewEvent::TaskCreated(
+            events::task_hint(&record),
+        ));
+        Ok(())
     }
 
     pub fn load_task(&self, task_id: TaskId) -> Result<LocalTaskRecord, WorkerError> {
@@ -3203,6 +3246,7 @@ impl ClientStateStore {
                 before_final_sync,
             )
             .map_err(WorkerError::Io)?;
+        self.capture_task_change(&existing, &replacement);
         if !keep {
             if self.take_fault(ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire) {
                 return Err(injected_failure(
@@ -3294,6 +3338,7 @@ impl ClientStateStore {
         let names = tasks.list_names().map_err(WorkerError::Io)?;
         self.recover_task_replacement_residue(&tasks, &names)?;
         let task_name = task_file_name(task_id)?;
+        let removed = self.load_task_locked(task_id).ok();
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
@@ -3301,6 +3346,11 @@ impl ClientStateStore {
         }
         match tasks.remove_owned_regular(&task_name) {
             Ok(()) => {
+                if let Some(record) = removed {
+                    self.capture_hint(crate::controller::events::NewEvent::TaskRemoved(
+                        events::task_hint(&record),
+                    ));
+                }
                 if self.take_fault(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval) {
                     return Err(injected_failure(
                         ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,
@@ -5202,6 +5252,17 @@ impl WorktreeAffinityRecord {
 struct QueueLock {
     _state: StateLock,
     marker: OwnedFd,
+}
+
+// Field order closes/unlocks every authoritative FD before releasing hints.
+struct EventQueueLock {
+    _lock: QueueLock,
+    _hints: Option<events::DeferredHints>,
+}
+
+struct EventStateLock {
+    _lock: StateLock,
+    _hints: Option<events::DeferredHints>,
 }
 
 impl QueueLock {
