@@ -5,9 +5,9 @@ mod channels;
 
 pub use cache::{NotifyCache, commit_then_deliver, plan_notifications};
 pub use channels::{
-    ChannelOptions, HerdrChannel, MacosChannel, SelectedChannel, UnconfirmedTask, channels_for,
-    eligibility_unknown_diagnostic, herdr_socket_reachable, laptop_notification_socket,
-    notices_for_support, select_channels,
+    ChannelOptions, HerdrChannel, MacosChannel, OSASCRIPT_HANDLER, SelectedChannel,
+    UnconfirmedTask, channels_for, eligibility_unknown_diagnostic, herdr_socket_reachable,
+    herdr_sound, laptop_notification_socket, notices_for_support, select_channels,
 };
 
 pub use super::contracts::{
