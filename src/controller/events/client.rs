@@ -225,22 +225,106 @@ struct Sweep {
 struct Comparison {
     old: PreviousProjection,
     ids: VecDeque<TaskId>,
-    attention: Sha256,
-    attention_count: usize,
+    attention: BTreeMap<TaskId, TaskEligibilitySignature>,
+    waiting: BTreeSet<TaskId>,
+    verified: BTreeSet<TaskId>,
+    hash: Sha256,
+    hashed_through: Option<TaskId>,
+    hashed_count: usize,
+}
+impl Comparison {
+    fn invalidate_attention(&mut self, id: TaskId) {
+        self.waiting.insert(id);
+        self.verified.remove(&id);
+        if self.attention.remove(&id).is_some() {
+            self.reset_hash();
+        }
+    }
+    fn reset_hash(&mut self) {
+        self.hash = Sha256::new();
+        self.hashed_through = None;
+        self.hashed_count = 0;
+    }
+    fn refresh_attention(&mut self) {
+        self.attention.clear();
+        self.waiting.clear();
+        self.verified.clear();
+        self.reset_hash();
+    }
+    fn confirm_attention(&mut self, row: &TaskFacts) {
+        let signature = row.eligibility_signature();
+        if potential_attention(row) && signature.quiescent.is_none() {
+            self.invalidate_attention(row.task_id);
+            return;
+        }
+        self.waiting.remove(&row.task_id);
+        self.verified.insert(row.task_id);
+        let attention =
+            (signature.current_attention || signature.abandoned_without_turn).then_some(signature);
+        let changed = match attention {
+            Some(signature) => {
+                self.attention.insert(row.task_id, signature.clone()) != Some(signature)
+            }
+            None => self.attention.remove(&row.task_id).is_some(),
+        };
+        if changed {
+            self.reset_hash();
+        }
+    }
+    fn forget_attention(&mut self, id: TaskId) {
+        self.waiting.remove(&id);
+        self.verified.insert(id);
+        if self.attention.remove(&id).is_some() {
+            self.reset_hash();
+        }
+    }
+}
+// Unknown dispatch proof can still conceal current attention. A positive busy
+// fact, a closed attention turn, or an unknown outcome cannot be attention.
+fn potential_attention(row: &TaskFacts) -> bool {
+    row.eligibility_signature().busy != Some(true)
+        && ((row.state == "open"
+            && row.latest_turn_id.is_some()
+            && matches!(
+                row.outcome,
+                Some(SafeOutcome::NeedsInput | SafeOutcome::Blocked)
+            ))
+            || (row.state == "abandoned" && row.latest_turn_id.is_none() && row.outcome.is_none()))
+}
+struct ColdHistory {
+    signature: TaskEligibilitySignature,
+    abandoned: bool,
+}
+impl ColdHistory {
+    fn new(row: &TaskFacts) -> Self {
+        Self {
+            signature: row.eligibility_signature(),
+            abandoned: row.state == "abandoned",
+        }
+    }
+    fn matches(&self, row: &TaskFacts) -> bool {
+        self.signature.latest_turn_id == row.latest_turn_id
+            && self.signature.outcome == row.outcome
+            && self.signature.code == row.code
+            && self.abandoned == (row.state == "abandoned")
+    }
 }
 /// Consumer-owned projections and bounded confirmation work. Complete maps
 /// scale with the admitted registry; pending IDs and emitted chunks do not.
 pub struct TaskReconciler {
     previous: PreviousProjection,
     cursor: Option<EventCursor>,
+    cursor_validated: bool,
     runtime: Arc<dyn EventRuntime>,
     candidates: BTreeMap<TaskId, Candidate>,
     order: VecDeque<TaskId>,
     proof: Option<TaskAddressQuery>,
     sweep: Option<Sweep>,
     comparison: Option<Comparison>,
+    cold_unresolved: BTreeMap<TaskId, ColdHistory>,
     last_started: Option<Duration>,
     repair_needed: bool,
+    attention_refresh_required: bool,
     unaccounted_feed: bool,
     changes: VecDeque<DerivedTaskChange>,
     confirmed: BTreeMap<TaskId, TaskFacts>,
@@ -255,20 +339,23 @@ impl TaskReconciler {
         let mut reconciler = Self {
             previous,
             cursor,
+            cursor_validated: false,
             runtime,
             candidates: BTreeMap::new(),
             order: VecDeque::new(),
             proof: None,
             sweep: None,
             comparison: None,
+            cold_unresolved: BTreeMap::new(),
             last_started: None,
             repair_needed: false,
+            attention_refresh_required: false,
             unaccounted_feed: false,
             changes: VecDeque::new(),
             confirmed: BTreeMap::new(),
         };
         for id in pending {
-            reconciler.enqueue(id, None, None);
+            reconciler.enqueue(id, None, None, None);
         }
         reconciler
     }
@@ -289,16 +376,56 @@ impl TaskReconciler {
         id: TaskId,
         cause: Option<ChangeCause>,
         prior: Option<(Option<TaskFacts>, bool)>,
+        completed_rows: Option<&BTreeMap<TaskId, TaskFacts>>,
     ) -> bool {
+        let had_cold_history = self.cold_unresolved.contains_key(&id);
+        let cold = self.cold_unresolved.get(&id).is_some_and(|history| {
+            self.prior(id)
+                .as_ref()
+                .is_some_and(|row| history.matches(row))
+        });
+        if !cold {
+            self.cold_unresolved.remove(&id);
+        }
         if let Some(candidate) = self.candidates.get_mut(&id) {
+            if cold {
+                candidate.warm = false;
+            } else if had_cold_history {
+                candidate.warm = true;
+                if let Some((previous, _)) = prior {
+                    candidate.previous = previous;
+                }
+            }
             if cause.is_some() {
                 candidate.cause = cause;
             }
             return true;
         }
         if self.candidates.len() == NOTIFY_PENDING_CAPACITY {
+            // Positively ineligible rows stay in the full projection and are
+            // revisited by repair. They must not fence eligible overflow forever.
+            // Completed staged rows also supply this proof during cold replay,
+            // before the first complete projection can be installed.
+            let deferred = self.order.iter().copied().find(|other| {
+                self.proof
+                    .as_ref()
+                    .is_none_or(|query| !query.task_ids.contains(other))
+                    && completed_rows
+                        .and_then(|rows| rows.get(other))
+                        .cloned()
+                        .or_else(|| self.prior(*other))
+                        .is_some_and(|row| {
+                            row.eligibility_signature().quiescent == Some(false)
+                                || (row.latest_turn_id.is_some() && row.outcome.is_none())
+                        })
+            });
             self.repair_needed = true;
-            return false;
+            if let Some(deferred) = deferred {
+                self.candidates.remove(&deferred);
+                self.order.retain(|other| *other != deferred);
+            } else {
+                return false;
+            }
         }
         let (previous, warm) = prior.unwrap_or_else(|| {
             (
@@ -310,7 +437,7 @@ impl TaskReconciler {
             id,
             Candidate {
                 previous,
-                warm,
+                warm: warm && !cold,
                 cause,
             },
         );
@@ -321,28 +448,33 @@ impl TaskReconciler {
         &mut self,
         batch: &ReadBatch,
         replay: bool,
+        completed_rows: Option<&BTreeMap<TaskId, TaskFacts>>,
     ) -> Result<(bool, Option<EventCursor>), WorkerError> {
         batch.validate()?;
-        if !replay {
-            if let Some(cursor) = self.cursor {
-                let first_new = batch.events.iter().find(|event| event.seq > cursor.seq);
-                if batch.journal_id != cursor.journal_id
-                    || first_new
-                        .is_some_and(|event| cursor.seq.checked_increment() != Some(event.seq))
-                    || (batch.events.is_empty() && batch.next_after.seq > cursor.seq)
-                {
-                    self.repair_needed = true;
-                    return Err(unavailable());
-                }
+        if !replay && let Some(cursor) = self.cursor {
+            let first_new = batch.events.iter().find(|event| event.seq > cursor.seq);
+            if batch.journal_id != cursor.journal_id
+                || first_new.is_some_and(|event| cursor.seq.checked_increment() != Some(event.seq))
+                || (batch.events.is_empty() && batch.next_after.seq > cursor.seq)
+            {
+                self.repair_needed = true;
+                return Err(unavailable());
             }
         }
         let mut consumed = None;
         for event in &batch.events {
-            if !replay
-                && self.cursor.is_some_and(|cursor| {
-                    cursor.journal_id == event.journal_id && event.seq <= cursor.seq
-                })
-            {
+            let cursor = EventCursor {
+                journal_id: event.journal_id,
+                seq: event.seq,
+            };
+            if self.cursor.is_some_and(|cursor| {
+                cursor.journal_id == event.journal_id && event.seq <= cursor.seq
+            }) {
+                if replay {
+                    // Already-accounted live evidence is not new cold evidence.
+                    // Still advance this sweep's validated replay position.
+                    consumed = Some(cursor);
+                }
                 continue;
             }
             if let Some(id) = event.affected_task() {
@@ -358,26 +490,33 @@ impl TaskReconciler {
                     "task.abandoned" => Some(ChangeCause::ReplayAbandoned),
                     _ => None,
                 };
-                if !self.enqueue(id, cause, None) {
+                if !self.enqueue(id, cause, None, completed_rows) {
+                    self.attention_refresh_required = true;
+                    if let Some(comparison) = &mut self.comparison
+                        && (comparison.verified.contains(&id) || comparison.waiting.contains(&id))
+                    {
+                        comparison.invalidate_attention(id);
+                    }
                     if !replay {
                         self.unaccounted_feed = true;
                     }
                     return Ok((false, consumed));
                 }
+                if let Some(comparison) = &mut self.comparison {
+                    comparison.invalidate_attention(id);
+                }
             } else {
                 // Unknown kinds/versions and global hints never borrow a raw task_id.
                 self.repair_needed = true;
+                self.attention_refresh_required = true;
             }
-            let cursor = EventCursor {
-                journal_id: event.journal_id,
-                seq: event.seq,
-            };
             consumed = Some(cursor);
             if self
                 .cursor
                 .is_none_or(|old| old.journal_id == cursor.journal_id && old.seq < cursor.seq)
             {
                 self.cursor = Some(cursor);
+                self.cursor_validated = true;
             }
         }
         if !replay {
@@ -414,51 +553,67 @@ impl TaskReconciler {
         check(self.runtime.as_ref(), deadline)?;
         for row in result.rows {
             let id = row.task_id;
-            if let Some(sweep) = &mut self.sweep {
-                if sweep.complete {
-                    sweep.rows.insert(id, row.clone());
+            if let Some(sweep) = &mut self.sweep
+                && (sweep.complete || sweep.rows.contains_key(&id))
+            {
+                sweep.rows.insert(id, row.clone());
+            }
+            if let Some(comparison) = &mut self.comparison {
+                comparison.confirm_attention(&row);
+            }
+            let signature = row.eligibility_signature();
+            if let Some(history) = self.cold_unresolved.get(&id) {
+                let same_history = history.matches(&row);
+                if let Some(candidate) = self.candidates.get_mut(&id) {
+                    candidate.warm = !same_history;
+                }
+                if !same_history || signature.busy == Some(true) || signature.quiescent.is_some() {
+                    self.cold_unresolved.remove(&id);
                 }
             }
             if self.confirmed.len() < MAX_RECONCILIATION_ROWS || self.confirmed.contains_key(&id) {
                 self.confirmed.insert(id, row.clone());
             }
-            if let Some(candidate) = self.candidates.get(&id) {
-                let signature = row.eligibility_signature();
-                if signature.quiescent == Some(true) {
-                    let unchanged = candidate.warm
-                        && candidate
-                            .previous
-                            .as_ref()
-                            .is_some_and(|old| old.eligibility_signature() == signature);
-                    let cause = if unchanged {
-                        None
-                    } else {
-                        match &candidate.cause {
-                            Some(ChangeCause::ReplayTerminal { turn_id, outcome })
-                                if row.latest_turn_id == Some(*turn_id)
-                                    && row.outcome == Some(*outcome) =>
-                            {
-                                candidate.cause.clone()
-                            }
-                            Some(ChangeCause::ReplayAbandoned)
-                                if signature.abandoned_without_turn =>
-                            {
-                                candidate.cause.clone()
-                            }
-                            None if candidate.warm => Some(ChangeCause::RepairDifference),
-                            _ => None,
+            if let Some(candidate) = self.candidates.get(&id)
+                && signature.quiescent == Some(true)
+            {
+                let unchanged = candidate.warm
+                    && candidate
+                        .previous
+                        .as_ref()
+                        .is_some_and(|old| old.eligibility_signature() == signature);
+                let cause = if unchanged {
+                    None
+                } else {
+                    match &candidate.cause {
+                        Some(ChangeCause::ReplayTerminal { turn_id, outcome })
+                            if row.latest_turn_id == Some(*turn_id)
+                                && row.outcome == Some(*outcome) =>
+                        {
+                            candidate.cause.clone()
                         }
-                    };
-                    if let Some(cause) = cause {
-                        self.changes.push_back(DerivedTaskChange {
-                            task_id: id,
-                            previous: candidate.previous.clone(),
-                            current: Some(row.clone()),
-                            cause,
-                        });
+                        Some(ChangeCause::ReplayAbandoned) if signature.abandoned_without_turn => {
+                            candidate.cause.clone()
+                        }
+                        _ if candidate.warm => Some(ChangeCause::RepairDifference),
+                        _ => None,
                     }
-                    self.candidates.remove(&id);
+                };
+                if let Some(cause) = cause {
+                    self.changes.push_back(DerivedTaskChange {
+                        task_id: id,
+                        previous: candidate.previous.clone(),
+                        current: Some(row.clone()),
+                        cause,
+                    });
                 }
+                self.candidates.remove(&id);
+            }
+            if signature.quiescent == Some(false)
+                && let Some(candidate) = self.candidates.get_mut(&id)
+            {
+                candidate.previous = Some(row.clone());
+                candidate.warm = matches!(self.previous, PreviousProjection::Present(_));
             }
             if let PreviousProjection::Present(rows) = &mut self.previous {
                 rows.insert(id, row);
@@ -466,10 +621,14 @@ impl TaskReconciler {
         }
         for id in result.missing {
             self.candidates.remove(&id);
-            if let Some(sweep) = &mut self.sweep {
-                if sweep.complete {
-                    sweep.rows.remove(&id);
-                }
+            self.cold_unresolved.remove(&id);
+            if let Some(comparison) = &mut self.comparison {
+                comparison.forget_attention(id);
+            }
+            if let Some(sweep) = &mut self.sweep
+                && sweep.complete
+            {
+                sweep.rows.remove(&id);
             }
         }
         self.order.retain(|id| self.candidates.contains_key(id));
@@ -491,15 +650,13 @@ impl TaskReconciler {
     fn start_sweep(
         &mut self,
         source: &dyn EventSource,
-        baseline: Option<EventCursor>,
+        captured: Option<JournalWindow>,
         deadline: Duration,
     ) -> Result<(), WorkerError> {
         check(self.runtime.as_ref(), deadline)?;
-        let baseline = if baseline.is_some() {
-            baseline
+        let window = if captured.is_some() {
+            captured
         } else {
-            // H is observed before state enumeration. Journal failure leaves a
-            // state-only sweep; cancellation/deadline still stops the request.
             let read = source.read(ReadQuery::default(), deadline);
             check(self.runtime.as_ref(), deadline)?;
             match read {
@@ -508,11 +665,44 @@ impl TaskReconciler {
                     let EventReadResult::SnapshotRequired(control) = result else {
                         return Err(unavailable());
                     };
-                    Some(control.window.cursor())
+                    Some(control.window)
                 }
                 Err(_) => None,
             }
         };
+        let baseline = window.as_ref().map(JournalWindow::cursor);
+        // A valid saved cursor also owns retained pre-H hints. H stays pinned
+        // for every task page; replay traverses both that backlog and >H.
+        let replay_after = self
+            .cursor
+            .filter(|cursor| {
+                window.as_ref().is_some_and(|window| {
+                    cursor.journal_id == window.journal_id
+                        && cursor.seq <= window.head_seq
+                        && cursor.seq.as_u64() >= window.oldest_seq.as_u64().saturating_sub(1)
+                })
+            })
+            .or(baseline);
+        if window.as_ref().is_some_and(|window| {
+            replay_after != self.cursor
+                && (!self.cursor_validated
+                    || self
+                        .cursor
+                        .is_some_and(|cursor| cursor.journal_id != window.journal_id))
+        }) {
+            // Ahead, expired and replaced-epoch saved cursors are not consumed
+            // evidence in this window. Adopt H only after the full repair.
+            self.cursor = None;
+            self.cursor_validated = false;
+        } else if self.cursor.is_some() && replay_after == self.cursor {
+            self.cursor_validated = true;
+        }
+        if self.attention_refresh_required {
+            if let Some(comparison) = &mut self.comparison {
+                comparison.refresh_attention();
+            }
+            self.attention_refresh_required = false;
+        }
         self.last_started = Some(self.runtime.now());
         self.repair_needed = false;
         self.sweep = Some(Sweep {
@@ -520,7 +710,7 @@ impl TaskReconciler {
             after: None,
             baseline,
             complete: false,
-            replay_after: baseline,
+            replay_after,
             replay_done: false,
         });
         Ok(())
@@ -576,7 +766,8 @@ impl TaskReconciler {
                             return Ok(RepairProgress::Restarted);
                         }
                         EventReadResult::Batch(batch) => {
-                            let (all, consumed) = self.consume_batch(&batch, true)?;
+                            let (all, consumed) =
+                                self.consume_batch(&batch, true, Some(&sweep.rows))?;
                             sweep.replay_after = consumed.or(Some(after));
                             sweep.replay_done = all && !batch.has_more;
                             if !sweep.replay_done || !batch.events.is_empty() {
@@ -600,26 +791,34 @@ impl TaskReconciler {
                 Ok(RepairProgress::Restarted)
             }
             Ok(RepairProgress::Complete) => {
-                if let Some(baseline) = sweep.baseline {
-                    if !self.unaccounted_feed
-                        && self.cursor.is_none_or(|old| {
-                            old.journal_id != baseline.journal_id || old.seq < baseline.seq
-                        })
-                    {
-                        self.cursor = Some(baseline);
-                    }
+                if let Some(baseline) = sweep.baseline
+                    && !self.unaccounted_feed
+                    && self.cursor.is_none_or(|old| {
+                        old.journal_id != baseline.journal_id || old.seq < baseline.seq
+                    })
+                {
+                    self.cursor = Some(baseline);
+                    self.cursor_validated = true;
                 }
-                // A positively busy cold baseline becomes warm once complete.
+                self.cold_unresolved
+                    .retain(|id, _| sweep.rows.contains_key(id));
+                // A known non-quiescent cold baseline becomes warm once complete.
                 // Unknown proof of historical completion remains cold until confirmed.
                 if matches!(self.previous, PreviousProjection::Absent) {
+                    // This provenance scales with the complete projection, not
+                    // the bounded candidate cache. Unknown overflow is history too.
+                    for (id, row) in &sweep.rows {
+                        let signature = row.eligibility_signature();
+                        if signature.busy.is_none() || signature.quiescent.is_none() {
+                            self.cold_unresolved.insert(*id, ColdHistory::new(row));
+                        }
+                    }
                     for (id, candidate) in &mut self.candidates {
-                        if let Some(facts) = sweep.rows.get(id) {
-                            if facts.eligibility_signature().busy == Some(true)
-                                && candidate.cause.is_none()
-                            {
-                                candidate.previous = Some(facts.clone());
-                                candidate.warm = true;
-                            }
+                        if let Some(facts) = sweep.rows.get(id)
+                            && facts.eligibility_signature().quiescent == Some(false)
+                        {
+                            candidate.previous = Some(facts.clone());
+                            candidate.warm = true;
                         }
                     }
                 }
@@ -632,11 +831,24 @@ impl TaskReconciler {
                 if let PreviousProjection::Present(rows) = &self.previous {
                     ids.extend(rows.keys().copied());
                 }
-                self.comparison = Some(Comparison {
-                    old,
-                    ids: ids.into_iter().collect(),
-                    attention: Sha256::new(),
-                    attention_count: 0,
+                self.comparison = Some(match self.comparison.take() {
+                    Some(mut comparison) => {
+                        // Timer sweeps refresh the complete projection while
+                        // outstanding addressed verification keeps progressing.
+                        comparison.old = old;
+                        comparison.ids = ids.into_iter().collect();
+                        comparison
+                    }
+                    None => Comparison {
+                        old,
+                        ids: ids.into_iter().collect(),
+                        attention: BTreeMap::new(),
+                        waiting: BTreeSet::new(),
+                        verified: BTreeSet::new(),
+                        hash: Sha256::new(),
+                        hashed_through: None,
+                        hashed_count: 0,
+                    },
                 });
                 Ok(RepairProgress::InProgress)
             }
@@ -663,30 +875,36 @@ impl TaskReconciler {
             let changed = warm
                 && old.as_ref().map(TaskFacts::eligibility_signature)
                     != current.as_ref().map(TaskFacts::eligibility_signature);
+            if changed {
+                comparison.invalidate_attention(id);
+            }
             if let Some(facts) = &current {
                 let signature = facts.eligibility_signature();
-                if (changed || signature.current_attention || signature.abandoned_without_turn)
-                    && !self.enqueue(id, None, Some((old.clone(), warm)))
-                {
-                    break;
+                let attention = potential_attention(facts) && !comparison.verified.contains(&id);
+                if attention {
+                    comparison.waiting.insert(id);
+                } else if !potential_attention(facts) {
+                    comparison.forget_attention(id);
                 }
-                if signature.current_attention || signature.abandoned_without_turn {
-                    comparison.attention.update(
-                        serde_json::to_vec(&(
-                            id,
-                            signature.latest_turn_id,
-                            signature.outcome,
-                            &signature.code,
-                        ))
-                        .map_err(|_| unavailable())?,
-                    );
-                    comparison.attention.update(b"\n");
-                    comparison.attention_count += 1;
-                }
-                if !warm && self.confirmed.len() < MAX_RECONCILIATION_ROWS {
-                    self.confirmed.insert(id, facts.clone());
+                let needs_confirmation = attention
+                    || (changed
+                        && (signature.quiescent == Some(true)
+                            || (signature.busy.is_none()
+                                && (signature.outcome.is_some() || facts.state == "abandoned"))));
+                if needs_confirmation && !self.enqueue(id, None, Some((old.clone(), warm)), None) {
+                    // Keep unadmitted warm differences in the full baseline so
+                    // the next sweep can rediscover them. Advance this page even
+                    // when unrelated busy/unknown candidates fill the cache.
+                    if warm && let PreviousProjection::Present(rows) = &mut self.previous {
+                        if let Some(old) = old.clone() {
+                            rows.insert(id, old);
+                        } else {
+                            rows.remove(&id);
+                        }
+                    }
                 }
             } else if changed {
+                comparison.forget_attention(id);
                 if self.changes.len() == MAX_RECONCILIATION_ROWS {
                     break;
                 }
@@ -699,13 +917,54 @@ impl TaskReconciler {
             }
             comparison.ids.pop_front();
         }
-        if comparison.ids.is_empty() {
-            comparison
+        // Overflow attention is still part of the complete set, but only 256
+        // IDs may occupy the individual confirmation queue at once.
+        for id in comparison.waiting.iter().copied().take(REPAIR_MAX_LIMIT) {
+            let old = match &comparison.old {
+                PreviousProjection::Absent => None,
+                PreviousProjection::Present(rows) => rows.get(&id).cloned(),
+            };
+            let warm = matches!(comparison.old, PreviousProjection::Present(_));
+            self.enqueue(id, None, Some((old, warm)), None);
+        }
+        if comparison.ids.is_empty()
+            && comparison.waiting.is_empty()
+            && self.sweep.is_none()
+            && !self.attention_refresh_required
+        {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let start = comparison.hashed_through.map_or(Unbounded, Excluded);
+            for (id, signature) in comparison
                 .attention
-                .update((comparison.attention_count as u64).to_le_bytes());
+                .range((start, Unbounded))
+                .take(REPAIR_MAX_LIMIT)
+            {
+                comparison.hash.update(
+                    serde_json::to_vec(&(
+                        id,
+                        signature.latest_turn_id,
+                        signature.outcome,
+                        signature.outcome.is_none().then_some(&signature.code),
+                    ))
+                    .map_err(|_| unavailable())?,
+                );
+                comparison.hash.update(b"\n");
+                comparison.hashed_through = Some(*id);
+                comparison.hashed_count += 1;
+            }
+        }
+        if comparison.ids.is_empty()
+            && comparison.waiting.is_empty()
+            && comparison.hashed_count == comparison.attention.len()
+            && self.sweep.is_none()
+            && !self.attention_refresh_required
+        {
+            comparison
+                .hash
+                .update((comparison.hashed_count as u64).to_le_bytes());
             Ok(Some(AttentionSummary {
-                count: comparison.attention_count,
-                fingerprint: format!("{:x}", comparison.attention.finalize()),
+                count: comparison.hashed_count,
+                fingerprint: format!("{:x}", comparison.hash.finalize()),
             }))
         } else {
             self.comparison = Some(comparison);
@@ -731,24 +990,43 @@ impl EventReconciler for TaskReconciler {
             read.validate()?;
             match read {
                 EventReadResult::Batch(batch) => {
-                    self.consume_batch(&batch, false)?;
+                    self.consume_batch(&batch, false, None)?;
                 }
                 EventReadResult::SnapshotRequired(control) => {
-                    captured = Some(control.window.cursor());
-                    self.sweep = None;
-                    self.unaccounted_feed = false;
-                    self.repair_needed = true;
+                    let compatible = self.sweep.as_ref().is_some_and(|sweep| {
+                        sweep.baseline.is_some_and(|baseline| {
+                            baseline.journal_id == control.window.journal_id
+                                && baseline.seq <= control.window.head_seq
+                                && baseline.seq.as_u64()
+                                    >= control.window.oldest_seq.as_u64().saturating_sub(1)
+                        })
+                    });
+                    if !compatible {
+                        captured = Some(control.window);
+                        self.sweep = None;
+                        self.unaccounted_feed = false;
+                        self.repair_needed = true;
+                    }
                 }
             }
         }
         // Pending proof is always ahead of historical enumeration work.
         self.confirm_pending(source, input.include_titles, deadline)?;
-        let due = input.repair_due
-            || self.repair_needed
-            || self.last_started.is_none_or(|started| {
-                self.runtime.now().saturating_sub(started) >= REPAIR_INTERVAL
-            });
-        if self.sweep.is_none() && self.comparison.is_none() && due {
+        let timer_due = self
+            .last_started
+            .is_none_or(|started| self.runtime.now().saturating_sub(started) >= REPAIR_INTERVAL);
+        let due = input.repair_due || self.repair_needed || timer_due;
+        let can_start = self.comparison.is_none()
+            || self.comparison.as_ref().is_some_and(|comparison| {
+                comparison.ids.is_empty()
+                    && (!comparison.waiting.is_empty()
+                        || self.attention_refresh_required
+                        || captured.is_some())
+            }) && (input.repair_due
+                || captured.is_some()
+                || timer_due
+                || self.attention_refresh_required);
+        if self.sweep.is_none() && can_start && due {
             self.start_sweep(source, captured, deadline)?;
         }
         let mut repair = self.advance_sweep(source, deadline)?;

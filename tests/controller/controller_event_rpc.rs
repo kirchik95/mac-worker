@@ -1185,9 +1185,12 @@ mod reconciliation {
             .unwrap();
         h.source.hint(2, true);
         let read = h.feed(h.reconciler.cursor().unwrap());
-        assert!(
-            h.tick(Some(read), false).changes.is_empty(),
-            "Done hint must not confirm NeedsInput"
+        let result = h.tick(Some(read), false);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(
+            result.changes[0].cause,
+            ChangeCause::RepairDifference,
+            "a stale Done hint must remain separate from a warm confirmed NeedsInput difference"
         );
     }
     #[test]
@@ -1516,6 +1519,15 @@ mod reconciliation {
             (1..=256).map(task_id).collect(),
             h.runtime.clone(),
         );
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        // Keep the first sweep partial: no independent replay can account for
+        // the rejected hint until a later tick has freed candidate capacity.
+        h.source.tasks.set_page_budget(1);
         h.source.hint(1000, false);
         let read = h.feed(after);
         let first = h.tick(Some(read.clone()), false);
@@ -1653,6 +1665,662 @@ mod reconciliation {
             0
         );
         assert_eq!(reconciler.cursor(), None);
+    }
+    #[test]
+    fn review_valid_saved_cursor_accounts_retained_terminal_backlog_before_h() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            Some(after),
+            vec![],
+            h.runtime.clone(),
+        );
+        for _ in 0..4 {
+            h.source
+                .journal
+                .append(
+                    EventBatch::try_new(vec![
+                        NewEvent::ControllerDrainChanged { drained: true };
+                        32
+                    ])
+                    .unwrap(),
+                    deadline(),
+                )
+                .unwrap();
+        }
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(1, true);
+        let first = h
+            .source
+            .journal
+            .read(
+                ReadQuery {
+                    after: Some(after),
+                    limit: 128,
+                    wait_ms: 0,
+                },
+                deadline(),
+            )
+            .unwrap();
+        assert!(matches!(&first,EventReadResult::Batch(batch) if batch.has_more));
+        let mut changes = h.tick(Some(first), false).changes;
+        changes.extend(h.sweep());
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            changes[0].cause,
+            ChangeCause::ReplayTerminal {
+                outcome: SafeOutcome::Done,
+                ..
+            }
+        ));
+        assert_eq!(h.reconciler.cursor().unwrap().seq, Seq::new(129));
+    }
+    #[test]
+    fn review_stale_terminal_hint_preserves_confirmed_warm_difference() {
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, false)), None, vec![]);
+        let mut current = terminal(1, SafeOutcome::NeedsInput, true);
+        current.latest_turn_id = Some(TurnId::new(uuid::Uuid::from_u128(201)));
+        h.source.tasks.insert(current).unwrap();
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.source.hint(1, true);
+        let read = h.feed(after);
+        let result = h.tick(Some(read), false);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].cause, ChangeCause::RepairDifference);
+        assert_eq!(
+            result.changes[0].current.as_ref().unwrap().outcome,
+            Some(SafeOutcome::NeedsInput)
+        );
+    }
+    #[test]
+    fn review_more_than_candidate_cap_busy_rows_finish_and_allow_next_sweep() {
+        let mut h = Harness::new(PreviousProjection::Present(BTreeMap::new()), None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, false))
+                .unwrap();
+        }
+        let mut complete = false;
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.pending_ids.len() <= 256);
+            if result.repair == RepairProgress::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(
+            complete,
+            "settled busy registry must finish even with more than 256 rows"
+        );
+        let first = h.source.tasks.repair_requests().len();
+        h.runtime.advance(Duration::from_secs(15));
+        h.tick(None, false);
+        assert!(h.source.tasks.repair_requests().len() > first);
+    }
+    #[test]
+    fn review_resolving_cold_unknown_proof_baselines_history_including_overflow() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            let mut facts = terminal(id, SafeOutcome::Done, true);
+            facts.queue_dispatching = None;
+            facts.busy = None;
+            facts.quiescent = None;
+            h.source.tasks.insert(facts).unwrap();
+        }
+        assert!(h.sweep().is_empty());
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        h.runtime.advance(Duration::from_secs(15));
+        assert!(
+            h.sweep().is_empty(),
+            "finishing old proof must not alert historical completion"
+        );
+    }
+    #[test]
+    fn review_attention_summary_waits_for_addressed_confirmation() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        let first = h.tick(None, true);
+        assert!(first.attention.is_none());
+        assert!(first.confirmed.is_empty());
+        let mut closed = terminal(1, SafeOutcome::NeedsInput, true);
+        closed.state = "closed".into();
+        h.source.tasks.insert(closed).unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.attention.unwrap().count, 0);
+        assert_eq!(h.source.tasks.addressed_requests().len(), 1);
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn unresolved_cold_attention_does_not_hide_a_later_new_turn() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let mut unknown = terminal(1, SafeOutcome::NeedsInput, true);
+        unknown.queue_dispatching = None;
+        unknown.busy = None;
+        unknown.quiescent = None;
+        h.source.tasks.insert(unknown).unwrap();
+        for i in 0..4 {
+            assert!(h.tick(None, i == 0).changes.is_empty());
+        }
+        let mut current = terminal(1, SafeOutcome::Blocked, true);
+        current.latest_turn_id = Some(TurnId::new(uuid::Uuid::from_u128(901)));
+        h.source.tasks.insert(current).unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].cause, ChangeCause::RepairDifference);
+    }
+
+    #[test]
+    fn busy_pending_capacity_does_not_block_attention_overflow() {
+        let old: BTreeMap<_, _> = (1..=256)
+            .map(|id| (task_id(id), terminal(id, SafeOutcome::Done, false)))
+            .collect();
+        let mut h = Harness::new(
+            PreviousProjection::Present(old.clone()),
+            None,
+            (1..=256).map(task_id).collect(),
+        );
+        for row in old.into_values() {
+            h.source.tasks.insert(row).unwrap();
+        }
+        h.source
+            .tasks
+            .insert(terminal(1000, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        let mut summary = None;
+        let mut changes = Vec::new();
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.pending_ids.len() <= 256);
+            changes.extend(result.changes);
+            if result.attention.is_some() {
+                summary = result.attention;
+                break;
+            }
+        }
+        assert_eq!(
+            summary
+                .expect("fresh overflow attention must be confirmed")
+                .count,
+            1
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].task_id, task_id(1000));
+    }
+
+    #[test]
+    fn warm_eligible_overflow_is_rediscovered_without_losing_or_repeating_changes() {
+        let mut h = Harness::new(PreviousProjection::Present(BTreeMap::new()), None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        let mut changes = Vec::new();
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.pending_ids.len() <= 256 && result.changes.len() <= 256);
+            changes.extend(result.changes);
+        }
+        assert_eq!(changes.len(), 300);
+        let ids: std::collections::BTreeSet<_> = changes.iter().map(|row| row.task_id).collect();
+        assert_eq!(ids.len(), 300);
+    }
+
+    #[test]
+    fn unresolved_attention_allows_timer_repair_and_waits_for_real_proof() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let mut unknown = terminal(1, SafeOutcome::NeedsInput, true);
+        unknown.queue_dispatching = None;
+        unknown.busy = None;
+        unknown.quiescent = None;
+        h.source.tasks.insert(unknown).unwrap();
+        for i in 0..4 {
+            let result = h.tick(None, i == 0);
+            assert!(result.attention.is_none() && result.changes.is_empty());
+        }
+        let before = h.source.tasks.repair_requests().len();
+        h.runtime.advance(Duration::from_secs(15));
+        assert!(h.tick(None, false).attention.is_none());
+        assert!(h.source.tasks.repair_requests().len() > before);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.attention.unwrap().count, 1);
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn changed_turn_of_unresolved_cold_member_survives_a_completed_new_sweep() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            let mut row = terminal(id, SafeOutcome::NeedsInput, true);
+            row.queue_dispatching = None;
+            row.busy = None;
+            row.quiescent = None;
+            h.source.tasks.insert(row).unwrap();
+        }
+        for i in 0..10 {
+            assert!(h.tick(None, i == 0).changes.is_empty());
+        }
+        let mut current = terminal(250, SafeOutcome::Blocked, true);
+        current.latest_turn_id = Some(TurnId::new(uuid::Uuid::from_u128(950)));
+        h.source.tasks.insert(current).unwrap();
+        h.runtime.advance(Duration::from_secs(15));
+        let mut changes = Vec::new();
+        for _ in 0..80 {
+            changes.extend(h.tick(None, false).changes);
+        }
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].task_id, task_id(250));
+        assert_eq!(changes[0].cause, ChangeCause::RepairDifference);
+    }
+
+    #[test]
+    fn attention_proof_that_becomes_unknown_cannot_complete_a_stale_summary() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                .unwrap();
+        }
+        for i in 0..200 {
+            let result = h.tick(None, i == 0);
+            assert!(result.attention.is_none());
+            let requests = h.source.tasks.addressed_requests();
+            if requests
+                .last()
+                .is_some_and(|query| query.task_ids.contains(&task_id(300)))
+            {
+                break;
+            }
+        }
+        let mut unknown = terminal(1, SafeOutcome::NeedsInput, true);
+        unknown.queue_dispatching = None;
+        unknown.busy = None;
+        unknown.quiescent = None;
+        h.source.tasks.insert(unknown).unwrap();
+        let after = h.reconciler.cursor().unwrap();
+        h.source.hint(1, false);
+        let read = h.feed(after);
+        for i in 0..4 {
+            assert!(
+                h.tick((i == 0).then(|| read.clone()), false)
+                    .attention
+                    .is_none()
+            );
+        }
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        let mut summary = None;
+        for _ in 0..4 {
+            let result = h.tick(None, false);
+            if result.attention.is_some() {
+                summary = result.attention;
+                break;
+            }
+        }
+        assert_eq!(summary.unwrap().count, 300);
+    }
+
+    #[test]
+    fn timer_sweeps_preserve_slow_attention_confirmation_progress() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                .unwrap();
+        }
+        let mut summary = None;
+        for i in 0..100 {
+            let result = h
+                .reconciler
+                .reconcile(
+                    h.source.as_ref(),
+                    ReconcileInput {
+                        read: None,
+                        repair_due: i == 0,
+                        include_titles: false,
+                    },
+                    h.runtime.now() + Duration::from_secs(60),
+                )
+                .unwrap();
+            if result.attention.is_some() {
+                summary = result.attention;
+                break;
+            }
+            h.runtime.advance(Duration::from_secs(1));
+        }
+        assert_eq!(
+            summary
+                .expect("timer repairs must preserve confirmation progress")
+                .count,
+            300
+        );
+        assert!(h.source.tasks.repair_requests().len() > 5);
+    }
+
+    #[test]
+    fn hinted_attention_member_waits_behind_unrelated_unknown_candidates() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                .unwrap();
+        }
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.attention.is_none());
+            if h.source
+                .tasks
+                .addressed_requests()
+                .last()
+                .is_some_and(|query| query.task_ids.contains(&task_id(300)))
+            {
+                break;
+            }
+        }
+        let after = h.reconciler.cursor().unwrap();
+        for id in 1001..=1032 {
+            let mut row = terminal(id, SafeOutcome::Done, true);
+            row.queue_dispatching = None;
+            row.busy = None;
+            row.quiescent = None;
+            h.source.tasks.insert(row).unwrap();
+            h.source.hint(id, false);
+        }
+        let mut closed = terminal(1, SafeOutcome::NeedsInput, true);
+        closed.state = "closed".into();
+        h.source.tasks.insert(closed).unwrap();
+        h.source.hint(1, false);
+        let read = h.feed(after);
+        assert!(h.tick(Some(read), false).attention.is_none());
+        assert!(h.tick(None, false).attention.is_none());
+        let mut summary = None;
+        for _ in 0..6 {
+            if let Some(attention) = h.tick(None, false).attention {
+                summary = Some(attention);
+                break;
+            }
+        }
+        assert_eq!(summary.unwrap().count, 299);
+    }
+
+    #[test]
+    fn global_hint_during_hash_waits_for_a_new_complete_repair() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                .unwrap();
+        }
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.attention.is_none());
+            if h.source
+                .tasks
+                .addressed_requests()
+                .last()
+                .is_some_and(|query| query.task_ids.contains(&task_id(300)))
+            {
+                break;
+            }
+        }
+        let mut closed = terminal(1, SafeOutcome::NeedsInput, true);
+        closed.state = "closed".into();
+        h.source.tasks.insert(closed).unwrap();
+        let after = h.reconciler.cursor().unwrap();
+        h.source
+            .journal
+            .append(
+                EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: true }])
+                    .unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        let read = h.feed(after);
+        assert!(h.tick(Some(read), false).attention.is_none());
+        assert!(h.tick(None, false).attention.is_none());
+        let mut summary = None;
+        for _ in 0..100 {
+            if let Some(attention) = h.tick(None, false).attention {
+                summary = Some(attention);
+                break;
+            }
+        }
+        assert_eq!(summary.unwrap().count, 299);
+    }
+
+    #[test]
+    fn cold_live_and_repair_replay_overlap_emits_terminal_evidence_once() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            Some(after),
+            vec![],
+            h.runtime.clone(),
+        );
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        h.source.tasks.set_page_budget(1);
+        assert!(h.tick(None, true).changes.is_empty());
+        h.source.hint(1, true);
+        let read = h.feed(after);
+        let mut changes = h.tick(Some(read), false).changes;
+        changes.extend(h.sweep());
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            changes[0].cause,
+            ChangeCause::ReplayTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn ahead_saved_cursor_is_replaced_only_by_the_completed_captured_baseline() {
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, true)), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        let window = h.source.journal.window(deadline()).unwrap();
+        let ahead = EventCursor {
+            journal_id: window.journal_id,
+            seq: Seq::new(900),
+        };
+        h.reconciler = TaskReconciler::new(
+            warm(terminal(1, SafeOutcome::Done, true)),
+            Some(ahead),
+            vec![],
+            h.runtime.clone(),
+        );
+        let control = h
+            .source
+            .journal
+            .read(
+                ReadQuery {
+                    after: Some(ahead),
+                    limit: 128,
+                    wait_ms: 0,
+                },
+                deadline(),
+            )
+            .unwrap();
+        let result = h.tick(Some(control), false);
+        assert_eq!(result.repair, RepairProgress::Complete);
+        assert_eq!(result.consumed_after, Some(window.cursor()));
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn repeated_compatible_repair_control_preserves_active_key_sweep() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let old = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            Some(old),
+            vec![],
+            h.runtime.clone(),
+        );
+        h.source
+            .journal
+            .replace_epoch(uuid::Uuid::from_u128(2))
+            .unwrap();
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        h.source.tasks.set_page_budget(1);
+        let control = h
+            .source
+            .journal
+            .read(
+                ReadQuery {
+                    after: Some(old),
+                    limit: 128,
+                    wait_ms: 0,
+                },
+                deadline(),
+            )
+            .unwrap();
+        assert_eq!(
+            h.tick(Some(control.clone()), false).repair,
+            RepairProgress::InProgress
+        );
+        let result = h.tick(Some(control), false);
+        assert_eq!(result.repair, RepairProgress::Complete);
+        let requests = h.source.tasks.repair_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].after.is_some());
+    }
+
+    fn queued(id: u128) -> TaskFacts {
+        let mut row = terminal(id, SafeOutcome::Done, false);
+        row.state = "queued".into();
+        row.latest_turn_id = None;
+        row.outcome = None;
+        row.runner_present = false;
+        row.result_imported = false;
+        row.busy = Some(false);
+        row.quiescent = Some(false);
+        row.queue_dispatching = Some(false);
+        row.validate().unwrap();
+        assert_eq!(row.eligibility_signature().busy, Some(false));
+        assert_eq!(row.eligibility_signature().quiescent, Some(false));
+        row
+    }
+
+    #[test]
+    fn queued_pending_capacity_does_not_block_a_fresh_attention_member() {
+        let old: BTreeMap<_, _> = (1..=256).map(|id| (task_id(id), queued(id))).collect();
+        let mut h = Harness::new(
+            PreviousProjection::Present(old.clone()),
+            None,
+            (1..=256).map(task_id).collect(),
+        );
+        for row in old.into_values() {
+            h.source.tasks.insert(row).unwrap();
+        }
+        h.source
+            .tasks
+            .insert(terminal(1000, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        let mut summary = None;
+        let mut changes = Vec::new();
+        for i in 0..100 {
+            let result = h.tick(None, i == 0);
+            assert!(result.pending_ids.len() <= 256);
+            changes.extend(result.changes);
+            if result.attention.is_some() {
+                summary = result.attention;
+                break;
+            }
+        }
+        assert_eq!(
+            summary
+                .expect("queued candidates must yield their bounded slots")
+                .count,
+            1
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].task_id, task_id(1000));
+    }
+
+    #[test]
+    fn cold_queued_baseline_detects_first_terminal_turn_without_a_hint() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![task_id(1)]);
+        h.source.tasks.insert(queued(1)).unwrap();
+        let baseline = h.tick(None, true);
+        assert_eq!(baseline.repair, RepairProgress::Complete);
+        assert!(baseline.changes.is_empty());
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].cause, ChangeCause::RepairDifference);
+        assert_eq!(result.changes[0].previous.as_ref().unwrap().state, "queued");
+    }
+
+    #[test]
+    fn cold_queued_overflow_admits_retained_terminal_before_baseline_commit() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            Some(after),
+            (1..=256).map(task_id).collect(),
+            h.runtime.clone(),
+        );
+        for id in 1..=256 {
+            h.source.tasks.insert(queued(id)).unwrap();
+        }
+        h.source
+            .tasks
+            .insert(terminal(1000, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(1000, true);
+        let changes = h.sweep();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].task_id, task_id(1000));
+        assert!(matches!(
+            changes[0].cause,
+            ChangeCause::ReplayTerminal { .. }
+        ));
+        assert_eq!(h.reconciler.cursor().unwrap().seq, Seq::new(1));
+        assert!(
+            matches!(h.reconciler.previous_projection(), PreviousProjection::Present(rows) if rows.len() == 257)
+        );
     }
 }
 
