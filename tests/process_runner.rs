@@ -503,7 +503,12 @@ mod termination {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             match listener.accept() {
-                Ok((gate, _)) => return gate,
+                // BSD sockets inherit O_NONBLOCK from the listener; the read
+                // timeout below only applies to a blocking stream.
+                Ok((gate, _)) => {
+                    gate.set_nonblocking(false).unwrap();
+                    return gate;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "fixture never connected");
                     thread::yield_now();
