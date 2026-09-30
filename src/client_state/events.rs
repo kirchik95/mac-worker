@@ -705,13 +705,9 @@ pub(crate) mod tests {
         store
             .complete_runner_spawn(record.meta().task_id(), turn, token, owner())
             .unwrap();
-        assert!(
-            sink.events()
-                .iter()
-                .filter(|event| matches!(event, NewEvent::QueueChanged(_)))
-                .count()
-                >= 1
-        );
+        assert!(sink.events().iter().any(
+            |event| matches!(event, NewEvent::QueueChanged(hint) if hint.turn_id == Some(turn))
+        ));
         sink.clear();
         store.park_row(turn).unwrap();
         assert!(
@@ -720,6 +716,66 @@ pub(crate) mod tests {
         sink.clear();
         store.update_queue(|_| Ok(((), true))).unwrap();
         assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn queue_publication_reuses_pre_mutation_snapshot() {
+        let (_dir, store, sink) = store_with_sink();
+        let turn = TurnId::generate();
+        store.enqueue(queue_row(&store, turn)).unwrap();
+        sink.clear();
+        let queue = store.inner.state_root.join("queue/state.json");
+        use std::os::unix::fs::MetadataExt;
+        let original = std::fs::metadata(&queue).unwrap();
+        store
+            .update_queue(|snapshot| {
+                snapshot.entries[0].park()?;
+                // A same-inode read witness: the caller has already read the
+                // authoritative snapshot. Publication must not parse it again.
+                std::fs::write(&queue, b"not a queue snapshot\n")?;
+                let witness = std::fs::metadata(&queue)?;
+                assert_eq!(
+                    (witness.dev(), witness.ino()),
+                    (original.dev(), original.ino())
+                );
+                Ok(((), true))
+            })
+            .unwrap();
+        assert!(matches!(
+            store.queue_entry(turn).unwrap().unwrap().state(),
+            crate::job::QueueState::Parked
+        ));
+        assert!(
+            matches!(sink.events().as_slice(), [NewEvent::QueueChanged(hint)]
+            if hint.turn_id == Some(turn) && hint.state.as_deref() == Some("parked")),
+            "queue hints must use the caller's pre-mutation snapshot, without rereading the file"
+        );
+    }
+
+    #[test]
+    fn queue_publication_without_previous_keeps_generic_hint() {
+        use std::os::fd::AsRawFd;
+        let (_dir, store, sink) = store_with_sink();
+        let turn = TurnId::generate();
+        store.enqueue(queue_row(&store, turn)).unwrap();
+        sink.clear();
+        let lock = store.acquire_queue_lock().unwrap();
+        let (mut snapshot, identity) =
+            crate::client_state::read_queue_snapshot(store.inner.queue.as_raw_fd()).unwrap();
+        snapshot.entries[0].park().unwrap();
+        crate::client_state::publish_queue_snapshot(&store, &snapshot, None, identity).unwrap();
+        assert!(
+            sink.events().is_empty(),
+            "the queue fence still defers release"
+        );
+        drop(lock);
+        assert!(
+            matches!(sink.events().as_slice(), [NewEvent::QueueChanged(hint)] if hint.turn_id.is_none())
+        );
+        assert!(matches!(
+            store.queue_entry(turn).unwrap().unwrap().state(),
+            crate::job::QueueState::Parked
+        ));
     }
 
     fn observation(time: u64) -> crate::job::AdmissionObservation {

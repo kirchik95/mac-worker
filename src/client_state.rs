@@ -1295,6 +1295,7 @@ impl ClientStateStore {
         let _lock = self.acquire_queue_lock()?;
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
+        let previous = self.event_sink.as_ref().map(|_| snapshot.clone());
         {
             let entry = find_queue_entry_mut(&mut snapshot, turn_id)?;
             match entry.slot_reservation() {
@@ -1326,7 +1327,7 @@ impl ClientStateStore {
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
-        publish_queue_snapshot(self, &snapshot, identity)?;
+        publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         let record = self.load_task_locked(task_id)?;
         self.update_task_locked_before_final_sync(
             record.with_runner(Some(RunnerIdentity::new(child)))?,
@@ -1335,6 +1336,7 @@ impl ClientStateStore {
         )?;
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
+        let previous = self.event_sink.as_ref().map(|_| snapshot.clone());
         let entry = find_queue_entry_mut(&mut snapshot, turn_id)?;
         match entry.slot_reservation() {
             Some(reservation) if reservation.token() == token => {
@@ -1350,7 +1352,7 @@ impl ClientStateStore {
         }
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
-        publish_queue_snapshot(self, &snapshot, identity)?;
+        publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         Ok(snapshot
             .entries
             .iter()
@@ -2602,12 +2604,13 @@ impl ClientStateStore {
     {
         let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
+        let previous = self.event_sink.as_ref().map(|_| snapshot.clone());
         let (result, changed) = update(&mut snapshot)?;
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         if changed {
             self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
-            publish_queue_snapshot(self, &snapshot, identity)?;
+            publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         }
         Ok(result)
     }
@@ -5598,16 +5601,9 @@ fn require_queue_client(snapshot: &QueueSnapshot, client_id: ClientId) -> Result
 fn publish_queue_snapshot(
     store: &ClientStateStore,
     snapshot: &QueueSnapshot,
+    previous: Option<&QueueSnapshot>,
     expected: FileIdentity,
 ) -> Result<(), WorkerError> {
-    let previous = if store.event_sink.is_some() {
-        read_queue_snapshot(store.inner.queue.as_raw_fd())
-            .ok()
-            .filter(|(_, binding)| *binding == expected)
-            .map(|(snapshot, _)| snapshot)
-    } else {
-        None
-    };
     let bytes = canonical_queue_bytes(snapshot)?;
     let operation = OperationFile::stage(
         store.inner.operations.as_raw_fd(),
@@ -5629,7 +5625,7 @@ fn publish_queue_snapshot(
     sync_directory(store.inner.queue.as_raw_fd())?;
     if store.event_sink.is_some() {
         if let Some(previous) = previous {
-            events::capture_queue_diff(&previous, snapshot, |hint| store.capture_hint(hint));
+            events::capture_queue_diff(previous, snapshot, |hint| store.capture_hint(hint));
         } else {
             store.capture_hint(events::generic_queue_hint());
         }

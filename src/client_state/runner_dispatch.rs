@@ -94,12 +94,13 @@ impl ClientStateStore {
                 })?;
             self.write_task_project_path_locked(recipient, &source_path)?;
         }
+        let previous = self.event_sink.as_ref().map(|_| snapshot.clone());
         snapshot.entries[source_index].park()?;
         snapshot.entries[target_index].unpark(owner)?;
         snapshot.entries[target_index].dispatch(owner, worker, now_millis)?;
         snapshot.validate()?;
         self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
-        publish_queue_snapshot(self, &snapshot, identity)?;
+        publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         if self.take_fault(ClientStateWritePoint::AfterRunnerYieldQueuePublication) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterRunnerYieldQueuePublication,
