@@ -20,6 +20,30 @@ use crate::{
 const PROJECT_CONTEXT_FILE: &str = "project.json";
 const MAX_PROJECT_CONTEXT_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedProjectPath(PathBuf);
+
+impl ValidatedProjectPath {
+    fn from_user_path(path: &Path) -> Result<Self, WorkerError> {
+        if !path.is_absolute() {
+            return Err(invalid_state("task project path must be absolute"));
+        }
+        let path = fs::canonicalize(path).map_err(WorkerError::Io)?;
+        if !fs::metadata(&path).map_err(WorkerError::Io)?.is_dir() {
+            return Err(invalid_state("task project path must name a directory"));
+        }
+        Ok(Self(path))
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
 /// Private execution input, kept beside the owner-only turn prompts. It is
 /// never part of a task record or a queue/dashboard projection.
 #[derive(Serialize, Deserialize)]
@@ -34,7 +58,7 @@ struct TaskProjectContext {
 }
 
 impl TaskProjectContext {
-    fn project_path(&self, record: &LocalTaskRecord) -> Result<PathBuf, WorkerError> {
+    fn project_path(&self, record: &LocalTaskRecord) -> Result<ValidatedProjectPath, WorkerError> {
         if self.version != 1 {
             return Err(invalid_state("task project context version is unsupported"));
         }
@@ -64,7 +88,7 @@ impl TaskProjectContext {
                 "task project path is not absolute and normalized",
             ));
         }
-        Ok(path)
+        Ok(ValidatedProjectPath(path))
     }
 }
 
@@ -75,8 +99,9 @@ impl ClientStateStore {
         record: &LocalTaskRecord,
         project_path: &Path,
     ) -> Result<(), WorkerError> {
+        let project_path = ValidatedProjectPath::from_user_path(project_path)?;
         let _lock = self.acquire_state_lock()?;
-        self.write_task_project_path_locked(record, project_path)
+        self.write_task_project_path_locked(record, &project_path)
     }
 
     /// Queue handoff publishes inherited context before its reservation,
@@ -84,25 +109,15 @@ impl ClientStateStore {
     pub(super) fn write_task_project_path_locked(
         &self,
         record: &LocalTaskRecord,
-        project_path: &Path,
+        project_path: &ValidatedProjectPath,
     ) -> Result<(), WorkerError> {
-        if !project_path.is_absolute() {
-            return Err(invalid_state("task project path must be absolute"));
-        }
-        let project_path = fs::canonicalize(project_path).map_err(WorkerError::Io)?;
-        if !fs::metadata(&project_path)
-            .map_err(WorkerError::Io)?
-            .is_dir()
-        {
-            return Err(invalid_state("task project path must name a directory"));
-        }
         let context = TaskProjectContext {
             version: 1,
             task_id: record.meta().task_id(),
             project_id: record.meta().project_id().to_owned(),
             worktree_id: record.meta().worktree_id().to_owned(),
             repo_id: record.repo_id().to_owned(),
-            path_base64: STANDARD.encode(project_path.as_os_str().as_bytes()),
+            path_base64: STANDARD.encode(project_path.as_path().as_os_str().as_bytes()),
         };
         let bytes = canonical_json_bytes(&context, "task project context")?;
         if bytes.len() > MAX_PROJECT_CONTEXT_BYTES {
@@ -115,7 +130,7 @@ impl ClientStateStore {
         match task_dir.write_private_atomic_no_replace(PROJECT_CONTEXT_FILE, &bytes) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if self.task_project_path_locked(record)? == Some(project_path) {
+                if self.task_project_path_locked(record)?.as_ref() == Some(project_path) {
                     Ok(())
                 } else {
                     Err(queue_error(
@@ -136,14 +151,16 @@ impl ClientStateStore {
         record: &LocalTaskRecord,
     ) -> Result<Option<PathBuf>, WorkerError> {
         let _lock = self.acquire_state_lock()?;
-        self.task_project_path_locked(record)
+        Ok(self
+            .task_project_path_locked(record)?
+            .map(ValidatedProjectPath::into_path_buf))
     }
 
     /// QueueLock callers already hold StateLock while selecting a handoff.
     pub(super) fn task_project_path_locked(
         &self,
         record: &LocalTaskRecord,
-    ) -> Result<Option<PathBuf>, WorkerError> {
+    ) -> Result<Option<ValidatedProjectPath>, WorkerError> {
         let task_dir = match self
             .turns_dir()?
             .open_child_directory(&relative_path(&record.meta().task_id().to_string())?, false)

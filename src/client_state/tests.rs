@@ -246,6 +246,53 @@ fn task_read_waits_for_the_bound_record_writer() {
 }
 
 #[test]
+fn task_project_path_is_validated_before_waiting_for_the_state_lock() {
+    let (_dir, store, _) = open_store();
+    let record = sample_record();
+    store.create_task(record.clone()).unwrap();
+    let project_path = _dir.path().join("project");
+    fs::create_dir(&project_path).unwrap();
+    let expected_project_path = fs::canonicalize(&project_path).unwrap();
+    let alias_path = _dir.path().join("project-alias");
+    std::os::unix::fs::symlink(&project_path, &alias_path).unwrap();
+
+    let lock = store.acquire_state_lock().unwrap();
+    let contention = store.observe_next_lock_contention();
+    let writer = store.clone();
+    let writer_record = record.clone();
+    let writer_path = alias_path.clone();
+    let (written_tx, written_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let result = writer.write_task_project_path(&writer_record, &writer_path);
+            let _ = written_tx.send(result);
+        });
+        let contended = contention.confirmed_within(crate::test_support::HANDSHAKE_TIMEOUT);
+        if contended {
+            // Once the writer is waiting on StateLock, its path validation
+            // must already be complete. Removing it cannot change the value
+            // handed to the locked filesystem write.
+            fs::remove_dir(&project_path).unwrap();
+        }
+        drop(lock);
+        let written = written_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .expect("project context writer must finish after StateLock is released");
+        assert!(
+            contended,
+            "project writer must wait only after path validation"
+        );
+        written.unwrap();
+    });
+
+    assert_eq!(
+        store.task_project_path(&record).unwrap(),
+        Some(expected_project_path)
+    );
+}
+
+#[test]
 fn turn_reads_wait_for_submission_retirement() {
     for operation in ["prompt", "binding", "ids", "context"] {
         let (_dir, store, _) = open_store();
