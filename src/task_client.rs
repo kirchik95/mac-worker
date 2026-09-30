@@ -2309,13 +2309,7 @@ impl<'a> TaskClient<'a> {
             // Observe completion before reading bytes so a final diagnostic
             // written just before the status update is included in this read.
             record = self.client_state.load_task(task_id)?;
-            let checkpoint = match crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)
-            {
-                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {
-                    continue;
-                }
-                result => result?,
-            };
+            let checkpoint = crate::runner_log::snapshot(&self.paths.state, task_id, turn_id)?;
             let finished = !follow || checkpoint.as_ref().is_some_and(|s| s.completion.is_some());
             let may_initialize = matches!(
                 record.status().state(),
@@ -2389,9 +2383,6 @@ impl<'a> TaskClient<'a> {
                         return Err(WorkerError::Io(error));
                     }
                     None
-                }
-                Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE) => {
-                    continue;
                 }
                 Err(error) => return Err(error),
             };
@@ -6049,8 +6040,7 @@ impl<'a> TaskClient<'a> {
         let task = runners
             .open_child_directory(&relative_path(&task_id.to_string())?, false)
             .map_err(WorkerError::Io)?;
-        task.read_private_regular(&format!("{turn_id}.log"), 8 * 1024 * 1024)
-            .map_err(WorkerError::Io)
+        read_runner_log_snapshot(&task, &format!("{turn_id}.log"), || {}).map_err(WorkerError::Io)
     }
 
     fn current_project(&self, record: Option<&LocalTaskRecord>) -> Result<PathBuf, WorkerError> {
@@ -6920,6 +6910,31 @@ fn task_preview_id(task: &BatchTask, index: usize) -> String {
     task.id.clone().unwrap_or_else(|| index.to_string())
 }
 
+fn read_runner_log_snapshot(
+    task: &crate::rooted_fs::RootedDir,
+    name: &str,
+    mut after_open: impl FnMut(),
+) -> io::Result<Vec<u8>> {
+    // Reconciliation may discover a writer after its liveness observation.
+    // Appends may invalidate a full snapshot, but neither the log inode nor
+    // its directory may change while we recheck it.
+    let bound = task.open_private_regular_handle(name)?;
+    let mut retries = 0;
+    loop {
+        match task.read_private_regular_with_hook(name, 8 * 1024 * 1024, &mut after_open) {
+            Ok(bytes) => {
+                task.validate_private_append_binding(name, &bound)?;
+                return Ok(bytes);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESTALE) && retries < 3 => {
+                task.validate_private_append_binding(name, &bound)?;
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn overlapping_paths(left: &[String], right: &[String]) -> Vec<String> {
     let mut paths = Vec::new();
     for path in left {
@@ -7222,6 +7237,79 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_log_snapshot_rechecks_a_concurrent_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::rooted_fs::RootedDir::create(&temp.path().join("runner")).unwrap();
+        root.write_private_atomic_no_replace("turn.log", b"before\n")
+            .unwrap();
+        let mut writer = root.open_private_append("turn.log").unwrap();
+        let mut append = true;
+        let bytes = read_runner_log_snapshot(&root, "turn.log", || {
+            if std::mem::take(&mut append) {
+                writer.write_all(b"after\n").unwrap();
+                writer.sync_all().unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(bytes, b"before\nafter\n");
+    }
+
+    #[test]
+    fn runner_log_snapshot_never_rebinds_a_replaced_log_or_directory() {
+        for replace_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::rooted_fs::RootedDir::create(&temp.path().join("runner")).unwrap();
+            root.write_private_atomic_no_replace("turn.log", b"before\n")
+                .unwrap();
+            let mut reads = 0;
+            let result = read_runner_log_snapshot(&root, "turn.log", || {
+                reads += 1;
+                if replace_directory {
+                    std::fs::rename(root.path(), temp.path().join("detached")).unwrap();
+                    let replacement = crate::rooted_fs::RootedDir::create(root.path()).unwrap();
+                    replacement
+                        .write_private_atomic_no_replace("turn.log", b"unrelated\n")
+                        .unwrap();
+                } else {
+                    root.replace_private_regular_exact("turn.log", b"before\n", b"unrelated\n")
+                        .unwrap();
+                }
+            });
+            assert!(
+                result.is_err(),
+                "must retain the original log inode and directory"
+            );
+            assert_eq!(reads, 1);
+            assert_eq!(
+                std::fs::read(root.path().join("turn.log")).unwrap(),
+                b"unrelated\n"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_log_snapshot_rechecks_are_bounded_with_a_busy_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::rooted_fs::RootedDir::create(&temp.path().join("runner")).unwrap();
+        root.write_private_atomic_no_replace("turn.log", b"before\n")
+            .unwrap();
+        let mut writer = root.open_private_append("turn.log").unwrap();
+        let mut reads = 0;
+        let error = read_runner_log_snapshot(&root, "turn.log", || {
+            reads += 1;
+            writer.write_all(b"another line\n").unwrap();
+            writer.sync_all().unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+        assert!(reads > 1, "an appended log should be rechecked");
+        assert!(
+            reads <= 4,
+            "an active writer must not cause an unbounded read"
+        );
+    }
 
     #[test]
     fn questions_wait_stays_pending_while_finalizer_owns_rowless_intent() {
