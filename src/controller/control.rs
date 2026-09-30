@@ -70,11 +70,12 @@ pub fn drain_via_controller(
 pub(crate) fn serve_drain(
     request: &ControllerRequest,
     state_root: &Path,
+    sink: Option<std::sync::Arc<dyn super::events::EventSink>>,
 ) -> Result<Vec<u8>, WorkerError> {
     let body = parse_body(request)?;
     let drained = match body.drained {
         Some(drained) => {
-            drain::set_drained(state_root, drained)?;
+            drain::set_drained_with_event_sink(state_root, drained, sink)?;
             // Acknowledge this write's committed value. Another operator may
             // change the flag immediately after our exclusive lock releases.
             drained

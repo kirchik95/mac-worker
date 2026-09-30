@@ -575,6 +575,7 @@ pub fn serve_rpc_with_runtime(
 ) -> Result<(), WorkerError> {
     let payload = crate::controller::protocol::read_frame(stdin)?;
     let request = crate::controller::protocol::parse_request(&payload)?;
+    let mut _events = None;
     let frame = if crate::controller::events::rpc::is_event_selector(&request) {
         use crate::controller::events::{
             EventRuntime, RPC_BUDGET,
@@ -589,13 +590,16 @@ pub fn serve_rpc_with_runtime(
     } else if crate::controller::health_read::is_health_read(&request) {
         crate::controller::health_read::serve_health_read(&request, &paths.controller_state_root())?
     } else if request.command() == "controller.drain" {
-        crate::controller::control::serve_drain(&request, &paths.controller_state_root())?
+        _events = crate::open_existing_controller_event_publisher(paths, crate::ControllerEventRuntime::system());
+        crate::controller::control::serve_drain(&request, &paths.controller_state_root(), _events.as_ref().map(crate::ControllerEventPublisher::sink))?
     } else if is_read_command(request.command()) {
-        let client_state = ClientStateStore::open(&paths.state)?;
+        let (client_state, events) = crate::open_with_existing_controller_events(paths, crate::ControllerEventRuntime::system())?;
+        _events = events;
         let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
         serve_read_command(&request, &client)?
     } else if is_lifecycle_command(request.command()) {
-        let client_state = ClientStateStore::open(&paths.state)?;
+        let (client_state, events) = crate::open_with_existing_controller_events(paths, crate::ControllerEventRuntime::system())?;
+        _events = events;
         let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
         serve_lifecycle_command(&request, &client)?
     } else if is_transfer_command(request.command()) {
@@ -606,7 +610,8 @@ pub fn serve_rpc_with_runtime(
         crate::controller::protocol::encode_json_frame(&ack)?
     } else {
         let store = ControllerStore::open(&paths.controller_state_root())?;
-        let client_state = ClientStateStore::open(&paths.state)?;
+        let (client_state, events) = crate::open_with_existing_controller_events(paths, crate::ControllerEventRuntime::system())?;
+        _events = events;
         let handler = TaskSubmitHandler::new(runner, config, paths, &client_state);
         let ack = store.handle_with(&request, &handler, fault)?;
         crate::controller::protocol::encode_json_frame(&ack)?

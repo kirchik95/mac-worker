@@ -203,6 +203,133 @@ impl RuntimeContext {
     }
 }
 
+/// Monotonic event timing with process-scoped shutdown cancellation.
+pub struct ControllerEventRuntime {
+    clock: std::sync::Arc<dyn controller::events::EventRuntime>,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+struct SystemControllerEventClock(std::time::Instant);
+
+impl controller::events::EventRuntime for SystemControllerEventClock {
+    fn now(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl ControllerEventRuntime {
+    pub fn new(clock: std::sync::Arc<dyn controller::events::EventRuntime>) -> Self {
+        Self { clock, stopped: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    pub fn system() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new(std::sync::Arc::new(SystemControllerEventClock(std::time::Instant::now()))))
+    }
+
+    pub fn cancel(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl controller::events::EventRuntime for ControllerEventRuntime {
+    fn now(&self) -> std::time::Duration {
+        self.clock.now()
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        if !self.cancelled() {
+            self.clock.sleep(duration);
+        }
+    }
+    fn cancelled(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire) || self.clock.cancelled()
+    }
+}
+
+/// Retain exactly one publisher for the command's lifetime. Store clones and
+/// deadline reopens share its try-only sink; no producer owns journal I/O.
+pub struct ControllerEventPublisher {
+    journal: std::sync::Arc<controller::events::journal::ControllerJournal>,
+    sink: std::sync::Arc<dyn controller::events::EventSink>,
+    publisher: controller::events::journal::PublisherHandle,
+    runtime: std::sync::Arc<ControllerEventRuntime>,
+}
+
+impl ControllerEventPublisher {
+    fn start(
+        journal: std::sync::Arc<controller::events::journal::ControllerJournal>,
+        runtime: std::sync::Arc<ControllerEventRuntime>,
+    ) -> Self {
+        let (sink, publisher) = controller::events::journal::BoundedPublisher::start(journal.clone(), runtime.clone());
+        Self { journal, sink, publisher, runtime }
+    }
+
+    /// Attach a journal already initialized by a leader or opened existing-only.
+    pub fn attach(
+        store: ClientStateStore,
+        journal: std::sync::Arc<controller::events::journal::ControllerJournal>,
+        runtime: std::sync::Arc<ControllerEventRuntime>,
+    ) -> (ClientStateStore, Self) {
+        let publisher = Self::start(journal, runtime);
+        (store.with_event_sink(publisher.sink()), publisher)
+    }
+
+    pub fn sink(&self) -> std::sync::Arc<dyn controller::events::EventSink> {
+        self.sink.clone()
+    }
+    pub fn journal(&self) -> std::sync::Arc<controller::events::journal::ControllerJournal> {
+        self.journal.clone()
+    }
+    pub fn runtime(&self) -> std::sync::Arc<ControllerEventRuntime> {
+        self.runtime.clone()
+    }
+    pub fn diagnostics(&self) -> Vec<controller::events::journal::PublisherDiagnostic> {
+        self.publisher.diagnostics()
+    }
+}
+
+impl Drop for ControllerEventPublisher {
+    fn drop(&mut self) {
+        // Every entry-point guard outlives its authoritative work and fences.
+        // Grace is bounded; a stalled fsync is never joined.
+        self.publisher.finish_with_grace(controller::events::PUBLISHER_EXIT_GRACE);
+        self.runtime.cancel();
+    }
+}
+
+pub(crate) fn open_existing_controller_event_publisher(
+    paths: &PathLayout,
+    runtime: std::sync::Arc<dyn controller::events::EventRuntime>,
+) -> Option<ControllerEventPublisher> {
+    let runtime = std::sync::Arc::new(ControllerEventRuntime::new(runtime));
+    // The journal is optional. Unsafe bindings disable hints, never state.
+    let journal = controller::events::journal::ControllerJournal::open_existing(
+        paths,
+        controller::events::journal::JournalOptions { runtime: runtime.clone() },
+    ).ok().flatten()?;
+    Some(ControllerEventPublisher::start(journal, runtime))
+}
+
+/// Open authoritative state and attach only this host's initialized journal.
+/// This entry point never initializes the journal or consults routing config.
+pub fn open_with_existing_controller_events(
+    paths: &PathLayout,
+    runtime: std::sync::Arc<dyn controller::events::EventRuntime>,
+) -> Result<(ClientStateStore, Option<ControllerEventPublisher>), WorkerError> {
+    let store = ClientStateStore::open(&paths.state)?;
+    let publisher = open_existing_controller_event_publisher(paths, runtime);
+    let store = match &publisher {
+        Some(publisher) => store.with_event_sink(publisher.sink()),
+        None => store,
+    };
+    Ok((store, publisher))
+}
+
 pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
     let runtime = RuntimeContext::capture();
     execute_with_context(cli, runner, &runtime)
@@ -323,7 +450,7 @@ fn execute_with_context(
         Command::Status { job_id } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
-            let client_state = ClientStateStore::open(&paths.state)?;
+            let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
             if job_id.is_none() {
                 FleetReconciler {
                     config: &config,
@@ -347,7 +474,7 @@ fn execute_with_context(
         Command::Cancel { job_id } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
-            let client_state = ClientStateStore::open(&paths.state)?;
+            let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
             let service = CancelService::new(runner, &config, &client_state);
             Ok(CommandOutput::Cancel(service.cancel(job_id)?))
         }
@@ -607,7 +734,7 @@ fn run_public_streaming_body(
     let paths = discover_paths(cli.config, runtime)?;
     let config = Config::load(&paths.config)?;
     config.require_local_inventory()?;
-    let client_state = ClientStateStore::open(&paths.state)?;
+    let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
     let remote = RemoteJobClient::new(runner);
     let follow_runtime = SystemFollowRuntime;
     let logs = LogsService {
@@ -1298,6 +1425,7 @@ fn run_controller_command(
         }
         if let ControllerCommand::Drain { off } = command {
             let config = Config::load(&paths.config)?;
+            let _events = (!config.controller.enabled).then(|| open_existing_controller_event_publisher(&paths, ControllerEventRuntime::system())).flatten();
             let drained = if config.controller.enabled {
                 crate::controller::control::drain_via_controller(
                     runner,
@@ -1305,7 +1433,7 @@ fn run_controller_command(
                     Some(!off),
                 )?
             } else {
-                crate::controller::drain::set_drained(&paths.controller_state_root(), !off)?;
+                crate::controller::drain::set_drained_with_event_sink(&paths.controller_state_root(), !off, _events.as_ref().map(ControllerEventPublisher::sink))?;
                 !off
             };
             if json {
@@ -1421,6 +1549,17 @@ fn run_controller_command(
         let leader = crate::controller::ControllerLeader::acquire(&state_root)?;
         let store = crate::controller::ControllerStore::open(&state_root)?;
         let client_state = ClientStateStore::open(&paths.state)?;
+        let event_runtime = ControllerEventRuntime::system();
+        // Initialization is leader-only, after leadership is actually held.
+        let (client_state, _events) = match controller::events::journal::ControllerJournal::initialize_for_leader(
+            &paths, &leader, controller::events::journal::JournalOptions { runtime: event_runtime.clone() },
+        ) {
+            Ok(journal) => {
+                let (store, publisher) = ControllerEventPublisher::attach(client_state, journal, event_runtime);
+                (store, Some(publisher))
+            }
+            Err(_) => (client_state, None),
+        };
         let health_store = HealthStore::open(&state_root)?;
         let mut health = ControllerHealth::new(leader.identity(), now_millis()?);
         health.config_path = Some(std::path::absolute(&paths.config)?);
@@ -1573,6 +1712,7 @@ fn run_task_command(
     stderr: &mut dyn Write,
 ) -> u8 {
     let json = cli.json;
+    let mut _events = None;
     let result = (|| -> Result<u8, WorkerError> {
         let paths = discover_paths(cli.config, runtime)?;
         let config = Config::load(&paths.config)?;
@@ -1622,7 +1762,8 @@ fn run_task_command(
                 stderr,
             );
         }
-        let client_state = ClientStateStore::open(&paths.state)?;
+        let (client_state, events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+        _events = events;
         let command = cli.command;
         let inline = matches!(
             &command,
@@ -1665,7 +1806,10 @@ fn run_task_command(
                             .map_err(|_| WorkerError::Protocol("invalid runner slot token".into()))
                     })
                     .transpose()?;
-                let outcome = TurnRunner::new(runner, &config, &paths, &client_state, executor)
+                // Preserve the sink and original rooted binding on a reopen;
+                // a parent's in-memory sink cannot cross the detached spawn.
+                let runner_state = client_state.reopen_until(None)?;
+                let outcome = TurnRunner::new(runner, &config, &paths, &runner_state, executor)
                     .with_notifier(notifier)
                     .with_slot_token(slot_token)
                     .run_detached(task_id, turn_id)?;
