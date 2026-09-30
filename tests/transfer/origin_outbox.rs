@@ -467,8 +467,9 @@ fn prepared_supervisor_job(
         )
         .unwrap(),
     );
+    let now = wall_clock_millis();
     let lease = match LeaseService::new(store)
-        .acquire(&request, &admissions(), 1)
+        .acquire(&request, &admissions(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -499,7 +500,7 @@ fn prepared_supervisor_job(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, 2)
+        .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (lease, SubmitRequest::new(request.material().clone()))
 }
@@ -1119,7 +1120,7 @@ fn delayed_origin_leaves_the_heavy_slot_idle() {
 fn cleanup_after_durable_intent_releases_the_heavy_slot() {
     let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
     fs::write(origin.join("reject"), b"1").unwrap();
-    let (_lease, request) = prepared_supervisor_job(
+    let (lease, request) = prepared_supervisor_job(
         &store,
         CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
     );
@@ -1137,6 +1138,10 @@ fn cleanup_after_durable_intent_releases_the_heavy_slot() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
+    assert!(
+        lease.expires_at_millis() > wall_clock_millis(),
+        "durable cleanup fixture must start with a live execution lease"
+    );
     let response = JobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
