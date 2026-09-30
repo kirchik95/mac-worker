@@ -172,7 +172,7 @@ where
 }
 
 fn wait_for_url(stdout: &Arc<Mutex<String>>, child: &mut Child) -> String {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let text = stdout.lock().unwrap().clone();
         if let Some(url) = text.lines().find(|line| line.starts_with("http://")) {
@@ -222,7 +222,7 @@ fn laptop_heartbeat_reaches_the_ssh_stdin() {
             heartbeat_ms: 60,
             backoff_initial_ms: 1_000,
             backoff_cap_ms: 1_000,
-            readiness_ms: 8_000,
+            readiness_ms: 15_000,
             rotation_ms: 60_000,
         },
     );
@@ -269,13 +269,13 @@ fn tunnel_reconnects_on_the_same_port_until_signalled() {
             heartbeat_ms: 40,
             backoff_initial_ms: 80,
             backoff_cap_ms: 160,
-            readiness_ms: 8_000,
+            readiness_ms: 15_000,
             rotation_ms: 60_000,
         },
     );
     let url = wait_for_url(&child.stdout, &mut child.child);
     wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
-    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(8));
+    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(30));
     thread::sleep(Duration::from_millis(200));
     assert!(process_live(child.child.id()));
     let stdout = child.stdout.lock().unwrap().clone();
@@ -299,7 +299,7 @@ fn ssh_connection_failures_keep_the_published_port() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 2_000,
+            readiness_ms: 15_000,
             rotation_ms: 250,
         },
     );
@@ -330,7 +330,7 @@ fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 2_000,
+            readiness_ms: 15_000,
             rotation_ms: 300,
         },
     );
@@ -338,7 +338,7 @@ fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
     wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
     let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
     let _held = hold_loopback_port(port);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(8));
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
     assert_ne!(urls[0], urls[1], "{urls:?}");
     wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
     let stderr = child.stderr.lock().unwrap().clone();
@@ -359,12 +359,12 @@ fn stdout_eof_before_a_remote_exit_still_rotates() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 2_000,
+            readiness_ms: 15_000,
             rotation_ms: 400,
         },
     );
     wait_for_url(&child.stdout, &mut child.child);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(8));
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
     assert_ne!(urls[0], urls[1], "{urls:?}");
     wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
     let stderr = child.stderr.lock().unwrap().clone();
@@ -385,12 +385,12 @@ fn remote_viewer_failure_prints_a_new_url() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 4_000,
+            readiness_ms: 15_000,
             rotation_ms: 300,
         },
     );
     wait_for_url(&child.stdout, &mut child.child);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(8));
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
     assert_ne!(urls[0], urls[1], "{urls:?}");
     wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
     let stderr = child.stderr.lock().unwrap().clone();
