@@ -7799,7 +7799,7 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     }
 
     fn recorded_child() -> ProcessIdentity {
-        ProcessIdentity::new(42_001, 42_001_000).unwrap()
+        ProcessIdentity::new(crate::fixture_pid::fixture_pid(42_001), 42_001_000).unwrap()
     }
 
     #[test]
@@ -7998,5 +7998,16 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
         assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+    }
+
+    #[test]
+    fn fixture_pid_observes_as_absent_under_the_system_inspector() {
+        let pid = crate::fixture_pid::fixture_pid(41);
+        assert_eq!(pid, crate::fixture_pid::FIXTURE_PID_BASE + 41);
+        let identity = ProcessIdentity::new(pid, 1).unwrap();
+        assert_eq!(
+            SystemProcessInspector.observe(identity),
+            ProcessObservation::Absent
+        );
     }
 }

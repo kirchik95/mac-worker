@@ -6162,8 +6162,9 @@ mod tests {
     }
 
     fn succeeded_status() -> JobStatus {
-        let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
-        let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+        let supervisor =
+            ProcessIdentity::new(crate::fixture_pid::fixture_pid(101), 1_000_001).unwrap();
+        let child = ProcessIdentity::new(crate::fixture_pid::fixture_pid(202), 2_000_002).unwrap();
         JobStatus::accepted(10)
             .unwrap()
             .with_supervisor(supervisor, 11)
@@ -6177,8 +6178,9 @@ mod tests {
     }
 
     fn failed_status() -> JobStatus {
-        let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
-        let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+        let supervisor =
+            ProcessIdentity::new(crate::fixture_pid::fixture_pid(101), 1_000_001).unwrap();
+        let child = ProcessIdentity::new(crate::fixture_pid::fixture_pid(202), 2_000_002).unwrap();
         JobStatus::accepted(10)
             .unwrap()
             .with_supervisor(supervisor, 11)
@@ -6317,7 +6319,7 @@ mod tests {
 
     #[test]
     fn queue_entry_deserializes_when_replacement_failure_is_absent() {
-        let owner = ProcessIdentity::new(1, 1).unwrap();
+        let owner = ProcessIdentity::new(crate::fixture_pid::fixture_pid(1), 1).unwrap();
         let mut entry = QueueEntry::new(
             "00000000000000000000000000000001".parse().unwrap(),
             "00000000000000000000000000000002".parse().unwrap(),

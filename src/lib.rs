@@ -139,6 +139,8 @@ pub mod turn_log;
 pub mod turn_runner;
 
 #[cfg(test)]
+pub(crate) mod fixture_pid;
+#[cfg(test)]
 pub(crate) mod test_sync;
 
 #[doc(hidden)]

@@ -1,4 +1,8 @@
 pub mod agent_launch_fixture;
+#[allow(dead_code)]
+mod fixture_pid;
+#[allow(dead_code, unused_imports)]
+pub use fixture_pid::{FIXTURE_PID_BASE, fixture_pid};
 pub mod fake_herdr;
 pub mod recording_runner;
 #[allow(dead_code)]

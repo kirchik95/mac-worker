@@ -915,8 +915,8 @@ mod tests {
 
     #[test]
     fn claimed_node_recovery_distinguishes_live_owner_from_dead_and_existing_task() {
-        let caller = ProcessIdentity::new(7, 1).unwrap();
-        let other = ProcessIdentity::new(8, 2).unwrap();
+        let caller = ProcessIdentity::new(crate::fixture_pid::fixture_pid(7), 1).unwrap();
+        let other = ProcessIdentity::new(crate::fixture_pid::fixture_pid(8), 2).unwrap();
         assert_eq!(
             claimed_node_action(Some(other), caller, true, false, false),
             ClaimedNodeAction::SkipLive

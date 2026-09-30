@@ -71,7 +71,8 @@ fn sample_record() -> LocalTaskRecord {
         status,
         None,
         Some(RunnerIdentity::new(
-            ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process"),
+            ProcessIdentity::new(crate::fixture_pid::fixture_pid(42), 1_700_000_000_001)
+                .expect("fixture process"),
         )),
         None,
         REPO_ID.to_owned(),
@@ -326,7 +327,8 @@ impl ProcessInspector for ScriptedInspector {
 }
 
 fn identity() -> ProcessIdentity {
-    ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process")
+    ProcessIdentity::new(crate::fixture_pid::fixture_pid(42), 1_700_000_000_001)
+        .expect("fixture process")
 }
 
 fn open_with_script(

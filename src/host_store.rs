@@ -6695,7 +6695,11 @@ mod review_regression_tests {
                 let initial_bytes = initial_bytes.clone();
                 handles.push(scope.spawn(move || {
                     let replacement = initial
-                        .with_supervisor(ProcessIdentity::new(pid, start).unwrap(), updated)
+                        .with_supervisor(
+                            ProcessIdentity::new(crate::fixture_pid::fixture_pid(pid), start)
+                                .unwrap(),
+                            updated,
+                        )
                         .unwrap();
                     let job = store
                         .open_directory(

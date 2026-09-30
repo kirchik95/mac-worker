@@ -2896,7 +2896,8 @@ mod tests {
         let reserver = current_process_identity().unwrap();
         let turn = TurnId::generate();
         let token = uuid::Uuid::new_v4();
-        let owner = crate::job::ProcessIdentity::new(1, 1).unwrap();
+        let owner =
+            crate::job::ProcessIdentity::new(crate::fixture_pid::fixture_pid(1), 1).unwrap();
         let mut healthy = QueueEntry::new(
             turn,
             ClientId::generate(),
@@ -2938,7 +2939,7 @@ mod tests {
         // Adopted away with the token intact: must refuse.
         let mut adopted = healthy.clone();
         adopted
-            .adopt(crate::job::ProcessIdentity::new(3, 3).unwrap())
+            .adopt(crate::job::ProcessIdentity::new(crate::fixture_pid::fixture_pid(3), 3).unwrap())
             .unwrap();
         assert!(!handoff_spawn_admitted(
             Some(&adopted),
@@ -2951,7 +2952,8 @@ mod tests {
 
         // Already bound to a child elsewhere: must refuse.
         let mut bound = healthy.clone();
-        let child = crate::job::ProcessIdentity::new(2, 2).unwrap();
+        let child =
+            crate::job::ProcessIdentity::new(crate::fixture_pid::fixture_pid(2), 2).unwrap();
         bound
             .set_slot_reservation(Some(
                 RunnerSlotReservation::new(reserver, token)
@@ -3372,7 +3374,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             .expect("accepted cancellation still needs a remote drainer");
         assert!(log.is_accepted());
         drop(log);
-        let child = ProcessIdentity::new(8, 8).unwrap();
+        let child = ProcessIdentity::new(crate::fixture_pid::fixture_pid(8), 8).unwrap();
         let expected = store.bind_runner_slot_child(turn_id, token, child).unwrap();
         let log = open_handoff_journal_after_bind(
             &store, &paths, task_id, turn_id, token, owner, &expected,
@@ -3502,8 +3504,11 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             for adopt in [false, true] {
                 let label = format!("after_bind={after_bind} adopt={adopt}");
                 let owner = current_process_identity().unwrap();
-                let child = crate::job::ProcessIdentity::new(8, 8).unwrap();
-                let replacement = crate::job::ProcessIdentity::new(999_997, 997).unwrap();
+                let child = crate::job::ProcessIdentity::new(crate::fixture_pid::fixture_pid(8), 8)
+                    .unwrap();
+                let replacement =
+                    crate::job::ProcessIdentity::new(crate::fixture_pid::fixture_pid(999_997), 997)
+                        .unwrap();
                 let (entered_tx, entered_rx) = std::sync::mpsc::channel();
                 let (resume_tx, resume_rx) = std::sync::mpsc::channel();
                 let (_root, paths) = isolated_handoff_paths();

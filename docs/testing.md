@@ -81,9 +81,10 @@ concurrent clients, and the real 10 s supervisor TERM grace.
   - `note_confirmed_runner_absence`.
 
   The production defaults do not change.
-- **Fixture process identities with made-up pids** need a fake `ProcessInspector`, for example
-  `AbsentOwnerInspector` in `tests/run_command.rs`, or `LiveSetInspector` in `tests/scheduler_queue.rs`. With the
-  system inspector:
+- **Fixture process identities with made-up pids** are built with `fixture_pid` (`FIXTURE_PID_BASE` in
+  `tests/support/fixture_pid.rs` and `src/fixture_pid.rs`), so the pid cannot exist. A fake `ProcessInspector`,
+  for example `AbsentOwnerInspector` in `tests/run_command.rs` or `LiveSetInspector` in `tests/scheduler_queue.rs`,
+  is how a test chooses Alive, Reused, or Ambiguous. With the system inspector and a pid in the real range:
   - the result depends on whichever real process holds that pid at the moment;
   - a root-owned process reads as `Ambiguous`, which never confirms absence.
 - **Never run a real agent CLI** (`codex`, `claude`, `cursor-agent`, `opencode`) from a test. Put a fixture script
