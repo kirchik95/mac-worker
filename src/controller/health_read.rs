@@ -176,15 +176,33 @@ fn observe_leader(
     path: &Path,
     expected: ProcessIdentity,
 ) -> Result<ProcessObservation, WorkerError> {
+    observe_leader_with_hook(path, expected, || {})
+}
+
+fn observe_leader_with_hook(
+    path: &Path,
+    expected: ProcessIdentity,
+    mut after_open: impl FnMut(),
+) -> Result<ProcessObservation, WorkerError> {
     let Some(root) = open_existing_controller_root(path)? else {
         return Ok(ProcessObservation::Absent);
     };
-    let bytes = match root.read_private_regular("leader.json", 4096) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ProcessObservation::Absent);
+    let mut attempts = 0;
+    let bytes = loop {
+        match root.read_private_regular_with_hook("leader.json", 4096, &mut after_open) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ProcessObservation::Absent);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESTALE) && attempts < 3 => {
+                // Leader handoff can replace this identity while it is read.
+                // Keep the original directory and compare the new identity to
+                // the health record's expected leader below.
+                root.verify_bound()?;
+                attempts += 1;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     };
     let current: ProcessIdentity =
         serde_json::from_slice(&bytes).map_err(|_| invalid_controller_reply())?;
@@ -289,5 +307,82 @@ pub fn fetch_controller_health(
             }
         }
         Err(error) => ControllerHealthStatus::unavailable(&error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn identity(number: u32) -> ProcessIdentity {
+        ProcessIdentity::new(crate::fixture_pid::fixture_pid(number), 1).unwrap()
+    }
+
+    #[test]
+    fn leader_read_rechecks_a_new_leader_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("controller");
+        let root = super::super::leader::open_controller_root(&path).unwrap();
+        let original = serde_json::to_vec(&identity(1)).unwrap();
+        let replacement = serde_json::to_vec(&identity(2)).unwrap();
+        root.write_private_atomic_no_replace("leader.json", &original)
+            .unwrap();
+        let mut replace = true;
+        let observed = observe_leader_with_hook(&path, identity(1), || {
+            if std::mem::take(&mut replace) {
+                root.replace_private_regular_exact("leader.json", &original, &replacement)
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(observed, ProcessObservation::Reused);
+        assert_eq!(fs::read(path.join("leader.json")).unwrap(), replacement);
+    }
+
+    #[test]
+    fn leader_read_recheck_preserves_invalid_records_and_directory_bindings() {
+        for kind in ["record", "permissions", "directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("controller");
+            let root = super::super::leader::open_controller_root(&path).unwrap();
+            let original = serde_json::to_vec(&identity(1)).unwrap();
+            root.write_private_atomic_no_replace("leader.json", &original)
+                .unwrap();
+            let mut replace = true;
+            let error = observe_leader_with_hook(&path, identity(1), || {
+                if !std::mem::take(&mut replace) {
+                    return;
+                }
+                let file = path.join("leader.json");
+                match kind {
+                    "record" => root
+                        .replace_private_regular_exact("leader.json", &original, b"{}")
+                        .unwrap(),
+                    "permissions" => {
+                        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap()
+                    }
+                    "directory" => {
+                        fs::rename(&path, temp.path().join("detached")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::write(&file, serde_json::to_vec(&identity(2)).unwrap()).unwrap();
+                        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .unwrap_err();
+
+            match kind {
+                "record" => assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE"),
+                "permissions" => assert!(matches!(error, WorkerError::Io(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied)),
+                "directory" => assert!(matches!(error, WorkerError::Io(error)
+                    if error.raw_os_error() == Some(libc::ESTALE))),
+                _ => unreachable!(),
+            }
+        }
     }
 }

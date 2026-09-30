@@ -308,13 +308,30 @@ impl HealthStore {
     }
 
     pub fn read(&self) -> Result<Option<ControllerHealth>, WorkerError> {
-        let bytes = match self
-            .root
-            .read_private_regular(HEALTH_FILE, MAX_HEALTH_BYTES)
-        {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        self.read_with_hook(|| {})
+    }
+
+    fn read_with_hook(
+        &self,
+        mut after_open: impl FnMut(),
+    ) -> Result<Option<ControllerHealth>, WorkerError> {
+        let mut attempts = 0;
+        let bytes = loop {
+            match self.root.read_private_regular_with_hook(
+                HEALTH_FILE,
+                MAX_HEALTH_BYTES,
+                &mut after_open,
+            ) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.raw_os_error() == Some(libc::ESTALE) && attempts < 3 => {
+                    // Tick publication replaces this observation atomically.
+                    // Recheck only within the root retained by this store.
+                    self.root.verify_bound()?;
+                    attempts += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         let health: ControllerHealth =
             serde_json::from_slice(&bytes).map_err(|_| invalid_health())?;
@@ -348,4 +365,115 @@ impl HealthStore {
 
 fn invalid_health() -> WorkerError {
     WorkerError::Protocol("CONTROLLER_TRANSPORT: controller health record is invalid".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn health() -> ControllerHealth {
+        ControllerHealth::new(
+            ProcessIdentity::new(crate::fixture_pid::fixture_pid(1), 1).unwrap(),
+            1,
+        )
+    }
+
+    #[test]
+    fn health_read_rechecks_a_tick_replacement_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HealthStore::open(&temp.path().join("controller")).unwrap();
+        let initial = health();
+        store.write(&initial).unwrap();
+        let mut next = initial.clone();
+        next.begin_tick(2);
+        let mut replace = true;
+
+        let observed = store
+            .read_with_hook(|| {
+                if std::mem::take(&mut replace) {
+                    store.write(&next).unwrap();
+                }
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(observed, next);
+    }
+
+    #[test]
+    fn health_read_recheck_preserves_invalid_records_and_directory_bindings() {
+        for kind in ["record", "permissions", "directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("controller");
+            let store = HealthStore::open(&path).unwrap();
+            store.write(&health()).unwrap();
+            let mut replace = true;
+            let error = store
+                .read_with_hook(|| {
+                    if !std::mem::take(&mut replace) {
+                        return;
+                    }
+                    let file = path.join(HEALTH_FILE);
+                    match kind {
+                        "record" => {
+                            let previous = fs::read(&file).unwrap();
+                            let mut invalid = health();
+                            invalid.version = 2;
+                            store
+                                .root
+                                .replace_private_regular_exact(
+                                    HEALTH_FILE,
+                                    &previous,
+                                    &serde_json::to_vec(&invalid).unwrap(),
+                                )
+                                .unwrap();
+                        }
+                        "permissions" => {
+                            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap()
+                        }
+                        "directory" => {
+                            let bytes = fs::read(&file).unwrap();
+                            fs::rename(&path, temp.path().join("detached")).unwrap();
+                            fs::create_dir(&path).unwrap();
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                            fs::write(&file, bytes).unwrap();
+                            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .unwrap_err();
+
+            match kind {
+                "record" => assert_eq!(error.public_code(), "CONTROLLER_TRANSPORT"),
+                "permissions" => assert!(matches!(error, WorkerError::Io(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied)),
+                "directory" => assert!(matches!(error, WorkerError::Io(error)
+                    if error.raw_os_error() == Some(libc::ESTALE))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn health_read_recheck_is_bounded_during_continuous_ticks() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HealthStore::open(&temp.path().join("controller")).unwrap();
+        let mut next = health();
+        store.write(&next).unwrap();
+        let mut ticks = 0;
+        let error = store
+            .read_with_hook(|| {
+                ticks += 1;
+                assert!(ticks <= 16, "health snapshot must stop retrying");
+                next.begin_tick(ticks + 1);
+                store.write(&next).unwrap();
+            })
+            .unwrap_err();
+
+        assert!(ticks > 1, "a raced health snapshot must be rechecked");
+        assert!(matches!(error, WorkerError::Io(error)
+            if error.raw_os_error() == Some(libc::ESTALE)));
+    }
 }
