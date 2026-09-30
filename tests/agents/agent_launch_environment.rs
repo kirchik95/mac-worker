@@ -1,5 +1,4 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::fs;
 
@@ -123,7 +122,10 @@ fn refresh_facts_uses_supplied_home_not_process_home_wrapper() {
     fs::create_dir_all(&other_home).unwrap();
 
     assert_subprocess_success(
-        "refresh_facts_uses_supplied_home_not_process_home",
+        &crate::support::libtest_name(
+            module_path!(),
+            "refresh_facts_uses_supplied_home_not_process_home",
+        ),
         &[
             ("FIXTURE_HOME", fixture.home.to_str().unwrap()),
             ("HOME", other_home.to_str().unwrap()),
@@ -345,7 +347,10 @@ fn non_isolated_runner_still_inherits_parent_credentials_wrapper() {
     ));
     fixture.install_home_cursor(PARENT_ONLY);
     assert_subprocess_success(
-        "non_isolated_runner_still_inherits_parent_credentials",
+        &crate::support::libtest_name(
+            module_path!(),
+            "non_isolated_runner_still_inherits_parent_credentials",
+        ),
         &[
             ("FIXTURE_HOME", fixture.home.to_str().unwrap()),
             ("CURSOR_API_KEY", PARENT_ONLY),

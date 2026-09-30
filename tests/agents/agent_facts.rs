@@ -1,5 +1,4 @@
-#[path = "support/fake_herdr.rs"]
-mod fake_herdr;
+use crate::fake_herdr;
 
 use std::{
     ffi::OsString,
@@ -2090,7 +2089,10 @@ fn before_publish_lock_keeps_a_peer_process_from_erasing_an_incident() {
         .env(AUTH_INCIDENT_PEER_HOST, &host)
         .args([
             "--exact",
-            "before_publish_lock_keeps_a_peer_process_from_erasing_an_incident",
+            &crate::support::libtest_name(
+                module_path!(),
+                "before_publish_lock_keeps_a_peer_process_from_erasing_an_incident",
+            ),
             "--nocapture",
             "--test-threads=1",
         ])
