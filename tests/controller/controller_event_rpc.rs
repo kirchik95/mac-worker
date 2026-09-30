@@ -1489,6 +1489,16 @@ mod state_reads {
     }
     #[test]
     fn real_names_cost_cap_and_independent_addressed_reads() {
+        measure_real_names_cost_and_addressed_reads(&[1_000]);
+    }
+
+    #[test]
+    #[ignore = "real 10k/100k registry measurement; run explicitly or in the nightly stress group"]
+    fn real_names_cost_cap_and_independent_addressed_reads_stress() {
+        measure_real_names_cost_and_addressed_reads(&[10_000, 100_000, 100_001]);
+    }
+
+    fn measure_real_names_cost_and_addressed_reads(requested_counts: &[usize]) {
         use std::os::unix::fs::OpenOptionsExt;
 
         let (_root, paths, runtime) = fixture();
@@ -1502,7 +1512,7 @@ mod state_reads {
         .unwrap();
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let mut entries = 2;
-        for requested in [1_000, 10_000, 100_000, 100_001] {
+        for &requested in requested_counts {
             while entries < requested {
                 let name = if entries % 10 == 0 {
                     format!("replace-{}", uuid::Uuid::from_u128(entries as u128))
@@ -1538,16 +1548,14 @@ mod state_reads {
                 assert_eq!(stats.queue_reads, 0);
                 assert_eq!(stats.input_bytes, 0);
                 assert_eq!(stats.association_checks, 0);
-                assert_eq!(
-                    reader
-                        .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
-                        .unwrap()
-                        .value
-                        .rows[0]
-                        .quiescent,
-                    Some(true)
-                );
             }
+            let addressed = reader
+                .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
+                .unwrap();
+            assert_eq!(addressed.value.rows[0].quiescent, Some(true));
+            assert_eq!(addressed.stats.names_calls, 0);
+            assert_eq!(addressed.stats.record_reads, 1);
+            assert_eq!(addressed.stats.queue_reads, 1);
             println!(
                 "EV_T4_NAMES entries={} name_bytes={} names_us={} work_us={} records={} task_bytes={} queue_reads={} associations={}",
                 requested,
