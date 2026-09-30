@@ -4091,7 +4091,7 @@ fn add_second_worker(fixture: &mut AcceptedThenTerminalFixture, first: bool) {
     fixture.config.workers.insert(usize::from(!first), worker);
 }
 
-fn plant_bound_mini1_ready(state: &ClientStateStore, capabilities: Vec<String>) {
+fn plant_bound_mini1_ready(state: &ClientStateStore, capabilities: Vec<String>) -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -4118,6 +4118,7 @@ fn plant_bound_mini1_ready(state: &ClientStateStore, capabilities: Vec<String>) 
             ),
         )
         .unwrap();
+    now
 }
 
 #[test]
@@ -6148,7 +6149,7 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
     .unwrap();
     let runner = AcceptedThenTerminalRunner::new();
     let executor = InlineRunnerExecutor;
-    plant_bound_mini1_ready(
+    let admission_now = plant_bound_mini1_ready(
         &state,
         vec![
             "darwin-arm64".into(),
@@ -6157,7 +6158,7 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
         ],
     );
     // This fixture's synthetic origin capability must stay cached across both submits.
-    let state = freeze_admission_clock(state);
+    let state = state.with_admission_clock(Arc::new(move || Ok(admission_now)));
     let request = || TaskSubmitRequest {
         questions: None,
         agent: AgentKind::Codex,

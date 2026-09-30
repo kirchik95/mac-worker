@@ -2279,6 +2279,7 @@ fn extra_watchers_exit_instead_of_blocking() {
     let cloned = store.clone();
     let stop_thread = stop.clone();
     thread::scope(|scope| {
+        let _stop_on_panic = crate::support::on_drop(|| stop.store(true, Ordering::SeqCst));
         scope.spawn(|| {
             OriginOutbox::new(&cloned, &SystemProcessRunner)
                 .run_watch_with(&stop_thread, || 1, 50)
@@ -2316,6 +2317,7 @@ fn wake_leaves_a_live_watcher_with_the_same_binary_identity_alone() {
     let cloned = store.clone();
     let stop_thread = stop.clone();
     thread::scope(|scope| {
+        let _stop_on_panic = crate::support::on_drop(|| stop.store(true, Ordering::SeqCst));
         scope.spawn(|| {
             OriginOutbox::new(&cloned, &SystemProcessRunner)
                 .run_watch_with(&stop_thread, || 1, 50)
@@ -2575,6 +2577,7 @@ fn once_returns_busy_while_a_watcher_holds_the_pump() {
     let cloned = store.clone();
     let stop_thread = stop.clone();
     thread::scope(|scope| {
+        let _stop_on_panic = crate::support::on_drop(|| stop.store(true, Ordering::SeqCst));
         scope.spawn(|| {
             OriginOutbox::new(&cloned, &SystemProcessRunner)
                 .run_watch_with(&stop_thread, || 1, 50)
