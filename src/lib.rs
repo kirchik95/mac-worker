@@ -6042,6 +6042,7 @@ impl ProcessRunner for ControllerLogsExchange<'_> {
                 !crate::controller::decode_frame(&output.stdout)
                     .is_ok_and(|frame| serde_json::from_slice::<HostControlError>(frame).is_ok())
             }
+            Err(WorkerError::Io(_)) => true,
             Err(WorkerError::Process(crate::error::ProcessError::DeadlineExceeded { .. })) => true,
             Err(error @ WorkerError::Unavailable(_)) => {
                 error.public_code() == "CONTROLLER_UNAVAILABLE"

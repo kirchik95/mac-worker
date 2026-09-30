@@ -539,7 +539,8 @@ rediscovered. A controller advertising
 `controller.task-logs-wait` waits up to 20 seconds for new log bytes before replying, within the
 unchanged 30-second SSH deadline. Older controllers use an idle polling backoff from 100 ms to
 2 seconds, reset whenever bytes arrive. Follow pins the selected turn and keeps its byte offset
-across temporary SSH failures, empty exchanges, and SSH deadline expiry. It prints
+across temporary SSH failures, local SSH process startup errors, empty exchanges, and SSH
+deadline expiry. It prints
 `controller unreachable; retrying…` once per outage, retries with a 1-to-10-second backoff, and
 prints `controller reachable again` on recovery. After 10 minutes of continuous failure it returns
 the original error; each retry's SSH deadline is capped by the remaining outage budget.

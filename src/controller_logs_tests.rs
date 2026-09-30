@@ -39,6 +39,7 @@ enum Step {
     Empty(i32),
     FailedExchange,
     Deadline,
+    SpawnIo,
     Typed(&'static str),
     Invalid(fn(&mut Value)),
     InvalidFrame,
@@ -162,6 +163,7 @@ impl ProcessRunner for Rpc<'_> {
                 }
                 .into())
             }
+            Step::SpawnIo => Err(std::io::Error::from_raw_os_error(libc::EAGAIN).into()),
             Step::Typed(code) => frame(
                 1,
                 &serde_json::to_value(
@@ -389,6 +391,36 @@ fn follow_retries_empty_failed_and_deadline_exchanges_at_the_pinned_offset() {
 }
 
 #[test]
+fn follow_retries_ssh_spawn_io_errors_at_the_pinned_offset() {
+    let clock = Clock::default();
+    let rpc = Rpc::new(
+        &clock,
+        supports_wait(),
+        vec![
+            Step::Chunk(b"before", false),
+            Step::SpawnIo,
+            Step::SpawnIo,
+            Step::Chunk(b"after", true),
+        ],
+    );
+    let (result, out, err) = invoke(&rpc, true, true);
+    result.unwrap();
+    assert_eq!(out, b"beforeafter");
+    assert_eq!(
+        err,
+        "controller unreachable; retrying…\ncontroller reachable again\n"
+    );
+    assert_eq!(
+        *clock.sleeps.lock().unwrap(),
+        [1, 2].map(Duration::from_secs)
+    );
+    for request in &rpc.requests.lock().unwrap()[1..] {
+        assert_eq!(request.body()["offset"], 6);
+        assert_eq!(request.body()["turn_id"], turn_id().to_string());
+    }
+}
+
+#[test]
 fn ten_minutes_of_continuous_failure_returns_the_original_error() {
     let clock = Clock::default();
     let mut steps = vec![Step::Deadline];
@@ -441,6 +473,7 @@ fn verification_and_typed_errors_end_follow_without_retry() {
         Step::InvalidFrame,
         Step::Typed("TASK_NOT_FOUND"),
         Step::Typed("CONTROLLER_UNAVAILABLE"),
+        Step::Typed("IO"),
     ] {
         let clock = Clock::default();
         let rpc = Rpc::new(
@@ -461,7 +494,12 @@ fn verification_and_typed_errors_end_follow_without_retry() {
 
 #[test]
 fn nonfollow_keeps_immediate_reads_without_discovery_or_transport_retry() {
-    for failure in [Step::Empty(0), Step::Empty(255), Step::Deadline] {
+    for failure in [
+        Step::Empty(0),
+        Step::Empty(255),
+        Step::Deadline,
+        Step::SpawnIo,
+    ] {
         let clock = Clock::default();
         let rpc = Rpc::new(&clock, supports_wait(), vec![failure]);
         let (result, _, err) = invoke(&rpc, false, true);
