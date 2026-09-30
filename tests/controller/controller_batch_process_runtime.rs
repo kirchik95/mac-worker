@@ -329,6 +329,9 @@ fn runtime_dag_from_parent_requires_actual_close() {
     );
 
     let child_done = wait_for_terminal_turn(&fixture, &repo, &child_task, Some(&child_turn));
+    // Terminal status precedes result import; fetch requires the runner's
+    // completed publication, just as the parent close does above.
+    assert_task_quiescent(&fixture, repo.root(), &child_task);
     let child_result = terminal_head_oid(&child_done, Some(&child_turn))
         .expect("child terminal head")
         .to_owned();
