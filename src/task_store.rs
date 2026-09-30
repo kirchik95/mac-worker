@@ -2135,11 +2135,35 @@ impl<'a> TaskStore<'a> {
     }
 
     fn read_meta(&self, task: &RootedDir) -> Result<TaskMeta, WorkerError> {
-        read_record(task, "meta.json").map_err(map_task_not_found)
+        read_record(task, "meta.json").map_err(|error| map_task_read_error(task, error))
     }
 
     fn read_status(&self, task: &RootedDir) -> Result<TaskStatus, WorkerError> {
-        read_record(task, "status.json").map_err(map_task_not_found)
+        self.read_status_with_hook(task, || {})
+    }
+
+    fn read_status_with_hook(
+        &self,
+        task: &RootedDir,
+        mut after_open: impl FnMut(),
+    ) -> Result<TaskStatus, WorkerError> {
+        let mut retries = 0;
+        loop {
+            match read_record_with_hook(task, "status.json", &mut after_open) {
+                Err(WorkerError::Io(error))
+                    if error.raw_os_error() == Some(libc::ESTALE) && retries < 3 =>
+                {
+                    // Publication replaces status.json atomically. Retry only
+                    // within this task directory; GC disappearance stays
+                    // TASK_NOT_FOUND and a replaced directory stays an error.
+                    task.verify_bound()
+                        .map_err(WorkerError::Io)
+                        .map_err(map_task_not_found)?;
+                    retries += 1;
+                }
+                result => return result.map_err(|error| map_task_read_error(task, error)),
+            }
+        }
     }
 }
 
@@ -2202,7 +2226,16 @@ fn read_record<T: DeserializeOwned + Serialize>(
     directory: &RootedDir,
     name: &str,
 ) -> Result<T, WorkerError> {
-    let bytes = directory.read_private_regular(name, MAX_TASK_RECORD_BYTES)?;
+    read_record_with_hook(directory, name, || {})
+}
+
+fn read_record_with_hook<T: DeserializeOwned + Serialize>(
+    directory: &RootedDir,
+    name: &str,
+    after_open: impl FnMut(),
+) -> Result<T, WorkerError> {
+    let bytes =
+        directory.read_private_regular_with_hook(name, MAX_TASK_RECORD_BYTES, after_open)?;
     let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
     let value = T::deserialize(&mut deserializer)
         .map_err(|error| WorkerError::Protocol(format!("invalid task JSON: {error}")))?;
@@ -2331,6 +2364,18 @@ fn json_escaped_char_len(character: char) -> usize {
         character if character <= '\u{1f}' => 6,
         character => character.len_utf8(),
     }
+}
+
+fn map_task_read_error(task: &RootedDir, error: WorkerError) -> WorkerError {
+    if matches!(&error, WorkerError::Io(error) if error.raw_os_error() == Some(libc::ESTALE)) {
+        // GC can retire the directory after it was opened. Only confirmed
+        // absence of this binding has the same meaning as ENOENT; a live or
+        // replaced directory must preserve the original identity failure.
+        if let Err(binding_error) = task.verify_bound() {
+            return map_task_not_found(binding_error.into());
+        }
+    }
+    map_task_not_found(error)
 }
 
 fn map_task_not_found(error: WorkerError) -> WorkerError {
@@ -2517,6 +2562,154 @@ mod tests {
     use uuid::Uuid;
 
     const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn status_fixture() -> (tempfile::TempDir, HostStore, RootedDir, TaskStatus) {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task = store
+            .open_task_directory(PROJECT_ID, TaskId::generate(), true)
+            .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Open,
+            None,
+            Some("worker".into()),
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        write_record_once(&task, "status.json", &status).unwrap();
+        (temp, store, task, status)
+    }
+
+    #[test]
+    fn status_read_rechecks_peer_publication_in_the_bound_task() {
+        let (_temp, store, task, original) = status_fixture();
+        let mut expected = original.clone();
+        let mut published = false;
+        let status = TaskStore::new(&store, &SystemProcessRunner)
+            .read_status_with_hook(&task, || {
+                if !published {
+                    published = true;
+                    expected = replace_status_record_at(
+                        &task,
+                        original.clone(),
+                        TaskState::Closed,
+                        None,
+                        2,
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap();
+        assert!(published);
+        assert_eq!(status, expected);
+        assert_eq!(status.state(), TaskState::Closed);
+    }
+
+    #[test]
+    fn status_read_rechecks_gc_retirement_as_task_not_found() {
+        let (_temp, store, task, _) = status_fixture();
+        let parent = store
+            .open_directory(&format!("tasks/{PROJECT_ID}"), false)
+            .unwrap();
+        let name = task.path().file_name().unwrap().to_str().unwrap();
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .read_status_with_hook(&task, || {
+                store.remove_owned_child_committed(&parent, name).unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.public_code(), "TASK_NOT_FOUND");
+        assert!(!task.path().exists());
+    }
+
+    #[test]
+    fn stale_task_read_is_missing_only_after_bound_gc_retirement() {
+        let (_temp, store, task, _) = status_fixture();
+        let parent = store
+            .open_directory(&format!("tasks/{PROJECT_ID}"), false)
+            .unwrap();
+        store
+            .remove_owned_child_committed(
+                &parent,
+                task.path().file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+        // APFS may return ESTALE rather than ENOENT for a lookup through the
+        // descriptor of the directory that GC just retired.
+        let error = map_task_read_error(&task, io::Error::from_raw_os_error(libc::ESTALE).into());
+        assert_eq!(error.public_code(), "TASK_NOT_FOUND");
+    }
+
+    #[test]
+    fn stale_task_read_keeps_errors_for_a_live_or_replaced_binding() {
+        for replace in [false, true] {
+            let (temp, _store, task, _) = status_fixture();
+            if replace {
+                std::fs::rename(task.path(), temp.path().join("detached-task")).unwrap();
+                RootedDir::create(task.path()).unwrap();
+            }
+            let error =
+                map_task_read_error(&task, io::Error::from_raw_os_error(libc::ESTALE).into());
+            assert!(
+                matches!(error, WorkerError::Io(error) if error.raw_os_error() == Some(libc::ESTALE))
+            );
+        }
+    }
+
+    #[test]
+    fn status_read_does_not_follow_a_replaced_task_directory() {
+        let (_temp, store, task, original) = status_fixture();
+        let mut reads = 0;
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .read_status_with_hook(&task, || {
+                reads += 1;
+                let detached = task.path().with_extension("detached");
+                std::fs::rename(task.path(), detached).unwrap();
+                let replacement = RootedDir::create(task.path()).unwrap();
+                write_record_once(&replacement, "status.json", &original).unwrap();
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerError::Io(ref error) if error.raw_os_error() == Some(libc::ESTALE))
+        );
+        assert_eq!(reads, 1, "do not rebind to the replacement task");
+    }
+
+    #[test]
+    fn status_read_rechecks_are_bounded_under_continuous_publication() {
+        let (_temp, store, task, mut current) = status_fixture();
+        let mut reads = 0;
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .read_status_with_hook(&task, || {
+                reads += 1;
+                current = replace_status_record_at(
+                    &task,
+                    current.clone(),
+                    TaskState::Open,
+                    None,
+                    reads + 1,
+                )
+                .unwrap();
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkerError::Io(ref error) if error.raw_os_error() == Some(libc::ESTALE))
+        );
+        assert!(
+            reads > 1,
+            "a concurrent status publication must be rechecked"
+        );
+        assert!(
+            reads <= 4,
+            "continuous writers must not cause an unbounded read"
+        );
+    }
 
     #[test]
     fn unrecoverable_payload_finishes_matching_active_turn_by_job_id() {
