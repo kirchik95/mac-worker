@@ -1,8 +1,13 @@
 //! Independent task-only event reads; Phase A module placement is temporary.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use serde::Serialize;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -17,6 +22,10 @@ use crate::{
 pub const REPAIR_MAX_DIRECTORY_ENTRIES: usize = 100_000;
 pub const MAX_TASK_RECORD_BYTES: usize = 1024 * 1024;
 pub const MAX_DISPATCH_ASSOCIATIONS: usize = 32;
+pub const REPAIR_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const REPAIR_WORK_BUDGET: Duration = Duration::from_millis(50);
+pub const REPAIR_MAX_ROWS: usize = 128;
+pub const MAX_CONTINUATION_BYTES: usize = 2048;
 
 /// Validate the names-only registry before reading any task or queue record.
 pub fn sorted_task_ids(names: Vec<Vec<u8>>) -> Result<Vec<TaskId>, WorkerError> {
@@ -36,7 +45,7 @@ pub fn sorted_task_ids(names: Vec<Vec<u8>>) -> Result<Vec<TaskId>, WorkerError> 
         let id_text = text.strip_suffix(".json").ok_or_else(invalid_state)?;
         ids.push(id_text.parse::<TaskId>().map_err(|_| invalid_state())?);
     }
-    ids.sort_unstable_by_key(TaskId::to_string);
+    ids.sort_by_cached_key(TaskId::to_string);
     Ok(ids)
 }
 
@@ -188,11 +197,130 @@ impl TaskEventReadStore {
 
     pub fn repair(
         &self,
-        _after: Option<&str>,
-        _limit: usize,
-        _deadline: Duration,
+        after: Option<&str>,
+        limit: usize,
+        deadline: Duration,
     ) -> Result<TaskReadResult<RepairFacts>, WorkerError> {
-        Err(invalid_state())
+        let (value, stats) = self.repair_measured(after, limit, deadline);
+        Ok(TaskReadResult {
+            value: value?,
+            stats,
+        })
+    }
+
+    /// Measurements are returned even on admission failure, before record/fact work.
+    pub fn repair_measured(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        deadline: Duration,
+    ) -> (Result<RepairFacts, WorkerError>, TaskReadStats) {
+        let mut stats = TaskReadStats::default();
+        let value = self.repair_inner(after, limit.clamp(1, REPAIR_MAX_ROWS), deadline, &mut stats);
+        (value, stats)
+    }
+
+    fn repair_inner(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        deadline: Duration,
+        stats: &mut TaskReadStats,
+    ) -> Result<RepairFacts, WorkerError> {
+        let token = after.map(decode_token::<RepairToken>).transpose()?;
+        let _fence = self.acquire(deadline)?;
+        let binding = self.repair_binding()?;
+        if token.as_ref().is_some_and(|token| {
+            token.version != 1 || token.kind != "repair" || token.binding != binding
+        }) {
+            return Err(invalid_cursor());
+        }
+        self.check_deadline(deadline)?;
+        let names_started = Instant::now();
+        stats.names_calls += 1;
+        let names = self.tasks.list_names()?;
+        stats.directory_entries = names.len();
+        stats.name_bytes = names.iter().map(Vec::len).sum();
+        self.check_deadline(deadline)?;
+        let ids = sorted_task_ids(names);
+        stats.names_elapsed = names_started.elapsed();
+        let ids = ids?;
+        self.check_deadline(deadline)?;
+        let after_text = token.map(|token| token.after_task_id.to_string());
+        let start = after_text.as_ref().map_or(0, |after| {
+            ids.partition_point(|id| id.to_string() <= *after)
+        });
+        if start == ids.len() {
+            return Ok(RepairFacts {
+                rows: Vec::new(),
+                next: None,
+                complete: true,
+            });
+        }
+        let work_started = Instant::now();
+        let result = self.repair_rows(&ids[start..], binding, limit, deadline, stats);
+        stats.work_elapsed = work_started.elapsed();
+        result
+    }
+
+    fn repair_rows(
+        &self,
+        ids: &[TaskId],
+        binding: RepairBinding,
+        limit: usize,
+        deadline: Duration,
+        stats: &mut TaskReadStats,
+    ) -> Result<RepairFacts, WorkerError> {
+        let work_started = self.runtime.now();
+        let (queue, _) = self.read_queue(stats)?;
+        let mut rows = Vec::new();
+        let mut processed = 0;
+        for &id in ids {
+            if processed >= limit
+                || (processed > 0
+                    && (self.runtime.now().saturating_sub(work_started) >= REPAIR_WORK_BUDGET
+                        || stats.input_bytes > REPAIR_MAX_INPUT_BYTES - MAX_TASK_RECORD_BYTES))
+            {
+                break;
+            }
+            self.check_deadline(deadline)?;
+            if let Some(record) = self.read_task(id, stats)? {
+                let dispatching =
+                    if crate::client_state::task_operator_busy_reason(&record, None).is_some() {
+                        None
+                    } else {
+                        self.dispatching(id, &queue, stats)?
+                    };
+                rows.push(record_facts(&record, dispatching, false)?);
+            }
+            processed += 1;
+        }
+        self.verify_bindings()?;
+        self.check_deadline(deadline)?;
+        let complete = processed == ids.len();
+        let next = if complete {
+            None
+        } else {
+            Some(encode_token(&RepairToken {
+                version: 1,
+                kind: "repair".into(),
+                binding,
+                after_task_id: ids[processed - 1],
+            })?)
+        };
+        Ok(RepairFacts {
+            rows,
+            next,
+            complete,
+        })
+    }
+
+    fn repair_binding(&self) -> Result<RepairBinding, WorkerError> {
+        Ok(RepairBinding {
+            client_id: self.client_id,
+            root: directory_identity(&self.root)?,
+            tasks: directory_identity(&self.tasks)?,
+        })
     }
 
     fn check_deadline(&self, deadline: Duration) -> Result<(), WorkerError> {
@@ -322,6 +450,63 @@ impl TaskEventReadStore {
         task_turns.verify_bound()?;
         Ok(Some(false))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairBinding {
+    client_id: ClientId,
+    root: DirectoryIdentity,
+    tasks: DirectoryIdentity,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairToken {
+    version: u8,
+    kind: String,
+    binding: RepairBinding,
+    after_task_id: TaskId,
+}
+
+fn directory_identity(directory: &RootedDir) -> Result<DirectoryIdentity, WorkerError> {
+    let metadata = directory.root_metadata()?;
+    Ok(DirectoryIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino,
+    })
+}
+
+fn encode_token(value: &impl Serialize) -> Result<String, WorkerError> {
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).map_err(|_| invalid_cursor())?);
+    if encoded.len() > MAX_CONTINUATION_BYTES {
+        return Err(invalid_cursor());
+    }
+    Ok(encoded)
+}
+
+fn decode_token<T: DeserializeOwned>(encoded: &str) -> Result<T, WorkerError> {
+    if encoded.is_empty() || encoded.len() > MAX_CONTINUATION_BYTES {
+        return Err(invalid_cursor());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_cursor())?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+        return Err(invalid_cursor());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid_cursor())
+}
+
+fn invalid_cursor() -> WorkerError {
+    WorkerError::Protocol("CONTROLLER_EVENTS_INVALID_CURSOR".into())
 }
 
 pub fn record_facts(
@@ -769,5 +954,353 @@ mod tests {
                 .addressed(&[id(1)], false, None, Duration::from_secs(30))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn large_frozen_registry_key_pages_complete_under_injected_work_budget() {
+        let (_root, paths, runtime) = fixture();
+        for number in 1..=65 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+        }
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        runtime.step.store(5, Ordering::SeqCst);
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = reader
+                .repair(cursor.as_deref(), 128, Duration::from_secs(1000))
+                .unwrap();
+            pages += 1;
+            assert_eq!(page.stats.names_calls, 1);
+            assert!(page.stats.record_reads > 0 && page.stats.record_reads < 65);
+            assert!(page.stats.association_checks <= 32);
+            assert!(page.stats.input_bytes <= 8 * 1024 * 1024);
+            assert!(page.value.rows.iter().all(|row| row.title.is_none()));
+            seen.extend(page.value.rows.iter().map(|row| row.task_id));
+            if page.value.complete {
+                assert!(page.value.next.is_none());
+                break;
+            }
+            let next = page.value.next.unwrap();
+            assert!(next.len() <= 2048);
+            assert_ne!(cursor.as_ref(), Some(&next));
+            cursor = Some(next);
+            assert!(pages <= 65, "a frozen admitted registry must make progress");
+        }
+        assert!(pages > 1);
+        assert_eq!(seen, (1..=65).map(id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn removed_cursor_and_insertions_above_and_below_it_converge_by_keys() {
+        let (_root, paths, runtime) = fixture();
+        for number in [10, 20, 30] {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+        }
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .repair(None, 2, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert_eq!(
+            first.rows.iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            vec![id(10), id(20)]
+        );
+        fs::remove_file(paths.state.join("tasks").join(format!("{}.json", id(20)))).unwrap();
+        write_record(&paths, &record(5, TaskState::Open, TaskOutcome::Done));
+        write_record(&paths, &record(25, TaskState::Open, TaskOutcome::Done));
+        let last = reader
+            .repair(first.next.as_deref(), 2, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert_eq!(
+            last.rows.iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            vec![id(25), id(30)]
+        );
+        assert!(last.complete);
+        let next_sweep = reader
+            .repair(None, 64, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert_eq!(
+            next_sweep
+                .rows
+                .iter()
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>(),
+            vec![id(5), id(10), id(25), id(30)]
+        );
+        assert!(next_sweep.complete);
+    }
+
+    #[test]
+    fn residue_excluded_without_record_or_queue_reads() {
+        let (_root, paths, runtime) = fixture();
+        let residue = paths
+            .state
+            .join("tasks")
+            .join("replace-00000000-0000-0000-0000-000000000001");
+        fs::write(&residue, b"never decode this residue").unwrap();
+        fs::write(
+            paths.state.join("queue/state.json"),
+            b"broken queue is irrelevant to an empty page",
+        )
+        .unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let page = reader.repair(None, 64, Duration::from_secs(30)).unwrap();
+        assert!(page.value.complete);
+        assert!(page.value.next.is_none());
+        assert!(page.value.rows.is_empty());
+        assert_eq!(page.stats.record_reads, 0);
+        assert_eq!(page.stats.queue_reads, 0);
+        assert_eq!(fs::read(residue).unwrap(), b"never decode this residue");
+    }
+
+    #[test]
+    fn bad_key_cursor_and_foreign_root_are_rejected() {
+        let (_root, paths, runtime) = fixture();
+        for number in 1..=2 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+        }
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let first = reader
+            .repair(None, 1, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        for invalid in ["not a cursor".to_owned(), "a".repeat(2049)] {
+            assert!(
+                reader
+                    .repair(Some(&invalid), 1, Duration::from_secs(30))
+                    .is_err()
+            );
+        }
+        let (_other, other_paths, other_runtime) = fixture();
+        let other = TaskEventReadStore::open_existing(&other_paths, other_runtime).unwrap();
+        assert!(
+            other
+                .repair(first.next.as_deref(), 1, Duration::from_secs(30))
+                .is_err()
+        );
+        // Reopening the same physical root is independent of process-owned iterator state.
+        let reopened =
+            TaskEventReadStore::open_existing(&paths, Arc::new(ManualRuntime::default())).unwrap();
+        assert_eq!(
+            reopened
+                .repair(first.next.as_deref(), 1, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows[0]
+                .task_id,
+            id(2)
+        );
+    }
+
+    #[test]
+    fn cursor_reused_in_new_process() {
+        let (_root, paths, runtime) = fixture();
+        for number in 1..=2 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+        }
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let cursor = reader
+            .repair(None, 1, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .next
+            .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "controller::event_task_reads::tests::resume_cursor_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("EV_T4_FIXTURE_STATE", &paths.state)
+            .env("EV_T4_FIXTURE_CURSOR", cursor)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    #[ignore = "fixture: explicitly re-executed by cursor_reused_in_new_process"]
+    fn resume_cursor_child() {
+        let state = std::path::PathBuf::from(std::env::var_os("EV_T4_FIXTURE_STATE").unwrap());
+        let cursor = std::env::var("EV_T4_FIXTURE_CURSOR").unwrap();
+        let paths = PathLayout {
+            state,
+            config: "unused".into(),
+            cache: "unused".into(),
+            data: "unused".into(),
+        };
+        let reader =
+            TaskEventReadStore::open_existing(&paths, Arc::new(ManualRuntime::default())).unwrap();
+        let page = reader
+            .repair(Some(&cursor), 1, Duration::from_secs(30))
+            .unwrap()
+            .value;
+        assert_eq!(page.rows[0].task_id, id(2));
+        assert!(page.complete);
+    }
+
+    fn near_max_record(number: u128) -> LocalTaskRecord {
+        let mut wire =
+            serde_json::to_value(record(number, TaskState::Open, TaskOutcome::Done)).unwrap();
+        let template = wire["status"]["turns"][0].clone();
+        let history = (1..=7000)
+            .map(|index| {
+                let mut turn = template.clone();
+                turn["turn_number"] = serde_json::json!(index);
+                turn["turn_id"] = serde_json::json!(TurnId::new(uuid::Uuid::from_u128(
+                    number + 1_000_000 + index
+                )));
+                turn
+            })
+            .collect::<Vec<_>>();
+        let mut low = 1;
+        let mut high = history.len();
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            wire["status"]["turns"] = serde_json::json!(&history[..middle]);
+            let candidate: LocalTaskRecord = serde_json::from_value(wire.clone()).unwrap();
+            if candidate.canonical_bytes().unwrap().len() <= MAX_TASK_RECORD_BYTES {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        wire["status"]["turns"] = serde_json::json!(&history[..low]);
+        let candidate: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+        assert!(candidate.canonical_bytes().unwrap().len() > MAX_TASK_RECORD_BYTES - 1024);
+        candidate
+    }
+
+    #[test]
+    fn maximal_task_record_yields_once_and_next_page_progresses() {
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &near_max_record(1));
+        write_record(&paths, &record(2, TaskState::Open, TaskOutcome::Done));
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        runtime.step.store(30, Ordering::SeqCst);
+        let first = reader.repair(None, 64, Duration::from_secs(1000)).unwrap();
+        assert_eq!(first.value.rows.len(), 1);
+        assert_eq!(first.value.rows[0].task_id, id(1));
+        assert_eq!(first.stats.record_reads, 1);
+        assert!(!first.value.complete);
+        let second = reader
+            .repair(first.value.next.as_deref(), 64, Duration::from_secs(1000))
+            .unwrap();
+        assert_eq!(second.value.rows[0].task_id, id(2));
+        assert!(second.value.complete);
+    }
+
+    #[test]
+    fn repair_input_bytes_and_encoded_frame_are_bounded() {
+        let (_root, paths, runtime) = fixture();
+        let large = near_max_record(1);
+        for number in 1..=12 {
+            let mut wire = serde_json::to_value(&large).unwrap();
+            wire["meta"]["task_id"] = serde_json::json!(id(number));
+            write_record(&paths, &serde_json::from_value(wire).unwrap());
+        }
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let page = reader.repair(None, 128, Duration::from_secs(30)).unwrap();
+        assert!(page.stats.record_reads > 0 && page.stats.record_reads < 12);
+        assert!(page.stats.input_bytes <= 8 * 1024 * 1024);
+        assert!(!page.value.complete);
+        let request = crate::controller::parse_request(
+            &serde_json::to_vec(&serde_json::json!({
+                "protocol_version": 7, "request_id": "00000000000000000000000000000001",
+                "command": "task.list", "body": {"controller_events": {"op": "repair"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = crate::controller::encode_json_frame(
+            &crate::controller::ControllerReadReply::from_request(&request, page.value),
+        )
+        .unwrap();
+        assert!(frame.len() < 1024 * 1024);
+    }
+
+    #[test]
+    fn real_names_cost_cap_and_independent_addressed_reads() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        let tasks = paths.state.join("tasks");
+        fs::create_dir(tasks.join(".mac-worker-rooted-fs")).unwrap();
+        fs::set_permissions(
+            tasks.join(".mac-worker-rooted-fs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let mut entries = 2;
+        for requested in [1_000, 10_000, 100_000, 100_001] {
+            while entries < requested {
+                let name = if entries % 10 == 0 {
+                    format!("replace-{}", uuid::Uuid::from_u128(entries as u128))
+                } else {
+                    format!("{}.json", id(entries as u128))
+                };
+                fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(tasks.join(name))
+                    .unwrap();
+                entries += 1;
+            }
+            let (page, stats) = reader.repair_measured(None, 1, Duration::from_secs(30));
+            assert_eq!(stats.names_calls, 1);
+            assert_eq!(stats.directory_entries, requested);
+            assert_eq!(
+                stats.name_bytes,
+                37 * (requested - 2) + 7 * ((requested - 1) / 10) + 58
+            );
+            if requested <= 100_000 {
+                assert_eq!(page.unwrap().rows[0].task_id, id(1));
+                assert_eq!(stats.record_reads, 1);
+                assert_eq!(stats.queue_reads, 1);
+            } else {
+                assert!(
+                    page.unwrap_err()
+                        .to_string()
+                        .contains("CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE")
+                );
+                assert_eq!(stats.record_reads, 0);
+                assert_eq!(stats.queue_reads, 0);
+                assert_eq!(stats.input_bytes, 0);
+                assert_eq!(stats.association_checks, 0);
+                assert_eq!(
+                    reader
+                        .addressed(&[id(1)], false, None, Duration::from_secs(30))
+                        .unwrap()
+                        .value
+                        .rows[0]
+                        .quiescent,
+                    Some(true)
+                );
+            }
+            println!(
+                "EV_T4_NAMES entries={} name_bytes={} names_us={} work_us={} records={} task_bytes={} queue_reads={} associations={}",
+                requested,
+                stats.name_bytes,
+                stats.names_elapsed.as_micros(),
+                stats.work_elapsed.as_micros(),
+                stats.record_reads,
+                stats.input_bytes,
+                stats.queue_reads,
+                stats.association_checks
+            );
+        }
     }
 }
