@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod active_tasks;
 mod deadline;
+pub mod events;
 pub(crate) use deadline::WaitDeadline;
 mod runner_dispatch;
 mod task_context;
