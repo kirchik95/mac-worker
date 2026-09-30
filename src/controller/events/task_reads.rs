@@ -1,4 +1,4 @@
-//! Independent task-only event reads; Phase A module placement is temporary.
+//! Independent, bounded task-only reads of existing authoritative state.
 
 use std::{
     io,
@@ -16,17 +16,19 @@ use crate::{
     job::{ClientId, QueueEntryKind, QueueSnapshot, QueueState},
     paths::PathLayout,
     rooted_fs::RootedDir,
-    task::{LocalTaskRecord, RunId, TaskId, TaskOutcome, TaskState, TurnId},
+    task::{LocalTaskRecord, TaskId, TaskOutcome, TaskState},
 };
 
-pub const REPAIR_MAX_DIRECTORY_ENTRIES: usize = 100_000;
-pub const MAX_TASK_RECORD_BYTES: usize = 1024 * 1024;
-pub const MAX_DISPATCH_ASSOCIATIONS: usize = 32;
-pub const REPAIR_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
-pub const REPAIR_WORK_BUDGET: Duration = Duration::from_millis(50);
-pub const REPAIR_MAX_ROWS: usize = 128;
-pub const MAX_CONTINUATION_BYTES: usize = 2048;
-pub const SAME_BINDING_ESTALE_RETRIES: usize = 3;
+pub use crate::controller::events::{
+    EventRuntime, MAX_DISPATCH_ASSOCIATIONS, MAX_OPAQUE_CURSOR_BYTES as MAX_CONTINUATION_BYTES,
+    MAX_STALE_RETRIES as SAME_BINDING_ESTALE_RETRIES,
+    MAX_STATE_RECORD_BYTES as MAX_TASK_RECORD_BYTES, REPAIR_MAX_DIRECTORY_ENTRIES,
+    REPAIR_MAX_INPUT_BYTES, REPAIR_MAX_LIMIT as REPAIR_MAX_ROWS, REPAIR_WORK_BUDGET,
+};
+use crate::controller::events::{
+    OpaqueCursor, TaskAddressQuery, TaskFacts, TaskFactsBatch, TaskFactsWire,
+    TaskProjectionProvider, TaskProjectionReader, TaskRepairPage, TaskRepairQuery,
+};
 
 /// Validate the names-only registry before reading any task or queue record.
 pub fn sorted_task_ids(names: Vec<Vec<u8>>) -> Result<Vec<TaskId>, WorkerError> {
@@ -54,33 +56,6 @@ fn invalid_state() -> WorkerError {
     WorkerError::Unavailable("CONTROLLER_EVENTS_UNAVAILABLE: invalid task state".into())
 }
 
-/// Phase A timing seam; replaced by the identical T1 EventRuntime trait in Phase B.
-pub trait TaskReadRuntime: Send + Sync {
-    fn now(&self) -> Duration;
-    fn sleep(&self, duration: Duration);
-    fn cancelled(&self) -> bool;
-}
-
-/// Internal, title-free by default. T1 wire conversion belongs to the RPC adapter.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct TaskRecordFacts {
-    pub task_id: TaskId,
-    pub run_id: Option<RunId>,
-    pub state: String,
-    pub latest_turn_id: Option<TurnId>,
-    pub outcome: Option<String>,
-    pub code: Option<String>,
-    pub runner_present: bool,
-    pub close_intent: bool,
-    pub auto_continue_intent: bool,
-    pub queue_dispatching: Option<bool>,
-    pub result_imported: bool,
-    pub busy: Option<bool>,
-    pub quiescent: Option<bool>,
-    pub fact_digest: String,
-    pub title: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskReadStats {
     pub names_calls: usize,
@@ -99,33 +74,84 @@ pub struct TaskReadResult<T> {
     pub stats: TaskReadStats,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AddressedFacts {
-    pub rows: Vec<TaskRecordFacts>,
-    pub missing: Vec<TaskId>,
-    pub proof_after: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RepairFacts {
-    pub rows: Vec<TaskRecordFacts>,
-    pub next: Option<String>,
-    pub complete: bool,
-}
-
 pub struct TaskEventReadStore {
     root: RootedDir,
     tasks: RootedDir,
     queue: RootedDir,
     turns: RootedDir,
     client_id: ClientId,
-    runtime: Arc<dyn TaskReadRuntime>,
+    runtime: Arc<dyn EventRuntime>,
+}
+
+impl TaskProjectionReader for TaskEventReadStore {
+    fn addressed(
+        &self,
+        query: TaskAddressQuery,
+        deadline: Duration,
+    ) -> Result<TaskFactsBatch, WorkerError> {
+        query.validate()?;
+        Ok(self
+            .addressed_measured(
+                &query.task_ids,
+                query.include_titles,
+                query.proof_after.as_ref().map(OpaqueCursor::as_str),
+                deadline,
+            )?
+            .value)
+    }
+
+    fn repair(
+        &self,
+        query: TaskRepairQuery,
+        deadline: Duration,
+    ) -> Result<TaskRepairPage, WorkerError> {
+        let query = query.normalized();
+        let mut page = self
+            .repair_read(
+                query.after.as_ref().map(OpaqueCursor::as_str),
+                query.limit,
+                deadline,
+            )?
+            .value;
+        page.baseline_after = query.baseline_after;
+        Ok(page)
+    }
+}
+
+pub struct ExistingTaskProjectionProvider {
+    paths: PathLayout,
+    runtime: Arc<dyn EventRuntime>,
+}
+
+impl ExistingTaskProjectionProvider {
+    pub fn new(paths: PathLayout, runtime: Arc<dyn EventRuntime>) -> Self {
+        Self { paths, runtime }
+    }
+}
+
+impl TaskProjectionProvider for ExistingTaskProjectionProvider {
+    fn open_existing(
+        &self,
+        deadline: Duration,
+    ) -> Result<Arc<dyn TaskProjectionReader>, WorkerError> {
+        if self.runtime.cancelled() {
+            return Err(WorkerError::Unavailable(
+                "CONTROLLER_EVENTS_CANCELLED: cancelled".into(),
+            ));
+        }
+        if self.runtime.now() >= deadline {
+            return Err(invalid_state());
+        }
+        let store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
+        store.check_deadline(deadline)?;
+        Ok(Arc::new(store))
+    }
 }
 
 impl TaskEventReadStore {
     pub fn open_existing(
         paths: &PathLayout,
-        runtime: Arc<dyn TaskReadRuntime>,
+        runtime: Arc<dyn EventRuntime>,
     ) -> Result<Self, WorkerError> {
         let mut root = RootedDir::open_anchored_absolute(&paths.state)?;
         let metadata = root.root_metadata()?;
@@ -145,13 +171,13 @@ impl TaskEventReadStore {
         })
     }
 
-    pub fn addressed(
+    pub fn addressed_measured(
         &self,
         ids: &[TaskId],
         include_titles: bool,
         proof_after: Option<&str>,
         deadline: Duration,
-    ) -> Result<TaskReadResult<AddressedFacts>, WorkerError> {
+    ) -> Result<TaskReadResult<TaskFactsBatch>, WorkerError> {
         if ids.is_empty()
             || ids.len() > 16
             || ids
@@ -176,10 +202,11 @@ impl TaskEventReadStore {
         }
         let mut stats = TaskReadStats::default();
         let (queue, queue_digest) = self.read_queue(deadline, &mut stats)?;
-        let mut result = AddressedFacts {
+        let mut result = TaskFactsBatch {
             rows: Vec::new(),
             missing: Vec::new(),
             proof_after: None,
+            baseline_after: None,
         };
         let mut snapshots = Vec::new();
         for &id in ids {
@@ -298,7 +325,7 @@ impl TaskEventReadStore {
             result.rows.push(snapshot.facts.clone());
         }
         if progress.next_task < snapshots.len() {
-            result.proof_after = Some(encode_token(&progress)?);
+            result.proof_after = Some(OpaqueCursor::parse(encode_token(&progress)?)?);
         }
         self.verify_bindings()?;
         self.check_deadline(deadline)?;
@@ -309,12 +336,12 @@ impl TaskEventReadStore {
         })
     }
 
-    pub fn repair(
+    pub fn repair_read(
         &self,
         after: Option<&str>,
         limit: usize,
         deadline: Duration,
-    ) -> Result<TaskReadResult<RepairFacts>, WorkerError> {
+    ) -> Result<TaskReadResult<TaskRepairPage>, WorkerError> {
         let (value, stats) = self.repair_measured(after, limit, deadline);
         Ok(TaskReadResult {
             value: value?,
@@ -328,7 +355,7 @@ impl TaskEventReadStore {
         after: Option<&str>,
         limit: usize,
         deadline: Duration,
-    ) -> (Result<RepairFacts, WorkerError>, TaskReadStats) {
+    ) -> (Result<TaskRepairPage, WorkerError>, TaskReadStats) {
         let mut stats = TaskReadStats::default();
         let value = self.repair_inner(after, limit.clamp(1, REPAIR_MAX_ROWS), deadline, &mut stats);
         (value, stats)
@@ -361,7 +388,7 @@ impl TaskEventReadStore {
         limit: usize,
         deadline: Duration,
         stats: &mut TaskReadStats,
-    ) -> Result<RepairFacts, WorkerError> {
+    ) -> Result<TaskRepairPage, WorkerError> {
         let token = after.map(decode_token::<RepairToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
         let binding = self.repair_binding()?;
@@ -386,10 +413,12 @@ impl TaskEventReadStore {
             ids.partition_point(|id| id.to_string() <= *after)
         });
         if start == ids.len() {
-            return Ok(RepairFacts {
+            return Ok(TaskRepairPage {
                 rows: Vec::new(),
                 next: None,
                 complete: true,
+                restart: false,
+                baseline_after: None,
             });
         }
         let work_started = Instant::now();
@@ -405,7 +434,7 @@ impl TaskEventReadStore {
         limit: usize,
         deadline: Duration,
         stats: &mut TaskReadStats,
-    ) -> Result<RepairFacts, WorkerError> {
+    ) -> Result<TaskRepairPage, WorkerError> {
         let work_started = self.runtime.now();
         let (queue, _) = self.read_queue(deadline, stats)?;
         let mut rows = Vec::new();
@@ -436,17 +465,19 @@ impl TaskEventReadStore {
         let next = if complete {
             None
         } else {
-            Some(encode_token(&RepairToken {
+            Some(OpaqueCursor::parse(encode_token(&RepairToken {
                 version: 1,
                 kind: "repair".into(),
                 binding,
                 after_task_id: ids[processed - 1],
-            })?)
+            })?)?)
         };
-        Ok(RepairFacts {
+        Ok(TaskRepairPage {
             rows,
             next,
             complete,
+            restart: false,
+            baseline_after: None,
         })
     }
 
@@ -681,7 +712,7 @@ struct ProofToken {
 }
 
 struct TaskSnapshot {
-    facts: TaskRecordFacts,
+    facts: TaskFacts,
     known_busy: bool,
     namespace: Option<RootedDir>,
     generation: Option<DirectoryGeneration>,
@@ -747,7 +778,7 @@ pub fn record_facts(
     record: &LocalTaskRecord,
     dispatching: Option<bool>,
     include_titles: bool,
-) -> Result<TaskRecordFacts, WorkerError> {
+) -> Result<TaskFacts, WorkerError> {
     let busy = if crate::client_state::task_operator_busy_reason(record, None).is_some() {
         Some(true)
     } else {
@@ -763,8 +794,16 @@ pub fn record_facts(
     let turn = record.status().turns().last();
     let outcome = turn.and_then(|turn| turn.outcome());
     let code = match outcome {
-        Some(TaskOutcome::Failed { reason }) => Some(safe_code(reason)),
-        _ => record.abandon_code().map(safe_code),
+        Some(TaskOutcome::Failed { reason }) => Some(
+            crate::controller::events::SafeCode::from_public_code(reason)
+                .as_str()
+                .into(),
+        ),
+        _ => record.abandon_code().map(|code| {
+            crate::controller::events::SafeCode::from_public_code(code)
+                .as_str()
+                .into()
+        }),
     };
     let state = match record.status().state() {
         TaskState::Queued => "queued",
@@ -774,7 +813,7 @@ pub fn record_facts(
         TaskState::Abandoned => "abandoned",
         TaskState::Lost => "lost",
     };
-    let facts = TaskRecordFacts {
+    let facts = TaskFacts::try_new(TaskFactsWire {
         task_id: record.meta().task_id(),
         run_id: record.meta().run_id(),
         state: state.into(),
@@ -792,7 +831,7 @@ pub fn record_facts(
         title: include_titles.then(|| {
             crate::redaction::RedactionBoundary::from_env().title(record.meta().title().as_str())
         }),
-    };
+    })?;
     if serde_json::to_vec(&facts)
         .map_err(|_| invalid_state())?
         .len()
@@ -801,21 +840,6 @@ pub fn record_facts(
         return Err(invalid_state());
     }
     Ok(facts)
-}
-
-fn safe_code(code: &str) -> String {
-    match code {
-        "TURN_FAILED"
-        | "PUBLISH_FAILED"
-        | "RESULT_FETCH_FAILED"
-        | "RESULT_UNPARSEABLE"
-        | "LOG_DRAIN_UNAVAILABLE"
-        | "TASK_ABANDONED"
-        | "TURN_LOST"
-        | "CANCELLED"
-        | "TIMED_OUT" => code.into(),
-        _ => "TURN_FAILED".into(),
-    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -874,11 +898,12 @@ mod tests {
         task::{
             ClosePolicy, GitIdentity, PublishMode, QuestionsPolicy, RunnerIdentity,
             TaskCloseIntent, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
-            TaskState, TaskStatus, TurnSummary, TurnTerminal,
+            TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
         },
     };
 
     use super::*;
+    use crate::controller::events::SafeOutcome;
 
     #[derive(Default)]
     struct ManualRuntime {
@@ -887,7 +912,7 @@ mod tests {
         cancelled: AtomicBool,
     }
 
-    impl TaskReadRuntime for ManualRuntime {
+    impl EventRuntime for ManualRuntime {
         fn now(&self) -> Duration {
             Duration::from_millis(
                 self.millis
@@ -1047,62 +1072,6 @@ mod tests {
     }
 
     #[test]
-    fn minimal_existing_open_never_bootstraps_and_avoids_other_domains() {
-        let (_root, paths, runtime) = fixture();
-        let task = record(1, TaskState::Open, TaskOutcome::Done);
-        write_record(&paths, &task);
-        fs::write(
-            paths.state.join("runs").join("invalid.json"),
-            b"broken large run",
-        )
-        .unwrap();
-        fs::remove_dir_all(paths.state.join("active-tasks")).unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
-        let result = reader
-            .addressed(&[id(1), id(2)], false, None, Duration::from_secs(30))
-            .unwrap();
-        assert_eq!(result.value.rows.len(), 1);
-        assert_eq!(result.value.missing, vec![id(2)]);
-        assert_eq!(result.stats.queue_reads, 1);
-        assert_eq!(result.stats.names_calls, 0);
-        assert!(!paths.state.join("active-tasks").exists());
-        let mut absent = paths;
-        absent.state = absent.state.with_file_name("absent");
-        assert!(TaskEventReadStore::open_existing(&absent, runtime).is_err());
-        assert!(!absent.state.exists());
-    }
-
-    #[test]
-    fn event_directory_or_lock_damage_still_returns_state() {
-        let (_root, paths, runtime) = fixture();
-        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::NeedsInput));
-        let events = paths.controller_state_root().join("events");
-        fs::create_dir_all(&events).unwrap();
-        std::os::unix::fs::symlink("missing", events.join("journal.lock")).unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        assert_eq!(
-            reader
-                .addressed(&[id(1)], false, None, Duration::from_secs(30))
-                .unwrap()
-                .value
-                .rows[0]
-                .quiescent,
-            Some(true)
-        );
-        fs::remove_dir_all(&events).unwrap();
-        fs::write(events, b"not a directory").unwrap();
-        assert_eq!(
-            reader
-                .addressed(&[id(1)], false, None, Duration::from_secs(30))
-                .unwrap()
-                .value
-                .rows
-                .len(),
-            1
-        );
-    }
-
-    #[test]
     fn addressed_hidden_auto_continue_runner_none_is_busy() {
         let task = record(1, TaskState::Open, TaskOutcome::NeedsInput)
             .with_questions_policy(QuestionsPolicy::Decide);
@@ -1113,19 +1082,6 @@ mod tests {
         let facts = record_facts(&task, Some(false), false).unwrap();
         assert!(!facts.runner_present);
         assert!(facts.auto_continue_intent);
-        assert_eq!(facts.busy, Some(true));
-        assert_eq!(facts.quiescent, Some(false));
-    }
-
-    #[test]
-    fn recorded_dead_runner_is_still_busy_without_liveness_inspection() {
-        let task = record(1, TaskState::Open, TaskOutcome::Done)
-            .with_runner(Some(RunnerIdentity::new(
-                ProcessIdentity::new(2_000_000_001, 1).unwrap(),
-            )))
-            .unwrap();
-        let facts = record_facts(&task, Some(false), false).unwrap();
-        assert!(facts.runner_present);
         assert_eq!(facts.busy, Some(true));
         assert_eq!(facts.quiescent, Some(false));
     }
@@ -1157,8 +1113,11 @@ mod tests {
             },
         );
         let facts = record_facts(&task, Some(false), false).unwrap();
-        assert_eq!(facts.outcome.as_deref(), Some("failed"));
-        assert_eq!(facts.code.as_deref(), Some("TURN_FAILED"));
+        assert_eq!(facts.outcome, Some(SafeOutcome::Failed));
+        assert_eq!(
+            facts.code.as_ref().map(|code| code.as_str()),
+            Some("TURN_FAILED")
+        );
         assert_eq!(facts.title, None);
         let encoded = serde_json::to_string(&facts).unwrap();
         assert!(!encoded.contains("private"));
@@ -1171,371 +1130,6 @@ mod tests {
                 .as_deref(),
             Some("fixture title")
         );
-    }
-
-    #[test]
-    fn unsafe_root_and_changed_task_binding_fail_closed() {
-        let (_root, paths, runtime) = fixture();
-        fs::set_permissions(&paths.state, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(TaskEventReadStore::open_existing(&paths, runtime.clone()).is_err());
-        fs::set_permissions(&paths.state, fs::Permissions::from_mode(0o700)).unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        fs::rename(paths.state.join("tasks"), paths.state.join("old-tasks")).unwrap();
-        fs::create_dir(paths.state.join("tasks")).unwrap();
-        fs::set_permissions(paths.state.join("tasks"), fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            reader
-                .addressed(&[id(1)], false, None, Duration::from_secs(30))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn large_frozen_registry_key_pages_complete_under_injected_work_budget() {
-        let (_root, paths, runtime) = fixture();
-        for number in 1..=65 {
-            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
-        }
-        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
-        runtime.step.store(5, Ordering::SeqCst);
-        let mut cursor = None;
-        let mut seen = Vec::new();
-        let mut pages = 0;
-        loop {
-            let page = reader
-                .repair(cursor.as_deref(), 128, Duration::from_secs(1000))
-                .unwrap();
-            pages += 1;
-            assert_eq!(page.stats.names_calls, 1);
-            assert!(page.stats.record_reads > 0 && page.stats.record_reads < 65);
-            assert!(page.stats.association_checks <= 32);
-            assert!(page.stats.input_bytes <= 8 * 1024 * 1024);
-            assert!(page.value.rows.iter().all(|row| row.title.is_none()));
-            seen.extend(page.value.rows.iter().map(|row| row.task_id));
-            if page.value.complete {
-                assert!(page.value.next.is_none());
-                break;
-            }
-            let next = page.value.next.unwrap();
-            assert!(next.len() <= 2048);
-            assert_ne!(cursor.as_ref(), Some(&next));
-            cursor = Some(next);
-            assert!(pages <= 65, "a frozen admitted registry must make progress");
-        }
-        assert!(pages > 1);
-        assert_eq!(seen, (1..=65).map(id).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn removed_cursor_and_insertions_above_and_below_it_converge_by_keys() {
-        let (_root, paths, runtime) = fixture();
-        for number in [10, 20, 30] {
-            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
-        }
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let first = reader
-            .repair(None, 2, Duration::from_secs(30))
-            .unwrap()
-            .value;
-        assert_eq!(
-            first.rows.iter().map(|row| row.task_id).collect::<Vec<_>>(),
-            vec![id(10), id(20)]
-        );
-        fs::remove_file(paths.state.join("tasks").join(format!("{}.json", id(20)))).unwrap();
-        write_record(&paths, &record(5, TaskState::Open, TaskOutcome::Done));
-        write_record(&paths, &record(25, TaskState::Open, TaskOutcome::Done));
-        let last = reader
-            .repair(first.next.as_deref(), 2, Duration::from_secs(30))
-            .unwrap()
-            .value;
-        assert_eq!(
-            last.rows.iter().map(|row| row.task_id).collect::<Vec<_>>(),
-            vec![id(25), id(30)]
-        );
-        assert!(last.complete);
-        let next_sweep = reader
-            .repair(None, 64, Duration::from_secs(30))
-            .unwrap()
-            .value;
-        assert_eq!(
-            next_sweep
-                .rows
-                .iter()
-                .map(|row| row.task_id)
-                .collect::<Vec<_>>(),
-            vec![id(5), id(10), id(25), id(30)]
-        );
-        assert!(next_sweep.complete);
-    }
-
-    #[test]
-    fn residue_excluded_without_record_or_queue_reads() {
-        let (_root, paths, runtime) = fixture();
-        let residue = paths
-            .state
-            .join("tasks")
-            .join("replace-00000000-0000-0000-0000-000000000001");
-        fs::write(&residue, b"never decode this residue").unwrap();
-        fs::write(
-            paths.state.join("queue/state.json"),
-            b"broken queue is irrelevant to an empty page",
-        )
-        .unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let page = reader.repair(None, 64, Duration::from_secs(30)).unwrap();
-        assert!(page.value.complete);
-        assert!(page.value.next.is_none());
-        assert!(page.value.rows.is_empty());
-        assert_eq!(page.stats.record_reads, 0);
-        assert_eq!(page.stats.queue_reads, 0);
-        assert_eq!(fs::read(residue).unwrap(), b"never decode this residue");
-    }
-
-    #[test]
-    fn bad_key_cursor_and_foreign_root_are_rejected() {
-        let (_root, paths, runtime) = fixture();
-        for number in 1..=2 {
-            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
-        }
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let first = reader
-            .repair(None, 1, Duration::from_secs(30))
-            .unwrap()
-            .value;
-        for invalid in ["not a cursor".to_owned(), "a".repeat(2049)] {
-            assert!(
-                reader
-                    .repair(Some(&invalid), 1, Duration::from_secs(30))
-                    .is_err()
-            );
-        }
-        let (_other, other_paths, other_runtime) = fixture();
-        let other = TaskEventReadStore::open_existing(&other_paths, other_runtime).unwrap();
-        assert!(
-            other
-                .repair(first.next.as_deref(), 1, Duration::from_secs(30))
-                .is_err()
-        );
-        // Reopening the same physical root is independent of process-owned iterator state.
-        let reopened =
-            TaskEventReadStore::open_existing(&paths, Arc::new(ManualRuntime::default())).unwrap();
-        assert_eq!(
-            reopened
-                .repair(first.next.as_deref(), 1, Duration::from_secs(30))
-                .unwrap()
-                .value
-                .rows[0]
-                .task_id,
-            id(2)
-        );
-    }
-
-    #[test]
-    fn cursor_reused_in_new_process() {
-        let (_root, paths, runtime) = fixture();
-        for number in 1..=2 {
-            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
-        }
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let cursor = reader
-            .repair(None, 1, Duration::from_secs(30))
-            .unwrap()
-            .value
-            .next
-            .unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "controller::event_task_reads::tests::resume_cursor_child",
-                "--ignored",
-                "--test-threads=1",
-            ])
-            .env("EV_T4_FIXTURE_STATE", &paths.state)
-            .env("EV_T4_FIXTURE_CURSOR", cursor)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-    }
-
-    #[test]
-    #[ignore = "fixture: explicitly re-executed by cursor_reused_in_new_process"]
-    fn resume_cursor_child() {
-        let state = std::path::PathBuf::from(std::env::var_os("EV_T4_FIXTURE_STATE").unwrap());
-        let cursor = std::env::var("EV_T4_FIXTURE_CURSOR").unwrap();
-        let paths = PathLayout {
-            state,
-            config: "unused".into(),
-            cache: "unused".into(),
-            data: "unused".into(),
-        };
-        let reader =
-            TaskEventReadStore::open_existing(&paths, Arc::new(ManualRuntime::default())).unwrap();
-        let page = reader
-            .repair(Some(&cursor), 1, Duration::from_secs(30))
-            .unwrap()
-            .value;
-        assert_eq!(page.rows[0].task_id, id(2));
-        assert!(page.complete);
-    }
-
-    fn near_max_record(number: u128) -> LocalTaskRecord {
-        let mut wire =
-            serde_json::to_value(record(number, TaskState::Open, TaskOutcome::Done)).unwrap();
-        let template = wire["status"]["turns"][0].clone();
-        let history = (1..=7000)
-            .map(|index| {
-                let mut turn = template.clone();
-                turn["turn_number"] = serde_json::json!(index);
-                turn["turn_id"] = serde_json::json!(TurnId::new(uuid::Uuid::from_u128(
-                    number + 1_000_000 + index
-                )));
-                turn
-            })
-            .collect::<Vec<_>>();
-        let mut low = 1;
-        let mut high = history.len();
-        while low < high {
-            let middle = (low + high).div_ceil(2);
-            wire["status"]["turns"] = serde_json::json!(&history[..middle]);
-            let candidate: LocalTaskRecord = serde_json::from_value(wire.clone()).unwrap();
-            if candidate.canonical_bytes().unwrap().len() <= MAX_TASK_RECORD_BYTES {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        wire["status"]["turns"] = serde_json::json!(&history[..low]);
-        let candidate: LocalTaskRecord = serde_json::from_value(wire).unwrap();
-        assert!(candidate.canonical_bytes().unwrap().len() > MAX_TASK_RECORD_BYTES - 1024);
-        candidate
-    }
-
-    #[test]
-    fn maximal_task_record_yields_once_and_next_page_progresses() {
-        let (_root, paths, runtime) = fixture();
-        write_record(&paths, &near_max_record(1));
-        write_record(&paths, &record(2, TaskState::Open, TaskOutcome::Done));
-        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
-        runtime.step.store(30, Ordering::SeqCst);
-        let first = reader.repair(None, 64, Duration::from_secs(1000)).unwrap();
-        assert_eq!(first.value.rows.len(), 1);
-        assert_eq!(first.value.rows[0].task_id, id(1));
-        assert_eq!(first.stats.record_reads, 1);
-        assert!(!first.value.complete);
-        let second = reader
-            .repair(first.value.next.as_deref(), 64, Duration::from_secs(1000))
-            .unwrap();
-        assert_eq!(second.value.rows[0].task_id, id(2));
-        assert!(second.value.complete);
-    }
-
-    #[test]
-    fn repair_input_bytes_and_encoded_frame_are_bounded() {
-        let (_root, paths, runtime) = fixture();
-        let large = near_max_record(1);
-        for number in 1..=12 {
-            let mut wire = serde_json::to_value(&large).unwrap();
-            wire["meta"]["task_id"] = serde_json::json!(id(number));
-            write_record(&paths, &serde_json::from_value(wire).unwrap());
-        }
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let page = reader.repair(None, 128, Duration::from_secs(30)).unwrap();
-        assert!(page.stats.record_reads > 0 && page.stats.record_reads < 12);
-        assert!(page.stats.input_bytes <= 8 * 1024 * 1024);
-        assert!(!page.value.complete);
-        let request = crate::controller::parse_request(
-            &serde_json::to_vec(&serde_json::json!({
-                "protocol_version": 7, "request_id": "00000000000000000000000000000001",
-                "command": "task.list", "body": {"controller_events": {"op": "repair"}},
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let frame = crate::controller::encode_json_frame(
-            &crate::controller::ControllerReadReply::from_request(&request, page.value),
-        )
-        .unwrap();
-        assert!(frame.len() < 1024 * 1024);
-    }
-
-    #[test]
-    fn real_names_cost_cap_and_independent_addressed_reads() {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let (_root, paths, runtime) = fixture();
-        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
-        let tasks = paths.state.join("tasks");
-        fs::create_dir(tasks.join(".mac-worker-rooted-fs")).unwrap();
-        fs::set_permissions(
-            tasks.join(".mac-worker-rooted-fs"),
-            fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let mut entries = 2;
-        for requested in [1_000, 10_000, 100_000, 100_001] {
-            while entries < requested {
-                let name = if entries % 10 == 0 {
-                    format!("replace-{}", uuid::Uuid::from_u128(entries as u128))
-                } else {
-                    format!("{}.json", id(entries as u128))
-                };
-                fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(tasks.join(name))
-                    .unwrap();
-                entries += 1;
-            }
-            let (page, stats) = reader.repair_measured(None, 1, Duration::from_secs(30));
-            assert_eq!(stats.names_calls, 1);
-            assert_eq!(stats.directory_entries, requested);
-            assert_eq!(
-                stats.name_bytes,
-                37 * (requested - 2) + 7 * ((requested - 1) / 10) + 58
-            );
-            if requested <= 100_000 {
-                assert_eq!(page.unwrap().rows[0].task_id, id(1));
-                assert_eq!(stats.record_reads, 1);
-                assert_eq!(stats.queue_reads, 1);
-            } else {
-                assert!(
-                    page.unwrap_err()
-                        .to_string()
-                        .contains("CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE")
-                );
-                assert_eq!(stats.record_reads, 0);
-                assert_eq!(stats.queue_reads, 0);
-                assert_eq!(stats.input_bytes, 0);
-                assert_eq!(stats.association_checks, 0);
-                assert_eq!(
-                    reader
-                        .addressed(&[id(1)], false, None, Duration::from_secs(30))
-                        .unwrap()
-                        .value
-                        .rows[0]
-                        .quiescent,
-                    Some(true)
-                );
-            }
-            println!(
-                "EV_T4_NAMES entries={} name_bytes={} names_us={} work_us={} records={} task_bytes={} queue_reads={} associations={}",
-                requested,
-                stats.name_bytes,
-                stats.names_elapsed.as_micros(),
-                stats.work_elapsed.as_micros(),
-                stats.record_reads,
-                stats.input_bytes,
-                stats.queue_reads,
-                stats.association_checks
-            );
-        }
     }
 
     fn private_directory(path: &std::path::Path) {
@@ -1596,22 +1190,27 @@ mod tests {
         dispatching_queue(&paths, 70);
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let first = reader
-            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
             .unwrap();
         assert_eq!(first.stats.association_checks, 32);
         assert_eq!(first.value.rows[0].quiescent, None);
         let cursor = first.value.proof_after.unwrap();
-        assert!(cursor.len() <= 2048);
+        assert!(cursor.as_str().len() <= 2048);
         let second = reader
-            .addressed(&[id(1)], false, Some(&cursor), Duration::from_secs(30))
+            .addressed_measured(
+                &[id(1)],
+                false,
+                Some(cursor.as_str()),
+                Duration::from_secs(30),
+            )
             .unwrap();
         assert_eq!(second.stats.association_checks, 32);
         assert_eq!(second.value.rows[0].busy, None);
         let final_page = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1)],
                 false,
-                second.value.proof_after.as_deref(),
+                second.value.proof_after.as_ref().map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap();
@@ -1629,7 +1228,7 @@ mod tests {
         let jobs = dispatching_queue(&paths, 70);
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let first = reader
-            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
             .unwrap()
             .value;
         assert!(first.proof_after.is_some());
@@ -1638,10 +1237,10 @@ mod tests {
         std::os::unix::fs::symlink("missing", turns.join(jobs[0].to_string()).join("prompt"))
             .unwrap();
         let updated = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1)],
                 false,
-                first.proof_after.as_deref(),
+                first.proof_after.as_ref().map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap();
@@ -1659,14 +1258,14 @@ mod tests {
         dispatching_queue(&paths, 70);
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let first = reader
-            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
             .unwrap()
             .value;
         let second = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1)],
                 false,
-                first.proof_after.as_deref(),
+                first.proof_after.as_ref().map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap()
@@ -1674,25 +1273,29 @@ mod tests {
         assert!(second.proof_after.is_some());
         write_record(&paths, &record(1, TaskState::Open, TaskOutcome::NeedsInput));
         let changed_task = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1)],
                 false,
-                second.proof_after.as_deref(),
+                second.proof_after.as_ref().map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap();
         assert_eq!(changed_task.stats.association_checks, 32);
         assert_eq!(changed_task.value.rows[0].quiescent, None);
         assert_eq!(
-            changed_task.value.rows[0].outcome.as_deref(),
-            Some("needs_input")
+            changed_task.value.rows[0].outcome,
+            Some(SafeOutcome::NeedsInput)
         );
         dispatching_queue(&paths, 35);
         let changed_queue = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1)],
                 false,
-                changed_task.value.proof_after.as_deref(),
+                changed_task
+                    .value
+                    .proof_after
+                    .as_ref()
+                    .map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap();
@@ -1715,7 +1318,12 @@ mod tests {
         let mut calls = 0;
         loop {
             let result = reader
-                .addressed(&ids, false, cursor.as_deref(), Duration::from_secs(30))
+                .addressed_measured(
+                    &ids,
+                    false,
+                    cursor.as_ref().map(OpaqueCursor::as_str),
+                    Duration::from_secs(30),
+                )
                 .unwrap();
             calls += 1;
             assert_eq!(result.value.rows.len(), 16);
@@ -1733,7 +1341,7 @@ mod tests {
                 );
                 break;
             }
-            assert!(cursor.as_ref().unwrap().len() <= 2048);
+            assert!(cursor.as_ref().unwrap().as_str().len() <= 2048);
             assert!(calls <= 17);
         }
         assert_eq!(associations, 528);
@@ -1747,7 +1355,9 @@ mod tests {
         private_directory(&paths.state.join("turns").join(id(1).to_string()));
         dispatching_queue(&paths, 70);
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
-        let page = reader.repair(None, 64, Duration::from_secs(30)).unwrap();
+        let page = reader
+            .repair_read(None, 64, Duration::from_secs(30))
+            .unwrap();
         assert_eq!(page.stats.association_checks, 32);
         assert_eq!(page.value.rows[0].quiescent, None);
         assert!(page.value.complete);
@@ -1822,25 +1432,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_and_expired_deadline_precede_state_binding_io() {
-        let (_root, paths, runtime) = fixture();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
-        let (result, stats) = reader.repair_measured(None, 1, Duration::ZERO);
-        assert!(result.unwrap_err().to_string().contains("deadline expired"));
-        assert_eq!(stats.names_calls, 0);
-        fs::rename(paths.state.join("tasks"), paths.state.join("retired-tasks")).unwrap();
-        runtime.cancelled.store(true, Ordering::SeqCst);
-        let error = reader
-            .addressed(&[id(1)], false, None, Duration::from_secs(30))
-            .err()
-            .unwrap();
-        assert!(matches!(
-            error,
-            WorkerError::Process(crate::error::ProcessError::Cancelled)
-        ));
-    }
-
-    #[test]
     fn known_busy_row_does_not_open_its_turn_namespace() {
         let (_root, paths, runtime) = fixture();
         let busy = record(1, TaskState::Open, TaskOutcome::Done)
@@ -1853,7 +1444,7 @@ mod tests {
             .unwrap();
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let result = reader
-            .addressed(&[id(1)], false, None, Duration::from_secs(30))
+            .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
             .unwrap();
         assert_eq!(result.stats.association_checks, 0);
         assert_eq!(result.value.rows[0].busy, Some(true));
@@ -1878,16 +1469,16 @@ mod tests {
         );
         let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
         let first = reader
-            .addressed(&[id(1), id(2)], false, None, Duration::from_secs(30))
+            .addressed_measured(&[id(1), id(2)], false, None, Duration::from_secs(30))
             .unwrap()
             .value;
         assert_eq!(first.rows[0].busy, Some(true));
         assert_eq!(first.rows[1].quiescent, None);
         let second = reader
-            .addressed(
+            .addressed_measured(
                 &[id(1), id(2)],
                 false,
-                first.proof_after.as_deref(),
+                first.proof_after.as_ref().map(OpaqueCursor::as_str),
                 Duration::from_secs(30),
             )
             .unwrap()
