@@ -212,6 +212,15 @@ fn list_pending_envelopes_at(
     all: bool,
     now: u64,
 ) -> Result<PendingEnvelopes, WorkerError> {
+    list_pending_envelopes_with_hook(cache_root, all, now, || {})
+}
+
+fn list_pending_envelopes_with_hook(
+    cache_root: &Path,
+    all: bool,
+    now: u64,
+    mut after_open: impl FnMut(),
+) -> Result<PendingEnvelopes, WorkerError> {
     let Some(root) = open_existing_controller_root(cache_root)? else {
         return Ok(PendingEnvelopes::default());
     };
@@ -235,7 +244,10 @@ fn list_pending_envelopes_at(
             });
             continue;
         };
-        let (envelope, legacy) = match load_pending_envelope(&root, &name) {
+        // Settlement and pruning use this same lock. Take it per addressed
+        // entry so a long listing does not block unrelated cache mutations.
+        let _lock = lock_operations(&root)?;
+        let (envelope, legacy) = match load_pending_envelope(&root, &name, &mut after_open) {
             Ok(envelope) => envelope,
             // A concurrent prune may remove a settled entry after enumeration.
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -318,14 +330,23 @@ pub fn load_operation_envelope(
     cache_root: &Path,
     request_id: &str,
 ) -> Result<Option<OperationEnvelope>, WorkerError> {
+    load_operation_envelope_with_hook(cache_root, request_id, || {})
+}
+
+fn load_operation_envelope_with_hook(
+    cache_root: &Path,
+    request_id: &str,
+    after_open: impl FnOnce(),
+) -> Result<Option<OperationEnvelope>, WorkerError> {
     let name = envelope_file_name(request_id)?;
     let Some(root) = open_existing_controller_root(cache_root)? else {
         return Ok(None);
     };
+    let _lock = lock_operations(&root)?;
     if !root.entry_exists(&name).map_err(store_io)? {
         return Ok(None);
     }
-    Ok(Some(load_envelope(&root, &name)?))
+    Ok(Some(load_envelope_with_hook(&root, &name, after_open)?))
 }
 
 fn lock_operations(root: &crate::rooted_fs::RootedDir) -> Result<File, WorkerError> {
@@ -338,8 +359,16 @@ fn load_envelope(
     root: &crate::rooted_fs::RootedDir,
     name: &str,
 ) -> Result<OperationEnvelope, WorkerError> {
+    load_envelope_with_hook(root, name, || {})
+}
+
+fn load_envelope_with_hook(
+    root: &crate::rooted_fs::RootedDir,
+    name: &str,
+    after_open: impl FnOnce(),
+) -> Result<OperationEnvelope, WorkerError> {
     let bytes = root
-        .read_private_regular(name, MAX_ENVELOPE_BYTES)
+        .read_private_regular_with_hook(name, MAX_ENVELOPE_BYTES, after_open)
         .map_err(store_io)?;
     decode_envelope(name, &bytes)
 }
@@ -347,9 +376,10 @@ fn load_envelope(
 fn load_pending_envelope(
     root: &crate::rooted_fs::RootedDir,
     name: &str,
+    after_open: impl FnOnce(),
 ) -> Result<(OperationEnvelope, bool), WorkerError> {
     let bytes = root
-        .read_private_regular(name, MAX_ENVELOPE_BYTES)
+        .read_private_regular_with_hook(name, MAX_ENVELOPE_BYTES, after_open)
         .map_err(store_io)?;
     // Validate the original bytes: Value would erase duplicate identity or
     // settlement fields before the typed decoder can reject them.
@@ -463,6 +493,158 @@ mod tests {
             &serde_json::to_vec(&envelope).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn envelope_reads_exclude_settlement_while_the_record_is_open() {
+        use std::os::fd::AsRawFd;
+
+        for operation in ["lookup", "pending"] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let request = request(1);
+            let original = persist_operation_envelope(&cache, &request).unwrap();
+            let root = open_existing_controller_root(&cache).unwrap().unwrap();
+            let name = envelope_file_name(request.request_id()).unwrap();
+            let previous = serde_json::to_vec(&original).unwrap();
+            let mut settled = original.clone();
+            settled.settled_at_millis = Some(original.created_at_millis);
+            settled.outcome = Some(OperationOutcome::Acknowledged);
+            let next = serde_json::to_vec(&settled).unwrap();
+            let mut peer_acquired = false;
+            let mut publish = || {
+                let lock = root.open_existing_private_lock(OPERATIONS_LOCK).unwrap();
+                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    peer_acquired = true;
+                    root.replace_private_regular_exact(&name, &previous, &next)
+                        .unwrap();
+                } else {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                }
+            };
+
+            match operation {
+                "lookup" => assert_eq!(
+                    load_operation_envelope_with_hook(&cache, request.request_id(), &mut publish)
+                        .unwrap()
+                        .unwrap(),
+                    original
+                ),
+                "pending" => {
+                    let report = list_pending_envelopes_with_hook(
+                        &cache,
+                        true,
+                        original.created_at_millis,
+                        &mut publish,
+                    )
+                    .unwrap();
+                    assert!(report.unreadable.is_empty());
+                    assert_eq!(report.pending, vec![original]);
+                }
+                _ => unreachable!(),
+            }
+            assert!(!peer_acquired, "{operation} read must exclude settlement");
+            settle_operation_envelope(&cache, &request, OperationOutcome::Acknowledged).unwrap();
+            assert!(
+                load_operation_envelope(&cache, request.request_id())
+                    .unwrap()
+                    .unwrap()
+                    .settled_at_millis()
+                    .is_some()
+            );
+            assert!(
+                list_pending_envelopes(&cache, true)
+                    .unwrap()
+                    .pending
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_pending_read_keeps_pruning_outside_the_open_record() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        seed_envelope(&root, 1, Some(1));
+        let name = envelope_file_name(request(1).request_id()).unwrap();
+        let mut peer_acquired = false;
+        let report =
+            list_pending_envelopes_with_hook(&cache, true, ENVELOPE_WINDOW_MILLIS + 2, || {
+                let lock = root.open_existing_private_lock(OPERATIONS_LOCK).unwrap();
+                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    peer_acquired = true;
+                    root.remove_owned_regular(&name).unwrap();
+                } else {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                }
+            })
+            .unwrap();
+
+        assert!(
+            !peer_acquired,
+            "pruning must wait for the bound envelope read"
+        );
+        assert!(report.pending.is_empty());
+        assert!(report.unreadable.is_empty());
+        let _lock = lock_operations(&root).unwrap();
+        prune_settled_from(&root, ENVELOPE_WINDOW_MILLIS + 2, 0).unwrap();
+        assert!(!root.entry_exists(&name).unwrap());
+    }
+
+    #[test]
+    fn envelope_reads_do_not_follow_a_replaced_cache_directory() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        for operation in ["lookup", "pending"] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let request = request(1);
+            let original = persist_operation_envelope(&cache, &request).unwrap();
+            let name = envelope_file_name(request.request_id()).unwrap();
+            let bytes = fs::read(cache.join(&name)).unwrap();
+            let mut replace = || {
+                fs::rename(&cache, temp.path().join("detached")).unwrap();
+                fs::create_dir(&cache).unwrap();
+                fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+                let file = cache.join(&name);
+                fs::write(&file, &bytes).unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            };
+
+            match operation {
+                "lookup" => assert!(matches!(
+                    load_operation_envelope_with_hook(&cache, request.request_id(), replace),
+                    Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::ESTALE)
+                )),
+                "pending" => {
+                    let report = list_pending_envelopes_with_hook(
+                        &cache,
+                        true,
+                        original.created_at_millis,
+                        &mut replace,
+                    )
+                    .unwrap();
+                    assert!(report.pending.is_empty());
+                    assert_eq!(report.unreadable.len(), 1);
+                    assert_eq!(report.unreadable[0].code, "IO");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(cache.join(&name)).unwrap(), bytes);
+            assert_eq!(
+                fs::read(temp.path().join("detached").join(&name)).unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]

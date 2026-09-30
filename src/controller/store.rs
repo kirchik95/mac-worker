@@ -434,7 +434,26 @@ impl ControllerStore {
         Ok(self.request_names()?.len())
     }
 
+    /// Read under the same request lock as result and ACK publication, so a
+    /// concurrent publisher cannot retire this read's opened record inode.
     pub fn load(&self, request_id: &str) -> Result<Option<DurableRequest>, WorkerError> {
+        self.load_with_hook(request_id, || {})
+    }
+
+    fn load_with_hook(
+        &self,
+        request_id: &str,
+        after_open: impl FnOnce(),
+    ) -> Result<Option<DurableRequest>, WorkerError> {
+        let _per_request = self.lock_request(request_id)?;
+        self.load_locked(request_id, after_open)
+    }
+
+    fn load_locked(
+        &self,
+        request_id: &str,
+        after_open: impl FnOnce(),
+    ) -> Result<Option<DurableRequest>, WorkerError> {
         let name = request_file_name(request_id)?;
         if !self
             .root
@@ -443,7 +462,7 @@ impl ControllerStore {
         {
             return Ok(None);
         }
-        Ok(Some(self.read_record(&name)?))
+        Ok(Some(self.read_record_with_hook(&name, after_open)?))
     }
 
     /// Persist or resume. Holds ONLY the per-request lock across executor
@@ -464,7 +483,7 @@ impl ControllerStore {
         fault: ControllerFault,
     ) -> Result<ControllerAck, WorkerError> {
         let _per_request = self.lock_request(request.request_id())?;
-        let result = if let Some(existing) = self.load(request.request_id())? {
+        let result = if let Some(existing) = self.load_locked(request.request_id(), || {})? {
             check_replay(&existing, request)?;
             self.drive_to_ack(existing, executor, fault, 0)
         } else {
@@ -487,9 +506,12 @@ impl ControllerStore {
             // Preparation and replay-identity failures return before this point.
             // A saved success still needs recovery if ACK/receipt cleanup fails.
             // An unreadable row cannot prove a definitive rejection either.
-            if self.load(request.request_id()).map_or(true, |row| {
-                row.is_some_and(|row| matches!(saved_rejection(row.result.as_ref()), Ok(None)))
-            }) {
+            if self
+                .load_locked(request.request_id(), || {})
+                .map_or(true, |row| {
+                    row.is_some_and(|row| matches!(saved_rejection(row.result.as_ref()), Ok(None)))
+                })
+            {
                 WorkerError::ControllerResumable(Box::new(error))
             } else {
                 error
@@ -552,7 +574,7 @@ impl ControllerStore {
                     continue;
                 }
             };
-            let record = match self.load(&request_id) {
+            let record = match self.load_locked(&request_id, || {}) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     // Receipt without a row: publication never finished.
@@ -1088,9 +1110,17 @@ impl ControllerStore {
     }
 
     fn read_record(&self, name: &str) -> Result<DurableRequest, WorkerError> {
+        self.read_record_with_hook(name, || {})
+    }
+
+    fn read_record_with_hook(
+        &self,
+        name: &str,
+        after_open: impl FnOnce(),
+    ) -> Result<DurableRequest, WorkerError> {
         let bytes = self
             .root
-            .read_private_regular(name, MAX_STORED_REQUEST_BYTES as u64)
+            .read_private_regular_with_hook(name, MAX_STORED_REQUEST_BYTES as u64, after_open)
             .map_err(|error| op_io("read-row", name, error))?;
         ensure_stored_size(&bytes)?;
         let record: DurableRequest = serde_json::from_slice(&bytes).map_err(|_| {
@@ -1541,6 +1571,54 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn request_load_excludes_ack_replacement_while_its_record_is_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("controller");
+        let store = ControllerStore::open(&root).unwrap();
+        let peer = ControllerStore::open(&root).unwrap();
+        let request = submit_request(json!({}));
+        let prepare = FailingHandler {
+            prepare_fails: false,
+            terminal: false,
+        };
+        store
+            .handle_with(&request, &prepare, ControllerFault::StopAfterPublish)
+            .unwrap();
+        let published = store.load(request.request_id()).unwrap().unwrap();
+        let mut peer_acquired = false;
+
+        // A cooperative publisher can replace the opened inode only if this
+        // public read failed to retain the same request's authority lock.
+        let observed = store
+            .load_with_hook(request.request_id(), || {
+                if let Some(_lock) = peer.try_lock_request(request.request_id()).unwrap() {
+                    peer_acquired = true;
+                    peer.drive_to_ack(
+                        published.clone(),
+                        &FakeControllerExecutor,
+                        ControllerFault::None,
+                        0,
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(observed, published);
+        assert!(
+            !peer_acquired,
+            "ACK replacement must wait for the bound read"
+        );
+        let ack = peer.handle(&request, ControllerFault::None).unwrap();
+        assert_eq!(ack.status(), "acked");
+        assert_eq!(
+            store.load(request.request_id()).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
     }
 
     #[test]
