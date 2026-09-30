@@ -16,7 +16,7 @@ Cherry-picked onto starting base `69aa8a652633c9b1b708a180ca8e9b3a5e3730ab` (rel
 
 **Measured source HEAD** for CI and timings: `1c0bb51703c65587d25c658c046f236f671c6fab`.
 
-Addressed detail/log no longer fail because an unrelated sibling record is corrupt. That independence is intentional. Target corruption still fails. `list_tasks` / collection still scan and still fail on a corrupt sibling. Writer exclusion is preserved: the point read holds `StateLock`, the same lock `update_task` uses around replacement. Unlocked `load_task` is unchanged for nested callers.
+Addressed detail/log no longer fail because an unrelated sibling record is corrupt. That independence is intentional. Target corruption still fails. `list_tasks` / collection still scan and still fail on a corrupt sibling. Writer exclusion is preserved: the point read holds `StateLock`, the same lock `update_task` uses around replacement. Public `load_task` also takes `StateLock`; nested callers already holding it use `load_task_locked`.
 
 Snapshot safety kept: rooted no-follow reads, two full captures, `SNAPSHOT_CHANGED` on mismatch, Git still constructs objects. Cleanup is **best effort** (`let _ =` on scratch removal); this does not claim every failure path is now impossible.
 

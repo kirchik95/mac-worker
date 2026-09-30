@@ -395,7 +395,8 @@ fn prepare_result_reply(
     }
     // Local record identity must match the frozen original: the trusted
     // logical project/worktree resolved above must equal the record's own.
-    // Same fields, same saved snapshot load — no second load, no new locks.
+    // Same fields, same saved snapshot load — no second load. This point
+    // lookup takes StateLock to match task-record writers.
     if record.meta().project_id() != resolved.project_id {
         return Err(WorkerError::Protocol(
             "CONTROLLER_REQUEST_CONFLICT: local project does not match the frozen original".into(),

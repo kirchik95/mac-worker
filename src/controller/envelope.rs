@@ -325,7 +325,8 @@ fn prune_settled_from(
     Ok(())
 }
 
-/// Read-only lookup. Does not create a missing cache directory.
+/// Reads the cached envelope under the operations lock. Does not create a
+/// missing cache directory; the lock file may be created.
 pub fn load_operation_envelope(
     cache_root: &Path,
     request_id: &str,
