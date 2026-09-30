@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useControllerEvents } from '@/hooks/ControllerEventsContext'
 import { fetchTaskDetail, type TaskDetail, type TaskRow } from '@/lib/api'
 import { taskEventKey } from '@/lib/taskPresentation'
 export type TaskPreviews = Record<string, TaskDetail | null | undefined>
@@ -8,7 +9,10 @@ export function useTaskPreviews(tasks: TaskRow[], enabled = true): TaskPreviews 
     key: '',
     previews: {},
   })
-  const key = enabled ? tasks.map(taskEventKey).join(',') : ''
+  const events = useControllerEvents()
+  const key = enabled
+    ? tasks.map((task) => `${taskEventKey(task)}:${events.taskEpoch(task.task_id)}`).join(',')
+    : ''
   useEffect(() => {
     if (!key) return
     const ids = key.split(',').map((entry) => entry.split(':')[0])

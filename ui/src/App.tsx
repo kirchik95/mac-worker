@@ -10,6 +10,7 @@ import { Runs } from '@/views/Runs'
 import { Settings } from '@/views/Settings'
 import { TaskDetail } from '@/views/TaskDetail'
 import { Tasks } from '@/views/Tasks'
+import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
 import { useSnapshot } from '@/hooks/useSnapshot'
 import { useTaskPreviews } from '@/hooks/useTaskPreviews'
 import { useInputModality } from '@/hooks/useInputModality'
@@ -65,6 +66,14 @@ const VIEWS = [
 ] as const
 
 export default function App() {
+  return (
+    <ControllerEventsProvider>
+      <Dashboard />
+    </ControllerEventsProvider>
+  )
+}
+
+function Dashboard() {
   useInputModality()
   const { snapshot, error, offline, example } = useSnapshot()
   const [route, setRoute] = useState(currentRoute)

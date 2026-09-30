@@ -1,7 +1,8 @@
-import { StrictMode } from 'react'
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { type ReactNode, StrictMode } from 'react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
 import { MALICIOUS, originDelivery, task } from '@/test/fixtures'
 import { TaskDetail } from './TaskDetail'
 
@@ -784,4 +785,120 @@ it('keeps partial changes, reported checks and terminal commands accessible whil
   expect(screen.getByText('src/lib.rs')).toBeInTheDocument()
   expect(screen.getByText('Partial checks')).toBeInTheDocument()
   expect(screen.getByText('worker task fetch aaaa')).toBeInTheDocument()
+})
+
+class DetailSource {
+  readonly url: string
+  private listeners = new Map<string, Set<(event: Event) => void>>()
+
+  constructor(url: string) {
+    this.url = url
+  }
+
+  addEventListener(type: string, listener: (event: Event) => void) {
+    const set = this.listeners.get(type) ?? new Set()
+    set.add(listener)
+    this.listeners.set(type, set)
+  }
+
+  close() {}
+
+  emit(name: string, data: string, lastEventId = '') {
+    const event = new MessageEvent(name, { data, lastEventId })
+    this.listeners.get(name)?.forEach((listener) => listener(event))
+  }
+}
+
+describe('task detail follows invalidation', () => {
+  const taskId = 'a'.repeat(32)
+  const journal = '614dc3be-668f-4922-bd31-b1d7a0056790'
+
+  function renderDetail(node: ReactNode = <TaskDetail taskId={taskId} />) {
+    const sources: DetailSource[] = []
+    const makeSource = (url: string) => {
+      const source = new DetailSource(url)
+      sources.push(source)
+      return source as unknown as EventSource
+    }
+    const view = render(
+      <ControllerEventsProvider makeSource={makeSource}>{node}</ControllerEventsProvider>,
+    )
+    return { ...view, sources }
+  }
+
+  function finished(seq: string, outcome = 'needs_input') {
+    return {
+      name: 'controller.event',
+      data: JSON.stringify({
+        schema_version: 1,
+        journal_id: journal,
+        seq,
+        time_millis: 12,
+        kind: 'turn.finished',
+        data: { task_id: taskId, outcome },
+      }),
+      id: `${journal}:${seq}`,
+    }
+  }
+
+  it('draft_preserved_on_refresh', async () => {
+    const payloads = [
+      reviewable({ summary: 'Before refresh' }),
+      reviewable({ summary: 'After refresh' }),
+    ]
+    let calls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(jsonResponse(payloads[Math.min(calls++, payloads.length - 1)])),
+      ),
+    )
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { sources } = renderDetail()
+    expect(await screen.findByText('Before refresh')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Follow-up'), { target: { value: 'please add tests' } })
+
+    const frame = finished('11', 'imaginary_outcome')
+    await act(async () => {
+      sources[0].emit(frame.name, frame.data, frame.id)
+      await vi.advanceTimersByTimeAsync(100)
+    })
+
+    expect(await screen.findByText('After refresh')).toBeInTheDocument()
+    expect(screen.getByLabelText('Follow-up')).toHaveValue('please add tests')
+    expect(screen.queryByText('imaginary_outcome')).not.toBeInTheDocument()
+  })
+
+  it('stale_detail_or_questions_does_not_overwrite', async () => {
+    const first = deferred<ReturnType<typeof jsonResponse>>()
+    const second = deferred<ReturnType<typeof jsonResponse>>()
+    const pending = [first, second]
+    let calls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => pending[Math.min(calls++, pending.length - 1)].promise),
+    )
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { sources } = renderDetail()
+    await waitFor(() => expect(calls).toBe(1))
+
+    const frame = finished('12')
+    await act(async () => {
+      sources[0].emit(frame.name, frame.data, frame.id)
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    expect(calls).toBe(1)
+
+    await act(async () => {
+      first.resolve(jsonResponse(detail({ summary: 'Stale detail' })))
+    })
+    expect(screen.queryByText('Stale detail')).not.toBeInTheDocument()
+
+    await waitFor(() => expect(calls).toBe(2))
+    await act(async () => {
+      second.resolve(jsonResponse(detail({ summary: 'Fresh detail' })))
+    })
+    expect(await screen.findByText('Fresh detail')).toBeInTheDocument()
+    expect(screen.queryByText('Stale detail')).not.toBeInTheDocument()
+  })
 })

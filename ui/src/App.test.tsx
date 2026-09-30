@@ -1,7 +1,13 @@
+import { type ReactNode } from 'react'
 import { render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
+import { useAttentionQuestions } from '@/hooks/useAttentionQuestions'
+import { useSnapshot } from '@/hooks/useSnapshot'
+import { useTaskPreviews } from '@/hooks/useTaskPreviews'
 import { snapshot, task, worker } from '@/test/fixtures'
+import { TaskDetail } from '@/views/TaskDetail'
 import App, { documentTitle, parseTaskHash } from './App'
 
 afterEach(() => {
@@ -181,5 +187,104 @@ describe('deep links', () => {
     render(<App />)
     expect(await screen.findByText('That task link is not valid.')).toBeInTheDocument()
     expect(screen.getByText('Repair login')).toBeInTheDocument()
+  })
+})
+
+describe('shared event stream', () => {
+  const taskId = 'a'.repeat(32)
+
+  it('one_source_for_many_hooks', async () => {
+    const urls: string[] = []
+    vi.stubGlobal(
+      'EventSource',
+      class {
+        constructor(url: string) {
+          urls.push(url)
+        }
+        addEventListener() {}
+        removeEventListener() {}
+        close() {}
+      },
+    )
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) => {
+        if (String(url).includes('/api/v1/snapshot')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () =>
+              snapshot({
+                tasks: [
+                  task({
+                    task_id: taskId,
+                    state: 'open',
+                    review_state: 'waiting_on_you',
+                    last_outcome: { kind: 'needs_input' },
+                  }),
+                ],
+              }),
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            task: task({
+              task_id: taskId,
+              state: 'open',
+              review_state: 'waiting_on_you',
+              last_outcome: { kind: 'needs_input' },
+            }),
+            project_id: 'p',
+            worktree_id: 'w',
+            base_oid: null,
+            head_oid: null,
+            session_present: false,
+            summary: 'Loaded',
+            questions: ['What next?'],
+            files_changed: [],
+            diff_stat: null,
+            fetch_command: 'worker task fetch',
+            review_state: 'waiting_on_you',
+            close_policy: 'done',
+            reported_checks: [],
+            fetched_head: null,
+            fetched_ref: null,
+            review_commands: [],
+            turns: [],
+            timeline: [],
+          }),
+        })
+      }),
+    )
+
+    function Many({ children }: { children?: ReactNode }) {
+      useSnapshot()
+      useAttentionQuestions([taskId])
+      useTaskPreviews([
+        task({
+          task_id: taskId,
+          state: 'open',
+          review_state: 'waiting_on_you',
+          last_outcome: { kind: 'needs_input' },
+        }),
+      ])
+      return (
+        <>
+          {children}
+          <TaskDetail taskId={taskId} />
+        </>
+      )
+    }
+
+    render(
+      <ControllerEventsProvider>
+        <Many />
+      </ControllerEventsProvider>,
+    )
+    expect(await screen.findByText('Loaded')).toBeInTheDocument()
+    expect(urls).toHaveLength(1)
+    expect(urls[0]).toContain('/api/v1/events')
   })
 })

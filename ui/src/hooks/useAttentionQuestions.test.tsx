@@ -1,6 +1,8 @@
+import { type ReactNode } from 'react'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
 import { useAttentionQuestions } from './useAttentionQuestions'
 
 function deferred<T>() {
@@ -22,7 +24,10 @@ function taskIdFrom(url: string) {
   return decodeURIComponent(path.slice(path.lastIndexOf('/') + 1))
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
 
 describe('useAttentionQuestions', () => {
   it('loads more than six waiting ids with at most six active fetches', async () => {
@@ -149,5 +154,147 @@ describe('useAttentionQuestions', () => {
     expect(result.current[first[0]]).toBeUndefined()
     expect(requested.filter((id) => id.startsWith('old-'))).toEqual(first.slice(0, 6))
     expect(requested.filter((id) => id.startsWith('new-'))).toHaveLength(6)
+  })
+
+  it('six_fetch_cap', async () => {
+    const ids = Array.from({ length: 8 }, (_, index) => `cap-${index + 1}`)
+    let active = 0
+    let maximumActive = 0
+    const pending = deferred<ReturnType<typeof ok>>()
+    const fetchMock = vi.fn(() => {
+      active += 1
+      maximumActive = Math.max(maximumActive, active)
+      return pending.promise.finally(() => {
+        active -= 1
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderHook(() => useAttentionQuestions(ids))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(6))
+    expect(maximumActive).toBe(6)
+    expect(fetchMock).toHaveBeenCalledTimes(6)
+  })
+})
+
+class QuestionSource {
+  readonly url: string
+  private listeners = new Map<string, Set<(event: Event) => void>>()
+
+  constructor(url: string) {
+    this.url = url
+  }
+
+  addEventListener(type: string, listener: (event: Event) => void) {
+    const set = this.listeners.get(type) ?? new Set()
+    set.add(listener)
+    this.listeners.set(type, set)
+  }
+
+  close() {}
+
+  emit(name: string, data: string, lastEventId = '') {
+    const event = new MessageEvent(name, { data, lastEventId })
+    this.listeners.get(name)?.forEach((listener) => listener(event))
+  }
+}
+
+describe('attention questions follow task revisions', () => {
+  const taskId = 'a'.repeat(32)
+  const journal = '614dc3be-668f-4922-bd31-b1d7a0056790'
+
+  function mount(ids: string[]) {
+    const sources: QuestionSource[] = []
+    const makeSource = (url: string) => {
+      const source = new QuestionSource(url)
+      sources.push(source)
+      return source as unknown as EventSource
+    }
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <ControllerEventsProvider makeSource={makeSource}>{children}</ControllerEventsProvider>
+    )
+    const view = renderHook(() => useAttentionQuestions(ids), { wrapper })
+    return { ...view, sources }
+  }
+
+  it('same_waiting_ids_new_turn_refetches', async () => {
+    const responses = [ok([{ text: 'first question' }]), ok([{ text: 'new turn question' }])]
+    let calls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(responses[Math.min(calls++, responses.length - 1)])),
+    )
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { result, sources } = mount([taskId])
+    await waitFor(() =>
+      expect(result.current[taskId]?.[0]).toMatchObject({ text: 'first question' }),
+    )
+
+    await act(async () => {
+      sources[0].emit(
+        'controller.event',
+        JSON.stringify({
+          schema_version: 1,
+          journal_id: journal,
+          seq: '9',
+          time_millis: 10,
+          kind: 'turn.finished',
+          data: { task_id: taskId, turn_id: 'b'.repeat(32), outcome: 'needs_input' },
+        }),
+        `${journal}:9`,
+      )
+      await vi.advanceTimersByTimeAsync(100)
+    })
+
+    await waitFor(() =>
+      expect(result.current[taskId]?.[0]).toMatchObject({ text: 'new turn question' }),
+    )
+    expect(calls).toBe(2)
+  })
+
+  it('stale_detail_or_questions_does_not_overwrite', async () => {
+    const first = deferred<ReturnType<typeof ok>>()
+    const second = deferred<ReturnType<typeof ok>>()
+    const pending = [first, second]
+    let calls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => pending[Math.min(calls++, pending.length - 1)].promise),
+    )
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { result, sources } = mount([taskId])
+    await waitFor(() => expect(calls).toBe(1))
+
+    await act(async () => {
+      sources[0].emit(
+        'controller.event',
+        JSON.stringify({
+          schema_version: 1,
+          journal_id: journal,
+          seq: '10',
+          time_millis: 11,
+          kind: 'turn.outcome_changed',
+          data: { task_id: taskId, outcome: 'imaginary_outcome' },
+        }),
+        `${journal}:10`,
+      )
+      await vi.advanceTimersByTimeAsync(100)
+    })
+    expect(calls).toBe(2)
+
+    await act(async () => {
+      first.resolve(ok([{ text: 'stale question' }]))
+    })
+    expect(result.current[taskId]).toBeUndefined()
+    expect(JSON.stringify(result.current)).not.toContain('imaginary_outcome')
+
+    await act(async () => {
+      second.resolve(ok([{ text: 'fresh question' }]))
+    })
+    await waitFor(() =>
+      expect(result.current[taskId]?.[0]).toMatchObject({ text: 'fresh question' }),
+    )
+    expect(JSON.stringify(result.current)).not.toContain('stale question')
+    expect(JSON.stringify(result.current)).not.toContain('imaginary_outcome')
   })
 })

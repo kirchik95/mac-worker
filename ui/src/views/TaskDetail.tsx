@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
+import { useControllerEvents } from '@/hooks/ControllerEventsContext'
 import { CommandList } from '@/components/CommandList'
 import { DeliveryChip } from '@/components/DeliveryChip'
 import { Icon, type IconName } from '@/components/Icon'
@@ -25,8 +26,7 @@ import {
   type TaskMutation,
   type TurnRow,
 } from '@/lib/api'
-
-const POLL_INTERVAL_MS = 2000
+import { FALLBACK_POLL_MS, HEALTHY_ANTI_ENTROPY_MS } from '@/lib/controllerEvents'
 
 function fileIcon(path: string): IconName {
   if (/(^|\/)(tests?|spec)\//.test(path) || /\.(test|spec)\./.test(path)) return 'fileCheck'
@@ -152,15 +152,24 @@ export function TaskDetail({
   const detailEpoch = useRef(0)
   const pollController = useRef<AbortController | null>(null)
   const resumePoll = useRef<() => void>(() => {})
+  const kickRef = useRef<(count: number) => void>(() => {})
+  const rescheduleRef = useRef<() => void>(() => {})
+  const events = useControllerEvents()
+  const taskRevision = events.taskEpoch(taskId)
+  const healthyRef = useRef(events.healthy)
+  const detailFailed = useRef(false)
 
   useEffect(() => {
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
+    let active = false
+    let queued = 0
     mutationGeneration.current += 1
     mutationController.current?.abort()
     mutationController.current = null
     mutationInFlight.current = false
     detailEpoch.current += 1
+    detailFailed.current = false
     pollController.current?.abort()
     pollController.current = null
     setDetail(null)
@@ -171,20 +180,39 @@ export function TaskDetail({
     setAction(null)
     setOpenTurn(null)
 
+    const delay = () =>
+      healthyRef.current && !detailFailed.current ? HEALTHY_ANTI_ENTROPY_MS : FALLBACK_POLL_MS
+
     const schedule = () => {
       if (cancelled || timer !== null) return
       timer = setTimeout(() => {
         timer = null
-        void poll()
-      }, POLL_INTERVAL_MS)
+        enqueue(1)
+      }, delay())
     }
 
-    const poll = async () => {
-      if (cancelled) return
+    const enqueue = (count: number) => {
+      if (cancelled || count <= 0) return
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
       if (mutationInFlight.current) {
         schedule()
         return
       }
+      queued += count
+      if (!active) void poll()
+    }
+
+    const poll = async () => {
+      if (cancelled || active) return
+      if (mutationInFlight.current) {
+        schedule()
+        return
+      }
+      active = true
+      if (queued > 0) queued -= 1
       pollController.current?.abort()
       const controller = new AbortController()
       pollController.current = controller
@@ -197,22 +225,41 @@ export function TaskDetail({
           detailEpoch.current === epoch &&
           !mutationInFlight.current
         ) {
+          detailFailed.current = false
           setDetail(payload)
           setError(null)
         }
       } catch (cause) {
         if (!cancelled && !controller.signal.aborted && detailEpoch.current === epoch) {
+          detailFailed.current = true
           setError(cause instanceof Error ? cause.message : String(cause))
         }
+      } finally {
+        active = false
       }
-      if (!cancelled && pollController.current === controller) schedule()
+      if (!cancelled && pollController.current === controller) {
+        if (queued > 0) void poll()
+        else schedule()
+      }
     }
 
+    kickRef.current = (count: number) => {
+      detailEpoch.current += 1
+      enqueue(count)
+    }
+    rescheduleRef.current = () => {
+      if (timer === null || active) return
+      clearTimeout(timer)
+      timer = null
+      schedule()
+    }
     resumePoll.current = schedule
-    void poll()
+    enqueue(1)
     return () => {
       cancelled = true
       resumePoll.current = () => {}
+      kickRef.current = () => {}
+      rescheduleRef.current = () => {}
       pollController.current?.abort()
       pollController.current = null
       mutationController.current?.abort()
@@ -220,6 +267,29 @@ export function TaskDetail({
       if (timer !== null) clearTimeout(timer)
     }
   }, [taskId])
+
+  const seenTask = useRef(taskId)
+  const seenRevision = useRef(taskRevision)
+  useEffect(() => {
+    if (seenTask.current !== taskId) {
+      seenTask.current = taskId
+      seenRevision.current = taskRevision
+      return
+    }
+    if (taskRevision === seenRevision.current) return
+    const delta = taskRevision - seenRevision.current
+    seenRevision.current = taskRevision
+    if (delta > 0) kickRef.current(delta)
+  }, [taskId, taskRevision])
+
+  const healthy = events.healthy
+  const seenHealthy = useRef(healthy)
+  useEffect(() => {
+    healthyRef.current = healthy
+    if (seenHealthy.current === healthy) return
+    seenHealthy.current = healthy
+    rescheduleRef.current()
+  }, [healthy])
 
   const runMutation = async (kind: 'reply' | 'accept', message?: string) => {
     if (!detail || mutationInFlight.current) return
