@@ -319,6 +319,37 @@ fn pending_skips_unreadable_envelopes_and_reports_them_without_private_details()
 }
 
 #[test]
+fn pending_rejects_duplicate_envelope_fields_like_explicit_retry() {
+    let fixture = Fixture::new(true);
+    let cache = fixture.paths.controller_cache_root();
+    persist_operation_envelope(&cache, &request()).unwrap();
+    let path = cache.join(format!("op-{ID}.json"));
+    let original = fs::read_to_string(&path).unwrap();
+    for (field, value) in [
+        ("request_id", json!(ID)),
+        ("settled_at_millis", Value::Null),
+        ("outcome", Value::Null),
+    ] {
+        let duplicate = format!("{},\"{field}\":{value}}}", &original[..original.len() - 1]);
+        fs::write(&path, &duplicate).unwrap();
+        let (exit, stdout, stderr) =
+            fixture.run(&["controller", "pending", "--json"], &NoTransport);
+        assert_eq!(exit, 0, "{stderr}");
+        assert_eq!(stderr, "1 saved controller requests could not be read\n");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["pending"], json!([]));
+        assert_eq!(
+            report["unreadable"],
+            json!([{"request_id": ID, "code": "CONTROLLER_TRANSPORT"}])
+        );
+        let (exit, _, stderr) = fixture.run(&["controller", "retry", ID], &NoTransport);
+        assert_ne!(exit, 0);
+        assert!(stderr.contains("CONTROLLER_TRANSPORT"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), duplicate);
+    }
+}
+
+#[test]
 fn retry_reconstructs_frozen_frame_settles_and_prints_ack_result() {
     let fixture = Fixture::new(true);
     persist_operation_envelope(&fixture.paths.controller_cache_root(), &request()).unwrap();

@@ -346,12 +346,13 @@ fn load_pending_envelope(
     let bytes = root
         .read_private_regular(name, MAX_ENVELOPE_BYTES)
         .map_err(store_io)?;
+    // Validate the original bytes: Value would erase duplicate identity or
+    // settlement fields before the typed decoder can reject them.
+    let envelope = decode_envelope(name, &bytes)?;
     let invalid =
         |_| WorkerError::Protocol("CONTROLLER_TRANSPORT: operation envelope is invalid".into());
     let value: Value = serde_json::from_slice(&bytes).map_err(invalid)?;
     let legacy = value.get("settled_at_millis").is_none() && value.get("outcome").is_none();
-    let envelope = serde_json::from_value(value).map_err(invalid)?;
-    validate_envelope(name, &envelope)?;
     Ok((envelope, legacy))
 }
 
