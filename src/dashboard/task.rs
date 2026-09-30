@@ -164,6 +164,39 @@ impl DashboardTaskSource for MacWorkerTaskSource {
     }
 }
 
+/// Project saved records only. The event fast path deliberately has no remote
+/// reader argument, so it cannot inherit the full collector's SSH overlay.
+pub(crate) fn project_local_tasks(
+    config: &Config,
+    state: &ClientStateStore,
+) -> Result<DashboardTaskCollection, DashboardError> {
+    let records = state.list_tasks().map_err(map_local_error)?;
+    let runs = state.list_runs().map_err(map_local_error)?;
+    let blocking_codes = state.task_blocking_codes(config).map_err(map_local_error)?;
+    let runner_states = records
+        .iter()
+        .map(|record| {
+            let task_id = record.meta().task_id();
+            state
+                .runner_liveness(task_id)
+                .map(|runner| (task_id, runner))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(map_local_error)?;
+    let projection = project_task_list_with_blocking_codes(
+        &records,
+        &runs,
+        &runner_states,
+        &HashMap::new(),
+        &blocking_codes,
+    )
+    .map_err(map_task_view_error)?;
+    Ok(DashboardTaskCollection {
+        projection,
+        errors: Vec::new(),
+    })
+}
+
 pub(crate) fn collect_task_projection(
     config: &Config,
     state: &ClientStateStore,

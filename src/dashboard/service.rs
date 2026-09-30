@@ -182,6 +182,11 @@ pub trait DashboardDataSource: Send + Sync + 'static {
         Ok(DashboardTaskCollection::empty())
     }
 
+    /// Saved task/run projection only; this path must never contact workers.
+    fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
+        Ok(DashboardTaskCollection::empty())
+    }
+
     /// Refresh cached agent facts on a reachable worker. The dashboard
     /// collector calls this off the snapshot path so a slow refresh cannot
     /// shrink the collection deadline. Default is a no-op so read-only
@@ -225,6 +230,8 @@ pub struct DashboardService<S, C, M> {
     completed: Mutex<Option<Arc<DashboardSnapshot>>>,
     last_failure: Mutex<Option<DashboardError>>,
     revision: AtomicU64,
+    local_generation: AtomicU64,
+    publications: tokio::sync::broadcast::Sender<u64>,
     refresh: Mutex<RefreshState>,
     facts_refresh: Arc<Mutex<FactsRefreshTracker>>,
     probe_records: Mutex<HashMap<String, WorkerProbeRecord>>,
@@ -365,6 +372,8 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             completed: Mutex::new(None),
             last_failure: Mutex::new(None),
             revision: AtomicU64::new(0),
+            local_generation: AtomicU64::new(0),
+            publications: tokio::sync::broadcast::channel(256).0,
             refresh: Mutex::new(RefreshState {
                 next_generation: 1,
                 in_flight: None,
@@ -414,6 +423,97 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 Ok(snapshot)
             }
         }
+    }
+
+    pub fn refresh_local_projection(&self) -> Result<u64, DashboardError> {
+        // Do all record reads outside the publication lock. In particular this
+        // does not share the collector flight or any worker/SSH deadline.
+        let tasks = self.source.local_task_projection()?;
+        let queue = self.source.queue_entries()?;
+        let now_millis = self.clock.now_millis();
+        let mut completed = lock_recover(&self.completed);
+        let mut snapshot = completed
+            .as_ref()
+            .map(|value| value.as_ref().clone())
+            .unwrap_or_else(|| DashboardSnapshot {
+                api_version: DASHBOARD_API_VERSION,
+                revision: 0,
+                generated_at_millis: now_millis,
+                collection: CollectionSummary {
+                    freshness: Freshness::Current,
+                    errors: Vec::new(),
+                },
+                project_defaults: self.source.project_defaults(),
+                task_view: TaskListProjection::empty(),
+                workers: Vec::new(),
+                queue: Vec::new(),
+                active_jobs: Vec::new(),
+                recent_jobs: Vec::new(),
+                laptop: None,
+            });
+        let generation = self
+            .local_generation
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| {
+                DashboardError::new(
+                    "DASHBOARD_REVISION_OVERFLOW",
+                    "dashboard local generation exceeds u64",
+                )
+            })?;
+        snapshot.task_view = tasks.projection;
+        snapshot.queue = queue;
+        for error in tasks.errors {
+            push_error(&mut snapshot.collection.errors, error);
+        }
+        snapshot.generated_at_millis = now_millis;
+        refresh_agent_facts_freshness(&mut snapshot.workers, now_millis);
+        enrich_active_tasks(&mut snapshot.workers, &snapshot.task_view);
+        snapshot.revision = self.next_revision()?;
+        let revision = snapshot.revision;
+        *completed = Some(Arc::new(snapshot));
+        self.local_generation.store(generation, Ordering::SeqCst);
+        // Receivers can only observe this control once the completed cache is
+        // installed; readers use the same lock to see it.
+        let _ = self.publications.send(revision);
+        Ok(revision)
+    }
+
+    pub fn subscribe_publications(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.publications.subscribe()
+    }
+
+    fn publish_full_snapshot(
+        &self,
+        mut snapshot: DashboardSnapshot,
+        local_generation: u64,
+    ) -> Result<Arc<DashboardSnapshot>, DashboardError> {
+        let mut completed = lock_recover(&self.completed);
+        if self.local_generation.load(Ordering::SeqCst) != local_generation
+            && let Some(current) = completed.as_ref()
+        {
+            snapshot.task_view = current.task_view.clone();
+            snapshot.queue = current.queue.clone();
+            // Worker collection is independently stamped and remains useful
+            // even when the task part of this collection lost its fence.
+            for worker in &mut snapshot.workers {
+                if let Some(cached) = current
+                    .workers
+                    .iter()
+                    .find(|cached| cached.name == worker.name)
+                    && cached.observed_at_millis > worker.observed_at_millis
+                {
+                    *worker = cached.clone();
+                }
+            }
+            enrich_active_tasks(&mut snapshot.workers, &snapshot.task_view);
+        }
+        snapshot.revision = self.next_revision()?;
+        let snapshot = Arc::new(snapshot);
+        *completed = Some(Arc::clone(&snapshot));
+        *lock_recover(&self.last_failure) = None;
+        let _ = self.publications.send(snapshot.revision);
+        Ok(snapshot)
     }
 
     pub fn start_background_collection(
@@ -493,17 +593,15 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         &self,
         flight: Arc<RefreshFlight>,
     ) -> Result<Arc<DashboardSnapshot>, DashboardError> {
+        let local_generation = self.local_generation.load(Ordering::SeqCst);
         let result = catch_unwind(AssertUnwindSafe(|| {
             let deadline = absolute_deadline(&self.monotonic, self.deadlines.global)?;
-            self.collect_snapshot(deadline)
+            let snapshot = self.collect_snapshot(deadline)?;
+            self.publish_full_snapshot(snapshot, local_generation)
         }))
-        .unwrap_or_else(|_| Err(refresh_aborted_error()))
-        .map(Arc::new);
+        .unwrap_or_else(|_| Err(refresh_aborted_error()));
 
-        if let Ok(snapshot) = &result {
-            *lock_recover(&self.completed) = Some(Arc::clone(snapshot));
-            *lock_recover(&self.last_failure) = None;
-        } else if let Err(error) = &result {
+        if let Err(error) = &result {
             *lock_recover(&self.last_failure) = Some(error.clone());
         }
         *lock_recover(&flight.result) = Some(result.clone());
@@ -572,10 +670,9 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
 
         let generated_at_millis = self.clock.now_millis();
         refresh_agent_facts_freshness(&mut workers, generated_at_millis);
-        let revision = self.next_revision()?;
         let mut snapshot = DashboardSnapshot {
             api_version: DASHBOARD_API_VERSION,
-            revision,
+            revision: 0,
             generated_at_millis,
             collection: CollectionSummary {
                 freshness: Freshness::Current,
@@ -1464,5 +1561,187 @@ mod tests {
 
         let subsequent = service.snapshot(Default::default()).unwrap();
         assert_eq!(subsequent.revision, leader_snapshot.revision + 1);
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use crate::{
+        dashboard::model::SystemSummary,
+        task::{BranchName, ClosePolicy, TaskId},
+        task_view::{ReviewState, TaskListRow},
+    };
+    use std::sync::{atomic::AtomicUsize, mpsc};
+
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now_millis(&self) -> u64 {
+            1_000
+        }
+    }
+    impl MonotonicClock for FixedClock {
+        fn now_millis(&self) -> u64 {
+            0
+        }
+    }
+
+    #[derive(Clone)]
+    struct Source {
+        local_version: Arc<AtomicU64>,
+        remote_calls: Arc<AtomicUsize>,
+        worker_stamp: Arc<AtomicU64>,
+        hold: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+    }
+    impl Source {
+        fn new() -> Self {
+            Self {
+                local_version: Arc::new(AtomicU64::new(1)),
+                remote_calls: Arc::new(AtomicUsize::new(0)),
+                worker_stamp: Arc::new(AtomicU64::new(100)),
+                hold: Arc::new(Mutex::new(None)),
+            }
+        }
+        fn projection(&self) -> DashboardTaskCollection {
+            let task_id = TaskId::new(uuid::Uuid::from_u128(1));
+            let mut projection = TaskListProjection::empty();
+            projection.tasks.push(TaskListRow {
+                task_id,
+                run_id: None,
+                run_position: None,
+                title: "fixture".into(),
+                agent: "codex".into(),
+                model: None,
+                effort: None,
+                permissions: None,
+                env_profile: None,
+                state: TaskState::Open,
+                blocking_code: None,
+                stage: None,
+                residual: None,
+                last_outcome: None,
+                worker: None,
+                branch: BranchName::for_task(task_id),
+                turn_count: 0,
+                runner: None,
+                freshness: TaskFreshness::Current,
+                created_at_millis: 1,
+                updated_at_millis: self.local_version.load(Ordering::SeqCst),
+                active_turn_id: None,
+                close_policy: ClosePolicy::Never,
+                review_state: ReviewState::NotReviewable,
+                delivery: None,
+                deliveries: Vec::new(),
+                publish_push: false,
+            });
+            projection.progress.total = 1;
+            projection.progress.open = 1;
+            DashboardTaskCollection {
+                projection,
+                errors: Vec::new(),
+            }
+        }
+    }
+    impl DashboardDataSource for Source {
+        fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
+            Ok(vec!["mini-1".into()])
+        }
+        fn collect_workers(&self, _: Duration) -> Vec<WorkerObservationResult> {
+            let stamp = self.worker_stamp.load(Ordering::SeqCst);
+            vec![WorkerObservationResult::Current(Observation {
+                observed_at_millis: stamp,
+                cpu_counters: None,
+                worker: DashboardWorker {
+                    name: "mini-1".into(),
+                    health: WorkerHealth::Ready,
+                    freshness: Freshness::Current,
+                    observed_at_millis: Some(stamp),
+                    hostname: Some(format!("worker-{stamp}")),
+                    agent_facts: None,
+                    herdr: None,
+                    slot: SlotSummary::idle(1),
+                    capabilities: Vec::new(),
+                    missing_capabilities: Vec::new(),
+                    system: SystemSummary {
+                        free_disk_bytes: Some(stamp),
+                        total_disk_bytes: None,
+                        memory_pressure: None,
+                        swap_used_bytes: None,
+                        cpu_busy_percent: None,
+                    },
+                    error: None,
+                    active_task: None,
+                },
+            })]
+        }
+        fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
+            Ok(Vec::new())
+        }
+        fn authoritative_active_jobs(
+            &self,
+            _: Duration,
+        ) -> Vec<Result<DashboardJob, DashboardError>> {
+            Vec::new()
+        }
+        fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
+            Ok(Vec::new())
+        }
+        fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
+            Ok(self.projection())
+        }
+        fn task_projection(&self, _: Duration) -> Result<DashboardTaskCollection, DashboardError> {
+            self.remote_calls.fetch_add(1, Ordering::SeqCst);
+            let projection = self.projection();
+            if let Some((started, release)) = lock_recover(&self.hold).take() {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(projection)
+        }
+    }
+
+    #[test]
+    fn a_late_full_collector_cannot_restore_older_local_tasks() {
+        let source = Source::new();
+        let service = Arc::new(DashboardService::new(
+            source.clone(),
+            FixedClock,
+            FixedClock,
+        ));
+        service.snapshot(Default::default()).unwrap();
+        source.worker_stamp.store(101, Ordering::SeqCst);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *lock_recover(&source.hold) = Some((started_tx, release_rx));
+        let collector = {
+            let service = Arc::clone(&service);
+            thread::spawn(move || service.snapshot(Default::default()).unwrap())
+        };
+        started_rx.recv().unwrap();
+        source.local_version.store(2, Ordering::SeqCst);
+        let local_result = service.refresh_local_projection();
+        release_tx.send(()).unwrap();
+        let full = collector.join().unwrap();
+        local_result.unwrap();
+        let visible = service.read_snapshot().unwrap();
+        assert_eq!(visible.task_view.tasks[0].updated_at_millis, 2);
+        assert_eq!(full.task_view.tasks[0].updated_at_millis, 2);
+        assert_eq!(visible.workers[0].system.free_disk_bytes, Some(101));
+        assert_eq!(visible.workers[0].hostname.as_deref(), Some("worker-101"));
+    }
+
+    #[test]
+    fn local_refresh_calls_no_remote_collector() {
+        let source = Source::new();
+        let service = DashboardService::new(source.clone(), FixedClock, FixedClock);
+        service.snapshot(Default::default()).unwrap();
+        source.remote_calls.store(0, Ordering::SeqCst);
+        source.local_version.store(2, Ordering::SeqCst);
+        service.refresh_local_projection().unwrap();
+        assert_eq!(
+            service.read_snapshot().unwrap().task_view.tasks[0].updated_at_millis,
+            2
+        );
+        assert_eq!(source.remote_calls.load(Ordering::SeqCst), 0);
     }
 }

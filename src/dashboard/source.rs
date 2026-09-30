@@ -22,7 +22,7 @@ use crate::{
             DashboardDataSource, DashboardQueueReader, DashboardTaskCollection,
             WorkerObservationResult,
         },
-        task::collect_task_projection,
+        task::{collect_task_projection, project_local_tasks},
         web::DashboardLogSource,
     },
     error::WorkerError,
@@ -355,6 +355,10 @@ impl DashboardDataSource for MacWorkerDashboardSource {
             self.remote.as_ref(),
             deadline,
         )
+    }
+
+    fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
+        project_local_tasks(&self.config, &self.local_jobs)
     }
 
     fn refresh_worker_facts(&self, worker_name: &str) -> Result<(), WorkerError> {
