@@ -961,7 +961,7 @@ fn run_dashboard_command(
         if controller_viewer {
             let (shutdown, heartbeat_lost) = viewer_shutdown_signal();
             let outcome = async_runtime.block_on(run_local_dashboard(
-                config, paths, runtime, request, shutdown, stdout, stderr,
+                config, paths, runtime, request, true, shutdown, stdout, stderr,
             ));
             if heartbeat_lost.load(std::sync::atomic::Ordering::SeqCst) {
                 write_viewer_heartbeat_lost(stderr);
@@ -987,6 +987,7 @@ fn run_dashboard_command(
             paths,
             runtime,
             request,
+            false,
             Box::pin(async {
                 let _ = tokio::signal::ctrl_c().await;
             }),
@@ -1239,18 +1240,21 @@ mod viewer_heartbeat_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_local_dashboard(
     config: std::sync::Arc<Config>,
     paths: PathLayout,
     runtime: &RuntimeContext,
     request: DashboardCommandRequest,
+    controller_viewer: bool,
     shutdown_signal: Pin<Box<dyn Future<Output = ()> + Send>>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), WorkerError> {
-    let client_state = std::sync::Arc::new(ClientStateStore::open(&paths.state)?);
+    let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+    let client_state = std::sync::Arc::new(client_state);
     let launch_directory = runtime.current_dir().ok();
-    let launcher = SystemDashboardLauncher::from_system_with_config(
+    let mut launcher = SystemDashboardLauncher::from_system_with_config(
         config,
         client_state,
         launch_directory.as_deref(),
@@ -1259,6 +1263,21 @@ async fn run_local_dashboard(
         },
         paths,
     );
+    let event_runtime = if controller_viewer && let Some(events) = &_events {
+        let source = crate::dashboard::events::LocalViewerEventSource::new(
+            events.journal(), events.runtime(), launcher.state.service.clone(),
+        );
+        launcher = launcher.with_events(source);
+        Some(events.runtime())
+    } else {
+        None
+    };
+    let shutdown_signal = Box::pin(async move {
+        shutdown_signal.await;
+        if let Some(runtime) = event_runtime {
+            runtime.cancel();
+        }
+    });
     let opener = SystemBrowserOpener;
     run_dashboard(request, &launcher, &opener, shutdown_signal, stdout, stderr).await?;
     Ok(())

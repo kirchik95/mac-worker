@@ -981,6 +981,198 @@ struct SseConnection {
     names: Vec<String>,
     closed: bool,
 }
+
+/// Actual dashboard command/launcher/stdin watcher, with private paths and an
+/// a local fake SSH executable, so no host or browser can be reached.
+struct ProcessViewerHarness {
+    _temporary: tempfile::TempDir,
+    paths: mac_worker::paths::PathLayout,
+    journal: Option<Arc<mac_worker::controller::events::journal::ControllerJournal>>,
+    child: std::process::Child,
+    address: SocketAddr,
+}
+
+impl ProcessViewerHarness {
+    fn start(initialized: bool, controller_viewer: bool) -> Self {
+        use std::{collections::BTreeMap, ffi::OsString, process::{Command, Stdio}};
+        use mac_worker::controller::{ControllerLeader, events::journal::{ControllerJournal, JournalOptions}};
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let environment = BTreeMap::from([
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (OsString::from("XDG_STATE_HOME"), root.join("state").into_os_string()),
+            (OsString::from("XDG_CONFIG_HOME"), root.join("config").into_os_string()),
+            (OsString::from("XDG_CACHE_HOME"), root.join("cache").into_os_string()),
+            (OsString::from("XDG_DATA_HOME"), root.join("data").into_os_string()),
+        ]);
+        for value in environment.values() {
+            crate::support::create_directory(std::path::PathBuf::from(value));
+        }
+        let paths = mac_worker::paths::PathLayout::discover(None, &environment, &home).unwrap();
+        crate::support::create_directory(paths.config.parent().unwrap());
+        std::fs::write(&paths.config, "version = 1\n[controller]\nenabled = false\n[notifications]\nherdr = false\n[[workers]]\nname = \"fixture\"\nssh = \"fake-viewer-worker\"\nslots = 1\n").unwrap();
+        let fake_ssh = root.join("fake-ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\n# Local viewer fixture: no network or child processes.\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        mac_worker::client_state::ClientStateStore::open(&paths.state).unwrap();
+        let journal = initialized.then(|| {
+            let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+            ControllerJournal::initialize_for_leader(&paths, &leader, JournalOptions { runtime: Arc::new(ManualEventRuntime::new()) }).unwrap()
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+        command.envs(environment).current_dir(&root)
+            .env("MAC_WORKER_TEST_SSH", fake_ssh)
+            .env("MAC_WORKER_TEST_VIEWER_HEARTBEAT_MS", "0")
+            .args(["dashboard", "--no-open", "--no-facts-refresh"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if controller_viewer { command.arg("--controller-viewer"); }
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sent, received) = mpsc::channel();
+        thread::spawn(move || {
+            let mut url = String::new();
+            BufReader::new(stdout).read_line(&mut url).unwrap();
+            let _ = sent.send(url);
+        });
+        let url = received.recv_timeout(crate::support::HANDSHAKE_TIMEOUT).unwrap();
+        if !url.starts_with("http://") {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+            panic!("viewer failed to announce its loopback URL: {url:?} {stderr}");
+        }
+        let address = url.trim().trim_start_matches("http://").trim_end_matches('/').parse().unwrap();
+        Self { _temporary: temporary, paths, journal, child, address }
+    }
+
+    fn request(&self, path: &str) -> String {
+        let mut socket = TcpStream::connect(self.address).unwrap();
+        socket.set_read_timeout(Some(crate::support::HANDSHAKE_TIMEOUT)).unwrap();
+        write!(socket, "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", self.address).unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn subscribe(&self) -> SseConnection {
+        let stream = SseConnection::open(self.address, None);
+        stream.socket.get_ref().set_read_timeout(Some(crate::support::HANDSHAKE_TIMEOUT)).unwrap();
+        stream
+    }
+
+    fn finish(&mut self, timeout: bool) -> std::process::Output {
+        if timeout {
+            // The existing debug watcher injection makes the next heartbeat
+            // deadline expired immediately, without sleeping or elapsed bounds.
+            self.child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        } else {
+            self.child.stdin.take();
+        }
+        let status = self.child.wait().unwrap();
+        let mut stderr = Vec::new();
+        self.child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+        std::process::Output { status, stdout: Vec::new(), stderr }
+    }
+}
+
+impl Drop for ProcessViewerHarness {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn actual_controller_viewer_serves_initialized_journal_and_cache_publications() {
+    let mut viewer = ProcessViewerHarness::start(true, true);
+    let mut stream = viewer.subscribe();
+    loop {
+        let frame = stream.next_frame().unwrap();
+        if frame.contains("event: ready") { break; }
+    }
+    viewer.journal.as_ref().unwrap().append(
+        EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: true }]).unwrap(),
+        Duration::from_secs(60),
+    ).unwrap();
+    let window = viewer.journal.as_ref().unwrap().window(Duration::MAX).unwrap();
+    let mut unavailable = false;
+    let mut reconnected = false;
+    loop {
+        let Some(frame) = stream.next_frame() else {
+            // A concurrent append may exhaust the reader's bounded lock
+            // admission. The explicit repair closes that stream; reconnect
+            // after the committed append must replay the retained cursor.
+            assert!(unavailable && !reconnected);
+            stream = SseConnection::open(viewer.address, Some(EventCursor { journal_id: window.journal_id, seq: Seq::ZERO }));
+            reconnected = true;
+            continue;
+        };
+        if frame.contains("event: snapshot_required") && frame.contains("unavailable") {
+            unavailable = true;
+        }
+        if frame.contains("event: controller.event") {
+            assert!(frame.contains("controller.drained"), "{frame}");
+            break;
+        }
+    }
+    loop {
+        let frame = stream.next_frame().unwrap();
+        if frame.contains("event: snapshot.ready") {
+            let data = frame.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+            let revision = serde_json::from_str::<serde_json::Value>(data).unwrap()["revision"].as_u64().unwrap();
+            let response = viewer.request("/api/v1/snapshot");
+            let body = response.split_once("\r\n\r\n").unwrap().1;
+            assert!(serde_json::from_str::<serde_json::Value>(body).unwrap()["revision"].as_u64().unwrap() >= revision);
+            break;
+        }
+    }
+    viewer.child.stdin.take();
+    while stream.next_frame().is_some() {}
+    assert!(stream.closed);
+    assert!(viewer.finish(false).status.success());
+}
+
+#[test]
+fn actual_laptop_local_and_uninitialized_viewer_have_no_sse_route() {
+    for (initialized, controller_viewer) in [(false, false), (false, true), (true, false)] {
+        let mut viewer = ProcessViewerHarness::start(initialized, controller_viewer);
+        assert!(viewer.request("/api/v1/events").starts_with("HTTP/1.1 404"));
+        if controller_viewer {
+            assert!(viewer.finish(false).status.success());
+        } else {
+            unsafe { libc::kill(viewer.child.id() as i32, libc::SIGINT); }
+            assert!(viewer.finish(false).status.success());
+        }
+        assert_eq!(viewer.paths.controller_state_root().join("events").exists(), initialized);
+    }
+}
+
+#[test]
+fn actual_viewer_heartbeat_eof_and_timeout_close_sse_before_join() {
+    for timeout in [false, true] {
+        let mut viewer = ProcessViewerHarness::start(true, true);
+        let mut stream = viewer.subscribe();
+        while !stream.next_frame().unwrap().contains("event: ready") {}
+        if timeout {
+            viewer.child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        } else {
+            viewer.child.stdin.take();
+        }
+        // Observe the TCP stream finish before any process/graceful join.
+        while stream.next_frame().is_some() {}
+        assert!(stream.closed);
+        let output = viewer.finish(false);
+        if timeout {
+            assert_eq!(output.status.code(), Some(75));
+            assert_eq!(output.stderr, b"DASHBOARD_VIEWER_HEARTBEAT_LOST\n");
+        } else {
+            assert!(output.status.success());
+        }
+    }
+}
 impl SseConnection {
     fn open(address: SocketAddr, after: Option<EventCursor>) -> Self {
         let path = after.map_or_else(
