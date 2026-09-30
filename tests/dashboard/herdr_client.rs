@@ -1,5 +1,4 @@
-#[path = "support/fake_herdr.rs"]
-mod fake_herdr;
+use crate::fake_herdr;
 
 use std::{
     ffi::OsString,
@@ -373,7 +372,7 @@ fn typed_calls_match_the_captured_herdr_schema() {
         )
         .unwrap();
 
-    let schema: Value = serde_json::from_str(include_str!("fixtures/herdr/schema-subset.json"))
+    let schema: Value = serde_json::from_str(include_str!("../fixtures/herdr/schema-subset.json"))
         .expect("schema fixture");
     let methods = schema["methods"].as_object().expect("methods");
     let requests = server.requests();

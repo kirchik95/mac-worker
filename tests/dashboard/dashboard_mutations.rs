@@ -1,8 +1,6 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
-#[path = "support/task_state.rs"]
-mod task_state_fixture;
+use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
 
 use std::{
@@ -252,7 +250,7 @@ fn open_done_record_for_project(
     project_id: String,
     worktree_id: String,
 ) -> LocalTaskRecord {
-    // Keep this fixture aligned with tests/task_review.rs so dashboard
+    // Keep this fixture aligned with tests/task/task_review.rs so dashboard
     // mutations exercise the same Open+done review record.
     let base_oid: mac_worker::task::BaseOid = "a".repeat(40).parse().unwrap();
     let meta = mac_worker::task::TaskMeta::new(mac_worker::task::TaskMetaInput {

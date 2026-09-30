@@ -1,5 +1,4 @@
-#[path = "support/fake_herdr.rs"]
-mod fake_herdr;
+use crate::fake_herdr;
 
 use std::{
     sync::{Arc, Mutex},
