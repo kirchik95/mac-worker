@@ -1,5 +1,4 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     collections::{BTreeMap, VecDeque},
