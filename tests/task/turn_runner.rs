@@ -7453,12 +7453,57 @@ fn contending_runner_stops_when_its_reservation_token_changes() {
     runner_parent_publication_contention(true);
 }
 
+#[derive(Default)]
+struct ExpireDeadlineAtJournalFence {
+    deadline: Mutex<Option<Instant>>,
+    contended: AtomicBool,
+}
+
+impl ClientStateConcurrencyHook for ExpireDeadlineAtJournalFence {
+    fn reach(&self, point: ClientStateConcurrencyPoint) {
+        if point == ClientStateConcurrencyPoint::RunnerLogContention
+            && !self.contended.swap(true, Ordering::SeqCst)
+        {
+            let deadline = self
+                .deadline
+                .lock()
+                .unwrap()
+                .expect("executor supplied budget");
+            // The child is already bound and the journal is actually held.
+            // Expire this caller's budget here, independent of startup speed.
+            let (_sender, receiver) = mpsc::channel::<()>();
+            assert_eq!(
+                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            assert!(Instant::now() >= deadline);
+        }
+    }
+}
+
 struct HoldJournalAfterSpawn {
     held: Mutex<Option<fs::File>>,
     starts: AtomicUsize,
+    fence: Arc<ExpireDeadlineAtJournalFence>,
 }
 
 impl RunnerExecutor for HoldJournalAfterSpawn {
+    fn start_with_slot_until(
+        &self,
+        paths: &mac_worker::paths::PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        _slot_token: Option<uuid::Uuid>,
+        deadline: Option<Instant>,
+    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+        assert!(
+            deadline.is_some_and(|deadline| deadline > Instant::now()),
+            "fixture must reach the executor before its wait budget expires"
+        );
+        *self.fence.deadline.lock().unwrap() = deadline;
+        self.start(paths, task_id, turn_id)
+    }
+
     fn start(
         &self,
         paths: &mac_worker::paths::PathLayout,
@@ -7494,9 +7539,13 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
         .unwrap()
         .owner_opt()
         .unwrap();
+    let fence = Arc::new(ExpireDeadlineAtJournalFence::default());
+    let state =
+        ClientStateStore::open_with_concurrency_hook(&fixture.paths.state, fence.clone()).unwrap();
     let executor = HoldJournalAfterSpawn {
         held: Mutex::new(None),
         starts: AtomicUsize::new(0),
+        fence: fence.clone(),
     };
     if !after_spawn {
         let file = fs::OpenOptions::new()
@@ -7525,7 +7574,7 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
         &fixture.runner,
         &fixture.config,
         &fixture.paths,
-        &fixture.state,
+        &state,
         selected,
     );
     thread::scope(|scope| {
@@ -7534,7 +7583,11 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             let started = Instant::now();
             let result = client.wait(
                 WaitSelector::Task(fixture.task_id),
-                Some(Duration::from_millis(150)),
+                Some(if after_spawn {
+                    crate::support::HANDSHAKE_TIMEOUT / 2
+                } else {
+                    Duration::from_millis(150)
+                }),
             );
             done_tx.send(started.elapsed()).unwrap();
             result
@@ -7565,6 +7618,10 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
     assert_eq!(entry.owner_opt(), Some(&owner));
     assert!(!entry.is_cancel_requested());
     if after_spawn {
+        assert!(
+            fence.contended.load(Ordering::SeqCst),
+            "wait must expire at the post-bind journal fence"
+        );
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
         assert_eq!(entry.slot_reservation().unwrap().child(), Some(owner));
         assert!(matches!(
