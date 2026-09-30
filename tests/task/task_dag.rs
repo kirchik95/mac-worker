@@ -633,11 +633,11 @@ fn dag_test_config() -> Config {
     .unwrap()
 }
 
-fn plant_bound_mini1_ready(state: &ClientStateStore) {
-    plant_bound_mini1_ready_with(state, vec!["darwin-arm64".into(), "agent:codex".into()]);
+fn plant_bound_mini1_ready(state: &ClientStateStore) -> u64 {
+    plant_bound_mini1_ready_with(state, vec!["darwin-arm64".into(), "agent:codex".into()])
 }
 
-fn plant_bound_mini1_ready_with(state: &ClientStateStore, capabilities: Vec<String>) {
+fn plant_bound_mini1_ready_with(state: &ClientStateStore, capabilities: Vec<String>) -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -664,6 +664,7 @@ fn plant_bound_mini1_ready_with(state: &ClientStateStore, capabilities: Vec<Stri
             ),
         )
         .unwrap();
+    now
 }
 
 /// Isolated DAG tests keep production `SystemProcessRunner` for Git and
@@ -989,6 +990,21 @@ fn prepared_frozen_dag() -> FrozenDagFixture {
     prepared_frozen_dag_inner(None)
 }
 
+fn prepared_frozen_dag_with_frozen_admission_clock() -> FrozenDagFixture {
+    let mut fixture = prepared_frozen_dag();
+    // Keep generic write faults aimed at task publication: an admission refresh
+    // must not consume BeforePublish merely because fixture setup took >2s.
+    let now = plant_bound_mini1_ready(&fixture.store);
+    fixture.store = Arc::new(
+        fixture
+            .store
+            .as_ref()
+            .clone()
+            .with_admission_clock(Arc::new(move || Ok(now))),
+    );
+    fixture
+}
+
 fn prepared_frozen_dag_inner(
     hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
 ) -> FrozenDagFixture {
@@ -1182,7 +1198,7 @@ fn recover_after_fault(point: ClientStateWritePoint, occupy: bool) {
         "recover_after_fault begin point={point:?} occupy={occupy} thread={:?}",
         thread::current().name()
     );
-    let fixture = prepared_frozen_dag();
+    let fixture = prepared_frozen_dag_with_frozen_admission_clock();
     if occupy {
         occupy_worker_slot(&fixture);
     }
@@ -1335,7 +1351,7 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
             elapsed.is_ok(),
             "same-process submit guard outlived wait deadline"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(3));
+        assert!(elapsed.unwrap() < crate::support::HANDSHAKE_TIMEOUT);
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
         assert_eq!(
             after, before,
@@ -2723,7 +2739,7 @@ fn local_wait_deadline_bounds_transfer_repository_lock() {
         drop(held);
         let result = waiter.join().unwrap();
         assert!(elapsed.is_ok(), "transfer lock outlived wait deadline");
-        assert!(elapsed.unwrap() < Duration::from_secs(3));
+        assert!(elapsed.unwrap() < crate::support::HANDSHAKE_TIMEOUT);
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(harness.store.load_run_dag(run_id).unwrap().unwrap(), dag);
