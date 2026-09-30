@@ -146,21 +146,35 @@ fn exec_direct(argv: &[OsString]) -> Result<(), WorkerError> {
 }
 
 fn record_then_exec_agent(argv: &[OsString]) -> Result<(), WorkerError> {
-    use crate::agent::identity::{VERSION_DEADLINE, observe_identity};
+    use crate::agent::identity::{observe_identity, observe_required_identity};
     let executable = resolve_executable(&argv[0])?;
-    let deadline = std::env::var("MAC_WORKER_LEASE_DEADLINE_MILLIS")
+    // Each observation has its own bound; the turn's lease only shortens it.
+    let remaining = std::env::var("MAC_WORKER_LEASE_DEADLINE_MILLIS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|end| Duration::from_millis(end.saturating_sub(unix_now_millis().unwrap_or(end))))
-        .unwrap_or(VERSION_DEADLINE)
-        .min(VERSION_DEADLINE);
-    let identity = observe_identity(&InheritProcessGroupRunner, &executable, deadline);
+        .unwrap_or(Duration::MAX);
+    // An OpenCode argv was built on the runner for one CLI generation, from
+    // facts that may be stale. Its launch depends on the version it is about
+    // to start, so it may wait longer for the answer.
+    let built_for = crate::agent::opencode_launch_dialect(argv);
+    let identity = if built_for.is_some() {
+        observe_required_identity(&InheritProcessGroupRunner, &executable, remaining)
+    } else {
+        observe_identity(&InheritProcessGroupRunner, &executable, remaining)
+    };
     // Identity is diagnostic: unavailable versions or storage must not stop
     // real work. On a probe bound, the runner reaps the direct probe child.
     // Exec closes the helper's capture FDs and discards its capture threads;
     // any remaining descendants stay in the recorded group for supervisor
     // cleanup after the agent exits or the turn is cancelled.
     let _ = persist_agent_identity(&identity);
+    // The one launch the version does stop: an OpenCode argv that does not
+    // fit the installed generation. v2 without `--standalone` would start a
+    // background service that the turn's process group cannot clean up.
+    if let Some(built_for) = built_for {
+        crate::agent::verify_opencode_launch(built_for, identity.version.as_deref())?;
+    }
     let mut resolved = argv.to_vec();
     resolved[0] = executable.into_os_string();
     exec_direct(&resolved)

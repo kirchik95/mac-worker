@@ -13,6 +13,10 @@ pub(crate) const IDENTITY_FILE: &str = "agent-identity.json";
 pub(crate) const STAGED_IDENTITY_FILE: &str = "mac-worker-agent-identity.json";
 pub(crate) const IDENTITY_MAX_BYTES: u64 = 8192;
 pub(crate) const VERSION_DEADLINE: Duration = Duration::from_secs(2);
+/// Bound for a launch whose argv depends on the version. It waits longer
+/// than the diagnostic probe so a slow host is not mistaken for an unknown
+/// agent.
+pub(crate) const REQUIRED_VERSION_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +86,20 @@ pub(crate) fn observe_identity(
     executable: &Path,
     deadline: Duration,
 ) -> AgentIdentity {
+    observe(runner, executable, deadline.min(VERSION_DEADLINE))
+}
+
+/// [`observe_identity`] for a launch that is checked against the version:
+/// the same probe under [`REQUIRED_VERSION_DEADLINE`].
+pub(crate) fn observe_required_identity(
+    runner: &dyn ProcessRunner,
+    executable: &Path,
+    deadline: Duration,
+) -> AgentIdentity {
+    observe(runner, executable, deadline.min(REQUIRED_VERSION_DEADLINE))
+}
+
+fn observe(runner: &dyn ProcessRunner, executable: &Path, deadline: Duration) -> AgentIdentity {
     let result = runner.run(&ProcessRequest {
         program: executable.into(),
         args: vec!["--version".into()],
@@ -91,7 +109,7 @@ pub(crate) fn observe_identity(
         policy: ProcessPolicy {
             stdout_limit: 4096,
             stderr_limit: 4096,
-            deadline: deadline.min(VERSION_DEADLINE),
+            deadline,
         },
         isolate_parent_environment: false,
     });
@@ -170,5 +188,38 @@ mod tests {
         );
         assert_eq!(identity.version_observation, VersionObservation::TimedOut);
         assert!(identity.version.is_none());
+    }
+
+    struct BoundRunner(std::sync::Mutex<Vec<Duration>>);
+    impl ProcessRunner for BoundRunner {
+        fn run(
+            &self,
+            request: &ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            assert_eq!(request.args, ["--version"]);
+            self.0.lock().unwrap().push(request.policy.deadline);
+            Err(ProcessError::DeadlineExceeded {
+                deadline: request.policy.deadline,
+            }
+            .into())
+        }
+    }
+
+    #[test]
+    fn a_required_version_waits_longer_than_a_diagnostic_one_and_never_past_the_turn() {
+        let runner = BoundRunner(std::sync::Mutex::new(Vec::new()));
+        let agent = Path::new("/resolved/agent");
+        let minute = Duration::from_secs(60);
+        let short = Duration::from_millis(500);
+        observe_identity(&runner, agent, minute);
+        observe_required_identity(&runner, agent, minute);
+        observe_identity(&runner, agent, short);
+        let last = observe_required_identity(&runner, agent, short);
+        assert_eq!(
+            *runner.0.lock().unwrap(),
+            [VERSION_DEADLINE, REQUIRED_VERSION_DEADLINE, short, short]
+        );
+        assert!(REQUIRED_VERSION_DEADLINE > VERSION_DEADLINE);
+        assert_eq!(last.version_observation, VersionObservation::TimedOut);
     }
 }

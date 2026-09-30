@@ -82,6 +82,12 @@ fn preparation_failure_outcome(dir: &RootedDir) -> Result<Option<TaskOutcome>, W
         "AGENT_EXECUTABLE_NOT_FOUND" => {
             "AGENT_EXECUTABLE_NOT_FOUND: check the agent PATH in the login shell and env profile"
         }
+        crate::agent::OPENCODE_DIALECT_MISMATCH => {
+            "OPENCODE_DIALECT_MISMATCH: the worker's OpenCode is not the generation this turn was built for, so it was not started; run `worker workers --refresh` and retry"
+        }
+        crate::agent::OPENCODE_VERSION_UNVERIFIED => {
+            "OPENCODE_VERSION_UNVERIFIED: `opencode --version` gave no version on the worker, so the turn was not started without --standalone; check OpenCode in the worker's login shell"
+        }
         _ => return Ok(None),
     };
     Ok(Some(TaskOutcome::failed(reason)))
@@ -2918,6 +2924,44 @@ mod tests {
         assert!(reason.contains("SETUP_INPUTS_CHANGED"), "{reason}");
         assert!(reason.contains("submit a new task"), "{reason}");
         assert!(!wire.to_string().contains("private helper detail"));
+    }
+
+    #[test]
+    fn refused_opencode_launch_reaches_the_public_task_outcome_with_a_hint() {
+        for (code, reason) in [
+            (
+                crate::agent::OPENCODE_DIALECT_MISMATCH,
+                "OPENCODE_DIALECT_MISMATCH: the worker's OpenCode is not the generation this turn was built for, so it was not started; run `worker workers --refresh` and retry",
+            ),
+            (
+                crate::agent::OPENCODE_VERSION_UNVERIFIED,
+                "OPENCODE_VERSION_UNVERIFIED: `opencode --version` gave no version on the worker, so the turn was not started without --standalone; check OpenCode in the worker's login shell",
+            ),
+        ] {
+            let fixture = publication_fixture(Some(""));
+            crate::project_readiness::write_setup_stage_result(
+                &fixture.turn_dir,
+                &WorkerError::task(code, "private helper detail"),
+            )
+            .unwrap();
+            // The helper exits with the setup-stage code before any agent
+            // ran, so no session is bound and nothing was printed.
+            invoke_publication(
+                &fixture,
+                TurnTerminal::Failed,
+                TerminalPath::ChildExit(78),
+                Some(78),
+            )
+            .unwrap();
+            let status = TaskStore::new(&fixture.store, &crate::process::SystemProcessRunner)
+                .load_status(PROJECT_ID, fixture.section.turn().task_id())
+                .unwrap();
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire["last_outcome"]["kind"], "failed", "{code}");
+            assert_eq!(wire["last_outcome"]["reason"], reason, "{code}");
+            assert_eq!(wire["turns"][0]["terminal"], "failed", "{code}");
+            assert!(!wire.to_string().contains("private helper detail"));
+        }
     }
 
     fn codex_result_record(summary: &str) -> String {
