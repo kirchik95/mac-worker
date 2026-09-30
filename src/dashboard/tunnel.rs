@@ -52,6 +52,8 @@ impl DashboardTunnelTimings {
     }
 
     pub(crate) fn resolved() -> Self {
+        // Only debug builds apply test overrides, so release never mutates.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut timings = Self::production();
         #[cfg(debug_assertions)]
         apply_debug_timing_overrides(&mut timings);
