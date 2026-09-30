@@ -1301,6 +1301,10 @@ mod runner_events {
                 &InlineRunnerExecutor,
             )
         }
+
+        fn run_to_terminal(&self) {
+            self.runner().run(self.task, self.turn, None).unwrap();
+        }
     }
 
     fn enqueue(store: &ClientStateStore, record: &LocalTaskRecord) {
@@ -1387,6 +1391,86 @@ mod runner_events {
                 .state(),
             QueueState::Parked
         ));
+        assert_eq!(fixture.worker.result_fetches.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn runner_finish_terminal_emits_one_hint_after_log_unlock() {
+        let fixture = Fixture::new(false);
+        fixture.run_to_terminal();
+        let events = fixture.sink.events();
+        let finished = events
+            .iter()
+            .filter_map(|event| match event {
+                NewEvent::TurnFinished(hint) => Some(hint),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1, "the runner emits one turn.finished");
+        assert_eq!(finished[0].task_id, fixture.task);
+        assert_eq!(finished[0].turn_id, fixture.turn);
+        assert_eq!(finished[0].outcome, SafeOutcome::Done);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NewEvent::TurnOutcomeChanged(_)))
+        );
+        let saved = fixture.store.load_task(fixture.task).unwrap();
+        assert_eq!(saved.status().last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(saved.fetched_head(), Some(saved.meta().base_oid()));
+        assert!(fixture.store.queue_entry(fixture.turn).unwrap().is_none());
+        assert_eq!(fixture.worker.result_fetches.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn runner_result_fetch_failure_emits_terminal_correction() {
+        let fixture = Fixture::new(true);
+        fixture.run_to_terminal();
+        let events = fixture.sink.events();
+        let changed = events
+            .iter()
+            .filter_map(|event| match event {
+                NewEvent::TurnOutcomeChanged(hint) => Some(hint),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed.len(),
+            1,
+            "a failed fetch corrects the terminal outcome"
+        );
+        assert_eq!(changed[0].task_id, fixture.task);
+        assert_eq!(changed[0].turn_id, fixture.turn);
+        assert_eq!(changed[0].outcome, SafeOutcome::Failed);
+        assert_eq!(
+            changed[0].code.as_ref().unwrap().as_str(),
+            "RESULT_FETCH_FAILED"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, NewEvent::TurnFinished(_)))
+                .count(),
+            1
+        );
+        let finished_at = events
+            .iter()
+            .position(|event| matches!(event, NewEvent::TurnFinished(_)))
+            .unwrap();
+        let changed_at = events
+            .iter()
+            .position(|event| matches!(event, NewEvent::TurnOutcomeChanged(_)))
+            .unwrap();
+        assert!(finished_at < changed_at);
+        let saved = fixture.store.load_task(fixture.task).unwrap();
+        assert_eq!(
+            saved.status().last_outcome(),
+            Some(&TaskOutcome::failed("RESULT_FETCH_FAILED"))
+        );
+        assert!(saved.fetched_head().is_none());
+        assert!(fixture.store.queue_entry(fixture.turn).unwrap().is_none());
         assert_eq!(fixture.worker.result_fetches.load(Ordering::Relaxed), 1);
         assert_eq!(fixture.sink.unsafe_releases.load(Ordering::Relaxed), 0);
     }
