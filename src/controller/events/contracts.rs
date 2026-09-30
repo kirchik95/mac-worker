@@ -147,10 +147,11 @@ pub struct EventCursor {
     pub seq: Seq,
 }
 
+/// Journal read arguments. Defaults: limit 128, wait 0; normalize to 1..256 / 20 s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_request_cursor")]
     pub after: Option<EventCursor>,
     #[serde(default = "default_read_limit")]
     pub limit: usize,
@@ -162,6 +163,7 @@ fn default_read_limit() -> usize {
     READ_DEFAULT_LIMIT
 }
 
+/// Exclusive task.list controller_events selector, discriminated by snake_case op.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EventSelector {
@@ -277,7 +279,8 @@ impl From<OpaqueCursor> for String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One to sixteen distinct task IDs; addressed proof continuation is independent of repair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskAddressQuery {
     pub task_ids: Vec<TaskId>,
@@ -312,6 +315,7 @@ impl TaskAddressQuery {
         Ok(query)
     }
 }
+/// Task-only key page. Preserve the pre-enumeration baseline H across every page; titles excluded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRepairQuery {
@@ -319,7 +323,7 @@ pub struct TaskRepairQuery {
     pub after: Option<OpaqueCursor>,
     #[serde(default = "default_repair_limit")]
     pub limit: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_request_cursor")]
     pub baseline_after: Option<EventCursor>,
 }
 fn default_repair_limit() -> usize {
@@ -490,6 +494,7 @@ pub fn ensure_frame_bound<T: Serialize>(reply: &T) -> Result<(), WorkerError> {
     }
     Ok(())
 }
+/// Committed records with last-delivered next_after; empty timeout preserves the input cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadBatch {
     pub schema_version: u32,
@@ -501,11 +506,13 @@ pub struct ReadBatch {
     pub events: Vec<WireEvent>,
     pub has_more: bool,
 }
+/// Stable repair reason and current safe window; this control invents no journal records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotRequired {
     pub reason: String,
     pub window: JournalWindow,
 }
+/// Tolerant selector reply discriminated by type: batch or snapshot_required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventReadResult {
@@ -632,7 +639,8 @@ impl From<WorkerName> for String {
         value.0
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Saved task identifiers/state/code only. Constructor and decoder reject noncatalog states.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskHint {
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
@@ -640,6 +648,7 @@ pub struct TaskHint {
     pub state: String,
     pub code: Option<SafeCode>,
 }
+/// Saved terminal outcome hint; does not prove retirement, import completion or eligibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnHint {
     pub task_id: TaskId,
@@ -648,6 +657,7 @@ pub struct TurnHint {
     pub outcome: SafeOutcome,
     pub code: Option<SafeCode>,
 }
+/// Host acceptance hint, captured only after accepted status is saved, never prepared Active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedHint {
     pub task_id: TaskId,
@@ -655,7 +665,8 @@ pub struct AcceptedHint {
     pub run_id: Option<RunId>,
     pub worker: WorkerName,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Saved waiting/dispatching/parked hint; optional fields None mean global invalidation. No owners/affinities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueHint {
     pub turn_id: Option<TurnId>,
     pub state: Option<String>,
@@ -918,6 +929,7 @@ impl EventBatch {
         self.0.is_empty()
     }
 }
+/// Optional best-effort enqueue result; a drop never changes authoritative mutation success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishAttempt {
     Queued,
@@ -941,6 +953,7 @@ pub trait JournalReader: Send + Sync {
     fn window(&self, deadline: Duration) -> Result<JournalWindow, WorkerError>;
     fn read(&self, query: ReadQuery, deadline: Duration) -> Result<EventReadResult, WorkerError>;
 }
+/// Atomically publish a validated batch outside authoritative fences; speculative tails are invisible.
 pub trait JournalWriter: JournalReader {
     fn append(&self, batch: EventBatch, deadline: Duration) -> Result<EventCursor, WorkerError>;
 }
@@ -1073,6 +1086,7 @@ impl TaskFacts {
         (Some(false), Some(false))
     }
 }
+/// At most sixteen distinct row/missing IDs; unknown proof carries an independent continuation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskFactsBatch {
     pub rows: Vec<TaskFacts>,
@@ -1080,6 +1094,7 @@ pub struct TaskFactsBatch {
     pub proof_after: Option<OpaqueCursor>,
     pub baseline_after: Option<EventCursor>,
 }
+/// At most 128 title-free rows. Complete can include unknown proofs; it is not a point-in-time snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskRepairPage {
     pub rows: Vec<TaskFacts>,
@@ -1088,6 +1103,7 @@ pub struct TaskRepairPage {
     pub restart: bool,
     pub baseline_after: Option<EventCursor>,
 }
+/// Existing-state, read-only addressed/repair facts; no initialization, SSH, Git or task reconciliation.
 pub trait TaskProjectionReader: Send + Sync {
     fn addressed(
         &self,
@@ -1107,11 +1123,13 @@ pub trait TaskProjectionProvider: Send + Sync {
         deadline: Duration,
     ) -> Result<Arc<dyn TaskProjectionReader>, WorkerError>;
 }
+/// Transport support only; Unsupported never means confirmed absence of task attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSupport {
     Supported,
     Unsupported,
 }
+/// Remote read abstraction. Discovery/read/state requests share the original absolute RPC deadline.
 pub trait EventSource: Send + Sync {
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError>;
     fn read(&self, query: ReadQuery, deadline: Duration) -> Result<EventReadResult, WorkerError>;
@@ -1144,11 +1162,13 @@ pub enum PreviousProjection {
     Absent,
     Present(BTreeMap<TaskId, TaskFacts>),
 }
+/// Cold baseline suppresses historical repair completions; Warm has a previous complete projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaselineKind {
     Cold,
     Warm,
 }
+/// Notification-relevant facts only: latest outcome/proof/attention/abandonment, excluding title/metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEligibilitySignature {
     pub latest_turn_id: Option<TurnId>,
@@ -1159,6 +1179,7 @@ pub struct TaskEligibilitySignature {
     pub current_attention: bool,
     pub abandoned_without_turn: bool,
 }
+/// Replay terminal/abandonment evidence stays separate from warm derived repair differences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeCause {
     ReplayTerminal {
@@ -1168,6 +1189,7 @@ pub enum ChangeCause {
     ReplayAbandoned,
     RepairDifference,
 }
+/// Previous/current confirmed facts without a sequence; never serialized as a fabricated WireEvent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedTaskChange {
     pub task_id: TaskId,
@@ -1175,6 +1197,7 @@ pub struct DerivedTaskChange {
     pub current: Option<TaskFacts>,
     pub cause: ChangeCause,
 }
+/// Consumer-owned nonoverlapping sweep progress; budgeted pages continue rather than timer-restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairProgress {
     NotStarted,
@@ -1182,12 +1205,14 @@ pub enum RepairProgress {
     Complete,
     Restarted,
 }
+/// Optional feed hint and repair/title preferences; neither is permission to display unconfirmed outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileInput {
     pub read: Option<EventReadResult>,
     pub repair_due: bool,
     pub include_titles: bool,
 }
+/// Count and SHA-256 of the sorted complete current attention set, independent of epoch/time/page boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionSummary {
     pub count: usize,
@@ -1206,6 +1231,7 @@ pub struct Reconciliation {
     pub attention: Option<AttentionSummary>,
     pub repair_needed: bool,
 }
+/// Confirms affected IDs before yielding bounded changes; cold history and incomplete absence do not become notices.
 pub trait EventReconciler {
     fn reconcile(
         &mut self,
@@ -1244,6 +1270,7 @@ impl ViewerMessage {
         }
     }
 }
+/// Bounded local subscriptions (256 messages/eight streams). Stop cancels streams before HTTP shutdown.
 pub trait ViewerEventSource: Send + Sync {
     fn subscribe(
         &self,
@@ -1257,10 +1284,12 @@ impl Serialize for ViewerMessage {
         serde_json::json!({"event": self.event_name(), "data": data}).serialize(s)
     }
 }
+/// Request debounced local refresh; broadcast cache revisions only after the projection is visible.
 pub trait LocalProjectionRefresh: Send + Sync {
     fn request_refresh(&self);
     fn subscribe_publications(&self) -> tokio::sync::broadcast::Receiver<u64>;
 }
+/// Laptop channel choice. Auto resolves the laptop Herdr socket or macOS; no controller-account forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NotifyChannel {
@@ -1270,6 +1299,7 @@ pub enum NotifyChannel {
     Herdr,
     Both,
 }
+/// CLI-only options; default is follow=false, quiet=false, no_titles=false, channel=Auto.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NotifyOptions {
     pub follow: bool,
@@ -1277,12 +1307,14 @@ pub struct NotifyOptions {
     pub no_titles: bool,
     pub channel: NotifyChannel,
 }
+/// Fixed sound policy: Done for done, Request for needs_input/blocked, otherwise None.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeSound {
     None,
     Done,
     Request,
 }
+/// Laptop display-only safe title and fixed outcome copy; never journal/cache task prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub fingerprint: String,
@@ -1290,6 +1322,7 @@ pub struct Notice {
     pub body: String,
     pub sound: NoticeSound,
 }
+/// Bounded pending task/turn identity without display titles or persisted task projections.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCandidate {
     pub task_id: TaskId,
@@ -1319,11 +1352,13 @@ impl NotifyState {
         }
     }
 }
+/// Save next state before attempting these notices; quiet consumes decisions without channel calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyPlan {
     pub next: NotifyState,
     pub notices: Vec<Notice>,
 }
+/// One bounded delivery attempt after cache save; OS delivery is not transactional/exactly-once.
 pub trait NoticeChannel: Send + Sync {
     fn deliver(&self, notice: &Notice, deadline: Duration) -> Result<(), WorkerError>;
 }
@@ -1593,6 +1628,43 @@ validated_deserialize!(SnapshotRequired, RawSnapshot, { reason: String, window: 
 validated_deserialize!(TaskFactsBatch, RawFactsBatch, { rows: Vec<TaskFacts>, missing: Vec<TaskId>, proof_after: Option<OpaqueCursor>, baseline_after: Option<EventCursor> });
 validated_deserialize!(TaskRepairPage, RawRepairPage, { rows: Vec<TaskFacts>, next: Option<OpaqueCursor>, complete: bool, restart: bool, baseline_after: Option<EventCursor> });
 validated_deserialize!(NotifyState, RawNotifyState, { schema_version: u32, consumed_after: Option<EventCursor>, last_complete_repair_millis: Option<u64>, decisions: Vec<String>, pending: Vec<PendingCandidate>, attention_overflow: Option<String>, repair_needed: bool });
+
+/// Requests reject unknown cursor keys even when decoded directly; replies use
+/// the tolerant EventCursor decoder so additive result fields remain compatible.
+fn deserialize_request_cursor<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<EventCursor>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RequestCursor {
+        #[serde(with = "uuid_wire")]
+        journal_id: uuid::Uuid,
+        seq: Seq,
+    }
+    Ok(
+        Option::<RequestCursor>::deserialize(d)?.map(|cursor| EventCursor {
+            journal_id: cursor.journal_id,
+            seq: cursor.seq,
+        }),
+    )
+}
+impl<'de> Deserialize<'de> for TaskAddressQuery {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            task_ids: Vec<TaskId>,
+            #[serde(default)]
+            include_titles: bool,
+            #[serde(default)]
+            proof_after: Option<OpaqueCursor>,
+        }
+        let raw = Request::deserialize(d)?;
+        Self::try_new(raw.task_ids, raw.include_titles, raw.proof_after).map_err(de::Error::custom)
+    }
+}
+validated_deserialize!(TaskHint, RawTaskHint, { task_id: TaskId, run_id: Option<RunId>, turn_id: Option<TurnId>, state: String, code: Option<SafeCode> });
+validated_deserialize!(QueueHint, RawQueueHint, { turn_id: Option<TurnId>, state: Option<String>, kind: Option<String>, code: Option<SafeCode> });
 
 mod uuid_wire {
     use super::*;

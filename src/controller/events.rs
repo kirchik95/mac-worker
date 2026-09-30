@@ -404,4 +404,50 @@ mod tests {
             assert_eq!(message.cursor().is_some(), key == "event_above_2pow53");
         }
     }
+
+    #[test]
+    fn review_direct_addressed_dtos_reject_invalid_task_sets() {
+        for ids in [
+            Vec::new(),
+            vec![task_id(), task_id()],
+            (1..=17)
+                .map(|id| TaskId::new(uuid::Uuid::from_u128(id)))
+                .collect(),
+        ] {
+            let query =
+                serde_json::json!({"task_ids":ids,"include_titles":false,"proof_after":null});
+            assert!(serde_json::from_value::<TaskAddressQuery>(query.clone()).is_err());
+            let mut selector = query;
+            selector["op"] = serde_json::json!("tasks");
+            assert!(serde_json::from_value::<EventSelector>(selector).is_err());
+        }
+    }
+
+    #[test]
+    fn review_request_cursor_keys_are_strict_but_reply_cursors_tolerant() {
+        let cursor = serde_json::json!({"journal_id":window().journal_id.to_string(),"seq":"42","future":true});
+        assert!(serde_json::from_value::<EventCursor>(cursor.clone()).is_ok());
+        assert!(
+            serde_json::from_value::<ReadQuery>(serde_json::json!({"after":cursor.clone()}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TaskRepairQuery>(
+                serde_json::json!({"baseline_after":cursor.clone()})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EventSelector>(
+                serde_json::json!({"op":"read","after":cursor})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn review_direct_hints_reject_owned_prose_fields() {
+        assert!(serde_json::from_value::<TaskHint>(serde_json::json!({"task_id":task_id(),"run_id":null,"turn_id":null,"state":"secret /tmp/a","code":null})).is_err());
+        assert!(serde_json::from_value::<QueueHint>(serde_json::json!({"turn_id":null,"state":null,"kind":"private queue label","code":null})).is_err());
+    }
 }

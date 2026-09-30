@@ -92,6 +92,7 @@ fn check(runtime: &dyn EventRuntime, deadline: Duration) -> Result<(), WorkerErr
     Ok(())
 }
 
+/// Try-only whole-batch recorder; drop mode, lock contention or 128 batches drops atomically.
 #[derive(Clone, Default)]
 pub struct RecordingSink {
     inner: Arc<Mutex<Vec<EventBatch>>>,
@@ -167,6 +168,9 @@ impl MemoryJournal {
             return Err(invalid("nil replacement epoch"));
         }
         let mut state = self.inner.lock().unwrap();
+        if journal_id == state.window.journal_id {
+            return Err(invalid("replacement epoch must change journal identity"));
+        }
         state.window = JournalWindow {
             journal_id,
             oldest_seq: Seq::new(1),
@@ -298,6 +302,7 @@ impl JournalWriter for MemoryJournal {
     }
 }
 
+/// Present/absent/error existing-journal opener with an open counter; never initializes.
 #[derive(Clone)]
 pub struct FakeJournalProvider {
     reader: Option<Arc<dyn JournalReader>>,
@@ -371,6 +376,7 @@ impl<T> Script<T> {
             .unwrap_or_else(|| Err(unavailable("script exhausted")))
     }
 }
+/// Captured exact safe selector body and original deadline, bounded with the source script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedEventRequest {
     pub selector: EventSelector,
@@ -394,6 +400,7 @@ fn capture(
     });
     Ok(())
 }
+/// Scripted discovery/read/tasks/repair replies; bounded captures preserve exact request bodies/deadlines.
 #[derive(Default)]
 pub struct ScriptedEventSource {
     discovery: Script<EventSupport>,
@@ -513,6 +520,7 @@ impl JournalReader for FakeJournalReader {
     }
 }
 
+/// Bounded task projection with key pages and separate generation-checked proof tokens. Stored rows are completed facts.
 #[derive(Clone)]
 pub struct MemoryTaskReader {
     inner: Arc<Mutex<TaskRows>>,
@@ -580,10 +588,14 @@ impl MemoryTaskReader {
     pub fn set_proof_budget(&self, checks: usize) {
         self.inner.lock().unwrap().proof_budget = checks.clamp(1, MAX_DISPATCH_ASSOCIATIONS);
     }
-    pub fn set_proof_work(&self, id: TaskId, checks: usize) {
+    pub fn set_proof_work(&self, id: TaskId, checks: usize) -> Result<(), WorkerError> {
         let mut state = self.inner.lock().unwrap();
+        if !state.rows.contains_key(&id) {
+            return Err(invalid("proof work requires a registered task"));
+        }
         state.proof_work.insert(id, checks);
         state.generation += 1;
+        Ok(())
     }
     pub fn set_baseline(&self, baseline: Option<EventCursor>) {
         self.inner.lock().unwrap().baseline = baseline;
@@ -647,14 +659,9 @@ impl TaskProjectionReader for MemoryTaskReader {
                 row.busy = None;
                 row.quiescent = None;
                 row.queue_dispatching = None;
-            } else if work > 0 {
-                row.queue_dispatching = Some(false);
-                row.busy = Some(false);
-                row.quiescent = Some(matches!(
-                    row.state.as_str(),
-                    "open" | "closed" | "abandoned" | "lost"
-                ));
             } else {
+                // Stored facts are the completed proof result. Finishing a
+                // queue scan cannot upgrade independent outcome uncertainty.
                 row.busy = proof.busy;
                 row.quiescent = proof.quiescent;
             }
@@ -791,6 +798,7 @@ fn decode_token<T: serde::de::DeserializeOwned>(cursor: &OpaqueCursor) -> Result
     serde_json::from_slice(&bytes).map_err(|_| invalid("invalid memory token"))
 }
 
+/// Independent reader/error existing-state opener with an open counter; journal damage is irrelevant.
 #[derive(Clone)]
 pub struct FakeTaskProjectionProvider {
     reader: Option<Arc<dyn TaskProjectionReader>>,
@@ -828,6 +836,7 @@ impl TaskProjectionProvider for FakeTaskProjectionProvider {
     }
 }
 
+/// Bounded scripted reconciliation results and input capture; validates chunks/cold-baseline invariants.
 #[derive(Default)]
 pub struct FakeEventReconciler {
     results: Script<Reconciliation>,
@@ -862,6 +871,7 @@ impl EventReconciler for FakeEventReconciler {
     }
 }
 
+/// Try-only bounded local fanout; full subscriptions disconnect rather than silently losing messages.
 #[derive(Default)]
 pub struct MemoryViewerEventSource {
     inner: Mutex<ViewerSubscribers>,
@@ -921,6 +931,7 @@ impl ViewerEventSource for MemoryViewerEventSource {
         state.senders.clear();
     }
 }
+/// Counts refresh requests and broadcasts explicitly published visible cache revisions.
 pub struct FakeLocalProjectionRefresh {
     requests: AtomicUsize,
     publications: tokio::sync::broadcast::Sender<u64>,
@@ -953,6 +964,7 @@ impl LocalProjectionRefresh for FakeLocalProjectionRefresh {
         self.publications.subscribe()
     }
 }
+/// Records attempted notices/deadlines with optional injected failure; never invokes a real notification channel.
 #[derive(Default)]
 pub struct RecordingNoticeChannel {
     records: Mutex<Vec<(Notice, Duration)>>,
@@ -1220,7 +1232,7 @@ mod tests {
                 .task_id,
             id(1)
         );
-        tasks.set_proof_work(id(4), 40);
+        tasks.set_proof_work(id(4), 40).unwrap();
         tasks.set_proof_budget(16);
         let mut query = TaskAddressQuery::try_new(vec![id(4), id(9)], false, None).unwrap();
         for index in 0..3 {
@@ -1407,6 +1419,84 @@ mod tests {
         assert_eq!(
             channel.records(),
             vec![(notice.clone(), deadline()), (notice, deadline())]
+        );
+    }
+
+    #[test]
+    fn review_completed_proof_never_upgrades_unknown_outcome() {
+        let wire = TaskFactsWire {
+            task_id: id(2),
+            run_id: None,
+            state: "abandoned".into(),
+            latest_turn_id: None,
+            outcome: Some("future_outcome".into()),
+            code: None,
+            runner_present: false,
+            close_intent: false,
+            auto_continue_intent: false,
+            queue_dispatching: Some(false),
+            result_imported: false,
+            busy: Some(false),
+            quiescent: Some(true),
+            fact_digest: "a".repeat(64),
+            title: None,
+        };
+        let facts = TaskFacts::try_new(wire).unwrap();
+        assert_eq!(facts.quiescent, None);
+        let tasks = MemoryTaskReader::new();
+        tasks.insert(facts).unwrap();
+        tasks.set_proof_work(id(2), 1).unwrap();
+        let read = tasks
+            .addressed(
+                TaskAddressQuery::try_new(vec![id(2)], false, None).unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        assert_eq!(read.rows[0].quiescent, None);
+        assert!(!read.rows[0].eligibility_signature().abandoned_without_turn);
+    }
+
+    #[test]
+    fn review_epoch_replacement_requires_new_identity_and_preserves_history() {
+        let journal = MemoryJournal::new();
+        let cursor = journal.append(batch(1), deadline()).unwrap();
+        assert!(journal.replace_epoch(cursor.journal_id).is_err());
+        assert_eq!(journal.window(deadline()).unwrap().cursor(), cursor);
+        let after = EventCursor {
+            seq: Seq::ZERO,
+            ..cursor
+        };
+        let EventReadResult::Batch(read) = journal
+            .read(
+                ReadQuery {
+                    after: Some(after),
+                    wait_ms: 0,
+                    limit: 1,
+                },
+                deadline(),
+            )
+            .unwrap()
+        else {
+            panic!("expected existing history")
+        };
+        assert_eq!(read.events[0].seq, Seq::new(1));
+    }
+
+    #[test]
+    fn review_proof_metadata_requires_a_registered_task() {
+        let tasks = MemoryTaskReader::new();
+        assert!(tasks.set_proof_work(id(2), 1).is_err());
+        tasks.insert(terminal(2)).unwrap();
+        tasks.set_proof_work(id(2), 1).unwrap();
+        assert!(
+            tasks
+                .addressed(
+                    TaskAddressQuery::try_new(vec![id(2)], false, None).unwrap(),
+                    deadline()
+                )
+                .unwrap()
+                .proof_after
+                .is_none()
         );
     }
 }
