@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod command;
+pub mod events;
 pub mod model;
 pub mod queue;
 pub mod service;
