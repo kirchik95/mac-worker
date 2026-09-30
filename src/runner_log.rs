@@ -514,9 +514,33 @@ pub(crate) fn snapshot(
     task: TaskId,
     turn: TurnId,
 ) -> Result<Option<Snapshot>, WorkerError> {
+    snapshot_with_hook(root, task, turn, || {})
+}
+
+fn snapshot_with_hook(
+    root: &Path,
+    task: TaskId,
+    turn: TurnId,
+    mut after_open: impl FnMut(),
+) -> Result<Option<Snapshot>, WorkerError> {
     let result = (|| {
         let dir = directory(root, task, false)?;
-        let bytes = dir.read_private_regular(&format!("{turn}.checkpoint.json"), LIMIT as u64)?;
+        let name = format!("{turn}.checkpoint.json");
+        let mut attempts = 0;
+        let bytes = loop {
+            match dir.read_private_regular_with_hook(&name, LIMIT as u64, &mut after_open) {
+                Ok(bytes) => break bytes,
+                Err(error) if error.raw_os_error() == Some(libc::ESTALE) && attempts < 3 => {
+                    // A live writer atomically replaces the checkpoint while
+                    // retaining its journal flock for the entire turn. Recheck
+                    // this logical record without following a replaced runner
+                    // directory; decode below still requires this exact turn.
+                    dir.verify_bound()?;
+                    attempts += 1;
+                }
+                Err(error) => return Err(WorkerError::Io(error)),
+            }
+        };
         let j = decode(&bytes, task, turn)?;
         Ok(Snapshot {
             accepted: j.committed.accepted
@@ -895,6 +919,171 @@ mod crash_tests {
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         (d, TaskId::generate(), TurnId::generate())
     }
+
+    #[test]
+    fn snapshot_rechecks_checkpoint_replaced_after_open() {
+        let (d, t, u) = setup();
+        let mut writer = RunnerLog::open(d.path(), t, u).unwrap();
+        writer.accepted("mini-1", b"accepted\n").unwrap();
+        let completion = Completion {
+            outcome: TaskOutcome::Done,
+            drained: true,
+        };
+        let mut publish = Some(completion.clone());
+
+        let snapshot = snapshot_with_hook(d.path(), t, u, || {
+            if let Some(completion) = publish.take() {
+                writer.finish(completion, b"done\n").unwrap();
+            }
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(snapshot.accepted);
+        assert_eq!(snapshot.len, 14);
+        assert_eq!(snapshot.completion, Some(completion));
+        assert_eq!(
+            read_committed(d.path(), t, u, &snapshot).unwrap(),
+            b"accepted\ndone\n"
+        );
+    }
+
+    #[test]
+    fn snapshot_recheck_rejects_wrong_task_or_turn() {
+        for wrong_task in [true, false] {
+            let (d, t, u) = setup();
+            let writer = RunnerLog::open(d.path(), t, u).unwrap();
+            let mut replacement = writer.journal.clone();
+            if wrong_task {
+                replacement.task_id = TaskId::generate();
+            } else {
+                replacement.turn_id = TurnId::generate();
+            }
+            let bytes = serde_json::to_vec(&replacement).unwrap();
+            let mut publish = Some(bytes.clone());
+            let error = snapshot_with_hook(d.path(), t, u, || {
+                if let Some(bytes) = publish.take() {
+                    writer
+                        .dir
+                        .replace_private_regular_exact(&writer.sidecar, &writer.encoded, &bytes)
+                        .unwrap();
+                }
+            })
+            .err()
+            .expect("another task or turn must not become this snapshot");
+
+            assert_eq!(error.public_code(), "LOG_CHECKPOINT_INVALID");
+            assert_eq!(
+                std::fs::read(writer.dir.path().join(&writer.sidecar)).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_recheck_keeps_the_original_runner_directory_binding() {
+        let (d, t, u) = setup();
+        let writer = RunnerLog::open(d.path(), t, u).unwrap();
+        let original = writer.dir.path().to_path_buf();
+        let detached = original.with_file_name("detached");
+        let mut replace = true;
+        let error = snapshot_with_hook(d.path(), t, u, || {
+            if !std::mem::take(&mut replace) {
+                return;
+            }
+            std::fs::rename(&original, &detached).unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sidecar = original.join(&writer.sidecar);
+            std::fs::write(&sidecar, &writer.encoded).unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .err()
+        .expect("a replacement runner directory must not be followed");
+
+        assert!(matches!(
+            error,
+            WorkerError::Io(error) if error.raw_os_error() == Some(libc::ESTALE)
+        ));
+        assert_eq!(
+            std::fs::read(original.join(&writer.sidecar)).unwrap(),
+            writer.encoded
+        );
+        assert_eq!(
+            std::fs::read(detached.join(&writer.sidecar)).unwrap(),
+            writer.encoded
+        );
+    }
+
+    #[test]
+    fn snapshot_recheck_preserves_unsafe_checkpoint_errors() {
+        for kind in ["permissions", "hardlink", "directory", "symlink"] {
+            let (d, t, u) = setup();
+            let writer = RunnerLog::open(d.path(), t, u).unwrap();
+            let sidecar = writer.dir.path().join(&writer.sidecar);
+            let detached = writer.dir.path().join("detached.json");
+            let mut replace = true;
+            let error = snapshot_with_hook(d.path(), t, u, || {
+                if !std::mem::take(&mut replace) {
+                    return;
+                }
+                std::fs::rename(&sidecar, &detached).unwrap();
+                match kind {
+                    "permissions" => {
+                        std::fs::write(&sidecar, &writer.encoded).unwrap();
+                        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    }
+                    "hardlink" => std::fs::hard_link(&detached, &sidecar).unwrap(),
+                    "directory" => std::fs::create_dir(&sidecar).unwrap(),
+                    "symlink" => symlink(&detached, &sidecar).unwrap(),
+                    _ => unreachable!(),
+                }
+            })
+            .err()
+            .expect("unsafe checkpoint replacement must remain an error");
+
+            assert!(
+                matches!(
+                    error,
+                    WorkerError::Io(error)
+                        if error.kind() == std::io::ErrorKind::PermissionDenied
+                ),
+                "{kind}"
+            );
+            assert_eq!(std::fs::read(&detached).unwrap(), writer.encoded);
+            if kind != "directory" {
+                assert_eq!(std::fs::read(&sidecar).unwrap(), writer.encoded);
+            } else {
+                assert!(std::fs::read_dir(&sidecar).unwrap().next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_recheck_is_bounded_during_continuous_publication() {
+        let (d, t, u) = setup();
+        let mut writer = RunnerLog::open(d.path(), t, u).unwrap();
+        let mut publications = 0;
+        let error = snapshot_with_hook(d.path(), t, u, || {
+            publications += 1;
+            assert!(
+                publications <= 16,
+                "snapshot retry did not converge within its bound"
+            );
+            writer.append_bytes(b"x").unwrap();
+        })
+        .err()
+        .expect("continuous publication must eventually return its race");
+
+        assert!(publications > 1, "a raced snapshot should be rechecked");
+        assert!(matches!(
+            error,
+            WorkerError::Io(error) if error.raw_os_error() == Some(libc::ESTALE)
+        ));
+        assert_eq!(writer.len(), publications);
+    }
+
     #[test]
     fn failed_checkpoint_cas_exposes_only_old_commit_until_reopen() {
         let (d, t, u) = setup();
