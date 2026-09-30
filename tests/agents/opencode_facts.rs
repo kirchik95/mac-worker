@@ -406,7 +406,9 @@ fn the_fixture_would_catch_a_plain_auth_probe_on_v2() {
         policy: mac_worker::process::ProcessPolicy {
             stdout_limit: 4096,
             stderr_limit: 4096,
-            deadline: std::time::Duration::from_secs(2),
+            // Only the recorded command matters here; a loaded login shell and
+            // a fixture's first exec can take seconds to start.
+            deadline: std::time::Duration::from_secs(30),
         },
         isolate_parent_environment: true,
     };
