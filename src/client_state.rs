@@ -506,6 +506,66 @@ impl ClientStateStore {
         }
     }
 
+    fn capture_run_changed(&self, run_id: RunId) {
+        self.capture_hint(crate::controller::events::NewEvent::RunChanged {
+            run_id,
+            task_id: None,
+        });
+    }
+
+    fn capture_dag_publication(&self, before: &DagRecord, next: &DagRecord) {
+        if self.event_sink.is_none() {
+            return;
+        }
+        self.capture_run_changed(next.run_id);
+        let membership = self
+            .runs_dir()
+            .and_then(|runs| read_run_from_dir(&runs, &run_file_name(next.run_id)?, next.run_id));
+        if let Ok(run) = membership {
+            for node in next.nodes.values() {
+                if node.state == DagNodeState::Submitted
+                    && before
+                        .nodes
+                        .get(&node.batch_id)
+                        .is_none_or(|old| old.state != DagNodeState::Submitted)
+                    && run.task_ids().contains(&node.task_id)
+                {
+                    self.capture_hint(crate::controller::events::NewEvent::DagChildAdmitted {
+                        run_id: next.run_id,
+                        task_id: node.task_id,
+                        turn_id: node.turn_id,
+                    });
+                }
+            }
+        }
+    }
+
+    fn capture_run_publication(&self, before: &RunRecord, next: &RunRecord) {
+        if self.event_sink.is_none() {
+            return;
+        }
+        self.capture_run_changed(next.run_id());
+        if next
+            .task_ids()
+            .iter()
+            .any(|id| !before.task_ids().contains(id))
+            && let Ok(Some(dag)) = self.load_run_dag_locked(next.run_id())
+        {
+            for node in dag.nodes.values() {
+                if node.state == DagNodeState::Submitted
+                    && next.task_ids().contains(&node.task_id)
+                    && !before.task_ids().contains(&node.task_id)
+                {
+                    self.capture_hint(crate::controller::events::NewEvent::DagChildAdmitted {
+                        run_id: next.run_id(),
+                        task_id: node.task_id,
+                        turn_id: node.turn_id,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn with_timings(mut self, timings: ClientStateTimings) -> Self {
         self.timings = timings;
         self
@@ -3572,7 +3632,10 @@ impl ClientStateStore {
         self.recover_run_replacement_residue(&runs, &names)?;
         let name = run_file_name(run_id)?;
         match runs.write_private_atomic_no_replace(&name, &bytes) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.capture_run_changed(run_id);
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = read_run_from_dir(&runs, &name, run_id)?;
                 if existing == record {
@@ -3637,7 +3700,9 @@ impl ClientStateStore {
         let dag_name = dag_file_name(run_id)?;
         let run_name = run_file_name(run_id)?;
         match dags.write_private_atomic_no_replace(&dag_name, &dag_bytes) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.capture_run_changed(run_id);
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = read_dag_from_dir(&dags, &dag_name, run_id)?;
                 if existing != dag {
@@ -3655,7 +3720,9 @@ impl ClientStateStore {
             ));
         }
         match runs.write_private_atomic_no_replace(&run_name, &run_bytes) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.capture_run_changed(run_id);
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = read_run_from_dir(&runs, &run_name, run_id)?;
                 if existing == record {
@@ -4227,7 +4294,10 @@ impl ClientStateStore {
                 )?;
                 let bytes = run_record_bytes(&run)?;
                 match runs.write_private_atomic_no_replace(&run_name, &bytes) {
-                    Ok(()) => run,
+                    Ok(()) => {
+                        self.capture_run_changed(run_id);
+                        run
+                    }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         read_run_from_dir(runs, &run_name, run_id)?
                     }
@@ -4267,7 +4337,14 @@ impl ClientStateStore {
             },
             || Ok(()),
         )
-        .map_err(WorkerError::Io)
+        .map_err(WorkerError::Io)?;
+        if old != replacement
+            && self.event_sink.is_some()
+            && let (Ok(before), Ok(next)) = (parse_run_record(old), parse_run_record(replacement))
+        {
+            self.capture_run_publication(&before, &next);
+        }
+        Ok(())
     }
 
     pub fn reserve_run_publish_branch(
@@ -4920,7 +4997,14 @@ impl ClientStateStore {
             || Ok(()),
             || Ok(()),
         )
-        .map_err(WorkerError::Io)
+        .map_err(WorkerError::Io)?;
+        if old != replacement
+            && self.event_sink.is_some()
+            && let (Ok(before), Ok(next)) = (parse_dag_record(old), parse_dag_record(replacement))
+        {
+            self.capture_dag_publication(&before, &next);
+        }
+        Ok(())
     }
 
     fn dag_parent_gates_locked(

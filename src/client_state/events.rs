@@ -940,4 +940,163 @@ pub(crate) mod tests {
         assert!(!encoded.contains(&"a".repeat(64)));
         assert!(!encoded.contains(&"b".repeat(64)));
     }
+
+    fn run_and_dag(record: &LocalTaskRecord) -> (crate::task::RunRecord, crate::dag::DagRecord) {
+        use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref};
+        let id = crate::task::RunId::generate();
+        let node = DagNode {
+            batch_id: "private-node".into(),
+            task_id: record.meta().task_id(),
+            turn_id: record.status().turns()[0].turn_id(),
+            depends_on: vec![],
+            base: DagBase::Frozen {
+                oid: record.meta().base_oid().clone(),
+                pin_ref: dag_pin_ref(id, "private-node"),
+                wip: false,
+            },
+            frozen: DagFrozenSpec {
+                questions: None,
+                prompt: "PRIVATE_PROMPT".into(),
+                title: Some("PRIVATE_TITLE".into()),
+                agent: "codex".into(),
+                model: None,
+                effort: None,
+                source: "local".into(),
+                origin_url: None,
+                publish: vec!["fetch".into()],
+                publish_branch: None,
+                close_on: ClosePolicy::Never,
+                env_profile: None,
+                worker: None,
+                wip: false,
+                project_path: "/private/project/path".into(),
+                project_id: "a".repeat(64),
+                worktree_id: "b".repeat(64),
+                timeout_millis: 1000,
+                max_turns: None,
+                max_budget_usd_cents: None,
+                max_followups: 10,
+                permissions: "workspace".into(),
+                requires: vec![],
+                include_untracked: vec![],
+                include_empty_dirs: vec![],
+                allow_sensitive: vec![],
+                cli_includes: vec![],
+                branch: None,
+            },
+            state: DagNodeState::Waiting,
+            bound_oid: None,
+            bound_turn_id: None,
+            pin_ref: None,
+            blocked_by: None,
+            claimed_by: None,
+            claimed_at_millis: None,
+        };
+        (
+            crate::task::RunRecord::new(id, None, vec![], 1, 100).unwrap(),
+            DagRecord::new(
+                id,
+                std::collections::BTreeMap::from([("private-node".into(), node)]),
+                1,
+                None,
+                100,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn run_creation_and_reservations_invalidate_without_settlement() {
+        let (_dir, store, sink) = store_with_sink();
+        let (run, _) = run_and_dag(&task_record());
+        store.create_run(run.clone()).unwrap();
+        assert_eq!(sink.events().len(), 1);
+        assert!(
+            matches!(&sink.events()[0], NewEvent::RunChanged { run_id, .. } if *run_id == run.run_id())
+        );
+        sink.clear();
+        store.create_run(run.clone()).unwrap();
+        assert!(sink.events().is_empty());
+        let branch = "agent/private-branch".parse().unwrap();
+        store
+            .reserve_run_publish_branch(run.run_id(), branch)
+            .unwrap();
+        assert_eq!(sink.events().len(), 1);
+        assert!(!format!("{:?}", sink.events()).contains("private-branch"));
+    }
+
+    #[test]
+    fn partial_dag_creation_does_not_admit_child() {
+        let (_dir, store, sink) = store_with_sink();
+        let (run, dag) = run_and_dag(&task_record());
+        store.inject_write_failure_once(ClientStateWritePoint::AfterDagPublishBeforeRun);
+        assert!(store.create_run_with_dag(run.clone(), dag).is_err());
+        assert!(store.load_run_dag(run.run_id()).unwrap().is_some());
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::RunChanged { .. }))
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::DagChildAdmitted { .. }))
+        );
+        sink.clear();
+        store
+            .claim_next_eligible_dag_node(run.run_id(), owner(), 110)
+            .unwrap();
+        assert!(store.load_run(run.run_id()).is_ok());
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::RunChanged { .. }))
+        );
+    }
+
+    #[test]
+    fn dag_recovery_admission_requires_two_records() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = task_record();
+        let (run, dag) = run_and_dag(&record);
+        store.create_run_with_dag(run.clone(), dag).unwrap();
+        store
+            .claim_next_eligible_dag_node(run.run_id(), owner(), 110)
+            .unwrap();
+        store.create_task(record.clone()).unwrap();
+        store
+            .write_turn_prompt(
+                record.meta().task_id(),
+                record.status().turns()[0].turn_id(),
+                "PRIVATE_PROMPT",
+            )
+            .unwrap();
+        sink.clear();
+        store.inject_write_failure_once(ClientStateWritePoint::AfterDagRunMembership);
+        assert!(
+            store
+                .mark_dag_node_submitted(run.run_id(), "private-node", record.meta().task_id())
+                .is_err()
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::DagChildAdmitted { .. }))
+        );
+        sink.clear();
+        store
+            .claim_next_eligible_dag_node(run.run_id(), owner(), 120)
+            .unwrap();
+        assert!(sink.events().iter().any(|event| matches!(event,
+            NewEvent::DagChildAdmitted { run_id, task_id, turn_id } if *run_id == run.run_id()
+                && *task_id == record.meta().task_id() && *turn_id == record.status().turns()[0].turn_id())));
+        assert!(!format!("{:?}", sink.events()).contains("private-node"));
+        sink.clear();
+        store
+            .claim_next_eligible_dag_node(run.run_id(), owner(), 130)
+            .unwrap();
+        assert!(sink.events().is_empty());
+    }
 }
