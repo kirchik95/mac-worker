@@ -1016,14 +1016,6 @@ fn verify_retained_bindings(root: &RootedDir, manifest: &Manifest) -> io::Result
     Ok(extra_tail)
 }
 
-pub(super) fn validate_contents(
-    root: &RootedDir,
-    manifest: &Manifest,
-    faults: &dyn FaultHooks,
-) -> io::Result<()> {
-    verify_retained(root, manifest, None, faults)
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Retirement {

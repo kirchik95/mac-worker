@@ -305,9 +305,9 @@ impl ControllerJournal {
             clock,
             hooks,
         });
-        journal.with_manifest(deadline, |manifest| {
-            fs::validate_contents(&journal.root, manifest, &journal.hooks)
-        })?;
+        // Healthy attachment checks retained bindings and sizes. Ambiguous
+        // state still takes full EX recovery; read_after validates served data.
+        journal.with_manifest(deadline, |_| Ok(()))?;
         Ok(journal)
     }
 

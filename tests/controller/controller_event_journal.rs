@@ -370,12 +370,20 @@ fn full_journal_with_segment_counter() -> (JournalHarness, Arc<ControllerJournal
     )
     .unwrap()
     .unwrap();
-    assert!(
-        touches.load(Ordering::SeqCst) >= 64,
-        "attachment validates all retained contents"
+    assert_eq!(
+        touches.load(Ordering::SeqCst),
+        0,
+        "healthy attachment must validate bindings without decoding 64 segments"
     );
     touches.store(0, Ordering::SeqCst);
     (h, journal, touches)
+}
+
+#[test]
+fn healthy_attachment_full_journal_skips_segment_contents() {
+    let (_h, journal, touches) = full_journal_with_segment_counter();
+    assert_eq!(journal.window(DEADLINE).unwrap().head_seq, Seq::new(16384));
+    assert_eq!(touches.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1606,14 +1614,27 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
 #[test]
 fn committed_envelopes_use_frozen_validation_and_allow_unknown_versions() {
     let h = JournalHarness::new();
-    let epoch = h.head().journal_id;
+    let cursor = h.head().cursor();
     let mut event = NewEvent::ControllerDrainChanged { drained: true }
-        .to_wire(epoch, Seq::new(1), 0)
+        .to_wire(cursor.journal_id, Seq::new(1), 0)
         .unwrap();
     event.data = serde_json::json!({"drained":"invalid"});
     store_single_event(&h, &event);
+    let journal = h
+        .reopen()
+        .expect("healthy bindings attach before any record is served");
     assert_eq!(
-        h.reopen().err().unwrap().public_code(),
+        journal
+            .read(
+                ReadQuery {
+                    after: Some(cursor),
+                    limit: 1,
+                    wait_ms: 0
+                },
+                DEADLINE
+            )
+            .unwrap_err()
+            .public_code(),
         "CONTROLLER_EVENTS_UNAVAILABLE"
     );
     event.schema_version = 2;
@@ -1628,9 +1649,10 @@ fn committed_envelopes_use_frozen_validation_and_allow_unknown_versions() {
 #[test]
 fn committed_event_limit_counts_newline_and_rejects_one_extra_byte() {
     let h = JournalHarness::new();
+    let cursor = h.head().cursor();
     let mut event = mac_worker::controller::events::WireEvent {
         schema_version: 1,
-        journal_id: h.head().journal_id,
+        journal_id: cursor.journal_id,
         seq: Seq::new(1),
         time_millis: 0,
         kind: "future.changed".into(),
@@ -1643,8 +1665,21 @@ fn committed_event_limit_counts_newline_and_rejects_one_extra_byte() {
     event.data["padding"] = serde_json::json!("a".repeat(1025 - base));
     store_single_event(&h, &event);
     let bytes = fs::read(h.root().join("segment-1.jsonl")).unwrap();
+    let journal = h
+        .reopen()
+        .expect("healthy bindings attach before any record is served");
     assert_eq!(
-        h.reopen().err().unwrap().public_code(),
+        journal
+            .read(
+                ReadQuery {
+                    after: Some(cursor),
+                    limit: 1,
+                    wait_ms: 0
+                },
+                DEADLINE
+            )
+            .unwrap_err()
+            .public_code(),
         "CONTROLLER_EVENTS_UNAVAILABLE"
     );
     assert_eq!(fs::read(h.root().join("segment-1.jsonl")).unwrap(), bytes);
