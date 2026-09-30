@@ -491,7 +491,9 @@ impl TaskEventReadStore {
 
     fn check_deadline(&self, deadline: Duration) -> Result<(), WorkerError> {
         if self.runtime.cancelled() {
-            return Err(crate::error::ProcessError::Cancelled.into());
+            return Err(WorkerError::Unavailable(
+                "CONTROLLER_EVENTS_CANCELLED: cancelled".into(),
+            ));
         }
         if self.runtime.now() >= deadline {
             return Err(WorkerError::Unavailable(

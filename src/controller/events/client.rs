@@ -241,6 +241,7 @@ pub struct TaskReconciler {
     comparison: Option<Comparison>,
     last_started: Option<Duration>,
     repair_needed: bool,
+    unaccounted_feed: bool,
     changes: VecDeque<DerivedTaskChange>,
     confirmed: BTreeMap<TaskId, TaskFacts>,
 }
@@ -262,6 +263,7 @@ impl TaskReconciler {
             comparison: None,
             last_started: None,
             repair_needed: false,
+            unaccounted_feed: false,
             changes: VecDeque::new(),
             confirmed: BTreeMap::new(),
         };
@@ -321,6 +323,19 @@ impl TaskReconciler {
         replay: bool,
     ) -> Result<(bool, Option<EventCursor>), WorkerError> {
         batch.validate()?;
+        if !replay {
+            if let Some(cursor) = self.cursor {
+                let first_new = batch.events.iter().find(|event| event.seq > cursor.seq);
+                if batch.journal_id != cursor.journal_id
+                    || first_new
+                        .is_some_and(|event| cursor.seq.checked_increment() != Some(event.seq))
+                    || (batch.events.is_empty() && batch.next_after.seq > cursor.seq)
+                {
+                    self.repair_needed = true;
+                    return Err(unavailable());
+                }
+            }
+        }
         let mut consumed = None;
         for event in &batch.events {
             if !replay
@@ -344,6 +359,9 @@ impl TaskReconciler {
                     _ => None,
                 };
                 if !self.enqueue(id, cause, None) {
+                    if !replay {
+                        self.unaccounted_feed = true;
+                    }
                     return Ok((false, consumed));
                 }
             } else {
@@ -361,6 +379,9 @@ impl TaskReconciler {
             {
                 self.cursor = Some(cursor);
             }
+        }
+        if !replay {
+            self.unaccounted_feed = false;
         }
         Ok((true, consumed))
     }
@@ -483,14 +504,11 @@ impl TaskReconciler {
             check(self.runtime.as_ref(), deadline)?;
             match read {
                 Ok(result) => {
-                    result.validate()?;
-                    Some(match result {
-                        EventReadResult::SnapshotRequired(control) => control.window.cursor(),
-                        EventReadResult::Batch(batch) => EventCursor {
-                            journal_id: batch.journal_id,
-                            seq: batch.head_seq,
-                        },
-                    })
+                    validate_read(&ReadQuery::default(), &result)?;
+                    let EventReadResult::SnapshotRequired(control) = result else {
+                        return Err(unavailable());
+                    };
+                    Some(control.window.cursor())
                 }
                 Err(_) => None,
             }
@@ -583,10 +601,26 @@ impl TaskReconciler {
             }
             Ok(RepairProgress::Complete) => {
                 if let Some(baseline) = sweep.baseline {
-                    if self.cursor.is_none_or(|old| {
-                        old.journal_id != baseline.journal_id || old.seq < baseline.seq
-                    }) {
+                    if !self.unaccounted_feed
+                        && self.cursor.is_none_or(|old| {
+                            old.journal_id != baseline.journal_id || old.seq < baseline.seq
+                        })
+                    {
                         self.cursor = Some(baseline);
+                    }
+                }
+                // A positively busy cold baseline becomes warm once complete.
+                // Unknown proof of historical completion remains cold until confirmed.
+                if matches!(self.previous, PreviousProjection::Absent) {
+                    for (id, candidate) in &mut self.candidates {
+                        if let Some(facts) = sweep.rows.get(id) {
+                            if facts.eligibility_signature().busy == Some(true)
+                                && candidate.cause.is_none()
+                            {
+                                candidate.previous = Some(facts.clone());
+                                candidate.warm = true;
+                            }
+                        }
                     }
                 }
                 let old =
@@ -668,7 +702,7 @@ impl TaskReconciler {
         if comparison.ids.is_empty() {
             comparison
                 .attention
-                .update(comparison.attention_count.to_le_bytes());
+                .update((comparison.attention_count as u64).to_le_bytes());
             Ok(Some(AttentionSummary {
                 count: comparison.attention_count,
                 fingerprint: format!("{:x}", comparison.attention.finalize()),
@@ -702,6 +736,7 @@ impl EventReconciler for TaskReconciler {
                 EventReadResult::SnapshotRequired(control) => {
                     captured = Some(control.window.cursor());
                     self.sweep = None;
+                    self.unaccounted_feed = false;
                     self.repair_needed = true;
                 }
             }

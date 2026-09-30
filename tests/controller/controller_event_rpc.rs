@@ -326,7 +326,6 @@ mod state_reads {
 
     use mac_worker::{
         controller::events::{OpaqueCursor, rpc::task_reads::*},
-        error::WorkerError,
         paths::PathLayout,
         task::{LocalTaskRecord, TaskId},
     };
@@ -474,7 +473,7 @@ mod state_reads {
         let events = paths.controller_state_root().join("events");
         fs::create_dir_all(&events).unwrap();
         std::os::unix::fs::symlink("missing", events.join("journal.lock")).unwrap();
-        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
         assert_eq!(
             reader
                 .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
@@ -486,6 +485,36 @@ mod state_reads {
         );
         fs::remove_dir_all(&events).unwrap();
         fs::write(events, b"not a directory").unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        let provider = mac_worker::controller::events::rpc::ExistingTaskProjectionProvider::new(
+            paths.clone(),
+            runtime,
+        );
+        let journal = mac_worker::controller::events::testing::FakeJournalProvider::error(
+            "unsafe event namespace",
+        );
+        for selector in [
+            mac_worker::controller::events::EventSelector::Tasks(
+                mac_worker::controller::events::TaskAddressQuery::try_new(vec![id(1)], false, None)
+                    .unwrap(),
+            ),
+            mac_worker::controller::events::EventSelector::Repair(
+                mac_worker::controller::events::TaskRepairQuery::default(),
+            ),
+        ] {
+            let frame = mac_worker::controller::events::rpc::serve_selector_with(
+                &super::request(&selector),
+                &journal,
+                &provider,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(mac_worker::controller::decode_frame(&frame).unwrap())
+                    .unwrap();
+            assert_eq!(value["result"]["rows"][0]["quiescent"], true);
+        }
+        assert_eq!(journal.open_count(), 0);
         assert_eq!(
             reader
                 .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
@@ -557,6 +586,17 @@ mod state_reads {
             let next = page.value.next.unwrap();
             assert!(next.as_str().len() <= 2048);
             assert_ne!(cursor.as_ref(), Some(&next));
+            use base64::Engine as _;
+            let token: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(next.as_str())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                token["after_task_id"].as_str().unwrap(),
+                seen.last().unwrap().to_string()
+            );
             cursor = Some(next);
             assert!(pages <= 65, "a frozen admitted registry must make progress");
         }
@@ -871,10 +911,7 @@ mod state_reads {
             .addressed_measured(&[id(1)], false, None, Duration::from_secs(30))
             .err()
             .unwrap();
-        assert!(matches!(
-            error,
-            WorkerError::Process(mac_worker::error::ProcessError::Cancelled)
-        ));
+        assert_eq!(error.public_code(), "CONTROLLER_EVENTS_CANCELLED");
     }
     fn near_max_record(number: u128) -> LocalTaskRecord {
         let mut wire =
@@ -906,10 +943,6 @@ mod state_reads {
         let candidate: LocalTaskRecord = serde_json::from_value(wire).unwrap();
         assert!(candidate.canonical_bytes().unwrap().len() > MAX_TASK_RECORD_BYTES - 1024);
         candidate
-    }
-    fn private_directory(path: &std::path::Path) {
-        fs::create_dir(path).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
 
@@ -1382,6 +1415,498 @@ mod reconciliation {
             assert_eq!(result.repair, RepairProgress::Restarted);
             assert!(
                 matches!(reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.contains_key(&task_id(9)))
+            );
+        }
+    }
+    #[test]
+    fn repair_never_jumps_to_post_snapshot_head() {
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, false)), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, false))
+            .unwrap();
+        h.source
+            .tasks
+            .insert(terminal(2, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.tasks.set_page_budget(1);
+        assert_eq!(h.tick(None, true).repair, RepairProgress::InProgress);
+        let baseline = h.source.tasks.repair_requests()[0].baseline_after.unwrap();
+        assert_eq!(baseline.seq, Seq::ZERO);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(1, true);
+        let source = h.source.clone();
+        *h.source.read_hook.lock().unwrap() = Some(Box::new(move || source.hint(2, false)));
+        assert_eq!(h.tick(None, false).repair, RepairProgress::InProgress);
+        let result = h.tick(None, false);
+        assert_eq!(result.repair, RepairProgress::Complete);
+        assert_eq!(result.consumed_after.unwrap().seq, Seq::new(1));
+        assert_eq!(
+            h.source.journal.window(deadline()).unwrap().head_seq,
+            Seq::new(2)
+        );
+        assert!(
+            h.source
+                .tasks
+                .repair_requests()
+                .iter()
+                .all(|q| q.baseline_after == Some(baseline))
+        );
+        assert!(
+            matches!(h.reconciler.previous_projection(),PreviousProjection::Present(rows) if rows[&task_id(1)].quiescent==Some(true))
+        );
+    }
+    #[test]
+    fn replay_expiry_restarts_without_replacing_previous_projection() {
+        let mut h = Harness::new(warm(terminal(9, SafeOutcome::Done, true)), None, vec![]);
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        h.source.tasks.set_page_budget(1);
+        h.tick(None, true);
+        h.source
+            .journal
+            .replace_epoch(uuid::Uuid::from_u128(2))
+            .unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.repair, RepairProgress::Restarted);
+        assert!(
+            matches!(h.reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.contains_key(&task_id(9)))
+        );
+    }
+    #[test]
+    fn cold_busy_baseline_can_later_derive_a_warm_quiescent_transition() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![task_id(1)]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, false))
+            .unwrap();
+        let first = h.tick(None, true);
+        assert!(first.changes.is_empty());
+        assert_eq!(first.repair, RepairProgress::Complete);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        let result = h.tick(None, false);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].cause, ChangeCause::RepairDifference);
+        assert_eq!(
+            result.changes[0].previous.as_ref().unwrap().busy,
+            Some(true)
+        );
+    }
+    #[test]
+    fn unaccounted_candidates_do_not_advance_cursor_and_replayed_ids_eventually_fit() {
+        let mut h = Harness::new(
+            PreviousProjection::Present(BTreeMap::new()),
+            None,
+            (1..=256).map(task_id).collect(),
+        );
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Present(BTreeMap::new()),
+            Some(after),
+            (1..=256).map(task_id).collect(),
+            h.runtime.clone(),
+        );
+        h.source.hint(1000, false);
+        let read = h.feed(after);
+        let first = h.tick(Some(read.clone()), false);
+        assert_eq!(first.consumed_after, Some(after));
+        assert!(first.pending_ids.len() <= 256);
+        let second = h.tick(Some(read), false);
+        assert_eq!(second.consumed_after.unwrap().seq, Seq::new(1));
+    }
+    #[test]
+    fn a_gap_after_consumed_cursor_is_rejected_without_advancing_it() {
+        let mut h = Harness::new(PreviousProjection::Present(BTreeMap::new()), None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Present(BTreeMap::new()),
+            Some(after),
+            vec![],
+            h.runtime.clone(),
+        );
+        h.source.hint(1, false);
+        h.source.hint(2, false);
+        let EventReadResult::Batch(mut batch) = h.feed(after) else {
+            panic!("batch expected")
+        };
+        batch.events.remove(0);
+        batch.validate().unwrap();
+        let error = h
+            .reconciler
+            .reconcile(
+                h.source.as_ref(),
+                ReconcileInput {
+                    read: Some(EventReadResult::Batch(batch)),
+                    repair_due: false,
+                    include_titles: false,
+                },
+                deadline(),
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_EVENTS_UNAVAILABLE");
+        assert_eq!(h.reconciler.cursor(), Some(after));
+    }
+    #[test]
+    fn many_current_attention_rows_are_chunked_with_stable_complete_fingerprint() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        for id in 1..=300 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                .unwrap();
+        }
+        let mut summary = None;
+        for i in 0..200 {
+            let result = h.tick(None, i == 0);
+            assert!(
+                result.confirmed.len() <= 256
+                    && result.changes.len() <= 256
+                    && result.pending_ids.len() <= 256
+            );
+            if result.attention.is_some() {
+                summary = result.attention;
+                break;
+            }
+        }
+        let summary = summary.expect("complete attention summary");
+        assert_eq!(summary.count, 300);
+        h.runtime.advance(Duration::from_secs(15));
+        let mut next = None;
+        for _ in 0..200 {
+            let result = h.tick(None, false);
+            if result.attention.is_some() {
+                next = result.attention;
+                break;
+            }
+        }
+        assert_eq!(next, Some(summary));
+    }
+    #[test]
+    fn bootstrap_batch_never_uses_undelivered_head_as_baseline() {
+        let source = ScriptedEventSource::new();
+        let id = uuid::Uuid::from_u128(1);
+        let cursor = EventCursor {
+            journal_id: id,
+            seq: Seq::new(10),
+        };
+        source
+            .queue_read(Ok(EventReadResult::Batch(
+                mac_worker::controller::events::ReadBatch {
+                    schema_version: 1,
+                    journal_id: id,
+                    oldest_seq: Seq::new(10),
+                    head_seq: Seq::new(10),
+                    next_after: cursor,
+                    events: vec![
+                        NewEvent::ControllerDrainChanged { drained: true }
+                            .to_wire(id, Seq::new(10), 0)
+                            .unwrap(),
+                    ],
+                    has_more: false,
+                },
+            )))
+            .unwrap();
+        source
+            .queue_repair(Ok(TaskRepairPage {
+                rows: vec![],
+                next: None,
+                complete: true,
+                restart: false,
+                baseline_after: Some(cursor),
+            }))
+            .unwrap();
+        let mut reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            None,
+            vec![],
+            Arc::new(ManualEventRuntime::new()),
+        );
+        assert!(
+            reconciler
+                .reconcile(
+                    &source,
+                    ReconcileInput {
+                        read: None,
+                        repair_due: true,
+                        include_titles: false
+                    },
+                    deadline()
+                )
+                .is_err()
+        );
+        assert_eq!(
+            source
+                .requests()
+                .iter()
+                .filter(|request| request.body["controller_events"]["op"] == "repair")
+                .count(),
+            0
+        );
+        assert_eq!(reconciler.cursor(), None);
+    }
+}
+
+mod transport_bounds {
+    use super::*;
+    use mac_worker::controller::events::{
+        EventBatch, JournalReader, JournalWriter, NewEvent, TaskProjectionReader,
+        rpc::TaskEventReadStore, testing::ManualEventRuntime,
+    };
+    use std::sync::Mutex;
+    type ReplyFactory = dyn Fn(&mac_worker::controller::ControllerRequest) -> Value + Send + Sync;
+    struct ReplyRunner {
+        reply: Box<ReplyFactory>,
+        calls: Mutex<Vec<ProcessRequest>>,
+    }
+    impl ProcessRunner for ReplyRunner {
+        fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.calls.lock().unwrap().push(process.clone());
+            let request = decode_request(process.stdin.as_ref().unwrap())?;
+            let value = (self.reply)(&request);
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: encode_json_frame(&value)?,
+                stderr: b"PRIVATE REMOTE DETAIL".to_vec(),
+            })
+        }
+    }
+    fn client(
+        reply: impl Fn(&mac_worker::controller::ControllerRequest) -> Value + Send + Sync + 'static,
+        runtime: Arc<ManualEventRuntime>,
+    ) -> (ControllerEventClient, Arc<ReplyRunner>) {
+        let runner = Arc::new(ReplyRunner {
+            reply: Box::new(reply),
+            calls: Mutex::new(vec![]),
+        });
+        let config =
+            Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n").unwrap();
+        (
+            ControllerEventClient::new(runner.clone(), config.controller, runtime),
+            runner,
+        )
+    }
+    #[test]
+    fn only_exact_legacy_selector_rejection_means_unsupported() {
+        for (code, message, want) in [
+            (
+                "INVALID_REQUEST",
+                "task.list body contained unexpected key controller_events",
+                "CONTROLLER_EVENTS_UNSUPPORTED",
+            ),
+            (
+                "INVALID_REQUEST",
+                "another malformed request",
+                "CONTROLLER_EVENTS_UNAVAILABLE",
+            ),
+            (
+                "CONTROLLER_EVENTS_UNAVAILABLE",
+                "task.list body contained unexpected key controller_events",
+                "CONTROLLER_EVENTS_UNAVAILABLE",
+            ),
+            (
+                "INVALID_REQUEST",
+                "protocol error",
+                "CONTROLLER_EVENTS_UNAVAILABLE",
+            ),
+        ] {
+            let (client, _) = client(
+                move |_| {
+                    serde_json::to_value(HostControlError::new(code, message).unwrap()).unwrap()
+                },
+                Arc::new(ManualEventRuntime::new()),
+            );
+            let error = client.read(ReadQuery::default(), deadline()).unwrap_err();
+            assert_eq!(error.public_code(), want);
+            assert!(!error.to_string().contains("PRIVATE"));
+        }
+    }
+    #[test]
+    fn every_reply_identity_field_is_verified() {
+        for field in [
+            "protocol_version",
+            "command",
+            "request_id",
+            "payload_sha256",
+        ] {
+            let (client, _) = client(
+                move |request| {
+                    let mut value = envelope(
+                        request,
+                        json!({"rows":[],"missing":[task_id(1)],"proof_after":null,"baseline_after":null}),
+                    );
+                    value[field] = if field == "protocol_version" {
+                        json!(6)
+                    } else {
+                        json!("wrong")
+                    };
+                    value
+                },
+                Arc::new(ManualEventRuntime::new()),
+            );
+            let error = client
+                .tasks(
+                    TaskAddressQuery::try_new(vec![task_id(1)], false, None).unwrap(),
+                    deadline(),
+                )
+                .unwrap_err();
+            assert_eq!(error.public_code(), "CONTROLLER_EVENTS_UNAVAILABLE");
+        }
+    }
+    #[test]
+    fn addressed_reply_covers_exact_requested_ids_and_title_preference() {
+        for bad in [
+            json!({"rows":[],"missing":[task_id(2)],"proof_after":null,"baseline_after":null}),
+            {
+                let mut facts = terminal(1, SafeOutcome::Done, true);
+                facts.title = Some("display".into());
+                json!({"rows":[facts],"missing":[],"proof_after":null,"baseline_after":null})
+            },
+        ] {
+            let (client, _) = client(
+                move |request| envelope(request, bad.clone()),
+                Arc::new(ManualEventRuntime::new()),
+            );
+            assert!(
+                client
+                    .tasks(
+                        TaskAddressQuery::try_new(vec![task_id(1)], false, None).unwrap(),
+                        deadline()
+                    )
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn limit_wait_overflow_clamps_and_process_policy_keeps_original_budget() {
+        let journal = MemoryJournal::new();
+        let after = journal.window(deadline()).unwrap().cursor();
+        journal
+            .append(
+                EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: true }; 32])
+                    .unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        let (client, runner) = client(
+            move |request| {
+                let EventSelector::Read(query) =
+                    EventSelector::from_request_body(request.body()).unwrap()
+                else {
+                    panic!("read")
+                };
+                assert_eq!(query.limit, 256);
+                assert_eq!(query.wait_ms, 20000);
+                envelope(
+                    request,
+                    serde_json::to_value(journal.read(query, deadline()).unwrap()).unwrap(),
+                )
+            },
+            Arc::new(ManualEventRuntime::new()),
+        );
+        client
+            .read(
+                ReadQuery {
+                    after: Some(after),
+                    limit: usize::MAX,
+                    wait_ms: u64::MAX,
+                },
+                Duration::from_secs(7),
+            )
+            .unwrap();
+        assert_eq!(
+            runner.calls.lock().unwrap()[0].policy.deadline,
+            Duration::from_secs(7)
+        );
+    }
+    #[test]
+    fn read_deadline_and_cancellation_use_injected_runtime() {
+        let runtime = Arc::new(ManualEventRuntime::new());
+        let advance = runtime.clone();
+        let (client, runner) = client(
+            move |request| {
+                advance.advance(Duration::from_secs(30));
+                envelope(request, json!({}))
+            },
+            runtime.clone(),
+        );
+        assert_eq!(
+            client
+                .read(ReadQuery::default(), deadline())
+                .unwrap_err()
+                .public_code(),
+            "CONTROLLER_EVENTS_UNAVAILABLE"
+        );
+        assert_eq!(
+            runner.calls.lock().unwrap()[0].policy.deadline,
+            Duration::from_secs(30)
+        );
+        runtime.cancel();
+        assert_eq!(
+            client
+                .read(ReadQuery::default(), deadline())
+                .unwrap_err()
+                .public_code(),
+            "CONTROLLER_EVENTS_CANCELLED"
+        );
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn lazy_real_reader_reports_event_cancellation_code() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: path.join("config"),
+            state: path.join("state"),
+            cache: path.join("cache"),
+            data: path.join("data"),
+        };
+        ClientStateStore::open(&paths.state).unwrap();
+        let runtime = Arc::new(ManualEventRuntime::new());
+        let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        runtime.cancel();
+        let error = reader
+            .addressed(
+                TaskAddressQuery::try_new(vec![task_id(1)], false, None).unwrap(),
+                deadline(),
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_EVENTS_CANCELLED");
+    }
+    #[test]
+    fn damaged_or_absent_journal_does_not_disable_supported_state_selectors() {
+        for journal in [
+            FakeJournalProvider::error("damaged event root/lock"),
+            FakeJournalProvider::absent(),
+        ] {
+            let tasks = FakeTaskProjectionProvider::new(Arc::new(MemoryTaskReader::new()));
+            for selector in [
+                EventSelector::Tasks(
+                    TaskAddressQuery::try_new(vec![task_id(1)], false, None).unwrap(),
+                ),
+                EventSelector::Repair(TaskRepairQuery::default()),
+            ] {
+                serve_selector_with(&request(&selector), &journal, &tasks, deadline()).unwrap();
+            }
+            assert_eq!(journal.open_count(), 0);
+            assert_eq!(tasks.open_count(), 2);
+            assert!(
+                serve_selector_with(
+                    &request(&EventSelector::Read(ReadQuery::default())),
+                    &journal,
+                    &tasks,
+                    deadline()
+                )
+                .is_err()
             );
         }
     }
