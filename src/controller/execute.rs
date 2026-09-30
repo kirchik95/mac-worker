@@ -546,6 +546,25 @@ fn run_git(runner: &dyn ProcessRunner, args: Vec<OsString>) -> Result<(), Worker
     }
 }
 
+struct RpcEventRuntime;
+
+impl crate::controller::events::EventRuntime for RpcEventRuntime {
+    fn now(&self) -> Duration {
+        crate::transfer::ResolutionRuntime::monotonic_now(&crate::transfer::SystemResolutionRuntime)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        crate::transfer::ResolutionRuntime::sleep(
+            &crate::transfer::SystemResolutionRuntime,
+            duration,
+        );
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
 pub fn serve_rpc_with_runtime(
     paths: &PathLayout,
     config: &Config,
@@ -556,7 +575,18 @@ pub fn serve_rpc_with_runtime(
 ) -> Result<(), WorkerError> {
     let payload = crate::controller::protocol::read_frame(stdin)?;
     let request = crate::controller::protocol::parse_request(&payload)?;
-    let frame = if crate::controller::health_read::is_health_read(&request) {
+    let frame = if crate::controller::events::rpc::is_event_selector(&request) {
+        use crate::controller::events::{
+            EventRuntime, RPC_BUDGET,
+            journal::ExistingJournalProvider,
+            rpc::{ExistingTaskProjectionProvider, serve_selector_with},
+        };
+        let runtime: std::sync::Arc<dyn EventRuntime> = std::sync::Arc::new(RpcEventRuntime);
+        let deadline = runtime.now().saturating_add(RPC_BUDGET);
+        let journal = ExistingJournalProvider::new(paths.clone(), runtime.clone());
+        let tasks = ExistingTaskProjectionProvider::new(paths.clone(), runtime);
+        serve_selector_with(&request, &journal, &tasks, deadline)?
+    } else if crate::controller::health_read::is_health_read(&request) {
         crate::controller::health_read::serve_health_read(&request, &paths.controller_state_root())?
     } else if request.command() == "controller.drain" {
         crate::controller::control::serve_drain(&request, &paths.controller_state_root())?

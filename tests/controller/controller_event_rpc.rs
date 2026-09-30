@@ -73,15 +73,40 @@ fn terminal(n: u128, outcome: SafeOutcome, quiescent: bool) -> TaskFacts {
     )
 }
 fn request(selector: &EventSelector) -> mac_worker::controller::ControllerRequest {
+    rpc_request("task.list", selector.request_body().unwrap())
+}
+fn rpc_request(command: &str, body: Value) -> mac_worker::controller::ControllerRequest {
     mac_worker::controller::parse_request(
         &serde_json::to_vec(&json!({
             "protocol_version": PROTOCOL_VERSION,
-            "command": "task.list", "request_id": uuid::Uuid::new_v4().simple().to_string(),
-            "body": selector.request_body().unwrap()
+            "command": command, "request_id": uuid::Uuid::new_v4().simple().to_string(),
+            "body": body
         }))
         .unwrap(),
     )
     .unwrap()
+}
+fn routed_rpc(
+    paths: &PathLayout,
+    request: &mac_worker::controller::ControllerRequest,
+) -> Result<Vec<u8>, WorkerError> {
+    let config = Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n")?;
+    let input = encode_json_frame(&json!({
+        "protocol_version": request.protocol_version(),
+        "command": request.command(),
+        "request_id": request.request_id(),
+        "body": request.body(),
+    }))?;
+    let mut output = Vec::new();
+    mac_worker::controller::serve_rpc_with_runtime(
+        paths,
+        &config,
+        &NoRemote,
+        &mut std::io::Cursor::new(input),
+        &mut output,
+        ControllerFault::None,
+    )?;
+    Ok(output)
 }
 fn envelope(request: &mac_worker::controller::ControllerRequest, result: Value) -> Value {
     json!({"protocol_version": PROTOCOL_VERSION, "command":request.command(),
@@ -307,6 +332,10 @@ fn invalid_selectors_are_rejected_before_opening_any_provider() {
 }
 
 mod state_reads {
+    use super::{
+        ControllerStore, EventSelector, ReadQuery, TaskAddressQuery, TaskRepairQuery, WorkerError,
+        decode_frame, is_event_selector,
+    };
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -439,6 +468,172 @@ mod state_reads {
 
     fn id(number: u128) -> TaskId {
         TaskId::new(uuid::Uuid::from_u128(number))
+    }
+
+    #[test]
+    fn rpc_routing_serves_all_selectors_with_the_existing_read_envelope() {
+        use mac_worker::controller::{
+            ControllerLeader,
+            events::{
+                EventBatch, JournalReader, NewEvent,
+                journal::{ControllerJournal, JournalOptions},
+            },
+            read::ControllerReadReply,
+        };
+
+        let (_root, paths, runtime) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
+        let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+        let journal =
+            ControllerJournal::initialize_for_leader(&paths, &leader, JournalOptions { runtime })
+                .unwrap();
+        let after = journal.window(super::deadline()).unwrap().cursor();
+        journal
+            .append(
+                EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: true }])
+                    .unwrap(),
+                super::deadline(),
+            )
+            .unwrap();
+        for selector in [
+            EventSelector::Read(ReadQuery {
+                after: Some(after),
+                limit: 1,
+                wait_ms: 0,
+            }),
+            EventSelector::Tasks(TaskAddressQuery::try_new(vec![id(1)], false, None).unwrap()),
+            EventSelector::Repair(TaskRepairQuery::default()),
+        ] {
+            let request = super::request(&selector);
+            assert_eq!(request.command(), "task.list");
+            let frame = super::routed_rpc(&paths, &request).unwrap();
+            let reply: ControllerReadReply<serde_json::Value> =
+                serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
+            reply.verify_envelope(&request).unwrap();
+            let value = reply.result();
+            match selector {
+                EventSelector::Read(_) => {
+                    assert_eq!(value["type"], "batch");
+                    assert_eq!(value["events"][0]["kind"], "controller.drained");
+                    assert_eq!(value["next_after"]["seq"], "1");
+                }
+                EventSelector::Tasks(_) | EventSelector::Repair(_) => {
+                    assert_eq!(value["rows"][0]["task_id"], id(1).to_string());
+                    assert_eq!(value["rows"][0]["quiescent"], true);
+                    assert_eq!(value["baseline_after"], serde_json::Value::Null);
+                }
+            }
+        }
+        assert_eq!(
+            ControllerStore::open(&paths.controller_state_root())
+                .unwrap()
+                .pending_health(1000)
+                .unwrap()
+                .active_count,
+            0
+        );
+        assert!(
+            fs::read_dir(paths.controller_state_root())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("req-")
+                })
+        );
+    }
+
+    #[test]
+    fn rpc_routing_rejects_selector_conflicts_before_health_or_state_open() {
+        let (_root, mut paths, _) = fixture();
+        paths.state = paths.state.with_file_name("uninitialized");
+        for body in [
+            serde_json::json!({"controller_events":{"op":"read"},"controller_health":true}),
+            serde_json::json!({"controller_events":{"op":"read"},"full":true}),
+            serde_json::json!({"controller_events":{"op":"read"},"run":"run"}),
+            serde_json::json!({"controller_events":{"op":"read"},"state":"open"}),
+            serde_json::json!({"controller_events":{"op":"read"},"outcome":"done"}),
+            serde_json::json!({"controller_events":null}),
+            serde_json::json!({"controller_events":{"op":"unknown"}}),
+            serde_json::json!({"controller_events":{"op":"read","path":"private"}}),
+            serde_json::json!({"controller_events":{"op":"tasks","task_ids":[]}}),
+        ] {
+            let request = super::rpc_request("task.list", body);
+            let error = super::routed_rpc(&paths, &request).unwrap_err();
+            assert_eq!(error.public_code(), "CONTROLLER_EVENTS_INVALID");
+            assert!(
+                !paths.state.exists(),
+                "malformed selector bootstrapped state"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_routing_state_selectors_use_minimal_reads_without_journal_access() {
+        let (_root, paths, _) = fixture();
+        write_record(&paths, &record(1, TaskState::Open, TaskOutcome::NeedsInput));
+        fs::write(paths.state.join("runs").join("invalid.json"), b"broken run").unwrap();
+        fs::remove_dir_all(paths.state.join("active-tasks")).unwrap();
+        let events = paths.controller_state_root().join("events");
+        fs::create_dir_all(&events).unwrap();
+        for damaged_lock in [false, true] {
+            if damaged_lock {
+                std::os::unix::fs::symlink("missing", events.join("journal.lock")).unwrap();
+            } else {
+                fs::remove_dir(&events).unwrap();
+                fs::write(&events, b"not a directory").unwrap();
+            }
+            for selector in [
+                EventSelector::Tasks(TaskAddressQuery::try_new(vec![id(1)], false, None).unwrap()),
+                EventSelector::Repair(TaskRepairQuery::default()),
+            ] {
+                let frame = super::routed_rpc(&paths, &super::request(&selector)).unwrap();
+                let reply: serde_json::Value =
+                    serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
+                assert_eq!(reply["result"]["rows"][0]["quiescent"], true);
+                assert_eq!(reply["result"]["baseline_after"], serde_json::Value::Null);
+                assert!(!paths.state.join("active-tasks").exists());
+            }
+            if !damaged_lock {
+                fs::remove_file(&events).unwrap();
+                fs::create_dir(&events).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_routing_missing_journal_is_unavailable_without_initializing_state() {
+        let (_root, mut paths, _) = fixture();
+        paths.state = paths.state.with_file_name("uninitialized");
+        let error = super::routed_rpc(
+            &paths,
+            &super::request(&EventSelector::Read(ReadQuery::default())),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_EVENTS_UNAVAILABLE");
+        assert!(!paths.state.exists());
+    }
+
+    #[test]
+    fn rpc_routing_unknown_commands_never_enter_event_reads() {
+        let (_root, paths, _) = fixture();
+        for command in ["events.read", "events.tasks", "events.repair"] {
+            let request = super::rpc_request(
+                command,
+                EventSelector::Repair(TaskRepairQuery::default())
+                    .request_body()
+                    .unwrap(),
+            );
+            assert!(!is_event_selector(&request));
+            let error = super::routed_rpc(&paths, &request).unwrap_err();
+            assert_eq!(error.public_code(), "CONTROLLER_TRANSPORT");
+            assert!(
+                matches!(error, WorkerError::Protocol(message) if message.contains("unsupported controller command"))
+            );
+        }
+        assert!(!paths.controller_state_root().join("events").exists());
     }
 
     #[test]
