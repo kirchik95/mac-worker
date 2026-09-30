@@ -17,7 +17,9 @@ use serde_json::{Map, Value};
 
 use crate::{
     account_launch::{account_environment_scaffold, account_login_shell_request},
-    agent::{AgentKind, AuthProbe, AuthProbeResult, adapter_for, render_prebind_shell},
+    agent::{
+        AgentKind, AuthProbe, AuthProbeResult, adapter_for, adapter_for_host, render_prebind_shell,
+    },
     error::{ProcessError, WorkerError},
     herdr::{
         CONNECT_DEADLINE, HerdrClient, HerdrError, HerdrSocket, ListedAgent, RESPONSE_DEADLINE,
@@ -1316,9 +1318,7 @@ where
             agents.push(unfinished_agent(name, &env_profiles));
             continue;
         }
-        let adapter = adapter_for(kind);
-        let binary = adapter.binary();
-        let auth_probe = adapter.auth_probe();
+        let binary = adapter_for(kind).binary();
         let Some(locate_allowance) = budget.allowance(PROBE_DEADLINE) else {
             agents.push(unfinished_agent(name, &env_profiles));
             continue;
@@ -1336,6 +1336,10 @@ where
             agents.push(unfinished_agent(name, &env_profiles));
             continue;
         }
+        // An agent with dialects takes its auth probe from the version this
+        // refresh has just observed, never from an older record: the wrong
+        // form of `opencode auth list` would reach the v2 background service.
+        let auth_probe = adapter_for_host(kind, version.as_deref()).auth_probe();
         let auth = if !base_available {
             AgentAuth::Unknown
         } else if let Some(auth_allowance) = budget.allowance(PROBE_DEADLINE) {
@@ -1376,7 +1380,7 @@ where
                 continue;
             }
             let entries = profile.profile_entries();
-            let available = resolve_profile_binary(
+            let located = resolve_profile_binary(
                 runner,
                 account_home,
                 binary,
@@ -1384,10 +1388,13 @@ where
                 profile_name,
                 &entries,
                 base_available,
+                version.as_deref(),
                 timing,
                 budget,
             );
-            any_profile_binary |= available;
+            any_profile_binary |= located.available;
+            // A profile that moves PATH can resolve another generation.
+            let auth_probe = adapter_for_host(kind, located.version.as_deref()).auth_probe();
             let auth = probe_profile_auth(
                 runner,
                 account_home,
@@ -1397,7 +1404,7 @@ where
                 profile_name,
                 &entries,
                 profile.keychain_config(),
-                available,
+                located.available,
                 timing,
                 budget,
                 &mut unlocks,
@@ -1583,6 +1590,8 @@ fn count_interactive_agents(listed: &[ListedAgent]) -> Option<u32> {
     u32::try_from(count).ok()
 }
 
+/// The binary a profile's login shell resolves, and its version. A profile
+/// that cannot change binary resolution reuses the default shell's answer.
 #[allow(clippy::too_many_arguments)]
 fn resolve_profile_binary(
     runner: &dyn ProcessRunner,
@@ -1592,24 +1601,29 @@ fn resolve_profile_binary(
     profile_name: &str,
     entries: &[(OsString, OsString)],
     base_available: bool,
+    base_version: Option<&str>,
     timing: &mut FactsTiming,
     budget: &FactsBudget<'_>,
-) -> bool {
+) -> LocateVersion {
     if !profile_can_change_binary_resolution(entries) {
-        return base_available;
+        return LocateVersion {
+            available: base_available,
+            version: base_version.map(str::to_owned),
+        };
     }
     let Some(allowance) = budget.allowance(PROBE_DEADLINE) else {
-        return false;
+        return LocateVersion {
+            available: false,
+            version: None,
+        };
     };
-    timing
-        .probe(
-            Some(agent),
-            Some(profile_name),
-            "locate+version",
-            allowance,
-            || run_locate_and_version(runner, account_home, binary, entries, allowance),
-        )
-        .available
+    timing.probe(
+        Some(agent),
+        Some(profile_name),
+        "locate+version",
+        allowance,
+        || run_locate_and_version(runner, account_home, binary, entries, allowance),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
