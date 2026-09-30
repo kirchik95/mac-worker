@@ -6,6 +6,107 @@ use predicates::prelude::*;
 use std::path::PathBuf;
 
 #[test]
+fn events_requires_follow_and_rejects_historical_or_notification_options() {
+    for arguments in [
+        vec!["worker", "events", "-f"],
+        vec!["worker", "events", "-f", "--json"],
+        vec!["worker", "--json", "events", "-f"],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_ok());
+    }
+    for arguments in [
+        vec!["worker", "events"],
+        vec!["worker", "events", "--json"],
+        vec!["worker", "events", "--follow"],
+        vec!["worker", "events", "-f", "--since", "1"],
+        vec!["worker", "events", "-f", "--quiet"],
+        vec!["worker", "events", "-f", "--channel", "macos"],
+        vec!["worker", "events", "-f", "--no-titles"],
+        vec!["worker", "events", "-f", "task-id"],
+    ] {
+        assert!(
+            Cli::try_parse_from(arguments.clone()).is_err(),
+            "accepted {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn notify_parses_every_option_and_channel() {
+    for arguments in [
+        vec!["worker", "notify"],
+        vec!["worker", "notify", "--follow"],
+        vec!["worker", "notify", "--quiet"],
+        vec!["worker", "notify", "--no-titles"],
+        vec!["worker", "notify", "--json"],
+        vec![
+            "worker",
+            "notify",
+            "--follow",
+            "--quiet",
+            "--no-titles",
+            "--channel",
+            "both",
+        ],
+    ] {
+        assert!(
+            Cli::try_parse_from(arguments.clone()).is_ok(),
+            "rejected {arguments:?}"
+        );
+    }
+    for channel in ["auto", "macos", "herdr", "both"] {
+        assert!(Cli::try_parse_from(["worker", "notify", "--channel", channel]).is_ok());
+    }
+    for arguments in [
+        vec!["worker", "notify", "-f"],
+        vec!["worker", "notify", "--channel"],
+        vec!["worker", "notify", "--channel", "remote"],
+        vec!["worker", "notify", "--channel", ""],
+        vec!["worker", "notify", "--since", "1"],
+        vec!["worker", "notify", "--follow=false"],
+        vec!["worker", "notify", "--quiet=false"],
+        vec!["worker", "notify", "--no-titles=false"],
+        vec!["worker", "notify", "task-id"],
+    ] {
+        assert!(
+            Cli::try_parse_from(arguments.clone()).is_err(),
+            "accepted {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn events_and_notify_help_describes_every_control() {
+    let mut root = Command::cargo_bin("worker").unwrap();
+    root.arg("--help");
+    root.assert()
+        .success()
+        .stdout(predicate::str::contains("events"))
+        .stdout(predicate::str::contains("notify"));
+    let mut events = Command::cargo_bin("worker").unwrap();
+    events.args(["events", "--help"]);
+    events
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-f"))
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--since").not());
+    let mut notify = Command::cargo_bin("worker").unwrap();
+    notify.args(["notify", "--help"]);
+    notify
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--follow"))
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("--channel"))
+        .stdout(predicate::str::contains("--no-titles"))
+        .stdout(predicate::str::contains("auto"))
+        .stdout(predicate::str::contains("macos"))
+        .stdout(predicate::str::contains("herdr"))
+        .stdout(predicate::str::contains("both"));
+}
+
+#[test]
 fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
     let mut command = Command::cargo_bin("worker").unwrap();
     command.arg("--help");
@@ -633,4 +734,260 @@ fn invalid_cli_usage_uses_the_reserved_usage_exit_code() {
         .code(64)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("unrecognized subcommand"));
+}
+
+struct EventCliFixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    config: PathBuf,
+    ssh: PathBuf,
+}
+impl EventCliFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            "version = 1\n[controller]\nenabled = true\nssh = 'fixture-only'\n",
+        )
+        .unwrap();
+        let ssh = root.join("fixture-ssh");
+        std::fs::write(&ssh, r#"#!/usr/bin/python3
+# Isolated controller fixture: ignores SSH argv and never contacts a host.
+import glob, hashlib, json, os, struct, sys
+wire = sys.stdin.buffer.read()
+request = json.loads(wire[4:])
+with open(os.environ['EVENT_FIXTURE_LOG'], 'a') as log:
+    log.write(json.dumps(request) + '\n')
+body = request['body']
+window = {'journal_id':'00000000-0000-0000-0000-000000000001','oldest_seq':'1','head_seq':'5'}
+if body.get('controller_health'):
+    result = {'features':['controller.events'], 'state':'stale', 'reason':'missing'}
+else:
+    selector = body['controller_events']
+    if selector['op'] == 'repair':
+        result = {'rows':[], 'next':None, 'complete':True, 'restart':False, 'baseline_after':selector.get('baseline_after')}
+    elif selector['op'] == 'read':
+        if selector.get('after') and os.environ.get('EVENT_FIXTURE_READY_PIPE'):
+            cached = glob.glob(os.environ['EVENT_FIXTURE_CACHE'] + '/*/notify.json')
+            if cached and json.load(open(cached[0])).get('consumed_after'):
+                with open(os.environ['EVENT_FIXTURE_READY_PIPE'], 'w') as ready:
+                    ready.write('following\n')
+        if os.environ.get('EVENT_FIXTURE_UNAVAILABLE') == '1':
+            result = None
+        elif selector.get('after') is None:
+            result = {'type':'snapshot_required', 'reason':'bootstrap', 'window':window}
+        else:
+            result = dict(window, type='batch', schema_version=1, next_after=selector['after'], events=[], has_more=False)
+    else:
+        raise AssertionError('unexpected fixture selector')
+identity = {'protocol_version':request['protocol_version'],'command':request['command'],'body':body}
+digest = hashlib.sha256(json.dumps(identity,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+reply = {'protocol_version':request['protocol_version'],'command':request['command'],'request_id':request['request_id'],'payload_sha256':digest,'result':result}
+payload = json.dumps(reply,separators=(',',':')).encode()
+sys.stdout.buffer.write(struct.pack('>I',len(payload))+payload)
+"#).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            _temp: temp,
+            root,
+            config,
+            ssh,
+        }
+    }
+    fn command(&self) -> Command {
+        Command::from_std(self.process_command())
+    }
+    fn process_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_worker"));
+        command
+            .env("HOME", self.root.join("home"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .env("MAC_WORKER_TEST_SSH", &self.ssh)
+            .env("EVENT_FIXTURE_LOG", self.root.join("requests.jsonl"))
+            .env_remove("HERDR_SOCKET")
+            .args(["--config", self.config.to_str().unwrap()]);
+        command
+    }
+    fn requests(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.root.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+#[test]
+fn production_notify_quiet_uses_rpc_baselines_without_local_task_state_or_channels() {
+    for unavailable in [false, true] {
+        let fixture = EventCliFixture::new();
+        let mut command = fixture.command();
+        if unavailable {
+            command.env("EVENT_FIXTURE_UNAVAILABLE", "1");
+        }
+        command.args(["notify", "--quiet", "--no-titles", "--channel", "both"]);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let requests = fixture.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["command"] == "task.list")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["body"]["controller_events"]["op"] == "repair")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["command"] == "task.wait.poll")
+        );
+        assert!(!fixture.root.join("state/mac-worker/tasks").exists());
+        let events = fixture.root.join("cache/mac-worker/controller/events");
+        let state_file = std::fs::read_dir(events)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry.file_type().unwrap().is_dir()
+                    && entry.file_name().to_string_lossy().len() == 64
+            })
+            .unwrap()
+            .path()
+            .join("notify.json");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_file).unwrap()).unwrap();
+        if unavailable {
+            assert!(saved["consumed_after"].is_null());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("state-only confirmation"));
+        } else {
+            assert_eq!(saved["consumed_after"]["seq"], "5");
+        }
+    }
+}
+
+#[test]
+fn production_event_tail_emits_ready_and_ctrl_c_exits_the_foreground_loop() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::Stdio,
+    };
+    let fixture = EventCliFixture::new();
+    let mut command = fixture.process_command();
+    command
+        .args(["events", "-f", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    assert!(stdout.read_line(&mut ready).unwrap() > 0);
+    let value: serde_json::Value = serde_json::from_str(&ready).unwrap();
+    assert_eq!(value["event"], "ready");
+    assert_eq!(value["data"]["head_seq"], "5");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.requests().iter().all(|request| {
+        request["command"] == "task.list"
+            && request["body"]
+                .get("controller_events")
+                .is_none_or(|selector| selector["op"] == "read")
+    }));
+}
+
+#[test]
+fn event_commands_require_controller_mode_before_any_rpc() {
+    for arguments in [vec!["events", "-f"], vec!["notify", "--quiet"]] {
+        let fixture = EventCliFixture::new();
+        std::fs::write(
+            &fixture.config,
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture-only'\nslots = 1\n",
+        )
+        .unwrap();
+        let valid =
+            mac_worker::config::Config::parse(&std::fs::read_to_string(&fixture.config).unwrap())
+                .unwrap();
+        assert!(!valid.controller.enabled);
+        let mut command = fixture.command();
+        command.args(arguments);
+        command
+            .assert()
+            .code(64)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("configuration error"));
+        assert!(!fixture.root.join("requests.jsonl").exists());
+    }
+}
+
+struct EventChild(Option<std::process::Child>);
+impl Drop for EventChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn production_notify_follow_ctrl_c_stops_after_the_durable_baseline() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::ffi::OsStrExt,
+        process::Stdio,
+    };
+    let fixture = EventCliFixture::new();
+    let pipe = fixture.root.join("ready.fifo");
+    let pipe_c = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(pipe_c.as_ptr(), 0o600) }, 0);
+    let mut command = fixture.process_command();
+    command
+        .env("EVENT_FIXTURE_READY_PIPE", &pipe)
+        .env(
+            "EVENT_FIXTURE_CACHE",
+            fixture.root.join("cache/mac-worker/controller/events"),
+        )
+        .args(["notify", "--follow", "--quiet", "--no-titles"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut owned = EventChild(Some(command.spawn().unwrap()));
+    let mut handshake = BufReader::new(std::fs::File::open(pipe).unwrap());
+    let mut line = String::new();
+    assert!(handshake.read_line(&mut line).unwrap() > 0);
+    assert_eq!(line, "following\n");
+    assert_eq!(
+        unsafe { libc::kill(owned.0.as_ref().unwrap().id() as i32, libc::SIGINT) },
+        0
+    );
+    let output = owned.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .all(|request| request["command"] == "task.list")
+    );
+    assert!(!fixture.root.join("state/mac-worker/tasks").exists());
 }

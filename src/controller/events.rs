@@ -5,9 +5,11 @@
 
 pub mod client;
 pub mod contracts;
+pub(crate) mod foreground;
 pub mod journal;
 pub mod notify;
 pub mod rpc;
+pub mod tail;
 pub mod testing;
 pub use contracts::*;
 

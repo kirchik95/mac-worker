@@ -128,6 +128,27 @@ pub enum Command {
         /// Job whose logs to print
         job_id: JobId,
     },
+    #[command(about = "Follow future controller lifecycle events")]
+    Events {
+        /// Follow new events from the current journal head (required)
+        #[arg(short = 'f', required = true, action = clap::ArgAction::SetTrue)]
+        follow: bool,
+    },
+    #[command(about = "Confirm current task attention and send laptop notifications")]
+    Notify {
+        /// Keep confirming new events and periodic repairs until Ctrl-C
+        #[arg(long)]
+        follow: bool,
+        /// Save notification decisions without displaying banners
+        #[arg(long)]
+        quiet: bool,
+        /// Laptop delivery channel (auto prefers reachable Herdr, then macOS)
+        #[arg(long, default_value = "auto", value_parser = ["auto", "macos", "herdr", "both"])]
+        channel: String,
+        /// Skip retrieving and displaying task titles
+        #[arg(long)]
+        no_titles: bool,
+    },
     Cancel {
         /// Job to cancel
         job_id: JobId,

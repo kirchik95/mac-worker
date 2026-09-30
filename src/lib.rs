@@ -464,6 +464,9 @@ fn execute_with_context(
         Command::Run { .. } => Err(WorkerError::Protocol(
             "public run requires the stdio execution boundary".into(),
         )),
+        Command::Events { .. } | Command::Notify { .. } => Err(WorkerError::Protocol(
+            "public event commands require the stdio execution boundary".into(),
+        )),
         Command::Task { .. } => Err(WorkerError::Protocol(
             "public task commands require the stdio execution boundary".into(),
         )),
@@ -932,6 +935,17 @@ pub fn run_with_stdio_in_context(
         // block commands; pending reports marker problems and includes legacy files.
         let _ =
             crate::controller::envelope::adopt_operation_envelopes(&paths.controller_cache_root());
+    }
+    match &cli.command {
+        Command::Events { .. } => {
+            return crate::controller::events::tail::run_command(&cli, runtime, stdout, stderr);
+        }
+        Command::Notify { .. } => {
+            return crate::controller::events::notify::follow::run_command(
+                &cli, runtime, stdout, stderr,
+            );
+        }
+        _ => {}
     }
     if let Command::Dashboard {
         port,

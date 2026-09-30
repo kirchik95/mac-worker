@@ -2,6 +2,7 @@
 
 mod cache;
 mod channels;
+pub mod follow;
 
 pub use cache::{NotifyCache, commit_then_deliver, plan_notifications};
 pub use channels::{
