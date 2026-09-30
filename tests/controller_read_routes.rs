@@ -522,7 +522,7 @@ fn logs_wait_terminal_follow_remains_bounded_until_checkpoint_completion() {
                     *count
                 };
                 assert!(call <= 3, "terminal logs must eventually finish");
-                assert_eq!(request.body()["wait_ms"], 20_000);
+                assert_eq!(request.body()["wait_ms"], 15_000);
                 if call == 3 {
                     seed_runner_log_checkpoint(
                         &self.controller.paths,
@@ -545,7 +545,7 @@ fn logs_wait_terminal_follow_remains_bounded_until_checkpoint_completion() {
                 )?;
                 assert_eq!(
                     self.clock.elapsed(),
-                    Duration::from_secs((call.min(2) * 20) as u64),
+                    Duration::from_secs((call.min(2) * 15) as u64),
                     "a terminal incomplete checkpoint must not cause immediate SSH repolling"
                 );
                 assert_eq!(reply.result().complete(), call == 3);

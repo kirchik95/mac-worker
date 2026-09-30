@@ -5907,7 +5907,7 @@ fn controller_task_logs_with_runtime(
             "follow": follow,
         });
         if long_poll {
-            body["wait_ms"] = serde_json::json!(20_000);
+            body["wait_ms"] = serde_json::json!(15_000);
         }
         if let Some(turn) = turn {
             body["turn"] = serde_json::json!(turn);

@@ -230,7 +230,7 @@ fn follow_negotiates_once_and_does_not_sleep_between_long_poll_replies() {
     assert!(clock.sleeps.lock().unwrap().is_empty());
     let requests = rpc.requests.lock().unwrap();
     for request in requests.iter() {
-        assert_eq!(request.body()["wait_ms"], 20_000);
+        assert_eq!(request.body()["wait_ms"], 15_000);
     }
     assert!(requests[0].body().get("turn_id").is_none());
     for request in &requests[1..] {
