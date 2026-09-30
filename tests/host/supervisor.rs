@@ -2463,10 +2463,12 @@ fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
 #[test]
 fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
     let temp = tempfile::tempdir().unwrap();
+    // Install ignored signals before forking so cleanup cannot beat the
+    // background shell to its traps. The child keeps them across exec.
     let command = CommandSpec::argv(vec![
         "/bin/sh".into(),
         "-c".into(),
-        "/bin/sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & echo $!; exit 0".into(),
+        "trap '' HUP TERM; /bin/sh -c 'exec /bin/sleep 120' & echo $!; exit 0".into(),
     ])
     .unwrap();
     let (store, lease, request) = prepared_host_with_command_and_timeout(
