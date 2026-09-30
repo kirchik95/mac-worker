@@ -1,5 +1,4 @@
-#[path = "support/fixture_pid.rs"]
-mod fixture_pid;
+use crate::fixture_pid;
 
 use base64::Engine;
 use mac_worker::{

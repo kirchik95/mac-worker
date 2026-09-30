@@ -5,8 +5,7 @@
 //! runtime (`MAC_WORKER_TEST_SSH` + `run_enabled_controller_task`); tests
 //! stay un-ignored.
 
-#[path = "support/controller_fail_closed_harness.rs"]
-mod harness;
+use crate::harness;
 
 use harness::{
     IsolatedHomes, REQUEST_ID, REQUEST_ID_OTHER, TASK_ID, controller_request_files, frame_json,

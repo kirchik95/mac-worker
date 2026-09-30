@@ -1,11 +1,9 @@
 //! Bounded controller task-mutation gates: server snapshot, no-effect rejects,
 //! JSON identity, and delegation to the existing fenced TaskClient methods.
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
-#[path = "support/task_state.rs"]
-mod task_state_fixture;
+use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
 
 use std::{

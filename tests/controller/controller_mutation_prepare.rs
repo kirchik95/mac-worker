@@ -6,10 +6,9 @@
 //! tree. `task.cancel` keeps its existing path. Real client state and real
 //! local git; no worker runs, no network.
 
-mod support;
+use crate::support;
 
-#[path = "support/task_state.rs"]
-mod task_state_fixture;
+use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
 
 use std::{

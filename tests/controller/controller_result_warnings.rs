@@ -1,6 +1,4 @@
-#[allow(dead_code)]
-#[path = "support/controller_gap.rs"]
-mod fixture;
+use crate::fixture;
 
 use fixture::{ControllerBridge, IsolatedHost, NoProcesses};
 use mac_worker::{controller::decode_frame, protocol::PROTOCOL_VERSION};

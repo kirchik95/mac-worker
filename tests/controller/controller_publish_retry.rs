@@ -1,6 +1,4 @@
-#[allow(dead_code)]
-#[path = "support/controller_gap.rs"]
-mod fixture;
+use crate::fixture;
 
 use std::{ffi::OsString, os::unix::process::ExitStatusExt, process::ExitStatus};
 

@@ -1,7 +1,6 @@
 //! Attached drain regression: real queue, admission and completion, fake worker transport.
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     ffi::{OsStr, OsString},
@@ -836,7 +835,11 @@ fn attached_resumed_followup_waits_for_drain() {
 
 fn probe_recovery(paths: &PathLayout) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "drain_recovery_probe", "--nocapture"])
+        .args([
+            "--exact",
+            &crate::support::libtest_name(module_path!(), "drain_recovery_probe"),
+            "--nocapture",
+        ])
         .env("DRAIN_RECOVERY_ROOT", paths.state.parent().unwrap())
         .output()
         .unwrap();
@@ -916,7 +919,11 @@ fn attached_waiter_exit_is_recovered_once_after_drain_off() {
     let task_id = expected.meta().task_id();
     mac_worker::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "drain_exiting_waiter", "--nocapture"])
+        .args([
+            "--exact",
+            &crate::support::libtest_name(module_path!(), "drain_exiting_waiter"),
+            "--nocapture",
+        ])
         .env("DRAIN_EXIT_ROOT", paths.state.parent().unwrap())
         .env("DRAIN_EXIT_REPO", repo.root())
         .output()

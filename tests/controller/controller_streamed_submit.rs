@@ -1,8 +1,7 @@
 //! Streamed source handshake bound to real TaskClient submit, plus result
 //! prepare/fetch/import. Not the ENV process harness.
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     collections::BTreeMap,

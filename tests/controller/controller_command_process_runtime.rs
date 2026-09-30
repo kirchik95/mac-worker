@@ -13,9 +13,8 @@
 //! uniquely owned test-private transport tap for controller wait RPC (the
 //! shared fake SSH journal only covers fakeexec, never controller frames).
 
-#[path = "support/controller_process.rs"]
-mod controller_process;
-mod support;
+use crate::controller_process;
+use crate::support;
 
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;

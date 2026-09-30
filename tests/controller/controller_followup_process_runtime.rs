@@ -5,9 +5,8 @@
 //! over the existing ENV process fixture. Shared `tests/support/controller_process*`
 //! is referenced, not copied.
 
-#[path = "support/controller_process.rs"]
-mod controller_process;
-mod support;
+use crate::controller_process;
+use crate::support;
 
 use std::path::Path;
 use std::process::{Command, Output};

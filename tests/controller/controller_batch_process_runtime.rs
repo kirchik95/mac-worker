@@ -7,9 +7,8 @@
 //! helper green as FLOW runtime acceptance. No production edits. No seeded
 //! completion.
 
-#[path = "support/controller_process.rs"]
-mod controller_process;
-mod support;
+use crate::controller_process;
+use crate::support;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;

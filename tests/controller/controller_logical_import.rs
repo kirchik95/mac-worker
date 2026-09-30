@@ -6,7 +6,7 @@
 //! rejecting foreign repositories and keep mandatory alternates verification.
 //! Real Git only; no worker binary is spawned.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 

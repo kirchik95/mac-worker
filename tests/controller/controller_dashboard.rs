@@ -981,7 +981,11 @@ fn readiness_timeout_reaps_a_silent_term_ignoring_stub() {
     let started = Instant::now();
     let output = command
         .env("MAC_WORKER_READINESS_FIXTURE", "1")
-        .args(["--exact", "readiness_timeout_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            &crate::support::libtest_name(module_path!(), "readiness_timeout_fixture"),
+            "--nocapture",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -1013,7 +1017,11 @@ fn readiness_timeout_rejects_slow_drip_http_and_reaps_child() {
     let started = Instant::now();
     let output = command
         .env("MAC_WORKER_READINESS_FIXTURE", "1")
-        .args(["--exact", "readiness_timeout_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            &crate::support::libtest_name(module_path!(), "readiness_timeout_fixture"),
+            "--nocapture",
+        ])
         .output()
         .unwrap();
     let elapsed = started.elapsed();

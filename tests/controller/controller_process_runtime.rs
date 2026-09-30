@@ -4,9 +4,8 @@
 //! (`runtime_*`) assert FLOW-owned enabled routing and stay honest red until
 //! that checkpoint; they are not `#[ignore]`.
 
-#[path = "support/controller_process.rs"]
-mod controller_process;
-mod support;
+use crate::controller_process;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

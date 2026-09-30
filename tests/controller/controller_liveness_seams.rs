@@ -1,8 +1,7 @@
 //! Slot occupancy and DAG claim occupy until a positive `Exited` verdict.
 //! First `Absent` is Unverifiable; only confirmed absence or `Reused` releases.
 
-#[path = "support/fixture_pid.rs"]
-mod fixture_pid;
+use crate::fixture_pid;
 
 use std::{
     collections::BTreeMap,

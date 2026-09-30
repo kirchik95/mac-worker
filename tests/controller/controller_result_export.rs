@@ -5,7 +5,7 @@
 //! Git objects. Durable rows are persisted through the real `ControllerStore`
 //! machinery; binds use the real registry API. No worker binary is spawned.
 
-mod support;
+use crate::support;
 
 use std::{
     collections::BTreeMap, ffi::OsString, io::Cursor, os::unix::fs::PermissionsExt, path::PathBuf,
