@@ -1431,7 +1431,28 @@ fn submit_request(
     }
 }
 
+fn freeze_admission_clock(state: ClientStateStore) -> ClientStateStore {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    state.with_admission_clock(Arc::new(move || Ok(now)))
+}
+
 impl AcceptedThenTerminalFixture {
+    fn new_with_frozen_admission_clock() -> Self {
+        Self::build_with_state(
+            AcceptedThenTerminalRunner::new(),
+            None,
+            WorkerPreference::Pinned {
+                worker: "mini-1".into(),
+            },
+            true,
+            false,
+            freeze_admission_clock,
+        )
+    }
+
     fn new() -> Self {
         Self::new_with_push_origin(None)
     }
@@ -1483,6 +1504,24 @@ impl AcceptedThenTerminalFixture {
         wait_for_capacity: bool,
         origin_source: bool,
     ) -> Self {
+        Self::build_with_state(
+            runner,
+            origin,
+            preference,
+            wait_for_capacity,
+            origin_source,
+            |state| state,
+        )
+    }
+
+    fn build_with_state(
+        runner: AcceptedThenTerminalRunner,
+        origin: Option<&str>,
+        preference: WorkerPreference,
+        wait_for_capacity: bool,
+        origin_source: bool,
+        configure_state: fn(ClientStateStore) -> ClientStateStore,
+    ) -> Self {
         let repo = support::GitRepo::init();
         repo.write("base.txt", b"base\n");
         repo.commit_all("base");
@@ -1492,7 +1531,7 @@ impl AcceptedThenTerminalFixture {
         let state_root = tempfile::tempdir().unwrap();
         let state_root_path = state_root.path().canonicalize().unwrap();
         let paths = support::task_harness::paths(&state_root_path);
-        let state = ClientStateStore::open(&paths.state).unwrap();
+        let state = configure_state(ClientStateStore::open(&paths.state).unwrap());
         let config = Config::parse(
             "version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\ncapabilities = [\"darwin-arm64\", \"origin:example.test\"]\n",
         )
@@ -6117,6 +6156,8 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
             "agent:codex".into(),
         ],
     );
+    // This fixture's synthetic origin capability must stay cached across both submits.
+    let state = freeze_admission_clock(state);
     let request = || TaskSubmitRequest {
         questions: None,
         agent: AgentKind::Codex,
@@ -8562,7 +8603,7 @@ impl ProcessRunner for GatedAdmissionRunner<'_> {
 #[test]
 fn runner_does_not_host_probe_when_submit_cache_is_fresh() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap();
-    let fixture = AcceptedThenTerminalFixture::new();
+    let fixture = AcceptedThenTerminalFixture::new_with_frozen_admission_clock();
     let probes_after_submit = fixture
         .runner
         .requests()
