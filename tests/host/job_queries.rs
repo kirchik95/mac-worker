@@ -3337,10 +3337,17 @@ fn terminal_statuses_remain_authoritative_after_the_lease_is_released() {
     for (index, terminal) in terminal_builders.into_iter().enumerate() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join(format!("terminal-{index}"));
-        let (store, lease, request) = prepared_host(&root);
+        let (store, lease, request) = prepared_host_with_live_command(
+            &root,
+            CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+        );
         let launcher = InlineSupervisorLauncher {
             store: store.clone(),
         };
+        assert!(
+            lease.expires_at_millis() > matrix_execution_now_millis(),
+            "terminal authority fixture must start with a live execution lease"
+        );
         let completed = JobService::new(&store, &launcher)
             .submit_at(request, 10)
             .unwrap();
@@ -4467,10 +4474,17 @@ fn status_binds_every_accepted_index_identity_to_canonical_metadata() {
 fn terminal_status_rejects_log_length_mismatch_after_release() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("terminal-log-mismatch");
-    let (store, lease, request) = prepared_host(&root);
+    let (store, lease, request) = prepared_host_with_live_command(
+        &root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
+    assert!(
+        lease.expires_at_millis() > matrix_execution_now_millis(),
+        "log mismatch fixture must start with a live execution lease"
+    );
     JobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
@@ -4902,10 +4916,17 @@ fn status_preserves_prelaunch_jobs_with_nonempty_private_directories() {
 fn a_missing_index_without_the_exact_live_lease_is_not_repaired_from_status_absence() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("post-release-no-index");
-    let (store, lease, request) = prepared_host(&root);
+    let (store, lease, request) = prepared_host_with_live_command(
+        &root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
+    assert!(
+        lease.expires_at_millis() > matrix_execution_now_millis(),
+        "missing index fixture must start with a live execution lease"
+    );
     JobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();

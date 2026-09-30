@@ -199,8 +199,11 @@ fn prepared_host_on(
         )
         .unwrap(),
     );
+    // The request timestamp is fingerprint material; execution consumes the
+    // lease deadline against the supervisor's real clock.
+    let now = wall_clock_millis();
     let lease = match LeaseService::new(store)
-        .acquire(&request, &healthy(), created_at_millis)
+        .acquire(&request, &healthy(), now)
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -231,7 +234,7 @@ fn prepared_host_on(
     .unwrap();
     fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
     RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, created_at_millis + 1)
+        .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (lease, SubmitRequest::new(request.material().clone()))
 }
@@ -1532,6 +1535,13 @@ fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
     assert!(workspace_b.is_dir());
     drop(store);
 
+    let now = wall_clock_millis();
+    for lease in [&lease_a, &lease_b] {
+        assert!(
+            lease.expires_at_millis() > now,
+            "slot recovery must start with a live execution lease: {lease:?}; now={now}"
+        );
+    }
     let faulted = HostStore::open(&root).unwrap();
     let launcher = FaultingInlineSupervisorLauncher {
         store: faulted.clone(),
