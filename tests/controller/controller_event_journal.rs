@@ -822,6 +822,237 @@ journal_role_cases!(run_initialization_role_case, Manifest, {
     public_initialization_manifest_final_synced: FinalSynced,
 });
 
+fn role_name(role: JournalRole) -> &'static str {
+    match role {
+        JournalRole::Initialization => "initialization",
+        JournalRole::Manifest => "manifest",
+        JournalRole::Pending => "pending",
+        JournalRole::Segment => "segment",
+        JournalRole::Retirement => "retirement",
+    }
+}
+
+fn run_pre_evidence_initialization_case(role: JournalRole, boundary: JournalRoleBoundary) {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = private_paths(temporary.path());
+    let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+    let runtime = Arc::new(ManualEventRuntime::new());
+    let faults = Arc::new(FaultControl::default());
+    *faults.next.lock().unwrap() = Some((JournalFaultPoint::Role(role, boundary), libc::EIO, 1));
+    assert!(
+        ControllerJournal::initialize_for_leader_with_hook(
+            &paths,
+            &leader,
+            JournalOptions {
+                runtime: runtime.clone()
+            },
+            faults.clone(),
+        )
+        .is_err()
+    );
+    assert_eq!(faults.hits.load(Ordering::SeqCst), 1);
+    let root = paths.controller_state_root().join("events");
+    let stage = root.join(format!("{}.stage", role_name(role)));
+    let metadata = fs::metadata(&stage).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.len(), 0);
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.dev(), fs::metadata(&root).unwrap().dev());
+    assert!(!root.join(format!("{}.role", role_name(role))).exists());
+    let epoch = fs::read(root.join("initialization.json"))
+        .ok()
+        .map(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["journal_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+    assert!(
+        ControllerJournal::open_existing(
+            &paths,
+            JournalOptions {
+                runtime: runtime.clone()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(fs::metadata(&stage).unwrap().ino(), metadata.ino());
+    let journal =
+        ControllerJournal::initialize_for_leader(&paths, &leader, JournalOptions { runtime })
+            .expect("leader must discard the empty stage created before evidence");
+    let window = journal.window(DEADLINE).unwrap();
+    assert_eq!(window.head_seq, Seq::ZERO);
+    if let Some(epoch) = epoch {
+        assert_eq!(window.journal_id.to_string(), epoch);
+    }
+    assert!(!stage.exists());
+    assert_eq!(
+        journal.append(drain_batch(1), DEADLINE).unwrap().seq,
+        Seq::new(1)
+    );
+}
+
+journal_role_cases!(run_pre_evidence_initialization_case, Initialization, {
+    leader_recovers_initialization_stage_created_before_evidence: StageCreated,
+});
+journal_role_cases!(run_pre_evidence_initialization_case, Segment, {
+    leader_recovers_segment_stage_created_before_evidence: StageCreated,
+});
+journal_role_cases!(run_pre_evidence_initialization_case, Manifest, {
+    leader_recovers_manifest_stage_created_before_evidence: StageCreated,
+});
+
+fn write_empty_stage(h: &JournalHarness, role: &str) {
+    let stage = h.root().join(format!("{role}.stage"));
+    fs::write(&stage, []).unwrap();
+    fs::set_permissions(stage, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn leader_alone_discards_evidence_less_empty_stages_without_resetting_head() {
+    for role in [
+        "initialization",
+        "manifest",
+        "pending",
+        "segment",
+        "retirement",
+    ] {
+        let h = JournalHarness::new();
+        h.append_one().unwrap();
+        let before = h.head();
+        write_empty_stage(&h, role);
+        let stage = h.root().join(format!("{role}.stage"));
+        let inode = fs::metadata(&stage).unwrap().ino();
+        assert!(h.reopen().is_err(), "reader cannot discard {role} stage");
+        assert!(
+            h.append_one().is_err(),
+            "append cannot discard {role} stage"
+        );
+        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        let journal = ControllerJournal::initialize_for_leader(
+            &h.paths,
+            &h._leader,
+            JournalOptions {
+                runtime: h.runtime.clone(),
+            },
+        )
+        .expect("leader must recover every fixed empty role stage");
+        assert!(!stage.exists());
+        assert_eq!(journal.window(DEADLINE).unwrap(), before);
+        assert_eq!(
+            journal.append(drain_batch(1), DEADLINE).unwrap().seq,
+            Seq::new(2)
+        );
+        h.assert_budget();
+    }
+}
+
+fn assert_evidence_less_stage_preserved(h: &JournalHarness, role: &str) {
+    // A safe earlier role must remain too if a later stage is unsafe.
+    write_empty_stage(h, "initialization");
+    let stage = h.root().join(format!("{role}.stage"));
+    let before = fs::symlink_metadata(&stage).unwrap();
+    let bytes = fs::read(&stage).unwrap();
+    let manifest = fs::read(h.root().join("manifest.json")).unwrap();
+    let names = || {
+        let mut names: Vec<_> = fs::read_dir(h.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before_names = names();
+    let error = ControllerJournal::initialize_for_leader(
+        &h.paths,
+        &h._leader,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+    )
+    .err()
+    .expect("unsafe evidence-less stage must fail closed");
+    assert_eq!(error.public_code(), "CONTROLLER_EVENTS_UNAVAILABLE");
+    assert!(
+        error.to_string().contains(role),
+        "diagnostic must name {role}: {error}"
+    );
+    assert!(!error.to_string().contains(h.root().to_str().unwrap()));
+    let after = fs::symlink_metadata(&stage).unwrap();
+    assert_eq!(
+        (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.mode(),
+            after.len(),
+            after.nlink()
+        ),
+        (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.mode(),
+            before.len(),
+            before.nlink()
+        )
+    );
+    assert_eq!(fs::read(&stage).unwrap(), bytes);
+    assert_eq!(fs::read(h.root().join("manifest.json")).unwrap(), manifest);
+    assert_eq!(names(), before_names);
+    assert_eq!(
+        fs::metadata(h.root().join("initialization.stage"))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn leader_preserves_nonempty_evidence_less_stage_and_names_its_role() {
+    let h = JournalHarness::new();
+    let stage = h.root().join("pending.stage");
+    fs::write(&stage, b"unproved content").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_evidence_less_stage_preserved(&h, "pending");
+}
+
+#[test]
+fn leader_preserves_wrong_mode_evidence_less_stage_and_names_its_role() {
+    for mode in [0o400, 0o640] {
+        let h = JournalHarness::new();
+        write_empty_stage(&h, "manifest");
+        fs::set_permissions(
+            h.root().join("manifest.stage"),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        assert_evidence_less_stage_preserved(&h, "manifest");
+    }
+}
+
+#[test]
+fn leader_preserves_foreign_hardlinked_evidence_less_stage_and_names_its_role() {
+    let h = JournalHarness::new();
+    let foreign = h._temporary.path().join("foreign-empty");
+    fs::write(&foreign, []).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&foreign, h.root().join("retirement.stage")).unwrap();
+    assert_evidence_less_stage_preserved(&h, "retirement");
+    assert_eq!(fs::metadata(foreign).unwrap().nlink(), 2);
+}
+
+#[test]
+fn leader_preserves_foreign_symlink_evidence_less_stage_and_names_its_role() {
+    let h = JournalHarness::new();
+    let foreign = h._temporary.path().join("foreign-empty");
+    fs::write(&foreign, []).unwrap();
+    std::os::unix::fs::symlink(&foreign, h.root().join("segment.stage")).unwrap();
+    assert_evidence_less_stage_preserved(&h, "segment");
+    assert!(fs::metadata(foreign).unwrap().is_file());
+}
+
 fn drain_batch(count: usize) -> EventBatch {
     EventBatch::try_new(vec![
         NewEvent::ControllerDrainChanged { drained: true };

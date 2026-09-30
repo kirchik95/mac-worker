@@ -36,6 +36,8 @@ pub enum JournalRole {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalRoleBoundary {
+    /// Empty stage and directory are durable; creation evidence is not written yet.
+    StageCreated,
     CreationRecorded,
     PartialStage,
     StageSynced,
@@ -95,6 +97,7 @@ impl fs::FaultHooks for Hooks {
                     R::Retirement => JournalRole::Retirement,
                 },
                 match boundary {
+                    PrivateRolePoint::StageCreated => JournalRoleBoundary::StageCreated,
                     PrivateRolePoint::CreationRecorded => JournalRoleBoundary::CreationRecorded,
                     PrivateRolePoint::PartialStage => JournalRoleBoundary::PartialStage,
                     PrivateRolePoint::StageSynced => JournalRoleBoundary::StageSynced,
@@ -144,7 +147,12 @@ pub struct ControllerJournal {
 
 fn io_unavailable(error: io::Error) -> WorkerError {
     // Never expose filesystem paths or arbitrary syscall text to event consumers.
-    if error.raw_os_error() == Some(libc::ESTALE) {
+    if let Some(stage) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<fs::UnprovedStage>())
+    {
+        unavailable(&stage.to_string())
+    } else if error.raw_os_error() == Some(libc::ESTALE) {
         unavailable("transient journal binding race; retryable")
     } else {
         unavailable("journal binding, contents or admission unavailable")

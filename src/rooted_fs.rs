@@ -794,6 +794,7 @@ pub(crate) struct PrivateRegularRole<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateRolePoint {
+    StageCreated,
     CreationRecorded,
     PartialStage,
     StageSynced,
@@ -1957,6 +1958,7 @@ impl RootedDir {
         let binding = PrivateEntryIdentity::from_stat(&stat_fd(file.as_raw_fd())?);
         file.sync_all()?;
         self.sync_root()?;
+        hooks.at(PrivateRolePoint::StageCreated)?;
         hooks.record_creation(binding)?;
         hooks.at(PrivateRolePoint::CreationRecorded)?;
         self.validate_private_regular_binding(role.stage, &file, binding)?;

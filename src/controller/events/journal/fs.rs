@@ -254,6 +254,62 @@ impl RoleKind {
     }
 }
 
+/// Only this closed role label may cross the facade's filesystem-error redaction.
+#[derive(Debug)]
+pub(super) struct UnprovedStage(RoleKind);
+
+impl std::fmt::Display for UnprovedStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unproved {} stage unavailable", self.0.name())
+    }
+}
+
+impl std::error::Error for UnprovedStage {}
+
+fn stage_unavailable(kind: RoleKind) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, UnprovedStage(kind))
+}
+
+fn empty_stage_binding(root: &RootedDir, kind: RoleKind, device: u64) -> io::Result<Binding> {
+    let inspect = || {
+        let name = kind.stage();
+        let binding = root.private_entry_identity(&name)?;
+        // The rooted helpers also reject hard links, symlinks and foreign owners.
+        if binding.kind != libc::S_IFREG as u32
+            || binding.device != device
+            || binding.owner != unsafe { libc::geteuid() }
+            || binding.mode != 0o600
+        {
+            return Err(stage_unavailable(kind));
+        }
+        let file = root.open_private_regular_handle(&name)?;
+        root.validate_private_regular_binding(&name, &file, binding)?;
+        if file.metadata()?.len() != 0 {
+            return Err(stage_unavailable(kind));
+        }
+        root.validate_private_regular_binding(&name, &file, binding)?;
+        Ok(binding.into())
+    };
+    inspect().map_err(|error| {
+        if error.raw_os_error() == Some(libc::ESTALE) {
+            error
+        } else {
+            stage_unavailable(kind)
+        }
+    })
+}
+
+fn empty_unproved_stages(root: &RootedDir) -> io::Result<Vec<(RoleKind, Binding)>> {
+    let device = root.identity()?.device;
+    let mut stages = Vec::new();
+    for kind in RoleKind::ALL {
+        if !root.entry_exists(&kind.evidence())? && root.entry_exists(&kind.stage())? {
+            stages.push((kind, empty_stage_binding(root, kind, device)?));
+        }
+    }
+    Ok(stages)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FaultPoint {
     Role(RoleKind, PrivateRolePoint),
@@ -622,7 +678,7 @@ fn recover_roles_in(root: &RootedDir, epoch: &str) -> io::Result<()> {
         root.resume_pending_owned_regular_cleanup(&kind.evidence())?;
         if !root.entry_exists(&kind.evidence())? {
             if root.entry_exists(&kind.stage())? {
-                return Err(unavailable());
+                return Err(stage_unavailable(kind));
             }
             continue;
         }
@@ -1396,6 +1452,9 @@ pub(super) fn initialize_storage(
     clock: &dyn FsClock,
     faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
+    // Inspect every evidence-less stage before audit or any mutation, so unsafe
+    // modes/types report the fixed role and cannot cause partial stage cleanup.
+    let _ = empty_unproved_stages(root)?;
     audit(root)?.admit(0, 0)?;
     if !root.entry_exists("journal.lock")?
         && (cleanup_residue(root)?
@@ -1414,6 +1473,18 @@ pub(super) fn initialize_storage(
     drop(lock);
     let lock_binding: Binding = root.private_entry_identity("journal.lock")?.into();
     let _exclusive = acquire_lock(root, lock_binding, false, deadline, clock)?;
+    // Only leader initialization may discard these provably uncommitted files.
+    // Validate all candidates under EX before removing the first one.
+    let stages = empty_unproved_stages(root)?;
+    let device = root.identity()?.device;
+    for (kind, binding) in stages {
+        if root.entry_exists(&kind.evidence())?
+            || empty_stage_binding(root, kind, device)? != binding
+        {
+            return Err(stage_unavailable(kind));
+        }
+        remove_bound(root, &kind.stage(), binding)?;
+    }
     let epoch = if root.entry_exists("initialization.json")? {
         load_initialization(root)?.journal_id
     } else if root.entry_exists(&RoleKind::Initialization.evidence())? {
