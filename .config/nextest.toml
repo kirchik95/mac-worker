@@ -23,7 +23,9 @@ test-group = 'stress'
 slow-timeout = { period = "300s", terminate-after = 4 }
 
 [[profile.default.overrides]]
-filter = 'binary(/^(supervisor|job_queries|task_turn|host|task)$/) & (test(/^(supervisor|job_queries|task_turn)::/) | !test(/::/))'
+# Keep the former integration modules in this group, without selecting library
+# unit tests such as supervisor::tests::*.
+filter = '(binary(host) | binary(task)) & test(/^(supervisor|job_queries|task_turn)::/)'
 test-group = 'fork_heavy'
 
 [profile.ci]
