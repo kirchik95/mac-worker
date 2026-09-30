@@ -58,7 +58,7 @@ impl LocalViewerEventSource {
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
         });
         let publications = refresh.subscribe_publications();
-        thread::Builder::new()
+        let spawn = thread::Builder::new()
             .name("dashboard-event-tailer".into())
             .spawn(move || {
                 let mut tail = Tailer {
@@ -79,8 +79,10 @@ impl LocalViewerEventSource {
                     tail.check();
                 }
                 let _ = shutdown.send(true);
-            })
-            .expect("dashboard event tailer thread could not start");
+            });
+        if spawn.is_err() {
+            source.stop();
+        }
         source
     }
 }
@@ -110,9 +112,11 @@ impl ViewerEventSource for LocalViewerEventSource {
         let mut shutdown = self.shutdown.subscribe();
         handle.spawn(async move {
             let _permit = permit;
+            let disconnect = sender.clone();
             tokio::select! {
                 biased;
                 _ = cancelled(&mut shutdown) => {},
+                _ = disconnect.closed() => {},
                 _ = replay_and_follow(reader, runtime, after, live, sender) => {},
             }
         });
@@ -408,6 +412,9 @@ pub(crate) fn resolve_cursor(
 ) -> Result<Option<EventCursor>, WorkerError> {
     let mut after = None;
     if let Some(query) = query {
+        if query.len() > 256 {
+            return Err(invalid_cursor());
+        }
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             if key != "after" || after.is_some() {
                 return Err(invalid_cursor());
@@ -466,6 +473,7 @@ mod tests {
         events: Mutex<Vec<WireEvent>>,
         head_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         unavailable: AtomicBool,
+        oldest: AtomicU64,
     }
     impl Journal {
         fn cursor(&self, seq: u64) -> EventCursor {
@@ -500,7 +508,7 @@ mod tests {
             }
             Ok(JournalWindow {
                 journal_id: uuid::Uuid::from_u128(1),
-                oldest_seq: Seq::new(1),
+                oldest_seq: Seq::new(self.oldest.load(Ordering::SeqCst).max(1)),
                 head_seq: Seq::new(head),
             })
         }
@@ -717,5 +725,97 @@ mod tests {
         assert!(
             matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 1)
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reset_expired_and_ahead_send_explicit_repair_baselines() {
+        let h = Harness::new();
+        for _ in 0..4 {
+            h.journal.append();
+        }
+        h.journal.oldest.store(3, Ordering::SeqCst);
+        let foreign = EventCursor {
+            journal_id: uuid::Uuid::from_u128(9),
+            seq: Seq::ZERO,
+        };
+        for (after, expected) in [
+            (None, "bootstrap"),
+            (Some(foreign), "journal_changed"),
+            (Some(h.journal.cursor(0)), "cursor_expired"),
+            (Some(h.journal.cursor(9)), "cursor_ahead"),
+        ] {
+            let mut stream = h.source.subscribe(after).unwrap();
+            assert!(
+                matches!(stream.recv().await, Some(ViewerMessage::SnapshotRequired(repair))
+                if repair.reason == expected && repair.window.head_seq.as_u64() == 4)
+            );
+            assert!(
+                matches!(stream.recv().await, Some(ViewerMessage::Ready(window)) if window.head_seq.as_u64() == 4)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lag_during_replay_sends_repair_and_closes_without_skipping_to_head() {
+        let h = Harness::new();
+        h.journal.append();
+        let journal = Arc::clone(&h.journal);
+        let runtime = Arc::clone(&h.runtime);
+        *h.journal.head_hook.lock().unwrap() = Some(Box::new(move || {
+            for _ in 0..300 {
+                journal.append();
+            }
+            runtime.tick(200);
+            runtime.tick(200);
+        }));
+        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
+        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
+        assert!(
+            matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 1)
+        );
+        assert!(
+            matches!(stream.recv().await, Some(ViewerMessage::SnapshotRequired(repair)) if repair.reason == "lagged")
+        );
+        assert!(stream.recv().await.is_none());
+        assert_eq!(h.journal.events.lock().unwrap().len(), 301);
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_reserves_a_repair_slot_and_does_not_block_append() {
+        let h = Harness::new();
+        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
+        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
+        for _ in 0..260 {
+            h.journal.append();
+            h.runtime.tick(200);
+            tokio::task::yield_now().await;
+        }
+        let mut messages = Vec::new();
+        while let Some(message) = stream.recv().await {
+            messages.push(message);
+        }
+        assert!(messages.len() <= 256);
+        assert!(
+            matches!(messages.last(), Some(ViewerMessage::SnapshotRequired(repair)) if repair.reason == "lagged")
+        );
+        assert_eq!(h.journal.events.lock().unwrap().len(), 260);
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_stream_before_a_held_replay_reader_returns() {
+        let h = Harness::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *h.journal.head_hook.lock().unwrap() = Some(Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        let mut stream = h.source.subscribe(None).unwrap();
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        h.source.stop();
+        assert!(stream.recv().await.is_none());
+        release_tx.send(()).unwrap();
     }
 }

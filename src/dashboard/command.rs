@@ -5,6 +5,7 @@ use std::{
 use crate::{
     client_state::ClientStateStore,
     config::Config,
+    controller::events::ViewerEventSource,
     dashboard::{
         service::{
             DashboardConfig, DashboardDeadlines, DashboardService, SystemClock,
@@ -62,9 +63,14 @@ pub trait BrowserOpener: Send + Sync {
 
 pub struct SystemDashboardLauncher {
     pub state: Arc<DashboardHttpState<MacWorkerDashboardSource, SystemClock, SystemMonotonicClock>>,
+    events: Option<Arc<dyn ViewerEventSource>>,
 }
 
 impl SystemDashboardLauncher {
+    pub fn with_events(mut self, source: Arc<dyn ViewerEventSource>) -> Self {
+        self.events = Some(source);
+        self
+    }
     pub fn from_system(
         config: Arc<Config>,
         local_jobs: Arc<ClientStateStore>,
@@ -124,6 +130,7 @@ impl SystemDashboardLauncher {
         );
         let log_source = Arc::new(MacWorkerLogSource::new(config, local_jobs, remote));
         Self {
+            events: None,
             state: Arc::new(DashboardHttpState {
                 service: Arc::new(DashboardService::with_options(
                     source,
@@ -147,9 +154,18 @@ impl DashboardLauncher for SystemDashboardLauncher {
         request: DashboardCommandRequest,
     ) -> Pin<Box<dyn Future<Output = Result<DashboardHttpServer, WorkerError>> + Send + 'a>> {
         Box::pin(async move {
-            DashboardHttpServer::bind(request.port, Arc::clone(&self.state))
-                .await
-                .map_err(api_error)
+            match &self.events {
+                Some(events) => {
+                    DashboardHttpServer::bind_with_events(
+                        request.port,
+                        Arc::clone(&self.state),
+                        Arc::clone(events),
+                    )
+                    .await
+                }
+                None => DashboardHttpServer::bind(request.port, Arc::clone(&self.state)).await,
+            }
+            .map_err(api_error)
         })
     }
 }

@@ -11,8 +11,12 @@ use std::{
 
 use crate::{
     agent_facts::FACTS_TTL,
+    controller::events::LocalProjectionRefresh,
     dashboard::{
-        cache::{Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS, idle_probe_due},
+        cache::{
+            OBSERVATION_TTL_MILLIS, Observation, ObservationCache, SNAPSHOT_INTERVAL_MILLIS,
+            idle_probe_due,
+        },
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
             DashboardError, DashboardJob, DashboardJobState, DashboardLaptop,
@@ -227,11 +231,12 @@ impl Default for DashboardConfig {
 pub struct DashboardService<S, C, M> {
     source: Arc<S>,
     cache: Mutex<ObservationCache>,
-    completed: Mutex<Option<Arc<DashboardSnapshot>>>,
+    completed: Arc<Mutex<Option<Arc<DashboardSnapshot>>>>,
     last_failure: Mutex<Option<DashboardError>>,
     revision: AtomicU64,
     local_generation: AtomicU64,
     publications: tokio::sync::broadcast::Sender<u64>,
+    local_refresh: Arc<(Mutex<LocalRefreshState>, Condvar)>,
     refresh: Mutex<RefreshState>,
     facts_refresh: Arc<Mutex<FactsRefreshTracker>>,
     probe_records: Mutex<HashMap<String, WorkerProbeRecord>>,
@@ -282,6 +287,55 @@ impl Drop for CollectorHandle {
 struct RefreshState {
     next_generation: u64,
     in_flight: Option<Arc<RefreshFlight>>,
+}
+
+#[derive(Default)]
+struct LocalRefreshState {
+    dirty: bool,
+    running: bool,
+    stopped: bool,
+    started: bool,
+    not_before: u64,
+}
+impl LocalRefreshState {
+    fn request(&mut self, now: u64) {
+        if !self.stopped {
+            self.dirty = true;
+            self.not_before = now.saturating_add(100);
+        }
+    }
+    fn begin(&mut self, now: u64) -> bool {
+        if self.stopped || self.running || !self.dirty || now < self.not_before {
+            return false;
+        }
+        self.running = true;
+        self.dirty = false;
+        true
+    }
+    fn finish(&mut self) {
+        self.running = false;
+    }
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.dirty = false;
+    }
+}
+
+pub struct LocalRefreshHandle {
+    signal: Arc<(Mutex<LocalRefreshState>, Condvar)>,
+    completed: Arc<Mutex<Option<Arc<DashboardSnapshot>>>>,
+}
+impl LocalRefreshHandle {
+    pub fn stop(&self) {
+        let _publication = lock_recover(&self.completed);
+        lock_recover(&self.signal.0).stop();
+        self.signal.1.notify_all();
+    }
+}
+impl Drop for LocalRefreshHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Last attempt is stamped when a refresh is *started*, including a failed
@@ -369,11 +423,12 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         Self {
             source: Arc::new(source),
             cache: Mutex::new(ObservationCache::new()),
-            completed: Mutex::new(None),
+            completed: Arc::new(Mutex::new(None)),
             last_failure: Mutex::new(None),
             revision: AtomicU64::new(0),
             local_generation: AtomicU64::new(0),
             publications: tokio::sync::broadcast::channel(256).0,
+            local_refresh: Arc::new((Mutex::new(LocalRefreshState::default()), Condvar::new())),
             refresh: Mutex::new(RefreshState {
                 next_generation: 1,
                 in_flight: None,
@@ -432,6 +487,12 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         let queue = self.source.queue_entries()?;
         let now_millis = self.clock.now_millis();
         let mut completed = lock_recover(&self.completed);
+        if lock_recover(&self.local_refresh.0).stopped {
+            return Err(DashboardError::new(
+                "DASHBOARD_REFRESH_ABORTED",
+                "local projection refresh was cancelled",
+            ));
+        }
         let mut snapshot = completed
             .as_ref()
             .map(|value| value.as_ref().clone())
@@ -467,6 +528,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             push_error(&mut snapshot.collection.errors, error);
         }
         snapshot.generated_at_millis = now_millis;
+        age_cached_workers(&mut snapshot.workers, now_millis);
         refresh_agent_facts_freshness(&mut snapshot.workers, now_millis);
         enrich_active_tasks(&mut snapshot.workers, &snapshot.task_view);
         snapshot.revision = self.next_revision()?;
@@ -506,6 +568,10 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                     *worker = cached.clone();
                 }
             }
+            snapshot.generated_at_millis = snapshot
+                .generated_at_millis
+                .max(current.generated_at_millis);
+            age_cached_workers(&mut snapshot.workers, snapshot.generated_at_millis);
             enrich_active_tasks(&mut snapshot.workers, &snapshot.task_view);
         }
         snapshot.revision = self.next_revision()?;
@@ -536,6 +602,69 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             stop,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    pub fn start_local_projection_refresh(
+        self: &Arc<Self>,
+    ) -> Result<LocalRefreshHandle, DashboardError> {
+        let signal = Arc::clone(&self.local_refresh);
+        {
+            let mut state = lock_recover(&signal.0);
+            if state.started {
+                return Err(DashboardError::new(
+                    COLLECTOR_START_FAILED,
+                    "local projection worker is already running",
+                ));
+            }
+            state.started = true;
+            state.stopped = false;
+        }
+        let service = Arc::clone(self);
+        if thread::Builder::new()
+            .name("dashboard-local-projector".into())
+            .spawn(move || service.run_local_projector())
+            .is_err()
+        {
+            lock_recover(&signal.0).started = false;
+            return Err(DashboardError::new(
+                COLLECTOR_START_FAILED,
+                "local projection worker could not start",
+            ));
+        }
+        Ok(LocalRefreshHandle {
+            signal,
+            completed: Arc::clone(&self.completed),
+        })
+    }
+
+    fn run_local_projector(&self) {
+        let (lock, changed) = &*self.local_refresh;
+        let mut state = lock_recover(lock);
+        loop {
+            if state.stopped {
+                state.started = false;
+                return;
+            }
+            if !state.dirty {
+                state = changed
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+                continue;
+            }
+            let now = self.monotonic.now_millis();
+            if !state.begin(now) {
+                let remaining = state.not_before.saturating_sub(now).max(1);
+                state = changed
+                    .wait_timeout(state, Duration::from_millis(remaining))
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0;
+                continue;
+            }
+            drop(state);
+            let _ = catch_unwind(AssertUnwindSafe(|| self.refresh_local_projection()));
+            state = lock_recover(lock);
+            state.finish();
+        }
     }
 
     fn run_collector(&self, stop: Arc<(Mutex<bool>, Condvar)>, interval: Duration) {
@@ -1050,6 +1179,18 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
     }
 }
 
+impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> LocalProjectionRefresh
+    for DashboardService<S, C, M>
+{
+    fn request_refresh(&self) {
+        lock_recover(&self.local_refresh.0).request(self.monotonic.now_millis());
+        self.local_refresh.1.notify_all();
+    }
+    fn subscribe_publications(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        DashboardService::subscribe_publications(self)
+    }
+}
+
 fn apply_laptop_binary(source: &Arc<dyn BinaryIdentitySource>, snapshot: &mut DashboardSnapshot) {
     snapshot.laptop = binary_is_outdated(source.as_ref()).then_some(DashboardLaptop {
         binary_outdated: true,
@@ -1099,6 +1240,17 @@ fn enrich_active_tasks(workers: &mut [DashboardWorker], task_view: &TaskListProj
             started_at_millis: None,
             runner: task.runner,
         });
+    }
+}
+
+fn age_cached_workers(workers: &mut [DashboardWorker], now_millis: u64) {
+    for worker in workers {
+        if worker.observed_at_millis.is_some_and(|observed| {
+            now_millis < observed || now_millis.saturating_sub(observed) > OBSERVATION_TTL_MILLIS
+        }) && worker.freshness != Freshness::Offline
+        {
+            worker.freshness = Freshness::Stale;
+        }
     }
 }
 
@@ -1587,11 +1739,27 @@ mod event_tests {
     }
 
     #[derive(Clone)]
+    struct ManualClock(Arc<AtomicU64>);
+    impl Clock for ManualClock {
+        fn now_millis(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    impl MonotonicClock for ManualClock {
+        fn now_millis(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    type ProjectionHold = Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>;
+
+    #[derive(Clone)]
     struct Source {
         local_version: Arc<AtomicU64>,
         remote_calls: Arc<AtomicUsize>,
         worker_stamp: Arc<AtomicU64>,
-        hold: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+        hold: ProjectionHold,
+        local_hold: ProjectionHold,
     }
     impl Source {
         fn new() -> Self {
@@ -1600,6 +1768,7 @@ mod event_tests {
                 remote_calls: Arc::new(AtomicUsize::new(0)),
                 worker_stamp: Arc::new(AtomicU64::new(100)),
                 hold: Arc::new(Mutex::new(None)),
+                local_hold: Arc::new(Mutex::new(None)),
             }
         }
         fn projection(&self) -> DashboardTaskCollection {
@@ -1687,7 +1856,12 @@ mod event_tests {
             Ok(Vec::new())
         }
         fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
-            Ok(self.projection())
+            let projection = self.projection();
+            if let Some((started, release)) = lock_recover(&self.local_hold).take() {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(projection)
         }
         fn task_projection(&self, _: Duration) -> Result<DashboardTaskCollection, DashboardError> {
             self.remote_calls.fetch_add(1, Ordering::SeqCst);
@@ -1703,9 +1877,10 @@ mod event_tests {
     #[test]
     fn a_late_full_collector_cannot_restore_older_local_tasks() {
         let source = Source::new();
+        let clock = ManualClock(Arc::new(AtomicU64::new(1_000)));
         let service = Arc::new(DashboardService::new(
             source.clone(),
-            FixedClock,
+            clock.clone(),
             FixedClock,
         ));
         service.snapshot(Default::default()).unwrap();
@@ -1719,6 +1894,7 @@ mod event_tests {
         };
         started_rx.recv().unwrap();
         source.local_version.store(2, Ordering::SeqCst);
+        clock.0.store(20_000, Ordering::SeqCst);
         let local_result = service.refresh_local_projection();
         release_tx.send(()).unwrap();
         let full = collector.join().unwrap();
@@ -1728,6 +1904,7 @@ mod event_tests {
         assert_eq!(full.task_view.tasks[0].updated_at_millis, 2);
         assert_eq!(visible.workers[0].system.free_disk_bytes, Some(101));
         assert_eq!(visible.workers[0].hostname.as_deref(), Some("worker-101"));
+        assert_eq!(visible.workers[0].freshness, Freshness::Stale);
     }
 
     #[test]
@@ -1743,5 +1920,130 @@ mod event_tests {
             2
         );
         assert_eq!(source.remote_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn debounce_coalesces_requests_and_preserves_dirty_work_during_a_flight() {
+        let mut state = LocalRefreshState::default();
+        state.request(0);
+        state.request(50);
+        assert!(!state.begin(149));
+        assert!(state.begin(150));
+        state.request(160);
+        assert!(!state.begin(300));
+        state.finish();
+        assert!(state.begin(300));
+        state.finish();
+        assert!(!state.begin(300));
+        state.stop();
+        state.request(400);
+        assert!(!state.begin(500));
+    }
+
+    #[test]
+    fn full_publication_sends_control_after_cache_visibility() {
+        let service = DashboardService::new(Source::new(), FixedClock, FixedClock);
+        let mut publications = service.subscribe_publications();
+        let full = service.snapshot(Default::default()).unwrap();
+        let revision = publications.try_recv().unwrap();
+        assert_eq!(service.read_snapshot().unwrap().revision, revision);
+        assert_eq!(full.revision, revision);
+    }
+
+    #[test]
+    fn event_then_snapshot_ready_reads_fresh_cache() {
+        let source = Source::new();
+        let service = DashboardService::new(source.clone(), FixedClock, FixedClock);
+        service.snapshot(Default::default()).unwrap();
+        let mut publications = service.subscribe_publications();
+        source.local_version.store(2, Ordering::SeqCst);
+        service.refresh_local_projection().unwrap();
+        let revision = publications.try_recv().unwrap();
+        let visible = service.read_snapshot().unwrap();
+        assert_eq!(visible.revision, revision);
+        assert_eq!(visible.task_view.tasks[0].updated_at_millis, 2);
+    }
+
+    #[test]
+    fn cancelled_local_work_cannot_publish_after_a_held_projector_returns() {
+        let source = Source::new();
+        let service = Arc::new(DashboardService::new(
+            source.clone(),
+            FixedClock,
+            FixedClock,
+        ));
+        let full = service.snapshot(Default::default()).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *lock_recover(&source.local_hold) = Some((started_tx, release_rx));
+        source.local_version.store(2, Ordering::SeqCst);
+        let flight = {
+            let service = service.clone();
+            thread::spawn(move || service.refresh_local_projection())
+        };
+        started_rx.recv().unwrap();
+        let handle = LocalRefreshHandle {
+            signal: Arc::clone(&service.local_refresh),
+            completed: Arc::clone(&service.completed),
+        };
+        handle.stop();
+        release_tx.send(()).unwrap();
+        assert!(flight.join().unwrap().is_err());
+        assert_eq!(service.read_snapshot().unwrap().revision, full.revision);
+        assert_eq!(
+            service.read_snapshot().unwrap().task_view.tasks[0].updated_at_millis,
+            1
+        );
+    }
+    #[test]
+    fn ttl_freshness_without_worker_event_keeps_metrics_and_makes_no_remote_call() {
+        let source = Source::new();
+        let clock = ManualClock(Arc::new(AtomicU64::new(100)));
+        let service = DashboardService::new(source.clone(), clock.clone(), FixedClock);
+        service.snapshot(Default::default()).unwrap();
+        clock.0.store(20_000, Ordering::SeqCst);
+        service.refresh_local_projection().unwrap();
+        let visible = service.read_snapshot().unwrap();
+        assert_eq!(visible.workers[0].freshness, Freshness::Stale);
+        assert_eq!(visible.workers[0].system.free_disk_bytes, Some(100));
+        assert_eq!(source.remote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn real_local_worker_coalesces_and_repeats_a_dirty_flight_with_injected_time() {
+        let source = Source::new();
+        let clock = ManualClock(Arc::new(AtomicU64::new(0)));
+        let service = Arc::new(DashboardService::new(
+            source.clone(),
+            FixedClock,
+            clock.clone(),
+        ));
+        service.snapshot(Default::default()).unwrap();
+        let mut publications = service.subscribe_publications();
+        let worker = service.start_local_projection_refresh().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *lock_recover(&source.local_hold) = Some((started_tx, release_rx));
+        source.local_version.store(2, Ordering::SeqCst);
+        service.request_refresh();
+        clock.0.store(100, Ordering::SeqCst);
+        service.local_refresh.1.notify_all();
+        started_rx.recv().unwrap();
+        source.local_version.store(3, Ordering::SeqCst);
+        clock.0.store(200, Ordering::SeqCst);
+        for _ in 0..100 {
+            service.request_refresh();
+        }
+        clock.0.store(300, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(publications.blocking_recv().unwrap(), 2);
+        assert_eq!(publications.blocking_recv().unwrap(), 3);
+        worker.stop();
+        assert_eq!(
+            service.read_snapshot().unwrap().task_view.tasks[0].updated_at_millis,
+            3
+        );
+        assert!(publications.try_recv().is_err());
+        assert_eq!(source.remote_calls.load(Ordering::SeqCst), 1);
     }
 }

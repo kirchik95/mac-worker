@@ -1,31 +1,42 @@
 use std::{
     collections::BTreeMap,
     net::{Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path, RawQuery, Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio_stream::{
+    Stream,
+    wrappers::{ReceiverStream, WatchStream},
+};
 
 use crate::{
     agent_settings::{
         AgentSettingsError, AgentSettingsGetRequest, AgentSettingsSaveRequest,
         validate_get_request, validate_save_request,
     },
+    controller::events::{ViewerEventSource, ViewerMessage},
     dashboard::{
         model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
-        service::{Clock, CollectorHandle, DashboardDataSource, DashboardService, MonotonicClock},
+        service::{
+            Clock, CollectorHandle, DashboardDataSource, DashboardService, LocalRefreshHandle,
+            MonotonicClock,
+        },
         settings::DashboardSettingsSource,
         task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
     },
+    error::WorkerError,
     job::{JobId, LogStream},
     task::{TaskId, TurnId},
 };
@@ -68,12 +79,54 @@ pub struct DashboardHttpServer {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<Result<(), ApiError>>,
     collector: CollectorHandle,
+    events: EventStopGuard,
+    local_refresh: Option<LocalRefreshHandle>,
+}
+
+struct EventStopGuard(Option<Arc<dyn ViewerEventSource>>);
+impl EventStopGuard {
+    fn stop(&self) {
+        if let Some(source) = &self.0 {
+            source.stop();
+        }
+    }
+}
+impl Drop for EventStopGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl DashboardHttpServer {
+    pub async fn bind_with_events<S, C, M>(
+        port: Option<u16>,
+        state: Arc<DashboardHttpState<S, C, M>>,
+        events: Arc<dyn ViewerEventSource>,
+    ) -> Result<Self, ApiError>
+    where
+        S: DashboardDataSource,
+        C: Clock,
+        M: MonotonicClock,
+    {
+        Self::bind_inner(port, state, Some(events)).await
+    }
+
     pub async fn bind<S, C, M>(
         port: Option<u16>,
         state: Arc<DashboardHttpState<S, C, M>>,
+    ) -> Result<Self, ApiError>
+    where
+        S: DashboardDataSource,
+        C: Clock,
+        M: MonotonicClock,
+    {
+        Self::bind_inner(port, state, None).await
+    }
+
+    async fn bind_inner<S, C, M>(
+        port: Option<u16>,
+        state: Arc<DashboardHttpState<S, C, M>>,
+        events: Option<Arc<dyn ViewerEventSource>>,
     ) -> Result<Self, ApiError>
     where
         S: DashboardDataSource,
@@ -96,6 +149,16 @@ impl DashboardHttpServer {
             )
         })?;
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let local_refresh = if events.is_some() {
+            Some(
+                state
+                    .service
+                    .start_local_projection_refresh()
+                    .map_err(|error| ApiError::new(error.code, error.message))?,
+            )
+        } else {
+            None
+        };
         let collector = state
             .service
             .start_background_collection()
@@ -103,6 +166,8 @@ impl DashboardHttpServer {
         let app_state = AppState {
             dashboard: state,
             expected_host: local_addr.to_string(),
+            events: events.clone(),
+            shutdown: shutdown_receiver.clone(),
         };
         let task = tokio::spawn(async move {
             axum::serve(listener, router(app_state))
@@ -120,6 +185,8 @@ impl DashboardHttpServer {
             shutdown,
             task,
             collector,
+            events: EventStopGuard(events),
+            local_refresh,
         })
     }
 
@@ -128,6 +195,10 @@ impl DashboardHttpServer {
     }
 
     pub async fn shutdown(self) -> Result<(), ApiError> {
+        self.events.stop();
+        if let Some(handle) = &self.local_refresh {
+            handle.stop();
+        }
         self.collector.stop();
         let _ = self.shutdown.send(true);
         self.task.await.map_err(|_| {
@@ -142,6 +213,8 @@ impl DashboardHttpServer {
 struct AppState<S, C, M> {
     dashboard: Arc<DashboardHttpState<S, C, M>>,
     expected_host: String,
+    events: Option<Arc<dyn ViewerEventSource>>,
+    shutdown: watch::Receiver<bool>,
 }
 
 impl<S, C, M> Clone for AppState<S, C, M> {
@@ -149,6 +222,8 @@ impl<S, C, M> Clone for AppState<S, C, M> {
         Self {
             dashboard: Arc::clone(&self.dashboard),
             expected_host: self.expected_host.clone(),
+            events: self.events.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -166,6 +241,7 @@ where
         .route("/favicon.svg", get(favicon))
         .route("/assets/{font}", get(font))
         .route("/api/v1/snapshot", get(snapshot::<S, C, M>))
+        .route("/api/v1/events", get(events::<S, C, M>))
         .route(
             "/api/v1/tasks/{task_id}/turns/{turn_id}/logs",
             get(task_log_chunk::<S, C, M>),
@@ -244,6 +320,149 @@ async fn security_headers(mut response: Response) -> Response {
         HeaderValue::from_static("no-referrer"),
     );
     response
+}
+
+async fn events<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    let Some(source) = state.events else {
+        return not_found().await;
+    };
+    let expected_origin = format!("http://{}", state.expected_host);
+    let origins = headers.get_all(header::ORIGIN).iter().collect::<Vec<_>>();
+    if origins.len() > 1
+        || origins
+            .first()
+            .is_some_and(|value| value.to_str().ok() != Some(expected_origin.as_str()))
+        || headers.get_all("sec-fetch-site").iter().any(|value| {
+            value
+                .to_str()
+                .map_or(true, |value| value.eq_ignore_ascii_case("cross-site"))
+        })
+    {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            ApiError::new("INVALID_ORIGIN", "event stream requires the viewer origin"),
+        );
+    }
+    let last_ids = headers.get_all("last-event-id").iter().collect::<Vec<_>>();
+    if last_ids.len() > 1
+        || last_ids
+            .first()
+            .is_some_and(|value| value.to_str().is_err())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::new(
+                "INVALID_EVENT_CURSOR",
+                "event cursor is invalid or conflicting",
+            ),
+        );
+    }
+    let last_id = last_ids.first().and_then(|value| value.to_str().ok());
+    let after = match crate::dashboard::events::resolve_cursor(query.as_deref(), last_id) {
+        Ok(after) => after,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                ApiError::new(
+                    "INVALID_EVENT_CURSOR",
+                    "event cursor is invalid or conflicting",
+                ),
+            );
+        }
+    };
+    let receiver = match source.subscribe(after) {
+        Ok(receiver) => receiver,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiError::new(
+                    "CONTROLLER_EVENTS_UNAVAILABLE",
+                    "viewer event stream is unavailable",
+                ),
+            );
+        }
+    };
+    let stream = ResponseEvents {
+        messages: ReceiverStream::new(receiver),
+        shutdown: WatchStream::new(state.shutdown),
+    };
+    let mut response = Sse::new(stream).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Poll cancellation first, including when an unread subscriber queue is full.
+/// Closing just its sender would otherwise drain that queue during shutdown.
+struct ResponseEvents {
+    messages: ReceiverStream<ViewerMessage>,
+    shutdown: WatchStream<bool>,
+}
+impl Stream for ResponseEvents {
+    type Item = Result<Event, WorkerError>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.shutdown).poll_next(cx) {
+                Poll::Ready(Some(true) | None) => return Poll::Ready(None),
+                Poll::Ready(Some(false)) => continue,
+                Poll::Pending => break,
+            }
+        }
+        Pin::new(&mut self.messages)
+            .poll_next(cx)
+            .map(|message| message.map(sse_message))
+    }
+}
+
+fn sse_message(message: ViewerMessage) -> Result<Event, WorkerError> {
+    let (name, data, cursor) = match message {
+        ViewerMessage::ControllerEvent(event) => {
+            let cursor = format!("{}:{}", event.journal_id, event.seq);
+            (
+                "controller.event",
+                serde_json::to_value(event),
+                Some(cursor),
+            )
+        }
+        ViewerMessage::SnapshotRequired(repair) => {
+            ("snapshot_required", serde_json::to_value(repair), None)
+        }
+        ViewerMessage::Ready(window) => ("ready", serde_json::to_value(window), None),
+        ViewerMessage::SnapshotReady { revision } => (
+            "snapshot.ready",
+            Ok(serde_json::json!({"revision": revision})),
+            None,
+        ),
+        ViewerMessage::Heartbeat => ("heartbeat", Ok(serde_json::json!({})), None),
+        ViewerMessage::Unavailable { .. } => (
+            "snapshot_required",
+            Ok(serde_json::json!({
+                "reason": "unavailable", "code": "CONTROLLER_EVENTS_UNAVAILABLE", "window": null,
+            })),
+            None,
+        ),
+    };
+    let data = data.map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_EVENTS_UNAVAILABLE: viewer event encoding failed".into())
+    })?;
+    let mut event = Event::default().event(name).data(data.to_string());
+    if let Some(cursor) = cursor {
+        event = event.id(cursor);
+    }
+    if name == "heartbeat" {
+        event = event.comment("keepalive");
+    }
+    Ok(event)
 }
 
 async fn index() -> Response {
@@ -848,4 +1067,332 @@ fn parse_log_query(raw_query: Option<&str>) -> Result<LogQuery, ApiError> {
         offset,
         limit,
     })
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use crate::{
+        controller::events::{EventCursor, JournalWindow, Seq, ViewerEventSource, ViewerMessage},
+        dashboard::{model::DashboardQueueEntry, service::WorkerObservationResult},
+        error::WorkerError,
+        task_view::TaskDetailProjection,
+    };
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpStream,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::mpsc;
+
+    struct Empty;
+    impl Clock for Empty {
+        fn now_millis(&self) -> u64 {
+            1_000
+        }
+    }
+    impl MonotonicClock for Empty {
+        fn now_millis(&self) -> u64 {
+            0
+        }
+    }
+    impl DashboardDataSource for Empty {
+        fn configured_workers(&self) -> Result<Vec<String>, DashboardError> {
+            Ok(Vec::new())
+        }
+        fn collect_workers(&self, _: Duration) -> Vec<WorkerObservationResult> {
+            Vec::new()
+        }
+        fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
+            Ok(Vec::new())
+        }
+        fn authoritative_active_jobs(
+            &self,
+            _: Duration,
+        ) -> Vec<Result<DashboardJob, DashboardError>> {
+            Vec::new()
+        }
+        fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
+            Ok(Vec::new())
+        }
+    }
+    impl DashboardLogSource for Empty {
+        fn job_detail(&self, _: JobId) -> Result<DashboardJob, ApiError> {
+            Err(ApiError::new("NOT_FOUND", "fixture"))
+        }
+        fn read_log(
+            &self,
+            _: JobId,
+            _: LogStream,
+            _: u64,
+            _: u32,
+        ) -> Result<DashboardLogChunk, ApiError> {
+            Err(ApiError::new("NOT_FOUND", "fixture"))
+        }
+    }
+    impl DashboardTaskSource for Empty {
+        fn task_detail(&self, _: TaskId) -> Result<TaskDetailProjection, ApiError> {
+            Err(ApiError::new("NOT_FOUND", "fixture"))
+        }
+        fn read_task_log(
+            &self,
+            _: TaskId,
+            _: TurnId,
+            _: LogStream,
+            _: u64,
+            _: u32,
+        ) -> Result<DashboardLogChunk, ApiError> {
+            Err(ApiError::new("NOT_FOUND", "fixture"))
+        }
+    }
+    #[derive(Default)]
+    struct Source {
+        after: Mutex<Vec<Option<EventCursor>>>,
+        senders: Mutex<Vec<mpsc::Sender<ViewerMessage>>>,
+        stopped: AtomicBool,
+    }
+    impl ViewerEventSource for Source {
+        fn subscribe(
+            &self,
+            after: Option<EventCursor>,
+        ) -> Result<mpsc::Receiver<ViewerMessage>, WorkerError> {
+            self.after.lock().unwrap().push(after);
+            let (sender, receiver) = mpsc::channel(256);
+            sender
+                .try_send(ViewerMessage::Ready(JournalWindow {
+                    journal_id: uuid::Uuid::from_u128(1),
+                    oldest_seq: Seq::new(1),
+                    head_seq: Seq::new(0),
+                }))
+                .unwrap();
+            self.senders.lock().unwrap().push(sender);
+            Ok(receiver)
+        }
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            self.senders.lock().unwrap().clear();
+        }
+    }
+    fn state() -> Arc<DashboardHttpState<Empty, Empty, Empty>> {
+        Arc::new(DashboardHttpState {
+            service: Arc::new(DashboardService::new(Empty, Empty, Empty)),
+            log_source: Arc::new(Empty),
+            task_source: Arc::new(Empty),
+            settings_source: None,
+            mutation_source: None,
+        })
+    }
+    async fn request(
+        server: &DashboardHttpServer,
+        path: &str,
+        headers: &str,
+        read_ready: bool,
+    ) -> String {
+        let address = server.local_addr;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{headers}Connection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            let mut socket = TcpStream::connect(address).unwrap();
+            socket.write_all(request.as_bytes()).unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut response = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                response.push_str(&line);
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            if read_ready && response.starts_with("HTTP/1.1 200") {
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    response.push_str(&line);
+                    if line.starts_with("data:") || line.is_empty() {
+                        break;
+                    }
+                }
+            }
+            response
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn events_route_preserves_local_404_and_serves_no_store_named_controls() {
+        let local = DashboardHttpServer::bind(None, state()).await.unwrap();
+        assert!(
+            request(&local, "/api/v1/events", "", false)
+                .await
+                .starts_with("HTTP/1.1 404")
+        );
+        local.shutdown().await.unwrap();
+        let source = Arc::new(Source::default());
+        let server = DashboardHttpServer::bind_with_events(None, state(), source.clone())
+            .await
+            .unwrap();
+        let response = request(&server, "/api/v1/events", "", true).await;
+        server.shutdown().await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("content-type: text/event-stream"));
+        assert!(response.contains("cache-control: no-store"));
+        assert!(response.contains("event: ready"));
+        assert!(!response.contains("id:"));
+        assert!(!response.contains("access-control-allow-origin"));
+        assert!(response.contains("connect-src 'self'"));
+    }
+
+    #[tokio::test]
+    async fn events_route_rejects_foreign_origin_cross_site_and_cursor_conflicts() {
+        let source = Arc::new(Source::default());
+        let server = DashboardHttpServer::bind_with_events(None, state(), source.clone())
+            .await
+            .unwrap();
+        for (headers, status) in [
+            ("Origin: https://foreign.test\r\n", "403"),
+            ("Sec-Fetch-Site: cross-site\r\n", "403"),
+            ("Last-Event-ID: malformed\r\n", "400"),
+        ] {
+            let response = request(&server, "/api/v1/events", headers, false).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+        }
+        let id = "00000000-0000-0000-0000-000000000001";
+        let response = request(
+            &server,
+            &format!("/api/v1/events?after={id}%3A1"),
+            &format!("Last-Event-ID: {id}:2\r\n"),
+            false,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(source.after.lock().unwrap().is_empty());
+        let response = request(
+            &server,
+            &format!("/api/v1/events?after={id}%3A9007199254740993"),
+            &format!("Origin: {}\r\n", server.local_url()),
+            true,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            source.after.lock().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .seq
+                .as_u64(),
+            9_007_199_254_740_993
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_precedes_graceful_join_and_closes_sse_tcp() {
+        let source = Arc::new(Source::default());
+        let server = DashboardHttpServer::bind_with_events(None, state(), source.clone())
+            .await
+            .unwrap();
+        let address = server.local_addr;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let reading = tokio::task::spawn_blocking(move || {
+            let mut socket = TcpStream::connect(address).unwrap();
+            write!(
+                socket,
+                "GET /api/v1/events HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut prefix = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                prefix.push_str(&line);
+                if line.starts_with("data:") || line.is_empty() {
+                    break;
+                }
+            }
+            ready_tx.send(prefix).unwrap();
+            let mut rest = String::new();
+            reader.read_to_string(&mut rest).unwrap();
+            rest
+        });
+        let prefix = ready_rx.await.unwrap();
+        server.shutdown().await.unwrap();
+        reading.await.unwrap();
+        assert!(prefix.contains("event: ready"), "{prefix}");
+        assert!(source.stopped.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn encoded_controls_have_no_ids_and_heartbeat_has_a_keepalive_comment() {
+        use crate::controller::events::WireEvent;
+        let (sender, receiver) = mpsc::channel(8);
+        sender
+            .try_send(ViewerMessage::ControllerEvent(WireEvent {
+                schema_version: 1,
+                journal_id: uuid::Uuid::from_u128(1),
+                seq: Seq::new(9_007_199_254_740_993),
+                time_millis: 0,
+                kind: "queue.changed".into(),
+                data: serde_json::json!({}),
+            }))
+            .unwrap();
+        sender
+            .try_send(ViewerMessage::SnapshotReady { revision: 5 })
+            .unwrap();
+        sender.try_send(ViewerMessage::Heartbeat).unwrap();
+        sender
+            .try_send(ViewerMessage::Unavailable {
+                code: "private path must not escape".into(),
+            })
+            .unwrap();
+        drop(sender);
+        let (_shutdown, receiver_shutdown) = watch::channel(false);
+        let response = Sse::new(ResponseEvents {
+            messages: ReceiverStream::new(receiver),
+            shutdown: WatchStream::new(receiver_shutdown),
+        })
+        .into_response();
+        let bytes = to_bytes(response.into_body(), 4_096).await.unwrap();
+        let encoded = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(encoded.contains("id: 00000000-0000-0000-0000-000000000001:9007199254740993"));
+        assert!(encoded.contains("\"seq\":\"9007199254740993\""));
+        assert!(encoded.contains("event: snapshot.ready"));
+        assert!(encoded.contains("event: heartbeat"));
+        assert!(encoded.contains(": keepalive"));
+        assert!(encoded.contains("event: snapshot_required"));
+        assert!(encoded.contains("\"window\":null"));
+        assert!(!encoded.contains("private path"));
+        assert_eq!(encoded.matches("id:").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_discards_an_unread_sse_queue_before_draining() {
+        let (sender, receiver) = mpsc::channel(8);
+        sender.try_send(ViewerMessage::Heartbeat).unwrap();
+        sender
+            .try_send(ViewerMessage::SnapshotReady { revision: 7 })
+            .unwrap();
+        drop(sender);
+        let (shutdown, receiver_shutdown) = watch::channel(false);
+        shutdown.send(true).unwrap();
+        let response = Sse::new(ResponseEvents {
+            messages: ReceiverStream::new(receiver),
+            shutdown: WatchStream::new(receiver_shutdown),
+        })
+        .into_response();
+        assert!(
+            to_bytes(response.into_body(), 4_096)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
