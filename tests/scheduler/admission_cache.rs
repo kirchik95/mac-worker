@@ -1,7 +1,6 @@
 //! Stage 5.2 RED tests for admission cache reuse rules (unchanged runtime).
 
 #![allow(dead_code)]
-mod support;
 
 use std::{
     fs,
