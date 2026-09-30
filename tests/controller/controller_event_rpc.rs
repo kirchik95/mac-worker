@@ -470,6 +470,147 @@ mod state_reads {
         TaskId::new(uuid::Uuid::from_u128(number))
     }
 
+    fn legacy_reply<T: serde::de::DeserializeOwned>(
+        paths: &PathLayout,
+        command: &str,
+        body: serde_json::Value,
+    ) -> super::legacy_v7::ControllerReadReply<T> {
+        let request = super::rpc_request(command, body);
+        let frame = super::routed_rpc(paths, &request).unwrap();
+        let reply: super::legacy_v7::ControllerReadReply<T> =
+            serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
+        assert_eq!(reply.protocol_version, 7);
+        assert_eq!(reply.command, command);
+        assert_eq!(reply.request_id, request.request_id());
+        assert_eq!(reply.payload_sha256, request.payload_sha256());
+        reply
+    }
+
+    #[test]
+    fn legacy_laptop_decodes_status_list_log_wait_and_drain_from_new_rpc() {
+        use super::legacy_v7;
+        use base64::Engine;
+        use std::io::Write;
+
+        let (_root, paths, _) = fixture();
+        let task = record(1, TaskState::Open, TaskOutcome::Done);
+        let turn_id = task.status().turns()[0].turn_id();
+        write_record(&paths, &task);
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let mut log = state.open_runner_log(id(1), turn_id).unwrap();
+        log.write_all(b"legacy log\n").unwrap();
+        drop(log);
+        let checkpoint = paths
+            .state
+            .join("runners")
+            .join(id(1).to_string())
+            .join(format!("{turn_id}.checkpoint.json"));
+        fs::write(
+            &checkpoint,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"task_id":id(1),"turn_id":turn_id,
+                "committed":{"offsets":[0,0],"len":11,"accepted":true,
+                    "completion":{"outcome":{"kind":"done"},"drained":true}},
+                "pending":null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(checkpoint, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let status = legacy_reply::<legacy_v7::ControllerTaskStatusResult>(
+            &paths,
+            "task.status",
+            serde_json::json!({"task_id":id(1)}),
+        )
+        .result;
+        assert_eq!(status.task_id, id(1));
+        assert_eq!(status.run_id, None);
+        assert_eq!(status.status.state(), TaskState::Open);
+        assert_eq!(status.status.last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(status.runner, None);
+        assert_eq!(status.exit_code, None);
+
+        let list = legacy_reply::<legacy_v7::TaskListProjection>(
+            &paths,
+            "task.list",
+            serde_json::json!({"full":true}),
+        )
+        .result;
+        assert_eq!(list.tasks.len(), 1);
+        assert_eq!(list.tasks[0].task_id, id(1));
+        assert_eq!(list.tasks[0].state, TaskState::Open);
+        assert_eq!(list.tasks[0].last_outcome, Some(TaskOutcome::Done));
+        assert_eq!(list.progress.total, 1);
+        assert_eq!(list.progress.open, 1);
+        assert!(list.runs.is_empty());
+        assert!(list.dag_nodes.is_empty());
+
+        let log = legacy_reply::<legacy_v7::ControllerTaskLogsResult>(
+            &paths,
+            "task.logs",
+            serde_json::json!({"task_id":id(1),"raw":true,"offset":0,"limit":64}),
+        )
+        .result;
+        assert_eq!(log.task_id, id(1));
+        assert_eq!(log.turn_id, turn_id);
+        assert_eq!(log.turn_number, 1);
+        assert_eq!(log.agent, "codex");
+        assert_eq!(log.offset, 0);
+        assert_eq!(log.next_offset, 11);
+        assert!(log.raw && log.exhausted && log.complete);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(log.bytes_base64)
+                .unwrap(),
+            b"legacy log\n"
+        );
+        assert_eq!(log.failure, None);
+
+        let wait = legacy_reply::<legacy_v7::ControllerWaitPollResult>(
+            &paths,
+            "task.wait.poll",
+            serde_json::json!({"task_id":id(1)}),
+        )
+        .result;
+        assert_eq!(wait.task_ids, vec![id(1)]);
+        assert!(wait.quiescent);
+        assert_eq!(wait.exit_code, 0);
+        for (body, expected) in [
+            (serde_json::json!({}), false),
+            (serde_json::json!({"drained":true}), true),
+            (serde_json::json!({}), true),
+            (serde_json::json!({"drained":false}), false),
+        ] {
+            assert_eq!(
+                legacy_reply::<legacy_v7::DrainResult>(&paths, "controller.drain", body)
+                    .result
+                    .drained,
+                expected
+            );
+        }
+        assert_eq!(
+            ControllerStore::open(&paths.controller_state_root())
+                .unwrap()
+                .pending_health(1000)
+                .unwrap()
+                .active_count,
+            0
+        );
+        assert!(
+            fs::read_dir(paths.controller_state_root())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("req-")
+                })
+        );
+        assert!(!paths.controller_state_root().join("events").exists());
+    }
+
     #[test]
     fn rpc_routing_serves_all_selectors_with_the_existing_read_envelope() {
         use mac_worker::controller::{
@@ -2772,5 +2913,149 @@ mod transport_bounds {
                 .is_err()
             );
         }
+    }
+}
+
+// Frozen DTO definitions from 37915a9, before the event wave. Existing nested
+// task schema types are reused; no production DTO or module root is changed.
+#[allow(dead_code)]
+mod legacy_v7 {
+    use mac_worker::{
+        dag::DagNodeProjection,
+        task::{
+            BranchName, ClosePolicy, OriginDelivery, RunId, RunnerState, TaskId, TaskOutcome,
+            TaskState, TaskStatus, TurnId,
+        },
+        task_view::{ReviewState, TaskFreshness},
+    };
+    use serde_json::Value;
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct ControllerReadReply<T> {
+        pub(super) protocol_version: u32,
+        pub(super) command: String,
+        pub(super) request_id: String,
+        pub(super) payload_sha256: String,
+        pub(super) result: T,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct ControllerTaskStatusResult {
+        pub(super) task_id: TaskId,
+        pub(super) run_id: Option<RunId>,
+        pub(super) status: TaskStatus,
+        #[serde(default)]
+        pub(super) warnings: Vec<String>,
+        #[serde(default)]
+        pub(super) events: Vec<Value>,
+        pub(super) runner: Option<RunnerState>,
+        pub(super) exit_code: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) delivery: Option<OriginDelivery>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub(super) deliveries: Vec<OriginDelivery>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) residual: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct ControllerTaskLogsResult {
+        pub(super) task_id: TaskId,
+        pub(super) turn_id: TurnId,
+        pub(super) turn_number: u32,
+        pub(super) agent: String,
+        pub(super) offset: u64,
+        pub(super) next_offset: u64,
+        pub(super) exhausted: bool,
+        pub(super) complete: bool,
+        pub(super) raw: bool,
+        pub(super) bytes_base64: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) failure: Option<String>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct ControllerWaitPollResult {
+        pub(super) task_ids: Vec<TaskId>,
+        pub(super) quiescent: bool,
+        pub(super) exit_code: u8,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct DrainResult {
+        pub(super) drained: bool,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(super) struct TaskListProjection {
+        pub tasks: Vec<TaskListRow>,
+        pub runs: Vec<TaskRunProjection>,
+        pub progress: RunProgress,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub dag_nodes: Vec<DagNodeProjection>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(super) struct TaskListRow {
+        pub task_id: TaskId,
+        pub run_id: Option<RunId>,
+        pub run_position: Option<u32>,
+        pub title: String,
+        pub agent: String,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        pub permissions: Option<String>,
+        pub env_profile: Option<String>,
+        pub state: TaskState,
+        pub blocking_code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub stage: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub residual: Option<Vec<String>>,
+        pub last_outcome: Option<TaskOutcome>,
+        pub worker: Option<String>,
+        pub branch: BranchName,
+        pub turn_count: u32,
+        pub runner: Option<RunnerState>,
+        pub freshness: TaskFreshness,
+        pub created_at_millis: u64,
+        pub updated_at_millis: u64,
+        pub active_turn_id: Option<TurnId>,
+        pub close_policy: ClosePolicy,
+        pub review_state: ReviewState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub delivery: Option<OriginDelivery>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub deliveries: Vec<OriginDelivery>,
+        /// True when the task asked for an origin push. Text `task list` uses
+        /// this so fetch-only rows never grow a `push:` suffix.
+        #[serde(skip)]
+        pub publish_push: bool,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    pub(super) struct TaskRunProjection {
+        pub run_id: RunId,
+        pub name: Option<String>,
+        pub max_parallel: u32,
+        pub created_at_millis: u64,
+        pub progress: RunProgress,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct RunProgress {
+        pub total: usize,
+        pub queued: usize,
+        pub active: usize,
+        pub open: usize,
+        pub closed: usize,
+        pub failed_like: usize,
     }
 }
