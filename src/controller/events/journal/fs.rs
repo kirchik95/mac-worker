@@ -1,8 +1,10 @@
 //! Journal storage primitives. Public event contracts are adapted by the facade.
 use std::io;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 
 use crate::rooted_fs::PrivateRolePoint;
 use crate::rooted_fs::{PrivateEntryIdentity, PrivateRegularRole, PrivateRoleHooks, RootedDir};
@@ -620,6 +622,381 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
     audit(root)?.admit(0, 0)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDelta {
+    appended: Segment,
+    rotate: bool,
+    retired: Option<Segment>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Pending {
+    schema_version: u32,
+    journal_id: String,
+    transaction_id: String,
+    previous_digest: String,
+    previous_head: u64,
+    first: u64,
+    last: u64,
+    bytes_base64: String,
+    batch_digest: String,
+    delta: ManifestDelta,
+    next_digest: String,
+}
+
+fn prepare_append(
+    manifest: &Manifest,
+    bytes: &[u8],
+    new_segment: Option<Segment>,
+) -> io::Result<Pending> {
+    validate_manifest(manifest)?;
+    let count = bytes.iter().filter(|byte| **byte == b'\n').count();
+    if bytes.len() > BATCH_BYTES || count == 0 || count > BATCH_EVENTS {
+        return Err(unavailable());
+    }
+    let first = manifest.head.checked_add(1).ok_or_else(unavailable)?;
+    let last = manifest
+        .head
+        .checked_add(count as u64)
+        .ok_or_else(unavailable)?;
+    decode_records(bytes, &manifest.journal_id, first, Some(last))?;
+    let active = manifest.segments.last().ok_or_else(unavailable)?;
+    let rotate = active
+        .committed_len
+        .checked_add(bytes.len())
+        .is_none_or(|len| len > SEGMENT_BYTES);
+    let mut appended = if rotate {
+        let segment = new_segment.ok_or_else(unavailable)?;
+        if segment.first != first
+            || segment.name != format!("segment-{first}.jsonl")
+            || segment.last.is_some()
+            || segment.committed_len != 0
+            || segment.sealed
+            || segment.binding.device != active.binding.device
+        {
+            return Err(unavailable());
+        }
+        segment
+    } else {
+        if new_segment.is_some() {
+            return Err(unavailable());
+        }
+        active.clone()
+    };
+    appended.committed_len += bytes.len();
+    appended.last = Some(last);
+    let retired = if rotate && manifest.segments.len() == RETAINED_SEGMENTS {
+        Some(manifest.segments[0].clone())
+    } else {
+        None
+    };
+    let mut pending = Pending {
+        schema_version: 1,
+        journal_id: manifest.journal_id.clone(),
+        transaction_id: uuid::Uuid::new_v4().to_string(),
+        previous_digest: digest(&bounded_json(manifest, METADATA_BYTES)?),
+        previous_head: manifest.head,
+        first,
+        last,
+        bytes_base64: STANDARD.encode(bytes),
+        batch_digest: digest(bytes),
+        delta: ManifestDelta {
+            appended,
+            rotate,
+            retired,
+        },
+        next_digest: String::new(),
+    };
+    bounded_json(&pending.delta, 4096)?;
+    let next = apply_delta(manifest, &pending)?;
+    pending.next_digest = digest(&bounded_json(&next, METADATA_BYTES)?);
+    bounded_json(&pending, METADATA_BYTES)?;
+    Ok(pending)
+}
+
+fn apply_delta(manifest: &Manifest, pending: &Pending) -> io::Result<Manifest> {
+    let mut next = manifest.clone();
+    if pending.delta.rotate {
+        next.segments.last_mut().ok_or_else(unavailable)?.sealed = true;
+        next.segments.push(pending.delta.appended.clone());
+        if next.segments.len() > RETAINED_SEGMENTS {
+            let retired = next.segments.remove(0);
+            if pending.delta.retired.as_ref() != Some(&retired) {
+                return Err(unavailable());
+            }
+        } else if pending.delta.retired.is_some() {
+            return Err(unavailable());
+        }
+    } else {
+        *next.segments.last_mut().ok_or_else(unavailable)? = pending.delta.appended.clone();
+        if pending.delta.retired.is_some() {
+            return Err(unavailable());
+        }
+    }
+    next.head = pending.last;
+    next.oldest = next.segments[0].first;
+    validate_manifest(&next)?;
+    Ok(next)
+}
+
+fn pending_bytes(pending: &Pending) -> io::Result<Vec<u8>> {
+    bounded_json(pending, METADATA_BYTES)?;
+    if pending.schema_version != 1
+        || !canonical_uuid(&pending.journal_id)
+        || !canonical_uuid(&pending.transaction_id)
+        || pending.bytes_base64.len() > BATCH_BYTES.div_ceil(3) * 4
+    {
+        return Err(unavailable());
+    }
+    let bytes = STANDARD
+        .decode(&pending.bytes_base64)
+        .map_err(|_| unavailable())?;
+    if bytes.len() > BATCH_BYTES
+        || digest(&bytes) != pending.batch_digest
+        || STANDARD.encode(&bytes) != pending.bytes_base64
+    {
+        return Err(unavailable());
+    }
+    Ok(bytes)
+}
+
+fn verify_pending(manifest: &Manifest, pending: &Pending, bytes: &[u8]) -> io::Result<Manifest> {
+    let new_segment = if pending.delta.rotate {
+        let mut segment = pending.delta.appended.clone();
+        segment.last = None;
+        segment.committed_len = 0;
+        Some(segment)
+    } else {
+        None
+    };
+    let expected = prepare_append(manifest, bytes, new_segment)?;
+    if expected.journal_id != pending.journal_id
+        || expected.previous_digest != pending.previous_digest
+        || expected.previous_head != pending.previous_head
+        || expected.first != pending.first
+        || expected.last != pending.last
+        || expected.delta != pending.delta
+        || expected.next_digest != pending.next_digest
+    {
+        return Err(unavailable());
+    }
+    apply_delta(manifest, pending)
+}
+
+fn predecessor(next: &Manifest, pending: &Pending, bytes: &[u8]) -> io::Result<Manifest> {
+    let mut old = next.clone();
+    if pending.delta.rotate {
+        if old.segments.pop().as_ref() != Some(&pending.delta.appended) {
+            return Err(unavailable());
+        }
+        old.segments.last_mut().ok_or_else(unavailable)?.sealed = false;
+        if let Some(retired) = &pending.delta.retired {
+            old.segments.insert(0, retired.clone());
+        }
+    } else {
+        let active = old.segments.last_mut().ok_or_else(unavailable)?;
+        active.committed_len = active
+            .committed_len
+            .checked_sub(bytes.len())
+            .ok_or_else(unavailable)?;
+        active.last = if active.committed_len == 0 {
+            None
+        } else {
+            Some(pending.previous_head)
+        };
+    }
+    old.head = pending.previous_head;
+    old.oldest = old.segments.first().ok_or_else(unavailable)?.first;
+    validate_manifest(&old)?;
+    verify_pending(&old, pending, bytes)?;
+    Ok(old)
+}
+
+fn verify_retained(
+    root: &RootedDir,
+    manifest: &Manifest,
+    pending: Option<&Pending>,
+) -> io::Result<()> {
+    validate_manifest(manifest)?;
+    let device = root.identity()?.device;
+    for segment in &manifest.segments {
+        if segment.binding.device != device {
+            return Err(unavailable());
+        }
+        let allow_tail = pending.is_some_and(|p| p.delta.appended.name == segment.name);
+        committed_records(root, segment, &manifest.journal_id, allow_tail)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    schema_version: u32,
+    journal_id: String,
+    manifest_digest: String,
+    segment: Segment,
+}
+
+fn recover_retirement(
+    root: &RootedDir,
+    manifest: &Manifest,
+    faults: &dyn FaultHooks,
+) -> io::Result<()> {
+    root.resume_pending_owned_regular_cleanup("retirement.json")?;
+    if !root.entry_exists("retirement.json")? {
+        return Ok(());
+    }
+    let retirement: Retirement = read_json(root, "retirement.json", METADATA_BYTES)?;
+    if retirement.schema_version != 1
+        || retirement.journal_id != manifest.journal_id
+        || retirement.manifest_digest != digest(&bounded_json(manifest, METADATA_BYTES)?)
+        || manifest
+            .segments
+            .iter()
+            .any(|s| s.name == retirement.segment.name || s.binding == retirement.segment.binding)
+        || !retirement.segment.sealed
+        || !valid_segment_name(&retirement.segment.name)
+    {
+        return Err(unavailable());
+    }
+    root.retry_pending_owned_regulars_matching(|name, id| {
+        name == retirement.segment.name.as_bytes()
+            && Binding::from(id) == retirement.segment.binding
+    })?;
+    if root.entry_exists(&retirement.segment.name)? {
+        committed_records(root, &retirement.segment, &manifest.journal_id, false)?;
+        remove_bound(root, &retirement.segment.name, retirement.segment.binding)?;
+    }
+    faults.at(FaultPoint::Retired)?;
+    let binding = root.private_entry_identity("retirement.json")?.into();
+    remove_bound(root, "retirement.json", binding)
+}
+
+fn finish_pending(
+    root: &RootedDir,
+    manifest: &Manifest,
+    pending: &Pending,
+    faults: &dyn FaultHooks,
+) -> io::Result<()> {
+    if let Some(segment) = &pending.delta.retired {
+        let retirement = Retirement {
+            schema_version: 1,
+            journal_id: manifest.journal_id.clone(),
+            manifest_digest: pending.next_digest.clone(),
+            segment: segment.clone(),
+        };
+        let bytes = bounded_json(&retirement, METADATA_BYTES)?;
+        if root.entry_exists("retirement.json")? {
+            if root.read_private_regular("retirement.json", METADATA_BYTES as u64)? != bytes {
+                return Err(unavailable());
+            }
+        } else {
+            replace_role(
+                root,
+                &manifest.journal_id,
+                RoleKind::Retirement,
+                "retirement.json",
+                &bytes,
+                faults,
+            )?;
+        }
+    }
+    let binding = root.private_entry_identity("pending.json")?.into();
+    remove_bound(root, "pending.json", binding)?;
+    faults.at(FaultPoint::PendingRemoved)?;
+    recover_retirement(root, manifest, faults)
+}
+
+fn publish_append(
+    root: &RootedDir,
+    pending: &Pending,
+    faults: &dyn FaultHooks,
+) -> io::Result<Manifest> {
+    let manifest = recover_append(root, faults)?;
+    let bytes = pending_bytes(pending)?;
+    verify_pending(&manifest, pending, &bytes)?;
+    let target = &pending.delta.appended;
+    if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
+        return Err(unavailable());
+    }
+    let encoded = bounded_json(pending, METADATA_BYTES)?;
+    replace_role(
+        root,
+        &manifest.journal_id,
+        RoleKind::Pending,
+        "pending.json",
+        &encoded,
+        faults,
+    )?;
+    faults.at(FaultPoint::PendingDurable)?;
+    recover_append(root, faults)
+}
+
+fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manifest> {
+    let initial: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
+    recover_roles(root, &initial.journal_id)?;
+    root.resume_pending_owned_regular_cleanup("pending.json")?;
+    let manifest: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
+    if !root.entry_exists("pending.json")? {
+        verify_retained(root, &manifest, None)?;
+        recover_retirement(root, &manifest, faults)?;
+        return Ok(manifest);
+    }
+    let pending: Pending = read_json(root, "pending.json", METADATA_BYTES)?;
+    let bytes = pending_bytes(&pending)?;
+    let current_digest = digest(&bounded_json(&manifest, METADATA_BYTES)?);
+    if current_digest == pending.next_digest {
+        predecessor(&manifest, &pending, &bytes)?;
+        verify_retained(root, &manifest, None)?;
+        finish_pending(root, &manifest, &pending, faults)?;
+        return Ok(manifest);
+    }
+    if current_digest != pending.previous_digest {
+        return Err(unavailable());
+    }
+    let next = verify_pending(&manifest, &pending, &bytes)?;
+    verify_retained(root, &manifest, Some(&pending))?;
+    let target = &pending.delta.appended;
+    if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
+        return Err(unavailable());
+    }
+    let existing = root.read_private_regular(&target.name, SEGMENT_BYTES as u64)?;
+    let offset = target
+        .committed_len
+        .checked_sub(bytes.len())
+        .ok_or_else(unavailable)?;
+    let tail = existing.get(offset..).ok_or_else(unavailable)?;
+    let suffix = completion_suffix(&bytes, tail)?;
+    let mut file = root.open_private_append(&target.name)?;
+    root.validate_private_regular_binding(&target.name, &file, target.binding.into())?;
+    if !suffix.is_empty() {
+        let split = suffix.len().div_ceil(2);
+        file.write_all(&suffix[..split])?;
+        faults.at(FaultPoint::PartialAppend)?;
+        file.write_all(&suffix[split..])?;
+    }
+    file.sync_all()?;
+    root.validate_private_regular_binding(&target.name, &file, target.binding.into())?;
+    faults.at(FaultPoint::SegmentSynced)?;
+    // The committed prefix in this manifest is the only visibility boundary.
+    replace_role(
+        root,
+        &manifest.journal_id,
+        RoleKind::Manifest,
+        "manifest.json",
+        &bounded_json(&next, METADATA_BYTES)?,
+        faults,
+    )?;
+    faults.at(FaultPoint::ManifestCommitted)?;
+    verify_retained(root, &next, None)?;
+    finish_pending(root, &next, &pending, faults)?;
+    audit(root)?.admit(0, 0)?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +1135,193 @@ mod tests {
             }],
         };
         (temp, root, manifest)
+    }
+
+    fn append_fixture() -> (TempDir, RootedDir, Pending) {
+        let (temp, root, manifest) = fixture(&record(1), false);
+        root.write_new_private_file("manifest.json", &serde_json::to_vec(&manifest).unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let bytes = [record(2), record(3)].concat();
+        let pending = prepare_append(&manifest, &bytes, None).unwrap();
+        (temp, root, pending)
+    }
+
+    fn padded_record(seq: u64) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(&record(seq)).unwrap();
+        value["data"]["padding"] = "".into();
+        let length = serde_json::to_vec(&value).unwrap().len() + 1;
+        value["data"]["padding"] = "x".repeat(1024 - length).into();
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn pending_encodes_maximum_batch_with_delta_instead_of_manifest_copy() {
+        let (_temp, _root, manifest) = fixture(&record(1), false);
+        let bytes = (2..=33).map(padded_record).collect::<Vec<_>>().concat();
+        assert_eq!(bytes.len(), 32 * 1024);
+        let pending = prepare_append(&manifest, &bytes, None).unwrap();
+        let encoded = serde_json::to_vec(&pending).unwrap();
+        assert!(encoded.len() <= 64 * 1024);
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(value.get("segments").is_none());
+        assert!(serde_json::to_vec(&value["delta"]).unwrap().len() <= 4096);
+    }
+
+    #[test]
+    fn sixty_four_segment_rotation_retires_only_manifest_excluded_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootedDir::create(&temp.path().join("events")).unwrap();
+        let mut segments = Vec::new();
+        for index in 0..64u64 {
+            let first = index * 256 + 1;
+            let name = format!("segment-{first}.jsonl");
+            let bytes = (first..first + 256)
+                .map(padded_record)
+                .collect::<Vec<_>>()
+                .concat();
+            root.write_new_private_file(&name, &bytes)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            segments.push(Segment {
+                name: name.clone(),
+                first,
+                last: Some(first + 255),
+                committed_len: 256 * 1024,
+                binding: root.private_entry_identity(&name).unwrap().into(),
+                sealed: index < 63,
+            });
+        }
+        let manifest = Manifest {
+            schema_version: 1,
+            journal_id: EPOCH.into(),
+            head: 16_384,
+            oldest: 1,
+            segments,
+        };
+        root.write_new_private_file("manifest.json", &serde_json::to_vec(&manifest).unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        root.write_new_private_file("segment-16385.jsonl", b"")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let new_segment = Segment {
+            name: "segment-16385.jsonl".into(),
+            first: 16_385,
+            last: None,
+            committed_len: 0,
+            binding: root
+                .private_entry_identity("segment-16385.jsonl")
+                .unwrap()
+                .into(),
+            sealed: false,
+        };
+        let pending = prepare_append(&manifest, &record(16_385), Some(new_segment)).unwrap();
+        let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Retired)));
+        assert!(publish_append(&root, &pending, &fault).is_err());
+        let next = recover_append(&root, &NoFaults).unwrap();
+        assert_eq!(next.head, 16_385);
+        assert_eq!(next.oldest, 257);
+        assert_eq!(next.segments.len(), 64);
+        assert!(!root.entry_exists("segment-1.jsonl").unwrap());
+        assert!(root.entry_exists("segment-257.jsonl").unwrap());
+        let usage = audit(&root).unwrap();
+        assert!(usage.bytes <= 18 * 1024 * 1024 && usage.files <= 128);
+    }
+
+    #[test]
+    fn pending_recovery_commits_each_append_boundary_once() {
+        for point in [
+            FaultPoint::PendingDurable,
+            FaultPoint::PartialAppend,
+            FaultPoint::SegmentSynced,
+            FaultPoint::ManifestCommitted,
+            FaultPoint::PendingRemoved,
+        ] {
+            let (_temp, root, pending) = append_fixture();
+            let fault = FailOnce(std::sync::Mutex::new(Some(point)));
+            assert!(
+                publish_append(&root, &pending, &fault).is_err(),
+                "{point:?}"
+            );
+            let reopened = RootedDir::open(root.path()).unwrap();
+            let manifest = recover_append(&reopened, &NoFaults).unwrap();
+            assert_eq!(manifest.head, 3, "{point:?}");
+            let records =
+                committed_records(&reopened, &manifest.segments[0], EPOCH, false).unwrap();
+            let seqs: Vec<&str> = records.iter().map(|r| r["seq"].as_str().unwrap()).collect();
+            assert_eq!(seqs, ["1", "2", "3"]);
+            // The next caller starts at four; recovery never allocates another range.
+            let next = prepare_append(&manifest, &record(4), None).unwrap();
+            assert_eq!(publish_append(&reopened, &next, &NoFaults).unwrap().head, 4);
+            assert_eq!(recover_append(&reopened, &NoFaults).unwrap().head, 4);
+            let usage = audit(&reopened).unwrap();
+            assert!(usage.bytes <= 18 * 1024 * 1024 && usage.files <= 128);
+            assert!(usage.evidence_bytes <= 512 * 1024 && usage.evidence_files <= 32);
+        }
+    }
+
+    #[test]
+    fn unexplained_append_tail_is_preserved_without_committing() {
+        use std::io::Write;
+        let (_temp, root, pending) = append_fixture();
+        let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::PendingDurable)));
+        assert!(publish_append(&root, &pending, &fault).is_err());
+        let mut file = root.open_private_append("segment-1.jsonl").unwrap();
+        file.write_all(b"foreign bytes").unwrap();
+        file.sync_all().unwrap();
+        assert!(recover_append(&root, &NoFaults).is_err());
+        let saved: Manifest = read_json(&root, "manifest.json", METADATA_BYTES).unwrap();
+        assert_eq!(saved.head, 1);
+        assert!(
+            root.read_private_regular("segment-1.jsonl", SEGMENT_BYTES as u64)
+                .unwrap()
+                .ends_with(b"foreign bytes")
+        );
+    }
+
+    #[test]
+    fn repeated_partial_append_crashes_keep_one_sequence_range_and_bounded_residue() {
+        let (_temp, root, pending) = append_fixture();
+        let initial = FailOnce(std::sync::Mutex::new(Some(FaultPoint::PendingDurable)));
+        assert!(publish_append(&root, &pending, &initial).is_err());
+        for _ in 0..20 {
+            let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::PartialAppend)));
+            if recover_append(&root, &fault).is_ok() {
+                break;
+            }
+            let usage = audit(&root).unwrap();
+            assert!(usage.files <= 4 && usage.bytes < 64 * 1024);
+        }
+        let manifest = recover_append(&root, &NoFaults).unwrap();
+        assert_eq!(manifest.head, 3);
+        assert_eq!(
+            committed_records(&root, &manifest.segments[0], EPOCH, false)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_batch_count_size_and_sequence_overflow_before_writing() {
+        let (_temp, _root, mut manifest) = fixture(&record(1), false);
+        let too_many = (2..=34).map(record).collect::<Vec<_>>().concat();
+        assert!(prepare_append(&manifest, &too_many, None).is_err());
+        assert!(prepare_append(&manifest, &vec![b'x'; 32 * 1024 + 1], None).is_err());
+        assert!(prepare_append(&manifest, &record(3), None).is_err());
+        manifest.head = u64::MAX;
+        manifest.oldest = u64::MAX;
+        manifest.segments[0].name = format!("segment-{}.jsonl", u64::MAX);
+        manifest.segments[0].first = u64::MAX;
+        manifest.segments[0].last = Some(u64::MAX);
+        assert!(prepare_append(&manifest, &record(0), None).is_err());
     }
 
     #[test]
