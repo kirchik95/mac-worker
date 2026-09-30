@@ -756,7 +756,7 @@ pub fn run_with_stdio_in_context(
         && config.controller.enabled
     {
         // Record adoption on the first laptop CLI run. Cache problems must not
-        // block unrelated commands; pending and persistence check this strictly.
+        // block commands; pending reports marker problems and includes legacy files.
         let _ =
             crate::controller::envelope::adopt_operation_envelopes(&paths.controller_cache_root());
     }
@@ -1146,6 +1146,13 @@ fn run_controller_command(
                         &paths.controller_cache_root(),
                         all,
                     )?;
+                    if envelopes.adoption_marker_unreadable {
+                        let _ = writeln!(
+                            stderr,
+                            "controller request adoption marker could not be read; including legacy requests"
+                        );
+                        let _ = stderr.flush();
+                    }
                     if !envelopes.unreadable.is_empty() {
                         let _ = writeln!(
                             stderr,

@@ -132,7 +132,8 @@ pub fn persist_operation_envelope(
     let root = open_controller_root(cache_root)?;
     let _lock = lock_operations(&root)?;
     let now = now_millis()?;
-    adoption_time(&root, now)?;
+    // Adoption only filters legacy listings; it must never block a mutation.
+    let _ = adoption_time(&root, now);
     if root.entry_exists(&name).map_err(store_io)? {
         let existing = load_envelope(&root, &name)?;
         return reuse_or_conflict(&existing, request);
@@ -190,6 +191,7 @@ pub fn settle_operation_envelope(
 pub struct PendingEnvelopes {
     pub pending: Vec<OperationEnvelope>,
     pub unreadable: Vec<UnreadableEnvelope>,
+    pub adoption_marker_unreadable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,11 +215,14 @@ fn list_pending_envelopes_at(
     let Some(root) = open_existing_controller_root(cache_root)? else {
         return Ok(PendingEnvelopes::default());
     };
+    let mut report = PendingEnvelopes::default();
     let adopted_at = {
         let _lock = lock_operations(&root)?;
-        adoption_time(&root, now)?
+        adoption_time(&root, now).unwrap_or_else(|_| {
+            report.adoption_marker_unreadable = true;
+            0
+        })
     };
-    let mut report = PendingEnvelopes::default();
     for name in root.list_names().map_err(store_io)? {
         if !name.starts_with(b"op-") || !name.ends_with(b".json") {
             continue;
@@ -487,6 +492,46 @@ mod tests {
             .unwrap();
         assert!(legacy.settled_at_millis().is_none());
         assert_eq!(legacy.to_request().unwrap(), request);
+    }
+
+    #[test]
+    fn mutation_persistence_ignores_missing_invalid_and_unsafe_adoption_markers() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for kind in ["missing", "invalid", "permissions", "directory", "symlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let root = open_controller_root(&cache).unwrap();
+            let marker = cache.join(ADOPTION_MARKER);
+            match kind {
+                "missing" => {}
+                "invalid" => root
+                    .write_private_atomic_no_replace(ADOPTION_MARKER, b"PRIVATE invalid JSON")
+                    .unwrap(),
+                "permissions" => {
+                    root.write_private_atomic_no_replace(ADOPTION_MARKER, b"{}")
+                        .unwrap();
+                    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                "directory" => std::fs::create_dir(&marker).unwrap(),
+                "symlink" => symlink(temp.path().join("absent"), &marker).unwrap(),
+                _ => unreachable!(),
+            }
+            let request = request(1);
+            let saved = persist_operation_envelope(&cache, &request)
+                .unwrap_or_else(|error| panic!("{kind}: {error}"));
+            assert_eq!(saved.to_request().unwrap(), request);
+            assert_eq!(persist_operation_envelope(&cache, &request).unwrap(), saved);
+            settle_operation_envelope(&cache, &request, OperationOutcome::Acknowledged).unwrap();
+            assert_eq!(
+                load_operation_envelope(&cache, request.request_id())
+                    .unwrap()
+                    .unwrap()
+                    .outcome(),
+                Some(&OperationOutcome::Acknowledged)
+            );
+        }
     }
 
     #[test]

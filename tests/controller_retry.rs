@@ -239,6 +239,90 @@ fn first_controller_mode_run_writes_a_private_adoption_marker_once() {
 }
 
 #[test]
+fn pending_lists_legacy_requests_and_warns_once_when_adoption_marker_is_invalid() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for kind in ["invalid", "permissions", "directory", "symlink"] {
+        let fixture = Fixture::new(true);
+        let cache = fixture.paths.controller_cache_root();
+        persist_operation_envelope(&cache, &request()).unwrap();
+        fixture.rewrite(|value| {
+            value["created_at_millis"] = json!(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    - 86_400_000
+            );
+            value.as_object_mut().unwrap().remove("settled_at_millis");
+            value.as_object_mut().unwrap().remove("outcome");
+        });
+        let marker = cache.join("operations-adopted-v1.json");
+        match kind {
+            "invalid" => fs::write(&marker, b"PRIVATE invalid marker").unwrap(),
+            "permissions" => {
+                fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "directory" => {
+                fs::remove_file(&marker).unwrap();
+                fs::create_dir(&marker).unwrap();
+            }
+            "symlink" => {
+                fs::remove_file(&marker).unwrap();
+                symlink(fixture._temp.path().join("absent"), &marker).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        for args in [
+            vec!["controller", "pending", "--json"],
+            vec!["controller", "pending", "--all", "--json"],
+        ] {
+            let (exit, stdout, stderr) = fixture.run(&args, &NoTransport);
+            assert_eq!(exit, 0, "{kind}: {stderr}");
+            assert_eq!(
+                stderr,
+                "controller request adoption marker could not be read; including legacy requests\n"
+            );
+            let report: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(report["pending"].as_array().unwrap().len(), 1);
+            assert_eq!(report["pending"][0]["request_id"], ID);
+            assert_eq!(report["unreadable"], json!([]));
+            assert!(!stdout.contains("PRIVATE"));
+        }
+        if kind == "invalid" {
+            assert_eq!(fs::read(marker).unwrap(), b"PRIVATE invalid marker");
+        }
+    }
+}
+
+#[test]
+fn retry_settles_normally_with_an_invalid_adoption_marker() {
+    let fixture = Fixture::new(true);
+    let cache = fixture.paths.controller_cache_root();
+    persist_operation_envelope(&cache, &request()).unwrap();
+    fs::write(
+        cache.join("operations-adopted-v1.json"),
+        b"PRIVATE invalid marker",
+    )
+    .unwrap();
+    let runner = Reply::new(false);
+    let (exit, stdout, stderr) = fixture.run(&["controller", "retry", ID, "--json"], &runner);
+    assert_eq!(exit, 0, "{stderr}");
+    assert!(stderr.is_empty());
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["run_id"],
+        RUN
+    );
+    assert_eq!(
+        load_operation_envelope(&cache, ID)
+            .unwrap()
+            .unwrap()
+            .outcome(),
+        Some(&mac_worker::controller::OperationOutcome::Acknowledged)
+    );
+}
+
+#[test]
 fn pending_skips_unreadable_envelopes_and_reports_them_without_private_details() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
