@@ -158,7 +158,7 @@ gh auth setup-git
 
 ## Show turns in herdr (optional)
 
-If [herdr](https://herdr.dev) runs on the worker, the pool can show its turns in that herdr, and through herdr's machine link or the herdr-mirror plugin, in the herdr on your laptop.
+If [herdr](https://herdr.dev) runs on the worker, the pool can show its turns in that herdr, and through herdr's machine link, in the herdr on your laptop.
 
 1. Start herdr's server on the worker as the worker account and keep it running. Its default session must own the socket `~/.config/herdr/herdr.sock`:
 
@@ -183,7 +183,7 @@ If [herdr](https://herdr.dev) runs on the worker, the pool can show its turns in
 
    `doctor` prints `herdr: available (<version>)` for the worker, or warns with `HERDR_UNAVAILABLE` and says why. Turns run either way; the warning only means nothing will show up in herdr.
 
-3. Add the worker as a machine in your laptop's herdr (`herdr machine add <ssh-target>`) or run the herdr-mirror plugin, so the `mac-worker` workspace and its `task <id> · turn <n>` tabs appear beside your local agents. Custom sidebar rows can name the tokens `task`, `turn`, `mw_title`, `mw_agent`, and `mw_outcome`.
+3. Add the worker as a machine in your laptop's herdr (`herdr machine add <ssh-target>`), so the `mac-worker` workspace and its `task <id> · turn <n>` tabs appear beside your local agents. Custom sidebar rows can name the tokens `task`, `turn`, `mw_title`, `mw_agent`, and `mw_outcome`.
 
 The reporter only reads the worker's task records and writes nothing to disk on its own; `worker task close` and `worker gc --apply` remove the tabs it opened.
 
