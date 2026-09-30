@@ -219,13 +219,6 @@ impl JournalHarness {
         self.reopen().unwrap()
     }
 
-    fn residue_bytes(&self) -> usize {
-        self.usage().0
-    }
-    fn regular_file_count(&self) -> usize {
-        self.usage().1
-    }
-
     fn usage(&self) -> (usize, usize, usize, usize) {
         fn visit(path: &std::path::Path, depth: usize) -> (usize, usize, usize, usize) {
             let mut usage = (0, 0, 0, 0);
@@ -256,9 +249,9 @@ impl JournalHarness {
 
     fn assert_budget(&self) {
         use mac_worker::controller::events::*;
-        let (_, _, evidence_bytes, evidence_files) = self.usage();
-        assert!(self.residue_bytes() <= MAX_JOURNAL_BYTES);
-        assert!(self.regular_file_count() <= MAX_JOURNAL_FILES);
+        let (bytes, files, evidence_bytes, evidence_files) = self.usage();
+        assert!(bytes <= MAX_JOURNAL_BYTES);
+        assert!(files <= MAX_JOURNAL_FILES);
         assert!(evidence_bytes <= MAX_RECOVERY_EVIDENCE_BYTES);
         assert!(evidence_files <= MAX_RECOVERY_EVIDENCE_FILES);
     }
@@ -268,23 +261,41 @@ impl JournalHarness {
     fn fill_segments(&self, count: u64) {
         let epoch = self.head().journal_id;
         let mut segments = Vec::new();
+        // Equal-width canonical sequences have identical bounded encodings
+        // apart from their digits. Validate/encode each template once; the
+        // final real window read still validates every record in every file.
+        let mut records = std::collections::BTreeMap::new();
         for index in 0..count {
             let first = index * 256 + 1;
             let name = format!("segment-{first}.jsonl");
             let mut bytes = Vec::new();
             for seq in first..first + 256 {
-                let mut event = mac_worker::controller::events::WireEvent {
-                    schema_version: 1,
-                    journal_id: epoch,
-                    seq: Seq::new(seq),
-                    time_millis: 0,
-                    kind: "future.changed".into(),
-                    data: serde_json::json!({"padding":""}),
-                };
-                let base = event.encoded_len().unwrap();
-                event.data["padding"] = serde_json::json!("a".repeat(1024 - base));
-                event.validate().unwrap();
-                serde_json::to_writer(&mut bytes, &event).unwrap();
+                let sequence = seq.to_string();
+                let (record, range) = records.entry(sequence.len()).or_insert_with(|| {
+                    let mut event = mac_worker::controller::events::WireEvent {
+                        schema_version: 1,
+                        journal_id: epoch,
+                        seq: Seq::new(seq),
+                        time_millis: 0,
+                        kind: "future.changed".into(),
+                        data: serde_json::json!({"padding":""}),
+                    };
+                    let base = event.encoded_len().unwrap();
+                    event.data["padding"] = serde_json::json!("a".repeat(1024 - base));
+                    event.validate().unwrap();
+                    let record = serde_json::to_vec(&event).unwrap();
+                    assert_eq!(record.len() + 1, 1024);
+                    let marker = format!("\"seq\":\"{sequence}\"");
+                    let start = record
+                        .windows(marker.len())
+                        .position(|bytes| bytes == marker.as_bytes())
+                        .expect("typed fixture includes its sequence field")
+                        + b"\"seq\":\"".len();
+                    (record, start..start + sequence.len())
+                });
+                bytes.extend_from_slice(&record[..range.start]);
+                bytes.extend_from_slice(sequence.as_bytes());
+                bytes.extend_from_slice(&record[range.end..]);
                 bytes.push(b'\n');
             }
             assert_eq!(bytes.len(), 256 * 1024);
@@ -303,32 +314,40 @@ impl JournalHarness {
             "schema_version":1,"journal_id":epoch.to_string(),"head":count*256,"oldest":1,"segments":segments
         }))).unwrap();
         assert_eq!(
-            self.reopen().unwrap().window(DEADLINE).unwrap().head_seq,
+            self.journal.window(DEADLINE).unwrap().head_seq,
             Seq::new(count * 256)
         );
     }
 
     fn read_from(&self, seq: u64, limit: usize) -> mac_worker::controller::events::ReadBatch {
-        let EventReadResult::Batch(batch) = self
-            .recover()
-            .read(
-                ReadQuery {
-                    after: Some(mac_worker::controller::events::EventCursor {
-                        journal_id: self.head().journal_id,
-                        seq: Seq::new(seq),
-                    }),
-                    limit,
-                    wait_ms: 0,
-                },
-                DEADLINE,
-            )
-            .unwrap()
-        else {
-            panic!("expected committed records");
-        };
-        batch.validate().unwrap();
-        batch
+        read_from_journal(&self.recover(), self.head().journal_id, seq, limit)
     }
+}
+
+fn read_from_journal(
+    journal: &ControllerJournal,
+    journal_id: uuid::Uuid,
+    seq: u64,
+    limit: usize,
+) -> mac_worker::controller::events::ReadBatch {
+    let EventReadResult::Batch(batch) = journal
+        .read(
+            ReadQuery {
+                after: Some(mac_worker::controller::events::EventCursor {
+                    journal_id,
+                    seq: Seq::new(seq),
+                }),
+                limit,
+                wait_ms: 0,
+            },
+            DEADLINE,
+        )
+        .unwrap()
+    else {
+        panic!("expected committed records");
+    };
+    batch.validate().unwrap();
+    batch
 }
 
 #[test]
@@ -513,67 +532,95 @@ fn successful_initialization_and_attachment_allow_work_beyond_lock_admission_bud
     );
 }
 
-#[test]
-fn public_initialization_role_fault_matrix_preserves_epoch_and_budgets() {
-    for role in [
-        JournalRole::Initialization,
-        JournalRole::Segment,
-        JournalRole::Manifest,
-    ] {
-        for boundary in BOUNDARIES {
-            let temporary = tempfile::tempdir().unwrap();
-            let paths = private_paths(temporary.path());
-            let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
-            let runtime = Arc::new(ManualEventRuntime::new());
-            let faults = Arc::new(FaultControl::default());
-            *faults.next.lock().unwrap() =
-                Some((JournalFaultPoint::Role(role, boundary), libc::EIO, 1));
-            assert!(
-                ControllerJournal::initialize_for_leader_with_hook(
-                    &paths,
-                    &leader,
-                    JournalOptions {
-                        runtime: runtime.clone()
-                    },
-                    faults.clone()
-                )
-                .is_err(),
-                "{role:?} {boundary:?}"
-            );
-            assert_eq!(faults.hits.load(Ordering::SeqCst), 1);
-            let root = paths.controller_state_root().join("events");
-            let identity = if root.join("initialization.json").exists() {
-                "initialization.json"
-            } else {
-                "initialization.role"
-            };
-            let before: serde_json::Value =
-                serde_json::from_slice(&fs::read(root.join(identity)).unwrap()).unwrap();
-            let journal = ControllerJournal::initialize_for_leader(
-                &paths,
-                &leader,
-                JournalOptions { runtime },
-            )
+fn run_initialization_role_case(role: JournalRole, boundary: JournalRoleBoundary) {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = private_paths(temporary.path());
+    let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+    let runtime = Arc::new(ManualEventRuntime::new());
+    let faults = Arc::new(FaultControl::default());
+    *faults.next.lock().unwrap() = Some((JournalFaultPoint::Role(role, boundary), libc::EIO, 1));
+    assert!(
+        ControllerJournal::initialize_for_leader_with_hook(
+            &paths,
+            &leader,
+            JournalOptions {
+                runtime: runtime.clone()
+            },
+            faults.clone()
+        )
+        .is_err(),
+        "{role:?} {boundary:?}"
+    );
+    assert_eq!(faults.hits.load(Ordering::SeqCst), 1);
+    let root = paths.controller_state_root().join("events");
+    let identity = if root.join("initialization.json").exists() {
+        "initialization.json"
+    } else {
+        "initialization.role"
+    };
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(identity)).unwrap()).unwrap();
+    let journal =
+        ControllerJournal::initialize_for_leader(&paths, &leader, JournalOptions { runtime })
             .unwrap();
-            let window = journal.window(DEADLINE).unwrap();
-            assert_eq!(window.head_seq, Seq::ZERO);
-            assert_eq!(window.journal_id.to_string(), before["journal_id"]);
-            assert_eq!(
-                journal.append(drain_batch(1), DEADLINE).unwrap().seq,
-                Seq::new(1)
-            );
-            let h = JournalHarness {
-                _temporary: temporary,
-                paths,
-                _leader: leader,
-                runtime: Arc::new(ManualEventRuntime::new()),
-                journal,
-                faults,
-            };
-            h.assert_budget();
-        }
-    }
+    let window = journal.window(DEADLINE).unwrap();
+    assert_eq!(window.head_seq, Seq::ZERO);
+    assert_eq!(window.journal_id.to_string(), before["journal_id"]);
+    assert_eq!(
+        journal.append(drain_batch(1), DEADLINE).unwrap().seq,
+        Seq::new(1)
+    );
+    let h = JournalHarness {
+        _temporary: temporary,
+        paths,
+        _leader: leader,
+        runtime: Arc::new(ManualEventRuntime::new()),
+        journal,
+        faults,
+    };
+    h.assert_budget();
 }
+
+// Each expansion is a separate nextest process with exactly one role/boundary
+// case, so slow fixture work cannot accumulate across an entire matrix.
+macro_rules! journal_role_cases {
+    ($run:ident, $role:ident, { $($name:ident: $boundary:ident),+ $(,)? }) => {
+        $(
+            #[test]
+            fn $name() {
+                $run(JournalRole::$role, JournalRoleBoundary::$boundary);
+            }
+        )+
+    };
+}
+
+journal_role_cases!(run_initialization_role_case, Initialization, {
+    public_initialization_epoch_creation_recorded: CreationRecorded,
+    public_initialization_epoch_partial_stage: PartialStage,
+    public_initialization_epoch_stage_synced: StageSynced,
+    public_initialization_epoch_published: Published,
+    public_initialization_epoch_directory_synced: DirectorySynced,
+    public_initialization_epoch_displaced_removed: DisplacedRemoved,
+    public_initialization_epoch_final_synced: FinalSynced,
+});
+journal_role_cases!(run_initialization_role_case, Segment, {
+    public_initialization_segment_creation_recorded: CreationRecorded,
+    public_initialization_segment_partial_stage: PartialStage,
+    public_initialization_segment_stage_synced: StageSynced,
+    public_initialization_segment_published: Published,
+    public_initialization_segment_directory_synced: DirectorySynced,
+    public_initialization_segment_displaced_removed: DisplacedRemoved,
+    public_initialization_segment_final_synced: FinalSynced,
+});
+journal_role_cases!(run_initialization_role_case, Manifest, {
+    public_initialization_manifest_creation_recorded: CreationRecorded,
+    public_initialization_manifest_partial_stage: PartialStage,
+    public_initialization_manifest_stage_synced: StageSynced,
+    public_initialization_manifest_published: Published,
+    public_initialization_manifest_directory_synced: DirectorySynced,
+    public_initialization_manifest_displaced_removed: DisplacedRemoved,
+    public_initialization_manifest_final_synced: FinalSynced,
+});
 
 fn drain_batch(count: usize) -> EventBatch {
     EventBatch::try_new(vec![
@@ -649,72 +696,115 @@ fn publisher_retry_allows_successful_work_beyond_lock_admission_budget() {
     assert_eq!(h.read_from(0, 32).events.len(), 1);
 }
 
-fn run_role_matrix() {
-    for role in [
-        JournalRole::Pending,
-        JournalRole::Manifest,
-        JournalRole::Segment,
-        JournalRole::Retirement,
-    ] {
-        for boundary in BOUNDARIES {
-            let h = JournalHarness::new();
-            let baseline = match role {
-                JournalRole::Segment => {
-                    h.fill_segments(1);
-                    256
-                }
-                JournalRole::Retirement => {
-                    h.fill_segments(64);
-                    16384
-                }
-                _ => {
-                    h.append_one().unwrap();
-                    1
-                }
-            };
-            h.inject(JournalFaultPoint::Role(role, boundary));
-            assert!(h.append_one().is_err(), "{role:?} {boundary:?}");
-            assert_eq!(
-                h.faults.hits.load(Ordering::SeqCst),
-                1,
-                "fault must execute"
-            );
-            h.assert_budget();
-            let recovered = h.recover();
-            let head = recovered.window(DEADLINE).unwrap().head_seq.as_u64();
-            assert!(head == baseline || head == baseline + 1);
-            let next = recovered.append(drain_batch(1), DEADLINE).unwrap();
-            assert_eq!(next.seq.as_u64(), head + 1);
-            let oldest = recovered.window(DEADLINE).unwrap().oldest_seq.as_u64();
-            let batch = h.read_from(head.max(oldest - 1), 256);
-            assert_eq!(batch.events.len(), 1);
-            assert_eq!(batch.events[0].seq, next.seq);
-            assert!(h.read_from(next.seq.as_u64(), 256).events.is_empty());
-            h.assert_budget();
-            let names: Vec<_> = fs::read_dir(h.root())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert!(
-                !names
-                    .iter()
-                    .any(|name| name.to_str().unwrap().ends_with(".stage")
-                        || name.to_str().unwrap().ends_with(".role"))
-            );
+fn run_role_case(role: JournalRole, boundary: JournalRoleBoundary) {
+    let h = JournalHarness::new();
+    let journal_id = h.head().journal_id;
+    let baseline = match role {
+        JournalRole::Segment => {
+            h.fill_segments(1);
+            256
         }
-    }
+        JournalRole::Retirement => {
+            h.fill_segments(64);
+            16384
+        }
+        _ => {
+            h.append_one().unwrap();
+            1
+        }
+    };
+    h.inject(JournalFaultPoint::Role(role, boundary));
+    assert!(h.append_one().is_err(), "{role:?} {boundary:?}");
+    assert_eq!(
+        h.faults.hits.load(Ordering::SeqCst),
+        1,
+        "fault must execute"
+    );
+    h.assert_budget();
+    // Reopen after the injected crash, then reuse that validated binding for
+    // both cursor checks rather than repeating healthy attachment per query.
+    let recovered = h.recover();
+    let window = recovered.window(DEADLINE).unwrap();
+    assert_eq!(window.journal_id, journal_id);
+    let head = window.head_seq.as_u64();
+    assert!(head == baseline || head == baseline + 1);
+    let next = recovered.append(drain_batch(1), DEADLINE).unwrap();
+    assert_eq!(next.seq.as_u64(), head + 1);
+    let batch = read_from_journal(&recovered, journal_id, head, 256);
+    // The just-recovered head must remain resumable after one append; the
+    // validated read supplies oldest without another full manifest scan.
+    assert_eq!(head.max(batch.oldest_seq.as_u64() - 1), head);
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].seq, next.seq);
+    assert!(
+        read_from_journal(&recovered, journal_id, next.seq.as_u64(), 256)
+            .events
+            .is_empty()
+    );
+    h.assert_budget();
+    let names: Vec<_> = fs::read_dir(h.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.to_str().unwrap().ends_with(".stage")
+                || name.to_str().unwrap().ends_with(".role"))
+    );
 }
 
-#[test]
-fn public_append_rotation_retirement_role_fault_matrix() {
-    run_role_matrix();
-}
+journal_role_cases!(run_role_case, Pending, {
+    public_pending_creation_recorded: CreationRecorded,
+    public_pending_partial_stage: PartialStage,
+    public_pending_stage_synced: StageSynced,
+    public_pending_published: Published,
+    public_pending_directory_synced: DirectorySynced,
+    public_pending_displaced_removed: DisplacedRemoved,
+    public_pending_final_synced: FinalSynced,
+});
+journal_role_cases!(run_role_case, Manifest, {
+    public_manifest_creation_recorded: CreationRecorded,
+    public_manifest_partial_stage: PartialStage,
+    public_manifest_stage_synced: StageSynced,
+    public_manifest_published: Published,
+    public_manifest_directory_synced: DirectorySynced,
+    public_manifest_displaced_removed: DisplacedRemoved,
+    public_manifest_final_synced: FinalSynced,
+});
+journal_role_cases!(run_role_case, Segment, {
+    public_segment_creation_recorded: CreationRecorded,
+    public_segment_partial_stage: PartialStage,
+    public_segment_stage_synced: StageSynced,
+    public_segment_published: Published,
+    public_segment_directory_synced: DirectorySynced,
+    public_segment_displaced_removed: DisplacedRemoved,
+    public_segment_final_synced: FinalSynced,
+});
+journal_role_cases!(run_role_case, Retirement, {
+    public_retirement_creation_recorded: CreationRecorded,
+    public_retirement_partial_stage: PartialStage,
+    public_retirement_stage_synced: StageSynced,
+    public_retirement_published: Published,
+    public_retirement_directory_synced: DirectorySynced,
+    public_retirement_displaced_removed: DisplacedRemoved,
+    public_retirement_final_synced: FinalSynced,
+});
 
 #[test]
 #[ignore = "200 deterministic role-matrix iterations; explicit stress gate only"]
 fn public_journal_fault_matrix_stress() {
     for _ in 0..200 {
-        run_role_matrix();
+        for role in [
+            JournalRole::Pending,
+            JournalRole::Manifest,
+            JournalRole::Segment,
+            JournalRole::Retirement,
+        ] {
+            for boundary in BOUNDARIES {
+                run_role_case(role, boundary);
+            }
+        }
     }
 }
 
