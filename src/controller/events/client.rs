@@ -70,6 +70,13 @@ impl ControllerEventClient {
                     "CONTROLLER_EVENTS_UNSUPPORTED: legacy selector rejection".into(),
                 ));
             }
+            if request.body().get("controller_events").is_some()
+                && error.error().code() == CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE
+            {
+                return Err(WorkerError::Unavailable(format!(
+                    "{CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE}: repair unavailable, registry too large"
+                )));
+            }
             return Err(unavailable());
         }
         if !result.status.success() {

@@ -3313,6 +3313,59 @@ mod transport_bounds {
             assert!(!error.to_string().contains("PRIVATE"));
         }
     }
+
+    #[test]
+    fn review_client_preserves_registry_too_large_diagnostic() {
+        for message in [
+            "repair unavailable, registry too large",
+            "PRIVATE remote path, prompt and error prose",
+        ] {
+            let (client, _) = client(
+                move |_| {
+                    serde_json::to_value(
+                        HostControlError::new(
+                            "CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE",
+                            message,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                },
+                Arc::new(ManualEventRuntime::new()),
+            );
+            let error = client
+                .repair(TaskRepairQuery::default(), deadline())
+                .unwrap_err();
+            assert_eq!(
+                error.public_code(),
+                "CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE"
+            );
+            assert_eq!(
+                error.to_string(),
+                "worker unavailable: CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE: repair unavailable, registry too large"
+            );
+        }
+
+        let (client, _) = client(
+            |_| {
+                serde_json::to_value(
+                    HostControlError::new(
+                        "CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE_PRIVATE",
+                        "PRIVATE remote error prose",
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            },
+            Arc::new(ManualEventRuntime::new()),
+        );
+        let error = client
+            .repair(TaskRepairQuery::default(), deadline())
+            .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_EVENTS_UNAVAILABLE");
+        assert!(!error.to_string().contains("PRIVATE"));
+    }
+
     #[test]
     fn every_reply_identity_field_is_verified() {
         for field in [
