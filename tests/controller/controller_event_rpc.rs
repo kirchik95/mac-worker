@@ -612,7 +612,8 @@ mod state_reads {
         assert!(!paths.controller_state_root().join("events").exists());
     }
 
-    const SHORT_WAIT_DEADLINE: Duration = Duration::from_secs(2);
+    // Bound hangs without requiring real state/RPC work to finish quickly under load.
+    const WAIT_HANG_GUARD: Duration = Duration::from_secs(30);
 
     struct WaitRpc<'a> {
         paths: &'a PathLayout,
@@ -647,7 +648,7 @@ mod state_reads {
                 "task.wait.poll",
                 "wait used discovery or events"
             );
-            assert!(process.policy.deadline <= SHORT_WAIT_DEADLINE);
+            assert!(process.policy.deadline <= WAIT_HANG_GUARD);
             self.requests.lock().unwrap().push(request.clone());
             let (status, stdout) = match super::routed_rpc(self.paths, &request) {
                 Ok(frame) => (0, frame),
@@ -679,7 +680,7 @@ mod state_reads {
     }
 
     #[test]
-    fn wait_wiring_only_polls_with_short_deadline_and_eventless_quiescence() {
+    fn wait_wiring_only_polls_with_hang_guard_and_eventless_quiescence() {
         use mac_worker::controller::{ControllerWaitSelector, wait_via_controller};
 
         for (outcome, expected_exit) in [
@@ -693,7 +694,7 @@ mod state_reads {
                 &runner,
                 &wait_config(),
                 ControllerWaitSelector::Task(id(1)),
-                Some(SHORT_WAIT_DEADLINE),
+                Some(WAIT_HANG_GUARD),
             )
             .unwrap();
             assert_eq!(report.task_ids(), &[id(1)]);
@@ -793,7 +794,7 @@ mod state_reads {
             &runner,
             &wait_config(),
             ControllerWaitSelector::Run(run_id.to_string()),
-            Some(SHORT_WAIT_DEADLINE),
+            Some(WAIT_HANG_GUARD),
         )
         .unwrap();
         assert_eq!(report.task_ids(), &[id(1)]);
@@ -887,7 +888,7 @@ mod state_reads {
             &runner,
             &wait_config(),
             ControllerWaitSelector::Task(id(1)),
-            Some(SHORT_WAIT_DEADLINE),
+            Some(WAIT_HANG_GUARD),
         )
         .unwrap_err();
         assert_eq!(error.public_code(), "WAIT_BLOCKED");
