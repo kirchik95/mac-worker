@@ -1658,6 +1658,7 @@ impl ClientStateStore {
         turn_id: JobId,
         owner: ProcessIdentity,
     ) -> Result<(), WorkerError> {
+        let _hints = self.event_scope();
         let _lock = QueueLock::acquire_inner(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),

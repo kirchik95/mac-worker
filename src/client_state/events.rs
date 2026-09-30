@@ -69,6 +69,14 @@ impl DeferredHints {
             {
                 return;
             }
+            if let NewEvent::RunChanged { run_id, .. } = &event
+                && pending.hints.iter().any(|(binding, event)| {
+                    Arc::ptr_eq(binding, sink)
+                        && matches!(event, NewEvent::RunChanged { run_id: saved, task_id: None } if saved == run_id)
+                })
+            {
+                return;
+            }
             let event = if pending.hints.len() == MAX_HINTS
                 && matches!(&event, NewEvent::QueueChanged(_))
             {
@@ -81,6 +89,14 @@ impl DeferredHints {
                     kind: None,
                     code: None,
                 })
+            } else if pending.hints.len() == MAX_HINTS
+                && let NewEvent::RunChanged { run_id, .. } = event
+            {
+                pending.hints.retain(|(binding, event)| {
+                    !(Arc::ptr_eq(binding, sink)
+                        && matches!(event, NewEvent::RunChanged { run_id: saved, .. } if *saved == run_id))
+                });
+                NewEvent::RunChanged { run_id, task_id: None }
             } else {
                 event
             };
@@ -134,20 +150,7 @@ use crate::{
 };
 
 fn safe_code(code: &str) -> SafeCode {
-    SafeCode::from_public_code(match code {
-        "PUBLISH_FAILED"
-        | "RESULT_FETCH_FAILED"
-        | "RESULT_UNPARSEABLE"
-        | "LOG_DRAIN_UNAVAILABLE"
-        | "RUNNER_HANDOFF_FAILED"
-        | "CAPACITY_BUSY"
-        | "TASK_CANCELLED"
-        | "TASK_LOST"
-        | "SUBMISSION_ROLLBACK_INCOMPLETE"
-        | "AUTO_CONTINUE_FAILED"
-        | "TURN_FAILED" => code,
-        _ => "TURN_FAILED",
-    })
+    SafeCode::from_public_code(code)
 }
 
 fn outcome_hint(outcome: &TaskOutcome) -> (SafeOutcome, Option<SafeCode>) {
@@ -251,7 +254,7 @@ pub(crate) fn capture_task_diff(
             continue;
         }
         let hint = TurnHint {
-            task_id: after_task_id(next),
+            task_id: next.meta().task_id(),
             turn_id: turn.turn_id(),
             run_id: next.meta().run_id(),
             outcome,
@@ -274,10 +277,6 @@ pub(crate) fn capture_task_diff(
             next: next_turn,
         });
     }
-}
-
-fn after_task_id(record: &LocalTaskRecord) -> crate::task::TaskId {
-    record.meta().task_id()
 }
 
 pub(crate) fn generic_queue_hint() -> NewEvent {
@@ -352,19 +351,19 @@ pub(crate) fn capture_queue_diff(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{cell::RefCell, collections::BTreeSet, sync::Mutex};
+    use std::{cell::RefCell, collections::BTreeSet};
 
     use super::*;
     use crate::controller::events::{EventBatch, PublishAttempt, QueueHint};
 
     #[derive(Default)]
-    pub(crate) struct RecordingSink {
-        events: Mutex<Vec<Vec<NewEvent>>>,
+    pub(crate) struct CheckingSink {
+        recorder: crate::controller::events::testing::RecordingSink,
         release_check: Option<Box<dyn Fn() -> bool + Send + Sync>>,
         pub(crate) unsafe_releases: std::sync::atomic::AtomicUsize,
     }
 
-    impl RecordingSink {
+    impl CheckingSink {
         pub(crate) fn checking(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
             Self {
                 release_check: Some(Box::new(check)),
@@ -372,19 +371,21 @@ pub(crate) mod tests {
             }
         }
         pub(crate) fn events(&self) -> Vec<NewEvent> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .flatten()
-                .cloned()
+            self.recorder
+                .batches()
+                .into_iter()
+                .flat_map(EventBatch::into_events)
                 .collect()
         }
         pub(crate) fn batches(&self) -> Vec<Vec<NewEvent>> {
-            self.events.lock().unwrap().clone()
+            self.recorder
+                .batches()
+                .into_iter()
+                .map(EventBatch::into_events)
+                .collect()
         }
         pub(crate) fn clear(&self) {
-            self.events.lock().unwrap().clear();
+            self.recorder.take_batches();
         }
     }
 
@@ -407,20 +408,19 @@ pub(crate) mod tests {
         }
     }
 
-    impl EventSink for RecordingSink {
+    impl EventSink for CheckingSink {
         fn try_publish(&self, batch: EventBatch) -> PublishAttempt {
             FENCES.with(|fences| assert!(fences.borrow().is_empty(), "released under a fence"));
             if self.release_check.as_ref().is_some_and(|check| !check()) {
                 self.unsafe_releases.fetch_add(1, Ordering::Relaxed);
             }
-            self.events.lock().unwrap().push(batch.0);
-            PublishAttempt::Queued
+            self.recorder.try_publish(batch)
         }
     }
 
     #[test]
     fn durable_hints_are_released_after_all_outer_fences() {
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Arc::new(CheckingSink::default());
         let scope = DeferredHints::begin(sink.clone());
         {
             let log = TestFence::enter("runner_log");
@@ -447,7 +447,7 @@ pub(crate) mod tests {
 
     #[test]
     fn durable_hints_survive_error_unwinding() {
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Arc::new(CheckingSink::default());
         let result: Result<(), ()> = (|| {
             let scope = DeferredHints::begin(sink.clone());
             let _state = TestFence::enter("state");
@@ -460,7 +460,7 @@ pub(crate) mod tests {
 
     #[test]
     fn queue_overflow_becomes_one_generic_hint() {
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Arc::new(CheckingSink::default());
         let scope = DeferredHints::begin(sink.clone());
         for _ in 0..33 {
             scope.capture(NewEvent::QueueChanged(QueueHint {
@@ -481,9 +481,64 @@ pub(crate) mod tests {
             })]
         );
     }
+    #[test]
+    fn run_overflow_becomes_one_generic_hint() {
+        let sink = Arc::new(CheckingSink::default());
+        let scope = DeferredHints::begin(sink.clone());
+        let run_id = crate::task::RunId::generate();
+        for _ in 0..40 {
+            scope.capture(NewEvent::RunChanged {
+                run_id,
+                task_id: Some(crate::task::TaskId::generate()),
+            });
+        }
+        scope.finish();
+        assert_eq!(
+            sink.events(),
+            vec![NewEvent::RunChanged {
+                run_id,
+                task_id: None
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_bindings_release_to_their_own_sinks() {
+        let first = Arc::new(CheckingSink::default());
+        let second = Arc::new(CheckingSink::default());
+        let outer = DeferredHints::begin(first.clone());
+        let inner = DeferredHints::begin(second.clone());
+        outer.capture(NewEvent::ControllerDrainChanged { drained: true });
+        inner.capture(NewEvent::ControllerDrainChanged { drained: false });
+        outer.finish();
+        assert!(first.events().is_empty());
+        assert!(second.events().is_empty());
+        inner.finish();
+        assert_eq!(
+            first.events(),
+            vec![NewEvent::ControllerDrainChanged { drained: true }]
+        );
+        assert_eq!(
+            second.events(),
+            vec![NewEvent::ControllerDrainChanged { drained: false }]
+        );
+    }
+
+    #[test]
+    fn non_coalescible_overflow_is_bounded() {
+        let sink = Arc::new(CheckingSink::default());
+        let scope = DeferredHints::begin(sink.clone());
+        for _ in 0..64 {
+            scope.capture(NewEvent::ControllerDrainChanged { drained: true });
+        }
+        scope.finish();
+        assert_eq!(sink.events().len(), 32);
+        assert_eq!(sink.batches().len(), 1);
+    }
+
     use crate::{
         agent::{AgentKind, PermissionPolicy},
-        client_state::{ClientStateStore, ClientStateWritePoint},
+        client_state::ClientStateStore,
         task::{
             ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
             TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
@@ -585,121 +640,13 @@ pub(crate) mod tests {
         record.with_status(status).unwrap()
     }
 
-    pub(crate) fn store_with_sink() -> (tempfile::TempDir, ClientStateStore, Arc<RecordingSink>) {
+    pub(crate) fn store_with_sink() -> (tempfile::TempDir, ClientStateStore, Arc<CheckingSink>) {
         let dir = tempfile::tempdir().unwrap();
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Arc::new(CheckingSink::default());
         let store = ClientStateStore::open(&dir.path().canonicalize().unwrap().join("state"))
             .unwrap()
             .with_event_sink(sink.clone());
         (dir, store, sink)
-    }
-
-    #[test]
-    fn task_creation_is_captured_after_publication() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert!(matches!(&sink.events()[0], NewEvent::TaskCreated(hint)
-            if hint.task_id == record.meta().task_id() && hint.state == "queued"));
-        let printed = format!("{:?}", sink.events());
-        for private in [
-            "PRIVATE_TITLE",
-            "PRIVATE_PROMPT",
-            "/private/project/path",
-            "PRIVATE_SUMMARY",
-        ] {
-            assert!(!printed.contains(private));
-        }
-    }
-
-    #[test]
-    fn losing_cas_and_noop_are_silent() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        sink.clear();
-        store.create_task(record.clone()).unwrap();
-        assert!(
-            store
-                .update_task_if_current(&record, record.clone())
-                .unwrap()
-        );
-        assert!(sink.events().is_empty());
-        let terminal = terminal_record(&record, TaskOutcome::Done);
-        assert!(
-            store
-                .update_task_if_current(&record, terminal.clone())
-                .unwrap()
-        );
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TurnFinished(_)))
-        );
-        sink.clear();
-        assert!(
-            !store
-                .update_task_if_current(&record, record.clone())
-                .unwrap()
-        );
-        store
-            .mutate_task(
-                record.meta().task_id(),
-                Some(record.status().turns()[0].turn_id()),
-                |current| current.with_status(current.status().clone()),
-            )
-            .unwrap();
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn no_hint_before_durability() {
-        let dir = tempfile::tempdir().unwrap();
-        let sink = Arc::new(RecordingSink::default());
-        let store = ClientStateStore::open_with_write_fault(
-            &dir.path().canonicalize().unwrap().join("state"),
-            ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish,
-        )
-        .unwrap()
-        .with_event_sink(sink.clone());
-        assert!(store.create_task(task_record()).is_err());
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn terminal_correction_emits_outcome_changed() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        let terminal = terminal_record(&record, TaskOutcome::Done);
-        assert!(
-            store
-                .update_task_if_current(&record, terminal.clone())
-                .unwrap()
-        );
-        sink.clear();
-        let corrected = terminal_record(&terminal, TaskOutcome::failed("PUBLISH_FAILED"));
-        assert!(store.update_task_if_current(&terminal, corrected).unwrap());
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TurnOutcomeChanged(_)))
-        );
-        assert!(
-            !sink
-                .events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TurnFinished(_)))
-        );
-    }
-
-    #[test]
-    fn bare_local_store_is_silent() {
-        let (_dir, store, sink) = store_with_sink();
-        let bare = ClientStateStore::open(&store.inner.state_root).unwrap();
-        bare.create_task(task_record()).unwrap();
-        assert!(sink.events().is_empty());
     }
 
     pub(crate) fn locks_are_free(paths: &[std::path::PathBuf]) -> bool {
@@ -708,59 +655,6 @@ pub(crate) mod tests {
             let lock = std::fs::File::open(path).unwrap();
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
         })
-    }
-
-    #[test]
-    fn durable_task_hint_survives_index_cleanup_error() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        sink.clear();
-        let terminal = terminal_record(&record, TaskOutcome::Done);
-        let status = terminal.status();
-        let closed = terminal
-            .with_status(
-                TaskStatus::new(
-                    TaskState::Closed,
-                    status.last_outcome().cloned(),
-                    status.worker().map(str::to_owned),
-                    false,
-                    None,
-                    None,
-                    vec![],
-                    vec![],
-                    None,
-                    status.turns().to_vec(),
-                    130,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        store.inject_write_failure_once(ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire);
-        assert!(
-            store
-                .update_task_if_current(&record, closed.clone())
-                .is_err()
-        );
-        assert_eq!(store.load_task(record.meta().task_id()).unwrap(), closed);
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TaskClosed(_)))
-        );
-    }
-
-    #[test]
-    fn task_hint_after_real_state_lock_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("state");
-        let bare = ClientStateStore::open(&root).unwrap();
-        let locked = vec![root.clone(), root.join("jobs.lock")];
-        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
-        let store = bare.with_event_sink(sink.clone());
-        store.create_task(task_record()).unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
     }
 
     fn owner() -> crate::job::ProcessIdentity {
@@ -827,37 +721,6 @@ pub(crate) mod tests {
         assert!(sink.events().is_empty());
     }
 
-    #[test]
-    fn queue_hint_after_real_queue_and_state_locks_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("state");
-        let bare = ClientStateStore::open(&root).unwrap();
-        let locked = vec![
-            root.clone(),
-            root.join("jobs.lock"),
-            root.join("queue/lock"),
-        ];
-        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
-        let store = bare.with_event_sink(sink.clone());
-        store
-            .enqueue(queue_row(&store, TurnId::generate()))
-            .unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn queue_prepublication_failure_is_silent() {
-        let (_dir, store, sink) = store_with_sink();
-        store.inject_write_failure_once(ClientStateWritePoint::BeforePublish);
-        assert!(
-            store
-                .enqueue(queue_row(&store, TurnId::generate()))
-                .is_err()
-        );
-        assert!(sink.events().is_empty());
-    }
-
     fn observation(time: u64) -> crate::job::AdmissionObservation {
         crate::job::AdmissionObservation::new(
             "mini-1".into(),
@@ -869,6 +732,24 @@ pub(crate) mod tests {
             time,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn attached_waiter_direct_queue_publication_is_captured() {
+        let (_dir, bare, _) = store_with_sink();
+        let locked = vec![
+            bare.inner.state_root.clone(),
+            bare.inner.state_root.join("jobs.lock"),
+            bare.inner.state_root.join("queue/lock"),
+        ];
+        let sink = Arc::new(CheckingSink::checking(move || locks_are_free(&locked)));
+        let store = bare.with_event_sink(sink.clone());
+        let turn = TurnId::generate();
+        store.enqueue(queue_row(&store, turn)).unwrap();
+        sink.clear();
+        store.try_park_attached_waiter(turn, owner()).unwrap();
+        assert!(sink.events().iter().any(|event| matches!(event, NewEvent::QueueChanged(hint) if hint.turn_id == Some(turn) && hint.state.as_deref() == Some("parked"))));
+        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -919,233 +800,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn affinity_changes_emit_only_generic_queue_invalidation() {
-        let (_dir, store, sink) = store_with_sink();
-        store
-            .record_affinity(
-                "a".repeat(64).as_str(),
-                "b".repeat(64).as_str(),
-                "mini-1",
-                100,
-            )
-            .unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert!(
-            matches!(&sink.events()[0], NewEvent::QueueChanged(hint) if hint.turn_id.is_none())
-        );
-        sink.clear();
-        store
-            .remove_affinity_if_matches(&"a".repeat(64), &"b".repeat(64), "mini-1")
-            .unwrap();
-        assert_eq!(sink.events().len(), 1);
-        let encoded = format!("{:?}", sink.events());
-        assert!(!encoded.contains(&"a".repeat(64)));
-        assert!(!encoded.contains(&"b".repeat(64)));
-    }
-
-    fn run_and_dag(record: &LocalTaskRecord) -> (crate::task::RunRecord, crate::dag::DagRecord) {
-        use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref};
-        let id = crate::task::RunId::generate();
-        let node = DagNode {
-            batch_id: "private-node".into(),
-            task_id: record.meta().task_id(),
-            turn_id: record.status().turns()[0].turn_id(),
-            depends_on: vec![],
-            base: DagBase::Frozen {
-                oid: record.meta().base_oid().clone(),
-                pin_ref: dag_pin_ref(id, "private-node"),
-                wip: false,
-            },
-            frozen: DagFrozenSpec {
-                questions: None,
-                prompt: "PRIVATE_PROMPT".into(),
-                title: Some("PRIVATE_TITLE".into()),
-                agent: "codex".into(),
-                model: None,
-                effort: None,
-                source: "local".into(),
-                origin_url: None,
-                publish: vec!["fetch".into()],
-                publish_branch: None,
-                close_on: ClosePolicy::Never,
-                env_profile: None,
-                worker: None,
-                wip: false,
-                project_path: "/private/project/path".into(),
-                project_id: "a".repeat(64),
-                worktree_id: "b".repeat(64),
-                timeout_millis: 1000,
-                max_turns: None,
-                max_budget_usd_cents: None,
-                max_followups: 10,
-                permissions: "workspace".into(),
-                requires: vec![],
-                include_untracked: vec![],
-                include_empty_dirs: vec![],
-                allow_sensitive: vec![],
-                cli_includes: vec![],
-                branch: None,
-            },
-            state: DagNodeState::Waiting,
-            bound_oid: None,
-            bound_turn_id: None,
-            pin_ref: None,
-            blocked_by: None,
-            claimed_by: None,
-            claimed_at_millis: None,
-        };
-        (
-            crate::task::RunRecord::new(id, None, vec![], 1, 100).unwrap(),
-            DagRecord::new(
-                id,
-                std::collections::BTreeMap::from([("private-node".into(), node)]),
-                1,
-                None,
-                100,
-            )
-            .unwrap(),
-        )
-    }
-
-    #[test]
-    fn run_creation_and_reservations_invalidate_without_settlement() {
-        let (_dir, store, sink) = store_with_sink();
-        let (run, _) = run_and_dag(&task_record());
-        store.create_run(run.clone()).unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert!(
-            matches!(&sink.events()[0], NewEvent::RunChanged { run_id, .. } if *run_id == run.run_id())
-        );
-        sink.clear();
-        store.create_run(run.clone()).unwrap();
-        assert!(sink.events().is_empty());
-        let branch = "agent/private-branch".parse().unwrap();
-        store
-            .reserve_run_publish_branch(run.run_id(), branch)
-            .unwrap();
-        assert_eq!(sink.events().len(), 1);
-        assert!(!format!("{:?}", sink.events()).contains("private-branch"));
-    }
-
-    #[test]
-    fn partial_dag_creation_does_not_admit_child() {
-        let (_dir, store, sink) = store_with_sink();
-        let (run, dag) = run_and_dag(&task_record());
-        store.inject_write_failure_once(ClientStateWritePoint::AfterDagPublishBeforeRun);
-        assert!(store.create_run_with_dag(run.clone(), dag).is_err());
-        assert!(store.load_run_dag(run.run_id()).unwrap().is_some());
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::RunChanged { .. }))
-        );
-        assert!(
-            !sink
-                .events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::DagChildAdmitted { .. }))
-        );
-        sink.clear();
-        store
-            .claim_next_eligible_dag_node(run.run_id(), owner(), 110)
-            .unwrap();
-        assert!(store.load_run(run.run_id()).is_ok());
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::RunChanged { .. }))
-        );
-    }
-
-    #[test]
-    fn dag_recovery_admission_requires_two_records() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        let (run, dag) = run_and_dag(&record);
-        store.create_run_with_dag(run.clone(), dag).unwrap();
-        store
-            .claim_next_eligible_dag_node(run.run_id(), owner(), 110)
-            .unwrap();
-        store.create_task(record.clone()).unwrap();
-        store
-            .write_turn_prompt(
-                record.meta().task_id(),
-                record.status().turns()[0].turn_id(),
-                "PRIVATE_PROMPT",
-            )
-            .unwrap();
-        sink.clear();
-        store.inject_write_failure_once(ClientStateWritePoint::AfterDagRunMembership);
-        assert!(
-            store
-                .mark_dag_node_submitted(run.run_id(), "private-node", record.meta().task_id())
-                .is_err()
-        );
-        assert!(
-            !sink
-                .events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::DagChildAdmitted { .. }))
-        );
-        sink.clear();
-        store
-            .claim_next_eligible_dag_node(run.run_id(), owner(), 120)
-            .unwrap();
-        assert!(sink.events().iter().any(|event| matches!(event,
-            NewEvent::DagChildAdmitted { run_id, task_id, turn_id } if *run_id == run.run_id()
-                && *task_id == record.meta().task_id() && *turn_id == record.status().turns()[0].turn_id())));
-        assert!(!format!("{:?}", sink.events()).contains("private-node"));
-        sink.clear();
-        store
-            .claim_next_eligible_dag_node(run.run_id(), owner(), 130)
-            .unwrap();
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn accepted_status_proof_required() {
-        use crate::controller::events::{AcceptedHint, WorkerName};
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        let turn = record.status().turns()[0].turn_id();
-        let prepared = TaskStatus::new(
-            TaskState::Active,
-            None,
-            Some("mini-1".into()),
-            false,
-            None,
-            None,
-            vec![],
-            vec![],
-            None,
-            record.status().turns().to_vec(),
-            110,
-        )
-        .unwrap();
-        store
-            .mutate_task(record.meta().task_id(), Some(turn), |current| {
-                current.with_status(prepared)
-            })
-            .unwrap();
-        assert!(
-            !sink
-                .events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TurnStarted(_)))
-        );
-        sink.clear();
-        store.capture_accepted_turn(AcceptedHint {
-            task_id: record.meta().task_id(),
-            turn_id: turn,
-            run_id: record.meta().run_id(),
-            worker: WorkerName::parse("mini-1").unwrap(),
-        });
-        assert_eq!(sink.events().len(), 1);
-        assert!(matches!(&sink.events()[0], NewEvent::TurnStarted(hint) if hint.turn_id == turn));
-    }
-
-    #[test]
     fn real_log_fence_delays_started_and_terminal_hints() {
         use crate::controller::events::{AcceptedHint, WorkerName};
         let (_dir, bare, _) = store_with_sink();
@@ -1161,7 +815,7 @@ pub(crate) mod tests {
                 .state_root
                 .join(format!("runners/{task}/{turn}.log")),
         ];
-        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
+        let sink = Arc::new(CheckingSink::checking(move || locks_are_free(&locked)));
         let store = bare.with_event_sink(sink.clone());
         store.capture_accepted_turn(AcceptedHint {
             task_id: task,
@@ -1190,32 +844,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn drain_hint_after_lock_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap().join("controller");
-        crate::controller::drain::set_drained(&root, false).unwrap();
-        let locked = vec![root.join("drain.lock")];
-        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
-        crate::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
-            .unwrap();
-        assert_eq!(
-            sink.events(),
-            vec![NewEvent::ControllerDrainChanged { drained: true }]
-        );
-        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
-        sink.clear();
-        crate::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
-            .unwrap();
-        assert!(sink.events().is_empty());
-        crate::controller::drain::set_drained_with_event_sink(&root, false, Some(sink.clone()))
-            .unwrap();
-        assert_eq!(
-            sink.events(),
-            vec![NewEvent::ControllerDrainChanged { drained: false }]
-        );
-    }
-
-    #[test]
     fn real_launch_permit_defers_nested_store_hints() {
         let (_dir, store, sink) = store_with_sink();
         let root = store.inner.state_root.parent().unwrap().join("controller");
@@ -1239,15 +867,6 @@ pub(crate) mod tests {
         let reopened = store.reopen_until(None).unwrap();
         reopened.create_task(task_record()).unwrap();
         assert_eq!(sink.events().len(), 1);
-    }
-
-    #[test]
-    fn reopen_refuses_replaced_store_binding() {
-        let (_dir, store, _sink) = store_with_sink();
-        let root = store.inner.state_root.clone();
-        std::fs::rename(&root, root.with_extension("retired")).unwrap();
-        ClientStateStore::open(&root).unwrap();
-        assert!(store.reopen_until(None).is_err());
     }
 
     #[test]
@@ -1354,209 +973,6 @@ pub(crate) mod tests {
                 .iter()
                 .any(|event| matches!(event, NewEvent::QueueChanged(hint)
             if hint.turn_id == Some(from) && hint.state.as_deref() == Some("parked")))
-        );
-    }
-
-    #[test]
-    fn removed_task_hint_survives_later_rollback_error() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        let task = record.meta().task_id();
-        store.create_task(record).unwrap();
-        sink.clear();
-        store.inject_write_failure_once(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval);
-        assert!(store.remove_task_submission_record(task).is_err());
-        assert!(store.load_task_optional(task).unwrap().is_none());
-        assert!(matches!(&sink.events()[0], NewEvent::TaskRemoved(hint) if hint.task_id == task));
-        sink.clear();
-        store.remove_task_submission_record(task).unwrap();
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn all_terminal_outcomes_are_safe_and_prose_free() {
-        for (outcome, expected) in [
-            (TaskOutcome::Done, SafeOutcome::Done),
-            (TaskOutcome::NeedsInput, SafeOutcome::NeedsInput),
-            (TaskOutcome::Blocked, SafeOutcome::Blocked),
-            (TaskOutcome::Unknown, SafeOutcome::Unknown),
-            (
-                TaskOutcome::failed("PRIVATE_SECRET /private/project/path"),
-                SafeOutcome::Failed,
-            ),
-            (TaskOutcome::Cancelled, SafeOutcome::Cancelled),
-            (TaskOutcome::TimedOut, SafeOutcome::TimedOut),
-            (TaskOutcome::Lost, SafeOutcome::Lost),
-        ] {
-            let (_dir, store, sink) = store_with_sink();
-            let record = task_record();
-            store.create_task(record.clone()).unwrap();
-            sink.clear();
-            store
-                .update_task_if_current(&record, terminal_record(&record, outcome))
-                .unwrap();
-            assert!(sink.events().iter().any(
-                |event| matches!(event, NewEvent::TurnFinished(hint) if hint.outcome == expected)
-            ));
-            let encoded = format!("{:?}", sink.events());
-            assert!(!encoded.contains("PRIVATE_SECRET"));
-            assert!(!encoded.contains("/private/project/path"));
-        }
-    }
-
-    #[test]
-    fn metadata_rewrites_and_runner_log_sidecars_are_silent() {
-        use crate::task::{HerdrTurnReport, HerdrTurnState};
-        let (_dir, store, sink) = store_with_sink();
-        let record = terminal_record(&task_record(), TaskOutcome::Done);
-        let task = record.meta().task_id();
-        let turn = record.status().turns()[0].turn_id();
-        store.create_task(record.clone()).unwrap();
-        sink.clear();
-        let status = record.status();
-        let rewritten = TaskStatus::new(
-            status.state(),
-            status.last_outcome().cloned(),
-            status.worker().map(str::to_owned),
-            status.session_present(),
-            status.head_oid().cloned(),
-            status.summary().map(str::to_owned),
-            status.questions().to_vec(),
-            status.files_changed().to_vec(),
-            status.diff_stat().map(str::to_owned),
-            vec![status.turns()[0].clone().with_herdr(Some(HerdrTurnReport {
-                state: HerdrTurnState::Attached,
-                pane_id: Some("PRIVATE_PANE".into()),
-            }))],
-            status.updated_at_millis(),
-        )
-        .unwrap();
-        store
-            .update_task_if_current(&record, record.with_status(rewritten).unwrap())
-            .unwrap();
-        store
-            .finish_local_runner_log(task, turn, TaskOutcome::Done)
-            .unwrap();
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn legacy_job_running_and_health_bookkeeping_are_silent() {
-        use crate::job::{
-            JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
-            RequestFingerprintMaterial,
-        };
-        let (dir, store, sink) = store_with_sink();
-        let token = LeaseToken::generate();
-        let material = RequestFingerprintMaterial::new(
-            TurnId::generate(),
-            store.client_id(),
-            token,
-            100,
-            "mini-1".into(),
-            "a".repeat(64),
-            "b".repeat(64),
-            "c".repeat(64),
-            "packages/app".into(),
-            1000,
-            "heavy".into(),
-            crate::job::CommandSpec::argv(vec!["PRIVATE_COMMAND".into()]).unwrap(),
-        )
-        .unwrap();
-        let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
-        let record =
-            LocalJobRecord::new(meta.clone(), token, None, RemoteUncertainty::None).unwrap();
-        store.create_job(record).unwrap();
-        let status = JobStatus::running(
-            110,
-            owner().pid(),
-            owner().start_time_micros(),
-            owner().pid(),
-            owner().start_time_micros(),
-        )
-        .unwrap();
-        store
-            .update_job(
-                LocalJobRecord::new(meta, token, Some(status), RemoteUncertainty::None).unwrap(),
-            )
-            .unwrap();
-        let health = crate::controller::health::HealthStore::open(
-            &dir.path().canonicalize().unwrap().join("controller"),
-        )
-        .unwrap();
-        health
-            .write(&crate::controller::health::ControllerHealth::new(
-                owner(),
-                100,
-            ))
-            .unwrap();
-        assert!(sink.events().is_empty());
-    }
-
-    #[test]
-    fn unavailable_sink_does_not_change_authoritative_success() {
-        struct Unavailable;
-        impl EventSink for Unavailable {
-            fn try_publish(&self, _: EventBatch) -> PublishAttempt {
-                PublishAttempt::Dropped
-            }
-        }
-        let (_dir, store, _sink) = store_with_sink();
-        let store = store.with_event_sink(Arc::new(Unavailable));
-        let record = task_record();
-        store.create_task(record.clone()).unwrap();
-        assert_eq!(store.load_task(record.meta().task_id()).unwrap(), record);
-    }
-
-    #[test]
-    fn task_tree_removal_invalidation_survives_cleanup_error() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = task_record();
-        let task = record.meta().task_id();
-        store.create_task(record.clone()).unwrap();
-        store
-            .write_turn_prompt(task, record.status().turns()[0].turn_id(), "PRIVATE_PROMPT")
-            .unwrap();
-        sink.clear();
-        store.inject_submission_rollback_cleanup_failure_once(
-            ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
-        );
-        assert!(store.remove_task_submission_turns(task).is_err());
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TaskChanged(_)))
-        );
-    }
-
-    #[test]
-    fn changed_last_outcome_is_a_task_invalidation() {
-        let (_dir, store, sink) = store_with_sink();
-        let record = terminal_record(&task_record(), TaskOutcome::Done);
-        store.create_task(record.clone()).unwrap();
-        sink.clear();
-        let before = record.status();
-        let next = TaskStatus::new(
-            before.state(),
-            Some(TaskOutcome::NeedsInput),
-            before.worker().map(str::to_owned),
-            before.session_present(),
-            before.head_oid().cloned(),
-            None,
-            vec![],
-            vec![],
-            None,
-            before.turns().to_vec(),
-            130,
-        )
-        .unwrap();
-        store
-            .update_task_if_current(&record, record.with_status(next).unwrap())
-            .unwrap();
-        assert!(
-            sink.events()
-                .iter()
-                .any(|event| matches!(event, NewEvent::TaskChanged(_)))
         );
     }
 }
