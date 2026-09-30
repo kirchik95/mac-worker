@@ -1291,6 +1291,27 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::io::IntoRawFd;
 
+    /// A sibling test can inherit this listener before `CLOEXEC` sticks. Wait
+    /// until connect fails with `ConnectionRefused` so the stale-socket
+    /// assertions are not racing a still-live fd.
+    fn wait_until_unix_connect_refused(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return,
+                _ => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "stale control socket {} stayed connectable for 5s",
+                            path.display()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_ssh_override_accepts_only_absolute_paths() {
         assert_eq!(
@@ -1714,6 +1735,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let fd = listener.into_raw_fd();
         unsafe { libc::close(fd) };
+        wait_until_unix_connect_refused(&socket);
         with_ssh_settings(settings, || {
             let request =
                 ssh_exec_request(SshTarget::Worker, "mac1", "true", tiny_policy(), None).unwrap();
@@ -1768,6 +1790,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let raw = listener.into_raw_fd();
         unsafe { libc::close(raw) };
+        wait_until_unix_connect_refused(&socket);
         assert!(socket.exists());
         with_ssh_settings(
             SshSettings {
