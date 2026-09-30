@@ -339,6 +339,7 @@ mod state_reads {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
+        os::unix::process::ExitStatusExt,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
@@ -609,6 +610,290 @@ mod state_reads {
                 })
         );
         assert!(!paths.controller_state_root().join("events").exists());
+    }
+
+    const SHORT_WAIT_DEADLINE: Duration = Duration::from_secs(2);
+
+    struct WaitRpc<'a> {
+        paths: &'a PathLayout,
+        requests: std::sync::Mutex<Vec<mac_worker::controller::ControllerRequest>>,
+    }
+
+    impl<'a> WaitRpc<'a> {
+        fn new(paths: &'a PathLayout) -> Self {
+            Self {
+                paths,
+                requests: Default::default(),
+            }
+        }
+
+        fn only_poll(&self, expected_body: serde_json::Value) {
+            let requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].command(), "task.wait.poll");
+            assert_eq!(requests[0].body(), &expected_body);
+            assert!(!self.paths.controller_state_root().join("events").exists());
+        }
+    }
+
+    impl super::ProcessRunner for WaitRpc<'_> {
+        fn run(
+            &self,
+            process: &super::ProcessRequest,
+        ) -> Result<super::ProcessResult, WorkerError> {
+            let request = mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())?;
+            assert_eq!(
+                request.command(),
+                "task.wait.poll",
+                "wait used discovery or events"
+            );
+            assert!(process.policy.deadline <= SHORT_WAIT_DEADLINE);
+            self.requests.lock().unwrap().push(request.clone());
+            let (status, stdout) = match super::routed_rpc(self.paths, &request) {
+                Ok(frame) => (0, frame),
+                Err(error) => (
+                    1 << 8,
+                    mac_worker::controller::encode_json_frame(
+                        &mac_worker::job::HostControlError::new(
+                            error.public_code(),
+                            error.public_message(),
+                        )
+                        .unwrap(),
+                    )?,
+                ),
+            };
+            Ok(super::ProcessResult {
+                status: super::ExitStatus::from_raw(status),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn wait_config() -> mac_worker::config::ControllerConfig {
+        mac_worker::config::ControllerConfig {
+            enabled: true,
+            ssh: "controller".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wait_wiring_only_polls_with_short_deadline_and_eventless_quiescence() {
+        use mac_worker::controller::{ControllerWaitSelector, wait_via_controller};
+
+        for (outcome, expected_exit) in [
+            (TaskOutcome::Done, 0),
+            (TaskOutcome::failed("agent exited 3"), 1),
+        ] {
+            let (_root, paths, _) = fixture();
+            write_record(&paths, &record(1, TaskState::Open, outcome));
+            let runner = WaitRpc::new(&paths);
+            let report = wait_via_controller(
+                &runner,
+                &wait_config(),
+                ControllerWaitSelector::Task(id(1)),
+                Some(SHORT_WAIT_DEADLINE),
+            )
+            .unwrap();
+            assert_eq!(report.task_ids(), &[id(1)]);
+            assert_eq!(report.exit_code(), expected_exit);
+            runner.only_poll(serde_json::json!({"task_id":id(1)}));
+        }
+        let (_root, paths, _) = fixture();
+        let runner = WaitRpc::new(&paths);
+        let error = wait_via_controller(
+            &runner,
+            &wait_config(),
+            ControllerWaitSelector::Task(id(1)),
+            Some(Duration::ZERO),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "WAIT_TIMEOUT");
+        assert!(runner.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_wiring_advances_eventless_dag_and_preserves_ids_and_aggregate_exit() {
+        use mac_worker::{
+            controller::{ControllerWaitSelector, wait_via_controller},
+            dag::{
+                DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord,
+                dag_pin_ref,
+            },
+            task::{RunId, RunRecord},
+        };
+        use std::collections::BTreeMap;
+
+        let (_root, paths, _) = fixture();
+        let run_id = RunId::new(uuid::Uuid::from_u128(100));
+        let mut value = serde_json::to_value(record(
+            1,
+            TaskState::Closed,
+            TaskOutcome::failed("agent exited 3"),
+        ))
+        .unwrap();
+        value["meta"]["run_id"] = serde_json::json!(run_id);
+        let task: LocalTaskRecord = serde_json::from_value(value).unwrap();
+        write_record(&paths, &task);
+        let frozen: DagFrozenSpec = serde_json::from_value(serde_json::json!({
+            "prompt":"frozen work","agent":"codex","source":"local","publish":["fetch"],
+            "close_on":"never","wip":false,"project_path":paths.data,
+            "project_id":"a".repeat(64),"worktree_id":"b".repeat(64),
+            "timeout_millis":1000,"max_followups":3,"permissions":"workspace",
+            "requires":[],"include_untracked":[],"include_empty_dirs":[],"allow_sensitive":[],"cli_includes":[]
+        })).unwrap();
+        let parent = DagNode {
+            batch_id: "root".into(),
+            task_id: id(1),
+            turn_id: task.status().turns()[0].turn_id(),
+            depends_on: vec![],
+            base: DagBase::Frozen {
+                oid: task.meta().base_oid().clone(),
+                pin_ref: dag_pin_ref(run_id, "root"),
+                wip: false,
+            },
+            frozen,
+            state: DagNodeState::Submitted,
+            bound_oid: None,
+            bound_turn_id: None,
+            pin_ref: None,
+            blocked_by: None,
+            claimed_by: None,
+            claimed_at_millis: None,
+        };
+        let child = DagNode {
+            batch_id: "child".into(),
+            task_id: id(2),
+            turn_id: TurnId::new(uuid::Uuid::from_u128(1_000_002)),
+            depends_on: vec!["root".into()],
+            base: DagBase::From {
+                parent: "root".into(),
+            },
+            state: DagNodeState::Waiting,
+            ..parent.clone()
+        };
+        let dag = DagRecord::new(
+            run_id,
+            BTreeMap::from([("root".into(), parent), ("child".into(), child)]),
+            1,
+            None,
+            1,
+        )
+        .unwrap();
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        state
+            .create_run_with_dag(
+                RunRecord::new(run_id, None, vec![id(1)], 1, 1).unwrap(),
+                dag,
+            )
+            .unwrap();
+        let runner = WaitRpc::new(&paths);
+        let report = wait_via_controller(
+            &runner,
+            &wait_config(),
+            ControllerWaitSelector::Run(run_id.to_string()),
+            Some(SHORT_WAIT_DEADLINE),
+        )
+        .unwrap();
+        assert_eq!(report.task_ids(), &[id(1)]);
+        assert_eq!(report.exit_code(), 1);
+        let dag = state.load_run_dag(run_id).unwrap().unwrap();
+        assert_eq!(dag.nodes["child"].state, DagNodeState::Blocked);
+        assert_eq!(
+            dag.nodes["child"].blocked_by.as_deref(),
+            Some(DAG_PARENT_FAILED)
+        );
+        assert!(state.load_task_optional(id(2)).unwrap().is_none());
+        assert!(state.list_pending_run_ids().unwrap().is_empty());
+        runner.only_poll(serde_json::json!({"run":run_id.to_string()}));
+    }
+
+    #[test]
+    fn wait_wiring_preserves_wait_blocked_without_events_or_discovery() {
+        use mac_worker::{
+            controller::{ControllerWaitSelector, wait_via_controller},
+            job::{
+                CommandSpec, QueueEntry, QueueEntryKind, REPLACEMENT_FAILURE_PARK_AFTER,
+                ReplacementFailureBudget,
+            },
+            scheduler::WorkerPreference,
+        };
+
+        let (_root, paths, _) = fixture();
+        let task = record(1, TaskState::Open, TaskOutcome::Done);
+        let turn_id = task.status().turns()[0].turn_id();
+        write_record(&paths, &task);
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let turn_path = paths
+            .state
+            .join("turns")
+            .join(id(1).to_string())
+            .join(turn_id.to_string());
+        fs::create_dir_all(&turn_path).unwrap();
+        fs::set_permissions(
+            turn_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&turn_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = ProcessIdentity::new(crate::support::fixture_pid(80_003), 1).unwrap();
+        state
+            .enqueue(
+                QueueEntry::new(
+                    turn_id,
+                    state.client_id(),
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    CommandSpec::argv(vec!["__worker_task__".into()])
+                        .unwrap()
+                        .summary()
+                        .unwrap(),
+                    vec![],
+                    WorkerPreference::Pinned {
+                        worker: "mini-1".into(),
+                    },
+                    QueueEntryKind::TaskTurn,
+                    None,
+                    owner,
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        state.park_row(turn_id).unwrap();
+        state
+            .set_replacement_failure(
+                turn_id,
+                Some(
+                    ReplacementFailureBudget::new(
+                        1,
+                        "HOST_IO".into(),
+                        REPLACEMENT_FAILURE_PARK_AFTER,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let local_error = super::routed_rpc(
+            &paths,
+            &super::rpc_request("task.wait.poll", serde_json::json!({"task_id":id(1)})),
+        )
+        .unwrap_err();
+        assert_eq!(local_error.public_code(), "WAIT_BLOCKED");
+        assert_eq!(local_error.public_message(), "RUNNER_REPEATED_FAILURE");
+        let runner = WaitRpc::new(&paths);
+        let error = wait_via_controller(
+            &runner,
+            &wait_config(),
+            ControllerWaitSelector::Task(id(1)),
+            Some(SHORT_WAIT_DEADLINE),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "WAIT_BLOCKED");
+        assert_eq!(error.exit_code(), 70);
+        assert_eq!(error.public_message(), "task error");
+        runner.only_poll(serde_json::json!({"task_id":id(1)}));
     }
 
     #[test]
