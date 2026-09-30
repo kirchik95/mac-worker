@@ -9,8 +9,11 @@ use std::{
     time::Duration,
 };
 
-pub(super) const QUEUE_BATCHES: usize = 128;
-pub(super) const QUEUE_BYTES: usize = 4 * 1024 * 1024;
+use super::super::contracts::{
+    MAX_PUBLISHER_BYTES as QUEUE_BYTES, PUBLISHER_CAPACITY as QUEUE_BATCHES, PUBLISHER_EXIT_GRACE,
+};
+
+type BatchSize<T> = dyn Fn(&T) -> usize + Send + Sync;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum EnqueueResult {
@@ -42,7 +45,7 @@ struct Shared {
 
 pub(super) struct Queue<T> {
     sender: SyncSender<Option<Queued<T>>>,
-    size: Arc<dyn Fn(&T) -> usize + Send + Sync>,
+    size: Arc<BatchSize<T>>,
     shared: Arc<Shared>,
 }
 
@@ -218,9 +221,7 @@ impl WorkerHandle {
     pub(super) fn finish_with_grace(&self, grace: Duration, clock: &dyn GraceClock) {
         self.shared.accepting.store(false, Ordering::Release);
         (self.wake)();
-        let deadline = clock
-            .now()
-            .saturating_add(grace.min(Duration::from_millis(50)));
+        let deadline = clock.now().saturating_add(grace.min(PUBLISHER_EXIT_GRACE));
         while !self.shared.done.load(Ordering::Acquire) && !clock.cancelled() {
             let remaining = deadline.saturating_sub(clock.now());
             if remaining.is_zero() {
