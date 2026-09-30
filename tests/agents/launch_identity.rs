@@ -9,6 +9,24 @@ fn executable(path: &std::path::Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A `/bin/sh` fixture that has already run once. macOS assesses a new
+/// executable on its first exec, which takes seconds while other tests write
+/// fixtures. Paying that here keeps it out of the helper's two-second
+/// `--version` bound, which these tests rely on.
+fn warmed_script(path: &std::path::Path, body: &str) {
+    executable(
+        path,
+        &format!("#!/bin/sh\n[ \"$1\" = --fixture-warm ] && exit 0\n{body}"),
+    );
+    assert!(
+        Command::new(path)
+            .arg("--fixture-warm")
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 /// The launch wrapper can be killed by a cancel at any point, so it may only
 /// write inside the turn's disposable `tmp` scope. Returns the staged record.
 fn staged_identity(turn: &std::path::Path) -> Vec<u8> {
@@ -44,9 +62,9 @@ fn records_the_executable_and_version_after_final_login_environment_resolution()
         &old.join("fixture-agent"),
         "#!/bin/sh\nprintf 'agent 1.0.0\\n'\n",
     );
-    executable(
+    warmed_script(
         &selected.join("fixture-agent"),
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'agent %s\\n' \"$PROFILE_VERSION\"; else printf '%s' \"$PROFILE_VERSION\" > ran; fi\n",
+        "if [ \"$1\" = --version ]; then printf 'agent %s\\n' \"$PROFILE_VERSION\"; else printf '%s' \"$PROFILE_VERSION\" > ran; fi\n",
     );
     fs::write(
         home.join(".zprofile"),
@@ -107,10 +125,10 @@ fn assert_unavailable_probe_still_launches(probe: &str, observation: &str) {
     fs::create_dir(&turn).unwrap();
     fs::create_dir(turn.join("tmp")).unwrap();
     let program = root.path().join("fixture-agent");
-    executable(
+    warmed_script(
         &program,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then /bin/ps -o pgid= -p $$ > probe.pgid; {probe}; else /bin/ps -o pgid= -p $$ > agent.pgid; printf '%s' $$ > agent.pid; printf ran > ran; fi\n"
+            "if [ \"$1\" = --version ]; then /bin/ps -o pgid= -p $$ > probe.pgid; {probe}; else /bin/ps -o pgid= -p $$ > agent.pgid; printf '%s' $$ > agent.pid; printf ran > ran; fi\n"
         ),
     );
     let output = Command::new(assert_cmd::cargo::cargo_bin!("worker"))
