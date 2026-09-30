@@ -1,7 +1,5 @@
-#[path = "support/agent_launch_fixture.rs"]
-mod agent_launch_fixture;
-#[path = "support/fake_herdr.rs"]
-mod fake_herdr;
+use crate::agent_launch_fixture;
+use crate::fake_herdr;
 
 use std::{
     fs,
@@ -190,7 +188,7 @@ fn hung_herdr_close_releases_host_locks_wrapper() {
     fs::create_dir_all(&home).unwrap();
     let home = home.to_str().unwrap();
     agent_launch_fixture::assert_subprocess_success(
-        "hung_herdr_close_releases_host_locks",
+        &crate::support::libtest_name(module_path!(), "hung_herdr_close_releases_host_locks"),
         &[("HOME", home), ("MAC_WORKER_ACCOUNT_HOME", home)],
         false,
     );
@@ -259,7 +257,7 @@ fn herdr_close_error_does_not_change_the_task_wrapper() {
     fs::create_dir_all(&home).unwrap();
     let home = home.to_str().unwrap();
     agent_launch_fixture::assert_subprocess_success(
-        "herdr_close_error_does_not_change_the_task",
+        &crate::support::libtest_name(module_path!(), "herdr_close_error_does_not_change_the_task"),
         &[("HOME", home), ("MAC_WORKER_ACCOUNT_HOME", home)],
         false,
     );
@@ -301,7 +299,10 @@ fn hung_herdr_sweep_releases_the_installation_lock_wrapper() {
     fs::create_dir_all(&home).unwrap();
     let home = home.to_str().unwrap();
     agent_launch_fixture::assert_subprocess_success(
-        "hung_herdr_sweep_releases_the_installation_lock",
+        &crate::support::libtest_name(
+            module_path!(),
+            "hung_herdr_sweep_releases_the_installation_lock",
+        ),
         &[("HOME", home), ("MAC_WORKER_ACCOUNT_HOME", home)],
         false,
     );

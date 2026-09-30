@@ -21,8 +21,7 @@ use mac_worker::{
 };
 use support::recording_runner::RecordingRunner;
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 struct TestSchedulerRuntime {
     now_millis: AtomicU64,

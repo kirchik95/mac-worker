@@ -13,8 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use support::agent_launch_fixture::{
     DiagnosticProcessRunner, FixtureLayout, PARENT_ONLY, assert_subprocess_success,
@@ -342,7 +341,10 @@ fn isolate_parent_environment_rejects_parent_only_credentials_wrapper() {
     ));
     fixture.install_home_cursor(PARENT_ONLY);
     assert_subprocess_success(
-        "isolate_parent_environment_rejects_parent_only_credentials",
+        &crate::support::libtest_name(
+            module_path!(),
+            "isolate_parent_environment_rejects_parent_only_credentials",
+        ),
         &[
             ("FIXTURE_HOME", fixture.home.to_str().unwrap()),
             ("CURSOR_API_KEY", PARENT_ONLY),
@@ -409,7 +411,7 @@ mod termination {
         process::{Command, Stdio},
     };
 
-    const FIXTURE_TEST: &str = "termination::pipe_holder_fixture";
+    const FIXTURE_TEST: &str = "pipe_holder_fixture";
 
     struct FixtureProcess(ProcessIdentity);
 
@@ -436,10 +438,15 @@ mod termination {
         fn request(&self, mode: &str) -> ProcessRequest {
             ProcessRequest {
                 program: std::env::current_exe().unwrap().into(),
-                args: ["--ignored", "--exact", FIXTURE_TEST, "--nocapture"]
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
+                args: [
+                    "--ignored",
+                    "--exact",
+                    &crate::support::libtest_name(module_path!(), FIXTURE_TEST),
+                    "--nocapture",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
                 environment: vec![
                     ("RUNNER_FIXTURE_MODE".into(), mode.into()),
                     ("RUNNER_FIXTURE_DIR".into(), self.0.path().into()),
@@ -553,7 +560,12 @@ mod termination {
         record_identity(directory, "leader.pid", std::process::id());
         if mode == "background" {
             Command::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", FIXTURE_TEST, "--nocapture"])
+                .args([
+                    "--ignored",
+                    "--exact",
+                    &crate::support::libtest_name(module_path!(), FIXTURE_TEST),
+                    "--nocapture",
+                ])
                 .env("RUNNER_FIXTURE_MODE", "background-child")
                 .spawn()
                 .unwrap();
@@ -573,7 +585,12 @@ mod termination {
         }
 
         Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", FIXTURE_TEST, "--nocapture"])
+            .args([
+                "--ignored",
+                "--exact",
+                &crate::support::libtest_name(module_path!(), FIXTURE_TEST),
+                "--nocapture",
+            ])
             .env("RUNNER_FIXTURE_MODE", "escaped-child")
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

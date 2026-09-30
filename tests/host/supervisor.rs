@@ -1,5 +1,4 @@
-#[path = "support/fixture_pid.rs"]
-mod fixture_pid;
+use crate::fixture_pid;
 
 use std::{
     collections::BTreeMap,
@@ -2397,7 +2396,7 @@ fn timeout_keeps_a_waitable_leader_anchor_then_kills_and_proves_the_group_absent
     assert_timeout_group_cleanup(Some(TEST_TERM_GRACE));
 }
 
-// Nightly: CARGO_BUILD_JOBS=4 cargo test --locked --test supervisor production_term_grace_stress -- --ignored --exact
+// Nightly: CARGO_BUILD_JOBS=4 cargo nextest run --locked --test host --run-ignored only -E 'test(=supervisor::production_term_grace_stress)'
 #[test]
 #[ignore = "real production TERM grace; nightly stress check"]
 fn production_term_grace_stress() {
