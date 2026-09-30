@@ -290,7 +290,67 @@ fn tunnel_reconnects_on_the_same_port_until_signalled() {
 }
 
 #[test]
-fn tunnel_prints_a_new_url_when_the_port_stays_unready() {
+fn ssh_connection_failures_keep_the_published_port() {
+    let homes = Homes::new();
+    let mut child = spawn_tunnel(
+        &homes,
+        "connect-down",
+        &TunnelTimings {
+            heartbeat_ms: 40,
+            backoff_initial_ms: 25,
+            backoff_cap_ms: 50,
+            readiness_ms: 2_000,
+            rotation_ms: 250,
+        },
+    );
+    let url = wait_for_url(&child.stdout, &mut child.child);
+    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
+    thread::sleep(Duration::from_millis(1_500));
+    assert!(
+        process_live(child.child.id()),
+        "dashboard exited during reconnect"
+    );
+    let stdout = child.stdout.lock().unwrap().clone();
+    assert_eq!(url_lines(&stdout), vec![url], "stdout={stdout}");
+    let stderr = child.stderr.lock().unwrap().clone();
+    assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
+    assert_eq!(count_line(&stderr, RESTORED), 0, "{stderr}");
+    send_signal(child.child.id(), "TERM");
+    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
+}
+
+#[test]
+fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
+    let homes = Homes::new();
+    let mut child = spawn_tunnel(
+        &homes,
+        "connect-down",
+        &TunnelTimings {
+            heartbeat_ms: 40,
+            backoff_initial_ms: 25,
+            backoff_cap_ms: 50,
+            readiness_ms: 2_000,
+            rotation_ms: 300,
+        },
+    );
+    let url = wait_for_url(&child.stdout, &mut child.child);
+    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
+    let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+    let _held = hold_loopback_port(port);
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(8));
+    assert_ne!(urls[0], urls[1], "{urls:?}");
+    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
+    let stderr = child.stderr.lock().unwrap().clone();
+    assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
+    assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
+    send_signal(child.child.id(), "TERM");
+    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
+}
+
+#[test]
+fn remote_viewer_failure_prints_a_new_url() {
     let homes = Homes::new();
     let mut child = spawn_tunnel(
         &homes,
@@ -506,6 +566,17 @@ fn wait_for_urls(
     }
 }
 
+fn hold_loopback_port(port: u16) -> std::net::TcpListener {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return listener,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("could not hold 127.0.0.1:{port}: {error}"),
+        }
+    }
+}
+
 fn url_lines(text: &str) -> Vec<String> {
     text.lines()
         .filter(|line| line.starts_with("http://127.0.0.1:"))
@@ -713,6 +784,19 @@ def hang():
     while True:
         time.sleep(3600)
 
+def sticky_port(generation, port, fail_status):
+    port_file = os.environ.get("MAC_WORKER_FAKE_SSH_PORT_FILE")
+    if not port_file or port is None:
+        fail("sticky port requires a forward port")
+    if generation == 1:
+        with open(port_file, "w", encoding="utf-8") as handle:
+            handle.write(str(port))
+        drop_after_heartbeat()
+    saved = open(port_file, encoding="utf-8").read().strip()
+    if str(port) == saved:
+        sys.exit(fail_status)
+    exec_viewer()
+
 def log_argv():
     path = os.environ.get("MAC_WORKER_FAKE_SSH_ARGV_LOG")
     if not path:
@@ -742,17 +826,9 @@ def main():
             drop_after_heartbeat()
         hang()
     if mode == "sticky-port":
-        port_file = os.environ.get("MAC_WORKER_FAKE_SSH_PORT_FILE")
-        if not port_file or port is None:
-            fail("sticky port requires a forward port")
-        if generation == 1:
-            with open(port_file, "w", encoding="utf-8") as handle:
-                handle.write(str(port))
-            drop_after_heartbeat()
-        saved = open(port_file, encoding="utf-8").read().strip()
-        if str(port) == saved:
-            sys.exit(255)
-        exec_viewer()
+        sticky_port(generation, port, 1)
+    if mode == "connect-down":
+        sticky_port(generation, port, 255)
     fail("unknown fake ssh mode")
 
 if __name__ == "__main__":

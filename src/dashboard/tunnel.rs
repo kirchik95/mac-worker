@@ -164,24 +164,37 @@ async fn run_controller_dashboard_tunnel_with_timings(
     let mut port = allocate_loopback_port(requested_port)?;
     let mut ever_ready = false;
     let mut announced = false;
-    let mut failing_since: Option<Instant> = None;
-    let mut failed_attempts = 0u32;
+    let mut port_problem_since: Option<Instant> = None;
+    let mut port_problem_attempts = 0u32;
     let mut nominal_backoff = timings.backoff_initial;
     let mut published_port: Option<u16> = None;
 
     loop {
         if ever_ready {
-            let failing_for = failing_since.map(|start| start.elapsed());
-            if should_rotate_port(failed_attempts, failing_for, timings.port_rotation_after) {
+            let failing_for = port_problem_since.map(|start| start.elapsed());
+            if should_rotate_port(
+                port_problem_attempts,
+                failing_for,
+                timings.port_rotation_after,
+            ) {
                 port = allocate_fresh_port(port)?;
-                failed_attempts = 0;
-                failing_since = None;
+                port_problem_attempts = 0;
+                port_problem_since = None;
             }
             if interruptible_sleep(&mut signals, equal_jitter(nominal_backoff, random_u64())).await
             {
                 return Ok(());
             }
             nominal_backoff = next_backoff(nominal_backoff, timings.backoff_cap);
+            if local_port_is_busy(port) {
+                note_port_problem(
+                    &mut announced,
+                    &mut port_problem_since,
+                    &mut port_problem_attempts,
+                    stderr,
+                );
+                continue;
+            }
         }
 
         let mut request =
@@ -193,10 +206,10 @@ async fn run_controller_dashboard_tunnel_with_timings(
                 if !ever_ready {
                     return Err(error);
                 }
-                note_failed_attempt(
+                note_connection_failure(
                     &mut announced,
-                    &mut failing_since,
-                    &mut failed_attempts,
+                    &mut port_problem_since,
+                    &mut port_problem_attempts,
                     stderr,
                 );
                 continue;
@@ -204,14 +217,15 @@ async fn run_controller_dashboard_tunnel_with_timings(
         };
         let mut stdin = Some(child.stdin.take().ok_or_else(controller_unavailable)?);
         let Some(child_stdout) = child.stdout.take() else {
-            reap_with_escalation(&mut child, stdin.take());
+            let exit_code = reap_failed_attempt(&mut child, stdin.take());
             if !ever_ready {
                 return Err(controller_unavailable());
             }
-            note_failed_attempt(
+            record_reconnect_failure(
+                exit_code,
                 &mut announced,
-                &mut failing_since,
-                &mut failed_attempts,
+                &mut port_problem_since,
+                &mut port_problem_attempts,
                 stderr,
             );
             continue;
@@ -250,8 +264,8 @@ async fn run_controller_dashboard_tunnel_with_timings(
                 }
                 ever_ready = true;
                 announced = false;
-                failing_since = None;
-                failed_attempts = 0;
+                port_problem_since = None;
+                port_problem_attempts = 0;
                 nominal_backoff = timings.backoff_initial;
                 match supervise_ready_tunnel(
                     &mut child,
@@ -263,19 +277,20 @@ async fn run_controller_dashboard_tunnel_with_timings(
                 {
                     SteadyStop::Signal => return Ok(()),
                     SteadyStop::Lost => {
-                        note_outage(&mut announced, &mut failing_since, stderr);
+                        announce_tunnel_lost(stderr, &mut announced);
                     }
                 }
             }
             Err(error) => {
-                reap_with_escalation(&mut child, stdin.take());
+                let exit_code = reap_failed_attempt(&mut child, stdin.take());
                 if !ever_ready {
                     return Err(error);
                 }
-                note_failed_attempt(
+                record_reconnect_failure(
+                    exit_code,
                     &mut announced,
-                    &mut failing_since,
-                    &mut failed_attempts,
+                    &mut port_problem_since,
+                    &mut port_problem_attempts,
                     stderr,
                 );
             }
@@ -346,21 +361,76 @@ fn allocate_fresh_port(avoid: u16) -> Result<u16, WorkerError> {
     Err(bind_failed())
 }
 
-fn note_outage(announced: &mut bool, failing_since: &mut Option<Instant>, stderr: &mut dyn Write) {
-    announce_tunnel_lost(stderr, announced);
-    if failing_since.is_none() {
-        *failing_since = Some(Instant::now());
+/// A reconnect attempt moves the tunnel off its published port only when that
+/// port is the problem: the remote command exited with a status other than
+/// ssh's connection failure (255), or `127.0.0.1:port` is already bound here.
+fn counts_toward_port_rotation(exit_code: Option<i32>, local_port_busy: bool) -> bool {
+    local_port_busy || matches!(exit_code, Some(code) if code != 255)
+}
+
+fn local_port_is_busy(port: u16) -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => {
+            drop(listener);
+            false
+        }
+        Err(error) => error.kind() == io::ErrorKind::AddrInUse,
     }
 }
 
-fn note_failed_attempt(
+fn record_reconnect_failure(
+    exit_code: Option<i32>,
     announced: &mut bool,
-    failing_since: &mut Option<Instant>,
-    failed_attempts: &mut u32,
+    port_problem_since: &mut Option<Instant>,
+    port_problem_attempts: &mut u32,
     stderr: &mut dyn Write,
 ) {
-    note_outage(announced, failing_since, stderr);
-    *failed_attempts = failed_attempts.saturating_add(1);
+    if counts_toward_port_rotation(exit_code, false) {
+        note_port_problem(announced, port_problem_since, port_problem_attempts, stderr);
+    } else {
+        note_connection_failure(announced, port_problem_since, port_problem_attempts, stderr);
+    }
+}
+
+fn note_port_problem(
+    announced: &mut bool,
+    port_problem_since: &mut Option<Instant>,
+    port_problem_attempts: &mut u32,
+    stderr: &mut dyn Write,
+) {
+    announce_tunnel_lost(stderr, announced);
+    if port_problem_since.is_none() {
+        *port_problem_since = Some(Instant::now());
+    }
+    *port_problem_attempts = port_problem_attempts.saturating_add(1);
+}
+
+fn note_connection_failure(
+    announced: &mut bool,
+    port_problem_since: &mut Option<Instant>,
+    port_problem_attempts: &mut u32,
+    stderr: &mut dyn Write,
+) {
+    announce_tunnel_lost(stderr, announced);
+    *port_problem_since = None;
+    *port_problem_attempts = 0;
+}
+
+fn reap_failed_attempt(child: &mut Child, stdin: Option<std::process::ChildStdin>) -> Option<i32> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            drop(stdin);
+            status.code()
+        }
+        Ok(None) => {
+            reap_with_escalation(child, stdin);
+            None
+        }
+        Err(_) => {
+            drop(stdin);
+            None
+        }
+    }
 }
 
 fn announce_tunnel_lost(stderr: &mut dyn Write, announced: &mut bool) {
@@ -807,7 +877,10 @@ fn controller_unavailable() -> WorkerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DashboardTunnelTimings, equal_jitter, next_backoff, should_rotate_port};
+    use super::{
+        DashboardTunnelTimings, counts_toward_port_rotation, equal_jitter, next_backoff,
+        should_rotate_port,
+    };
     use std::time::Duration;
 
     #[test]
@@ -876,6 +949,26 @@ mod tests {
             threshold
         ));
         assert!(!should_rotate_port(4, None, threshold));
+    }
+
+    #[test]
+    fn only_a_remote_failure_or_a_busy_local_port_counts_toward_rotation() {
+        assert!(!counts_toward_port_rotation(Some(255), false));
+        assert!(!counts_toward_port_rotation(None, false));
+        assert!(counts_toward_port_rotation(Some(1), false));
+        assert!(counts_toward_port_rotation(Some(75), false));
+        assert!(counts_toward_port_rotation(Some(0), false));
+        assert!(counts_toward_port_rotation(Some(255), true));
+        assert!(counts_toward_port_rotation(None, true));
+    }
+
+    #[test]
+    fn local_port_is_busy_only_while_a_listener_holds_it() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(super::local_port_is_busy(port));
+        drop(listener);
+        assert!(!super::local_port_is_busy(port));
     }
 
     #[cfg(debug_assertions)]
