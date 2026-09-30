@@ -325,6 +325,7 @@ pub struct TaskReconciler {
     cold_unresolved: BTreeMap<TaskId, ColdHistory>,
     last_started: Option<Duration>,
     repair_needed: bool,
+    cursor_recovery: bool,
     attention_refresh_required: bool,
     unaccounted_feed: bool,
     changes: VecDeque<DerivedTaskChange>,
@@ -350,6 +351,7 @@ impl TaskReconciler {
             cold_unresolved: BTreeMap::new(),
             last_started: None,
             repair_needed: false,
+            cursor_recovery: false,
             attention_refresh_required: false,
             unaccounted_feed: false,
             changes: VecDeque::new(),
@@ -693,6 +695,7 @@ impl TaskReconciler {
         }) {
             // Ahead, expired and replaced-epoch saved cursors are not consumed
             // evidence in this window. Adopt H only after the full repair.
+            self.cursor_recovery |= self.cursor.is_some();
             self.cursor = None;
             self.cursor_validated = false;
         } else if self.cursor.is_some() && replay_after == self.cursor {
@@ -964,6 +967,10 @@ impl TaskReconciler {
             // must keep their provenance. Drain those changes first and retain
             // the verified set for the next chunk.
             && !(comparison.cold && self.has_warm_changes())
+            // Keep recovery attached to every fresh decision chunk, including
+            // delayed proof. Complete in a later settled chunk so consumers can
+            // both coalesce decisions and observe recovery finishing.
+            && !(self.cursor_recovery && (!self.changes.is_empty() || self.recovery_pending()))
         {
             comparison
                 .hash
@@ -981,6 +988,14 @@ impl TaskReconciler {
         self.changes
             .iter()
             .any(|change| change.cause == ChangeCause::RepairDifference)
+    }
+    fn recovery_pending(&self) -> bool {
+        self.candidates.keys().any(|id| match &self.previous {
+            PreviousProjection::Absent => true,
+            PreviousProjection::Present(rows) => rows
+                .get(id)
+                .is_none_or(|row| row.eligibility_signature().quiescent != Some(false)),
+        })
     }
 }
 impl EventReconciler for TaskReconciler {
@@ -1004,6 +1019,7 @@ impl EventReconciler for TaskReconciler {
                     self.consume_batch(&batch, false, None)?;
                 }
                 EventReadResult::SnapshotRequired(control) => {
+                    self.cursor_recovery |= control.reason != "bootstrap";
                     let compatible = self.sweep.as_ref().is_some_and(|sweep| {
                         sweep.baseline.is_some_and(|baseline| {
                             baseline.journal_id == control.window.journal_id
@@ -1032,6 +1048,7 @@ impl EventReconciler for TaskReconciler {
                 comparison.ids.is_empty()
                     && (!comparison.waiting.is_empty()
                         || self.attention_refresh_required
+                        || self.cursor_recovery
                         || captured.is_some())
             }) && (input.repair_due
                 || captured.is_some()
@@ -1044,6 +1061,9 @@ impl EventReconciler for TaskReconciler {
         let attention = self.compare_page()?;
         if attention.is_some() {
             repair = RepairProgress::Complete;
+            if !self.repair_needed {
+                self.cursor_recovery = false;
+            }
         } else if self.comparison.is_some() {
             repair = RepairProgress::InProgress;
         }
@@ -1060,7 +1080,7 @@ impl EventReconciler for TaskReconciler {
             pending_ids: self.order.iter().copied().collect(),
             repair,
             attention,
-            repair_needed: self.repair_needed,
+            repair_needed: self.repair_needed || self.cursor_recovery,
         };
         result.validate()?;
         Ok(result)

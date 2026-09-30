@@ -1851,6 +1851,165 @@ mod reconciliation {
         assert_eq!(plan.notices[0].title, "Tasks need attention");
     }
 
+    fn expired_cursor_recovery(
+        paged: bool,
+        delayed: bool,
+    ) -> (Harness, NotifyState, EventReadResult) {
+        let old = (1..=3)
+            .map(|id| (task_id(id), terminal(id, SafeOutcome::Done, false)))
+            .collect();
+        let mut h = Harness::new(PreviousProjection::Present(old), None, vec![]);
+        let cursor = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            h.reconciler.previous_projection().clone(),
+            Some(cursor),
+            vec![task_id(1), task_id(2), task_id(3)],
+            h.runtime.clone(),
+        );
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+            if delayed {
+                h.source.tasks.set_proof_work(task_id(id), 96).unwrap();
+            }
+        }
+        // A confirmed busy candidate can remain pending after recovery ends.
+        h.source
+            .tasks
+            .insert(terminal(3, SafeOutcome::Done, false))
+            .unwrap();
+        if paged {
+            h.source.tasks.set_page_budget(1);
+        }
+        for _ in 0..3 {
+            h.source.hint(999, false);
+        }
+        h.source.journal.trim_to(Seq::new(3)).unwrap();
+        let read = h.feed(cursor);
+        let EventReadResult::SnapshotRequired(control) = &read else {
+            panic!("the real journal must require cursor repair")
+        };
+        assert_eq!(control.reason, "cursor_expired");
+        assert_eq!(control.window.journal_id, cursor.journal_id);
+        let mut saved = NotifyState::empty();
+        saved.consumed_after = Some(cursor);
+        saved.last_complete_repair_millis = Some(0);
+        (h, saved, read)
+    }
+
+    #[test]
+    fn review_same_epoch_reset_coalesces_real_reconciler_decisions() {
+        for paged in [false, true] {
+            let (mut h, mut saved, read) = expired_cursor_recovery(paged, false);
+            let mut read = Some(read);
+            let mut notices = Vec::new();
+            let mut changed = Vec::new();
+            let mut complete = false;
+            for _ in 0..8 {
+                let result = h.tick(read.take(), false);
+                changed.extend(result.changes.iter().map(|change| change.task_id));
+                let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 1_000);
+                saved = plan.next;
+                notices.extend(plan.notices);
+                if result.repair == RepairProgress::Complete && !result.repair_needed {
+                    assert_eq!(result.pending_ids, vec![task_id(3)]);
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete, "cursor recovery did not settle");
+            assert_eq!(changed, vec![task_id(1), task_id(2)]);
+            assert_eq!(
+                h.source.tasks.repair_requests().len(),
+                if paged { 3 } else { 1 }
+            );
+            assert_eq!(notices.len(), 1, "paged={paged}");
+            assert_eq!(notices[0].title, "Tasks finished");
+            assert_eq!(notices[0].body, "2 tasks");
+
+            // Once recovery settles, an ordinary new completion is individual.
+            let after = h.reconciler.cursor().unwrap();
+            h.source
+                .tasks
+                .insert(terminal(3, SafeOutcome::Done, true))
+                .unwrap();
+            h.source.hint(3, true);
+            let result = h.tick(Some(h.feed(after)), false);
+            assert!(!result.repair_needed);
+            let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 1_001);
+            assert_eq!(plan.notices.len(), 1);
+            assert_eq!(plan.notices[0].title, "Done");
+        }
+    }
+
+    #[test]
+    fn cursor_recovery_coalesces_decisions_after_delayed_proof() {
+        let (mut h, mut saved, read) = expired_cursor_recovery(false, true);
+        let mut read = Some(read);
+        let mut changed = Vec::new();
+        let mut summaries = Vec::new();
+        let mut complete = false;
+        for _ in 0..10 {
+            let result = h.tick(read.take(), false);
+            let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 1_000);
+            saved = plan.next;
+            changed.extend(result.changes.iter().map(|change| change.task_id));
+            for notice in plan.notices {
+                assert_eq!(
+                    notice.title, "Tasks finished",
+                    "delayed recovery decision lost its provenance"
+                );
+                summaries.push(notice);
+            }
+            if result.repair == RepairProgress::Complete && !result.repair_needed {
+                assert_eq!(result.pending_ids, vec![task_id(3)]);
+                complete = true;
+                assert_eq!(
+                    changed.len(),
+                    2,
+                    "recovery completed before its unknown proof settled"
+                );
+                break;
+            }
+        }
+        assert!(complete);
+        assert_eq!(changed, vec![task_id(1), task_id(2)]);
+        assert_eq!(
+            summaries.len(),
+            2,
+            "each bounded decision chunk must coalesce"
+        );
+    }
+
+    #[test]
+    fn cursor_recovery_unknown_completion_keeps_periodic_repair_running() {
+        let (mut h, _, read) = expired_cursor_recovery(false, true);
+        let first = h.tick(Some(read), false);
+        assert!(first.repair_needed);
+        assert_eq!(h.source.tasks.repair_requests().len(), 1);
+
+        h.runtime.advance(Duration::from_secs(15));
+        let second = h.tick(None, false);
+        assert!(second.repair_needed);
+        assert_eq!(
+            h.source.tasks.repair_requests().len(),
+            2,
+            "unknown non-attention proof cannot starve periodic repair"
+        );
+        let mut changed = Vec::new();
+        for _ in 0..10 {
+            let result = h.tick(None, false);
+            changed.extend(result.changes.iter().map(|change| change.task_id));
+            if result.repair == RepairProgress::Complete && !result.repair_needed {
+                assert_eq!(changed, vec![task_id(1), task_id(2)]);
+                return;
+            }
+        }
+        panic!("refreshed recovery did not settle")
+    }
+
     #[test]
     fn lost_hint_warm_busy_to_quiescent_is_derived_change() {
         let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, false)), None, vec![]);
