@@ -441,6 +441,11 @@ fn failed_selected_keychain_unlock_does_not_discover_or_save() {
     assert!(!home.path().join("catalogue-called").exists());
 }
 
+/// Fixture line that answers `--version` like OpenCode 1. Settings asks
+/// OpenCode for its version before it lists models, and lists them only on
+/// v1; Codex is never asked, so the line is inert in its fixture.
+const OPENCODE_V1_VERSION: &str = "[ \"$*\" = --version ] && { printf '1.18.32\\n'; exit 0; }";
+
 fn install_binary(home: &TempDir, name: &str, script: &str) {
     let path = home.path().join("bin").join(name);
     fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
@@ -484,10 +489,11 @@ done
             name,
             &format!(
                 r#"
-[ "$*" = '{arguments}' ] || exit 21
 [ -z "${{OPENAI_API_KEY-}}" ] || exit 22
 [ -z "${{MAC_WORKER_KEYCHAIN_PASSWORD-}}" ] || exit 23
 [ -z "${{MAC_WORKER_KEYCHAIN_PATH-}}" ] || exit 24
+{OPENCODE_V1_VERSION}
+[ "$*" = '{arguments}' ] || exit 21
 printf called > "$HOME/{name}-called"
 . "$HOME/catalogue-barrier.sh"
 printf '%s\n' '{output}'
@@ -639,6 +645,7 @@ fn settings_get_runs_catalogs_outside_the_callers_project_directory() {
                 r#"
 [ ! -e opencode.json ] && [ ! -e .codex ] || exit 21
 [ -z "$(ls -A)" ] || exit 22
+{OPENCODE_V1_VERSION}
 printf '%s' "$PWD" > "$HOME/{name}-cwd"
 printf '%s\n' '{output}'
 "#

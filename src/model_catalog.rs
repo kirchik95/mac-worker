@@ -4,12 +4,15 @@ use std::{
     fs,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
 
-use crate::process::{ProcessPolicy, ProcessRunner};
+use crate::{
+    agent::OpencodeDialect,
+    process::{ProcessPolicy, ProcessRunner},
+};
 
 fn policy(stdout_limit: usize) -> ProcessPolicy {
     ProcessPolicy {
@@ -29,8 +32,23 @@ pub(crate) fn discover_codex(home: &Path, runner: &dyn ProcessRunner) -> Option<
     serde_json::from_slice(&output).ok()
 }
 
+/// OpenCode 2 lists models only through its shared background service, which
+/// a settings read must neither use nor start (`models --standalone` prints
+/// nothing). So the host is asked for its version first and only a positively
+/// identified v1 runs `opencode models`. Every other host, including one
+/// whose version cannot be read, returns `None` and the caller keeps the
+/// remembered catalog.
 pub(crate) fn discover_opencode(home: &Path, runner: &dyn ProcessRunner) -> Option<String> {
-    let output = discover(home, &["opencode", "models"], runner, policy(256 * 1024))?;
+    let started = Instant::now();
+    let version = discover(home, &["opencode", "--version"], runner, policy(4 * 1024))?;
+    let version = crate::agent_facts::parse_version(&version);
+    if OpencodeDialect::observed(version.as_deref()) != Some(OpencodeDialect::V1) {
+        return None;
+    }
+    // Both commands share the one discovery budget.
+    let mut models = policy(256 * 1024);
+    models.deadline = models.deadline.checked_sub(started.elapsed())?;
+    let output = discover(home, &["opencode", "models"], runner, models)?;
     String::from_utf8(output).ok()
 }
 
@@ -101,6 +119,28 @@ mod tests {
     const OPENCODE: &[&str] = &["opencode", "models"];
     const CODEX_OUTPUT: &str = r#"{"models":[{"slug":"live-model","visibility":"list"}]}"#;
     const OPENCODE_OUTPUT: &str = "provider/live-model";
+    /// Makes a fixture script exit at once, before its test body.
+    const WARM: &str = "--fixture-warm";
+
+    /// What the two OpenCode generations print for `--version`.
+    const V1_VERSION: &str = "printf '1.18.32\\n'";
+    const V2_VERSION: &str = "printf 'opencode v2.0.18\\n'";
+
+    /// An `opencode` that logs every invocation, answers `--version` with
+    /// `version` and lists models with `models`.
+    fn opencode_script(version: &str, models: &str) -> String {
+        format!(
+            "printf '%s\\n' \"$*\" >> \"$HOME/invocations\"\nif [ \"$1\" = --version ]; then\n{version}\nexit 0\nfi\n{models}"
+        )
+    }
+
+    fn invocations(home: &TempDir) -> Vec<String> {
+        fs::read_to_string(home.path().join("invocations"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
 
     fn fixture(argv: &[&str], script: &str) -> TempDir {
         let home = tempdir().unwrap();
@@ -129,7 +169,21 @@ mod tests {
         fs::create_dir_all(home.path().join("project/.codex")).unwrap();
         fs::write(home.path().join("project/opencode.json"), "project-only").unwrap();
         let binary = bin.join(argv[0]);
-        fs::write(binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\n[ \"$1\" = {WARM} ] && exit 0\n{script}\n"),
+        )
+        .unwrap();
+        // macOS assesses a new executable on its first exec, which can take
+        // seconds while other tests write fixtures. Pay that here, so the
+        // bounded discovery below measures the login shell and the script.
+        assert!(
+            std::process::Command::new(&binary)
+                .arg(WARM)
+                .status()
+                .unwrap()
+                .success()
+        );
         home
     }
 
@@ -328,7 +382,10 @@ printf '%s\n' '{output}'
             discover_codex(home.path(), &SystemProcessRunner).unwrap()["models"][0]["slug"],
             "live-model"
         );
-        let home = fixture(OPENCODE, &format!("printf '%s\\n' '{OPENCODE_OUTPUT}'"));
+        let home = fixture(
+            OPENCODE,
+            &opencode_script(V1_VERSION, &format!("printf '%s\\n' '{OPENCODE_OUTPUT}'")),
+        );
         assert_eq!(
             discover_opencode(home.path(), &SystemProcessRunner)
                 .unwrap()
@@ -338,12 +395,145 @@ printf '%s\n' '{output}'
         for script in ["printf not-json", "printf ''", "printf '\\377'"] {
             let home = fixture(CODEX, script);
             assert!(discover_codex(home.path(), &SystemProcessRunner).is_none());
-            let home = fixture(OPENCODE, script);
+            // `models` runs on this v1 host; it is its output that falls back.
+            let home = fixture(OPENCODE, &opencode_script(V1_VERSION, script));
             let settings = NativeAgentSettingsStore::new(home.path())
                 .with_opencode_catalog(discover_opencode(home.path(), &SystemProcessRunner))
                 .read("opencode")
                 .unwrap();
             assert_eq!(settings.model_catalog_source.as_deref(), Some("remembered"));
+            assert_eq!(invocations(&home), ["--version", "models"], "{script}");
+        }
+    }
+
+    #[test]
+    fn a_v2_host_keeps_the_remembered_opencode_catalog_without_running_models() {
+        let _serial = DISCOVERY_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // `models` would answer with a live catalog, through the background
+        // service on a real v2. It must not be run at all.
+        let home = fixture(
+            OPENCODE,
+            &opencode_script(V2_VERSION, &format!("printf '%s\\n' '{OPENCODE_OUTPUT}'")),
+        );
+        assert!(discover_opencode(home.path(), &SystemProcessRunner).is_none());
+        assert_eq!(invocations(&home), ["--version"]);
+
+        let settings = NativeAgentSettingsStore::new(home.path())
+            .with_opencode_catalog(discover_opencode(home.path(), &SystemProcessRunner))
+            .read("opencode")
+            .unwrap();
+        assert_eq!(settings.model_catalog_source.as_deref(), Some("remembered"));
+        assert!(
+            !settings
+                .model_options
+                .iter()
+                .any(|option| option.id == OPENCODE_OUTPUT)
+        );
+        assert_eq!(invocations(&home), ["--version", "--version"]);
+    }
+
+    /// Answers the two OpenCode catalog commands without running a process.
+    struct ScriptedOpencode {
+        /// What `--version` prints and its exit status; `None` lets the
+        /// command run into its deadline.
+        version: Option<(&'static [u8], i32)>,
+        commands: Mutex<Vec<(String, ProcessPolicy)>>,
+    }
+
+    impl ProcessRunner for ScriptedOpencode {
+        fn run(
+            &self,
+            request: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, crate::error::WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            let shell = request.args[1].to_str().unwrap();
+            let command = shell
+                .rsplit_once("; ")
+                .map_or(shell, |(_, command)| command);
+            self.commands
+                .lock()
+                .unwrap()
+                .push((command.to_owned(), request.policy));
+            let (stdout, status) = match command {
+                "exec 'opencode' '--version'" => match self.version {
+                    Some(answer) => answer,
+                    None => {
+                        return Err(crate::error::ProcessError::DeadlineExceeded {
+                            deadline: request.policy.deadline,
+                        }
+                        .into());
+                    }
+                },
+                "exec 'opencode' 'models'" => (&b"provider/live-model\n"[..], 0),
+                other => panic!("unexpected catalog command: {other}"),
+            };
+            Ok(crate::process::ProcessResult {
+                status: std::process::ExitStatus::from_raw(status << 8),
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn opencode_models_runs_only_after_a_version_that_is_positively_v1() {
+        const VERSION: &str = "exec 'opencode' '--version'";
+        const MODELS: &str = "exec 'opencode' 'models'";
+        let home = tempdir().unwrap();
+        for (version, expected) in [
+            (Some((&b"1.18.32\n"[..], 0)), &[VERSION, MODELS][..]),
+            (Some((b"0.15.3\n", 0)), &[VERSION, MODELS]),
+            // v2 and later list models through the background service.
+            (Some((b"opencode v2.0.18\n", 0)), &[VERSION]),
+            (Some((b"opencode v3.0.0\n", 0)), &[VERSION]),
+            // An unreadable version may be v2.
+            (Some((b"development build\n", 0)), &[VERSION]),
+            (Some((b"", 0)), &[VERSION]),
+            (Some((b"1.18.32\n", 3)), &[VERSION]),
+            (None, &[VERSION]),
+        ] {
+            let runner = ScriptedOpencode {
+                version,
+                commands: Mutex::new(Vec::new()),
+            };
+            let catalog = discover_opencode(home.path(), &runner);
+            let commands = runner.commands.lock().unwrap().clone();
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|(command, _)| command.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{version:?}"
+            );
+            let live = expected.contains(&MODELS);
+            assert_eq!(catalog.is_some(), live, "{version:?}");
+            let settings = NativeAgentSettingsStore::new(home.path())
+                .with_opencode_catalog(catalog)
+                .read("opencode")
+                .unwrap();
+            assert_eq!(
+                settings.model_catalog_source.as_deref(),
+                Some(if live { "live" } else { "remembered" }),
+                "{version:?}"
+            );
+            assert_eq!(
+                settings
+                    .model_options
+                    .iter()
+                    .any(|option| option.id == OPENCODE_OUTPUT),
+                live,
+                "{version:?}"
+            );
+            // The version probe and the listing share one discovery budget.
+            assert_eq!(commands[0].1.deadline, Duration::from_secs(15));
+            assert_eq!(commands[0].1.stdout_limit, 4 * 1024);
+            if let Some((_, models)) = commands.get(1) {
+                assert!(models.deadline <= Duration::from_secs(15));
+                assert_eq!(models.stdout_limit, 256 * 1024);
+            }
         }
     }
 }
