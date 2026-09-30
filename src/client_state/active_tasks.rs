@@ -382,6 +382,10 @@ impl ClientStateStore {
             task_id: task_id.to_string(),
         };
         let bytes = encode_index_json(&receipt)?;
+        if index.entry_exists(&name).map_err(WorkerError::Io)? {
+            read_receipt(&index, &name, task_id).map(|_| ())?;
+            return Ok(());
+        }
         match index.write_private_atomic_no_replace(&name, &bytes) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

@@ -1,4 +1,8 @@
-use std::{fs, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
+};
 
 use uuid::Uuid;
 
@@ -116,6 +120,30 @@ fn matching_cas_of_an_identical_record_keeps_the_underlying_file_identity() {
     );
     assert_eq!(regular_file_identity(&path), before);
     assert_eq!(store.load_task(record.meta().task_id()).unwrap(), record);
+}
+
+#[test]
+fn ensuring_an_existing_active_index_entry_skips_durable_publication() {
+    let (_dir, store, state_path) = open_store();
+    let record = sample_record();
+    store.create_task(record.clone()).unwrap();
+    let existing_id = record.meta().task_id();
+    let missing_id = TaskId::new(Uuid::from_u128(2));
+    let index_path = state_path.join("active-tasks");
+    let _lock = store.acquire_state_lock().unwrap();
+
+    // Reads remain allowed while a staging write would fail. This makes the
+    // existing-entry fast path observable without counting unrelated fsyncs.
+    fs::set_permissions(&index_path, fs::Permissions::from_mode(0o500)).unwrap();
+    let existing_result = store.ensure_active_task_index_locked(existing_id);
+    fs::set_permissions(&index_path, fs::Permissions::from_mode(0o700)).unwrap();
+    existing_result.unwrap();
+    store.ensure_active_task_index_locked(missing_id).unwrap();
+    let path = index_path.join(format!("{missing_id}.json"));
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["task_id"], missing_id.to_string());
 }
 
 #[test]
