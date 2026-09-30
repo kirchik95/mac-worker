@@ -1836,6 +1836,88 @@ impl RootedDir {
         self.replace_private_regular_exact_before_final_sync(name, expected, replacement, || Ok(()))
     }
 
+    /// Replaces an owned private regular file after checking its identity and
+    /// size. The previous body is not read, so an oversized corrupt cache can
+    /// be discarded without allocating it.
+    pub(crate) fn replace_private_regular_bound(
+        &self,
+        name: &str,
+        expected: PrivateEntryIdentity,
+        expected_size: u64,
+        replacement: &[u8],
+    ) -> io::Result<()> {
+        self.verify_root_name()?;
+        let target = CString::new(name).map_err(interior_nul_error)?;
+        let before = stat_at(self.root.as_raw_fd(), &target)?;
+        require_private_regular(&before)?;
+        self.require_bound_regular_device(&before)?;
+        if !bound_regular_matches(&before, expected, expected_size) {
+            return Err(os_error(libc::ESTALE));
+        }
+        let opened = open_regular_at(self.root.as_raw_fd(), &target)?;
+        let opened_stat = stat_fd(opened.as_raw_fd())?;
+        require_private_regular(&opened_stat)?;
+        self.require_bound_regular_device(&opened_stat)?;
+        if !same_file(&before, &opened_stat)
+            || !bound_regular_matches(&opened_stat, expected, expected_size)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        drop(opened);
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        require_private_regular(&rebound)?;
+        if !bound_regular_matches(&rebound, expected, expected_size) {
+            return Err(os_error(libc::ESTALE));
+        }
+
+        let temporary = random_private_name("replace");
+        let replacement_fd = create_regular_at(self.root.as_raw_fd(), &temporary)?;
+        let mut replacement_file = File::from(replacement_fd);
+        if let Err(error) = replacement_file
+            .write_all(replacement)
+            .and_then(|()| replacement_file.sync_all())
+        {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        let replacement_identity = FileIdentity::from_stat(&stat_fd(replacement_file.as_raw_fd())?);
+        self.verify_root_name()?;
+        let rebound = stat_at(self.root.as_raw_fd(), &target)?;
+        if !bound_regular_matches(&rebound, expected, expected_size) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(os_error(libc::ESTALE));
+        }
+        if let Err(error) = exchange_entries(
+            self.root.as_raw_fd(),
+            &temporary,
+            self.root.as_raw_fd(),
+            &target,
+        ) {
+            let _ = unlink_at(self.root.as_raw_fd(), &temporary, 0);
+            return Err(error);
+        }
+        let published = stat_at(self.root.as_raw_fd(), &target)?;
+        let displaced = stat_at(self.root.as_raw_fd(), &temporary)?;
+        let replacement_opened = stat_fd(replacement_file.as_raw_fd())?;
+        if FileIdentity::from_stat(&published) != replacement_identity
+            || FileIdentity::from_stat(&replacement_opened) != replacement_identity
+            || !same_file(&published, &replacement_opened)
+            || !bound_regular_matches(&displaced, expected, expected_size)
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        self.verify_root_name()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        self.remove_owned_regular(temporary.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "replacement name is not UTF-8")
+        })?)?;
+        let final_binding = stat_at(self.root.as_raw_fd(), &target)?;
+        if !same_file(&final_binding, &replacement_opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
     pub(crate) fn replace_private_regular_exact_in_role(
         &self,
         role: PrivateRegularRole<'_>,
@@ -11992,6 +12074,16 @@ fn modified_time(metadata: &libc::stat) -> (i64, i64) {
 
 fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn bound_regular_matches(
+    metadata: &libc::stat,
+    expected: PrivateEntryIdentity,
+    expected_size: u64,
+) -> bool {
+    metadata.st_size >= 0
+        && metadata.st_size as u64 == expected_size
+        && PrivateEntryIdentity::from_stat(metadata) == expected
 }
 
 fn file_type(mode: libc::mode_t) -> libc::mode_t {

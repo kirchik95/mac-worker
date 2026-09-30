@@ -78,9 +78,9 @@ mod policy {
         config::ControllerConfig,
         controller::events::contracts::{
             AttentionSummary, BaselineKind, ChangeCause, DerivedTaskChange, EventCursor,
-            EventReconciler, NOTIFY_DECISION_CAPACITY, Notice, NoticeChannel, NoticeSound,
-            NotifyOptions, NotifyState, ReconcileInput, Reconciliation, RepairProgress, SafeCode,
-            SafeOutcome, Seq, TaskFacts,
+            EventReconciler, MAX_NOTIFY_STATE_BYTES, NOTIFY_DECISION_CAPACITY, Notice,
+            NoticeChannel, NoticeSound, NotifyOptions, NotifyState, ReconcileInput, Reconciliation,
+            RepairProgress, SafeCode, SafeOutcome, Seq, TaskFacts,
         },
         error::WorkerError,
         paths::PathLayout,
@@ -1070,6 +1070,27 @@ mod policy {
                 .to_string()
                 .contains("CACHE_CORRUPT")
         );
+    }
+
+    #[test]
+    fn oversized_cache_rebaselines_and_the_next_load_is_valid() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = layout(root.path());
+        let controller = controller("notifier@cache-host");
+        let cache = NotifyCache::open(&paths, &controller).expect("open");
+        let file = cache_directory(&paths, &controller).join("notify.json");
+        fs::write(&file, vec![0_u8; MAX_NOTIFY_STATE_BYTES + 1]).expect("write");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("mode");
+        assert!(
+            cache
+                .load()
+                .expect_err("oversized")
+                .to_string()
+                .contains("CONTROLLER_EVENTS_NOTIFY_CACHE_CORRUPT")
+        );
+        let fresh = cache.rebaseline().expect("rebaseline");
+        assert!(fresh.decisions.is_empty());
+        assert!(cache.load().expect("valid").decisions.is_empty());
     }
 
     #[test]

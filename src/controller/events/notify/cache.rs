@@ -9,6 +9,8 @@ use std::{collections::HashSet, fs::File, io, os::fd::AsRawFd, path::PathBuf, sy
 
 use sha2::{Digest, Sha256};
 
+use std::os::unix::fs::MetadataExt;
+
 use crate::{
     config::ControllerConfig,
     controller::events::contracts::{
@@ -22,7 +24,7 @@ use crate::{
     error::WorkerError,
     paths::PathLayout,
     redaction::RedactionBoundary,
-    rooted_fs::RootedDir,
+    rooted_fs::{PrivateEntryIdentity, RootedDir},
     task::TaskId,
 };
 
@@ -540,13 +542,25 @@ impl NotifyCache {
             return Err(corrupt_cache());
         }
         if self.root.entry_exists(STATE_FILE).map_err(cache_io)? {
-            let previous = self
-                .root
-                .read_private_regular(STATE_FILE, MAX_NOTIFY_BYTES)
-                .map_err(cache_io)?;
-            self.root
-                .replace_private_regular_exact(STATE_FILE, &previous, &bytes)
-                .map_err(cache_io)?;
+            let observed = self.observe_state_file()?;
+            if observed.size > MAX_NOTIFY_BYTES {
+                self.root
+                    .replace_private_regular_bound(
+                        STATE_FILE,
+                        observed.identity,
+                        observed.size,
+                        &bytes,
+                    )
+                    .map_err(cache_io)?;
+            } else {
+                let previous = self
+                    .root
+                    .read_private_regular(STATE_FILE, MAX_NOTIFY_BYTES)
+                    .map_err(cache_io)?;
+                self.root
+                    .replace_private_regular_exact(STATE_FILE, &previous, &bytes)
+                    .map_err(cache_io)?;
+            }
         } else {
             self.root
                 .write_private_atomic_no_replace(STATE_FILE, &bytes)
@@ -630,6 +644,39 @@ fn try_lock_exclusive(file: &File) -> Result<(), WorkerError> {
         ));
     }
     Err(WorkerError::Io(error))
+}
+
+struct ObservedStateFile {
+    identity: PrivateEntryIdentity,
+    size: u64,
+}
+
+impl NotifyCache {
+    fn observe_state_file(&self) -> Result<ObservedStateFile, WorkerError> {
+        let file = self
+            .root
+            .open_private_regular_handle(STATE_FILE)
+            .map_err(cache_io)?;
+        let metadata = file.metadata().map_err(cache_io)?;
+        let identity = PrivateEntryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kind: metadata.mode() & u32::from(libc::S_IFMT),
+            owner: metadata.uid(),
+            mode: metadata.mode() & 0o7777,
+        };
+        let rooted = self
+            .root
+            .private_entry_identity(STATE_FILE)
+            .map_err(cache_io)?;
+        if rooted != identity {
+            return Err(WorkerError::Io(io::Error::from_raw_os_error(libc::ESTALE)));
+        }
+        Ok(ObservedStateFile {
+            identity: rooted,
+            size: metadata.len(),
+        })
+    }
 }
 
 fn decode_state(bytes: &[u8]) -> Result<NotifyState, WorkerError> {
