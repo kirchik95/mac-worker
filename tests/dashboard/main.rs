@@ -9,6 +9,7 @@ mod task_state_fixture;
 mod dashboard_cache;
 mod dashboard_command;
 mod dashboard_cpu_adapter;
+mod dashboard_events;
 mod dashboard_model;
 mod dashboard_mutations;
 mod dashboard_queue;

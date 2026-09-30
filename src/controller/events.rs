@@ -3,7 +3,12 @@
 //! Saved task state remains authoritative. This module advertises no feature
 //! and opens no state or journal. Component facades are filled by later tracks.
 
+pub mod client;
 pub mod contracts;
+pub mod journal;
+pub mod notify;
+pub mod rpc;
+pub mod testing;
 pub use contracts::*;
 
 #[cfg(test)]
@@ -332,10 +337,21 @@ mod tests {
 
     #[test]
     fn tolerant_replies_validate_identifiers_windows_and_committed_cursors() {
-        let event = NewEvent::TurnFinished(TurnHint { task_id: task_id(), turn_id: turn_id(), run_id: None, outcome: SafeOutcome::Done, code: None }).to_wire(window().journal_id, Seq::new(42), 0).unwrap();
+        let event = NewEvent::TurnFinished(TurnHint {
+            task_id: task_id(),
+            turn_id: turn_id(),
+            run_id: None,
+            outcome: SafeOutcome::Done,
+            code: None,
+        })
+        .to_wire(window().journal_id, Seq::new(42), 0)
+        .unwrap();
         let mut encoded = serde_json::to_value(&event).unwrap();
         encoded["future_field"] = serde_json::json!(true);
-        assert_eq!(serde_json::from_value::<WireEvent>(encoded.clone()).unwrap(), event);
+        assert_eq!(
+            serde_json::from_value::<WireEvent>(encoded.clone()).unwrap(),
+            event
+        );
         encoded["seq"] = serde_json::json!("0");
         assert!(serde_json::from_value::<WireEvent>(encoded).is_err());
         assert!(serde_json::from_value::<JournalWindow>(serde_json::json!({"journal_id":window().journal_id.to_string(),"oldest_seq":"43","head_seq":"41"})).is_err());
@@ -350,7 +366,8 @@ mod tests {
         let facts = TaskFacts::try_new(facts_wire()).unwrap();
         let batch = serde_json::json!({"rows":[facts.clone(),facts],"missing":[],"proof_after":null,"baseline_after":null});
         assert!(serde_json::from_value::<TaskFactsBatch>(batch).is_err());
-        let mut wire = facts_wire(); wire.code = Some("x".repeat(2049));
+        let mut wire = facts_wire();
+        wire.code = Some("x".repeat(2049));
         assert!(TaskFacts::try_new(wire).is_err());
         let mut cache = serde_json::to_value(NotifyState::empty()).unwrap();
         cache["decisions"] = serde_json::json!(vec!["a".repeat(64); 4097]);
@@ -359,14 +376,28 @@ mod tests {
 
     #[test]
     fn json_fixtures_match_rust_and_controls_have_no_cursor() {
-        let fixtures: serde_json::Value = serde_json::from_str(include_str!("../../ui/src/lib/controllerEvents.fixtures.json")).unwrap();
-        let win: JournalWindow = serde_json::from_value(fixtures["bootstrap"]["data"]["window"].clone()).unwrap();
-        let event: WireEvent = serde_json::from_value(fixtures["event_above_2pow53"]["data"].clone()).unwrap();
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../ui/src/lib/controllerEvents.fixtures.json"
+        ))
+        .unwrap();
+        let win: JournalWindow =
+            serde_json::from_value(fixtures["bootstrap"]["data"]["window"].clone()).unwrap();
+        let event: WireEvent =
+            serde_json::from_value(fixtures["event_above_2pow53"]["data"].clone()).unwrap();
         assert_eq!(event.seq.as_u64(), 9_007_199_254_740_993);
         for (key, message) in [
-            ("bootstrap", ViewerMessage::SnapshotRequired(SnapshotRequired { reason: "bootstrap".into(), window: win })),
+            (
+                "bootstrap",
+                ViewerMessage::SnapshotRequired(SnapshotRequired {
+                    reason: "bootstrap".into(),
+                    window: win,
+                }),
+            ),
             ("event_above_2pow53", ViewerMessage::ControllerEvent(event)),
-            ("snapshot.ready", ViewerMessage::SnapshotReady { revision: 42 }),
+            (
+                "snapshot.ready",
+                ViewerMessage::SnapshotReady { revision: 42 },
+            ),
             ("heartbeat", ViewerMessage::Heartbeat),
         ] {
             assert_eq!(serde_json::to_value(&message).unwrap(), fixtures[key]);
