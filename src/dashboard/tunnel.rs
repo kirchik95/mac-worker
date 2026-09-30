@@ -18,6 +18,10 @@ use crate::{
 };
 
 const REAP_GRACE: Duration = Duration::from_secs(2);
+/// Stdout EOF can arrive before ssh has been reaped. Poll for the real exit
+/// status this long before SIGTERM, so a finished remote command is not
+/// mistaken for an unknown death.
+const EXIT_STATUS_GRACE: Duration = Duration::from_millis(500);
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 const STDOUT_LIMIT: usize = 64 * 1024;
 const SNAPSHOT_LIMIT: usize = 64 * 1024;
@@ -385,6 +389,13 @@ fn record_reconnect_failure(
     port_problem_attempts: &mut u32,
     stderr: &mut dyn Write,
 ) {
+    // An unknown status (the child was still running, or it died from a signal)
+    // is neutral: it must not count as a stuck port and must not clear a window
+    // that earlier remote failures already started. Only an explicit 255 resets.
+    if exit_code.is_none() {
+        announce_tunnel_lost(stderr, announced);
+        return;
+    }
     if counts_toward_port_rotation(exit_code, false) {
         note_port_problem(announced, port_problem_since, port_problem_attempts, stderr);
     } else {
@@ -417,18 +428,25 @@ fn note_connection_failure(
 }
 
 fn reap_failed_attempt(child: &mut Child, stdin: Option<std::process::ChildStdin>) -> Option<i32> {
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            drop(stdin);
-            status.code()
-        }
-        Ok(None) => {
-            reap_with_escalation(child, stdin);
-            None
-        }
-        Err(_) => {
-            drop(stdin);
-            None
+    let deadline = Instant::now() + EXIT_STATUS_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                drop(stdin);
+                return status.code();
+            }
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    reap_with_escalation(child, stdin);
+                    return None;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(_) => {
+                drop(stdin);
+                return None;
+            }
         }
     }
 }
@@ -879,9 +897,9 @@ fn controller_unavailable() -> WorkerError {
 mod tests {
     use super::{
         DashboardTunnelTimings, counts_toward_port_rotation, equal_jitter, next_backoff,
-        should_rotate_port,
+        record_reconnect_failure, should_rotate_port,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn production_timings_match_the_operator_defaults() {
@@ -960,6 +978,31 @@ mod tests {
         assert!(counts_toward_port_rotation(Some(0), false));
         assert!(counts_toward_port_rotation(Some(255), true));
         assert!(counts_toward_port_rotation(None, true));
+    }
+
+    #[test]
+    fn unknown_exit_status_leaves_the_port_problem_window_in_place() {
+        let started = Instant::now();
+        let mut announced = false;
+        let mut since = Some(started);
+        let mut attempts = 2u32;
+        let mut stderr = Vec::new();
+        record_reconnect_failure(None, &mut announced, &mut since, &mut attempts, &mut stderr);
+        assert_eq!(since, Some(started));
+        assert_eq!(attempts, 2);
+        assert!(announced);
+        let lost = String::from_utf8(stderr).unwrap();
+        assert!(lost.contains("reconnecting"));
+
+        record_reconnect_failure(
+            Some(255),
+            &mut announced,
+            &mut since,
+            &mut attempts,
+            &mut Vec::new(),
+        );
+        assert_eq!(since, None);
+        assert_eq!(attempts, 0);
     }
 
     #[test]

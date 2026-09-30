@@ -350,6 +350,32 @@ fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
 }
 
 #[test]
+fn stdout_eof_before_a_remote_exit_still_rotates() {
+    let homes = Homes::new();
+    let mut child = spawn_tunnel(
+        &homes,
+        "stdout-then-exit",
+        &TunnelTimings {
+            heartbeat_ms: 40,
+            backoff_initial_ms: 25,
+            backoff_cap_ms: 50,
+            readiness_ms: 2_000,
+            rotation_ms: 400,
+        },
+    );
+    wait_for_url(&child.stdout, &mut child.child);
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(8));
+    assert_ne!(urls[0], urls[1], "{urls:?}");
+    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
+    let stderr = child.stderr.lock().unwrap().clone();
+    assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
+    assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
+    send_signal(child.child.id(), "TERM");
+    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
+}
+
+#[test]
 fn remote_viewer_failure_prints_a_new_url() {
     let homes = Homes::new();
     let mut child = spawn_tunnel(
@@ -784,6 +810,22 @@ def hang():
     while True:
         time.sleep(3600)
 
+def stdout_eof_then_status(generation, port, fail_status):
+    port_file = os.environ.get("MAC_WORKER_FAKE_SSH_PORT_FILE")
+    if not port_file or port is None:
+        fail("stdout-then-exit requires a forward port")
+    if generation == 1:
+        with open(port_file, "w", encoding="utf-8") as handle:
+            handle.write(str(port))
+        drop_after_heartbeat()
+    saved = open(port_file, encoding="utf-8").read().strip()
+    if str(port) == saved:
+        sys.stdout.flush()
+        os.close(1)
+        time.sleep(0.2)
+        os._exit(fail_status)
+    exec_viewer()
+
 def sticky_port(generation, port, fail_status):
     port_file = os.environ.get("MAC_WORKER_FAKE_SSH_PORT_FILE")
     if not port_file or port is None:
@@ -829,6 +871,8 @@ def main():
         sticky_port(generation, port, 1)
     if mode == "connect-down":
         sticky_port(generation, port, 255)
+    if mode == "stdout-then-exit":
+        stdout_eof_then_status(generation, port, 1)
     fail("unknown fake ssh mode")
 
 if __name__ == "__main__":
