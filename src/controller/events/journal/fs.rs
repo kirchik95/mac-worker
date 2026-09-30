@@ -70,9 +70,9 @@ pub(super) struct Segment {
 #[serde(deny_unknown_fields)]
 pub(super) struct Manifest {
     schema_version: u32,
-    journal_id: String,
-    head: u64,
-    oldest: u64,
+    pub(super) journal_id: String,
+    pub(super) head: u64,
+    pub(super) oldest: u64,
     segments: Vec<Segment>,
 }
 
@@ -526,6 +526,11 @@ fn replace_role(
         replacement,
         &hooks,
     )?;
+    // Empty recovery segments retain their creation proof until a durable
+    // pending record or manifest pins their binding.
+    if kind == RoleKind::Segment && old.is_none() && replacement.is_empty() {
+        return Ok(());
+    }
     let evidence_binding = root.private_entry_identity(&kind.evidence())?.into();
     remove_bound(root, &kind.evidence(), evidence_binding)?;
     audit(root)?.admit(0, 0)
@@ -609,6 +614,9 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
                 return Err(unavailable());
             }
             root.sync_root()?;
+            if kind == RoleKind::Segment && evidence.old_binding.is_none() && evidence.new_len == 0 {
+                continue;
+            }
         } else {
             let old_matches = match (evidence.old_binding, evidence.old_digest.as_deref()) {
                 (Some(old), Some(expected)) => {
@@ -666,7 +674,7 @@ pub(super) struct Pending {
     next_digest: String,
 }
 
-fn prepare_append(
+pub(super) fn prepare_append(
     manifest: &Manifest,
     bytes: &[u8],
     new_segment: Option<Segment>,
@@ -930,12 +938,12 @@ fn finish_pending(
     recover_retirement(root, manifest, faults)
 }
 
-fn publish_append(
+pub(super) fn publish_append(
     root: &RootedDir,
     pending: &Pending,
     faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
-    let manifest = recover_append(root, faults)?;
+    let manifest = recover_append_with_proposal(root, faults, Some(pending))?;
     let bytes = pending_bytes(pending)?;
     if digest(&bounded_json(&manifest, METADATA_BYTES)?) == pending.next_digest {
         predecessor(&manifest, pending, &bytes)?;
@@ -959,14 +967,27 @@ fn publish_append(
     recover_append(root, faults)
 }
 
-fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manifest> {
+pub(super) fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manifest> {
+    recover_append_with_proposal(root, faults, None)
+}
+
+fn recover_append_with_proposal(root: &RootedDir, faults: &dyn FaultHooks, proposal: Option<&Pending>) -> io::Result<Manifest> {
+    audit(root)?.admit(0, 0)?;
     let initial: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
     recover_roles(root, &initial.journal_id)?;
     root.resume_pending_owned_regular_cleanup("pending.json")?;
     let manifest: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
+    if root.entry_exists("initialization.json")? {
+        let initialization = load_initialization(root)?;
+        if initialization.journal_id != manifest.journal_id { return Err(unavailable()); }
+    }
     if !root.entry_exists("pending.json")? {
+        let proposed_rotation = proposal.filter(|p| p.delta.rotate && manifest.head == p.previous_head);
+        if let Some(proposed) = proposed_rotation { verify_pending(&manifest, proposed, &pending_bytes(proposed)?)?; }
+        reconcile_segment_creation(root, &manifest, proposed_rotation, proposed_rotation.is_none())?;
         verify_retained(root, &manifest, None)?;
         recover_retirement(root, &manifest, faults)?;
+        verify_residue(root, &manifest, proposed_rotation)?;
         return Ok(manifest);
     }
     let pending: Pending = read_json(root, "pending.json", METADATA_BYTES)?;
@@ -974,14 +995,18 @@ fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manif
     let current_digest = digest(&bounded_json(&manifest, METADATA_BYTES)?);
     if current_digest == pending.next_digest {
         predecessor(&manifest, &pending, &bytes)?;
+        reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
         verify_retained(root, &manifest, None)?;
+        verify_residue(root, &manifest, Some(&pending))?;
         finish_pending(root, &manifest, &pending, faults)?;
+        verify_residue(root, &manifest, None)?;
         return Ok(manifest);
     }
     if current_digest != pending.previous_digest {
         return Err(unavailable());
     }
     let next = verify_pending(&manifest, &pending, &bytes)?;
+    reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
     verify_retained(root, &manifest, Some(&pending))?;
     let target = &pending.delta.appended;
     if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
@@ -1017,6 +1042,7 @@ fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manif
     faults.at(FaultPoint::ManifestCommitted)?;
     verify_retained(root, &next, None)?;
     finish_pending(root, &next, &pending, faults)?;
+    verify_residue(root, &next, None)?;
     audit(root)?.admit(0, 0)?;
     Ok(next)
 }
@@ -1065,6 +1091,7 @@ pub(super) fn acquire_lock(
     }
     let file = root.open_existing_private_lock("journal.lock")?;
     root.validate_private_regular_binding("journal.lock", &file, binding.into())?;
+    if file.metadata()?.len() != 0 { return Err(unavailable()); }
     loop {
         if clock.cancelled() || clock.now() >= admission_end {
             return Err(unavailable());
@@ -1084,6 +1111,141 @@ pub(super) fn acquire_lock(
         }
         clock.sleep(remaining.min(Duration::from_millis(1)));
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Initialization {
+    schema_version: u32,
+    pub(super) journal_id: String,
+    root: Binding,
+    pub(super) lock: Binding,
+}
+
+/// Called only by the leader facade. Existing-journal readers never call this.
+pub(super) fn initialize_storage(
+    root: &RootedDir,
+    deadline: Duration,
+    clock: &dyn FsClock,
+    faults: &dyn FaultHooks,
+) -> io::Result<Manifest> {
+    audit(root)?.admit(0, 0)?;
+    let (lock, created) = root.open_private_lock_with_created("journal.lock")?;
+    if created { lock.sync_all()?; root.sync_root()?; }
+    drop(lock);
+    let lock_binding: Binding = root.private_entry_identity("journal.lock")?.into();
+    let _exclusive = acquire_lock(root, lock_binding, false, deadline, clock)?;
+    let epoch = if root.entry_exists("initialization.json")? {
+        load_initialization(root)?.journal_id
+    } else if root.entry_exists(&RoleKind::Initialization.evidence())? {
+        let evidence: RoleEvidence = read_json(root, &RoleKind::Initialization.evidence(), 4096)?;
+        evidence.journal_id
+    } else {
+        // A missing identity with existing data is corruption, not permission
+        // to generate a fresh epoch and reset the sequence.
+        if root.list_names()?.iter().any(|name| name != b"journal.lock" && name != b".mac-worker-rooted-fs") { return Err(unavailable()); }
+        uuid::Uuid::new_v4().to_string()
+    };
+    if !canonical_uuid(&epoch) { return Err(unavailable()); }
+    recover_roles(root, &epoch)?;
+    if !root.entry_exists("initialization.json")? {
+        let initialization = Initialization { schema_version: 1, journal_id: epoch.clone(), root: root.identity()?.into(), lock: lock_binding };
+        replace_role(root, &epoch, RoleKind::Initialization, "initialization.json", &bounded_json(&initialization, METADATA_BYTES)?, faults)?;
+    }
+    let initialization = load_initialization(root)?;
+    if root.entry_exists("manifest.json")? {
+        let manifest = recover_append(root, faults)?;
+        if manifest.journal_id != initialization.journal_id { return Err(unavailable()); }
+        return Ok(manifest);
+    }
+    if root.entry_exists("pending.json")? || root.entry_exists("retirement.json")? { return Err(unavailable()); }
+    let mut manifest = Manifest { schema_version: 1, journal_id: initialization.journal_id,
+        head: 0, oldest: 1, segments: Vec::new() };
+    reconcile_segment_creation(root, &manifest, None, true)?;
+    if root.list_names()?.iter().any(|name| std::str::from_utf8(name).is_ok_and(valid_segment_name)) { return Err(unavailable()); }
+    let segment = create_empty_segment(root, &manifest.journal_id, 1, faults)?;
+    manifest.segments.push(segment);
+    validate_manifest(&manifest)?;
+    replace_role(root, &manifest.journal_id, RoleKind::Manifest, "manifest.json", &bounded_json(&manifest, METADATA_BYTES)?, faults)?;
+    reconcile_segment_creation(root, &manifest, None, true)?;
+    verify_retained(root, &manifest, None)?;
+    verify_residue(root, &manifest, None)?;
+    Ok(manifest)
+}
+
+pub(super) fn load_initialization(root: &RootedDir) -> io::Result<Initialization> {
+    let initialization: Initialization = read_json(root, "initialization.json", METADATA_BYTES)?;
+    if initialization.schema_version != 1 || !canonical_uuid(&initialization.journal_id)
+        || initialization.root != Binding::from(root.identity()?)
+        || initialization.lock != Binding::from(root.private_entry_identity("journal.lock")?)
+        || initialization.lock.mode != 0o600
+        || !root.read_private_regular("journal.lock", 0)?.is_empty()
+    { return Err(unavailable()); }
+    Ok(initialization)
+}
+
+pub(super) fn create_empty_segment(root: &RootedDir, epoch: &str, first: u64, faults: &dyn FaultHooks) -> io::Result<Segment> {
+    if first == 0 || root.entry_exists(&RoleKind::Segment.evidence())? { return Err(unavailable()); }
+    let name = format!("segment-{first}.jsonl");
+    if root.entry_exists(&name)? { return Err(unavailable()); }
+    replace_role(root, epoch, RoleKind::Segment, &name, b"", faults)?;
+    Ok(Segment { name: name.clone(), first, last: None, committed_len: 0,
+        binding: root.private_entry_identity(&name)?.into(), sealed: false })
+}
+
+fn reconcile_segment_creation(root: &RootedDir, manifest: &Manifest, pending: Option<&Pending>, retire_proof: bool) -> io::Result<()> {
+    let name = RoleKind::Segment.evidence();
+    if !root.entry_exists(&name)? { return Ok(()); }
+    let evidence: RoleEvidence = read_json(root, &name, 4096)?;
+    if evidence.old_binding.is_some() || evidence.new_len != 0 || evidence.journal_id != manifest.journal_id { return Err(unavailable()); }
+    let retained = manifest.segments.iter().any(|s| s.name == evidence.target && s.binding == evidence.stage_binding);
+    let allocated = pending.is_some_and(|p| p.delta.appended.name == evidence.target && p.delta.appended.binding == evidence.stage_binding);
+    if !retained && !allocated {
+        root.retry_pending_owned_regulars_matching(|name, id| name == evidence.target.as_bytes() && Binding::from(id) == evidence.stage_binding)?;
+        if root.entry_exists(&evidence.target)? {
+            if !matches_file(root, &evidence.target, evidence.stage_binding, 0, &digest(b""))? { return Err(unavailable()); }
+            remove_bound(root, &evidence.target, evidence.stage_binding)?;
+        }
+    }
+    if retire_proof || (!retained && !allocated) {
+        let binding = root.private_entry_identity(&name)?.into();
+        remove_bound(root, &name, binding)?;
+    }
+    Ok(())
+}
+
+fn verify_residue(root: &RootedDir, manifest: &Manifest, pending: Option<&Pending>) -> io::Result<()> {
+    for name in root.list_names()? {
+        let text = std::str::from_utf8(&name).map_err(|_| unavailable())?;
+        if valid_segment_name(text) && !manifest.segments.iter().any(|s| s.name == text)
+            && !pending.is_some_and(|p| p.delta.appended.name == text || p.delta.retired.as_ref().is_some_and(|s| s.name == text))
+        { return Err(unavailable()); }
+    }
+    audit(root)?.admit(0, 0)
+}
+
+pub(super) fn cursor_reason(manifest: &Manifest, after: Option<(&str, u64)>) -> Option<&'static str> {
+    let Some((epoch, seq)) = after else { return Some("bootstrap"); };
+    if epoch != manifest.journal_id { return Some("journal_changed"); }
+    if seq < manifest.oldest.saturating_sub(1) { return Some("cursor_expired"); }
+    if seq > manifest.head { return Some("cursor_ahead"); }
+    None
+}
+
+pub(super) fn read_after(root: &RootedDir, manifest: &Manifest, after: u64, limit: usize) -> io::Result<Vec<serde_json::Value>> {
+    validate_manifest(manifest)?;
+    let limit = limit.clamp(1, 256);
+    let mut delivered = Vec::new();
+    for segment in &manifest.segments {
+        if segment.last.is_none_or(|last| last <= after) { continue; }
+        for event in committed_records(root, segment, &manifest.journal_id, false)? {
+            if canonical_seq(&event["seq"])? > after {
+                delivered.push(event);
+                if delivered.len() == limit { return Ok(delivered); }
+            }
+        }
+    }
+    Ok(delivered)
 }
 
 #[cfg(test)]
@@ -1122,6 +1284,92 @@ mod tests {
         fn cancelled(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn bootstrap_recovers_each_initialization_segment_and_manifest_boundary() {
+        for role in [RoleKind::Initialization, RoleKind::Segment, RoleKind::Manifest] {
+            for point in [PrivateRolePoint::CreationRecorded, PrivateRolePoint::PartialStage,
+                PrivateRolePoint::StageSynced, PrivateRolePoint::Published, PrivateRolePoint::DirectorySynced,
+                PrivateRolePoint::DisplacedRemoved, PrivateRolePoint::FinalSynced] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = RootedDir::create(&temp.path().join("events")).unwrap();
+                let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+                let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Role(role, point))));
+                assert!(initialize_storage(&root, Duration::from_secs(1), &clock, &fault).is_err(), "{role:?} {point:?}");
+                let reopened = RootedDir::open(root.path()).unwrap();
+                let initial = initialize_storage(&reopened, Duration::from_secs(1), &clock, &NoFaults).unwrap();
+                assert_eq!(initial.head, 0);
+                assert_eq!(initial.oldest, 1);
+                let initialization: Initialization = read_json(&reopened, "initialization.json", METADATA_BYTES).unwrap();
+                let epoch = initial.journal_id.clone();
+                assert_eq!(initialization.journal_id, epoch);
+                let bytes = String::from_utf8(record(1)).unwrap().replace(EPOCH, &epoch).into_bytes();
+                let pending = prepare_append(&initial, &bytes, None).unwrap();
+                assert_eq!(publish_append(&reopened, &pending, &NoFaults).unwrap().head, 1);
+                let again = initialize_storage(&reopened, Duration::from_secs(1), &clock, &NoFaults).unwrap();
+                assert_eq!(again.journal_id, epoch);
+                assert_eq!(again.head, 1);
+                let usage = audit(&reopened).unwrap();
+                assert!(usage.bytes <= 18 * 1024 * 1024 && usage.files <= 128);
+            }
+        }
+    }
+
+    #[test]
+    fn initialized_root_rejects_a_replaced_lock_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootedDir::create(&temp.path().join("events")).unwrap();
+        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        initialize_storage(&root, Duration::from_secs(1), &clock, &NoFaults).unwrap();
+        let replacement = root.write_new_private_file("replacement-lock", b"").unwrap();
+        replacement.sync_all().unwrap();
+        fs::rename(root.path().join("replacement-lock"), root.path().join("journal.lock")).unwrap();
+        assert!(initialize_storage(&root, Duration::from_secs(1), &clock, &NoFaults).is_err());
+        let saved: Manifest = read_json(&root, "manifest.json", METADATA_BYTES).unwrap();
+        assert_eq!(saved.head, 0);
+    }
+
+    #[test]
+    fn committed_pending_cannot_hide_an_unbound_segment() {
+        let (_temp, root, pending) = append_fixture();
+        let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::ManifestCommitted)));
+        assert!(publish_append(&root, &pending, &fault).is_err());
+        root.write_new_private_file("segment-777.jsonl", b"").unwrap();
+        assert!(recover_append(&root, &NoFaults).is_err());
+        assert!(root.entry_exists("segment-777.jsonl").unwrap());
+    }
+
+    #[test]
+    fn nonempty_lock_is_not_admitted_or_rewritten() {
+        let (_temp, root, _manifest) = fixture(&record(1), false);
+        let mut file = root.open_private_lock("journal.lock").unwrap();
+        file.write_all(b"unexpected lock content").unwrap();
+        file.sync_all().unwrap();
+        let binding = root.private_entry_identity("journal.lock").unwrap().into();
+        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        assert!(acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).is_err());
+        assert_eq!(root.read_private_regular("journal.lock", 64).unwrap(), b"unexpected lock content");
+    }
+
+    #[test]
+    fn cursor_boundary_and_paginated_reads_never_jump_past_delivery() {
+        let (_temp, root, pending) = append_fixture();
+        let manifest = publish_append(&root, &pending, &NoFaults).unwrap();
+        assert_eq!(cursor_reason(&manifest, None), Some("bootstrap"));
+        assert_eq!(cursor_reason(&manifest, Some(("714dc3be-668f-4922-bd31-b1d7a0056790", 0))), Some("journal_changed"));
+        assert_eq!(cursor_reason(&manifest, Some((EPOCH, 4))), Some("cursor_ahead"));
+        assert_eq!(cursor_reason(&manifest, Some((EPOCH, 0))), None);
+        let delivered = read_after(&root, &manifest, 1, 1).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["seq"], "2");
+        assert!(read_after(&root, &manifest, 3, 128).unwrap().is_empty());
+        let mut retained = manifest;
+        retained.oldest = 14;
+        retained.head = 20;
+        assert_eq!(cursor_reason(&retained, Some((EPOCH, 12))), Some("cursor_expired"));
+        retained.head = u64::MAX;
+        assert_eq!(cursor_reason(&retained, Some((EPOCH, 13))), None);
     }
 
     #[test]
@@ -1412,21 +1660,7 @@ mod tests {
             .unwrap()
             .sync_all()
             .unwrap();
-        root.write_new_private_file("segment-16385.jsonl", b"")
-            .unwrap()
-            .sync_all()
-            .unwrap();
-        let new_segment = Segment {
-            name: "segment-16385.jsonl".into(),
-            first: 16_385,
-            last: None,
-            committed_len: 0,
-            binding: root
-                .private_entry_identity("segment-16385.jsonl")
-                .unwrap()
-                .into(),
-            sealed: false,
-        };
+        let new_segment = create_empty_segment(&root, EPOCH, 16_385, &NoFaults).unwrap();
         let pending = prepare_append(&manifest, &record(16_385), Some(new_segment)).unwrap();
         let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Retired)));
         assert!(publish_append(&root, &pending, &fault).is_err());
