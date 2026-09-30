@@ -17,7 +17,7 @@ fn viewer_heartbeat_loss_exits_tempfail() {
     let _url = wait_for_url(&child.stdout, &mut child.child);
     child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
     child.stdin.as_mut().unwrap().flush().unwrap();
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(3));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(75), "stderr={stderr}");
     assert!(
@@ -188,6 +188,11 @@ fn wait_for_url(stdout: &Arc<Mutex<String>>, child: &mut Child) -> String {
     }
 }
 
+/// Hang guard for a tunnel child that is expected to exit. Assertions check the
+/// exit status and stderr, not how fast the exit came: under a loaded parallel
+/// run a fresh fake-ssh fixture can take seconds to start.
+const CHILD_EXIT_GUARD: Duration = Duration::from_secs(30);
+
 fn wait_child_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
@@ -255,7 +260,7 @@ fn laptop_heartbeat_reaches_the_ssh_stdin() {
     );
     assert!(later.iter().all(|(_, byte)| *byte == 0x0a), "{later:?}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(3));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -285,7 +290,7 @@ fn tunnel_reconnects_on_the_same_port_until_signalled() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -316,7 +321,7 @@ fn ssh_connection_failures_keep_the_published_port() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 0, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -345,7 +350,7 @@ fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -371,7 +376,7 @@ fn stdout_eof_before_a_remote_exit_still_rotates() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -399,7 +404,7 @@ fn remote_viewer_failure_prints_a_new_url() {
     let stdout = child.stdout.lock().unwrap().clone();
     assert_eq!(url_lines(&stdout).len(), 2, "stdout={stdout}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -421,7 +426,7 @@ fn signal_during_backoff_exits_cleanly() {
     wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
     send_signal(child.child.id(), "TERM");
     let started = Instant::now();
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(2));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "signal during backoff took {:?}",
@@ -451,7 +456,7 @@ fn signal_during_readiness_reaps_the_child() {
     let first_pid = read_pid(&homes.pid_file);
     let hung = wait_for_new_pid(&homes.pid_file, first_pid, Duration::from_secs(3));
     send_signal(child.child.id(), "INT");
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(6));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(0), "stderr={stderr}");
     assert!(!process_live(hung), "ssh child {hung} was not reaped");
@@ -471,7 +476,7 @@ fn first_start_that_never_becomes_ready_returns_the_error() {
             rotation_ms: 60_000,
         },
     );
-    let status = wait_child_exit(&mut child.child, Duration::from_secs(4));
+    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
     let stderr = child.stderr_text();
     assert!(!status.success(), "stderr={stderr}");
     assert!(stderr.contains("CONTROLLER_UNAVAILABLE"), "{stderr}");
