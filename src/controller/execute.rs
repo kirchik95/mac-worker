@@ -601,6 +601,7 @@ enum MutationOutcome {
     Acknowledged(ControllerAck),
     Rejected(WorkerError),
     Ambiguous(WorkerError),
+    Resumable(WorkerError),
     UnverifiedAck(WorkerError),
 }
 
@@ -626,7 +627,7 @@ fn classify_mutation_exchange(
     };
     if let Ok(error) = serde_json::from_slice::<HostControlError>(reply) {
         if error.error().resumable() {
-            return MutationOutcome::Ambiguous(host_control_to_worker(&error));
+            return MutationOutcome::Resumable(host_control_to_worker(&error));
         }
         return MutationOutcome::Rejected(host_control_to_worker(&error));
     }
@@ -702,7 +703,9 @@ fn send_controller_mutation_with_wait(
                 return Err(error);
             }
             MutationOutcome::UnverifiedAck(error) => return Err(error),
-            MutationOutcome::Ambiguous(error) if attempt < 3 => {
+            MutationOutcome::Ambiguous(error) | MutationOutcome::Resumable(error)
+                if attempt < 3 =>
+            {
                 // Diagnostics must not stop recovery if stderr is closed.
                 let _ = writeln!(
                     stderr,
@@ -715,6 +718,15 @@ fn send_controller_mutation_with_wait(
                 let base_millis = [1000, 3000, 9000][attempt];
                 let jitter = (uuid::Uuid::new_v4().as_u128() % 501) as u64 + 750;
                 wait(Duration::from_millis(base_millis * jitter / 1000));
+            }
+            MutationOutcome::Resumable(error) => {
+                let _ = writeln!(
+                    stderr,
+                    "controller request {} is published; the controller will finish it; check `worker task list`",
+                    request.request_id()
+                );
+                let _ = stderr.flush();
+                return Err(error);
             }
             MutationOutcome::Ambiguous(error) => {
                 let _ = writeln!(
@@ -1971,7 +1983,7 @@ mod mutation_retry_tests {
             (
                 "resumable typed error",
                 output(encode_json_frame(&resumable).unwrap(), 69),
-                "ambiguous",
+                "resumable",
             ),
             (
                 "explicit definitive error",
@@ -2007,6 +2019,7 @@ mod mutation_retry_tests {
                 MutationOutcome::Acknowledged(_) => "ack",
                 MutationOutcome::Rejected(_) => "rejected",
                 MutationOutcome::Ambiguous(_) => "ambiguous",
+                MutationOutcome::Resumable(_) => "resumable",
                 MutationOutcome::UnverifiedAck(_) => "unverified",
             };
             assert_eq!(actual, expected, "{name}");
@@ -2224,12 +2237,9 @@ mod mutation_retry_tests {
         let runner = Replies::new((0..4).map(|_| output(frame.clone(), 74)).collect());
         let cache = temp.path().join("cache");
         let (mut stderr, mut delays) = (Vec::new(), Vec::new());
-        assert_eq!(
-            send(&runner, &cache, &mut stderr, &mut delays)
-                .unwrap_err()
-                .public_code(),
-            "HOST_IO"
-        );
+        let error = send(&runner, &cache, &mut stderr, &mut delays).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_IO");
+        assert_eq!(error.exit_code(), 70);
         let frames = runner.frames.lock().unwrap();
         assert_eq!(frames.len(), 4);
         assert!(frames.windows(2).all(|pair| pair[0] == pair[1]));
@@ -2239,7 +2249,13 @@ mod mutation_retry_tests {
         }
         let text = String::from_utf8(stderr).unwrap();
         assert_eq!(text.lines().count(), 4);
-        assert!(text.contains(&format!("controller request {} outcome is unknown; check `worker task list` or run `worker controller retry {}`", request().request_id(), request().request_id())));
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!(
+                "controller request {} is published; the controller will finish it; check `worker task list`",
+                request().request_id()
+            )
+        );
         assert!(!text.contains("PRIVATE"));
         assert!(
             load_operation_envelope(&cache, request().request_id())
@@ -2277,6 +2293,73 @@ mod mutation_retry_tests {
                 .settled_at_millis()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn exhaustion_hint_uses_the_final_reply_and_preserves_the_original_error() {
+        let frame = encode_json_frame(&json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {"code": "TASK_BUSY", "message": "PRIVATE detail", "resumable": true}
+        }))
+        .unwrap();
+        for final_resumable in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let mut replies = (0..3)
+                .map(|_| {
+                    if final_resumable {
+                        missing()
+                    } else {
+                        output(frame.clone(), 64)
+                    }
+                })
+                .collect::<Vec<_>>();
+            replies.push(if final_resumable {
+                output(frame.clone(), 64)
+            } else {
+                missing()
+            });
+            let runner = Replies::new(replies);
+            let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+            let error = send(&runner, &cache, &mut stderr, &mut delays).unwrap_err();
+            let text = String::from_utf8(stderr).unwrap();
+            let expected = if final_resumable {
+                assert!(matches!(
+                    &error,
+                    WorkerError::Task {
+                        code: "TASK_BUSY",
+                        ..
+                    }
+                ));
+                assert_eq!(error.exit_code(), 64);
+                format!(
+                    "controller request {} is published; the controller will finish it; check `worker task list`",
+                    request().request_id()
+                )
+            } else {
+                assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE");
+                assert_eq!(error.exit_code(), 69);
+                format!(
+                    "controller request {} outcome is unknown; check `worker task list` or run `worker controller retry {}`",
+                    request().request_id(),
+                    request().request_id()
+                )
+            };
+            assert_eq!(text.lines().last().unwrap(), expected);
+            assert_eq!(text.lines().count(), 4);
+            assert!(!text.contains("PRIVATE"));
+            assert_eq!(delays.len(), 3);
+            let frames = runner.frames.lock().unwrap();
+            assert_eq!(frames.len(), 4);
+            assert!(frames.windows(2).all(|pair| pair[0] == pair[1]));
+            assert!(
+                load_operation_envelope(&cache, request().request_id())
+                    .unwrap()
+                    .unwrap()
+                    .outcome()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
