@@ -52,8 +52,9 @@ use support::GitRepo;
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-fn owner(value: u32) -> ProcessIdentity {
-    ProcessIdentity::new(value, u64::from(value) * 10_000 + 7).unwrap()
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = support::fixture_pid(seed);
+    ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
 }
 
 fn run_reference(id: &str, max_parallel: u32) -> QueueRunReference {

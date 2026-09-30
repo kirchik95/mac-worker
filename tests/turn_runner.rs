@@ -2318,7 +2318,7 @@ fn questions_auto_reconcile_completed_dead_runner_starts_one_continuation() {
     );
     *fixture.runner.base_release_failures.lock().unwrap() = 1;
     assert!(fixture.run(&mut Vec::new()).is_err());
-    let dead = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    let dead = ProcessIdentity::new(support::fixture_pid(424_242), 4_242_427).unwrap();
     let (store, _) = adopt_dead_owner_and_reconcile(&fixture, &fixture.runner, dead);
     let record = store.load_task(fixture.task_id).unwrap();
     assert_eq!(record.status().turns().len(), 2);
@@ -3062,7 +3062,7 @@ fn assert_accepted_turn_recovers_from_park(
             ),
         )
         .unwrap();
-    let dead_owner = ProcessIdentity::new(424_299, 4_242_997).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_299), 4_242_997).unwrap();
     fixture
         .state
         .adopt_row(fixture.turn_id, dead_owner)
@@ -3286,7 +3286,7 @@ fn recovery_drains_the_log_tail_when_a_dead_owner_has_terminal_status_and_offset
     persist_independent_terminal_status(&fixture);
     assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
 
-    let dead_owner = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_242), 4_242_427).unwrap();
     remote.reads.lock().unwrap().clear();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 0);
@@ -3407,7 +3407,7 @@ fn recovery_imports_the_result_after_a_crash_between_terminal_persist_and_fetch(
         Some(&earlier)
     );
 
-    let dead_owner = ProcessIdentity::new(424_243, 4_242_437).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_243), 4_242_437).unwrap();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 0);
     assert!(store.queue_entry(fixture.turn_id).unwrap().is_some());
@@ -3469,7 +3469,7 @@ fn reconcile_retires_a_dead_dispatching_row_whose_journal_already_proves_complet
     persist_local_open_success(&fixture);
     assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
 
-    let dead_owner = ProcessIdentity::new(424_244, 4_242_447).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_244), 4_242_447).unwrap();
     fixture.state.record_runner(fixture.task_id, None).unwrap();
     let live_owner = fixture
         .state
@@ -3523,7 +3523,7 @@ fn recovery_records_log_drain_unavailable_when_the_worker_job_is_gone() {
     );
 
     let remote = MissingJobLogsRunner { inner };
-    let dead_owner = ProcessIdentity::new(424_245, 4_242_457).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_245), 4_242_457).unwrap();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 0);
     assert!(fixture_checkpoint(&fixture)["committed"]["completion"].is_null());
@@ -3698,7 +3698,7 @@ fn reconcile_repairs_an_undrainable_journal_left_ahead_of_the_local_record() {
         .status()
         .clone();
     let remote = RejectResultFetch::new(&fixture.runner);
-    let dead_owner = ProcessIdentity::new(424_246, 4_242_467).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_246), 4_242_467).unwrap();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 1);
     assert_eq!(report.started_runners(), 0);
@@ -3798,7 +3798,7 @@ fn undrainable_record_write_failure_after_journal_finish_is_recovered() {
     assert!(record.fetched_head().is_none());
     assert!(transfer_for_fixture(&fixture).has_ref(&base_pin_name(&fixture)));
 
-    let dead_owner = ProcessIdentity::new(424_247, 4_242_477).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_247), 4_242_477).unwrap();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 1);
     assert_undrainable_publication_kept_the_base_pin(&store, &fixture);
@@ -3819,7 +3819,7 @@ fn undrainable_follow_up_still_imports_when_prior_fetched_head_is_present() {
     let host_success = planted.status().clone();
 
     let remote = RejectResultFetch::new(&fixture.runner);
-    let dead_owner = ProcessIdentity::new(424_248, 4_242_487).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_248), 4_242_487).unwrap();
     let (store, report) = adopt_dead_owner_and_reconcile(&fixture, &remote, dead_owner);
     assert_eq!(report.repaired_rows(), 1);
     assert!(remote.result_fetch_count() >= 1);
@@ -4231,13 +4231,13 @@ fn saturated_pool(
     fixture.state = ClientStateStore::open_with_owner_inspector(
         &fixture.paths.state,
         DeadOwnerInspector {
-            dead_owner: ProcessIdentity::new(999_999, 1).unwrap(),
+            dead_owner: ProcessIdentity::new(support::fixture_pid(999_999), 1).unwrap(),
         },
     )
     .unwrap();
     // An already reserved mini-1 turn and two separate pinned runners fill
     // the process budget. The queued mini-2 task must therefore be parked.
-    let active_owner = ProcessIdentity::new(424_241, 1).unwrap();
+    let active_owner = ProcessIdentity::new(support::fixture_pid(424_241), 1).unwrap();
     fixture
         .state
         .adopt_row(fixture.turn_id, active_owner)
@@ -4264,7 +4264,7 @@ fn saturated_pool(
         fixture,
         fixture._repo.root(),
         "mini-1",
-        &FixedTaskExecutor(ProcessIdentity::new(424_242, 2).unwrap()),
+        &FixedTaskExecutor(ProcessIdentity::new(support::fixture_pid(424_242), 2).unwrap()),
     );
     let recipient = submit_pool_task(fixture, recipient_project, "mini-2", &InlineRunnerExecutor);
     assert!(matches!(
@@ -4459,7 +4459,7 @@ fn interrupted_legacy_reassignment_recovers_from_an_unrelated_working_directory(
             .join("project.json"),
     )
     .unwrap();
-    let crashed_owner = ProcessIdentity::new(424_243, 3).unwrap();
+    let crashed_owner = ProcessIdentity::new(support::fixture_pid(424_243), 3).unwrap();
     fixture.state.adopt_row(donor.1, crashed_owner).unwrap();
     fixture
         .state
@@ -6009,7 +6009,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
     let turn_id = pending.submission_rollback_turn_id().unwrap();
     assert!(state.turn_ids_for_task(task_id).unwrap().is_empty());
 
-    let dead_owner = ProcessIdentity::new(424_242, 4_242_427).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_242), 4_242_427).unwrap();
     state
         .remove_task_turn_for_submission_rollback(turn_id)
         .unwrap();
@@ -6428,7 +6428,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
             .job_id();
         assert!(published.submission_intent_turn_id().is_none());
 
-        let dead_owner = ProcessIdentity::new(424_243, 4_242_437).unwrap();
+        let dead_owner = ProcessIdentity::new(support::fixture_pid(424_243), 4_242_437).unwrap();
         state.adopt_row(turn_id, dead_owner).unwrap();
         state.inject_submission_rollback_cleanup_failure_once(
             ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
@@ -7172,7 +7172,7 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
         ));
         release_refresh.release();
         refresh.join().unwrap().unwrap();
-        let replacement_owner = ProcessIdentity::new(999_997, 997).unwrap();
+        let replacement_owner = ProcessIdentity::new(support::fixture_pid(999_997), 997).unwrap();
         if let Some(retire) = ownership_change {
             if retire {
                 let entry = state.queue_entry(fixture.turn_id).unwrap().unwrap();
@@ -7478,7 +7478,10 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             // failed regression must never launch a real detached child.
             fixture
                 .state
-                .adopt_row(fixture.turn_id, ProcessIdentity::new(888_777, 99).unwrap())
+                .adopt_row(
+                    fixture.turn_id,
+                    ProcessIdentity::new(support::fixture_pid(888_777), 99).unwrap(),
+                )
                 .unwrap();
         }
         executor.held.lock().unwrap().take();
@@ -8202,7 +8205,7 @@ fn reconcile_does_not_restart_a_fixture_turn_while_its_post_acceptance_backoff_i
     let mut checkpoint = fixture_checkpoint(&fixture);
     checkpoint["committed"]["len"] = serde_json::json!(body.len() as u64);
     write_fixture_checkpoint(&fixture, &checkpoint);
-    let dead_owner = ProcessIdentity::new(424_246, 4_242_467).unwrap();
+    let dead_owner = ProcessIdentity::new(support::fixture_pid(424_246), 4_242_467).unwrap();
     fixture
         .state
         .record_runner(
@@ -8388,7 +8391,7 @@ fn a_runner_for_a_row_held_by_another_identity_stops_after_the_adoption_wait() {
     // process is not the detached child its parent is about to adopt; it
     // must stop with the owner mismatch instead of sleeping forever, and
     // leave the row exactly as it found it.
-    let foreign = ProcessIdentity::new(424_243, 1).unwrap();
+    let foreign = ProcessIdentity::new(support::fixture_pid(424_243), 1).unwrap();
     fixture.state.adopt_row(fixture.turn_id, foreign).unwrap();
 
     let started = std::time::Instant::now();

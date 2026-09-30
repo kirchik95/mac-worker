@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use base64::Engine;
 use mac_worker::{
     controller::{decode_frame, encode_json_frame, init::InitRequest},
@@ -236,7 +239,7 @@ impl ProcessRunner for Fake {
                     .lock()
                     .unwrap()
                     .push(body["action"].as_str().unwrap().into());
-                let mut status = json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":remote_paths()});
+                let mut status = json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":fixture_pid::fixture_pid(42),"running":true,"restart_started_at_millis":1000,"paths":remote_paths()});
                 let mut loaded = self.service_loaded.lock().unwrap();
                 if body["action"] == "install" && *loaded {
                     // An already loaded job is left running; only a restart reloads it.
@@ -270,7 +273,11 @@ impl ProcessRunner for Fake {
                     {
                         let mut record = serde_json::to_value(
                             mac_worker::controller::health::ControllerHealth::new(
-                                mac_worker::job::ProcessIdentity::new(42, 1001000).unwrap(),
+                                mac_worker::job::ProcessIdentity::new(
+                                    fixture_pid::fixture_pid(42),
+                                    1001000,
+                                )
+                                .unwrap(),
                                 1001,
                             ),
                         )
@@ -710,7 +717,9 @@ fn init_supervision_rejects_a_foreign_manual_leader() {
         "{report:?}"
     );
     assert!(
-        report.message.contains("42"),
+        report
+            .message
+            .contains(&fixture_pid::fixture_pid(42).to_string()),
         "must identify the foreign pid: {report:?}"
     );
     assert!(

@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -97,7 +100,7 @@ fn queue_record(store: &ClientStateStore, job_id: &str, at: u64) -> QueueEntry {
         WorkerPreference::Automatic,
         QueueEntryKind::Batch,
         None,
-        ProcessIdentity::new(90_000, 90_000_001).unwrap(),
+        ProcessIdentity::new(fixture_pid::fixture_pid(90_000), 90_000_001).unwrap(),
         at,
     )
     .unwrap()
@@ -1299,13 +1302,19 @@ fn observations_use_status_transitions_for_same_state_enrichment() {
         .update_observation(original.meta().job_id(), accepted.clone())
         .unwrap();
     let supervised = accepted
-        .with_supervisor(ProcessIdentity::new(10, 100).unwrap(), 2_001)
+        .with_supervisor(
+            ProcessIdentity::new(fixture_pid::fixture_pid(10), 100).unwrap(),
+            2_001,
+        )
         .unwrap();
     store
         .update_observation(original.meta().job_id(), supervised.clone())
         .unwrap();
     let child_bound = supervised
-        .with_child(ProcessIdentity::new(11, 101).unwrap(), 2_002)
+        .with_child(
+            ProcessIdentity::new(fixture_pid::fixture_pid(11), 101).unwrap(),
+            2_002,
+        )
         .unwrap();
     store
         .update_observation(original.meta().job_id(), child_bound.clone())
@@ -1320,7 +1329,10 @@ fn observations_use_status_transitions_for_same_state_enrichment() {
 
     let replaced_identity = JobStatus::accepted(2_000)
         .unwrap()
-        .with_supervisor(ProcessIdentity::new(20, 200).unwrap(), 2_003)
+        .with_supervisor(
+            ProcessIdentity::new(fixture_pid::fixture_pid(20), 200).unwrap(),
+            2_003,
+        )
         .unwrap();
     assert!(
         store
@@ -1339,7 +1351,10 @@ fn skipped_observations_require_sticky_identities_and_terminal_outcomes() {
     store.create_job(original.clone()).unwrap();
     let accepted = JobStatus::accepted(2_000)
         .unwrap()
-        .with_supervisor(ProcessIdentity::new(10, 100).unwrap(), 2_001)
+        .with_supervisor(
+            ProcessIdentity::new(fixture_pid::fixture_pid(10), 100).unwrap(),
+            2_001,
+        )
         .unwrap();
     store
         .update_observation(original.meta().job_id(), accepted.clone())
@@ -1348,7 +1363,7 @@ fn skipped_observations_require_sticky_identities_and_terminal_outcomes() {
     let skipped_terminal = JobStatus::new(
         JobState::Succeeded,
         3_000,
-        Some(10),
+        Some(fixture_pid::fixture_pid(10)),
         Some(100),
         None,
         None,
@@ -1373,7 +1388,7 @@ fn skipped_observations_require_sticky_identities_and_terminal_outcomes() {
     let rewritten_outcome = JobStatus::new(
         JobState::Failed,
         3_002,
-        Some(10),
+        Some(fixture_pid::fixture_pid(10)),
         Some(100),
         None,
         None,
@@ -1755,7 +1770,7 @@ fn queue_update_crash_after_publication_is_a_complete_canonical_replacement() {
     let fixture = tempfile::tempdir().unwrap();
     let state = temp_root(&fixture).join("state");
     let store = ClientStateStore::open(&state).unwrap();
-    let dispatcher = ProcessIdentity::new(90_000, 90_000_001).unwrap();
+    let dispatcher = ProcessIdentity::new(fixture_pid::fixture_pid(90_000), 90_000_001).unwrap();
     store
         .enqueue(queue_record(
             &store,

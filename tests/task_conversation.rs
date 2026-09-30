@@ -640,7 +640,7 @@ fn local_wait_held_lock(relative_lock: &str) {
     let store = ClientStateStore::open_with_owner_inspector(&paths.state, LiveOwners).unwrap();
     let task_id = TaskId::generate();
     let turn_id = JobId::generate();
-    let owner = ProcessIdentity::new(777_111, 777_111_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(777_111), 777_111_007).unwrap();
     let record = task_record(
         task_id,
         turn_id,
@@ -913,7 +913,8 @@ impl Fixture {
     }
 }
 
-fn owner(pid: u32) -> ProcessIdentity {
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = support::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
 }
 

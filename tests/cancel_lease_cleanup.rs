@@ -34,7 +34,10 @@ impl TestSchedulerRuntime {
     fn new(now_millis: u64, owner_seed: u32) -> Self {
         Self {
             now_millis: AtomicU64::new(now_millis),
-            owner: ProcessIdentity::new(owner_seed, u64::from(owner_seed) * 10_000 + 7).unwrap(),
+            owner: {
+                let pid = support::fixture_pid(owner_seed);
+                ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+            },
             sleeps: Mutex::new(Vec::new()),
         }
     }
@@ -113,7 +116,7 @@ fn assert_no_host_lease(temp: &tempfile::TempDir) {
 fn cancel_waiting_row_leaves_no_lease_and_no_remote_work() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
-    let owner = ProcessIdentity::new(91_001, 910_010_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(91_001), 910_010_007).unwrap();
     let entry = queued_entry(&store, 91_001, owner, 1);
     let job_id = entry.job_id();
     store.enqueue(entry).unwrap();
@@ -137,7 +140,7 @@ fn cancel_waiting_row_leaves_no_lease_and_no_remote_work() {
 fn cancel_dispatching_row_requests_cancel_without_acquiring_or_releasing_a_lease() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
-    let owner = ProcessIdentity::new(91_101, 911_010_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(91_101), 911_010_007).unwrap();
     let entry = queued_entry(&store, 91_101, owner, 1);
     let job_id = entry.job_id();
     store.enqueue(entry).unwrap();
@@ -179,7 +182,7 @@ fn cancel_dispatching_row_requests_cancel_without_acquiring_or_releasing_a_lease
 fn cancel_waiting_then_cancel_again_stays_local_and_lease_free() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
-    let owner = ProcessIdentity::new(91_201, 912_010_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(91_201), 912_010_007).unwrap();
     let entry = queued_entry(&store, 91_201, owner, 1);
     let job_id = entry.job_id();
     store.enqueue(entry).unwrap();

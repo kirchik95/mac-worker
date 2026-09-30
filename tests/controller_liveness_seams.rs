@@ -1,6 +1,9 @@
 //! Slot occupancy and DAG claim occupy until a positive `Exited` verdict.
 //! First `Absent` is Unverifiable; only confirmed absence or `Reused` releases.
 
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -75,7 +78,8 @@ impl ProcessInspector for MappedInspector {
     }
 }
 
-fn owner(pid: u32) -> ProcessIdentity {
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
 }
 

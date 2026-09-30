@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -762,7 +765,7 @@ impl SupervisorLauncher for CapturedPreidentityLauncher {
         *self.held.lock().unwrap() = Some(guard);
         self.entered.send(()).unwrap();
         Ok(LaunchCandidate::new(
-            ProcessIdentity::new(99_001, 9_900_001).unwrap(),
+            ProcessIdentity::new(fixture_pid::fixture_pid(99_001), 9_900_001).unwrap(),
         ))
     }
 }
@@ -916,8 +919,8 @@ fn assert_protocol_code(error: WorkerError, expected: &str) {
 
 #[test]
 fn status_enrichment_and_terminal_outcomes_preserve_sticky_process_identities() {
-    let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
-    let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+    let supervisor = ProcessIdentity::new(fixture_pid::fixture_pid(101), 1_000_001).unwrap();
+    let child = ProcessIdentity::new(fixture_pid::fixture_pid(202), 2_000_002).unwrap();
 
     let accepted = JobStatus::accepted(10).unwrap();
     let supervised = accepted.with_supervisor(supervisor, 11).unwrap();
@@ -942,8 +945,8 @@ fn status_enrichment_and_terminal_outcomes_preserve_sticky_process_identities() 
 
 #[test]
 fn status_rejects_inconsistent_signal_identity_and_cleanup_shapes() {
-    let supervisor = ProcessIdentity::new(101, 1_000_001).unwrap();
-    let child = ProcessIdentity::new(202, 2_000_002).unwrap();
+    let supervisor = ProcessIdentity::new(fixture_pid::fixture_pid(101), 1_000_001).unwrap();
+    let child = ProcessIdentity::new(fixture_pid::fixture_pid(202), 2_000_002).unwrap();
     let running = JobStatus::accepted(10)
         .unwrap()
         .with_supervisor(supervisor, 11)
@@ -1073,7 +1076,7 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
     let launches = Arc::new(AtomicUsize::new(0));
-    let identity = ProcessIdentity::new(41_001, 4_100_001).unwrap();
+    let identity = ProcessIdentity::new(fixture_pid::fixture_pid(41_001), 4_100_001).unwrap();
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job_path.clone(),
@@ -1121,13 +1124,13 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
 fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted() {
     let temp = tempfile::tempdir().unwrap();
     let (store, lease, request) = prepared_host(&temp.path().join("host"));
-    let supervisor = ProcessIdentity::new(41_101, 4_110_001).unwrap();
+    let supervisor = ProcessIdentity::new(fixture_pid::fixture_pid(41_101), 4_110_001).unwrap();
     let launcher = PrelaunchTerminalLauncher {
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
         supervisor,
-        child: ProcessIdentity::new(41_102, 4_110_002).unwrap(),
+        child: ProcessIdentity::new(fixture_pid::fixture_pid(41_102), 4_110_002).unwrap(),
     };
 
     let service = JobService::new(&store, &launcher);
@@ -1267,7 +1270,7 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
-        identity: ProcessIdentity::new(41_002, 4_100_002).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_002), 4_100_002).unwrap(),
     };
     let changed = SubmitRequest::new(
         RequestFingerprintMaterial::new(
@@ -1309,7 +1312,7 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
                 abandoned_lease.job_id(),
             )
             .unwrap(),
-        identity: ProcessIdentity::new(41_003, 4_100_003).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_003), 4_100_003).unwrap(),
     };
     let error = JobService::new(&abandoned_store, &abandoned_launcher)
         .submit_at(abandoned_request, 4)
@@ -1342,7 +1345,7 @@ fn submit_treats_a_mismatched_same_job_abandonment_as_a_conflict() {
         job_path: store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap(),
-        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_004), 4_100_004).unwrap(),
     };
 
     let error = JobService::new(&store, &launcher)
@@ -1368,7 +1371,7 @@ fn submit_repairs_a_complete_final_job_after_crash_before_index() {
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job_path.clone(),
-        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_004), 4_100_004).unwrap(),
     };
     let error = JobService::new(&faulted, &launcher)
         .submit_at(request.clone(), 3)
@@ -1383,14 +1386,14 @@ fn submit_repairs_a_complete_final_job_after_crash_before_index() {
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path,
-        identity: ProcessIdentity::new(41_004, 4_100_004).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_004), 4_100_004).unwrap(),
     };
     let repaired = JobService::new(&reopened, &launcher)
         .submit_at(request, 4)
         .unwrap();
     assert_eq!(
         repaired.status().supervisor_identity(),
-        Some(ProcessIdentity::new(41_004, 4_100_004).unwrap())
+        Some(ProcessIdentity::new(fixture_pid::fixture_pid(41_004), 4_100_004).unwrap())
     );
     assert!(reopened.job_index(lease.job_id()).unwrap().is_file());
     assert_eq!(launches.load(Ordering::SeqCst), 1);
@@ -1867,7 +1870,7 @@ fn unindexed_final_with_corrupt_workspace_is_preserved_and_never_repaired_or_lau
     let first_launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job.clone(),
-        identity: ProcessIdentity::new(41_104, 4_110_004).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_104), 4_110_004).unwrap(),
     };
     assert!(
         JobService::new(&faulted, &first_launcher)
@@ -1882,7 +1885,7 @@ fn unindexed_final_with_corrupt_workspace_is_preserved_and_never_repaired_or_lau
     let retry_launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job.clone(),
-        identity: ProcessIdentity::new(41_105, 4_110_005).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_105), 4_110_005).unwrap(),
     };
     let error = JobService::new(&reopened, &retry_launcher)
         .submit_at(request, 4)
@@ -1987,7 +1990,7 @@ fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched(
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job_path.clone(),
-        identity: ProcessIdentity::new(41_005, 4_100_005).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_005), 4_100_005).unwrap(),
     };
 
     let error = JobService::new(&store, &launcher)
@@ -2013,7 +2016,7 @@ fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
         job_path: job_path.clone(),
-        identity: ProcessIdentity::new(41_006, 4_100_006).unwrap(),
+        identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_006), 4_100_006).unwrap(),
     };
     let service = JobService::new(&store, &launcher);
     let barrier = Arc::new(Barrier::new(100));
@@ -2034,7 +2037,7 @@ fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
             let response = handle.join().unwrap();
             assert_eq!(
                 response.status().supervisor_identity(),
-                Some(ProcessIdentity::new(41_006, 4_100_006).unwrap())
+                Some(ProcessIdentity::new(fixture_pid::fixture_pid(41_006), 4_100_006).unwrap())
             );
         }
     });

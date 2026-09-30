@@ -193,7 +193,8 @@ fn sample_record() -> LocalTaskRecord {
         sample_status(),
         None,
         Some(RunnerIdentity::new(
-            ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process"),
+            ProcessIdentity::new(support::fixture_pid(42), 1_700_000_000_001)
+                .expect("fixture process"),
         )),
         None,
         REPO_ID.to_owned(),
@@ -615,11 +616,11 @@ fn explicit_title_wins_and_derived_titles_are_redacted() {
 
 #[test]
 fn runner_identity_wraps_process_identity() {
-    let process = ProcessIdentity::new(9, 11).unwrap();
+    let process = ProcessIdentity::new(support::fixture_pid(9), 11).unwrap();
     let runner = RunnerIdentity::new(process);
     assert_eq!(runner.process_identity(), process);
     let json = serde_json::to_value(&runner).unwrap();
-    assert_eq!(json["pid"], 9);
+    assert_eq!(json["pid"], support::fixture_pid(9));
     assert_eq!(json["start_time_micros"], 11);
 }
 

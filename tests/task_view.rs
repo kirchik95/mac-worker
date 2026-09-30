@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
@@ -164,7 +167,8 @@ fn active_record() -> LocalTaskRecord {
         status,
         None,
         Some(RunnerIdentity::new(
-            ProcessIdentity::new(42, 1_700_000_000_001).expect("valid process identity"),
+            ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_700_000_000_001)
+                .expect("valid process identity"),
         )),
         None,
         REPO_ID.into(),
@@ -530,7 +534,7 @@ fn blocking_code_for_queued_requirement(
                 WorkerPreference::Automatic,
                 QueueEntryKind::TaskTurn,
                 None,
-                ProcessIdentity::new(42, 1_700_000_000_001).unwrap(),
+                ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_700_000_000_001).unwrap(),
                 now,
             )
             .unwrap(),

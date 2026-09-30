@@ -157,7 +157,7 @@ fn base_oid() -> BaseOid {
 }
 
 fn dead_owner() -> ProcessIdentity {
-    ProcessIdentity::new(424_244, 4_242_447).unwrap()
+    ProcessIdentity::new(support::fixture_pid(424_244), 4_242_447).unwrap()
 }
 
 struct DeadOwnerReusedInspector {

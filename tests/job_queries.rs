@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{CString, OsStr, OsString},
@@ -9176,6 +9179,7 @@ fn assert_after_ambiguous_grace(error: &mac_worker::error::WorkerError, context:
 }
 
 #[allow(dead_code)]
-fn identity(pid: u32) -> ProcessIdentity {
+fn identity(seed: u32) -> ProcessIdentity {
+    let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 1_000).unwrap()
 }

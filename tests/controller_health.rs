@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use mac_worker::{
     controller::{
         ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
@@ -73,7 +76,10 @@ fn repeated_failures_are_counted_without_hiding_neighbor_progress() {
     let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
     publish(&store, BAD);
     publish(&store, GOOD);
-    let mut health = ControllerHealth::new(ProcessIdentity::new(42, 1).unwrap(), 100);
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(fixture_pid::fixture_pid(42), 1).unwrap(),
+        100,
+    );
     for end in [200, 300] {
         let report = ControllerTickReport::collect(
             &store,
@@ -108,7 +114,10 @@ fn health_persistence_is_atomic_private_and_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("controller");
     let store = HealthStore::open(&path).unwrap();
-    let mut health = ControllerHealth::new(ProcessIdentity::new(42, 1).unwrap(), 100);
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(fixture_pid::fixture_pid(42), 1).unwrap(),
+        100,
+    );
     store.write(&health).unwrap();
     let held = std::fs::File::open(path.join("health.json")).unwrap();
     for i in 0..1_000 {
@@ -159,7 +168,10 @@ fn failure_logging_is_rate_limited_but_counts_every_tick() {
         controller::health::{ControllerHealth, HealthLogger},
         job::ProcessIdentity,
     };
-    let mut health = ControllerHealth::new(ProcessIdentity::new(42, 1).unwrap(), 100);
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(fixture_pid::fixture_pid(42), 1).unwrap(),
+        100,
+    );
     let mut logger = HealthLogger::default();
     health.record_failure("CONTROLLER_TRANSPORT", 200);
     let first = logger.failure_line(&health, 200).unwrap();

@@ -119,7 +119,8 @@ impl ProcessInspector for MappedInspector {
     }
 }
 
-fn owner(pid: u32) -> ProcessIdentity {
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = support::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
 }
 
@@ -1846,10 +1847,10 @@ fn plant_closed_done_import(
     result_oid: mac_worker::task::BaseOid,
 ) {
     if let Some(entry) = store.queue_entry_for_task_turn(task_id).unwrap() {
-        let owner = entry
-            .owner_opt()
-            .copied()
-            .unwrap_or_else(|| owner(std::process::id()));
+        let owner = entry.owner_opt().copied().unwrap_or_else(|| {
+            let pid = std::process::id();
+            ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+        });
         store.record_runner(task_id, None).unwrap();
         store
             .remove_task_turn_after_terminal(entry.job_id(), owner)
@@ -1903,10 +1904,10 @@ fn plant_parent_status(
     terminal: TurnTerminal,
 ) {
     if let Some(entry) = store.queue_entry_for_task_turn(task_id).unwrap() {
-        let owner = entry
-            .owner_opt()
-            .copied()
-            .unwrap_or_else(|| owner(std::process::id()));
+        let owner = entry.owner_opt().copied().unwrap_or_else(|| {
+            let pid = std::process::id();
+            ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+        });
         store.record_runner(task_id, None).unwrap();
         store
             .remove_task_turn_after_terminal(entry.job_id(), owner)

@@ -185,7 +185,10 @@ impl TestSchedulerRuntime {
     fn new(now_millis: u64, owner_seed: u32) -> Self {
         Self {
             now_millis: AtomicU64::new(now_millis),
-            owner: ProcessIdentity::new(owner_seed, u64::from(owner_seed) * 10_000 + 7).unwrap(),
+            owner: {
+                let pid = support::fixture_pid(owner_seed);
+                ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+            },
             sleeps: Mutex::new(Vec::new()),
         }
     }
@@ -222,7 +225,10 @@ impl FailingSchedulerRuntime {
         Self {
             calls: AtomicUsize::new(0),
             fail_on_call,
-            owner: ProcessIdentity::new(owner_seed, u64::from(owner_seed) * 10_000 + 7).unwrap(),
+            owner: {
+                let pid = support::fixture_pid(owner_seed);
+                ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
+            },
         }
     }
 }
@@ -998,7 +1004,7 @@ fn status_without_id_lists_waiting_queue_rows_with_jobs() {
                 WorkerPreference::Automatic,
                 QueueEntryKind::Batch,
                 None,
-                ProcessIdentity::new(77_001, 770_010_007).unwrap(),
+                ProcessIdentity::new(support::fixture_pid(77_001), 770_010_007).unwrap(),
                 1_000,
             )
             .unwrap(),
@@ -1895,10 +1901,16 @@ fn status_refresh_preserves_each_valid_accepted_identity_enrichment_step() {
         let store = state_store(&temp);
         let bare = JobStatus::accepted(101).unwrap();
         let supervisor = bare
-            .with_supervisor(ProcessIdentity::new(11, 12).unwrap(), 150)
+            .with_supervisor(
+                ProcessIdentity::new(support::fixture_pid(11), 12).unwrap(),
+                150,
+            )
             .unwrap();
         let child = supervisor
-            .with_child(ProcessIdentity::new(13, 14).unwrap(), 200)
+            .with_child(
+                ProcessIdentity::new(support::fixture_pid(13), 14).unwrap(),
+                200,
+            )
             .unwrap();
         let initial = if observed_step == "direct_child" {
             supervisor.clone()
@@ -2285,7 +2297,10 @@ fn status_exact_reconciles_a_current_at_least_remote_update_queued_before_the_ca
     let store = state_store(&temp);
     let bare = JobStatus::accepted(101).unwrap();
     let concurrent = bare
-        .with_supervisor(ProcessIdentity::new(11, 12).unwrap(), 150)
+        .with_supervisor(
+            ProcessIdentity::new(support::fixture_pid(11), 12).unwrap(),
+            150,
+        )
         .unwrap();
     let target = test_record(
         &store,
@@ -2370,10 +2385,16 @@ fn status_list_advances_a_compatible_intermediate_update_queued_before_the_cas()
     let store = state_store(&temp);
     let bare = JobStatus::accepted(101).unwrap();
     let intermediate = bare
-        .with_supervisor(ProcessIdentity::new(31, 32).unwrap(), 150)
+        .with_supervisor(
+            ProcessIdentity::new(support::fixture_pid(31), 32).unwrap(),
+            150,
+        )
         .unwrap();
     let remote_status = intermediate
-        .with_child(ProcessIdentity::new(33, 34).unwrap(), 200)
+        .with_child(
+            ProcessIdentity::new(support::fixture_pid(33), 34).unwrap(),
+            200,
+        )
         .unwrap();
     let target = test_record(
         &store,
@@ -4046,7 +4067,7 @@ fn cancel_removes_waiting_entry_without_ssh_or_snapshot() {
                 WorkerPreference::Automatic,
                 QueueEntryKind::Batch,
                 None,
-                ProcessIdentity::new(90_001, 900_010_007).unwrap(),
+                ProcessIdentity::new(support::fixture_pid(90_001), 900_010_007).unwrap(),
                 1,
             )
             .unwrap(),
@@ -5079,7 +5100,7 @@ fn dispatch_cancel_with_a_durable_record_reports_remote_never_queued() {
         RemoteUncertainty::None,
     );
     store.create_job(record.clone()).unwrap();
-    let owner = ProcessIdentity::new(90_204, 902_040_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(90_204), 902_040_007).unwrap();
     store
         .enqueue(
             QueueEntry::new(
@@ -5143,7 +5164,7 @@ fn dispatch_cancel_without_a_record_waits_boundedly_and_never_reports_queued() {
     let temp = tempfile::tempdir().unwrap();
     let store = state_store(&temp);
     let job_id = JobId::new(uuid::Uuid::from_u128(90_105));
-    let owner = ProcessIdentity::new(90_205, 902_050_007).unwrap();
+    let owner = ProcessIdentity::new(support::fixture_pid(90_205), 902_050_007).unwrap();
     store
         .enqueue(
             QueueEntry::new(
@@ -5262,7 +5283,7 @@ fn no_wait_claim_loss_removes_only_the_new_waiting_row() {
                 },
                 QueueEntryKind::Batch,
                 None,
-                ProcessIdentity::new(802, 8_020_007).unwrap(),
+                ProcessIdentity::new(support::fixture_pid(802), 8_020_007).unwrap(),
                 59_000,
             )
             .unwrap(),
@@ -5621,7 +5642,7 @@ fn older_live_pin_wins_its_worker_without_blocking_another_worker() {
                 },
                 QueueEntryKind::Batch,
                 None,
-                ProcessIdentity::new(801, 8_010_007).unwrap(),
+                ProcessIdentity::new(support::fixture_pid(801), 8_010_007).unwrap(),
                 49_000,
             )
             .unwrap(),

@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 #[path = "support/task_state.rs"]
 mod task_state_fixture;
 use task_state_fixture::TaskStateFixture;
@@ -137,7 +140,8 @@ fn remote_status_failure_keeps_a_stale_row_and_dead_runner() {
     let harness = DashboardTaskHarness::active_local_task()
         .with_runner_liveness(Some(RunnerState::Dead))
         .with_remote_failure("SSH_UNAVAILABLE");
-    let runner = mac_worker::job::ProcessIdentity::new(2_000_000_000, 1).unwrap();
+    let runner =
+        mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(2_000_000_000), 1).unwrap();
     assert_eq!(
         harness.state.runner_liveness(harness.task_id()).unwrap(),
         Some(RunnerState::Live),
@@ -1009,7 +1013,8 @@ impl QueueHarness {
             .write_turn_prompt(queued, task_turn_id, SECRET)
             .unwrap();
 
-        let owner = mac_worker::job::ProcessIdentity::new(42, 1_000).unwrap();
+        let owner =
+            mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_000).unwrap();
         state
             .enqueue(
                 QueueEntry::new(
@@ -1326,7 +1331,10 @@ fn task_record(
         status,
         None,
         with_runner.then(|| {
-            RunnerIdentity::new(mac_worker::job::ProcessIdentity::new(2_000_000_000, 1).unwrap())
+            RunnerIdentity::new(
+                mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(2_000_000_000), 1)
+                    .unwrap(),
+            )
         }),
         None,
         REPO_ID.into(),

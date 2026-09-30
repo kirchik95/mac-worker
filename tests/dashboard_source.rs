@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -819,7 +822,11 @@ fn queue_entry(
         preference,
         QueueEntryKind::Batch,
         None,
-        ProcessIdentity::new(10_000 + id as u32, 100_000 + id as u64).unwrap(),
+        ProcessIdentity::new(
+            fixture_pid::fixture_pid(10_000 + id as u32),
+            100_000 + id as u64,
+        )
+        .unwrap(),
         enqueued_at_millis,
     )
     .unwrap()

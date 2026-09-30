@@ -360,7 +360,7 @@ fn plant(script: Script) -> Fixture {
         .write_task_project_path(&record, &project.context.root)
         .unwrap();
     let owner = if script == Script::Idle {
-        ProcessIdentity::new(1, 1).unwrap()
+        ProcessIdentity::new(support::fixture_pid(1), 1).unwrap()
     } else {
         dispatching_turn(&store, turn_id, &project)
     };

@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use mac_worker::{
     job::{
         CommandSpec, CommandSummary, HostControlError, JobId, JobMeta, JobState, JobStatus,
@@ -407,10 +410,16 @@ fn material_rejects_noncanonical_identifiers_and_duplicate_json_fields() {
 fn status_requires_process_identities_for_running_terminal_lengths_and_monotonic_time() {
     let accepted = JobStatus::accepted(100).unwrap();
     let supervised = accepted
-        .with_supervisor(ProcessIdentity::new(10, 11).unwrap(), 100)
+        .with_supervisor(
+            ProcessIdentity::new(fixture_pid::fixture_pid(10), 11).unwrap(),
+            100,
+        )
         .unwrap();
     let ready = supervised
-        .with_child(ProcessIdentity::new(20, 21).unwrap(), 101)
+        .with_child(
+            ProcessIdentity::new(fixture_pid::fixture_pid(20), 21).unwrap(),
+            101,
+        )
         .unwrap();
     let running = ready.into_running(101).unwrap();
     assert!(

@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -3090,7 +3093,8 @@ impl ProcessRunner for SetupControllerHealth<'_> {
             .unwrap();
             let mut health =
                 serde_json::to_value(mac_worker::controller::health::ControllerHealth::new(
-                    mac_worker::job::ProcessIdentity::new(42, 1001000).unwrap(),
+                    mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(42), 1001000)
+                        .unwrap(),
                     1001,
                 ))
                 .unwrap();
@@ -3111,7 +3115,7 @@ fn setup_service_paths() -> serde_json::Value {
 }
 
 fn restarted_controller_service() -> ProcessResult {
-    let status: mac_worker::controller::service::ServiceStatus = serde_json::from_value(serde_json::json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":42,"running":true,"restart_started_at_millis":1000,"paths":setup_service_paths()})).unwrap();
+    let status: mac_worker::controller::service::ServiceStatus = serde_json::from_value(serde_json::json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":fixture_pid::fixture_pid(42),"running":true,"restart_started_at_millis":1000,"paths":setup_service_paths()})).unwrap();
     result(0, serde_json::to_vec(&status).unwrap(), b"")
 }
 

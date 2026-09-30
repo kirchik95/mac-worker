@@ -108,7 +108,7 @@ impl RunnerExecutor for CountingExecutor {
     ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(mac_worker::task::RunnerIdentity::new(ProcessIdentity::new(
-            2_000_000_011,
+            support::fixture_pid(2_000_000_011),
             9_999_999,
         )?))
     }

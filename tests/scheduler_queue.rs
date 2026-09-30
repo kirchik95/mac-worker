@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
@@ -228,7 +231,8 @@ where
     }
 }
 
-fn owner(pid: u32) -> ProcessIdentity {
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).unwrap()
 }
 

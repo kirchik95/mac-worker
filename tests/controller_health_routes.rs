@@ -130,7 +130,10 @@ fn old_health_is_stale_even_when_the_process_identity_matches() {
         job::ProcessIdentity,
         supervisor::ProcessObservation,
     };
-    let mut health = ControllerHealth::new(ProcessIdentity::new(42, 1).unwrap(), 1);
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(support::fixture_pid(42), 1).unwrap(),
+        1,
+    );
     health.last_tick_start_millis = Some(100);
     health.last_tick_end_millis = Some(200);
     health.last_success_millis = Some(200);
@@ -151,7 +154,10 @@ fn ambiguous_identity_never_becomes_a_dead_leader() {
         job::ProcessIdentity,
         supervisor::ProcessObservation,
     };
-    let health = ControllerHealth::new(ProcessIdentity::new(42, 1).unwrap(), 100);
+    let health = ControllerHealth::new(
+        ProcessIdentity::new(support::fixture_pid(42), 1).unwrap(),
+        100,
+    );
     let unknown = assess_health(Some(health.clone()), ProcessObservation::Ambiguous, 200);
     assert_eq!(unknown.state, HealthState::Unknown);
     assert_eq!(unknown.leader_running, None);

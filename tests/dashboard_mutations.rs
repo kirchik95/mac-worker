@@ -197,7 +197,10 @@ impl RunnerExecutor for RecordingExecutor {
     ) -> Result<RunnerIdentity, WorkerError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         *self.last.lock().unwrap() = Some((task_id, turn_id));
-        Ok(RunnerIdentity::new(ProcessIdentity::new(2_000_000_001, 1)?))
+        Ok(RunnerIdentity::new(ProcessIdentity::new(
+            support::fixture_pid(2_000_000_001),
+            1,
+        )?))
     }
 }
 
@@ -451,7 +454,7 @@ fn reply_starts_exactly_one_detached_follow_up_without_chdir() {
     assert_eq!(current.status().state(), TaskState::Active);
     assert_eq!(
         current.runner().unwrap().process_identity().pid(),
-        2_000_000_001
+        support::fixture_pid(2_000_000_001)
     );
     assert_eq!(detail.task.turn_count, 2);
 }

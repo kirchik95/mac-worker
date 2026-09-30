@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 #[path = "support/task_state.rs"]
 mod task_state_fixture;
 use task_state_fixture::TaskStateFixture;
@@ -75,7 +78,8 @@ fn open_live_store() -> (tempfile::TempDir, ClientStateStore, PathBuf) {
     (dir, store, state_path)
 }
 
-fn live_identity(pid: u32) -> ProcessIdentity {
+fn live_identity(seed: u32) -> ProcessIdentity {
+    let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7).expect("fixture live identity")
 }
 
@@ -130,7 +134,10 @@ fn record_with_id(n: u128, state: TaskState, runner: bool) -> LocalTaskRecord {
     )
     .expect("fixture status");
     let runner = runner.then(|| {
-        RunnerIdentity::new(ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process"))
+        RunnerIdentity::new(
+            ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_700_000_000_001)
+                .expect("fixture process"),
+        )
     });
     LocalTaskRecord::new(
         meta,
@@ -161,7 +168,7 @@ fn task_path(state: &Path, task_id: TaskId) -> PathBuf {
 }
 
 fn queue_owner() -> ProcessIdentity {
-    ProcessIdentity::new(90_000, 90_000_001).expect("fixture queue owner")
+    ProcessIdentity::new(fixture_pid::fixture_pid(90_000), 90_000_001).expect("fixture queue owner")
 }
 
 fn enqueue_task_turn(store: &ClientStateStore, record: &LocalTaskRecord) {
@@ -244,7 +251,10 @@ fn record_in_run(n: u128, state: TaskState, runner: bool, run_id: TaskRunId) -> 
     )
     .expect("fixture status");
     let runner = runner.then(|| {
-        RunnerIdentity::new(ProcessIdentity::new(42, 1_700_000_000_001).expect("fixture process"))
+        RunnerIdentity::new(
+            ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_700_000_000_001)
+                .expect("fixture process"),
+        )
     });
     LocalTaskRecord::new(
         meta,
@@ -406,7 +416,8 @@ fn quiescent_update_retires_and_stale_cas_cannot_drop_an_active_winner() {
     let still_active = winner
         .clone()
         .with_runner(Some(RunnerIdentity::new(
-            ProcessIdentity::new(43, 1_700_000_000_002).expect("fixture process"),
+            ProcessIdentity::new(fixture_pid::fixture_pid(43), 1_700_000_000_002)
+                .expect("fixture process"),
         )))
         .unwrap();
     assert!(

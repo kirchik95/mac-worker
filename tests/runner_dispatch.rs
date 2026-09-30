@@ -1,3 +1,6 @@
+#[path = "support/fixture_pid.rs"]
+mod fixture_pid;
+
 #[path = "support/task_state.rs"]
 mod task_state_fixture;
 use task_state_fixture::TaskStateFixture;
@@ -26,7 +29,7 @@ use uuid::Uuid;
 struct LiveOwners;
 impl ProcessInspector for LiveOwners {
     fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
-        Ok(owner(pid))
+        ProcessIdentity::new(pid, u64::from(pid) * 1000 + 1)
     }
     fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
         ProcessObservation::Matching {
@@ -41,7 +44,8 @@ impl ProcessInspector for LiveOwners {
     }
 }
 
-fn owner(pid: u32) -> ProcessIdentity {
+fn owner(seed: u32) -> ProcessIdentity {
+    let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 1000 + 1).unwrap()
 }
 fn pin(worker: &str) -> WorkerPreference {
