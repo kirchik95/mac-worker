@@ -170,15 +170,13 @@ mod policy {
                 }
                 facts.push(done_facts(task_id, turn_id));
             }
-            let mut seq = 2_u64;
-            for chunk in facts.chunks(MAX_RECONCILIATION_ROWS) {
+            for (offset, chunk) in facts.chunks(MAX_RECONCILIATION_ROWS).enumerate() {
                 let result = warm_complete(
                     self.journal_id,
-                    seq,
+                    2 + offset as u64,
                     chunk.iter().cloned().map(change).collect(),
                     chunk.to_vec(),
                 );
-                seq += 1;
                 result.validate().expect("decision chunk");
                 self.consume(result, NotifyOptions::default());
             }
@@ -215,17 +213,15 @@ mod policy {
                 quiet: true,
                 ..NotifyOptions::default()
             };
-            let mut seq = 100_u64;
             let chunks: Vec<_> = facts.chunks(MAX_RECONCILIATION_ROWS).collect();
             let last = chunks.len() - 1;
             for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut result = warm_complete(
                     self.journal_id,
-                    seq,
+                    100 + index as u64,
                     chunk.iter().cloned().map(change).collect(),
                     chunk.to_vec(),
                 );
-                seq += 1;
                 if index == last {
                     result.repair = RepairProgress::Complete;
                     result.repair_needed = false;
