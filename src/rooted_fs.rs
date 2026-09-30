@@ -8322,9 +8322,19 @@ fn resolve_bound_cleanup(
                 Err(error) => return Err(error),
             }
         }
-        if let Some(candidate) =
-            find_unpublished_cleanup_bootstrap(namespace, public_parent, parent, component)?
-        {
+        let candidate =
+            match find_unpublished_cleanup_bootstrap(namespace, public_parent, parent, component) {
+                Ok(candidate) => candidate,
+                Err(error) if cleanup_is_retryable_race(&error) => {
+                    // A peer may publish or retire the bootstrap after the intent
+                    // lookup. Recheck under the original target/generation fence;
+                    // never start over from the possibly replaced public name.
+                    last_race = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if let Some(candidate) = candidate {
             if candidate.kind != kind
                 || candidate.target != target
                 || candidate.original_mode != original_mode
@@ -17206,6 +17216,75 @@ mod tests {
             }
             assert_leaderless_retrier_converges_after_peer_progress_fault(
                 &physical, &root_path, progress,
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_bootstrap_lookup_can_race_peer_retirement() {
+        let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+        interrupt_owned_child_tree_cleanup(
+            &physical,
+            CleanupFault::AfterCleanupBootstrap(libc::EIO),
+        );
+        let parent = RootedDir::open(&physical).unwrap();
+        let parent_metadata = super::stat_fd(parent.root.as_raw_fd()).unwrap();
+        let parent_identity = super::FileIdentity::from_stat(&parent_metadata);
+        let namespace = PrivateNamespace::select_for_cleanup(
+            parent.root.as_raw_fd(),
+            parent_metadata.st_dev,
+            &[],
+        )
+        .unwrap();
+        let key = super::cleanup_key(parent_identity, b"root");
+        let slots = super::cleanup_bootstrap_slots(&namespace, &key).unwrap();
+        assert_eq!(slots.len(), 1);
+        let (name, parsed) = &slots[0];
+        let (operation, operation_identity) =
+            super::open_cleanup_bootstrap_directory(&namespace, name, parsed).unwrap();
+
+        // Pause the lookup after opening its bootstrap. An independent retrier
+        // completes before that lookup validates the public component.
+        RootedDir::open(&physical)
+            .unwrap()
+            .remove_owned_child("root")
+            .unwrap();
+        assert!(!root_path.exists());
+        let error = super::validate_unpublished_cleanup_bootstrap_opened(
+            &namespace,
+            parent.root.as_raw_fd(),
+            parent_identity,
+            name,
+            parsed,
+            &operation,
+            operation_identity,
+        )
+        .err()
+        .expect("the peer retired the lookup's public component");
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+    }
+
+    #[test]
+    fn cleanup_bound_retrier_rechecks_after_a_bootstrap_lookup_race() {
+        // A peer can retire or publish the bootstrap between the canonical
+        // intent lookup and the unpublished-bootstrap lookup. The bound call
+        // must recheck its original generation and the terminal postcondition.
+        for errno in [libc::ENOENT, libc::EAGAIN, libc::ESTALE] {
+            let (_fixture, physical, root_path) = owned_child_tree_cleanup_fixture();
+            let parent = RootedDir::open(&physical).unwrap();
+            let _fault = CleanupFaultOverride::set(
+                CleanupFault::AfterFindUnpublishedCleanupBootstrap(errno),
+            );
+            parent
+                .remove_owned_child("root")
+                .unwrap_or_else(|error| panic!("bootstrap lookup race {errno}: {error:?}"));
+            assert!(!root_path.exists(), "errno {errno}");
+            assert_eq!(
+                fs::read_dir(physical.join(".mac-worker-rooted-fs"))
+                    .unwrap()
+                    .count(),
+                0,
+                "errno {errno}"
             );
         }
     }
