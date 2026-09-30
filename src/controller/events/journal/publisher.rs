@@ -20,6 +20,12 @@ pub(super) enum EnqueueResult {
     Unavailable,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Diagnostic {
+    pub(super) code: &'static str,
+    pub(super) count: u64,
+}
+
 #[derive(Default)]
 struct Shared {
     accepting: AtomicBool,
@@ -131,6 +137,31 @@ pub(super) fn start<T: Send + 'static>(
 }
 
 impl<T> Queue<T> {
+    pub(super) fn diagnostics(&self) -> Vec<Diagnostic> {
+        [
+            ("CONTROLLER_EVENTS_DROPPED_FULL", &self.shared.full_drops),
+            (
+                "CONTROLLER_EVENTS_DROPPED_STOPPING",
+                &self.shared.stopping_drops,
+            ),
+            (
+                "CONTROLLER_EVENTS_UNAVAILABLE",
+                &self.shared.unavailable_drops,
+            ),
+            (
+                "CONTROLLER_EVENTS_WRITE_FAILED",
+                &self.shared.write_failures,
+            ),
+            ("CONTROLLER_EVENTS_PUBLISHER_PANIC", &self.shared.panics),
+        ]
+        .into_iter()
+        .filter_map(|(code, counter)| {
+            let count = counter.load(Ordering::Relaxed);
+            (count > 0).then_some(Diagnostic { code, count })
+        })
+        .collect()
+    }
+
     pub(super) fn try_enqueue(&self, batch: T) -> EnqueueResult {
         if self.shared.unavailable.load(Ordering::Acquire) {
             self.shared
@@ -224,6 +255,65 @@ mod tests {
         fn cancelled(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn drops_have_stable_diagnostics_without_synchronous_io() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sink, handle) = start(
+            move |_: Vec<u8>| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            Vec::len,
+        );
+        assert_eq!(sink.try_enqueue(vec![0]), EnqueueResult::Queued);
+        entered_rx.recv().unwrap();
+        for _ in 0..128 {
+            assert_eq!(sink.try_enqueue(vec![1]), EnqueueResult::Queued);
+        }
+        assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Full);
+        handle.stop_without_join();
+        assert_eq!(sink.try_enqueue(vec![3]), EnqueueResult::Stopping);
+        let diagnostics = sink.diagnostics();
+        assert!(diagnostics.contains(&Diagnostic {
+            code: "CONTROLLER_EVENTS_DROPPED_FULL",
+            count: 1
+        }));
+        assert!(diagnostics.contains(&Diagnostic {
+            code: "CONTROLLER_EVENTS_DROPPED_STOPPING",
+            count: 1
+        }));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn journal_failure_drops_one_hint_and_keeps_publisher_available() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sink, handle) = start(
+            move |batch: usize| {
+                if batch == 1 {
+                    return Err(());
+                }
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            |_| 1,
+        );
+        assert_eq!(sink.try_enqueue(1), EnqueueResult::Queued);
+        assert_eq!(sink.try_enqueue(2), EnqueueResult::Queued);
+        entered_rx.recv().unwrap();
+        assert_eq!(sink.try_enqueue(3), EnqueueResult::Queued);
+        assert!(sink.diagnostics().contains(&Diagnostic {
+            code: "CONTROLLER_EVENTS_WRITE_FAILED",
+            count: 1
+        }));
+        handle.stop_without_join();
+        release_tx.send(()).unwrap();
     }
 
     #[test]
