@@ -785,6 +785,30 @@ pub(crate) struct PrivateEntryIdentity {
     pub(crate) mode: u32,
 }
 
+/// A caller-owned fixed staging slot, admitted under its own serialization lock.
+pub(crate) struct PrivateRegularRole<'a> {
+    pub(crate) target: &'a str,
+    pub(crate) stage: &'a str,
+    pub(crate) expected_target: Option<PrivateEntryIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateRolePoint {
+    CreationRecorded,
+    PartialStage,
+    StageSynced,
+    Published,
+    DirectorySynced,
+    DisplacedRemoved,
+    FinalSynced,
+}
+
+pub(crate) trait PrivateRoleHooks {
+    /// Must durably record the binding before any stage content is written.
+    fn record_creation(&self, binding: PrivateEntryIdentity) -> io::Result<()>;
+    fn at(&self, point: PrivateRolePoint) -> io::Result<()>;
+}
+
 struct DirectoryBinding {
     directory: OwnedFd,
     parent: OwnedFd,
@@ -1809,6 +1833,97 @@ impl RootedDir {
         replacement: &[u8],
     ) -> io::Result<()> {
         self.replace_private_regular_exact_before_final_sync(name, expected, replacement, || Ok(()))
+    }
+
+    pub(crate) fn replace_private_regular_exact_in_role(
+        &self,
+        role: PrivateRegularRole<'_>,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        hooks: &dyn PrivateRoleHooks,
+    ) -> io::Result<PrivateEntryIdentity> {
+        self.verify_root_name()?;
+        let target = private_leaf_name(role.target)?;
+        let stage = private_leaf_name(role.stage)?;
+        if target == stage || expected.is_some() != role.expected_target.is_some() {
+            return Err(os_error(libc::EINVAL));
+        }
+        let old = if let (Some(bytes), Some(binding)) = (expected, role.expected_target) {
+            let before = stat_at(self.root.as_raw_fd(), &target)?;
+            require_private_regular(&before)?;
+            self.require_bound_regular_device(&before)?;
+            if PrivateEntryIdentity::from_stat(&before) != binding
+                || before.st_size < 0
+                || before.st_size as u64 != bytes.len() as u64
+                || self.read_private_regular(role.target, bytes.len() as u64)? != bytes
+                || !snapshot_metadata_stable(&before, &stat_at(self.root.as_raw_fd(), &target)?)
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+            Some(before)
+        } else {
+            if self.entry_exists(role.target)? {
+                return Err(os_error(libc::EEXIST));
+            }
+            None
+        };
+
+        // A fixed slot is never silently replaced or deleted on failure. The
+        // caller's durable evidence decides which generation may be resumed.
+        let mut file = File::from(create_regular_at(self.root.as_raw_fd(), &stage)?);
+        let binding = PrivateEntryIdentity::from_stat(&stat_fd(file.as_raw_fd())?);
+        file.sync_all()?;
+        self.sync_root()?;
+        hooks.record_creation(binding)?;
+        hooks.at(PrivateRolePoint::CreationRecorded)?;
+        self.validate_private_regular_binding(role.stage, &file, binding)?;
+        let split = replacement.len() / 2;
+        file.write_all(&replacement[..split])?;
+        hooks.at(PrivateRolePoint::PartialStage)?;
+        file.write_all(&replacement[split..])?;
+        file.sync_all()?;
+        self.validate_private_regular_binding(role.stage, &file, binding)?;
+        hooks.at(PrivateRolePoint::StageSynced)?;
+        if let Some(old) = old {
+            if !snapshot_metadata_stable(&old, &stat_at(self.root.as_raw_fd(), &target)?) {
+                return Err(os_error(libc::ESTALE));
+            }
+            exchange_entries(
+                self.root.as_raw_fd(),
+                &stage,
+                self.root.as_raw_fd(),
+                &target,
+            )?;
+            let displaced = stat_at(self.root.as_raw_fd(), &stage)?;
+            require_private_regular(&displaced)?;
+            if !same_file(&old, &displaced) {
+                return Err(os_error(libc::ESTALE));
+            }
+        } else {
+            rename_no_replace(
+                self.root.as_raw_fd(),
+                &stage,
+                self.root.as_raw_fd(),
+                &target,
+            )?;
+        }
+        self.validate_private_regular_binding(role.target, &file, binding)?;
+        hooks.at(PrivateRolePoint::Published)?;
+        self.sync_root()?;
+        hooks.at(PrivateRolePoint::DirectorySynced)?;
+        if let (Some(old), Some(bytes)) = (old, expected) {
+            if self.private_entry_identity(role.stage)? != PrivateEntryIdentity::from_stat(&old)
+                || self.read_private_regular(role.stage, bytes.len() as u64)? != bytes
+            {
+                return Err(os_error(libc::ESTALE));
+            }
+            self.remove_owned_regular(role.stage)?;
+        }
+        hooks.at(PrivateRolePoint::DisplacedRemoved)?;
+        self.validate_private_regular_binding(role.target, &file, binding)?;
+        self.sync_root()?;
+        hooks.at(PrivateRolePoint::FinalSynced)?;
+        Ok(binding)
     }
 
     pub(crate) fn replace_private_regular_exact_before_final_sync<F>(
@@ -11946,6 +12061,131 @@ fn current_errno() -> libc::c_int {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    struct JournalCreationHooks<'a> {
+        root: &'a super::RootedDir,
+        fail_at: Option<super::PrivateRolePoint>,
+    }
+
+    impl super::PrivateRoleHooks for JournalCreationHooks<'_> {
+        fn record_creation(&self, binding: super::PrivateEntryIdentity) -> std::io::Result<()> {
+            let bytes = format!("{}:{}", binding.device, binding.inode);
+            self.root
+                .write_new_private_file("creation", bytes.as_bytes())?
+                .sync_all()?;
+            self.root.sync_root()
+        }
+
+        fn at(&self, point: super::PrivateRolePoint) -> std::io::Result<()> {
+            if self.fail_at == Some(point) {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn journal_role_partial_stage_has_durable_creation_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("root")).unwrap();
+        root.write_new_private_file("manifest", b"old")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let hooks = JournalCreationHooks {
+            root: &root,
+            fail_at: Some(super::PrivateRolePoint::PartialStage),
+        };
+        let result = root.replace_private_regular_exact_in_role(
+            super::PrivateRegularRole {
+                target: "manifest",
+                stage: "manifest.stage",
+                expected_target: Some(root.private_entry_identity("manifest").unwrap()),
+            },
+            Some(b"old"),
+            b"replacement",
+            &hooks,
+        );
+        assert!(result.is_err());
+        assert_eq!(root.read_private_regular("manifest", 64).unwrap(), b"old");
+        assert_eq!(
+            root.read_private_regular("manifest.stage", 64).unwrap(),
+            b"repla"
+        );
+        let binding = root.private_entry_identity("manifest.stage").unwrap();
+        assert_eq!(
+            root.read_private_regular("creation", 64).unwrap(),
+            format!("{}:{}", binding.device, binding.inode).as_bytes()
+        );
+    }
+
+    #[test]
+    fn journal_role_unknown_stage_is_preserved_without_creation_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("root")).unwrap();
+        root.write_new_private_file("manifest.stage", b"foreign")
+            .unwrap();
+        let hooks = JournalCreationHooks {
+            root: &root,
+            fail_at: None,
+        };
+        assert!(
+            root.replace_private_regular_exact_in_role(
+                super::PrivateRegularRole {
+                    target: "manifest",
+                    stage: "manifest.stage",
+                    expected_target: None
+                },
+                None,
+                b"replacement",
+                &hooks,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            root.read_private_regular("manifest.stage", 64).unwrap(),
+            b"foreign"
+        );
+        assert!(!root.entry_exists("creation").unwrap());
+    }
+
+    #[test]
+    fn journal_role_exchange_preserves_both_pinned_generations_before_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("root")).unwrap();
+        root.write_new_private_file("manifest", b"old")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let old = root.private_entry_identity("manifest").unwrap();
+        let hooks = JournalCreationHooks {
+            root: &root,
+            fail_at: Some(super::PrivateRolePoint::Published),
+        };
+        assert!(
+            root.replace_private_regular_exact_in_role(
+                super::PrivateRegularRole {
+                    target: "manifest",
+                    stage: "manifest.stage",
+                    expected_target: Some(old)
+                },
+                Some(b"old"),
+                b"replacement",
+                &hooks,
+            )
+            .is_err()
+        );
+        assert_eq!(root.private_entry_identity("manifest.stage").unwrap(), old);
+        assert_eq!(
+            root.read_private_regular("manifest", 64).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            root.read_private_regular("manifest.stage", 64).unwrap(),
+            b"old"
+        );
+    }
+
     use std::{
         ffi::CString,
         fs,
