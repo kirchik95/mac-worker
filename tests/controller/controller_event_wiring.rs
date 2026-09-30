@@ -217,7 +217,7 @@ impl ProcessWiringHarness {
         );
     }
 
-    fn spawn_detached_runner_fixture(&mut self) {
+    fn spawn_detached_runner_fixture(&mut self) -> (TaskId, TurnId) {
         let store = ClientStateStore::open(&self.paths.state).unwrap();
         let record = task_record();
         let task = record.meta().task_id();
@@ -261,6 +261,7 @@ impl ProcessWiringHarness {
             saved.status().turns()[0].outcome(),
             Some(&mac_worker::task::TaskOutcome::Cancelled)
         );
+        (task, turn)
     }
 
     fn run_laptop_local_fixture(&mut self) {
@@ -299,6 +300,50 @@ impl ProcessWiringHarness {
 
     fn journal_exists(&self) -> bool {
         self.paths.controller_state_root().join("events").exists()
+    }
+
+    fn rpc<T: serde::de::DeserializeOwned>(&self, body: serde_json::Value) -> T {
+        use mac_worker::controller::{decode_frame, parse_request, read::ControllerReadReply};
+        use std::io::Write;
+
+        let wire = serde_json::json!({
+            "protocol_version": 7,
+            "command": "task.list",
+            "request_id": uuid::Uuid::new_v4().simple().to_string(),
+            "body": body,
+        });
+        let request = parse_request(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+            .envs(&self.environment)
+            .current_dir(&self.root)
+            .env("MAC_WORKER_TEST_SSH", self.root.join("fake-ssh"))
+            .args(["host", "controller-rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&encode_json_frame(&wire).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "RPC failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: ControllerReadReply<T> =
+            serde_json::from_slice(decode_frame(&output.stdout).unwrap()).unwrap();
+        reply.verify_envelope(&request).unwrap();
+        reply.into_result()
     }
 
     fn journal(&self) -> Arc<ControllerJournal> {
@@ -546,6 +591,125 @@ fn rpc_drain_attaches_to_initialized_host_journal() {
             .any(|event| event.kind == "controller.drained"),
         "{events:?} {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn process_end_to_end_reads_detached_producer_and_rpc_drain_on_one_root() {
+    use mac_worker::controller::{
+        ControllerStore,
+        events::{
+            EventSelector, SafeOutcome, TaskAddressQuery, TaskFactsBatch, TaskRepairPage,
+            TaskRepairQuery,
+        },
+    };
+
+    let mut controller = ProcessWiringHarness::controller();
+    controller.start_controller_leader();
+    let bootstrap: EventReadResult = controller.rpc(
+        EventSelector::Read(ReadQuery::default())
+            .request_body()
+            .unwrap(),
+    );
+    let EventReadResult::SnapshotRequired(control) = bootstrap else {
+        panic!("a missing cursor must bootstrap from the real host journal");
+    };
+    assert_eq!(control.reason, "bootstrap");
+    let baseline = control.window.cursor();
+
+    let (task, turn) = controller.spawn_detached_runner_fixture();
+    controller.reexec("rpc-drain", None);
+    let read: EventReadResult = controller.rpc(
+        EventSelector::Read(ReadQuery {
+            after: Some(baseline),
+            limit: 256,
+            wait_ms: 0,
+        })
+        .request_body()
+        .unwrap(),
+    );
+    read.validate().unwrap();
+    let EventReadResult::Batch(batch) = read else {
+        panic!("RPC must return the committed producer prefix");
+    };
+    assert_eq!(batch.journal_id, baseline.journal_id);
+    let finished = batch
+        .events
+        .iter()
+        .find(|event| event.kind == "turn.finished")
+        .unwrap();
+    assert_eq!(finished.data["task_id"], task.to_string());
+    assert_eq!(finished.data["turn_id"], turn.to_string());
+    assert_eq!(finished.data["outcome"], "cancelled");
+    let drained = batch
+        .events
+        .iter()
+        .find(|event| event.kind == "controller.drained")
+        .unwrap();
+    assert!(finished.seq < drained.seq);
+    assert_eq!(batch.next_after.seq, batch.events.last().unwrap().seq);
+    assert!(!batch.has_more);
+
+    let facts: TaskFactsBatch = controller.rpc(
+        EventSelector::Tasks(TaskAddressQuery::try_new(vec![task], false, None).unwrap())
+            .request_body()
+            .unwrap(),
+    );
+    facts.validate().unwrap();
+    assert_eq!(facts.rows.len(), 1);
+    assert!(facts.missing.is_empty());
+    assert_eq!(facts.rows[0].task_id, task);
+    assert_eq!(facts.rows[0].latest_turn_id, Some(turn));
+    assert_eq!(facts.rows[0].outcome, Some(SafeOutcome::Cancelled));
+    assert_eq!(facts.rows[0].quiescent, Some(true));
+    assert_eq!(facts.rows[0].title, None);
+
+    let repair: TaskRepairPage = controller.rpc(
+        EventSelector::Repair(TaskRepairQuery {
+            baseline_after: Some(baseline),
+            ..TaskRepairQuery::default()
+        })
+        .request_body()
+        .unwrap(),
+    );
+    repair.validate().unwrap();
+    assert!(repair.complete);
+    assert_eq!(repair.baseline_after, Some(baseline));
+    assert_eq!(repair.rows.len(), 1);
+    assert_eq!(repair.rows[0].task_id, task);
+    assert_eq!(repair.rows[0].quiescent, Some(true));
+
+    let saved = ClientStateStore::open(&controller.paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(saved.status().state(), TaskState::Open);
+    assert_eq!(
+        saved.status().turns()[0].outcome(),
+        Some(&mac_worker::task::TaskOutcome::Cancelled)
+    );
+    assert!(
+        mac_worker::controller::drain::is_drained(&controller.paths.controller_state_root())
+            .unwrap()
+    );
+    assert_eq!(
+        ControllerStore::open(&controller.paths.controller_state_root())
+            .unwrap()
+            .pending_health(1000)
+            .unwrap()
+            .active_count,
+        0
+    );
+    assert!(
+        fs::read_dir(controller.paths.controller_state_root())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("req-")
+            })
     );
 }
 

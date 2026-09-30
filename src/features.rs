@@ -5,7 +5,7 @@
 //! A missing feature list means an older peer whose features are unknown.
 
 pub const HOST_FEATURES: &[&str] = &["host.outbox-retry", "host.status-logs"];
-pub const CONTROLLER_FEATURES: &[&str] = &["controller.task-logs-wait"];
+pub const CONTROLLER_FEATURES: &[&str] = &["controller.events", "controller.task-logs-wait"];
 
 #[cfg(test)]
 mod tests {
@@ -14,7 +14,10 @@ mod tests {
     #[test]
     fn registries_are_sorted_unique_and_contain_the_supported_features() {
         assert_eq!(HOST_FEATURES, ["host.outbox-retry", "host.status-logs"]);
-        assert_eq!(CONTROLLER_FEATURES, ["controller.task-logs-wait"]);
+        assert_eq!(
+            CONTROLLER_FEATURES,
+            ["controller.events", "controller.task-logs-wait"]
+        );
         for features in [HOST_FEATURES, CONTROLLER_FEATURES] {
             assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
             assert!(
