@@ -350,6 +350,73 @@ fn read_from_journal(
     batch
 }
 
+fn full_journal_with_segment_counter() -> (JournalHarness, Arc<ControllerJournal>, Arc<AtomicUsize>)
+{
+    let h = JournalHarness::new();
+    h.fill_segments(64);
+    let touches = Arc::new(AtomicUsize::new(0));
+    let counter = touches.clone();
+    let journal = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        Arc::new(move |point| {
+            if matches!(point, JournalFaultPoint::SegmentRead { .. }) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        touches.load(Ordering::SeqCst) >= 64,
+        "attachment validates all retained contents"
+    );
+    touches.store(0, Ordering::SeqCst);
+    (h, journal, touches)
+}
+
+#[test]
+fn steady_state_full_journal_read_after_head_skips_segment_contents() {
+    let (_h, journal, touches) = full_journal_with_segment_counter();
+    let cursor = journal.window(DEADLINE).unwrap().cursor();
+    touches.store(0, Ordering::SeqCst);
+    let EventReadResult::Batch(batch) = journal
+        .read(
+            ReadQuery {
+                after: Some(cursor),
+                limit: 1,
+                wait_ms: 0,
+            },
+            DEADLINE,
+        )
+        .unwrap()
+    else {
+        panic!("expected empty committed batch")
+    };
+    assert!(batch.events.is_empty());
+    assert_eq!(batch.next_after, cursor);
+    assert_eq!(
+        touches.load(Ordering::SeqCst),
+        0,
+        "read after head must not decode 64 unchanged segments"
+    );
+}
+
+#[test]
+fn steady_state_full_journal_append_reads_constant_segment_contents() {
+    let (_h, journal, touches) = full_journal_with_segment_counter();
+    let cursor = journal.append(drain_batch(1), DEADLINE).unwrap();
+    assert_eq!(cursor.seq, Seq::new(16385));
+    let count = touches.load(Ordering::SeqCst);
+    assert!(
+        count <= 6,
+        "append must touch O(1) segment contents, touched {count}"
+    );
+}
+
 #[test]
 fn sealed_binding_is_pinned_across_reopen() {
     let h = JournalHarness::new();

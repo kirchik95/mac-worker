@@ -59,6 +59,7 @@ pub enum JournalFaultPoint {
     Retired,
     ReadAttempt,
     AppendPrepared,
+    SegmentRead { first_seq: u64 },
 }
 
 #[doc(hidden)]
@@ -111,6 +112,7 @@ impl fs::FaultHooks for Hooks {
             F::ManifestCommitted => J::ManifestCommitted,
             F::PendingRemoved => J::PendingRemoved,
             F::Retired => J::Retired,
+            F::SegmentRead(first_seq) => J::SegmentRead { first_seq },
         };
         self.at(point)
     }
@@ -294,7 +296,9 @@ impl ControllerJournal {
             clock,
             hooks,
         });
-        journal.window(deadline)?;
+        journal.with_manifest(deadline, |manifest| {
+            fs::validate_contents(&journal.root, manifest, &journal.hooks)
+        })?;
         Ok(journal)
     }
 
@@ -318,7 +322,7 @@ impl ControllerJournal {
             let shared = fs::acquire_lock(&self.root, self.lock, true, deadline, &self.clock)?;
             self.validate_epoch()?;
             self.hooks.at(JournalFaultPoint::ReadAttempt)?;
-            if let Some(manifest) = fs::clean_manifest(&self.root)? {
+            if let Some(manifest) = fs::clean_manifest(&self.root, &self.hooks)? {
                 return read(&manifest);
             }
             drop(shared);
@@ -433,11 +437,13 @@ impl JournalReader for ControllerJournal {
                     }));
                 }
                 let cursor = query.after.as_ref().expect("validated cursor");
-                let events: Vec<super::contracts::WireEvent> =
-                    fs::read_after(&self.root, manifest, cursor.seq.as_u64(), query.limit)?
-                        .into_iter()
-                        .map(|event| serde_json::from_value(event).map_err(io::Error::other))
-                        .collect::<io::Result<_>>()?;
+                let events = fs::read_after(
+                    &self.root,
+                    manifest,
+                    cursor.seq.as_u64(),
+                    query.limit,
+                    &self.hooks,
+                )?;
                 let next_after = events.last().map_or_else(
                     || *cursor,
                     |event| EventCursor {

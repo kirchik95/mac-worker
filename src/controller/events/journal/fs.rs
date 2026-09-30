@@ -89,15 +89,6 @@ fn canonical_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn canonical_seq(value: &serde_json::Value) -> io::Result<u64> {
-    let text = value.as_str().ok_or_else(unavailable)?;
-    let number: u64 = text.parse().map_err(|_| unavailable())?;
-    if number.to_string() != text {
-        return Err(unavailable());
-    }
-    Ok(number)
-}
-
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
     if manifest.schema_version != 1
         || !canonical_uuid(&manifest.journal_id)
@@ -147,15 +138,27 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn committed_records(
     root: &RootedDir,
     segment: &Segment,
     journal_id: &str,
     allow_tail: bool,
-) -> io::Result<Vec<serde_json::Value>> {
+) -> io::Result<Vec<super::super::contracts::WireEvent>> {
+    committed_records_with_hook(root, segment, journal_id, allow_tail, &NoFaults)
+}
+
+fn committed_records_with_hook(
+    root: &RootedDir,
+    segment: &Segment,
+    journal_id: &str,
+    allow_tail: bool,
+    faults: &dyn FaultHooks,
+) -> io::Result<Vec<super::super::contracts::WireEvent>> {
     if Binding::from(root.private_entry_identity(&segment.name)?) != segment.binding {
         return Err(unavailable());
     }
+    faults.at(FaultPoint::SegmentRead(segment.first))?;
     let bytes = root.read_private_regular(&segment.name, SEGMENT_BYTES as u64)?;
     if Binding::from(root.private_entry_identity(&segment.name)?) != segment.binding
         || segment.committed_len > bytes.len()
@@ -176,7 +179,7 @@ fn decode_records(
     journal_id: &str,
     first: u64,
     last: Option<u64>,
-) -> io::Result<Vec<serde_json::Value>> {
+) -> io::Result<Vec<super::super::contracts::WireEvent>> {
     if bytes.is_empty() {
         return if last.is_none() {
             Ok(Vec::new())
@@ -193,22 +196,15 @@ fn decode_records(
         if line.len() + 1 > EVENT_BYTES || line.is_empty() {
             return Err(unavailable());
         }
-        let event: serde_json::Value = serde_json::from_slice(line).map_err(|_| unavailable())?;
-        let _: super::super::contracts::WireEvent =
-            serde_json::from_value(event.clone()).map_err(|_| unavailable())?;
-        if canonical_seq(&event["seq"])? != seq || event["journal_id"].as_str() != Some(journal_id)
-        {
+        let event: super::super::contracts::WireEvent =
+            serde_json::from_slice(line).map_err(|_| unavailable())?;
+        if event.seq.as_u64() != seq || event.journal_id.to_string() != journal_id {
             return Err(unavailable());
         }
         records.push(event);
         seq = seq.checked_add(1).unwrap_or(0);
     }
-    if records
-        .last()
-        .map(|record| canonical_seq(&record["seq"]))
-        .transpose()?
-        != last
-    {
+    if records.last().map(|record| record.seq.as_u64()) != last {
         return Err(unavailable());
     }
     Ok(records)
@@ -267,6 +263,7 @@ pub(super) enum FaultPoint {
     ManifestCommitted,
     PendingRemoved,
     Retired,
+    SegmentRead(u64),
 }
 
 pub(super) trait FaultHooks: Send + Sync {
@@ -332,6 +329,44 @@ impl DiskUsage {
             return Err(unavailable());
         }
         Ok(())
+    }
+}
+
+/// A conservative allocation ledger for one EX transaction. Nested helpers
+/// reserve against its entry snapshot; only the outer boundary audits disk.
+struct AllocationBudget {
+    usage: DiskUsage,
+    bytes: usize,
+    files: usize,
+}
+
+impl AllocationBudget {
+    fn reserve(&mut self, bytes: usize, files: usize) -> io::Result<()> {
+        let bytes = self.bytes.checked_add(bytes).ok_or_else(unavailable)?;
+        let files = self.files.checked_add(files).ok_or_else(unavailable)?;
+        self.usage
+            .admit(bytes + EVIDENCE_BYTES, files + EVIDENCE_FILES)?;
+        self.bytes = bytes;
+        self.files = files;
+        Ok(())
+    }
+}
+
+fn audited<T>(
+    root: &RootedDir,
+    operation: impl FnOnce(&mut AllocationBudget) -> io::Result<T>,
+) -> io::Result<T> {
+    let usage = audit(root)?;
+    usage.admit(0, 0)?;
+    let result = operation(&mut AllocationBudget {
+        usage,
+        bytes: 0,
+        files: 0,
+    });
+    let final_check = audit(root).and_then(|usage| usage.admit(0, 0));
+    match result {
+        Ok(value) => final_check.map(|()| value),
+        Err(error) => Err(error),
     }
 }
 
@@ -495,7 +530,21 @@ fn replace_role(
     replacement: &[u8],
     faults: &dyn FaultHooks,
 ) -> io::Result<()> {
-    recover_roles(root, epoch)?;
+    audited(root, |budget| {
+        replace_role_in(root, epoch, kind, target, replacement, faults, budget)
+    })
+}
+
+fn replace_role_in(
+    root: &RootedDir,
+    epoch: &str,
+    kind: RoleKind,
+    target: &str,
+    replacement: &[u8],
+    faults: &dyn FaultHooks,
+    budget: &mut AllocationBudget,
+) -> io::Result<()> {
+    recover_roles_in(root, epoch)?;
     if cleanup_residue(root)? {
         return Err(unavailable());
     }
@@ -507,10 +556,7 @@ fn replace_role(
     if !canonical_uuid(epoch) || !valid_role_target(kind, target) || replacement.len() > limit {
         return Err(unavailable());
     }
-    audit(root)?.admit(
-        replacement.len() + 4096 + EVIDENCE_BYTES,
-        2 + EVIDENCE_FILES,
-    )?;
+    budget.reserve(replacement.len() + 4096, 2)?;
     let old = if root.entry_exists(target)? {
         Some(root.read_private_regular(target, limit as u64)?)
     } else {
@@ -547,7 +593,7 @@ fn replace_role(
     }
     let evidence_binding = root.private_entry_identity(&kind.evidence())?.into();
     remove_bound(root, &kind.evidence(), evidence_binding)?;
-    audit(root)?.admit(0, 0)
+    Ok(())
 }
 
 fn matches_file(
@@ -568,7 +614,10 @@ fn matches_file(
 }
 
 fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
-    audit(root)?;
+    audited(root, |_| recover_roles_in(root, epoch))
+}
+
+fn recover_roles_in(root: &RootedDir, epoch: &str) -> io::Result<()> {
     for kind in RoleKind::ALL {
         root.resume_pending_owned_regular_cleanup(&kind.evidence())?;
         if !root.entry_exists(&kind.evidence())? {
@@ -672,7 +721,7 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
         let binding = root.private_entry_identity(&kind.evidence())?.into();
         remove_bound(root, &kind.evidence(), binding)?;
     }
-    audit(root)?.admit(0, 0)
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -871,6 +920,7 @@ fn verify_retained(
     root: &RootedDir,
     manifest: &Manifest,
     pending: Option<&Pending>,
+    faults: &dyn FaultHooks,
 ) -> io::Result<()> {
     validate_manifest(manifest)?;
     let device = root.identity()?.device;
@@ -879,9 +929,43 @@ fn verify_retained(
             return Err(unavailable());
         }
         let allow_tail = pending.is_some_and(|p| p.delta.appended.name == segment.name);
-        committed_records(root, segment, &manifest.journal_id, allow_tail)?;
+        committed_records_with_hook(root, segment, &manifest.journal_id, allow_tail, faults)?;
     }
     Ok(())
+}
+
+/// Inspect identities and lengths without reading any segment contents.
+/// Extra active bytes signal recovery work, never a healthy speculative tail.
+fn verify_retained_bindings(root: &RootedDir, manifest: &Manifest) -> io::Result<bool> {
+    validate_manifest(manifest)?;
+    let device = root.identity()?.device;
+    let mut extra_tail = false;
+    for segment in &manifest.segments {
+        if segment.binding.device != device
+            || Binding::from(root.private_entry_identity(&segment.name)?) != segment.binding
+        {
+            return Err(unavailable());
+        }
+        let file = root.open_private_regular_handle(&segment.name)?;
+        root.validate_private_regular_binding(&segment.name, &file, segment.binding.into())?;
+        let len = file.metadata()?.len();
+        if len > SEGMENT_BYTES as u64
+            || len < segment.committed_len as u64
+            || (segment.sealed && len != segment.committed_len as u64)
+        {
+            return Err(unavailable());
+        }
+        extra_tail |= len != segment.committed_len as u64;
+    }
+    Ok(extra_tail)
+}
+
+pub(super) fn validate_contents(
+    root: &RootedDir,
+    manifest: &Manifest,
+    faults: &dyn FaultHooks,
+) -> io::Result<()> {
+    verify_retained(root, manifest, None, faults)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -920,7 +1004,13 @@ fn recover_retirement(
             && Binding::from(id) == retirement.segment.binding
     })?;
     if root.entry_exists(&retirement.segment.name)? {
-        committed_records(root, &retirement.segment, &manifest.journal_id, false)?;
+        committed_records_with_hook(
+            root,
+            &retirement.segment,
+            &manifest.journal_id,
+            false,
+            faults,
+        )?;
         remove_bound(root, &retirement.segment.name, retirement.segment.binding)?;
     }
     faults.at(FaultPoint::Retired)?;
@@ -933,6 +1023,7 @@ fn finish_pending(
     manifest: &Manifest,
     pending: &Pending,
     faults: &dyn FaultHooks,
+    budget: &mut AllocationBudget,
 ) -> io::Result<()> {
     if let Some(segment) = &pending.delta.retired {
         let retirement = Retirement {
@@ -947,13 +1038,14 @@ fn finish_pending(
                 return Err(unavailable());
             }
         } else {
-            replace_role(
+            replace_role_in(
                 root,
                 &manifest.journal_id,
                 RoleKind::Retirement,
                 "retirement.json",
                 &bytes,
                 faults,
+                budget,
             )?;
         }
     }
@@ -968,7 +1060,18 @@ pub(super) fn publish_append(
     pending: &Pending,
     faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
-    let manifest = recover_append_with_proposal(root, faults, Some(pending))?;
+    audited(root, |budget| {
+        publish_append_in(root, pending, faults, budget)
+    })
+}
+
+fn publish_append_in(
+    root: &RootedDir,
+    pending: &Pending,
+    faults: &dyn FaultHooks,
+    budget: &mut AllocationBudget,
+) -> io::Result<Manifest> {
+    let manifest = recover_append_in(root, faults, Some(pending), None, budget)?;
     let bytes = pending_bytes(pending)?;
     if digest(&bounded_json(&manifest, METADATA_BYTES)?) == pending.next_digest {
         predecessor(&manifest, pending, &bytes)?;
@@ -980,16 +1083,19 @@ pub(super) fn publish_append(
         return Err(unavailable());
     }
     let encoded = bounded_json(pending, METADATA_BYTES)?;
-    replace_role(
+    replace_role_in(
         root,
         &manifest.journal_id,
         RoleKind::Pending,
         "pending.json",
         &encoded,
         faults,
+        budget,
     )?;
     faults.at(FaultPoint::PendingDurable)?;
-    recover_append(root, faults)
+    // This pending was created by this uninterrupted EX operation. Validate
+    // its target, while cold recovery still decodes every retained segment.
+    recover_append_in(root, faults, None, Some(pending), budget)
 }
 
 pub(super) fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manifest> {
@@ -997,7 +1103,10 @@ pub(super) fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::R
 }
 
 /// A healthy SH read never mutates the journal. Ambiguous roles require EX recovery.
-pub(super) fn clean_manifest(root: &RootedDir) -> io::Result<Option<Manifest>> {
+pub(super) fn clean_manifest(
+    root: &RootedDir,
+    _faults: &dyn FaultHooks,
+) -> io::Result<Option<Manifest>> {
     audit(root)?.admit(0, 0)?;
     for role in RoleKind::ALL {
         if root.entry_exists(&role.stage())? || root.entry_exists(&role.evidence())? {
@@ -1015,7 +1124,9 @@ pub(super) fn clean_manifest(root: &RootedDir) -> io::Result<Option<Manifest>> {
     if manifest.journal_id != initialization.journal_id {
         return Err(unavailable());
     }
-    verify_retained(root, &manifest, None)?;
+    if verify_retained_bindings(root, &manifest)? {
+        return Ok(None);
+    }
     verify_residue(root, &manifest, None)?;
     Ok(Some(manifest))
 }
@@ -1036,9 +1147,35 @@ fn recover_append_with_proposal(
     faults: &dyn FaultHooks,
     proposal: Option<&Pending>,
 ) -> io::Result<Manifest> {
-    audit(root)?.admit(0, 0)?;
+    audited(root, |budget| {
+        recover_append_in(root, faults, proposal, None, budget)
+    })
+}
+
+fn recovery_work(root: &RootedDir, proposal: Option<&Pending>) -> io::Result<bool> {
+    for role in RoleKind::ALL {
+        if root.entry_exists(&role.stage())?
+            || (root.entry_exists(&role.evidence())?
+                && !(role == RoleKind::Segment && proposal.is_some_and(|p| p.delta.rotate)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(root.entry_exists("pending.json")?
+        || root.entry_exists("retirement.json")?
+        || cleanup_residue(root)?)
+}
+
+fn recover_append_in(
+    root: &RootedDir,
+    faults: &dyn FaultHooks,
+    proposal: Option<&Pending>,
+    owned_pending: Option<&Pending>,
+    budget: &mut AllocationBudget,
+) -> io::Result<Manifest> {
+    let full = owned_pending.is_none() && recovery_work(root, proposal)?;
     let initial: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
-    recover_roles(root, &initial.journal_id)?;
+    recover_roles_in(root, &initial.journal_id)?;
     root.resume_pending_owned_regular_cleanup("pending.json")?;
     let manifest: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
     if root.entry_exists("initialization.json")? {
@@ -1059,20 +1196,40 @@ fn recover_append_with_proposal(
             proposed_rotation,
             proposed_rotation.is_none(),
         )?;
-        verify_retained(root, &manifest, None)?;
+        if full || verify_retained_bindings(root, &manifest)? {
+            verify_retained(root, &manifest, None, faults)?;
+        }
         recover_retirement(root, &manifest, faults)?;
         verify_residue(root, &manifest, proposed_rotation)?;
         return Ok(manifest);
     }
     let pending: Pending = read_json(root, "pending.json", METADATA_BYTES)?;
+    if let Some(owned) = owned_pending
+        && bounded_json(owned, METADATA_BYTES)? != bounded_json(&pending, METADATA_BYTES)?
+    {
+        return Err(unavailable());
+    }
     let bytes = pending_bytes(&pending)?;
     let current_digest = digest(&bounded_json(&manifest, METADATA_BYTES)?);
     if current_digest == pending.next_digest {
         predecessor(&manifest, &pending, &bytes)?;
         reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
-        verify_retained(root, &manifest, None)?;
+        if full {
+            verify_retained(root, &manifest, None, faults)?;
+        } else {
+            if verify_retained_bindings(root, &manifest)? {
+                return Err(unavailable());
+            }
+            committed_records_with_hook(
+                root,
+                &pending.delta.appended,
+                &manifest.journal_id,
+                false,
+                faults,
+            )?;
+        }
         verify_residue(root, &manifest, Some(&pending))?;
-        finish_pending(root, &manifest, &pending, faults)?;
+        finish_pending(root, &manifest, &pending, faults, budget)?;
         verify_residue(root, &manifest, None)?;
         return Ok(manifest);
     }
@@ -1084,18 +1241,38 @@ fn recover_append_with_proposal(
     // next manifest generation, even when the pending transaction is valid.
     verify_residue(root, &manifest, Some(&pending))?;
     reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
-    verify_retained(root, &manifest, Some(&pending))?;
+    if full {
+        verify_retained(root, &manifest, Some(&pending), faults)?;
+    } else if verify_retained_bindings(root, &manifest)?
+        && manifest
+            .segments
+            .last()
+            .is_none_or(|s| s.name != pending.delta.appended.name)
+    {
+        return Err(unavailable());
+    }
     let target = &pending.delta.appended;
     if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
         return Err(unavailable());
     }
+    faults.at(FaultPoint::SegmentRead(target.first))?;
     let existing = root.read_private_regular(&target.name, SEGMENT_BYTES as u64)?;
     let offset = target
         .committed_len
         .checked_sub(bytes.len())
         .ok_or_else(unavailable)?;
     let tail = existing.get(offset..).ok_or_else(unavailable)?;
+    if !full {
+        let previous = manifest.segments.iter().find(|s| s.name == target.name);
+        decode_records(
+            &existing[..offset],
+            &manifest.journal_id,
+            target.first,
+            previous.and_then(|s| s.last),
+        )?;
+    }
     let suffix = completion_suffix(&bytes, tail)?;
+    budget.reserve(suffix.len(), 0)?;
     let mut file = root.open_private_append(&target.name)?;
     root.validate_private_regular_binding(&target.name, &file, target.binding.into())?;
     if !suffix.is_empty() {
@@ -1108,19 +1285,26 @@ fn recover_append_with_proposal(
     root.validate_private_regular_binding(&target.name, &file, target.binding.into())?;
     faults.at(FaultPoint::SegmentSynced)?;
     // The committed prefix in this manifest is the only visibility boundary.
-    replace_role(
+    replace_role_in(
         root,
         &manifest.journal_id,
         RoleKind::Manifest,
         "manifest.json",
         &bounded_json(&next, METADATA_BYTES)?,
         faults,
+        budget,
     )?;
     faults.at(FaultPoint::ManifestCommitted)?;
-    verify_retained(root, &next, None)?;
-    finish_pending(root, &next, &pending, faults)?;
+    if full {
+        verify_retained(root, &next, None, faults)?;
+    } else {
+        if verify_retained_bindings(root, &next)? {
+            return Err(unavailable());
+        }
+        committed_records_with_hook(root, target, &next.journal_id, false, faults)?;
+    }
+    finish_pending(root, &next, &pending, faults, budget)?;
     verify_residue(root, &next, None)?;
-    audit(root)?.admit(0, 0)?;
     Ok(next)
 }
 
@@ -1266,6 +1450,7 @@ pub(super) fn initialize_storage(
         if manifest.journal_id != initialization.journal_id {
             return Err(unavailable());
         }
+        verify_retained(root, &manifest, None, faults)?;
         return Ok(manifest);
     }
     if root.entry_exists("pending.json")? || root.entry_exists("retirement.json")? {
@@ -1298,7 +1483,7 @@ pub(super) fn initialize_storage(
         faults,
     )?;
     reconcile_segment_creation(root, &manifest, None, true)?;
-    verify_retained(root, &manifest, None)?;
+    verify_retained(root, &manifest, None, faults)?;
     verify_residue(root, &manifest, None)?;
     Ok(manifest)
 }
@@ -1410,7 +1595,7 @@ fn verify_residue(
     if cleanup_residue(root)? {
         return Err(unavailable());
     }
-    audit(root)?.admit(0, 0)
+    Ok(())
 }
 
 fn cleanup_residue(root: &RootedDir) -> io::Result<bool> {
@@ -1446,7 +1631,8 @@ pub(super) fn read_after(
     manifest: &Manifest,
     after: u64,
     limit: usize,
-) -> io::Result<Vec<serde_json::Value>> {
+    faults: &dyn FaultHooks,
+) -> io::Result<Vec<super::super::contracts::WireEvent>> {
     validate_manifest(manifest)?;
     let limit = limit.clamp(1, 256);
     let mut delivered = Vec::new();
@@ -1454,8 +1640,10 @@ pub(super) fn read_after(
         if segment.last.is_none_or(|last| last <= after) {
             continue;
         }
-        for event in committed_records(root, segment, &manifest.journal_id, false)? {
-            if canonical_seq(&event["seq"])? > after {
+        for event in
+            committed_records_with_hook(root, segment, &manifest.journal_id, false, faults)?
+        {
+            if event.seq.as_u64() > after {
                 delivered.push(event);
                 if delivered.len() == limit {
                     return Ok(delivered);
@@ -1604,10 +1792,14 @@ mod tests {
             Some("cursor_ahead")
         );
         assert_eq!(cursor_reason(&manifest, Some((EPOCH, 0))), None);
-        let delivered = read_after(&root, &manifest, 1, 1).unwrap();
+        let delivered = read_after(&root, &manifest, 1, 1, &NoFaults).unwrap();
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0]["seq"], "2");
-        assert!(read_after(&root, &manifest, 3, 128).unwrap().is_empty());
+        assert_eq!(delivered[0].seq.as_u64(), 2);
+        assert!(
+            read_after(&root, &manifest, 3, 128, &NoFaults)
+                .unwrap()
+                .is_empty()
+        );
         let mut retained = manifest;
         retained.oldest = 14;
         retained.head = 20;
@@ -2046,8 +2238,8 @@ mod tests {
             assert_eq!(manifest.head, 3, "{point:?}");
             let records =
                 committed_records(&reopened, &manifest.segments[0], EPOCH, false).unwrap();
-            let seqs: Vec<&str> = records.iter().map(|r| r["seq"].as_str().unwrap()).collect();
-            assert_eq!(seqs, ["1", "2", "3"]);
+            let seqs: Vec<u64> = records.iter().map(|r| r.seq.as_u64()).collect();
+            assert_eq!(seqs, [1, 2, 3]);
             // The next caller starts at four; recovery never allocates another range.
             let next = prepare_append(&manifest, &record(4), None).unwrap();
             assert_eq!(publish_append(&reopened, &next, &NoFaults).unwrap().head, 4);
