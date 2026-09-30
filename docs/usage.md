@@ -7,20 +7,44 @@ Start with the [quick start](../README.md#quick-start) to install the CLI and co
 | Agent | Flag | Login lives | Notes |
 |---|---|---|---|
 | Codex | `--agent codex` | file-based login on the worker | `--model` / `--effort` are passed through; runs in the Codex workspace sandbox |
-| OpenCode | `--agent opencode` | OpenCode auth store on the worker | uses the worker's default model; pick another with `--model opencode-go/<model>` |
+| OpenCode | `--agent opencode` | OpenCode auth store on the worker | uses the worker's default model; pick another with `--model opencode-go/<model>`; 1.x and 2.x are both supported, see [OpenCode 1.x and 2.x](#opencode-1x-and-2x) |
 | Cursor | `--agent cursor --env-profile agents` | Cursor login on the worker + an env profile | needs the profile described below because Cursor keeps its login in the macOS keychain |
 | Claude Code | `--agent claude` | worker login or env profile | check with `worker init <ssh> --agent claude`; add `--env-profile` for profile credentials |
 
 Honor the agent, model, and profile you configured. Do not copy credential profile contents. Every agent gets the same contract: work only in the task worktree, do not switch branches or push, and end with a JSON result. New tasks ask agents to make reasonable decisions unattended; see [Questions policy](#questions-policy). With `--questions ask`, an agent can return `needs_input` with the exact question; you answer with `worker task say <id> --message "…" --wait`, which starts the next turn in the same agent session.
 
-Each completed turn records the executable resolved **after** login-shell startup and the env profile, plus a bounded `--version` observation. `task status`, `task result`, and dashboard detail JSON expose `turns[].agent_identity`; account-home paths are shown relative to `~/` and secrets remain redacted. The private job `agent-identity.json` retains the resolved path. Version observation is best effort: an unsupported command, a timeout after two seconds (or the remaining turn deadline), or output above 4 KiB per stream does not prevent agent execution. Timeout and overflow retain the path with `version: null` and the fixed `version_observation` reason `timed_out` or `output_limit`; human output shows `version unavailable(timeout)` or `version unavailable(output_too_large)`. Diagnostic-storage errors also do not block launch. The probe's direct child is reaped on a bound, while descendants remain in the supervised process group for turn cleanup. An unresolved executable or a failed exec still fails launch.
+Each completed turn records the executable resolved **after** login-shell startup and the env profile, plus a bounded `--version` observation. `task status`, `task result`, and dashboard detail JSON expose `turns[].agent_identity`; account-home paths are shown relative to `~/` and secrets remain redacted. The private job `agent-identity.json` retains the resolved path. Version observation is best effort: an unsupported command, a timeout after two seconds (or the remaining turn deadline), or output above 4 KiB per stream does not prevent agent execution. OpenCode is the one exception: its launch is checked against the observed version, see [OpenCode 1.x and 2.x](#opencode-1x-and-2x). Timeout and overflow retain the path with `version: null` and the fixed `version_observation` reason `timed_out` or `output_limit`; human output shows `version unavailable(timeout)` or `version unavailable(output_too_large)`. Diagnostic-storage errors also do not block launch. The probe's direct child is reaped on a bound, while descendants remain in the supervised process group for turn cleanup. An unresolved executable or a failed exec still fails launch.
 
-`worker workers` and `worker doctor` emit informational `AGENT_VERSION_SKEW` notes when hosts report different versions of the same agent. They do not affect eligibility or scheduling. Facts refresh reads only the global OpenCode `~/.config/opencode/opencode.json` / `.jsonc` autoupdate setting. `AGENT_AUTOUPDATE_ENABLED` means automatic updates are not confirmed disabled there; set `"autoupdate": false` to disable them. OpenCode's `"notify"` mode also disables automatic installation. Missing, unreadable, malformed, or conflicting config produces a note; configuration contents are never emitted. Project/environment/managed overrides may differ from this global observation. No config is edited by mac-worker.
+`worker workers` and `worker doctor` emit informational `AGENT_VERSION_SKEW` notes when hosts report different versions of the same agent. They do not affect eligibility or scheduling. For OpenCode the recorded version also selects the command form for that worker. Facts refresh reads only the global OpenCode `~/.config/opencode/opencode.json` / `.jsonc` autoupdate setting. `AGENT_AUTOUPDATE_ENABLED` means automatic updates are not confirmed disabled there; set `"autoupdate": false` to disable them. OpenCode's `"notify"` mode also disables automatic installation. Missing, unreadable, malformed, or conflicting config produces a note; configuration contents are never emitted. Project/environment/managed overrides may differ from this global observation. No config is edited by mac-worker.
 
 Cursor CLI `2026.09.26-dd393fe` advertises `update` but no disable-auto-update option in `--help`; mac-worker does not infer Cursor's effective update setting from undocumented configuration.
 
 
 An `unknown` result includes `result_parse_reason`: `no_result_json`, `schema_mismatch:<field>`, `truncated`, or `empty_output`. These fixed codes contain no raw agent output. Truncated protocol still fails publication conservatively and records `truncated` for diagnosis.
+
+### OpenCode 1.x and 2.x
+
+mac-worker drives both OpenCode generations and chooses per worker, so workers can move to 2.x one at a time.
+
+OpenCode 2 sends `run` and most other commands to a shared background service. That service outlives the turn, and the turn's process-group cleanup cannot reach it. On a 2.x worker every OpenCode command mac-worker runs, apart from `--version`, therefore carries `--standalone`, which gives that command a private server. OpenCode 1 has no such service and rejects the flag.
+
+| | OpenCode 1.x | OpenCode 2.x and later |
+|---|---|---|
+| Turn | `opencode run --format json --auto [--model …] [--session …]` | `opencode run --standalone --format json --auto [--model …] [--session …]` |
+| Session delete on discard | `opencode session delete <id>` | `opencode session delete <id> --standalone` |
+| Login check in facts | `opencode auth list` | `opencode auth list --standalone` |
+| Live model list in settings | `opencode models` | none; settings show the remembered catalog |
+
+- **Which form a turn gets.** The runner reads the selected worker's recorded OpenCode version and builds the turn for that generation. A missing or unreadable version keeps the 1.x form. After you install, upgrade or downgrade OpenCode on a worker, run `worker workers --refresh`.
+- **Stale facts cannot start the service.** Before it starts OpenCode, the worker compares the turn's form with `opencode --version` of the executable it resolved. A turn that does not fit fails without starting OpenCode:
+  - `OPENCODE_DIALECT_MISMATCH`: the worker runs the other generation. Refresh the facts, then submit the task again, or repeat `worker task say` for a follow-up turn.
+  - `OPENCODE_VERSION_UNVERIFIED`: the turn has no `--standalone` and the worker could not read the version, so it may be 2.x. Check `opencode --version` in the worker's login shell.
+
+  For this check an OpenCode launch waits up to ten seconds for the version, not two. A turn that carries `--standalone` still starts when the version cannot be read: 2.x uses a private server and 1.x exits on the flag.
+- **Commands outside a turn.** The login check, the session delete and the settings catalog take their form from the version the worker observes at that moment. When it cannot read the version, the worker uses `--standalone` and skips `opencode models`.
+- **Models.** `--model` is passed through unchanged. 2.x accepts `provider/model#variant`; a plain `provider/model` works on both.
+
+The project's own Mac minis stay on OpenCode 1.x for now.
 
 
 ### Env profiles

@@ -68,7 +68,7 @@ warm and 10.4 seconds cold; Codex and OpenCode each get 15 seconds.
 | --- | --- | --- |
 | Codex | `codex debug models`, with `visibility: list` and native priority order | `~/.codex/models_cache.json`, then the current selection |
 | Cursor | `cursor-agent acp` → `cursor/list_available_models` using the selected environment profile | Native remembered models and the current selection |
-| OpenCode | `opencode models`, preserving usable `provider/model` IDs from every provider in CLI order | The existing current-provider list from `~/.cache/opencode/models.json`, then the current selection |
+| OpenCode | On OpenCode 1.x, `opencode models`, preserving usable `provider/model` IDs from every provider in CLI order. On 2.x there is no live source | The existing current-provider list from `~/.cache/opencode/models.json`, then the current selection |
 | Claude | Built-in `fable`, `opus`, `sonnet`, `haiku`, supplemented by `~/.claude/models.json` and `~/.claude/model-catalog.json` | Built-in aliases and the current selection |
 
 Codex and OpenCode use the adapters' account login shell with no environment-profile
@@ -79,6 +79,13 @@ and kills the process group on timeout or output overflow. Temporary directories
 are removed after discovery. A failed command, timeout, excessive output,
 malformed output, or empty catalog uses the existing file fallback. Codex may
 refresh its own model cache as a side effect of its catalog command.
+
+OpenCode 2 lists models only through its shared background service, which a
+settings read must neither use nor start, and `opencode models --standalone`
+prints nothing. Discovery therefore runs `opencode --version` first and
+`opencode models` only when the version is positively 1.x. On 2.x, and when the
+version cannot be read, OpenCode returns `remembered`. Both commands share the
+15-second budget.
 
 OpenCode output is stripped of ANSI sequences, validated, and deduplicated. The
 cache supplies display names only; it cannot add unavailable models to a live
