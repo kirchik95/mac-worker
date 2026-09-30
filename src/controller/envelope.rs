@@ -147,10 +147,22 @@ pub fn settle_operation_envelope(
         .map_err(store_io)
 }
 
+#[derive(Debug, Default)]
+pub struct PendingEnvelopes {
+    pub pending: Vec<OperationEnvelope>,
+    pub unreadable: Vec<UnreadableEnvelope>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnreadableEnvelope {
+    pub request_id: Option<String>,
+    pub code: String,
+}
+
 pub fn list_pending_envelopes(
     cache_root: &Path,
     all: bool,
-) -> Result<Vec<OperationEnvelope>, WorkerError> {
+) -> Result<PendingEnvelopes, WorkerError> {
     list_pending_envelopes_at(cache_root, all, now_millis()?)
 }
 
@@ -158,36 +170,51 @@ fn list_pending_envelopes_at(
     cache_root: &Path,
     all: bool,
     now: u64,
-) -> Result<Vec<OperationEnvelope>, WorkerError> {
+) -> Result<PendingEnvelopes, WorkerError> {
     let Some(root) = open_existing_controller_root(cache_root)? else {
-        return Ok(Vec::new());
+        return Ok(PendingEnvelopes::default());
     };
-    let mut pending = Vec::new();
+    let mut report = PendingEnvelopes::default();
     for name in root.list_names().map_err(store_io)? {
-        let Ok(name) = String::from_utf8(name) else {
-            continue;
-        };
-        if !is_envelope_name(&name) {
+        if !name.starts_with(b"op-") || !name.ends_with(b".json") {
             continue;
         }
+        let name = String::from_utf8(name).ok();
+        let Some(name) = name.filter(|name| is_envelope_name(name)) else {
+            report.unreadable.push(UnreadableEnvelope {
+                request_id: None,
+                code: "CONTROLLER_TRANSPORT".into(),
+            });
+            continue;
+        };
         let envelope = match load_envelope(&root, &name) {
             Ok(envelope) => envelope,
             // A concurrent prune may remove a settled entry after enumeration.
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                report.unreadable.push(UnreadableEnvelope {
+                    // The validated filename is trustworthy even if its body is not.
+                    request_id: Some(name[3..name.len() - 5].to_owned()),
+                    code: error.public_code(),
+                });
+                continue;
+            }
         };
         if envelope.settled_at_millis.is_none()
             && (all || now.saturating_sub(envelope.created_at_millis) <= ENVELOPE_WINDOW_MILLIS)
         {
-            pending.push(envelope);
+            report.pending.push(envelope);
         }
     }
-    pending.sort_by(|a, b| {
+    report.pending.sort_by(|a, b| {
         b.created_at_millis
             .cmp(&a.created_at_millis)
             .then_with(|| a.request_id.cmp(&b.request_id))
     });
-    Ok(pending)
+    report
+        .unreadable
+        .sort_by(|a, b| a.request_id.cmp(&b.request_id));
+    Ok(report)
 }
 
 fn is_envelope_name(name: &str) -> bool {
@@ -224,7 +251,8 @@ fn prune_settled_from(
         .chain(&names[..start])
         .take(PRUNE_SCAN_LIMIT)
     {
-        if let Ok(envelope) = load_envelope(root, name)
+        if let Ok(bytes) = root.read_private_regular(name, MAX_ENVELOPE_BYTES)
+            && let Ok(envelope) = decode_envelope_metadata(name, &bytes)
             && envelope
                 .settled_at_millis
                 .is_some_and(|settled| now.saturating_sub(settled) > ENVELOPE_WINDOW_MILLIS)
@@ -267,24 +295,37 @@ fn load_envelope(
 }
 
 fn decode_envelope(name: &str, bytes: &[u8]) -> Result<OperationEnvelope, WorkerError> {
-    let envelope: OperationEnvelope = serde_json::from_slice(bytes).map_err(|_| {
-        WorkerError::Protocol("CONTROLLER_TRANSPORT: operation envelope is invalid".into())
-    })?;
+    let envelope = decode_envelope_metadata(name, bytes)?;
     validate_envelope(name, &envelope)?;
     Ok(envelope)
 }
 
+// Retention depends on settlement metadata, not the protocol used to hash the
+// frozen payload. Retry and pending listing still require the current digest.
+fn decode_envelope_metadata(name: &str, bytes: &[u8]) -> Result<OperationEnvelope, WorkerError> {
+    let envelope: OperationEnvelope = serde_json::from_slice(bytes).map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_TRANSPORT: operation envelope is invalid".into())
+    })?;
+    validate_envelope_metadata(name, &envelope)?;
+    Ok(envelope)
+}
+
 fn validate_envelope(name: &str, envelope: &OperationEnvelope) -> Result<(), WorkerError> {
-    if envelope_file_name(&envelope.request_id)? != name {
-        return Err(WorkerError::Protocol(
-            "CONTROLLER_TRANSPORT: operation envelope id does not match its filename".into(),
-        ));
-    }
+    validate_envelope_metadata(name, envelope)?;
     let digest = canonical_request_sha256(PROTOCOL_VERSION, &envelope.command, &envelope.body)?;
     if digest != envelope.payload_sha256 {
         return Err(WorkerError::task(
             "CONTROLLER_ENVELOPE_INCOMPATIBLE",
             "saved request does not match this protocol version or its frozen payload; retry refused",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_envelope_metadata(name: &str, envelope: &OperationEnvelope) -> Result<(), WorkerError> {
+    if envelope_file_name(&envelope.request_id)? != name {
+        return Err(WorkerError::Protocol(
+            "CONTROLLER_TRANSPORT: operation envelope id does not match its filename".into(),
         ));
     }
     if envelope.settled_at_millis.is_some() != envelope.outcome.is_some() {
@@ -408,6 +449,7 @@ mod tests {
         let ids = |all| {
             list_pending_envelopes_at(&cache, all, now)
                 .unwrap()
+                .pending
                 .iter()
                 .map(|e| e.request_id().to_owned())
                 .collect::<Vec<_>>()
@@ -425,6 +467,7 @@ mod tests {
         assert!(
             list_pending_envelopes_at(&missing, false, now)
                 .unwrap()
+                .pending
                 .is_empty()
         );
         assert!(!missing.exists());
@@ -517,7 +560,7 @@ mod tests {
         let path = |id| cache.join(format!("op-{id:032x}.json"));
         std::fs::write(path(4), b"invalid json").unwrap();
         rewrite(&cache, 5, |value| {
-            value["payload_sha256"] = json!("0".repeat(64))
+            value["request_id"] = json!(request(6).request_id())
         });
         rewrite(&cache, 6, |value| value["outcome"] = Value::Null);
         let outside = temp.path().join("outside.json");
@@ -557,6 +600,44 @@ mod tests {
         .unwrap();
         prune_settled(&root, ENVELOPE_WINDOW_MILLIS + 2).unwrap();
         assert_eq!(std::fs::read(cursor).unwrap(), b"legacy cursor is opaque");
+    }
+
+    #[test]
+    fn pruning_expires_foreign_protocol_settlements_but_keeps_pending_recent_and_unsafe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        for (id, settled) in [(1, Some(1)), (2, None), (3, Some(2)), (4, Some(1))] {
+            seed_envelope(&root, id, settled);
+            rewrite(&cache, id, |value| {
+                value["payload_sha256"] = json!(
+                    canonical_request_sha256(
+                        PROTOCOL_VERSION - 1,
+                        request(id).command(),
+                        request(id).body()
+                    )
+                    .unwrap()
+                )
+            });
+        }
+        let path = |id| cache.join(format!("op-{id:032x}.json"));
+        std::fs::set_permissions(path(4), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            load_operation_envelope(&cache, request(1).request_id())
+                .unwrap_err()
+                .public_code(),
+            "CONTROLLER_ENVELOPE_INCOMPATIBLE"
+        );
+        prune_settled_from(&root, ENVELOPE_WINDOW_MILLIS + 2, 0).unwrap();
+        assert!(
+            !path(1).exists(),
+            "expired settlement does not depend on today's protocol digest"
+        );
+        for id in 2..=4 {
+            assert!(path(id).exists());
+        }
     }
 
     #[test]

@@ -140,12 +140,12 @@ fn pending_lists_safe_identifiers_without_prompts_and_honors_all() {
     let (exit, stdout, stderr) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
     assert_eq!(exit, 0, "{stderr}");
     let pending: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(pending[0]["request_id"], ID);
-    assert_eq!(pending[0]["command"], "task.batch");
-    assert_eq!(pending[0]["task_ids"], json!([TASK]));
-    assert_eq!(pending[0]["turn_ids"], json!([TURN]));
-    assert_eq!(pending[0]["run_ids"], json!([RUN]));
-    assert!(pending[0]["age_millis"].is_u64());
+    assert_eq!(pending["pending"][0]["request_id"], ID);
+    assert_eq!(pending["pending"][0]["command"], "task.batch");
+    assert_eq!(pending["pending"][0]["task_ids"], json!([TASK]));
+    assert_eq!(pending["pending"][0]["turn_ids"], json!([TURN]));
+    assert_eq!(pending["pending"][0]["run_ids"], json!([RUN]));
+    assert!(pending["pending"][0]["age_millis"].is_u64());
     assert!(!stdout.contains("PRIVATE"));
     let (_, text, _) = fixture.run(&["controller", "pending"], &NoTransport);
     for value in [ID, "task.batch", TASK, TURN, RUN] {
@@ -157,12 +157,95 @@ fn pending_lists_safe_identifiers_without_prompts_and_honors_all() {
         .as_millis() as u64;
     fixture.rewrite(|value| value["created_at_millis"] = json!(now - 8 * 24 * 60 * 60 * 1000));
     let (_, stdout, _) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
-    assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), json!([]));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap(),
+        json!({"pending": [], "unreadable": []})
+    );
     let (_, stdout, _) = fixture.run(&["controller", "pending", "--all", "--json"], &NoTransport);
     assert_eq!(
-        serde_json::from_str::<Value>(&stdout).unwrap()[0]["request_id"],
+        serde_json::from_str::<Value>(&stdout).unwrap()["pending"][0]["request_id"],
         ID
     );
+}
+
+#[test]
+fn pending_skips_unreadable_envelopes_and_reports_them_without_private_details() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = Fixture::new(true);
+    let cache = fixture.paths.controller_cache_root();
+    let envelope = persist_operation_envelope(&cache, &request()).unwrap();
+    let valid = serde_json::to_value(&envelope).unwrap();
+    let path = |id| cache.join(format!("op-{id:032x}.json"));
+    for id in 1..=5 {
+        let mut value = valid.clone();
+        value["request_id"] = json!(format!("{id:032x}"));
+        if id == 2 {
+            value["payload_sha256"] = json!(
+                canonical_request_sha256(
+                    PROTOCOL_VERSION - 1,
+                    request().command(),
+                    request().body()
+                )
+                .unwrap()
+            );
+        }
+        fs::write(path(id), serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(path(id), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(path(1), b"PRIVATE corrupt envelope").unwrap();
+    let outside = fixture._temp.path().join("outside.json");
+    fs::rename(path(3), &outside).unwrap();
+    let outside_bytes = fs::read(&outside).unwrap();
+    symlink(&outside, path(3)).unwrap();
+    fs::set_permissions(path(4), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(path(5)).unwrap();
+    fs::create_dir(path(5)).unwrap();
+    fs::write(cache.join("op-invalid.json"), b"PRIVATE invalid name").unwrap();
+
+    for args in [
+        vec!["controller", "pending", "--json"],
+        vec!["controller", "pending", "--all", "--json"],
+    ] {
+        let (exit, stdout, stderr) = fixture.run(&args, &NoTransport);
+        assert_eq!(exit, 0, "{stderr}");
+        assert_eq!(stderr, "6 saved controller requests could not be read\n");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(report["pending"][0]["request_id"], ID);
+        let unreadable = report["unreadable"].as_array().unwrap();
+        assert_eq!(unreadable.len(), 6);
+        for id in 1..=5 {
+            assert!(
+                unreadable
+                    .iter()
+                    .any(|entry| entry["request_id"] == format!("{id:032x}"))
+            );
+        }
+        assert!(unreadable.iter().any(|entry| entry["request_id"].is_null()));
+        assert!(!stdout.contains("PRIVATE"));
+        assert!(!stdout.contains("outside.json"));
+    }
+    let (exit, stdout, stderr) = fixture.run(&["controller", "pending"], &NoTransport);
+    assert_eq!(exit, 0);
+    assert!(stdout.contains(ID));
+    assert_eq!(stderr, "6 saved controller requests could not be read\n");
+    for (id, code) in [
+        (1, "CONTROLLER_TRANSPORT"),
+        (2, "CONTROLLER_ENVELOPE_INCOMPATIBLE"),
+        (3, "IO"),
+        (4, "IO"),
+        (5, "IO"),
+    ] {
+        let (exit, _, stderr) = fixture.run(
+            &["controller", "retry", &format!("{id:032x}")],
+            &NoTransport,
+        );
+        assert_ne!(exit, 0);
+        assert!(stderr.contains(code), "{stderr}");
+    }
+    assert_eq!(fs::read(outside).unwrap(), outside_bytes);
+    assert_eq!(fs::read(path(1)).unwrap(), b"PRIVATE corrupt envelope");
 }
 
 #[test]
@@ -188,7 +271,10 @@ fn retry_reconstructs_frozen_frame_settles_and_prints_ack_result() {
         .unwrap();
     assert!(serde_json::to_value(envelope).unwrap()["settled_at_millis"].is_u64());
     let (_, pending, _) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
-    assert_eq!(serde_json::from_str::<Value>(&pending).unwrap(), json!([]));
+    assert_eq!(
+        serde_json::from_str::<Value>(&pending).unwrap(),
+        json!({"pending": [], "unreadable": []})
+    );
     let (exit, text, stderr) = fixture.run(&["controller", "retry", ID], &runner);
     assert_eq!(exit, 0, "{stderr}");
     assert!(text.contains(&format!("request {ID} (task.batch): acknowledged")));

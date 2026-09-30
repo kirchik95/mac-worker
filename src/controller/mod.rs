@@ -42,8 +42,8 @@ pub use batch::{
 };
 pub use batch_freeze::{LaptopBatchSourceStream, LaptopFrozenBatch, freeze_laptop_batch};
 pub use envelope::{
-    OperationEnvelope, OperationOutcome, list_pending_envelopes, load_operation_envelope,
-    persist_operation_envelope,
+    OperationEnvelope, OperationOutcome, PendingEnvelopes, list_pending_envelopes,
+    load_operation_envelope, persist_operation_envelope,
 };
 pub use execute::{
     TaskSubmitHandler, send_controller_mutation, send_controller_read, send_controller_request,

@@ -1136,6 +1136,14 @@ fn run_controller_command(
                         &paths.controller_cache_root(),
                         all,
                     )?;
+                    if !envelopes.unreadable.is_empty() {
+                        let _ = writeln!(
+                            stderr,
+                            "{} saved controller requests could not be read",
+                            envelopes.unreadable.len()
+                        );
+                        let _ = stderr.flush();
+                    }
                     write_controller_pending(&envelopes, json, stdout)?;
                 }
                 ControllerCommand::Retry { request_id } => {
@@ -5439,7 +5447,7 @@ impl ControllerIdentifiers {
 }
 
 fn write_controller_pending(
-    envelopes: &[crate::controller::OperationEnvelope],
+    envelopes: &crate::controller::PendingEnvelopes,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<(), WorkerError> {
@@ -5453,6 +5461,7 @@ fn write_controller_pending(
     }
     let now = current_time_millis()?;
     let rows = envelopes
+        .pending
         .iter()
         .map(|envelope| {
             let mut ids = ControllerIdentifiers::default();
@@ -5466,7 +5475,10 @@ fn write_controller_pending(
         })
         .collect::<Vec<_>>();
     if json {
-        write_json_line(stdout, &rows)?;
+        write_json_line(
+            stdout,
+            &serde_json::json!({"pending": rows, "unreadable": envelopes.unreadable}),
+        )?;
     } else {
         writeln!(
             stdout,

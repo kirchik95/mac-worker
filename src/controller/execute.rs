@@ -1529,12 +1529,15 @@ mod tests {
             serde_json::from_slice::<Value>(&stdout).unwrap()
         };
         let listed = invoke(&["controller", "pending", "--json"]);
-        assert_eq!(listed[0]["request_id"], REQUEST_A);
+        assert_eq!(listed["pending"][0]["request_id"], REQUEST_A);
         rpc.lose_ack.store(false, Ordering::SeqCst);
         let recovered = invoke(&["controller", "retry", REQUEST_A, "--json"]);
         assert_eq!(recovered["task_id"], body.task_id.to_string());
         assert_eq!(recovered["turn_id"], body.turn_id.to_string());
-        assert_eq!(invoke(&["controller", "pending", "--json"]), json!([]));
+        assert_eq!(
+            invoke(&["controller", "pending", "--json"]),
+            json!({"pending": [], "unreadable": []})
+        );
         assert_eq!(state.list_tasks().unwrap().len(), 1);
         assert_eq!(state.load_task(body.task_id).unwrap(), saved_task);
         assert_eq!(rpc.attempts.load(Ordering::SeqCst), 5);
