@@ -463,6 +463,7 @@ impl<'a> TurnRunner<'a> {
         mut follow: Option<&mut dyn Write>,
         allow_reassignment: bool,
     ) -> Result<TurnOutcomeReport, WorkerError> {
+        let _hints = self.client_state.event_scope();
         ignore_sigpipe();
         // Legacy batch dispatch recovery deliberately skips task-turn rows,
         // but keeping the call here preserves the runner's recovery stage
@@ -893,6 +894,7 @@ impl<'a> TurnRunner<'a> {
         owner: ProcessIdentity,
         observations: &[CandidateObservation],
     ) -> Result<Option<(TaskId, crate::job::QueueClaim)>, WorkerError> {
+        let _hints = self.client_state.event_scope();
         // Reusing a process still starts a different turn. Fence the queue
         // claim and recipient ownership publication just like a new spawn.
         let Some(_drain_permit) = crate::controller::drain::launch_permit(
@@ -1388,6 +1390,12 @@ impl<'a> TurnRunner<'a> {
                         response.task().clone()
                     };
                     self.persist_status(task_id, status.clone())?;
+                    self.capture_accepted_status(
+                        task_id,
+                        turn_id,
+                        initial_record.meta().run_id(),
+                        worker,
+                    );
                     self.client_state.remove_turn_prompt(task_id, turn_id)?;
                     append_event(
                         &mut log,
@@ -1417,6 +1425,12 @@ impl<'a> TurnRunner<'a> {
                     .status()
                     .clone();
                 self.persist_status(task_id, status.clone())?;
+                self.capture_accepted_status(
+                    task_id,
+                    turn_id,
+                    initial_record.meta().run_id(),
+                    worker,
+                );
                 self.client_state.remove_turn_prompt(task_id, turn_id)?;
                 status
             }
@@ -1855,6 +1869,24 @@ impl<'a> TurnRunner<'a> {
             self.persist_status(task_id, status)?;
         }
         Ok(())
+    }
+
+    fn capture_accepted_status(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        run_id: Option<crate::task::RunId>,
+        worker: &WorkerEntry,
+    ) {
+        if let Ok(worker) = crate::controller::events::WorkerName::parse(&worker.name) {
+            self.client_state
+                .capture_accepted_turn(crate::controller::events::AcceptedHint {
+                    task_id,
+                    turn_id,
+                    run_id,
+                    worker,
+                });
+        }
     }
 
     fn persist_status(&self, task_id: TaskId, status: TaskStatus) -> Result<(), WorkerError> {
@@ -2408,6 +2440,7 @@ pub fn start_runner_with_reservation(
     slot_limit: usize,
     exclude_reserver: bool,
 ) -> Result<RunnerStart, WorkerError> {
+    let _hints = client_state.event_scope();
     let Some(_drain_permit) = crate::controller::drain::launch_permit(
         &paths.controller_state_root(),
         client_state.wait_deadline(),
@@ -3552,17 +3585,21 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
                     crate::runner_log::RunnerLog::open(&paths.state, task_id, turn_id).unwrap();
                 std::thread::scope(|scope| {
                     let resume = ResumeOnDrop(Some(resume_tx));
-                    let helper = scope.spawn(|| match expected.as_ref() {
-                        Some(expected) => open_handoff_journal_after_bind(
-                            &store, &paths, task_id, turn_id, token, owner, expected,
-                        ),
-                        None => open_handoff_journal_for_spawn(
-                            &store,
-                            &paths,
-                            task_id,
-                            turn_id,
-                            Some(token),
-                        ),
+                    let helper = scope.spawn(|| {
+                        let result = match expected.as_ref() {
+                            Some(expected) => open_handoff_journal_after_bind(
+                                &store, &paths, task_id, turn_id, token, owner, expected,
+                            ),
+                            None => open_handoff_journal_for_spawn(
+                                &store,
+                                &paths,
+                                task_id,
+                                turn_id,
+                                Some(token),
+                            ),
+                        };
+                        // The log's deferred scope must stay on its owning thread.
+                        expect_task_busy(result);
                     });
                     wait_confirmed_contention_then_mutate(entered_rx, resume, held, || {
                         if adopt {
@@ -3571,7 +3608,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
                             store.retain_task_turn_cancel(turn_id, 11).unwrap();
                         }
                     });
-                    expect_task_busy(helper.join().unwrap());
+                    helper.join().unwrap();
                     let row = store.queue_entry(turn_id).unwrap().unwrap();
                     if adopt {
                         assert_eq!(

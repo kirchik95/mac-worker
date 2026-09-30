@@ -53,6 +53,8 @@ pub(crate) struct RunnerLog {
     /// Dropped after `file` so the exclusion covers the locked FD's lifetime.
     #[cfg(test)]
     _fork_exclusion: crate::test_sync::HeldFlock,
+    // Dropped last: optional hints cannot escape this existing log fence.
+    _hints: crate::client_state::events::DeferredHints,
 }
 fn invalid() -> WorkerError {
     WorkerError::task(
@@ -180,6 +182,7 @@ impl RunnerLog {
     }
 
     pub(crate) fn open(root: &Path, task_id: TaskId, turn_id: TurnId) -> Result<Self, WorkerError> {
+        let hints = crate::client_state::events::DeferredHints::fence();
         #[cfg(test)]
         let fork_exclusion = crate::test_sync::HeldFlock::acquire();
         let dir = directory(root, task_id, true)?;
@@ -227,6 +230,7 @@ impl RunnerLog {
             poisoned: false,
             #[cfg(test)]
             _fork_exclusion: fork_exclusion,
+            _hints: hints,
         };
         writer.recover()?;
         Ok(writer)

@@ -1099,4 +1099,152 @@ pub(crate) mod tests {
             .unwrap();
         assert!(sink.events().is_empty());
     }
+
+    #[test]
+    fn accepted_status_proof_required() {
+        use crate::controller::events::{AcceptedHint, WorkerName};
+        let (_dir, store, sink) = store_with_sink();
+        let record = task_record();
+        store.create_task(record.clone()).unwrap();
+        let turn = record.status().turns()[0].turn_id();
+        let prepared = TaskStatus::new(
+            TaskState::Active,
+            None,
+            Some("mini-1".into()),
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            record.status().turns().to_vec(),
+            110,
+        )
+        .unwrap();
+        store
+            .mutate_task(record.meta().task_id(), Some(turn), |current| {
+                current.with_status(prepared)
+            })
+            .unwrap();
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TurnStarted(_)))
+        );
+        sink.clear();
+        store.capture_accepted_turn(AcceptedHint {
+            task_id: record.meta().task_id(),
+            turn_id: turn,
+            run_id: record.meta().run_id(),
+            worker: WorkerName::parse("mini-1").unwrap(),
+        });
+        assert_eq!(sink.events().len(), 1);
+        assert!(matches!(&sink.events()[0], NewEvent::TurnStarted(hint) if hint.turn_id == turn));
+    }
+
+    #[test]
+    fn real_log_fence_delays_started_and_terminal_hints() {
+        use crate::controller::events::{AcceptedHint, WorkerName};
+        let (_dir, bare, _) = store_with_sink();
+        let record = task_record();
+        bare.create_task(record.clone()).unwrap();
+        let task = record.meta().task_id();
+        let turn = record.status().turns()[0].turn_id();
+        let log = crate::runner_log::RunnerLog::open(&bare.inner.state_root, task, turn).unwrap();
+        let locked = vec![
+            bare.inner.state_root.clone(),
+            bare.inner.state_root.join("jobs.lock"),
+            bare.inner
+                .state_root
+                .join(format!("runners/{task}/{turn}.log")),
+        ];
+        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
+        let store = bare.with_event_sink(sink.clone());
+        store.capture_accepted_turn(AcceptedHint {
+            task_id: task,
+            turn_id: turn,
+            run_id: None,
+            worker: WorkerName::parse("mini-1").unwrap(),
+        });
+        let terminal = terminal_record(&record, TaskOutcome::Done);
+        store.update_task_if_current(&record, terminal).unwrap();
+        assert!(
+            sink.events().is_empty(),
+            "existing log fence may span the entire turn"
+        );
+        drop(log);
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TurnStarted(_)))
+        );
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TurnFinished(_)))
+        );
+        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn drain_hint_after_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("controller");
+        crate::controller::drain::set_drained(&root, false).unwrap();
+        let locked = vec![root.join("drain.lock")];
+        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
+        crate::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![NewEvent::ControllerDrainChanged { drained: true }]
+        );
+        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+        sink.clear();
+        crate::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
+            .unwrap();
+        assert!(sink.events().is_empty());
+        crate::controller::drain::set_drained_with_event_sink(&root, false, Some(sink.clone()))
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![NewEvent::ControllerDrainChanged { drained: false }]
+        );
+    }
+
+    #[test]
+    fn real_launch_permit_defers_nested_store_hints() {
+        let (_dir, store, sink) = store_with_sink();
+        let root = store.inner.state_root.parent().unwrap().join("controller");
+        crate::controller::drain::set_drained(&root, false).unwrap();
+        let permit = crate::controller::drain::launch_permit(&root, store.wait_deadline())
+            .unwrap()
+            .unwrap();
+        store.create_task(task_record()).unwrap();
+        assert!(sink.events().is_empty());
+        drop(permit);
+        assert_eq!(sink.events().len(), 1);
+    }
+
+    #[test]
+    fn sink_survives_clone_deadline_handle_and_bound_reopen() {
+        let (_dir, store, sink) = store_with_sink();
+        let deadline = store.with_wait_deadline(crate::client_state::WaitDeadline::default());
+        deadline.clone().create_task(task_record()).unwrap();
+        assert_eq!(sink.events().len(), 1);
+        sink.clear();
+        let reopened = store.reopen_until(None).unwrap();
+        reopened.create_task(task_record()).unwrap();
+        assert_eq!(sink.events().len(), 1);
+    }
+
+    #[test]
+    fn reopen_refuses_replaced_store_binding() {
+        let (_dir, store, _sink) = store_with_sink();
+        let root = store.inner.state_root.clone();
+        std::fs::rename(&root, root.with_extension("retired")).unwrap();
+        ClientStateStore::open(&root).unwrap();
+        assert!(store.reopen_until(None).is_err());
+    }
 }

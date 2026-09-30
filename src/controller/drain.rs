@@ -16,6 +16,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::WorkerError, rooted_fs::RootedDir};
 
+/// Optional sink is supplied only after opening an initialized host journal.
+pub fn set_drained_with_event_sink(
+    state_root: &Path,
+    drained: bool,
+    sink: Option<std::sync::Arc<dyn crate::controller::events::EventSink>>,
+) -> Result<(), WorkerError> {
+    let hints = sink.map(crate::client_state::events::DeferredHints::begin);
+    let root = open_controller_root(state_root)?;
+    let lock = root.open_private_lock(DRAIN_LOCK).map_err(store_io)?;
+    lock_exclusive(&lock)?;
+    validate_lock(&root, &lock)?;
+    let next = state_bytes(drained)?;
+    let changed = if root.entry_exists(DRAIN_FILE).map_err(store_io)? {
+        let (previous, state) = read_state(&root)?;
+        if state.drained != drained {
+            root.replace_private_regular_exact(DRAIN_FILE, &previous, &next)
+                .map_err(store_io)?;
+            true
+        } else {
+            false
+        }
+    } else {
+        root.write_private_atomic_no_replace(DRAIN_FILE, &next)
+            .map_err(store_io)?;
+        true
+    };
+    if changed && let Some(hints) = &hints {
+        hints.capture(crate::controller::events::NewEvent::ControllerDrainChanged { drained });
+    }
+    mark_initialized(&root, &lock)?;
+    // On both success and error, reverse local drop order releases the lock first.
+    Ok(())
+}
+
 use super::leader::{
     lock_exclusive, open_controller_root, open_existing_controller_root, store_io,
 };
@@ -34,6 +68,7 @@ struct DrainState {
 /// Held only for the new runner's spawn/handoff, never for a running turn.
 pub(crate) struct DrainLaunchPermit {
     _lock: Option<File>,
+    _hints: crate::client_state::events::DeferredHints,
 }
 
 /// Establish the lock before a controller store can execute any requests.
@@ -59,21 +94,7 @@ pub(crate) fn initialize(root: &RootedDir) -> Result<(), WorkerError> {
 /// Persist the valve under the same lock used for runner admission. This
 /// does not stop a running turn or prevent durable request publication.
 pub fn set_drained(state_root: &Path, drained: bool) -> Result<(), WorkerError> {
-    let root = open_controller_root(state_root)?;
-    let lock = root.open_private_lock(DRAIN_LOCK).map_err(store_io)?;
-    lock_exclusive(&lock)?;
-    validate_lock(&root, &lock)?;
-    let next = state_bytes(drained)?;
-    if root.entry_exists(DRAIN_FILE).map_err(store_io)? {
-        let (previous, _) = read_state(&root)?;
-        root.replace_private_regular_exact(DRAIN_FILE, &previous, &next)
-            .map_err(store_io)?;
-    } else {
-        root.write_private_atomic_no_replace(DRAIN_FILE, &next)
-            .map_err(store_io)?;
-    }
-    mark_initialized(&root, &lock)?;
-    Ok(())
+    set_drained_with_event_sink(state_root, drained, None)
 }
 
 /// Read-only observation. A missing controller store is ordinary local
@@ -96,19 +117,29 @@ pub(crate) fn launch_permit(
     state_root: &Path,
     deadline: crate::client_state::WaitDeadline,
 ) -> Result<Option<DrainLaunchPermit>, WorkerError> {
+    let hints = crate::client_state::events::DeferredHints::fence();
     deadline.remaining()?;
     let Some(root) = open_existing_controller_root(state_root)? else {
-        return Ok(Some(DrainLaunchPermit { _lock: None }));
+        return Ok(Some(DrainLaunchPermit {
+            _lock: None,
+            _hints: hints,
+        }));
     };
     let Some(lock) = existing_lock(&root)? else {
-        return Ok(Some(DrainLaunchPermit { _lock: None }));
+        return Ok(Some(DrainLaunchPermit {
+            _lock: None,
+            _hints: hints,
+        }));
     };
     deadline.lock(lock.as_raw_fd(), libc::LOCK_SH)?;
     validate_lock(&root, &lock)?;
     if read_state(&root)?.1.drained {
         return Ok(None);
     }
-    Ok(Some(DrainLaunchPermit { _lock: Some(lock) }))
+    Ok(Some(DrainLaunchPermit {
+        _lock: Some(lock),
+        _hints: hints,
+    }))
 }
 
 fn existing_lock(root: &RootedDir) -> Result<Option<File>, WorkerError> {

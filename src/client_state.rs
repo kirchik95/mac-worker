@@ -488,6 +488,47 @@ impl ClientStateStore {
         self
     }
 
+    /// Only a successfully saved accepted response authorizes this hint.
+    /// Prepared Active status and runner-log annotations are not acceptance.
+    pub fn capture_accepted_turn(&self, hint: crate::controller::events::AcceptedHint) {
+        let _hints = self.event_scope();
+        self.capture_hint(crate::controller::events::NewEvent::TurnStarted(hint));
+    }
+
+    /// Reopen a deadline-bound handle without crossing its original binding.
+    pub fn reopen_until(&self, expires: Option<Instant>) -> Result<Self, WorkerError> {
+        let deadline = WaitDeadline::until(expires);
+        deadline.remaining()?;
+        let expected = FileIdentity::from_stat(stat_fd(self.inner.root.as_raw_fd())?);
+        let current = open_directory_path(&self.inner.state_root)?;
+        require_owned_directory(current.as_raw_fd())?;
+        if FileIdentity::from_stat(stat_fd(current.as_raw_fd())?) != expected {
+            return Err(invalid_state(
+                "client state binding changed while reopening",
+            ));
+        }
+        let mut reopened = Self::open_inner(
+            &self.inner.state_root,
+            None,
+            None,
+            self.inner.owner_inspector.clone(),
+            self.inner.concurrency_hook.clone(),
+            deadline,
+        )?;
+        if FileIdentity::from_stat(stat_fd(reopened.inner.root.as_raw_fd())?) != expected
+            || reopened.client_id() != self.client_id()
+        {
+            return Err(invalid_state(
+                "client state binding changed while reopening",
+            ));
+        }
+        reopened.event_sink = self.event_sink.clone();
+        reopened.timings = self.timings;
+        reopened.liveness_clock = self.liveness_clock.clone();
+        reopened.admission_clock = self.admission_clock.clone();
+        Ok(reopened)
+    }
+
     pub(crate) fn event_scope(&self) -> Option<events::DeferredHints> {
         self.event_sink
             .as_ref()
