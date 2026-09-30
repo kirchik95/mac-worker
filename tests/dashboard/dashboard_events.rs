@@ -120,7 +120,10 @@ impl Ticks {
     }
     fn cancel(&self) {
         self.runtime.cancel();
+        let mut gate = self.gate.0.lock().unwrap();
+        gate.permits += 1;
         self.gate.1.notify_all();
+        drop(gate);
         self.runtime.clear_sleep_hook();
     }
 }
@@ -444,6 +447,8 @@ struct ProjectionSource {
     local_version: Arc<AtomicU64>,
     remote_calls: Arc<AtomicUsize>,
     worker_calls: Arc<AtomicUsize>,
+    worker_failure: Arc<AtomicBool>,
+    local_calls: Arc<AtomicUsize>,
     worker_stamp: Arc<AtomicU64>,
     hold: ProjectionHold,
     local_hold: ProjectionHold,
@@ -454,6 +459,8 @@ impl ProjectionSource {
             local_version: Arc::new(AtomicU64::new(1)),
             remote_calls: Arc::new(AtomicUsize::new(0)),
             worker_calls: Arc::new(AtomicUsize::new(0)),
+            worker_failure: Arc::new(AtomicBool::new(false)),
+            local_calls: Arc::new(AtomicUsize::new(0)),
             worker_stamp: Arc::new(AtomicU64::new(100)),
             hold: Arc::new(Mutex::new(None)),
             local_hold: Arc::new(Mutex::new(None)),
@@ -505,6 +512,12 @@ impl DashboardDataSource for ProjectionSource {
     }
     fn collect_workers(&self, _: Duration) -> Vec<WorkerObservationResult> {
         self.worker_calls.fetch_add(1, Ordering::SeqCst);
+        if self.worker_failure.load(Ordering::SeqCst) {
+            return vec![WorkerObservationResult::Failed {
+                worker_name: "mini-1".into(),
+                error: DashboardError::new("WORKER_UNAVAILABLE", "fixture worker unavailable"),
+            }];
+        }
         let stamp = self.worker_stamp.load(Ordering::SeqCst);
         vec![WorkerObservationResult::Current(Observation {
             observed_at_millis: stamp,
@@ -542,6 +555,7 @@ impl DashboardDataSource for ProjectionSource {
         Ok(Vec::new())
     }
     fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
+        self.local_calls.fetch_add(1, Ordering::SeqCst);
         let projection = self.projection();
         if let Some((started, release)) = self.local_hold.lock().unwrap().take() {
             started.send(()).unwrap();
@@ -1527,4 +1541,154 @@ async fn replacing_the_live_journal_epoch_sends_a_repair_before_new_events() {
         matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event))
         if event.journal_id == next_epoch && event.seq == Seq::new(1))
     );
+}
+
+#[test]
+fn a_lost_task_fence_preserves_a_new_offline_worker_result() {
+    let source = ProjectionSource::new();
+    let clock = ManualClock(Arc::new(AtomicU64::new(100)));
+    let service = Arc::new(DashboardService::new(
+        source.clone(),
+        clock.clone(),
+        FixedClock,
+    ));
+    service.snapshot(Default::default()).unwrap();
+    clock.0.store(20_000, Ordering::SeqCst);
+    source.worker_failure.store(true, Ordering::SeqCst);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *source.hold.lock().unwrap() = Some((started_tx, release_rx));
+    let flight_service = service.clone();
+    let flight = thread::spawn(move || flight_service.snapshot(Default::default()).unwrap());
+    started_rx.recv().unwrap();
+    source.local_version.store(2, Ordering::SeqCst);
+    service.refresh_local_projection().unwrap();
+    release_tx.send(()).unwrap();
+    let full = flight.join().unwrap();
+    let visible = service.read_snapshot().unwrap();
+    assert_eq!(visible.task_view.tasks[0].updated_at_millis, 2);
+    assert_eq!(full.workers[0].health, WorkerHealth::Unavailable);
+    assert_eq!(visible.workers[0].freshness, Freshness::Offline);
+    assert_eq!(visible.workers[0].observed_at_millis, None);
+    assert_eq!(
+        visible.workers[0].error.as_ref().unwrap().code,
+        "WORKER_UNAVAILABLE"
+    );
+}
+
+struct SubscribeRuntime {
+    runtime: ManualEventRuntime,
+    hook: Mutex<Option<Hook>>,
+}
+impl EventRuntime for SubscribeRuntime {
+    fn now(&self) -> Duration {
+        self.runtime.now()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.runtime.sleep(duration);
+    }
+    fn cancelled(&self) -> bool {
+        if thread::current().name() != Some("dashboard-event-tailer") {
+            run_hook(&self.hook);
+        }
+        self.runtime.cancelled()
+    }
+}
+
+#[tokio::test]
+async fn stop_between_admission_check_and_watch_registration_closes_the_stream() {
+    let ticks = Arc::new(Ticks::new(ManualEventRuntime::new()));
+    let runtime = Arc::new(SubscribeRuntime {
+        runtime: ticks.runtime.clone(),
+        hook: Mutex::new(None),
+    });
+    let source = LocalViewerEventSource::new(
+        Arc::new(MemoryJournal::new()),
+        runtime.clone(),
+        Arc::new(FakeLocalProjectionRefresh::new()),
+    );
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *runtime.hook.lock().unwrap() = Some(Box::new(move || {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    }));
+    let stopping = source.clone();
+    let stopper = thread::spawn(move || {
+        started_rx.recv().unwrap();
+        stopping.stop();
+        release_tx.send(()).unwrap();
+    });
+    let mut stream = source.subscribe(Some(cursor(0))).unwrap();
+    let message = stream.recv().await;
+    stopper.join().unwrap();
+    source.stop();
+    ticks.cancel();
+    assert_eq!(message, None);
+}
+
+#[test]
+fn a_held_local_projection_cannot_replace_a_later_full_publication() {
+    let source = ProjectionSource::new();
+    let service = Arc::new(DashboardService::new(
+        source.clone(),
+        FixedClock,
+        FixedClock,
+    ));
+    service.snapshot(Default::default()).unwrap();
+    let mut publications = service.subscribe_publications();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *source.local_hold.lock().unwrap() = Some((started_tx, release_rx));
+    let flight_service = service.clone();
+    let flight = thread::spawn(move || flight_service.refresh_local_projection());
+    started_rx.recv().unwrap();
+    source.local_version.store(2, Ordering::SeqCst);
+    let full = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.blocking_recv().unwrap(), full.revision);
+    release_tx.send(()).unwrap();
+    let result = flight.join().unwrap();
+    let visible = service.read_snapshot().unwrap();
+    assert_eq!(visible.task_view.tasks[0].updated_at_millis, 2);
+    assert_eq!(visible.revision, full.revision);
+    assert!(result.is_err());
+    assert!(publications.try_recv().is_err());
+}
+
+#[derive(Default)]
+struct StepMonotonic(AtomicU64);
+impl MonotonicClock for StepMonotonic {
+    fn now_millis(&self) -> u64 {
+        self.0.fetch_add(100, Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn superseded_local_work_is_requeued_without_publishing_its_old_projection() {
+    let source = ProjectionSource::new();
+    let service = Arc::new(DashboardService::new(
+        source.clone(),
+        FixedClock,
+        StepMonotonic::default(),
+    ));
+    service.snapshot(Default::default()).unwrap();
+    let mut publications = service.subscribe_publications();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *source.local_hold.lock().unwrap() = Some((started_tx, release_rx));
+    let worker = service.start_local_projection_refresh().unwrap();
+    service.request_refresh();
+    started_rx.recv().unwrap();
+    source.local_version.store(2, Ordering::SeqCst);
+    let full = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.blocking_recv().unwrap(), full.revision);
+    release_tx.send(()).unwrap();
+    let local_revision = publications.blocking_recv().unwrap();
+    worker.stop();
+    let visible = service.read_snapshot().unwrap();
+    assert_eq!(source.local_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(visible.task_view.tasks[0].updated_at_millis, 2);
+    assert_eq!(visible.revision, local_revision);
+    assert_eq!(local_revision, full.revision + 1);
+    assert!(publications.try_recv().is_err());
 }

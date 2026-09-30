@@ -483,6 +483,9 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
     pub fn refresh_local_projection(&self) -> Result<u64, DashboardError> {
         // Do all record reads outside the publication lock. In particular this
         // does not share the collector flight or any worker/SSH deadline.
+        let started_at_revision = lock_recover(&self.completed)
+            .as_ref()
+            .map(|snapshot| snapshot.revision);
         let tasks = self.source.local_task_projection()?;
         let queue = self.source.queue_entries()?;
         let now_millis = self.clock.now_millis();
@@ -491,6 +494,16 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             return Err(DashboardError::new(
                 "DASHBOARD_REFRESH_ABORTED",
                 "local projection refresh was cancelled",
+            ));
+        }
+        if completed.as_ref().map(|snapshot| snapshot.revision) != started_at_revision {
+            // A full publication may have observed newer records while this
+            // local read was held. Re-read instead of restoring its old task
+            // or queue projection over that completed publication.
+            self.request_refresh();
+            return Err(DashboardError::new(
+                REFRESH_ABORTED,
+                "local projection was superseded during collection",
             ));
         }
         let mut snapshot = completed
@@ -563,7 +576,10 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                     .workers
                     .iter()
                     .find(|cached| cached.name == worker.name)
-                    && cached.observed_at_millis > worker.observed_at_millis
+                    && cached
+                        .observed_at_millis
+                        .zip(worker.observed_at_millis)
+                        .is_some_and(|(cached, collected)| cached > collected)
                 {
                     *worker = cached.clone();
                 }

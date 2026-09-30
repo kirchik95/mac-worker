@@ -74,7 +74,7 @@ impl LocalViewerEventSource {
                     }
                     tail.check();
                 }
-                let _ = shutdown.send(true);
+                shutdown.send_replace(true);
             });
         if spawn.is_err() {
             source.stop();
@@ -120,7 +120,7 @@ impl ViewerEventSource for LocalViewerEventSource {
     }
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 }
 
