@@ -532,7 +532,10 @@ Task commands use the same public grammar as today (`worker task --help`): `subm
 
 On submit the laptop freezes the prompt, project identity, settings, and base (`HEAD`, `--base`, or `--wip` / `--include`) and transfers that snapshot before the controller accepts the request. A retry of the **same original envelope** keeps that freeze; it does not recapture a later HEAD or `.worker.toml`. After accept you can close the laptop CLI. That ACK means the request is persisted on the controller store; it does **not** mean a runner or the agent has started — enabled submit can stay queued until `worker controller run` advances it. Reconnect with `status`, `logs`, `wait`, `list`, and the dashboard.
 
-In controller mode, `worker task logs -f TASK_ID` discovers features once. A controller advertising
+In controller mode, `worker task logs -f TASK_ID` discovers features at startup. If discovery is
+unavailable and supplies no feature list, it retries once after the first successful logs read. Long-polling
+starts only after the feature is confirmed; older controllers and advertised lists are not
+rediscovered. A controller advertising
 `controller.task-logs-wait` waits up to 20 seconds for new log bytes before replying, within the
 unchanged 30-second SSH deadline. Older controllers use an idle polling backoff from 100 ms to
 2 seconds, reset whenever bytes arrive. Follow pins the selected turn and keeps its byte offset

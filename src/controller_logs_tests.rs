@@ -48,7 +48,8 @@ enum Step {
 struct Rpc<'a> {
     clock: &'a Clock,
     health: Option<Value>, // None is the old-controller Unsupported response.
-    health_reads: Mutex<usize>,
+    health_failures: Mutex<usize>,
+    health_reads: Mutex<Vec<usize>>, // Log requests seen at each discovery attempt.
     steps: Mutex<VecDeque<Step>>,
     requests: Mutex<Vec<ControllerRequest>>,
 }
@@ -57,7 +58,8 @@ impl<'a> Rpc<'a> {
         Self {
             clock,
             health,
-            health_reads: Mutex::new(0),
+            health_failures: Mutex::new(0),
+            health_reads: Mutex::new(Vec::new()),
             steps: Mutex::new(steps.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -102,7 +104,19 @@ impl ProcessRunner for Rpc<'_> {
         };
         if request.command() == "task.list" {
             assert_eq!(request.body(), &json!({"controller_health": true}));
-            *self.health_reads.lock().unwrap() += 1;
+            self.health_reads
+                .lock()
+                .unwrap()
+                .push(self.requests.lock().unwrap().len());
+            let mut failures = self.health_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Ok(ProcessResult {
+                    status: ExitStatus::from_raw(255 << 8),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
             return match &self.health {
                 Some(health) => frame(0, &envelope(health.clone())),
                 None => frame(
@@ -210,7 +224,7 @@ fn follow_negotiates_once_and_does_not_sleep_between_long_poll_replies() {
     result.unwrap();
     assert_eq!(out, b"ab");
     assert!(err.is_empty());
-    assert_eq!(*rpc.health_reads.lock().unwrap(), 1);
+    assert_eq!(*rpc.health_reads.lock().unwrap(), [0]);
     assert!(clock.sleeps.lock().unwrap().is_empty());
     let requests = rpc.requests.lock().unwrap();
     for request in requests.iter() {
@@ -223,11 +237,97 @@ fn follow_negotiates_once_and_does_not_sleep_between_long_poll_replies() {
 }
 
 #[test]
+fn unavailable_discovery_retries_after_the_first_successful_log_read() {
+    for failed_log_reads in [0, 1] {
+        let clock = Clock::default();
+        let mut steps = vec![Step::Empty(255); failed_log_reads];
+        steps.extend([
+            Step::Chunk(b"before", false),
+            Step::Chunk(b"", false),
+            Step::Chunk(b"after", true),
+        ]);
+        let rpc = Rpc::new(&clock, supports_wait(), steps);
+        *rpc.health_failures.lock().unwrap() = 1;
+
+        let (result, out, err) = invoke(&rpc, true, true);
+        result.unwrap();
+        assert_eq!(out, b"beforeafter");
+        assert_eq!(
+            *rpc.health_reads.lock().unwrap(),
+            [0, failed_log_reads + 1],
+            "retry discovery only after a successful logs read"
+        );
+        assert_eq!(
+            err,
+            if failed_log_reads == 0 {
+                ""
+            } else {
+                "controller unreachable; retrying…\ncontroller reachable again\n"
+            }
+        );
+        assert_eq!(
+            *clock.sleeps.lock().unwrap(),
+            vec![Duration::from_secs(1); failed_log_reads],
+            "confirmed long-poll support removes legacy idle sleeps"
+        );
+        let requests = rpc.requests.lock().unwrap();
+        for request in &requests[..=failed_log_reads] {
+            assert!(request.body().get("wait_ms").is_none());
+        }
+        for request in &requests[failed_log_reads + 1..] {
+            assert!(request.body()["wait_ms"].as_u64().is_some());
+            assert_eq!(request.body()["offset"], 6);
+            assert_eq!(request.body()["turn_id"], turn_id().to_string());
+        }
+    }
+}
+
+#[test]
+fn unavailable_discovery_retries_only_once_without_assuming_features() {
+    for (failures, health) in [
+        (1, None),
+        (1, Some(health(None))),
+        (1, Some(health(Some(json!([]))))),
+        (2, supports_wait()),
+    ] {
+        let clock = Clock::default();
+        let rpc = Rpc::new(
+            &clock,
+            health,
+            vec![
+                Step::Chunk(b"", false),
+                Step::Chunk(b"", false),
+                Step::Chunk(b"tail", true),
+            ],
+        );
+        *rpc.health_failures.lock().unwrap() = failures;
+
+        let (result, out, err) = invoke(&rpc, true, true);
+        result.unwrap();
+        assert_eq!(out, b"tail");
+        assert!(err.is_empty());
+        assert_eq!(*rpc.health_reads.lock().unwrap(), [0, 1]);
+        assert!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.body().get("wait_ms").is_none())
+        );
+        assert_eq!(
+            *clock.sleeps.lock().unwrap(),
+            [100, 200].map(Duration::from_millis)
+        );
+    }
+}
+
+#[test]
 fn unknown_or_absent_features_use_capped_idle_backoff_and_reset_on_progress() {
     for health in [
         Some(health(None)),
         Some(health(Some(json!([])))),
         Some(health(Some(json!(["future.feature"])))),
+        Some(json!({"state": "unavailable", "reason": "read_failed", "features": []})),
         None,
     ] {
         let clock = Clock::default();
@@ -241,7 +341,7 @@ fn unknown_or_absent_features_use_capped_idle_backoff_and_reset_on_progress() {
         let (result, out, _) = invoke(&rpc, true, true);
         result.unwrap();
         assert_eq!(out, b"ab");
-        assert_eq!(*rpc.health_reads.lock().unwrap(), 1);
+        assert_eq!(*rpc.health_reads.lock().unwrap(), [0]);
         assert!(
             rpc.requests
                 .lock()
@@ -367,7 +467,7 @@ fn nonfollow_keeps_immediate_reads_without_discovery_or_transport_retry() {
         let (result, _, err) = invoke(&rpc, false, true);
         assert!(result.is_err());
         assert!(err.is_empty());
-        assert_eq!(*rpc.health_reads.lock().unwrap(), 0);
+        assert!(rpc.health_reads.lock().unwrap().is_empty());
         assert!(clock.sleeps.lock().unwrap().is_empty());
         assert!(
             rpc.requests.lock().unwrap()[0]

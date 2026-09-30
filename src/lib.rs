@@ -5862,6 +5862,7 @@ fn controller_task_logs_with_runtime(
     stderr: &mut dyn Write,
     runtime: &dyn crate::transfer::ResolutionRuntime,
 ) -> Result<(), WorkerError> {
+    use crate::controller::health_read::{HealthState, fetch_controller_health};
     use std::time::Duration;
 
     const IDLE_MIN: Duration = Duration::from_millis(100);
@@ -5870,14 +5871,20 @@ fn controller_task_logs_with_runtime(
     const RETRY_MAX: Duration = Duration::from_secs(10);
     const OUTAGE_LIMIT: Duration = Duration::from_secs(10 * 60);
 
-    let long_poll = follow
-        && crate::controller::health_read::fetch_controller_health(runner, &config.controller)
-            .features
-            .is_some_and(|features| {
-                features
-                    .iter()
-                    .any(|feature| feature == "controller.task-logs-wait")
-            });
+    let supports_wait = |features: Option<Vec<String>>| {
+        features.is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature == "controller.task-logs-wait")
+        })
+    };
+    let (mut long_poll, mut retry_discovery) = if follow {
+        let health = fetch_controller_health(runner, &config.controller);
+        let retry = health.state == HealthState::Unavailable && health.features.is_none();
+        (supports_wait(health.features), retry)
+    } else {
+        (false, false)
+    };
     let mut idle_delay = IDLE_MIN;
     let mut retry_delay = RETRY_MIN;
     let mut outage: Option<(Duration, WorkerError)> = None;
@@ -5991,6 +5998,12 @@ fn controller_task_logs_with_runtime(
         stdout.flush()?;
         let progressed = chunk.next_offset() > offset;
         offset = chunk.next_offset();
+        if retry_discovery {
+            // A verified logs reply proves connectivity recovered. Retry only
+            // the unavailable startup discovery, never an authoritative list.
+            retry_discovery = false;
+            long_poll = supports_wait(fetch_controller_health(runner, &config.controller).features);
+        }
         if finished {
             break;
         }
