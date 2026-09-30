@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, SyncSender, TryRecvError},
+        mpsc::{self, SyncSender},
     },
     time::Duration,
 };
@@ -63,11 +63,7 @@ impl<T> Drop for Queued<T> {
     }
 }
 
-pub(super) trait GraceClock {
-    fn now(&self) -> Duration;
-    fn sleep(&self, duration: Duration);
-    fn cancelled(&self) -> bool;
-}
+pub(super) use super::super::contracts::EventRuntime as GraceClock;
 
 pub(super) struct WorkerHandle {
     shared: Arc<Shared>,
@@ -98,10 +94,7 @@ pub(super) fn start<T: Send + 'static>(
                 let message = if state.accepting.load(Ordering::Acquire) {
                     receiver.recv().ok()
                 } else {
-                    match receiver.try_recv() {
-                        Ok(message) => Some(message),
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-                    }
+                    receiver.try_recv().ok()
                 };
                 let Some(Some(mut queued)) = message else {
                     break;
@@ -244,19 +237,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    struct ManualClock(AtomicU64);
-    impl GraceClock for ManualClock {
-        fn now(&self) -> Duration {
-            Duration::from_millis(self.0.load(Ordering::Acquire))
-        }
-        fn sleep(&self, duration: Duration) {
-            self.0
-                .fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
-        }
-        fn cancelled(&self) -> bool {
-            false
-        }
-    }
+    use crate::controller::events::testing::ManualEventRuntime;
 
     #[test]
     fn drops_have_stable_diagnostics_without_synchronous_io() {
@@ -331,7 +312,7 @@ mod tests {
         );
         assert_eq!(sink.try_enqueue(vec![1]), EnqueueResult::Queued);
         entered_rx.recv().unwrap();
-        let clock = ManualClock(AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         handle.finish_with_grace(Duration::from_secs(30), &clock);
         assert_eq!(clock.now(), Duration::from_millis(50));
         assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Stopping);

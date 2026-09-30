@@ -799,6 +799,7 @@ pub(crate) enum PrivateRolePoint {
     StageSynced,
     Published,
     DirectorySynced,
+    CleanupDecisionDurable,
     DisplacedRemoved,
     FinalSynced,
 }
@@ -1917,7 +1918,9 @@ impl RootedDir {
             {
                 return Err(os_error(libc::ESTALE));
             }
-            self.remove_owned_regular(role.stage)?;
+            self.remove_owned_regular_with_cleanup_hook(role.stage, &|| {
+                hooks.at(PrivateRolePoint::CleanupDecisionDurable)
+            })?;
         }
         hooks.at(PrivateRolePoint::DisplacedRemoved)?;
         self.validate_private_regular_binding(role.target, &file, binding)?;
@@ -12184,6 +12187,45 @@ mod tests {
             root.read_private_regular("manifest.stage", 64).unwrap(),
             b"old"
         );
+    }
+
+    #[test]
+    fn journal_role_cleanup_decision_retains_resumable_rooted_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("root")).unwrap();
+        root.write_new_private_file("manifest", b"old")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let old = root.private_entry_identity("manifest").unwrap();
+        let hooks = JournalCreationHooks {
+            root: &root,
+            fail_at: Some(super::PrivateRolePoint::CleanupDecisionDurable),
+        };
+        assert!(
+            root.replace_private_regular_exact_in_role(
+                super::PrivateRegularRole {
+                    target: "manifest",
+                    stage: "manifest.stage",
+                    expected_target: Some(old)
+                },
+                Some(b"old"),
+                b"replacement",
+                &hooks
+            )
+            .is_err()
+        );
+        assert!(root.has_private_cleanup_residue().unwrap());
+        assert_eq!(
+            root.read_private_regular("manifest", 64).unwrap(),
+            b"replacement"
+        );
+        root.retry_pending_owned_regulars_matching(|name, identity| {
+            name == b"manifest.stage" && identity == old
+        })
+        .unwrap();
+        assert!(!root.has_private_cleanup_residue().unwrap());
+        assert!(!root.entry_exists("manifest.stage").unwrap());
     }
 
     use std::{

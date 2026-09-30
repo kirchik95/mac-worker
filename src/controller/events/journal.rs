@@ -41,6 +41,8 @@ pub enum JournalRoleBoundary {
     StageSynced,
     Published,
     DirectorySynced,
+    /// Emitted only when an exchange displaces an existing target.
+    CleanupDecisionDurable,
     DisplacedRemoved,
     FinalSynced,
 }
@@ -96,6 +98,9 @@ impl fs::FaultHooks for Hooks {
                     PrivateRolePoint::StageSynced => JournalRoleBoundary::StageSynced,
                     PrivateRolePoint::Published => JournalRoleBoundary::Published,
                     PrivateRolePoint::DirectorySynced => JournalRoleBoundary::DirectorySynced,
+                    PrivateRolePoint::CleanupDecisionDurable => {
+                        JournalRoleBoundary::CleanupDecisionDurable
+                    }
                     PrivateRolePoint::DisplacedRemoved => JournalRoleBoundary::DisplacedRemoved,
                     PrivateRolePoint::FinalSynced => JournalRoleBoundary::FinalSynced,
                 },
@@ -112,18 +117,7 @@ impl fs::FaultHooks for Hooks {
 }
 
 struct RuntimeClock(Arc<dyn EventRuntime>);
-impl fs::FsClock for RuntimeClock {
-    fn now(&self) -> Duration {
-        self.0.now()
-    }
-    fn sleep(&self, duration: Duration) {
-        self.0.sleep(duration);
-    }
-    fn cancelled(&self) -> bool {
-        self.0.cancelled()
-    }
-}
-impl publisher::GraceClock for RuntimeClock {
+impl EventRuntime for RuntimeClock {
     fn now(&self) -> Duration {
         self.0.now()
     }
@@ -164,6 +158,14 @@ fn check(runtime: &dyn EventRuntime, deadline: Duration) -> Result<(), WorkerErr
         return Err(unavailable("journal deadline exhausted"));
     }
     Ok(())
+}
+
+fn runtime_io(clock: &RuntimeClock, error: io::Error) -> WorkerError {
+    if clock.0.cancelled() {
+        WorkerError::Unavailable(format!("{CONTROLLER_EVENTS_CANCELLED}: cancelled"))
+    } else {
+        io_unavailable(error)
+    }
 }
 
 fn journal_root(paths: &PathLayout, create: bool) -> io::Result<Option<RootedDir>> {
@@ -227,7 +229,7 @@ impl ControllerJournal {
         fs::retry_same_binding(&root, binding, deadline, &clock, || {
             fs::initialize_storage(&root, deadline, &clock, &hooks)
         })
-        .map_err(io_unavailable)?;
+        .map_err(|error| runtime_io(&clock, error))?;
         Self::attach(root, clock, hooks, deadline)
     }
 
@@ -285,8 +287,8 @@ impl ControllerJournal {
             .map_err(io_unavailable)?
             .into();
         let initialization = {
-            let _shared =
-                fs::acquire_lock(&root, lock, true, deadline, &clock).map_err(io_unavailable)?;
+            let _shared = fs::acquire_lock(&root, lock, true, deadline, &clock)
+                .map_err(|error| runtime_io(&clock, error))?;
             fs::load_initialization(&root).map_err(io_unavailable)?
         };
         let journal_id = uuid::Uuid::parse_str(&initialization.journal_id)
@@ -332,7 +334,7 @@ impl ControllerJournal {
             let manifest = fs::recover_append(&self.root, &self.hooks)?;
             read(&manifest)
         })
-        .map_err(io_unavailable)
+        .map_err(|error| runtime_io(&self.clock, error))
     }
 
     fn manifest_window(&self, manifest: &fs::Manifest) -> JournalWindow {
@@ -401,7 +403,7 @@ impl ControllerJournal {
                     &self.hooks,
                 )
             })
-            .map_err(io_unavailable)?;
+            .map_err(|error| runtime_io(&self.clock, error))?;
         Ok(self.manifest_window(&manifest).cursor())
     }
 }
@@ -444,7 +446,7 @@ impl JournalReader for ControllerJournal {
                         .map(|event| serde_json::from_value(event).map_err(io::Error::other))
                         .collect::<io::Result<_>>()?;
                 let next_after = events.last().map_or_else(
-                    || cursor.clone(),
+                    || *cursor,
                     |event| EventCursor {
                         journal_id: self.journal_id,
                         seq: event.seq,

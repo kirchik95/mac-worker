@@ -79,7 +79,7 @@ fn unavailable() -> io::Error {
 }
 
 fn canonical_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value)
+    uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 
 fn canonical_seq(value: &serde_json::Value) -> io::Result<u64> {
@@ -103,6 +103,13 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
     {
         return Err(unavailable());
     }
+    super::super::contracts::JournalWindow {
+        journal_id: uuid::Uuid::parse_str(&manifest.journal_id).map_err(|_| unavailable())?,
+        oldest_seq: super::super::contracts::Seq::new(manifest.oldest),
+        head_seq: super::super::contracts::Seq::new(manifest.head),
+    }
+    .validate()
+    .map_err(|_| unavailable())?;
     let mut next = manifest.oldest;
     let mut last = None;
     for (index, segment) in manifest.segments.iter().enumerate() {
@@ -180,12 +187,9 @@ fn decode_records(
             return Err(unavailable());
         }
         let event: serde_json::Value = serde_json::from_slice(line).map_err(|_| unavailable())?;
-        if canonical_seq(&event["seq"])? != seq
-            || event["journal_id"].as_str() != Some(journal_id)
-            || event["schema_version"].as_u64() != Some(1)
-            || event["time_millis"].as_u64().is_none()
-            || event["kind"].as_str().is_none_or(str::is_empty)
-            || !event["data"].is_object()
+        let _: super::super::contracts::WireEvent =
+            serde_json::from_value(event.clone()).map_err(|_| unavailable())?;
+        if canonical_seq(&event["seq"])? != seq || event["journal_id"].as_str() != Some(journal_id)
         {
             return Err(unavailable());
         }
@@ -485,6 +489,9 @@ fn replace_role(
     faults: &dyn FaultHooks,
 ) -> io::Result<()> {
     recover_roles(root, epoch)?;
+    if cleanup_residue(root)? {
+        return Err(unavailable());
+    }
     let limit = if kind == RoleKind::Segment {
         SEGMENT_BYTES
     } else {
@@ -644,6 +651,11 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
                 }
                 remove_bound(root, &kind.stage(), evidence.stage_binding)?;
             }
+        }
+        // Keep empty-segment creation evidence until journal-aware recovery has
+        // completed any target cleanup intent as well as the staging intent.
+        if kind == RoleKind::Segment && evidence.old_binding.is_none() && evidence.new_len == 0 {
+            continue;
         }
         let binding = root.private_entry_identity(&kind.evidence())?.into();
         remove_bound(root, &kind.evidence(), binding)?;
@@ -980,7 +992,10 @@ pub(super) fn clean_manifest(root: &RootedDir) -> io::Result<Option<Manifest>> {
             return Ok(None);
         }
     }
-    if root.entry_exists("pending.json")? || root.entry_exists("retirement.json")? {
+    if root.entry_exists("pending.json")?
+        || root.entry_exists("retirement.json")?
+        || cleanup_residue(root)?
+    {
         return Ok(None);
     }
     let initialization = load_initialization(root)?;
@@ -1053,6 +1068,9 @@ fn recover_append_with_proposal(
         return Err(unavailable());
     }
     let next = verify_pending(&manifest, &pending, &bytes)?;
+    // Unbound residue must fail before completing an append or allocating the
+    // next manifest generation, even when the pending transaction is valid.
+    verify_residue(root, &manifest, Some(&pending))?;
     reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
     verify_retained(root, &manifest, Some(&pending))?;
     let target = &pending.delta.appended;
@@ -1094,11 +1112,7 @@ fn recover_append_with_proposal(
     Ok(next)
 }
 
-pub(super) trait FsClock {
-    fn now(&self) -> Duration;
-    fn sleep(&self, duration: Duration);
-    fn cancelled(&self) -> bool;
-}
+pub(super) use super::super::contracts::EventRuntime as FsClock;
 
 pub(super) fn retry_same_binding<T>(
     root: &RootedDir,
@@ -1180,6 +1194,15 @@ pub(super) fn initialize_storage(
     faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
     audit(root)?.admit(0, 0)?;
+    if !root.entry_exists("journal.lock")?
+        && (cleanup_residue(root)?
+            || root
+                .list_names()?
+                .iter()
+                .any(|name| name != b".mac-worker-rooted-fs"))
+    {
+        return Err(unavailable());
+    }
     let (lock, created) = root.open_private_lock_with_created("journal.lock")?;
     if created {
         lock.sync_all()?;
@@ -1372,7 +1395,19 @@ fn verify_residue(
             return Err(unavailable());
         }
     }
+    if cleanup_residue(root)? {
+        return Err(unavailable());
+    }
     audit(root)?.admit(0, 0)
+}
+
+fn cleanup_residue(root: &RootedDir) -> io::Result<bool> {
+    if !root.entry_exists(".mac-worker-rooted-fs")? {
+        return Ok(false);
+    }
+    let namespace =
+        root.open_private_direct_child_on_device(".mac-worker-rooted-fs", root.identity()?.device)?;
+    Ok(!namespace.list_names()?.is_empty())
 }
 
 pub(super) fn cursor_reason(
@@ -1441,21 +1476,7 @@ mod tests {
         }
     }
 
-    struct ManualClock(std::sync::atomic::AtomicU64);
-    impl FsClock for ManualClock {
-        fn now(&self) -> Duration {
-            Duration::from_millis(self.0.load(std::sync::atomic::Ordering::Acquire))
-        }
-        fn sleep(&self, duration: Duration) {
-            self.0.fetch_add(
-                duration.as_millis() as u64,
-                std::sync::atomic::Ordering::AcqRel,
-            );
-        }
-        fn cancelled(&self) -> bool {
-            false
-        }
-    }
+    use crate::controller::events::testing::ManualEventRuntime;
 
     #[test]
     fn bootstrap_recovers_each_initialization_segment_and_manifest_boundary() {
@@ -1475,7 +1496,7 @@ mod tests {
             ] {
                 let temp = tempfile::tempdir().unwrap();
                 let root = RootedDir::create(&temp.path().join("events")).unwrap();
-                let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+                let clock = ManualEventRuntime::new();
                 let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Role(role, point))));
                 assert!(
                     initialize_storage(&root, Duration::from_secs(1), &clock, &fault).is_err(),
@@ -1515,7 +1536,7 @@ mod tests {
     fn initialized_root_rejects_a_replaced_lock_on_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let root = RootedDir::create(&temp.path().join("events")).unwrap();
-        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         initialize_storage(&root, Duration::from_secs(1), &clock, &NoFaults).unwrap();
         let replacement = root
             .write_new_private_file("replacement-lock", b"")
@@ -1549,7 +1570,7 @@ mod tests {
         file.write_all(b"unexpected lock content").unwrap();
         file.sync_all().unwrap();
         let binding = root.private_entry_identity("journal.lock").unwrap().into();
-        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         assert!(acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).is_err());
         assert_eq!(
             root.read_private_regular("journal.lock", 64).unwrap(),
@@ -1589,7 +1610,7 @@ mod tests {
     #[test]
     fn estale_retries_with_same_binding_and_original_deadline() {
         let (_temp, root, _manifest) = fixture(&record(1), false);
-        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         let binding = root.identity().unwrap().into();
         let mut calls = 0;
         let value = retry_same_binding(&root, binding, Duration::from_secs(1), &clock, || {
@@ -1626,7 +1647,7 @@ mod tests {
     fn estale_retry_never_adopts_a_replaced_root() {
         let (temp, root, _manifest) = fixture(&record(1), false);
         let binding = root.identity().unwrap().into();
-        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         let mut calls = 0;
         let result =
             retry_same_binding::<()>(&root, binding, Duration::from_secs(1), &clock, || {
@@ -1644,7 +1665,7 @@ mod tests {
         let (_temp, root, _manifest) = fixture(&record(1), false);
         root.open_private_lock("journal.lock").unwrap();
         let binding = root.private_entry_identity("journal.lock").unwrap().into();
-        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let clock = ManualEventRuntime::new();
         let first = acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).unwrap();
         let second = acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).unwrap();
         assert!(acquire_lock(&root, binding, false, Duration::from_secs(30), &clock).is_err());
@@ -1693,6 +1714,7 @@ mod tests {
             PrivateRolePoint::StageSynced,
             PrivateRolePoint::Published,
             PrivateRolePoint::DirectorySynced,
+            PrivateRolePoint::CleanupDecisionDurable,
             PrivateRolePoint::DisplacedRemoved,
             PrivateRolePoint::FinalSynced,
         ];
