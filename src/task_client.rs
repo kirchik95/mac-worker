@@ -7882,4 +7882,108 @@ mod tests {
             "{issues:?}"
         );
     }
+
+    #[test]
+    fn worker_host_gc_is_silent_until_lifecycle_persists_remote_task() {
+        use crate::client_state::events::tests::{store_with_sink, task_record, terminal_record};
+        use crate::controller::events::NewEvent;
+        use crate::task_store::{TaskStatusRequest, TaskStatusResponse, TaskStore};
+        use std::os::unix::process::ExitStatusExt;
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("host retention fixture must not launch a process");
+            }
+        }
+        struct StatusReply {
+            task: TaskId,
+            project: String,
+            bytes: Vec<u8>,
+        }
+        impl ProcessRunner for StatusReply {
+            fn run(
+                &self,
+                request: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                let read: TaskStatusRequest =
+                    serde_json::from_slice(request.stdin.as_ref().unwrap()).unwrap();
+                assert_eq!(read.task_id(), self.task);
+                assert_eq!(read.project_id(), self.project);
+                Ok(crate::process::ProcessResult {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: self.bytes.clone(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let (dir, store, sink) = store_with_sink();
+        let root = dir.path().canonicalize().unwrap();
+        let record = terminal_record(&task_record(), TaskOutcome::Done);
+        let task = record.meta().task_id();
+        let project = record.meta().project_id();
+        store.create_task(record.clone()).unwrap();
+        sink.clear();
+        let host = crate::host_store::HostStore::open(&root.join("host")).unwrap();
+        let host_task = host.open_task_directory(project, task, true).unwrap();
+        host_task
+            .write_private_atomic_no_replace(
+                "status.json",
+                &serde_json::to_vec(record.status()).unwrap(),
+            )
+            .unwrap();
+        let closed = TaskStore::new(&host, &NoProcesses)
+            .close_for_retention(project, task, 130)
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.status.state(), TaskState::Closed);
+        assert!(sink.events().is_empty());
+        assert_eq!(
+            store.load_task(task).unwrap().status().state(),
+            TaskState::Open
+        );
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"fixture.invalid\"\nslots = 1\n",
+        )
+        .unwrap();
+        assert!(!crate::config::installed_ssh().multiplex);
+        let runner = StatusReply {
+            task,
+            project: project.to_owned(),
+            bytes: serde_json::to_vec(&TaskStatusResponse::new(closed.status)).unwrap(),
+        };
+        let paths = PathLayout {
+            state: root.join("state"),
+            config: root.join("config.toml"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = TaskClient::new(
+            &runner,
+            &config,
+            &paths,
+            &store,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        assert_eq!(
+            client
+                .project_remote_task(&record)
+                .unwrap()
+                .status()
+                .state(),
+            TaskState::Closed
+        );
+        assert!(
+            sink.events().is_empty(),
+            "ordinary remote projection does not persist"
+        );
+        client.persist_remote_task(&record).unwrap();
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TaskClosed(_)))
+        );
+    }
 }

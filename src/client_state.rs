@@ -3489,7 +3489,13 @@ impl ClientStateStore {
         }
         let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
+        let record = self.load_task_locked(task_id).ok();
         let after_durable_turn_tree_retirement = || {
+            if let Some(record) = &record {
+                self.capture_hint(crate::controller::events::NewEvent::TaskChanged(
+                    events::task_hint(record),
+                ));
+            }
             if self.take_submission_rollback_cleanup_fault(
                 ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
             ) {

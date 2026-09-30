@@ -214,6 +214,8 @@ pub(crate) fn capture_task_diff(
     let continuation = next.auto_continue_intent().map(|intent| intent.turn_id());
     if before != after
         || terminal_changed
+        || old.status().last_outcome().map(outcome_hint)
+            != next.status().last_outcome().map(outcome_hint)
         || old.runner().is_some() != next.runner().is_some()
         || result_imported(old) != result_imported(next)
         || old.close_intent().is_some() != next.close_intent().is_some()
@@ -1246,5 +1248,315 @@ pub(crate) mod tests {
         std::fs::rename(&root, root.with_extension("retired")).unwrap();
         ClientStateStore::open(&root).unwrap();
         assert!(store.reopen_until(None).is_err());
+    }
+
+    #[test]
+    fn continuation_precedes_retirement() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = terminal_record(&task_record(), TaskOutcome::NeedsInput)
+            .with_questions_policy(crate::task::QuestionsPolicy::Decide)
+            .with_runner(Some(crate::task::RunnerIdentity::new(owner())))
+            .unwrap();
+        let task = record.meta().task_id();
+        let turn = record.status().turns()[0].turn_id();
+        store.create_task(record).unwrap();
+        sink.clear();
+        crate::task_client::stage_auto_continue_before_retirement(&store, task, turn).unwrap();
+        assert!(
+            store
+                .load_task(task)
+                .unwrap()
+                .auto_continue_intent()
+                .is_some()
+        );
+        assert!(store.load_task(task).unwrap().runner().is_some());
+        assert_eq!(
+            sink.events()
+                .iter()
+                .filter(|event| matches!(event, NewEvent::AutoContinueScheduled { .. }))
+                .count(),
+            1
+        );
+        sink.clear();
+        crate::task_client::stage_auto_continue_before_retirement(&store, task, turn).unwrap();
+        assert!(sink.events().is_empty());
+        store.record_runner(task, None).unwrap();
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::AutoContinueScheduled { .. }))
+        );
+        sink.clear();
+        store
+            .mutate_task(task, Some(turn), |current| {
+                current.with_auto_continue_intent(None)
+            })
+            .unwrap();
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TaskChanged(_)))
+        );
+    }
+
+    #[test]
+    fn central_queue_capture_covers_dispatch_bypass() {
+        let (dir, store, sink) = store_with_sink();
+        let donor = task_record();
+        let recipient = task_record();
+        store.create_task(donor.clone()).unwrap();
+        store.create_task(recipient.clone()).unwrap();
+        store.write_task_project_path(&donor, dir.path()).unwrap();
+        let from = donor.status().turns()[0].turn_id();
+        let to = recipient.status().turns()[0].turn_id();
+        store
+            .write_turn_prompt(donor.meta().task_id(), from, "PRIVATE_PROMPT")
+            .unwrap();
+        store
+            .write_turn_prompt(recipient.meta().task_id(), to, "PRIVATE_PROMPT")
+            .unwrap();
+        let mut donor_row = queue_row(&store, from);
+        donor_row.preference = crate::scheduler::WorkerPreference::Pinned {
+            worker: "mini-2".into(),
+        };
+        store.enqueue(donor_row).unwrap();
+        store.enqueue(queue_row(&store, to)).unwrap();
+        store.park_row(to).unwrap();
+        sink.clear();
+        let observation = crate::scheduler::CandidateObservation::new(
+            "mini-1".into(),
+            true,
+            crate::scheduler::CandidateSlot::Idle,
+            vec![],
+            None,
+            1,
+        )
+        .unwrap();
+        let selected = store
+            .claim_parked_for_waiting_runner(
+                donor.meta().task_id(),
+                from,
+                owner(),
+                &[observation],
+                120,
+            )
+            .unwrap();
+        assert_eq!(selected.unwrap().0, recipient.meta().task_id());
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::QueueChanged(hint)
+            if hint.turn_id == Some(to) && hint.state.as_deref() == Some("dispatching")))
+        );
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::QueueChanged(hint)
+            if hint.turn_id == Some(from) && hint.state.as_deref() == Some("parked")))
+        );
+    }
+
+    #[test]
+    fn removed_task_hint_survives_later_rollback_error() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = task_record();
+        let task = record.meta().task_id();
+        store.create_task(record).unwrap();
+        sink.clear();
+        store.inject_write_failure_once(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval);
+        assert!(store.remove_task_submission_record(task).is_err());
+        assert!(store.load_task_optional(task).unwrap().is_none());
+        assert!(matches!(&sink.events()[0], NewEvent::TaskRemoved(hint) if hint.task_id == task));
+        sink.clear();
+        store.remove_task_submission_record(task).unwrap();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn all_terminal_outcomes_are_safe_and_prose_free() {
+        for (outcome, expected) in [
+            (TaskOutcome::Done, SafeOutcome::Done),
+            (TaskOutcome::NeedsInput, SafeOutcome::NeedsInput),
+            (TaskOutcome::Blocked, SafeOutcome::Blocked),
+            (TaskOutcome::Unknown, SafeOutcome::Unknown),
+            (
+                TaskOutcome::failed("PRIVATE_SECRET /private/project/path"),
+                SafeOutcome::Failed,
+            ),
+            (TaskOutcome::Cancelled, SafeOutcome::Cancelled),
+            (TaskOutcome::TimedOut, SafeOutcome::TimedOut),
+            (TaskOutcome::Lost, SafeOutcome::Lost),
+        ] {
+            let (_dir, store, sink) = store_with_sink();
+            let record = task_record();
+            store.create_task(record.clone()).unwrap();
+            sink.clear();
+            store
+                .update_task_if_current(&record, terminal_record(&record, outcome))
+                .unwrap();
+            assert!(sink.events().iter().any(
+                |event| matches!(event, NewEvent::TurnFinished(hint) if hint.outcome == expected)
+            ));
+            let encoded = format!("{:?}", sink.events());
+            assert!(!encoded.contains("PRIVATE_SECRET"));
+            assert!(!encoded.contains("/private/project/path"));
+        }
+    }
+
+    #[test]
+    fn metadata_rewrites_and_runner_log_sidecars_are_silent() {
+        use crate::task::{HerdrTurnReport, HerdrTurnState};
+        let (_dir, store, sink) = store_with_sink();
+        let record = terminal_record(&task_record(), TaskOutcome::Done);
+        let task = record.meta().task_id();
+        let turn = record.status().turns()[0].turn_id();
+        store.create_task(record.clone()).unwrap();
+        sink.clear();
+        let status = record.status();
+        let rewritten = TaskStatus::new(
+            status.state(),
+            status.last_outcome().cloned(),
+            status.worker().map(str::to_owned),
+            status.session_present(),
+            status.head_oid().cloned(),
+            status.summary().map(str::to_owned),
+            status.questions().to_vec(),
+            status.files_changed().to_vec(),
+            status.diff_stat().map(str::to_owned),
+            vec![status.turns()[0].clone().with_herdr(Some(HerdrTurnReport {
+                state: HerdrTurnState::Attached,
+                pane_id: Some("PRIVATE_PANE".into()),
+            }))],
+            status.updated_at_millis(),
+        )
+        .unwrap();
+        store
+            .update_task_if_current(&record, record.with_status(rewritten).unwrap())
+            .unwrap();
+        store
+            .finish_local_runner_log(task, turn, TaskOutcome::Done)
+            .unwrap();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn legacy_job_running_and_health_bookkeeping_are_silent() {
+        use crate::job::{
+            JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
+            RequestFingerprintMaterial,
+        };
+        let (dir, store, sink) = store_with_sink();
+        let token = LeaseToken::generate();
+        let material = RequestFingerprintMaterial::new(
+            TurnId::generate(),
+            store.client_id(),
+            token,
+            100,
+            "mini-1".into(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "packages/app".into(),
+            1000,
+            "heavy".into(),
+            crate::job::CommandSpec::argv(vec!["PRIVATE_COMMAND".into()]).unwrap(),
+        )
+        .unwrap();
+        let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
+        let record =
+            LocalJobRecord::new(meta.clone(), token, None, RemoteUncertainty::None).unwrap();
+        store.create_job(record).unwrap();
+        let status = JobStatus::running(
+            110,
+            owner().pid(),
+            owner().start_time_micros(),
+            owner().pid(),
+            owner().start_time_micros(),
+        )
+        .unwrap();
+        store
+            .update_job(
+                LocalJobRecord::new(meta, token, Some(status), RemoteUncertainty::None).unwrap(),
+            )
+            .unwrap();
+        let health = crate::controller::health::HealthStore::open(
+            &dir.path().canonicalize().unwrap().join("controller"),
+        )
+        .unwrap();
+        health
+            .write(&crate::controller::health::ControllerHealth::new(
+                owner(),
+                100,
+            ))
+            .unwrap();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn unavailable_sink_does_not_change_authoritative_success() {
+        struct Unavailable;
+        impl EventSink for Unavailable {
+            fn try_publish(&self, _: EventBatch) -> PublishAttempt {
+                PublishAttempt::Dropped
+            }
+        }
+        let (_dir, store, _sink) = store_with_sink();
+        let store = store.with_event_sink(Arc::new(Unavailable));
+        let record = task_record();
+        store.create_task(record.clone()).unwrap();
+        assert_eq!(store.load_task(record.meta().task_id()).unwrap(), record);
+    }
+
+    #[test]
+    fn task_tree_removal_invalidation_survives_cleanup_error() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = task_record();
+        let task = record.meta().task_id();
+        store.create_task(record.clone()).unwrap();
+        store
+            .write_turn_prompt(task, record.status().turns()[0].turn_id(), "PRIVATE_PROMPT")
+            .unwrap();
+        sink.clear();
+        store.inject_submission_rollback_cleanup_failure_once(
+            ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
+        );
+        assert!(store.remove_task_submission_turns(task).is_err());
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TaskChanged(_)))
+        );
+    }
+
+    #[test]
+    fn changed_last_outcome_is_a_task_invalidation() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = terminal_record(&task_record(), TaskOutcome::Done);
+        store.create_task(record.clone()).unwrap();
+        sink.clear();
+        let before = record.status();
+        let next = TaskStatus::new(
+            before.state(),
+            Some(TaskOutcome::NeedsInput),
+            before.worker().map(str::to_owned),
+            before.session_present(),
+            before.head_oid().cloned(),
+            None,
+            vec![],
+            vec![],
+            None,
+            before.turns().to_vec(),
+            130,
+        )
+        .unwrap();
+        store
+            .update_task_if_current(&record, record.with_status(next).unwrap())
+            .unwrap();
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::TaskChanged(_)))
+        );
     }
 }
