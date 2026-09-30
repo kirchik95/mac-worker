@@ -1,9 +1,15 @@
-use std::fs;
+use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus};
 
-use mac_worker::agent::{
-    AgentEvent, AgentKind, AgentOutcome, MAX_DECLARED_ACCEPTANCE, PROMPT_POINTER, PermissionPolicy,
-    PromptDelivery, Question, RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams,
-    adapter_for, declared_acceptance_instructions, render_shell,
+use mac_worker::{
+    agent::{
+        AgentAdapter, AgentEvent, AgentKind, AgentOutcome, AuthProbeResult,
+        MAX_DECLARED_ACCEPTANCE, OPENCODE_DIALECT_MISMATCH, OPENCODE_VERSION_UNVERIFIED,
+        OpencodeDialect, PROMPT_POINTER, PermissionPolicy, PromptDelivery, Question,
+        RESULT_SCHEMA_JSON, ResultStatus, TurnLaunch, TurnLimits, TurnParams, adapter_for,
+        adapter_for_host, adapter_for_launch, declared_acceptance_instructions, has_dialects,
+        render_shell, verify_opencode_launch,
+    },
+    process::ProcessResult,
 };
 use uuid::Uuid;
 
@@ -1190,4 +1196,515 @@ fn render_shell_double_quotes_the_argv_pointer_and_single_quotes_the_rest() {
     let shell = render_shell(&launch).unwrap();
     assert!(shell.starts_with("exec 'opencode' 'run' '--format' 'json' '--auto'"));
     assert!(shell.ends_with(&format!("\"{PROMPT_POINTER}\"")));
+}
+
+// OpenCode has two CLI generations. The v2 fixtures come from a live
+// `opencode run --standalone --format json --auto` capture on 2.0.18.
+
+const OPENCODE_V1_VERSION: &str = "1.18.32";
+const OPENCODE_V2_VERSION: &str = "2.0.18";
+const OPENCODE_V2_SESSION: &str = "ses_f0ea2018effeLWl2cU5BkMIijI";
+
+fn opencode_v1() -> &'static dyn AgentAdapter {
+    adapter_for_launch(AgentKind::Opencode, Some(OPENCODE_V1_VERSION))
+}
+
+fn opencode_v2() -> &'static dyn AgentAdapter {
+    adapter_for_launch(AgentKind::Opencode, Some(OPENCODE_V2_VERSION))
+}
+
+fn probe_output(status: i32, stdout: &[u8], stderr: &[u8]) -> ProcessResult {
+    ProcessResult {
+        status: ExitStatus::from_raw(status << 8),
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+    }
+}
+
+#[test]
+fn opencode_first_turn_argv_is_exact_in_each_dialect() {
+    let mut params = opencode_params(PermissionPolicy::Unattended);
+    let v1 = opencode_v1().first_turn(&params).unwrap();
+    assert_eq!(v1.program(), "opencode");
+    assert_eq!(
+        v1.args(),
+        ["run", "--format", "json", "--auto", PROMPT_POINTER]
+    );
+    let v2 = opencode_v2().first_turn(&params).unwrap();
+    assert_eq!(v2.program(), "opencode");
+    assert_eq!(
+        v2.args(),
+        [
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--auto",
+            PROMPT_POINTER
+        ]
+    );
+
+    params.model = Some("opencode/big-pickle#high".into());
+    assert_eq!(
+        opencode_v1().first_turn(&params).unwrap().args(),
+        [
+            "run",
+            "--format",
+            "json",
+            "--auto",
+            "--model",
+            "opencode/big-pickle#high",
+            PROMPT_POINTER
+        ]
+    );
+    assert_eq!(
+        opencode_v2().first_turn(&params).unwrap().args(),
+        [
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--auto",
+            "--model",
+            "opencode/big-pickle#high",
+            PROMPT_POINTER
+        ]
+    );
+    // The `#variant` of a v2 model reaches the CLI quoted, not as a comment.
+    assert_eq!(
+        render_shell(&opencode_v2().first_turn(&params).unwrap()).unwrap(),
+        format!(
+            "exec 'opencode' 'run' '--standalone' '--format' 'json' '--auto' '--model' 'opencode/big-pickle#high' \"{PROMPT_POINTER}\""
+        )
+    );
+    for launch in [v1, v2] {
+        assert_eq!(launch.prompt_delivery(), PromptDelivery::ArgvPointer);
+        assert!(launch.env_names().is_empty());
+        assert!(!launch.permission_fallback());
+    }
+}
+
+#[test]
+fn opencode_resume_argv_is_exact_in_each_dialect() {
+    let mut params = opencode_params(PermissionPolicy::Unattended);
+    assert_eq!(
+        opencode_v1()
+            .resume_turn(&params, OPENCODE_V2_SESSION)
+            .unwrap()
+            .args(),
+        [
+            "run",
+            "--format",
+            "json",
+            "--auto",
+            "--session",
+            OPENCODE_V2_SESSION,
+            PROMPT_POINTER
+        ]
+    );
+    assert_eq!(
+        opencode_v2()
+            .resume_turn(&params, OPENCODE_V2_SESSION)
+            .unwrap()
+            .args(),
+        [
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--auto",
+            "--session",
+            OPENCODE_V2_SESSION,
+            PROMPT_POINTER
+        ]
+    );
+
+    params.model = Some("opencode-go/deepseek-v4-pro".into());
+    assert_eq!(
+        opencode_v2()
+            .resume_turn(&params, OPENCODE_V2_SESSION)
+            .unwrap()
+            .args(),
+        [
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--auto",
+            "--model",
+            "opencode-go/deepseek-v4-pro",
+            "--session",
+            OPENCODE_V2_SESSION,
+            PROMPT_POINTER
+        ]
+    );
+    // The flags v2 removed from `run` were never part of either form.
+    for adapter in [opencode_v1(), opencode_v2()] {
+        let launch = adapter.resume_turn(&params, OPENCODE_V2_SESSION).unwrap();
+        for removed in [
+            "--pure",
+            "--command",
+            "--share",
+            "--attach",
+            "--dir",
+            "--port",
+        ] {
+            assert!(!launch.args().iter().any(|argument| argument == removed));
+        }
+        assert!(adapter.resume_turn(&params, "").is_err());
+    }
+}
+
+#[test]
+fn opencode_delete_argv_is_exact_in_each_dialect() {
+    assert_eq!(
+        opencode_v1().delete_session(OPENCODE_V2_SESSION).unwrap(),
+        ["opencode", "session", "delete", OPENCODE_V2_SESSION]
+    );
+    assert_eq!(
+        opencode_v2().delete_session(OPENCODE_V2_SESSION).unwrap(),
+        [
+            "opencode",
+            "session",
+            "delete",
+            OPENCODE_V2_SESSION,
+            "--standalone"
+        ]
+    );
+    for adapter in [opencode_v1(), opencode_v2()] {
+        assert_eq!(adapter.delete_session(""), None);
+        assert_eq!(adapter.delete_session("--help"), None);
+        assert_eq!(adapter.delete_session("session\n1"), None);
+        // OpenCode binds its session from the first JSON event: no command
+        // to keep standalone here.
+        assert_eq!(adapter.prebind_session(), None);
+    }
+}
+
+#[test]
+fn opencode_dialect_is_read_from_the_version_major() {
+    use OpencodeDialect::{V1, V2};
+    for (version, expected) in [
+        (Some("1.18.32"), Some(V1)),
+        (Some("0.15.3"), Some(V1)),
+        (Some("1"), Some(V1)),
+        (Some("2.0.18"), Some(V2)),
+        (Some("v2.0.18"), Some(V2)),
+        (Some("2.0.0-beta.1"), Some(V2)),
+        (Some("3.1.0"), Some(V2)),
+        (Some("10.0.0"), Some(V2)),
+        (None, None),
+        (Some(""), None),
+        (Some("latest"), None),
+        (Some("local"), None),
+        (Some("two.0.18"), None),
+        (Some("2x.0.18"), None),
+        (Some("2-beta"), None),
+        (Some("+2.0.18"), None),
+        (Some("-2.0.18"), None),
+        (Some(".2.0"), None),
+        (Some(" 2.0.18"), None),
+        (Some("99999999999999999999999.0"), None),
+    ] {
+        assert_eq!(OpencodeDialect::observed(version), expected, "{version:?}");
+        // A launch keeps today's v1 form unless the facts say v2.
+        assert_eq!(
+            OpencodeDialect::for_launch(version),
+            expected.unwrap_or(V1),
+            "{version:?}"
+        );
+        // A host command takes the v1 form only for a positively known v1.
+        assert_eq!(
+            OpencodeDialect::for_host_command(version),
+            expected.unwrap_or(V2),
+            "{version:?}"
+        );
+    }
+}
+
+#[test]
+fn launch_adapter_is_chosen_from_the_workers_recorded_version() {
+    let opencode = opencode_params(PermissionPolicy::Unattended);
+    let standalone = |version: Option<&str>| {
+        adapter_for_launch(AgentKind::Opencode, version)
+            .first_turn(&opencode)
+            .unwrap()
+            .args()
+            .iter()
+            .any(|argument| argument == "--standalone")
+    };
+    assert!(!standalone(Some("1.18.32")));
+    assert!(standalone(Some("2.0.18")));
+    // Unknown and garbage versions keep the v1 form, as before.
+    assert!(!standalone(None));
+    assert!(!standalone(Some("not-a-version")));
+    // The default adapter stays v1 for every existing caller.
+    assert_eq!(
+        adapter_for(AgentKind::Opencode)
+            .first_turn(&opencode)
+            .unwrap(),
+        adapter_for_launch(AgentKind::Opencode, None)
+            .first_turn(&opencode)
+            .unwrap()
+    );
+
+    // A host command is standalone unless the version is a known v1.
+    let host_standalone = |version: Option<&str>| {
+        adapter_for_host(AgentKind::Opencode, version)
+            .delete_session("ses_1")
+            .unwrap()
+            .iter()
+            .any(|argument| argument == "--standalone")
+    };
+    assert!(!host_standalone(Some("1.18.32")));
+    assert!(host_standalone(Some("2.0.18")));
+    assert!(host_standalone(None));
+    assert!(host_standalone(Some("not-a-version")));
+
+    // Only OpenCode has dialects; a version never changes another agent.
+    assert!(has_dialects(AgentKind::Opencode));
+    for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor] {
+        assert!(!has_dialects(kind));
+        let mut params = params(PermissionPolicy::Unattended);
+        params.kind = kind;
+        let default = adapter_for(kind).first_turn(&params).unwrap();
+        for version in [None, Some("1.0.0"), Some("2.0.18")] {
+            assert_eq!(
+                adapter_for_launch(kind, version)
+                    .first_turn(&params)
+                    .unwrap(),
+                default
+            );
+            assert_eq!(
+                adapter_for_host(kind, version).auth_probe().args(),
+                adapter_for(kind).auth_probe().args()
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_guard_refuses_a_generation_the_argv_was_not_built_for() {
+    use OpencodeDialect::{V1, V2};
+    for (built_for, observed) in [
+        (V1, Some("1.18.32")),
+        (V1, Some("0.15.3")),
+        (V2, Some("2.0.18")),
+        // `--standalone` cannot start the service on either generation, so
+        // an unobserved version does not block it.
+        (V2, None),
+        (V2, Some("not-a-version")),
+    ] {
+        assert!(
+            verify_opencode_launch(built_for, observed).is_ok(),
+            "{built_for:?} on {observed:?}"
+        );
+    }
+    for (built_for, observed, code) in [
+        // Stale v1 facts on a v2 worker: this would start the service.
+        (V1, Some("2.0.18"), OPENCODE_DIALECT_MISMATCH),
+        (V1, Some("3.0.0"), OPENCODE_DIALECT_MISMATCH),
+        (V2, Some("1.18.32"), OPENCODE_DIALECT_MISMATCH),
+        // Without the flag an unknown generation may be v2.
+        (V1, None, OPENCODE_VERSION_UNVERIFIED),
+        (V1, Some("not-a-version"), OPENCODE_VERSION_UNVERIFIED),
+    ] {
+        let error = verify_opencode_launch(built_for, observed)
+            .expect_err("mismatched launch must be refused");
+        assert_eq!(error.public_code(), code, "{built_for:?} on {observed:?}");
+    }
+}
+
+#[test]
+fn opencode_v2_events_map_like_v1_in_both_adapters() {
+    for adapter in [adapter_for(AgentKind::Opencode), opencode_v2()] {
+        let events: Vec<AgentEvent> = opencode_fixture("v2-run-standalone-json.jsonl")
+            .lines()
+            .filter_map(|line| adapter.parse_event(line))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::SessionStarted {
+                    session_ref: OPENCODE_V2_SESSION.into()
+                },
+                // The v2 tool part carries `partID` and the call `id`.
+                AgentEvent::FileChange {
+                    paths: vec!["hello.txt".into()]
+                },
+                // `step_finish` with `tool-calls` is not a turn end.
+                AgentEvent::SessionStarted {
+                    session_ref: OPENCODE_V2_SESSION.into()
+                },
+                AgentEvent::AssistantMessage {
+                    text: "done".into()
+                },
+            ]
+        );
+        assert_eq!(
+            adapter.session_ref(&events).as_deref(),
+            Some(OPENCODE_V2_SESSION)
+        );
+        // The capture ends on the last `text`: v2 printed no closing
+        // `step_finish`, so there is no `TurnEnd` to wait for.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        );
+    }
+}
+
+#[test]
+fn opencode_v2_tool_parts_with_part_id_and_call_id_are_accepted() {
+    let adapter = adapter_for(AgentKind::Opencode);
+    // Hand-derived from the captured `write` part: same envelope, other tool.
+    let read = r#"{"type":"tool_use","timestamp":1790755867064,"sessionID":"ses_f0ea2018effeLWl2cU5BkMIijI","part":{"partID":"prt_0f15e09ab001WTV2hsA5HmZtAE","sessionID":"ses_f0ea2018effeLWl2cU5BkMIijI","messageID":"msg_0f15dff64001zbFCHq7bPbxZTW","type":"tool","id":"call_function_p1bmuhyrpwxc_2","tool":"read","state":{"status":"completed","input":{"path":"hello.txt"},"output":"hi\n"}}}"#;
+    assert_eq!(
+        adapter.parse_event(read),
+        Some(AgentEvent::ToolCall {
+            name: "read".into(),
+            summary: r#"{"path":"hello.txt"}"#.into(),
+        })
+    );
+    let bash = r#"{"type":"tool_use","timestamp":1790755867064,"sessionID":"ses_f0ea2018effeLWl2cU5BkMIijI","part":{"partID":"prt_0f15e09ab001WTV2hsA5HmZtAE","sessionID":"ses_f0ea2018effeLWl2cU5BkMIijI","messageID":"msg_0f15dff64001zbFCHq7bPbxZTW","type":"tool","id":"call_function_p1bmuhyrpwxc_3","tool":"bash","state":{"status":"completed","input":{"command":"cat hello.txt"},"output":"hi\n"}}}"#;
+    assert_eq!(
+        adapter.parse_event(bash),
+        Some(AgentEvent::Command {
+            summary: "cat hello.txt".into(),
+            exit_code: None,
+        })
+    );
+}
+
+#[test]
+fn opencode_v2_result_does_not_need_a_closing_step_finish() {
+    for adapter in [adapter_for(AgentKind::Opencode), opencode_v2()] {
+        // A structured final message in the last `text` event is the result,
+        // although no `step_finish` follows it.
+        let stream = opencode_fixture("v2-final-json.jsonl");
+        assert!(
+            stream
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with(r#"{"type":"text""#))
+        );
+        let result = adapter.extract_result(&stream, None).unwrap();
+        assert_eq!(result.status(), ResultStatus::Done);
+        assert_eq!(result.summary(), "hello.txt created");
+        assert_eq!(result.files_changed(), &["hello.txt"]);
+        assert!(result.questions().is_empty());
+        assert!(result.parse_reason().is_none());
+
+        // The live capture ended with the prose `done`: no result, and the
+        // reason says so rather than reporting a cut stream.
+        let prose = adapter
+            .extract_result(&opencode_fixture("v2-run-standalone-json.jsonl"), None)
+            .unwrap();
+        assert_eq!(prose.status(), ResultStatus::Unknown);
+        assert_eq!(
+            serde_json::to_value(prose.parse_reason()).unwrap(),
+            "no_result_json"
+        );
+    }
+}
+
+#[test]
+fn opencode_v2_auth_probe_is_standalone_and_reads_the_credential_table() {
+    let probe = opencode_v2().auth_probe();
+    assert_eq!(probe.args(), ["auth", "list", "--standalone"]);
+    assert_eq!(
+        adapter_for_host(AgentKind::Opencode, Some(OPENCODE_V2_VERSION))
+            .auth_probe()
+            .args(),
+        ["auth", "list", "--standalone"]
+    );
+    // An unobserved version must not run the form that reaches the service.
+    assert_eq!(
+        adapter_for_host(AgentKind::Opencode, None)
+            .auth_probe()
+            .args(),
+        ["auth", "list", "--standalone"]
+    );
+    assert_eq!(
+        adapter_for_host(AgentKind::Opencode, Some(OPENCODE_V1_VERSION))
+            .auth_probe()
+            .args(),
+        ["auth", "list"]
+    );
+
+    // Captured from `opencode auth list` on 2.0.18.
+    let table = b"OpenCode Go     API key                     stored\nGitHub Copilot  OAuth                       stored\nZ.AI            API key                     stored\n";
+    let classify = |stdout: &[u8]| probe.classify(&probe_output(0, stdout, b""));
+    assert_eq!(classify(table), AuthProbeResult::Authenticated);
+    assert_eq!(
+        classify(b"Z.AI            API key                     stored\n"),
+        AuthProbeResult::Authenticated
+    );
+    assert_eq!(
+        classify(b"\x1b[1mZ.AI\x1b[0m  OAuth  \x1b[32mstored\x1b[0m\n"),
+        AuthProbeResult::Authenticated
+    );
+    // One stored row is enough beside rows in another state.
+    assert_eq!(
+        classify(b"Anthropic  OAuth  expired\nZ.AI  API key  stored\n"),
+        AuthProbeResult::Authenticated
+    );
+
+    // No rows: nothing is stored.
+    assert_eq!(classify(b""), AuthProbeResult::Unauthenticated);
+    assert_eq!(classify(b"\n  \n"), AuthProbeResult::Unauthenticated);
+
+    // Anything else stays unknown.
+    for junk in [
+        &b"unexpected output\n"[..],
+        b"stored\n",
+        b"Anthropic  OAuth  expired\n",
+        b"Z.AI  API key  stored soon\n",
+        b"{\"providers\":[]}\n",
+    ] {
+        assert_eq!(
+            classify(junk),
+            AuthProbeResult::Unknown,
+            "{}",
+            String::from_utf8_lossy(junk)
+        );
+    }
+    // v1 answers the unknown flag with its usage text on stderr.
+    assert_eq!(
+        probe.classify(&probe_output(
+            1,
+            b"",
+            b"opencode auth list\n\nlist providers and credentials\n\nOptions:\n  -h, --help  show help\n"
+        )),
+        AuthProbeResult::Unknown
+    );
+}
+
+#[test]
+fn opencode_v1_auth_probe_keeps_its_command_and_does_not_read_the_v2_table() {
+    let probe = opencode_v1().auth_probe();
+    assert_eq!(probe.args(), ["auth", "list"]);
+    assert_eq!(
+        adapter_for(AgentKind::Opencode).auth_probe().args(),
+        ["auth", "list"]
+    );
+    assert_eq!(
+        probe.classify(&probe_output(0, b"", b"")),
+        AuthProbeResult::Unknown
+    );
+    assert_eq!(
+        probe.classify(&probe_output(
+            0,
+            b"Z.AI            API key                     stored\n",
+            b""
+        )),
+        AuthProbeResult::Unknown
+    );
+    // Captured from `opencode auth list` on 1.18.32.
+    let listing = b"\xe2\x94\x8c  Credentials \x1b[90m~/.local/share/opencode/auth.json\n\xe2\x94\x82\n\xe2\x97\x8f  GitHub Copilot \x1b[90moauth\n\xe2\x94\x82\n\xe2\x97\x8f  OpenCode Go \x1b[90mapi\n\xe2\x94\x82\n\xe2\x97\x8f  Z.AI \x1b[90mapi\n\xe2\x94\x82\n\xe2\x94\x94  3 credentials\n\n";
+    assert_eq!(
+        probe.classify(&probe_output(0, listing, b"\x1b[0m")),
+        AuthProbeResult::Authenticated
+    );
 }

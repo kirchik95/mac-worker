@@ -5,6 +5,10 @@ pub(crate) mod identity;
 mod opencode;
 
 pub use identity::{AgentIdentity, VersionObservation};
+pub use opencode::{
+    OPENCODE_DIALECT_MISMATCH, OPENCODE_VERSION_UNVERIFIED, OpencodeDialect,
+    launch_dialect as opencode_launch_dialect, verify_launch as verify_opencode_launch,
+};
 
 use std::{ffi::OsString, path::Path, time::Duration};
 
@@ -16,7 +20,6 @@ use crate::{
 use claude::ClaudeAdapter;
 use codex::CodexAdapter;
 use cursor::CursorAdapter;
-use opencode::OpencodeAdapter;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -879,12 +882,48 @@ pub trait AgentAdapter: Send + Sync {
     }
 }
 
+/// The adapter for `kind` in its default dialect. Parsing and result
+/// extraction do not depend on the dialect, so every reader uses this one.
 pub fn adapter_for(kind: AgentKind) -> &'static dyn AgentAdapter {
     match kind {
         AgentKind::Codex => &CodexAdapter,
         AgentKind::Claude => &ClaudeAdapter,
         AgentKind::Cursor => &CursorAdapter,
-        AgentKind::Opencode => &OpencodeAdapter,
+        AgentKind::Opencode => opencode::adapter(OpencodeDialect::V1),
+    }
+}
+
+/// Whether the argv mac-worker builds for `kind` depends on the installed CLI
+/// generation. Only OpenCode has two ([`OpencodeDialect`]).
+pub fn has_dialects(kind: AgentKind) -> bool {
+    matches!(kind, AgentKind::Opencode)
+}
+
+/// The adapter that builds a turn launch for a worker whose facts record
+/// `recorded_version` for `kind`. An unknown version keeps the default
+/// dialect; the worker checks the argv against its own version before exec.
+pub fn adapter_for_launch(
+    kind: AgentKind,
+    recorded_version: Option<&str>,
+) -> &'static dyn AgentAdapter {
+    match kind {
+        AgentKind::Opencode => opencode::adapter(OpencodeDialect::for_launch(recorded_version)),
+        AgentKind::Codex | AgentKind::Claude | AgentKind::Cursor => adapter_for(kind),
+    }
+}
+
+/// The adapter for a command a host runs on its own account (the auth probe,
+/// a session delete) right after it observed `observed_version`. An unknown
+/// version gets the dialect that cannot start a background service.
+pub fn adapter_for_host(
+    kind: AgentKind,
+    observed_version: Option<&str>,
+) -> &'static dyn AgentAdapter {
+    match kind {
+        AgentKind::Opencode => {
+            opencode::adapter(OpencodeDialect::for_host_command(observed_version))
+        }
+        AgentKind::Codex | AgentKind::Claude | AgentKind::Cursor => adapter_for(kind),
     }
 }
 
