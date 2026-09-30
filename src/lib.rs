@@ -5709,7 +5709,6 @@ fn persist_and_send_controller(
     stderr: &mut dyn Write,
 ) -> Result<crate::controller::ControllerAck, WorkerError> {
     let request = controller_read_request(command, body)?;
-    crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
     crate::controller::send_controller_mutation(
         runner,
         &config.controller,
@@ -6740,6 +6739,41 @@ mod enabled_submit_freeze_tests {
             BaseOid, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
         },
     };
+
+    #[test]
+    fn ordinary_mutation_checks_transport_before_persisting_an_envelope() {
+        struct NoTransport;
+        impl ProcessRunner for NoTransport {
+            fn run(&self, _: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                panic!("invalid local configuration must not send");
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: temp.path().join("config.toml"),
+            state: temp.path().join("state"),
+            cache: temp.path().join("cache"),
+            data: temp.path().join("data"),
+        };
+        let mut config =
+            Config::parse("version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n")
+                .unwrap();
+        config.controller.enabled = false;
+        let error = super::persist_and_send_controller(
+            &NoTransport,
+            &paths,
+            &config,
+            "task.cancel",
+            json!({"task_id": "018f0f4a6b5c7d8e9f00112233445577"}),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE");
+        assert!(
+            !paths.controller_cache_root().exists(),
+            "local preparation must precede the sole envelope persist"
+        );
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
