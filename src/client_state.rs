@@ -2283,6 +2283,7 @@ impl ClientStateStore {
             unlink_at(self.inner.affinity_projects.as_raw_fd(), &project_name, 0)
                 .map_err(WorkerError::Io)?;
             sync_directory(self.inner.affinity_projects.as_raw_fd())?;
+            self.capture_hint(events::generic_queue_hint());
         }
         if worktree
             .as_ref()
@@ -2291,6 +2292,7 @@ impl ClientStateStore {
             unlink_at(self.inner.affinity_worktrees.as_raw_fd(), &worktree_name, 0)
                 .map_err(WorkerError::Io)?;
             sync_directory(self.inner.affinity_worktrees.as_raw_fd())?;
+            self.capture_hint(events::generic_queue_hint());
         }
         Ok(())
     }
@@ -2399,13 +2401,25 @@ impl ClientStateStore {
     pub fn invalidate_admission_observation(&self, worker: &str) -> Result<(), WorkerError> {
         validate_state_worker_name(worker)?;
         let _lock = self.acquire_state_lock()?;
+        let previous = read_observation_optional(self.inner.observations.as_raw_fd(), worker)
+            .ok()
+            .flatten();
         let name = observation_record_name(worker)?;
-        match unlink_at(self.inner.observations.as_raw_fd(), &name, 0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        let changed = match unlink_at(self.inner.observations.as_raw_fd(), &name, 0) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(WorkerError::Io(error)),
+        };
+        sync_directory(self.inner.observations.as_raw_fd())?;
+        if changed && let Ok(worker) = crate::controller::events::WorkerName::parse(worker) {
+            self.capture_hint(crate::controller::events::NewEvent::WorkerChanged {
+                worker,
+                ready: None,
+                observed_at_millis: previous.map_or(0, |row| row.observed_at_millis()),
+                code: None,
+            });
         }
-        sync_directory(self.inner.observations.as_raw_fd())
+        Ok(())
     }
 
     pub(crate) fn peek_admission_observation(
@@ -5449,6 +5463,14 @@ fn publish_queue_snapshot(
     snapshot: &QueueSnapshot,
     expected: FileIdentity,
 ) -> Result<(), WorkerError> {
+    let previous = if store.event_sink.is_some() {
+        read_queue_snapshot(store.inner.queue.as_raw_fd())
+            .ok()
+            .filter(|(_, binding)| *binding == expected)
+            .map(|(snapshot, _)| snapshot)
+    } else {
+        None
+    };
     let bytes = canonical_queue_bytes(snapshot)?;
     let operation = OperationFile::stage(
         store.inner.operations.as_raw_fd(),
@@ -5468,6 +5490,13 @@ fn publish_queue_snapshot(
         return Err(injected_failure(ClientStateWritePoint::AfterPublish));
     }
     sync_directory(store.inner.queue.as_raw_fd())?;
+    if store.event_sink.is_some() {
+        if let Some(previous) = previous {
+            events::capture_queue_diff(&previous, snapshot, |hint| store.capture_hint(hint));
+        } else {
+            store.capture_hint(events::generic_queue_hint());
+        }
+    }
     operation.cleanup(
         &store.inner.write_fault,
         &[expected],
@@ -5554,7 +5583,9 @@ fn publish_affinity_record(
     bytes: &[u8],
     store: &ClientStateStore,
 ) -> Result<(), WorkerError> {
-    publish_optional_record(directory, name, bytes, store)
+    publish_optional_record(directory, name, bytes, store, || {
+        store.capture_hint(events::generic_queue_hint())
+    })
 }
 
 fn publish_optional_record(
@@ -5562,8 +5593,11 @@ fn publish_optional_record(
     name: &CStr,
     bytes: &[u8],
     store: &ClientStateStore,
+    after_durable: impl FnOnce(),
 ) -> Result<(), WorkerError> {
-    let existing = read_regular_optional(directory, name)?.map(|(_, identity)| identity);
+    let previous = read_regular_optional(directory, name)?;
+    let changed = previous.as_ref().is_none_or(|(old, _)| old != bytes);
+    let existing = previous.map(|(_, identity)| identity);
     let operation = OperationFile::stage(
         store.inner.operations.as_raw_fd(),
         bytes,
@@ -5582,6 +5616,9 @@ fn publish_optional_record(
         return Err(injected_failure(ClientStateWritePoint::AfterPublish));
     }
     sync_directory(directory)?;
+    if changed {
+        after_durable();
+    }
     operation.cleanup(
         &store.inner.write_fault,
         &existing.into_iter().collect::<Vec<_>>(),
@@ -5677,7 +5714,25 @@ fn publish_observation(
     store: &ClientStateStore,
 ) -> Result<(), WorkerError> {
     read_observation_optional(directory, worker)?;
-    publish_optional_record(directory, &observation_record_name(worker)?, bytes, store)
+    publish_optional_record(
+        directory,
+        &observation_record_name(worker)?,
+        bytes,
+        store,
+        || {
+            if let (Ok(row), Ok(worker)) = (
+                serde_json::from_slice::<AdmissionObservation>(bytes),
+                crate::controller::events::WorkerName::parse(worker),
+            ) {
+                store.capture_hint(crate::controller::events::NewEvent::WorkerChanged {
+                    worker,
+                    ready: Some(row.ready()),
+                    observed_at_millis: row.observed_at_millis(),
+                    code: None,
+                });
+            }
+        },
+    )
 }
 
 fn open_or_create_refresh_marker(

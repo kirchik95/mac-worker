@@ -278,6 +278,76 @@ fn after_task_id(record: &LocalTaskRecord) -> crate::task::TaskId {
     record.meta().task_id()
 }
 
+pub(crate) fn generic_queue_hint() -> NewEvent {
+    NewEvent::QueueChanged(QueueHint {
+        turn_id: None,
+        state: None,
+        kind: None,
+        code: None,
+    })
+}
+
+pub(crate) fn capture_queue_diff(
+    old: &crate::job::QueueSnapshot,
+    next: &crate::job::QueueSnapshot,
+    mut capture: impl FnMut(NewEvent),
+) {
+    let mut changed = Vec::new();
+    for entry in next.entries() {
+        if old
+            .entries()
+            .iter()
+            .find(|old| old.job_id() == entry.job_id())
+            != Some(entry)
+        {
+            changed.push(NewEvent::QueueChanged(QueueHint {
+                turn_id: Some(entry.job_id()),
+                state: Some(
+                    match entry.state() {
+                        crate::job::QueueState::Waiting { .. } => "waiting",
+                        crate::job::QueueState::Dispatching { .. } => "dispatching",
+                        crate::job::QueueState::Parked => "parked",
+                    }
+                    .into(),
+                ),
+                kind: Some(
+                    match entry.kind() {
+                        crate::job::QueueEntryKind::Batch => "batch",
+                        crate::job::QueueEntryKind::TaskTurn => "task_turn",
+                    }
+                    .into(),
+                ),
+                code: None,
+            }));
+            if changed.len() > MAX_HINTS {
+                capture(generic_queue_hint());
+                return;
+            }
+        }
+    }
+    for entry in old.entries() {
+        if !next
+            .entries()
+            .iter()
+            .any(|next| next.job_id() == entry.job_id())
+        {
+            changed.push(NewEvent::QueueChanged(QueueHint {
+                turn_id: Some(entry.job_id()),
+                state: None,
+                kind: None,
+                code: None,
+            }));
+            if changed.len() > MAX_HINTS {
+                capture(generic_queue_hint());
+                return;
+            }
+        }
+    }
+    for event in changed {
+        capture(event);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{cell::RefCell, collections::BTreeSet, sync::Mutex};
@@ -689,5 +759,185 @@ pub(crate) mod tests {
         store.create_task(task_record()).unwrap();
         assert_eq!(sink.events().len(), 1);
         assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
+
+    fn owner() -> crate::job::ProcessIdentity {
+        crate::supervisor::SystemProcessInspector
+            .identity_for_pid(std::process::id())
+            .unwrap()
+    }
+
+    fn queue_row(store: &ClientStateStore, turn: TurnId) -> crate::job::QueueEntry {
+        crate::job::QueueEntry::new(
+            turn,
+            store.client_id(),
+            "a".repeat(64),
+            "b".repeat(64),
+            crate::job::CommandSummary::argv(1).unwrap(),
+            vec![],
+            crate::scheduler::WorkerPreference::Automatic,
+            crate::job::QueueEntryKind::TaskTurn,
+            None,
+            owner(),
+            100,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_queue_publication_path_is_covered() {
+        let (_dir, store, sink) = store_with_sink();
+        let record = task_record();
+        let turn = record.status().turns()[0].turn_id();
+        store.create_task(record.clone()).unwrap();
+        store
+            .write_turn_prompt(record.meta().task_id(), turn, "PRIVATE_PROMPT")
+            .unwrap();
+        sink.clear();
+        store.enqueue(queue_row(&store, turn)).unwrap();
+        assert!(
+            matches!(&sink.events()[0], NewEvent::QueueChanged(hint) if hint.turn_id == Some(turn))
+        );
+        sink.clear();
+        let crate::client_state::RunnerSlotDecision::Acquired { token } =
+            store.reserve_runner_slot(turn, owner(), 8, false).unwrap()
+        else {
+            panic!("reservation missing");
+        };
+        sink.clear();
+        store
+            .complete_runner_spawn(record.meta().task_id(), turn, token, owner())
+            .unwrap();
+        assert!(
+            sink.events()
+                .iter()
+                .filter(|event| matches!(event, NewEvent::QueueChanged(_)))
+                .count()
+                >= 1
+        );
+        sink.clear();
+        store.park_row(turn).unwrap();
+        assert!(
+            matches!(&sink.events()[0], NewEvent::QueueChanged(hint) if hint.state.as_deref() == Some("parked"))
+        );
+        sink.clear();
+        store.update_queue(|_| Ok(((), true))).unwrap();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn queue_hint_after_real_queue_and_state_locks_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("state");
+        let bare = ClientStateStore::open(&root).unwrap();
+        let locked = vec![
+            root.clone(),
+            root.join("jobs.lock"),
+            root.join("queue/lock"),
+        ];
+        let sink = Arc::new(RecordingSink::checking(move || locks_are_free(&locked)));
+        let store = bare.with_event_sink(sink.clone());
+        store
+            .enqueue(queue_row(&store, TurnId::generate()))
+            .unwrap();
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn queue_prepublication_failure_is_silent() {
+        let (_dir, store, sink) = store_with_sink();
+        store.inject_write_failure_once(ClientStateWritePoint::BeforePublish);
+        assert!(
+            store
+                .enqueue(queue_row(&store, TurnId::generate()))
+                .is_err()
+        );
+        assert!(sink.events().is_empty());
+    }
+
+    fn observation(time: u64) -> crate::job::AdmissionObservation {
+        crate::job::AdmissionObservation::new(
+            "mini-1".into(),
+            true,
+            crate::scheduler::CandidateSlot::Idle,
+            vec![],
+            None,
+            1,
+            time,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn observation_cas_loser_and_ttl_are_silent() {
+        let (_dir, store, sink) = store_with_sink();
+        let first = observation(100);
+        store.publish_admission_observation(first.clone()).unwrap();
+        assert!(matches!(
+            &sink.events()[0],
+            NewEvent::WorkerChanged {
+                ready: Some(true),
+                observed_at_millis: 100,
+                ..
+            }
+        ));
+        sink.clear();
+        assert_eq!(
+            store
+                .commit_admission_observation("mini-1", None, observation(110))
+                .unwrap(),
+            first
+        );
+        assert!(
+            store
+                .admission_observation("mini-1", 5000, || Err(crate::error::WorkerError::Protocol(
+                    "offline fixture".into()
+                )))
+                .is_err()
+        );
+        assert!(sink.events().is_empty());
+        store
+            .commit_admission_observation("mini-1", Some(&first), observation(110))
+            .unwrap();
+        assert_eq!(sink.events().len(), 1);
+        sink.clear();
+        store
+            .publish_admission_observation(observation(110))
+            .unwrap();
+        assert!(sink.events().is_empty());
+        store.invalidate_admission_observation("mini-1").unwrap();
+        assert!(matches!(
+            &sink.events()[0],
+            NewEvent::WorkerChanged { ready: None, .. }
+        ));
+        sink.clear();
+        store.invalidate_admission_observation("mini-1").unwrap();
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn affinity_changes_emit_only_generic_queue_invalidation() {
+        let (_dir, store, sink) = store_with_sink();
+        store
+            .record_affinity(
+                "a".repeat(64).as_str(),
+                "b".repeat(64).as_str(),
+                "mini-1",
+                100,
+            )
+            .unwrap();
+        assert_eq!(sink.events().len(), 1);
+        assert!(
+            matches!(&sink.events()[0], NewEvent::QueueChanged(hint) if hint.turn_id.is_none())
+        );
+        sink.clear();
+        store
+            .remove_affinity_if_matches(&"a".repeat(64), &"b".repeat(64), "mini-1")
+            .unwrap();
+        assert_eq!(sink.events().len(), 1);
+        let encoded = format!("{:?}", sink.events());
+        assert!(!encoded.contains(&"a".repeat(64)));
+        assert!(!encoded.contains(&"b".repeat(64)));
     }
 }
