@@ -460,6 +460,60 @@ fn committed_batch_exposes_last_delivered_cursor() {
 }
 
 #[test]
+fn successful_initialization_and_attachment_allow_work_beyond_lock_admission_budget() {
+    use mac_worker::controller::events::EventRuntime;
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = private_paths(temporary.path());
+    let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+    let runtime = Arc::new(ManualEventRuntime::new());
+    let clock = runtime.clone();
+    let hook = Arc::new(move |point| {
+        if point == JournalFaultPoint::Role(JournalRole::Manifest, JournalRoleBoundary::FinalSynced)
+        {
+            clock.advance(Duration::from_millis(100));
+        }
+        Ok(())
+    });
+    let journal = ControllerJournal::initialize_for_leader_with_hook(
+        &paths,
+        &leader,
+        JournalOptions {
+            runtime: runtime.clone(),
+        },
+        hook,
+    )
+    .expect("successful storage work must not consume the next lock's admission budget");
+    assert_eq!(runtime.now(), Duration::from_millis(100));
+    let before = journal.window(DEADLINE).unwrap();
+    assert_eq!(before.head_seq, Seq::ZERO);
+
+    let once = std::sync::atomic::AtomicBool::new(true);
+    let clock = runtime.clone();
+    let hook = Arc::new(move |point| {
+        if point == JournalFaultPoint::ReadAttempt && once.swap(false, Ordering::SeqCst) {
+            clock.advance(Duration::from_millis(100));
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(())
+    });
+    let reopened = ControllerJournal::open_existing_with_hook(
+        &paths,
+        JournalOptions {
+            runtime: runtime.clone(),
+        },
+        hook,
+    )
+    .expect("attachment retry retains an operation budget independent of lock admission")
+    .unwrap();
+    assert_eq!(runtime.now(), Duration::from_millis(200));
+    assert_eq!(reopened.window(DEADLINE).unwrap(), before);
+    assert_eq!(
+        reopened.append(drain_batch(1), DEADLINE).unwrap().seq,
+        Seq::new(1)
+    );
+}
+
+#[test]
 fn public_initialization_role_fault_matrix_preserves_epoch_and_budgets() {
     for role in [
         JournalRole::Initialization,
@@ -527,6 +581,72 @@ fn drain_batch(count: usize) -> EventBatch {
         count
     ])
     .unwrap()
+}
+
+struct CompletionWriter {
+    journal: Arc<ControllerJournal>,
+    complete: std::sync::mpsc::Sender<()>,
+}
+impl JournalReader for CompletionWriter {
+    fn window(
+        &self,
+        deadline: Duration,
+    ) -> Result<mac_worker::controller::events::JournalWindow, mac_worker::error::WorkerError> {
+        self.journal.window(deadline)
+    }
+    fn read(
+        &self,
+        query: ReadQuery,
+        deadline: Duration,
+    ) -> Result<EventReadResult, mac_worker::error::WorkerError> {
+        self.journal.read(query, deadline)
+    }
+}
+impl JournalWriter for CompletionWriter {
+    fn append(
+        &self,
+        batch: EventBatch,
+        deadline: Duration,
+    ) -> Result<mac_worker::controller::events::EventCursor, mac_worker::error::WorkerError> {
+        let result = self.journal.append(batch, deadline);
+        self.complete.send(()).unwrap();
+        result
+    }
+}
+
+#[test]
+fn publisher_retry_allows_successful_work_beyond_lock_admission_budget() {
+    use mac_worker::controller::events::PublishAttempt;
+    use std::sync::mpsc;
+    let h = JournalHarness::new();
+    let once = std::sync::atomic::AtomicBool::new(true);
+    let clock = h.runtime.clone();
+    let hook = Arc::new(move |point| {
+        if point == JournalFaultPoint::AppendPrepared && once.swap(false, Ordering::SeqCst) {
+            clock.advance(Duration::from_millis(100));
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(())
+    });
+    let journal = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hook,
+    )
+    .unwrap()
+    .unwrap();
+    let (complete, finished) = mpsc::channel();
+    let (sink, handle) = BoundedPublisher::start(
+        Arc::new(CompletionWriter { journal, complete }),
+        h.runtime.clone(),
+    );
+    assert_eq!(sink.try_publish(drain_batch(1)), PublishAttempt::Queued);
+    finished.recv().unwrap();
+    handle.stop_without_join();
+    assert_eq!(h.head().head_seq, Seq::new(1));
+    assert_eq!(h.read_from(0, 32).events.len(), 1);
 }
 
 fn run_role_matrix() {
@@ -931,38 +1051,6 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
     )
     .unwrap()
     .unwrap();
-    struct CompletionWriter {
-        journal: Arc<ControllerJournal>,
-        complete: mpsc::Sender<()>,
-    }
-    impl JournalReader for CompletionWriter {
-        fn window(
-            &self,
-            deadline: Duration,
-        ) -> Result<mac_worker::controller::events::JournalWindow, mac_worker::error::WorkerError>
-        {
-            self.journal.window(deadline)
-        }
-        fn read(
-            &self,
-            query: ReadQuery,
-            deadline: Duration,
-        ) -> Result<EventReadResult, mac_worker::error::WorkerError> {
-            self.journal.read(query, deadline)
-        }
-    }
-    impl JournalWriter for CompletionWriter {
-        fn append(
-            &self,
-            batch: EventBatch,
-            deadline: Duration,
-        ) -> Result<mac_worker::controller::events::EventCursor, mac_worker::error::WorkerError>
-        {
-            let result = self.journal.append(batch, deadline);
-            self.complete.send(()).unwrap();
-            result
-        }
-    }
     let (complete, finished) = mpsc::channel();
     let (sink, handle) = BoundedPublisher::start(
         Arc::new(CompletionWriter { journal, complete }),
@@ -970,7 +1058,7 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
     );
     assert_eq!(sink.try_publish(drain_batch(1)), PublishAttempt::Queued);
     wait.recv().unwrap();
-    for _ in 0..128 {
+    for _ in 0..127 {
         assert_eq!(sink.try_publish(drain_batch(32)), PublishAttempt::Queued);
     }
     assert_eq!(sink.try_publish(drain_batch(1)), PublishAttempt::Dropped);

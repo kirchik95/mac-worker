@@ -35,7 +35,9 @@ struct Shared {
     stop_now: AtomicBool,
     unavailable: AtomicBool,
     done: AtomicBool,
-    queued_bytes: AtomicUsize,
+    // Reservations include producers, the channel, and the active write.
+    outstanding_batches: AtomicUsize,
+    outstanding_bytes: AtomicUsize,
     full_drops: AtomicU64,
     stopping_drops: AtomicU64,
     unavailable_drops: AtomicU64,
@@ -58,8 +60,11 @@ struct Queued<T> {
 impl<T> Drop for Queued<T> {
     fn drop(&mut self) {
         self.shared
-            .queued_bytes
+            .outstanding_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.shared
+            .outstanding_batches
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -100,8 +105,9 @@ pub(super) fn start<T: Send + 'static>(
                     break;
                 };
                 let batch = queued.batch.take().expect("queued batch is present");
+                let written = catch_unwind(AssertUnwindSafe(|| write(batch)));
                 drop(queued);
-                match catch_unwind(AssertUnwindSafe(|| write(batch))) {
+                match written {
                     Ok(Ok(())) => {}
                     Ok(Err(())) => {
                         state.write_failures.fetch_add(1, Ordering::Relaxed);
@@ -172,7 +178,18 @@ impl<T> Queue<T> {
         let bytes = (self.size)(&batch);
         if self
             .shared
-            .queued_bytes
+            .outstanding_batches
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < QUEUE_BATCHES).then_some(current + 1)
+            })
+            .is_err()
+        {
+            self.shared.full_drops.fetch_add(1, Ordering::Relaxed);
+            return EnqueueResult::Full;
+        }
+        if self
+            .shared
+            .outstanding_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
@@ -180,6 +197,9 @@ impl<T> Queue<T> {
             })
             .is_err()
         {
+            self.shared
+                .outstanding_batches
+                .fetch_sub(1, Ordering::AcqRel);
             self.shared.full_drops.fetch_add(1, Ordering::Relaxed);
             return EnqueueResult::Full;
         }
@@ -253,7 +273,7 @@ mod tests {
         );
         assert_eq!(sink.try_enqueue(vec![0]), EnqueueResult::Queued);
         entered_rx.recv().unwrap();
-        for _ in 0..128 {
+        for _ in 0..127 {
             assert_eq!(sink.try_enqueue(vec![1]), EnqueueResult::Queued);
         }
         assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Full);
@@ -335,7 +355,7 @@ mod tests {
         );
         assert_eq!(sink.try_enqueue(vec![1]), EnqueueResult::Queued);
         entered_rx.recv().unwrap();
-        for _ in 0..128 {
+        for _ in 0..127 {
             assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Queued);
         }
         assert_eq!(sink.try_enqueue(vec![3]), EnqueueResult::Full);
@@ -346,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_is_reserved_before_queueing() {
+    fn byte_budget_includes_the_blocked_in_flight_batch() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (sink, handle) = start(
@@ -359,7 +379,7 @@ mod tests {
         );
         assert_eq!(sink.try_enqueue(1), EnqueueResult::Queued);
         entered_rx.recv().unwrap();
-        assert_eq!(sink.try_enqueue(4 * 1024 * 1024), EnqueueResult::Queued);
+        assert_eq!(sink.try_enqueue(QUEUE_BYTES - 1), EnqueueResult::Queued);
         assert_eq!(sink.try_enqueue(1), EnqueueResult::Full);
         handle.stop_without_join();
         release_tx.send(()).unwrap();

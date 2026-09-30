@@ -82,6 +82,13 @@ fn canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 
+fn canonical_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn canonical_seq(value: &serde_json::Value) -> io::Result<u64> {
     let text = value.as_str().ok_or_else(unavailable)?;
     let number: u64 = text.parse().map_err(|_| unavailable())?;
@@ -578,6 +585,11 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
             || evidence.kind != kind
             || !valid_role_target(kind, &evidence.target)
             || evidence.old_binding.is_some() != evidence.old_digest.is_some()
+            || !canonical_digest(&evidence.new_digest)
+            || evidence
+                .old_digest
+                .as_deref()
+                .is_some_and(|value| !canonical_digest(value))
             || evidence.old_len
                 > if kind == RoleKind::Segment {
                     SEGMENT_BYTES
@@ -1777,6 +1789,110 @@ mod tests {
     #[ignore = "stress: repeat every journal role fault at least 200 times"]
     fn journal_role_fault_matrix_stress() {
         role_fault_matrix(200);
+    }
+
+    #[test]
+    fn malformed_new_role_digest_preserves_partial_stage_and_evidence() {
+        for malformed in [
+            String::new(),
+            "a".repeat(63),
+            "g".repeat(64),
+            "A".repeat(64),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = RootedDir::create(&temp.path().join("events")).unwrap();
+            let kind = RoleKind::Manifest;
+            root.write_new_private_file("manifest.json", b"old generation")
+                .unwrap();
+            let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Role(
+                kind,
+                PrivateRolePoint::PartialStage,
+            ))));
+            assert!(
+                replace_role(
+                    &root,
+                    EPOCH,
+                    kind,
+                    "manifest.json",
+                    b"new generation",
+                    &fault
+                )
+                .is_err()
+            );
+            let mut evidence: RoleEvidence = read_json(&root, &kind.evidence(), 4096).unwrap();
+            evidence.new_digest = malformed;
+            let encoded = bounded_json(&evidence, 4096).unwrap();
+            fs::write(root.path().join(kind.evidence()), &encoded).unwrap();
+            let stage = root.read_private_regular(&kind.stage(), 4096).unwrap();
+            let names = root.list_names().unwrap();
+            assert!(
+                recover_roles(&root, EPOCH).is_err(),
+                "malformed new digest must be unavailable"
+            );
+            assert_eq!(root.list_names().unwrap(), names);
+            assert_eq!(
+                root.read_private_regular(&kind.evidence(), 4096).unwrap(),
+                encoded
+            );
+            assert_eq!(
+                root.read_private_regular(&kind.stage(), 4096).unwrap(),
+                stage
+            );
+            assert_eq!(
+                root.read_private_regular("manifest.json", 4096).unwrap(),
+                b"old generation"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_old_role_digest_preserves_evidence_after_displaced_removal() {
+        for malformed in [
+            String::new(),
+            "a".repeat(63),
+            "g".repeat(64),
+            "A".repeat(64),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = RootedDir::create(&temp.path().join("events")).unwrap();
+            let kind = RoleKind::Manifest;
+            root.write_new_private_file("manifest.json", b"old generation")
+                .unwrap();
+            let fault = FailOnce(std::sync::Mutex::new(Some(FaultPoint::Role(
+                kind,
+                PrivateRolePoint::DisplacedRemoved,
+            ))));
+            assert!(
+                replace_role(
+                    &root,
+                    EPOCH,
+                    kind,
+                    "manifest.json",
+                    b"new generation",
+                    &fault
+                )
+                .is_err()
+            );
+            assert!(!root.entry_exists(&kind.stage()).unwrap());
+            let mut evidence: RoleEvidence = read_json(&root, &kind.evidence(), 4096).unwrap();
+            evidence.old_digest = Some(malformed);
+            let encoded = bounded_json(&evidence, 4096).unwrap();
+            fs::write(root.path().join(kind.evidence()), &encoded).unwrap();
+            let names = root.list_names().unwrap();
+            assert!(
+                recover_roles(&root, EPOCH).is_err(),
+                "malformed old digest must be unavailable"
+            );
+            assert_eq!(root.list_names().unwrap(), names);
+            assert_eq!(
+                root.read_private_regular(&kind.evidence(), 4096).unwrap(),
+                encoded
+            );
+            assert_eq!(
+                root.read_private_regular("manifest.json", 4096).unwrap(),
+                b"new generation"
+            );
+        }
     }
 
     #[test]

@@ -9,8 +9,8 @@ mod fs;
 mod publisher;
 
 use super::contracts::{
-    CONTROLLER_EVENTS_CANCELLED, JOURNAL_ADMISSION_BUDGET, JOURNAL_CHECK_INTERVAL, MAX_BATCH_BYTES,
-    MAX_EVENT_BYTES, SCHEMA_VERSION, Seq, unavailable,
+    CONTROLLER_EVENTS_CANCELLED, JOURNAL_CHECK_INTERVAL, MAX_BATCH_BYTES, MAX_EVENT_BYTES,
+    RPC_BUDGET, SCHEMA_VERSION, Seq, unavailable,
 };
 use crate::{
     controller::ControllerLeader,
@@ -211,10 +211,9 @@ impl ControllerJournal {
         options: JournalOptions,
         hooks: Hooks,
     ) -> Result<Arc<Self>, WorkerError> {
-        let deadline = options
-            .runtime
-            .now()
-            .saturating_add(JOURNAL_ADMISSION_BUDGET);
+        // Each flock has its own admission cap; successful filesystem work can
+        // consume the longer cooperative operation budget between acquisitions.
+        let deadline = options.runtime.now().saturating_add(RPC_BUDGET);
         check(options.runtime.as_ref(), deadline)?;
         if leader.identity().pid() != std::process::id() {
             return Err(unavailable(
@@ -237,10 +236,7 @@ impl ControllerJournal {
         paths: &PathLayout,
         options: JournalOptions,
     ) -> Result<Option<Arc<Self>>, WorkerError> {
-        let deadline = options
-            .runtime
-            .now()
-            .saturating_add(JOURNAL_ADMISSION_BUDGET);
+        let deadline = options.runtime.now().saturating_add(RPC_BUDGET);
         Self::open_until(paths, options, deadline, Hooks(None))
     }
 
@@ -250,10 +246,7 @@ impl ControllerJournal {
         options: JournalOptions,
         hook: Arc<dyn JournalFaultHook>,
     ) -> Result<Option<Arc<Self>>, WorkerError> {
-        let deadline = options
-            .runtime
-            .now()
-            .saturating_add(JOURNAL_ADMISSION_BUDGET);
+        let deadline = options.runtime.now().saturating_add(RPC_BUDGET);
         Self::open_until(paths, options, deadline, Hooks(Some(hook)))
     }
 
@@ -544,7 +537,7 @@ impl BoundedPublisher {
         let (queue, worker) = publisher::start(
             move |batch| {
                 journal
-                    .append(batch, clock.now().saturating_add(JOURNAL_ADMISSION_BUDGET))
+                    .append(batch, clock.now().saturating_add(RPC_BUDGET))
                     .map(|_| ())
                     .map_err(|_| ())
             },
