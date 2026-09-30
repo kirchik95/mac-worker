@@ -169,6 +169,76 @@ fn pending_lists_safe_identifiers_without_prompts_and_honors_all() {
 }
 
 #[test]
+fn first_controller_mode_run_writes_a_private_adoption_marker_once() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = Fixture::new(true);
+    let cache = fixture.paths.controller_cache_root();
+    persist_operation_envelope(&cache, &request()).unwrap();
+    let marker = cache.join("operations-adopted-v1.json");
+    // Model an upgrade: keep a recent legacy envelope, with no adoption marker.
+    if marker.exists() {
+        fs::remove_file(&marker).unwrap();
+    }
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fixture.rewrite(|value| {
+        value["created_at_millis"] = json!(before - 24 * 60 * 60 * 1000);
+        value.as_object_mut().unwrap().remove("settled_at_millis");
+        value.as_object_mut().unwrap().remove("outcome");
+    });
+    let (exit, _, stderr) = fixture.run(
+        &["controller", "retry", "00000000000000000000000000000000"],
+        &NoTransport,
+    );
+    assert_eq!(exit, 64, "{stderr}");
+    assert!(
+        marker.is_file(),
+        "the first run must adopt before a recovery command returns"
+    );
+    let marker_bytes = fs::read(&marker).unwrap();
+    let metadata = fs::metadata(&marker).unwrap();
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    let adopted: Value = serde_json::from_slice(&marker_bytes).unwrap();
+    assert!(adopted["created_at_millis"].as_u64().unwrap() >= before);
+    let (exit, stdout, stderr) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["pending"],
+        json!([])
+    );
+    let (exit, stdout, stderr) =
+        fixture.run(&["controller", "pending", "--all", "--json"], &NoTransport);
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["pending"][0]["request_id"],
+        ID
+    );
+    let new_request = parse_request(
+        &serde_json::to_vec(&json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": "00000000000000000000000000000001",
+            "command": request().command(), "body": request().body(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    persist_operation_envelope(&cache, &new_request).unwrap();
+    let (exit, stdout, stderr) = fixture.run(&["controller", "pending", "--json"], &NoTransport);
+    assert_eq!(exit, 0, "{stderr}");
+    let pending: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        pending["pending"][0]["request_id"],
+        new_request.request_id()
+    );
+    assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+    assert_eq!(fs::metadata(marker).unwrap().ino(), metadata.ino());
+}
+
+#[test]
 fn pending_skips_unreadable_envelopes_and_reports_them_without_private_details() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 

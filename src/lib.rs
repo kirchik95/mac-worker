@@ -750,6 +750,16 @@ pub fn run_with_stdio_in_context(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    if !matches!(&cli.command, Command::Host { .. })
+        && let Ok(paths) = discover_paths(cli.config.clone(), runtime)
+        && let Ok(config) = Config::load(&paths.config)
+        && config.controller.enabled
+    {
+        // Record adoption on the first laptop CLI run. Cache problems must not
+        // block unrelated commands; pending and persistence check this strictly.
+        let _ =
+            crate::controller::envelope::adopt_operation_envelopes(&paths.controller_cache_root());
+    }
     if let Command::Dashboard {
         port,
         no_open,

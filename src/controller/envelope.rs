@@ -16,6 +16,7 @@ use crate::{
 };
 
 const OPERATIONS_LOCK: &str = "operations.lock";
+const ADOPTION_MARKER: &str = "operations-adopted-v1.json";
 const MAX_ENVELOPE_BYTES: u64 = crate::controller::protocol::MAX_STORED_REQUEST_BYTES as u64;
 pub const ENVELOPE_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_SCAN_LIMIT: usize = 256;
@@ -37,10 +38,46 @@ pub struct OperationEnvelope {
     command: String,
     body: Value,
     created_at_millis: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Explicit null fields distinguish new pending envelopes from legacy files.
+    #[serde(default)]
     settled_at_millis: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     outcome: Option<OperationOutcome>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptionMarker {
+    created_at_millis: u64,
+}
+
+pub(crate) fn adopt_operation_envelopes(cache_root: &Path) -> Result<(), WorkerError> {
+    let root = open_controller_root(cache_root)?;
+    let _lock = lock_operations(&root)?;
+    adoption_time(&root, now_millis()?)?;
+    Ok(())
+}
+
+// Caller holds operations.lock; publish once and never advance the cutoff.
+fn adoption_time(root: &crate::rooted_fs::RootedDir, now: u64) -> Result<u64, WorkerError> {
+    if !root.entry_exists(ADOPTION_MARKER).map_err(store_io)? {
+        let bytes = serde_json::to_vec(&AdoptionMarker {
+            created_at_millis: now,
+        })
+        .map_err(std::io::Error::other)?;
+        match root.write_private_atomic_no_replace(ADOPTION_MARKER, &bytes) {
+            Ok(()) => return Ok(now),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(store_io(error)),
+        }
+    }
+    let bytes = root
+        .read_private_regular(ADOPTION_MARKER, 256)
+        .map_err(store_io)?;
+    let marker: AdoptionMarker = serde_json::from_slice(&bytes).map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_TRANSPORT: envelope adoption marker is invalid".into())
+    })?;
+    Ok(marker.created_at_millis)
 }
 
 impl OperationEnvelope {
@@ -94,6 +131,8 @@ pub fn persist_operation_envelope(
     let name = envelope_file_name(request.request_id())?;
     let root = open_controller_root(cache_root)?;
     let _lock = lock_operations(&root)?;
+    let now = now_millis()?;
+    adoption_time(&root, now)?;
     if root.entry_exists(&name).map_err(store_io)? {
         let existing = load_envelope(&root, &name)?;
         return reuse_or_conflict(&existing, request);
@@ -103,7 +142,7 @@ pub fn persist_operation_envelope(
         payload_sha256: request.payload_sha256().to_owned(),
         command: request.command().to_owned(),
         body: request.body().clone(),
-        created_at_millis: now_millis()?,
+        created_at_millis: now,
         settled_at_millis: None,
         outcome: None,
     };
@@ -174,6 +213,10 @@ fn list_pending_envelopes_at(
     let Some(root) = open_existing_controller_root(cache_root)? else {
         return Ok(PendingEnvelopes::default());
     };
+    let adopted_at = {
+        let _lock = lock_operations(&root)?;
+        adoption_time(&root, now)?
+    };
     let mut report = PendingEnvelopes::default();
     for name in root.list_names().map_err(store_io)? {
         if !name.starts_with(b"op-") || !name.ends_with(b".json") {
@@ -187,7 +230,7 @@ fn list_pending_envelopes_at(
             });
             continue;
         };
-        let envelope = match load_envelope(&root, &name) {
+        let (envelope, legacy) = match load_pending_envelope(&root, &name) {
             Ok(envelope) => envelope,
             // A concurrent prune may remove a settled entry after enumeration.
             Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -201,7 +244,9 @@ fn list_pending_envelopes_at(
             }
         };
         if envelope.settled_at_millis.is_none()
-            && (all || now.saturating_sub(envelope.created_at_millis) <= ENVELOPE_WINDOW_MILLIS)
+            && (all
+                || (now.saturating_sub(envelope.created_at_millis) <= ENVELOPE_WINDOW_MILLIS
+                    && (!legacy || envelope.created_at_millis >= adopted_at)))
         {
             report.pending.push(envelope);
         }
@@ -292,6 +337,22 @@ fn load_envelope(
         .read_private_regular(name, MAX_ENVELOPE_BYTES)
         .map_err(store_io)?;
     decode_envelope(name, &bytes)
+}
+
+fn load_pending_envelope(
+    root: &crate::rooted_fs::RootedDir,
+    name: &str,
+) -> Result<(OperationEnvelope, bool), WorkerError> {
+    let bytes = root
+        .read_private_regular(name, MAX_ENVELOPE_BYTES)
+        .map_err(store_io)?;
+    let invalid =
+        |_| WorkerError::Protocol("CONTROLLER_TRANSPORT: operation envelope is invalid".into());
+    let value: Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let legacy = value.get("settled_at_millis").is_none() && value.get("outcome").is_none();
+    let envelope = serde_json::from_value(value).map_err(invalid)?;
+    validate_envelope(name, &envelope)?;
+    Ok((envelope, legacy))
 }
 
 fn decode_envelope(name: &str, bytes: &[u8]) -> Result<OperationEnvelope, WorkerError> {
@@ -471,6 +532,52 @@ mod tests {
                 .is_empty()
         );
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn adoption_hides_only_legacy_envelopes_created_before_the_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let root = open_controller_root(&cache).unwrap();
+        let adopted_at = 20 * ENVELOPE_WINDOW_MILLIS;
+        root.write_private_atomic_no_replace(
+            "operations-adopted-v1.json",
+            &serde_json::to_vec(&json!({"created_at_millis": adopted_at})).unwrap(),
+        )
+        .unwrap();
+        for (id, created, legacy) in [
+            (1, adopted_at - 1, true),
+            (2, adopted_at - 1, false),
+            (3, adopted_at + 1, true),
+            (4, adopted_at, true),
+        ] {
+            seed_envelope(&root, id, None);
+            rewrite(&cache, id, |value| {
+                value["created_at_millis"] = json!(created);
+                if legacy {
+                    value.as_object_mut().unwrap().remove("settled_at_millis");
+                    value.as_object_mut().unwrap().remove("outcome");
+                } else {
+                    value["settled_at_millis"] = Value::Null;
+                    value["outcome"] = Value::Null;
+                }
+            });
+        }
+        let ids = |all| {
+            list_pending_envelopes_at(&cache, all, adopted_at + 2)
+                .unwrap()
+                .pending
+                .into_iter()
+                .map(|envelope| envelope.request_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(false), [3, 4, 2].map(|id| format!("{id:032x}")));
+        assert_eq!(ids(true), [3, 4, 1, 2].map(|id| format!("{id:032x}")));
+        assert!(
+            load_operation_envelope(&cache, request(1).request_id())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
