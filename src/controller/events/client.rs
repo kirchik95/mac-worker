@@ -693,6 +693,10 @@ impl TaskReconciler {
                 })
             })
             .or(baseline);
+        // Retention can expire a cursor after validation. Recovery decisions
+        // still need coalescing even when the consumed cursor stays pinned.
+        self.cursor_recovery |=
+            window.is_some() && self.cursor.is_some() && replay_after != self.cursor;
         if window.as_ref().is_some_and(|window| {
             replay_after != self.cursor
                 && (!self.cursor_validated
@@ -702,7 +706,6 @@ impl TaskReconciler {
         }) {
             // Ahead, expired and replaced-epoch saved cursors are not consumed
             // evidence in this window. Adopt H only after the full repair.
-            self.cursor_recovery |= self.cursor.is_some();
             self.cursor = None;
             self.cursor_validated = false;
         } else if self.cursor.is_some() && replay_after == self.cursor {

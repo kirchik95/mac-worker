@@ -1994,6 +1994,126 @@ mod reconciliation {
         }
     }
 
+    fn assert_periodic_capture_expiry_coalesces(paged: bool) {
+        let old = (1..=3)
+            .map(|id| (task_id(id), terminal(id, SafeOutcome::Done, false)))
+            .collect();
+        let mut h = Harness::new(PreviousProjection::Present(old), None, vec![]);
+        let cursor = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            h.reconciler.previous_projection().clone(),
+            Some(cursor),
+            vec![task_id(1), task_id(2), task_id(3)],
+            h.runtime.clone(),
+        );
+        for id in 1..=3 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, false))
+                .unwrap();
+        }
+
+        // Validate the consumed cursor while the tasks are still busy.
+        let initial = h.tick(None, true);
+        assert_eq!(initial.repair, RepairProgress::Complete);
+        assert!(!initial.repair_needed);
+        assert!(initial.changes.is_empty());
+        assert_eq!(initial.consumed_after, Some(cursor));
+        let plan = plan_notifications(
+            &NotifyState::empty(),
+            &initial,
+            &NotifyOptions::default(),
+            1_000,
+        );
+        assert!(plan.notices.is_empty());
+        let mut saved = plan.next;
+        assert_eq!(saved.last_complete_repair_millis, Some(1_000));
+
+        for id in 1..=2 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        if paged {
+            h.source.tasks.set_page_budget(1);
+        }
+        for _ in 0..3 {
+            h.source.hint(999, false);
+        }
+        h.source.journal.trim_to(Seq::new(3)).unwrap();
+        let EventReadResult::SnapshotRequired(control) = h.feed(cursor) else {
+            panic!("the validated cursor must expire in the real journal")
+        };
+        assert_eq!(control.reason, "cursor_expired");
+        assert_eq!(control.window.journal_id, cursor.journal_id);
+
+        // Let the periodic sweep discover the gap through its own capture.
+        h.runtime.advance(Duration::from_secs(15));
+        let initial_pages = h.source.tasks.repair_requests().len();
+        let mut notices = Vec::new();
+        let mut changed = Vec::new();
+        let mut decision_recovery = Vec::new();
+        let mut settled = false;
+        for step in 0..8 {
+            let result = h.tick(None, false);
+            if paged && step < 2 {
+                assert_eq!(result.consumed_after, Some(cursor));
+            }
+            changed.extend(result.changes.iter().map(|change| change.task_id));
+            if !result.changes.is_empty() {
+                decision_recovery.push(result.repair_needed);
+            }
+            let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 2_000);
+            saved = plan.next;
+            notices.extend(plan.notices);
+            if result.repair == RepairProgress::Complete && !result.repair_needed {
+                assert!(
+                    result.changes.is_empty(),
+                    "recovery needs a later settled chunk"
+                );
+                assert_eq!(result.pending_ids, vec![task_id(3)]);
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "periodic cursor recovery did not settle");
+        assert_eq!(changed, vec![task_id(1), task_id(2)]);
+        assert_eq!(
+            h.source.tasks.repair_requests().len() - initial_pages,
+            if paged { 3 } else { 1 }
+        );
+        assert_eq!(notices.len(), 1, "paged={paged}: {notices:?}");
+        assert_eq!(notices[0].title, "Tasks finished");
+        assert_eq!(notices[0].body, "2 tasks");
+        assert!(decision_recovery.iter().all(|recovering| *recovering));
+        assert_eq!(saved.last_complete_repair_millis, Some(2_000));
+        let after = h.reconciler.cursor().unwrap();
+        assert_eq!(after.journal_id, cursor.journal_id);
+        assert_eq!(after.seq, Seq::new(3));
+
+        h.source
+            .tasks
+            .insert(terminal(3, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(3, true);
+        let result = h.tick(Some(h.feed(after)), false);
+        assert!(!result.repair_needed);
+        let plan = plan_notifications(&saved, &result, &NotifyOptions::default(), 2_001);
+        assert_eq!(plan.notices.len(), 1);
+        assert_eq!(plan.notices[0].title, "Done");
+    }
+
+    #[test]
+    fn review_periodic_capture_of_expired_validated_cursor_coalesces() {
+        assert_periodic_capture_expiry_coalesces(false);
+    }
+
+    #[test]
+    fn review_paged_periodic_capture_of_expired_validated_cursor_coalesces() {
+        assert_periodic_capture_expiry_coalesces(true);
+    }
+
     #[test]
     fn cursor_recovery_coalesces_decisions_after_delayed_proof() {
         let (mut h, mut saved, read) = expired_cursor_recovery(false, true);
