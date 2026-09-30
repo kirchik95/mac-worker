@@ -806,7 +806,7 @@ fn seeded_status_round_trips_through_a_host_controller_rpc_process() {
             child.kill_and_reap();
             panic!("host controller-rpc did not exit");
         });
-    let stdout = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stdout = rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT).unwrap();
     assert!(status.success(), "stderr process failed: {status:?}");
     let reply: ControllerReadReply<ControllerTaskStatusResult> = decode_read(&stdout);
     assert_eq!(reply.command(), "task.status");

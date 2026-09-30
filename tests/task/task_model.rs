@@ -13,7 +13,6 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
 };
 
 use mac_worker::{
@@ -706,10 +705,12 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
     state.create_task(original).unwrap();
 
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let writer_release_tx = crate::support::ScopedSender(writer_release_tx);
         let writer_state = Arc::clone(&state);
         let writer = scope.spawn(move || writer_state.replace_task_fixture(replacement.clone()));
         writer_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let reader_state = Arc::clone(&state);
@@ -719,7 +720,7 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
             listed_tx.send(reader_state.list_tasks()).unwrap();
         });
 
-        let reader_contended = contention.confirmed_within(Duration::from_secs(2));
+        let reader_contended = contention.confirmed_within(crate::support::HANDSHAKE_TIMEOUT);
         writer_release_tx.send(()).unwrap();
         writer.join().unwrap().unwrap();
         assert!(
@@ -728,7 +729,7 @@ fn task_enumeration_waits_for_a_pre_exchange_replacement_writer() {
         );
         assert_eq!(
             listed_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap()
                 .unwrap(),
             vec![expected]

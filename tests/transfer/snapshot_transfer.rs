@@ -988,7 +988,7 @@ impl RsyncServerExecutor for GateExecutor {
         )?;
         let (release, wait) = mpsc::channel();
         self.entered.send(release).unwrap();
-        wait.recv_timeout(Duration::from_secs(5))
+        wait.recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .map_err(|_| WorkerError::Protocol("test executor release timed out".into()))?;
         Ok(())
     }
@@ -1129,7 +1129,9 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
             receiver_executor.as_ref(),
         )
     });
-    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let (resolved_tx, resolved_rx) = mpsc::channel();
     let (classified_tx, classified_rx) = mpsc::channel();
@@ -1149,7 +1151,7 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
             .unwrap();
     });
     classified_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("resolver did not reach the held transfer lock");
     assert!(matches!(
         resolved_rx.try_recv(),
@@ -1158,7 +1160,7 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
     release.send(()).unwrap();
     receiver.join().unwrap().unwrap();
     let resolved = resolved_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     assert!(matches!(
@@ -1207,7 +1209,7 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
         )
     });
     let release_receiver = receiver_entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
 
     let submit = SubmitRequest::new(request.material().clone());
@@ -1226,7 +1228,7 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
             .unwrap();
     });
     classified_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("resolver did not complete initial authority classification");
     assert!(matches!(
         resolved_rx.try_recv(),
@@ -1257,7 +1259,7 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
     receiver.join().unwrap().unwrap();
 
     let error = resolved_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap_err();
     resolver.join().unwrap();
@@ -1455,7 +1457,9 @@ fn independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
     barrier.wait();
 
     for _ in 0..CONTENDERS {
-        let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let release = entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(entered_rx.recv_timeout(Duration::from_millis(25)).is_err());
         release.send(()).unwrap();
     }
@@ -1485,7 +1489,9 @@ fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
             active_executor.as_ref(),
         )
     });
-    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let transfer_dir = root
         .join("locks/jobs")
@@ -1540,7 +1546,9 @@ fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
             active_executor.as_ref(),
         )
     });
-    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let transfer_dir = root
         .join("locks/jobs")
@@ -1605,7 +1613,9 @@ fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
             active_executor.as_ref(),
         )
     });
-    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let job_locks = root.join("locks/jobs").join(identity.job_id().to_string());
     let transfer_dir = job_locks.join("transfer");

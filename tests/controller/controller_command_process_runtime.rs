@@ -840,10 +840,10 @@ fn finish_laptop_wait(
         ),
     }
     let stdout = out_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap_or_default();
     let stderr = err_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap_or_default();
     (stdout, stderr)
 }

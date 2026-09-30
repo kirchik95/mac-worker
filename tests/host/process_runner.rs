@@ -718,7 +718,7 @@ mod termination {
         let escaped = FixtureProcess(serde_json::from_slice(&bytes).unwrap());
         cancel.store(true, Ordering::SeqCst);
         let error = receiver
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap_err();
         runner.join().unwrap();
@@ -771,7 +771,7 @@ mod termination {
         gate.write_all(b"background stdout").unwrap();
         drop(gate);
         let result = receiver
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         runner.join().unwrap();

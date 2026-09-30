@@ -1124,7 +1124,9 @@ fn queue_symlink_fifo_and_device_backed_replacements_fail_without_blocking() {
         let store = fixture.store.clone();
         thread::spawn(move || sent.send(store.queue_snapshot().is_err()).unwrap());
         assert!(
-            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            received
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+                .unwrap(),
             "kind {kind}"
         );
     }
@@ -3638,7 +3640,9 @@ fn observation_refresh_loser_records_the_winner_timestamp() {
             })
         })
     };
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let loser_refreshes = Arc::clone(&refreshes);
     let loser_store = Arc::clone(&store);
@@ -3698,7 +3702,9 @@ fn stale_observation_refresh_is_single_flight_and_loser_keeps_age() {
             })
         })
     };
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let loser_refreshes = Arc::clone(&refreshes);
     let stale = store
@@ -3815,7 +3821,7 @@ fn observation_cache_rejects_symlink_and_fifo_replacement() {
             )
             .unwrap()
         });
-        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT).unwrap());
     }
 }
 

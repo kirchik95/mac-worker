@@ -682,10 +682,12 @@ fn task_detail_waits_for_a_pre_exchange_replacement_writer() {
     let expected = replacement.clone();
 
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let writer_release_tx = crate::support::ScopedSender(writer_release_tx);
         let writer_state = Arc::clone(&harness.state);
         let writer = scope.spawn(move || writer_state.replace_task_fixture(replacement));
         writer_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let source = harness.task_source();
@@ -696,7 +698,7 @@ fn task_detail_waits_for_a_pre_exchange_replacement_writer() {
             detail_tx.send(source.task_detail(task_id)).unwrap();
         });
 
-        let reader_contended = contention.confirmed_within(Duration::from_secs(2));
+        let reader_contended = contention.confirmed_within(crate::support::HANDSHAKE_TIMEOUT);
         writer_release_tx.send(()).unwrap();
         writer.join().unwrap().unwrap();
         assert!(
@@ -704,7 +706,7 @@ fn task_detail_waits_for_a_pre_exchange_replacement_writer() {
             "task detail must wait for the pre-exchange writer"
         );
         let detail = detail_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         assert_eq!(detail.task.task_id, task_id);

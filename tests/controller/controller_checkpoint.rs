@@ -781,7 +781,7 @@ fn two_leaders_are_excluded_in_library_and_process() {
         let _ = tx.send(line);
     });
     let line = rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("controller run should print leader acquired");
     assert!(
         line.contains("controller leader acquired"),
@@ -803,7 +803,7 @@ fn two_leaders_are_excluded_in_library_and_process() {
             panic!("second controller run did not exit");
         });
     let stderr = err_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap_or_else(|_| {
             rejected.kill_and_reap();
             panic!("second controller run stderr closed without a line");

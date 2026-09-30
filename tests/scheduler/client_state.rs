@@ -940,11 +940,11 @@ fn concurrent_open_waits_for_cooperating_cleanup_lock() {
 
     cleanup_pause.resume();
     writer_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     let reopened = result_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     writer.join().unwrap();
@@ -999,11 +999,11 @@ fn replacing_jobs_lock_does_not_split_the_authoritative_lock_domain() {
 
     cleanup_pause.resume();
     writer_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     let reopened = open_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     writer.join().unwrap();
@@ -1042,12 +1042,12 @@ fn cloned_stores_use_independent_lock_descriptions_and_serialize() {
 
     cleanup_pause.resume();
     writer_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     assert_eq!(
         reader_receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap(),
         vec![record]
@@ -1490,7 +1490,7 @@ impl ProcessRunner for BlockingStatusRunner {
         self.release
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("blocked runner was not released");
         Ok(ProcessResult {
             status: std::process::ExitStatus::from_raw(0),
@@ -1531,7 +1531,7 @@ impl ResolutionRuntime for BlockingRetryRuntime {
         self.release
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("blocked retry sleep was not released");
         *self.now.lock().unwrap() = Duration::from_secs(30);
     }
@@ -1560,7 +1560,7 @@ fn remote_status_call_holds_no_local_client_state_lock() {
         RemoteJobClient::new(client_runner.as_ref()).status(&remote_worker(), job_id)
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("remote runner did not block");
 
     let contention = store.observe_next_lock_contention();
@@ -1572,7 +1572,7 @@ fn remote_status_call_holds_no_local_client_state_lock() {
             .unwrap();
     });
     let updated = updated_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("local update blocked behind remote call")
         .unwrap();
     assert_eq!(updated.last_status(), Some(response.status()));
@@ -1641,7 +1641,7 @@ fn remote_retry_sleep_holds_no_local_client_state_lock() {
             .resolve_preacceptance(&remote_worker(), &request)
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("retry runtime did not block");
 
     let contention = store.observe_next_lock_contention();
@@ -1656,7 +1656,7 @@ fn remote_retry_sleep_holds_no_local_client_state_lock() {
             .unwrap();
     });
     let updated = updated_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("local uncertainty update blocked behind retry sleep")
         .unwrap();
     assert!(matches!(
@@ -1735,7 +1735,7 @@ fn observation_refresh_holds_no_queue_or_root_state_lock() {
         })
     };
     refresh_entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
 
     let contention = store.observe_next_lock_contention();
@@ -1753,7 +1753,7 @@ fn observation_refresh_holds_no_queue_or_root_state_lock() {
         })
     };
     enqueue_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("queue mutation blocked behind observation refresh")
         .unwrap();
     assert!(!contention.confirmed_within(Duration::from_millis(100)));

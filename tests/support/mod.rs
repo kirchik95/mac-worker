@@ -7,6 +7,9 @@ pub mod fake_herdr;
 pub mod recording_runner;
 #[allow(dead_code)]
 pub mod task_harness;
+mod test_sync;
+#[allow(unused_imports)]
+pub use test_sync::{HANDSHAKE_TIMEOUT, ScopedSender, on_drop};
 
 use std::{
     fs,

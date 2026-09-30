@@ -1100,7 +1100,7 @@ fn transfer_gc_skips_a_live_transfer_repository_handle_with_a_warning() {
         sender.send((preview, applied)).unwrap();
     });
     let (preview, applied) = receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("transfer GC must not wait for a live repository handle");
     handle.join().unwrap();
     let preview = preview.unwrap();

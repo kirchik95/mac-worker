@@ -447,7 +447,7 @@ impl RsyncServerExecutor for HoldReceiver {
     fn execute(&self, _invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
         let (release, wait) = mpsc::channel();
         self.entered.send(release).unwrap();
-        wait.recv_timeout(Duration::from_secs(5))
+        wait.recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .map_err(|_| WorkerError::Protocol("test receiver release timed out".into()))
     }
 }
@@ -2020,7 +2020,9 @@ fn receiver_first_blocks_verification_until_the_final_bundle_is_stable() {
             },
         )
     });
-    let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let (verified_tx, verified_rx) = mpsc::channel();
     let verifier_store = HostStore::open(&host_root).unwrap();
@@ -2043,7 +2045,7 @@ fn receiver_first_blocks_verification_until_the_final_bundle_is_stable() {
     release.send(()).unwrap();
     receiver.join().unwrap().unwrap();
     verified_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap()
         .unwrap();
     verifier.join().unwrap();

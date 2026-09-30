@@ -8,7 +8,6 @@
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex, mpsc},
-    time::Duration,
 };
 
 use mac_worker::{
@@ -126,7 +125,7 @@ impl ControllerCommandHandler for KernelTestExecutor {
             guard
                 .as_ref()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
         Ok(self.next_result.lock().unwrap().clone())
@@ -732,7 +731,7 @@ fn poisoned_early_entries_do_not_starve_later_work() {
             .unwrap()
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("background executor must enter the request gate");
 
     let tight = ActiveResumeConfig {
@@ -1058,7 +1057,7 @@ fn busy_request_is_skipped_while_others_progress() {
             .unwrap()
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("background executor must enter the request gate");
     // A second request is pending while the first is busy.
     ControllerStore::open(&state)

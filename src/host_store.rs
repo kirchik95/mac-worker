@@ -6062,7 +6062,9 @@ mod review_regression_tests {
             );
             drop(held);
             assert!(
-                receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+                receiver
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap(),
                 "reopen: {reopen}"
             );
             contender.join().unwrap();
@@ -6108,7 +6110,9 @@ mod review_regression_tests {
             );
             drop(held);
             assert!(
-                receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+                receiver
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap(),
                 "reopen: {reopen}"
             );
             contender.join().unwrap();
@@ -6144,7 +6148,11 @@ mod review_regression_tests {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap()
+        );
         contender.join().unwrap();
         assert!(detached.is_file());
         assert!(lock.is_file());
@@ -6178,7 +6186,11 @@ mod review_regression_tests {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         drop(held);
-        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap()
+        );
         contender.join().unwrap();
         assert!(detached.is_file());
         assert!(lock.is_file());
@@ -6646,7 +6658,11 @@ mod review_regression_tests {
                 .is_some();
             sender.send(won).unwrap();
         });
-        assert!(!receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(
+            !receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap()
+        );
         contender.join().unwrap();
 
         drop(supervisor);

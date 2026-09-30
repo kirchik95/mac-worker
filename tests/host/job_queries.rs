@@ -182,7 +182,7 @@ impl ProcessInspector for ScriptedReconciliation {
         if let Some(gate) = self.inner.first_observation_gate.lock().unwrap().take() {
             gate.start_contender.send(()).unwrap();
             gate.contender_queued
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("supervisor contender did not queue");
             thread::sleep(Duration::from_millis(50));
         }
@@ -692,7 +692,7 @@ fn cancel_waits_for_a_held_supervisor_without_retaining_admission() {
     let launching_status =
         thread::spawn(move || JobService::new(&launching_store, &launcher).status(launch_job_id));
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("pre-Running supervisor did not retain its guard");
 
     let cancel_store = store.clone();
@@ -727,11 +727,13 @@ fn cancel_waits_for_a_held_supervisor_without_retaining_admission() {
             0
         );
     });
-    let released_admission_before_guard = probe_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    let released_admission_before_guard = probe_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .is_ok();
 
     release_tx.send(()).unwrap();
     let response = cancel_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("cancellation must finish after the supervisor handoff")
         .unwrap();
     canceller.join().unwrap();
@@ -900,11 +902,11 @@ fn overlapping_cancels_do_not_record_lease_release_failed_after_the_slot_is_free
     });
 
     let first = rx_a
-        .recv_timeout(Duration::from_secs(20))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("cancel A hung")
         .unwrap_or_else(|error| panic!("cancel A failed: {error}"));
     let second = rx_b
-        .recv_timeout(Duration::from_secs(20))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("cancel B hung")
         .unwrap_or_else(|error| panic!("cancel B failed: {error}"));
     handle_a.join().expect("cancel A thread panicked");
@@ -1261,7 +1263,7 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
         .resolve_or_abandon(request)
     });
     classified_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("resolver did not reach its pre-transfer decision boundary");
     let (attempting_tx, attempting_rx) = mpsc::channel();
     let acquire_store = store.clone();
@@ -1478,7 +1480,7 @@ fn submit_and_supervisor_launch_first_make_resolution_accept_without_second_laun
         JobService::new(&submit_store, submit_launcher.as_ref()).submit_at(submit_request, 10)
     });
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("submit did not enter its elected supervisor launch");
 
     let resolver_launches = Arc::new(AtomicUsize::new(0));
@@ -4969,7 +4971,9 @@ fn status_returns_identityless_accepted_while_an_elected_supervisor_lock_is_busy
     let first = thread::spawn(move || {
         JobService::new(&first_store, first_launcher.as_ref()).status(job_id)
     });
-    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
     let execution = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap()
@@ -5763,7 +5767,7 @@ fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
         });
 
         acquired_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("supervisor contender did not acquire after reconciliation");
         let cleanup_marker = root
             .join("locks/jobs")
@@ -5778,14 +5782,14 @@ fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
             thread::sleep(Duration::from_millis(5));
         }
         let started = Instant::now();
-        let prompt = result_rx.recv_timeout(Duration::from_millis(500));
+        let prompt = result_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         release_tx.send(()).unwrap();
         contender.join().unwrap();
         let result = match prompt {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = result_rx
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("status remained blocked after releasing the contender");
                 status_thread.join().unwrap();
                 panic!("{label} enrichment blocked on a busy supervisor lock");
@@ -6979,6 +6983,8 @@ where
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let delayed_trace = Arc::clone(trace);
         let delayed = scope.spawn(move || {
             matrix_trace(&delayed_trace, ready_event);
@@ -7013,6 +7019,8 @@ where
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let delayed_trace = Arc::clone(trace);
         let delayed = scope.spawn(move || {
             matrix_trace(&delayed_trace, "resolver-ready");
@@ -8913,7 +8921,7 @@ fn race_two_independent_resolvers(
         start.wait();
         let _ = tx_b.send(JobService::new(&store, &RejectLauncher).resolve_or_abandon(request));
     });
-    let timeout = Duration::from_secs(20);
+    let timeout = crate::support::HANDSHAKE_TIMEOUT;
     let first = rx_a
         .recv_timeout(timeout)
         .unwrap_or_else(|_| panic!("resolver A hung after {timeout:?}"))

@@ -701,7 +701,7 @@ fn local_wait_held_lock(relative_lock: &str) {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
+        let elapsed = done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         // Always release and join before asserting so the RED run cannot hang.
         if private_operation {
             // A live private operation removes its name before releasing its lock.
@@ -2402,7 +2402,7 @@ impl ProcessInspector for FinalizerInspector {
                 self.resume
                     .lock()
                     .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("finalizer gate released");
             }
             ProcessObservation::Absent
@@ -2440,17 +2440,14 @@ impl ProcessRunner for PausedFinalizerRemote {
             self.resume
                 .lock()
                 .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("finalizer gate released");
         }
         self.inner.run(request)
     }
 }
 fn finalizer_cannot_damage_a_new_turn(mode: &str) {
-    use std::{
-        sync::{Arc, mpsc},
-        time::Duration,
-    };
+    use std::sync::{Arc, mpsc};
     let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap();
     let repo = support::GitRepo::init();
     repo.write("base.txt", b"base");
@@ -2560,7 +2557,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
                 .spawn_scoped(scope, || client.reconcile_runners())
                 .unwrap();
             observed_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("stale reconciler must observe the old owner");
             Some(handle)
         } else {
@@ -2595,7 +2592,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
             })
             .unwrap();
         entered_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("old finalizer must pause immediately before base release");
         if let Some(stale) = stale {
             resume_stale.release();

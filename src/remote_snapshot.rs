@@ -2065,12 +2065,15 @@ mod tests {
                 || {
                     let (release, wait) = mpsc::channel();
                     entered_tx.send(release).unwrap();
-                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    wait.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                        .unwrap();
                 },
             );
             verified_tx.send(result.map(|_| ())).unwrap();
         });
-        let release = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let release = entered_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
 
         let (resolved_tx, resolved_rx) = mpsc::channel();
         let resolver_request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
@@ -2099,11 +2102,11 @@ mod tests {
 
         release.send(()).unwrap();
         verified_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         let resolved = resolved_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         assert!(matches!(

@@ -462,7 +462,7 @@ impl RunObserver for DispatchHandoffGate {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .map_err(|_| {
                     WorkerError::Protocol("production dispatch handoff timed out".into())
                 })?;
@@ -1118,7 +1118,7 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
         });
 
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap_or_else(|_| panic!("case {case} never reached dispatch-to-lease handoff"));
         let before = store.queue_snapshot().unwrap();
         assert_eq!(before.entries().len(), 1, "case {case}");
@@ -1560,7 +1560,7 @@ fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
         let _ = done_tx.send(result);
     });
     waiting_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("waiting third job never blocked on a full two-slot host");
     eprintln!(
         "{}",
@@ -1585,7 +1585,7 @@ fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
     eprintln!("{after_release}");
     resume_tx.send(()).expect("waiting third resume failed");
 
-    let third = match done_rx.recv_timeout(Duration::from_secs(15)) {
+    let third = match done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT) {
         Ok(result) => result
             .unwrap_or_else(|error| panic!("waiting third production dispatch failed: {error}")),
         Err(_) => panic!("waiting third timed out; {after_release}"),

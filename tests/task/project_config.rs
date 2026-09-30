@@ -210,7 +210,7 @@ fn project_settings_reject_fifo_config_without_waiting_for_a_writer() {
         let _ = sender.send(ProjectSettings::load(&root, &[]));
     });
     let result = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("project settings load blocked on a FIFO");
     handle.join().unwrap();
     let error = result.unwrap_err();

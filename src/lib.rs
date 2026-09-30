@@ -141,6 +141,9 @@ pub mod turn_runner;
 #[cfg(test)]
 pub(crate) mod fixture_pid;
 #[cfg(test)]
+#[path = "../tests/support/test_sync.rs"]
+pub(crate) mod test_support;
+#[cfg(test)]
 pub(crate) mod test_sync;
 
 #[doc(hidden)]
@@ -1062,7 +1065,9 @@ mod viewer_heartbeat_tests {
         );
         drop(write);
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap(),
             ViewerStdinEvent::Eof
         );
     }
@@ -1081,7 +1086,9 @@ mod viewer_heartbeat_tests {
             "a fresh byte must postpone the watchdog"
         );
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap(),
             ViewerStdinEvent::HeartbeatLost
         );
         assert_eq!(viewer_heartbeat_lost_error().exit_code(), 75);
@@ -1097,7 +1104,9 @@ mod viewer_heartbeat_tests {
         assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
         drop(write);
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            receiver
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap(),
             ViewerStdinEvent::Eof
         );
     }

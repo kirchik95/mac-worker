@@ -1180,7 +1180,7 @@ fn stale_facts_refresh_does_not_block_or_shrink_the_snapshot() {
     });
     gate.wait_until_entered();
     let snapshot = done_rx
-        .recv_timeout(Duration::from_millis(500))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("snapshot must not wait for the facts refresh")
         .unwrap();
     assert_eq!(snapshot.workers[0].name, "mini-1");

@@ -1004,7 +1004,7 @@ fn watch_exits_between_pump_cycles_when_the_binary_is_replaced() {
                 self.release
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap();
             }
             SystemProcessRunner.run(request)
@@ -1029,10 +1029,10 @@ fn watch_exits_between_pump_cycles_when_the_binary_is_replaced() {
             done_tx.send(()).unwrap();
             result
         });
-        let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+        let entered = entered_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         let finished_while_push_held = done_rx.try_recv().is_ok();
         release_tx.send(()).unwrap();
-        let completed = done_rx.recv_timeout(Duration::from_secs(6));
+        let completed = done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         if completed.is_err() {
             stop.store(true, Ordering::SeqCst);
         }

@@ -173,7 +173,7 @@ impl ClientStateConcurrencyHook for MutationGate {
             self.resume
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
     }
@@ -213,8 +213,12 @@ fn runner_mutation_preserves_concurrent_fetched_head_and_deliveries() {
     .unwrap();
 
     std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let resume_tx = crate::test_support::ScopedSender(resume_tx);
         let mutation = scope.spawn(|| writer.record_runner(task_id, None));
-        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        entered_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             store
                 .update_fetched_head_for_current_turn(&original, head.clone())
@@ -273,8 +277,12 @@ fn runner_mutation_rejects_a_concurrently_replaced_turn() {
     .unwrap();
     let next = original.with_status(status).unwrap();
     let result = std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let resume_tx = crate::test_support::ScopedSender(resume_tx);
         let mutation = scope.spawn(|| writer.record_runner(task_id, None));
-        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        entered_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             store
                 .update_task_if_current(&original, next.clone())
@@ -531,7 +539,7 @@ fn wait_deadline_bounds_admission_refresh_lock() {
             done_tx.send(started.elapsed()).unwrap();
             result.map(|guard| guard.is_some())
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        let elapsed = done_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
         drop(held);
         let result = waiter.join().unwrap();
         assert!(

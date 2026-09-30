@@ -1231,7 +1231,7 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
         ))
     });
     delete_started
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("native deletion should start");
 
     let (bind_started, bind_started_receiver) = mpsc::channel();
@@ -1244,7 +1244,7 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
         bind_result.send(result).unwrap();
     });
     bind_started_receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("session binding should start while deletion is blocked");
     let bind_completed_during_delete = bind_done.recv_timeout(Duration::from_millis(250)).is_ok();
 
@@ -1252,7 +1252,7 @@ fn discard_serializes_native_session_delete_with_a_concurrent_session_binding() 
     close.join().unwrap().unwrap();
     bind.join().unwrap();
     bind_done
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("session binding should finish after discard")
         .unwrap();
     assert!(

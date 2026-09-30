@@ -782,7 +782,7 @@ fn two_handles_for_one_repository_open_concurrently() {
             .unwrap();
     });
     let second = receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("a second handle must not wait for the first")
         .unwrap();
     handle.join().unwrap();
@@ -823,7 +823,7 @@ fn concurrent_handles_build_bases_for_different_tasks() {
     drop(sender);
     for _ in &tasks {
         receiver
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("wip bases must not wait for the held handle")
             .expect("concurrent wip bases succeed");
     }
@@ -860,7 +860,7 @@ fn import_result_does_not_wait_for_another_live_handle() {
             .unwrap();
     });
     receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("import must not wait for another handle")
         .unwrap();
     handle.join().unwrap();

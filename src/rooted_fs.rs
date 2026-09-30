@@ -12002,7 +12002,7 @@ mod tests {
                 done_tx.send(started.elapsed()).unwrap();
                 result
             });
-            let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+            let elapsed = done_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
             drop(process_guard);
             drop(file_guard);
             let result = waiter.join().unwrap();
@@ -15452,7 +15452,7 @@ mod tests {
                 .remove_owned_child("root")
         });
         reached_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         fs::rename(&stage, &detached).unwrap();
@@ -16772,7 +16772,7 @@ mod tests {
             )
         });
         renamed_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let observer = RootedDir::open(&physical).unwrap();
@@ -16820,14 +16820,14 @@ mod tests {
             loaded_tx.send(loaded.identity).unwrap();
         });
         waiting_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         release_tx.send(()).unwrap();
         publisher.join().unwrap().unwrap();
         assert_eq!(
             loaded_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .unwrap(),
             canonical_identity
         );
@@ -16874,7 +16874,7 @@ mod tests {
                 .remove_owned_child("root")
         });
         reached_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         super::clear_errno();
@@ -16986,7 +16986,7 @@ mod tests {
                 .resume_pending_owned_child_cleanup("root")
         });
         reached_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
         observer_control.write_all(b"G").unwrap();
         let mut early_probe = observer_control.try_clone().unwrap();
@@ -17314,7 +17314,7 @@ mod tests {
 
     #[test]
     fn cleanup_process_guard_allows_different_keys_and_roots_while_one_key_is_paused() {
-        const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+        const WAIT_DEADLINE: Duration = crate::test_support::HANDSHAKE_TIMEOUT;
 
         // Catches a process-wide cleanup guard: a paused journal for one
         // (parent, component) key must not stall unrelated keys or roots.
@@ -17419,7 +17419,7 @@ mod tests {
                 .remove_owned_child("paused")
         });
         renamed_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let observer = RootedDir::open(&physical).unwrap();
@@ -17458,7 +17458,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let peer_while_paused = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let peer_while_paused = peer_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
         release_tx.send(()).unwrap();
         paused.join().unwrap().unwrap();
         peer.join().unwrap();
@@ -17510,7 +17510,7 @@ mod tests {
                 .remove_owned_child("paused")
         });
         renamed_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let observer = RootedDir::open(&physical).unwrap();
@@ -17555,7 +17555,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let peer_while_paused = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let peer_while_paused = peer_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
         release_tx.send(()).unwrap();
         paused.join().unwrap().unwrap();
         peer.join().unwrap();
@@ -17660,7 +17660,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        let peer_while_held = peer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let peer_while_held = peer_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
         drop(held);
         peer.join().unwrap();
 
@@ -17813,11 +17813,11 @@ mod tests {
         });
 
         blocked_receive
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
         drop(first);
         receive
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
         waiter.join().unwrap();
     }
@@ -18463,7 +18463,7 @@ mod tests {
                 })
         });
         reached_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
         peer_control.write_all(b"G").unwrap();
         let mut retired = [0; 2];

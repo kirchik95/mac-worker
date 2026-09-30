@@ -33,7 +33,7 @@ use mac_worker::{
     transport::{ProbeClock, SshTransport, WorkersService},
 };
 
-const TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(2);
+const TEST_COORDINATION_TIMEOUT: Duration = crate::support::HANDSHAKE_TIMEOUT;
 
 #[derive(Clone)]
 struct RecordingRunner {

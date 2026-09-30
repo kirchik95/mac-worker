@@ -16,7 +16,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
 };
 
 use mac_worker::{
@@ -930,7 +929,7 @@ impl ClientStateConcurrencyHook for MutationGate {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
     }
@@ -979,7 +978,7 @@ impl ProcessRunner for GatedCancelHost {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
         Ok(ProcessResult {
@@ -1027,9 +1026,13 @@ fn questions_cancel_conflict_after_host_effect_stays_retryable() {
         .handle_with(&envelope, &handler, ControllerFault::StopAfterPublish)
         .unwrap();
     let error = std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let operation =
             scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert_eq!(
             host.status.lock().unwrap().last_outcome(),
             Some(&TaskOutcome::Cancelled)
@@ -1088,7 +1091,7 @@ impl ProcessRunner for GatedCloseHost {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
         self.host.run(request)
@@ -1136,21 +1139,24 @@ fn questions_close_conflict_after_host_effect_stays_retryable() {
     )
     .unwrap();
     let error = std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let host_release_tx = crate::support::ScopedSender(host_release_tx);
+        let writer_release_tx = crate::support::ScopedSender(writer_release_tx);
         let operation =
             scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
         host_entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
         let current = harness.store.load_task(task_id).unwrap();
         assert!(current.close_intent().is_some());
         let changed = current.with_status_observed_at(Some(999)).unwrap();
         let writer = scope.spawn(move || writer_state.update_task_if_current(&current, changed));
         writer_entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
         let contention = harness.store.observe_next_lock_contention();
         host_release_tx.send(()).unwrap();
-        let contended = contention.confirmed_within(Duration::from_secs(5));
+        let contended = contention.confirmed_within(crate::support::HANDSHAKE_TIMEOUT);
         writer_release_tx.send(()).unwrap();
         assert!(writer.join().unwrap().unwrap());
         assert!(
@@ -1231,9 +1237,13 @@ fn questions_controller_say_cas_loser_resumes_published_evidence() {
     .unwrap();
     let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &state);
     let ack = std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let operation =
             scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert_eq!(
             state
                 .read_turn_prepared_binding(task_id, prepared.turn_id())
@@ -1320,9 +1330,13 @@ fn questions_close_conflict_after_retained_cancel_stays_retryable() {
     .unwrap();
     let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &state);
     let error = std::thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let operation =
             scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             harness
                 .store

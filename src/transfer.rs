@@ -1934,7 +1934,6 @@ mod exec_inheritance_tests {
         process::Stdio,
         sync::mpsc,
         thread,
-        time::Duration,
     };
 
     use tempfile::tempdir;
@@ -2437,11 +2436,13 @@ mod exec_inheritance_tests {
             );
             let _ = receiver_tx.send(outcome);
         });
-        let child_pid = child_pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let child_pid = child_pid_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         child_pid_thread.join().unwrap();
         let mut child_cleanup = IdentityCheckedProcessCleanup::new(child_pid);
         let ready = accepted_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         acceptor.join().unwrap();
@@ -2456,7 +2457,9 @@ mod exec_inheritance_tests {
             let _ = resolved_tx
                 .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2));
         });
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             matches!(resolved_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "resolver completed while the transfer was still in flight"
@@ -2468,14 +2471,14 @@ mod exec_inheritance_tests {
             .write_all(b"X")
             .unwrap();
         receiver_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .expect("exec receiver did not finish after explicit child release")
             .unwrap();
         receiver.join().unwrap();
         child_cleanup.disarm();
         assert_eq!(
             resolved_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .unwrap()
                 .unwrap(),
             AbandonTransferResult::Abandoned
@@ -2601,11 +2604,13 @@ mod exec_inheritance_tests {
         });
 
         let intermediary_pid = intermediary_pid_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap();
         intermediary_pid_thread.join().unwrap();
         let mut intermediary_cleanup = IdentityCheckedProcessCleanup::new(intermediary_pid);
-        let leaf_pid = leaf_pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let leaf_pid = leaf_pid_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         leaf_pid_thread.join().unwrap();
         let mut leaf_cleanup = IdentityCheckedProcessCleanup::new(leaf_pid);
         OpenOptions::new()
@@ -2615,7 +2620,7 @@ mod exec_inheritance_tests {
             .write_all(b"A")
             .unwrap();
         let ready = accepted_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap();
         acceptor.join().unwrap();
@@ -2630,7 +2635,7 @@ mod exec_inheritance_tests {
             .signal(libc::SIGKILL)
             .expect("must be able to signal the exact intermediary pid");
         let receiver_outcome = receiver_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .expect("receiver did not reap the killed intermediary within the deadline");
         receiver.join().unwrap();
         intermediary_cleanup.disarm();
@@ -2652,7 +2657,9 @@ mod exec_inheritance_tests {
             let _ = resolved_tx
                 .send(HostTransferService::new(&resolver_store).abandon(&resolver_request, 2));
         });
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             matches!(resolved_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
             "resolver completed even though direct nonblocking acquisition proved the orphaned leaf held the lock"
@@ -2666,7 +2673,7 @@ mod exec_inheritance_tests {
             .unwrap();
         assert_eq!(
             exit_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .unwrap()
                 .unwrap(),
             b'E',
@@ -2676,7 +2683,7 @@ mod exec_inheritance_tests {
         leaf_cleanup.disarm();
         assert_eq!(
             resolved_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .unwrap()
                 .unwrap(),
             AbandonTransferResult::Abandoned

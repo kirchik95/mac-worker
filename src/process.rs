@@ -667,7 +667,7 @@ mod tests {
 
             // The writers stay open until after the result: unbounded joins
             // cannot complete. This wide bound tolerates a loaded test host.
-            let result = completion.recv_timeout(Duration::from_secs(20));
+            let result = completion.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
             drop(receiver);
             drop((stdout_writer, stderr_writer));
             finishing.join().unwrap();

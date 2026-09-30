@@ -1764,7 +1764,7 @@ fn expired_auth_incident_is_not_overlaid() {
 }
 
 static AUTH_HOOK_TESTS: Mutex<()> = Mutex::new(());
-const HOOK_WAIT: Duration = Duration::from_secs(10);
+const HOOK_WAIT: Duration = crate::support::HANDSHAKE_TIMEOUT;
 
 fn recv_bounded<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
     rx.recv_timeout(HOOK_WAIT)

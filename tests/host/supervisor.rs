@@ -2062,7 +2062,9 @@ fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
         };
         JobService::new(&first_store, &launcher).submit_at(first_request, 10)
     });
-    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    observed
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let launches = Arc::new(AtomicUsize::new(0));
     let retry_store = store.clone();
@@ -2102,7 +2104,9 @@ fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
         };
         JobService::new(&first_store, &launcher).submit_at(first_request, 10)
     });
-    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    observed
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
 
     let launches = Arc::new(AtomicUsize::new(0));
     let launcher = FailingLauncher {
@@ -3314,7 +3318,7 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         let _ = ack_tx.send(result);
     });
     let ack_line = ack_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("accepted submit client did not emit its response within the deadline")
         .unwrap();
     ack_thread.join().unwrap();
@@ -3323,7 +3327,7 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
 
     assert_eq!(
         ready_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap()
             .unwrap(),
         b'R',

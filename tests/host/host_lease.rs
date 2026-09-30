@@ -830,7 +830,7 @@ fn abandoned_lease_with_receipt(
     (lease, receipt)
 }
 
-const CONCURRENCY_TIMEOUT: Duration = Duration::from_secs(15);
+const CONCURRENCY_TIMEOUT: Duration = crate::support::HANDSHAKE_TIMEOUT;
 
 fn plant_leases_leftover(root: &Path, name: &str, leaf: &str, bytes: &[u8]) -> PathBuf {
     let leftover = root.join("leases/slots").join(name);

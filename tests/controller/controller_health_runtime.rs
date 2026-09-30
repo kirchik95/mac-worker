@@ -66,7 +66,7 @@ fn controller_run_persists_failed_tick_and_shuts_down_cleanly() {
         let _ = line_tx.send(line);
     });
     let line = line_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("failing tick must be reported without waiting for operator input");
     assert!(line.contains("CONTROLLER_TRANSPORT"), "{line}");
     assert!(!line.contains("private-value"));
@@ -93,7 +93,7 @@ fn controller_run_persists_failed_tick_and_shuts_down_cleanly() {
         scope.spawn(move || {
             tx.send(process.wait().unwrap()).unwrap();
         });
-        let status = rx.recv_timeout(Duration::from_secs(5));
+        let status = rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         if status.is_err() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
@@ -135,7 +135,7 @@ fn blocked_tick_leaves_shutdown_pollable_and_is_joined() {
             release_rx
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("shutdown must run while the tick is blocked");
             // The signal future releases the handshake before the loop sets stop.
             while !stop.load(Ordering::Acquire) {

@@ -6,7 +6,6 @@ use std::{
     fs,
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
 };
 
 use mac_worker::{
@@ -86,7 +85,7 @@ fn observation_refresh_does_not_overwrite_a_newer_negative() {
         })
     };
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("refresh started");
     store
         .publish_admission_observation(negative_observation(2_000))
@@ -140,7 +139,7 @@ fn observation_refresh_does_not_restore_old_projection_at_the_same_millis() {
         })
     };
     entered_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("refresh started");
     store
         .publish_admission_observation(

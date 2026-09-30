@@ -706,7 +706,7 @@ mod tests {
         }
 
         fn wait_before(&self, ssh: &str, release: mpsc::Receiver<()>) {
-            self.wait_before_for(ssh, release, Duration::from_secs(2));
+            self.wait_before_for(ssh, release, crate::test_support::HANDSHAKE_TIMEOUT);
         }
 
         fn wait_before_for(&self, ssh: &str, release: mpsc::Receiver<()>, timeout: Duration) {
@@ -805,7 +805,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .remove(&ssh)
-                .unwrap_or(Duration::from_secs(2));
+                .unwrap_or(crate::test_support::HANDSHAKE_TIMEOUT);
             let observation_gate = self.observation_gate.lock().unwrap().remove(&ssh);
             if let Some(gate) = observation_gate {
                 wait_until_published(&gate);
@@ -1498,7 +1498,7 @@ mod tests {
             )
         });
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
             .expect("probe snapshot must run before the CAS replacement");
         store
             .publish_admission_observation(
@@ -1634,13 +1634,13 @@ mod tests {
         runner.wait_before_for(
             "mac2",
             mac2_release_rx,
-            Duration::from_millis(OBSERVATION_TTL_MILLIS + 500),
+            crate::test_support::HANDSHAKE_TIMEOUT,
         );
         let store_for_stale = store.clone();
         let mini2_for_stale = mini2.clone();
         let coordinator = thread::spawn(move || {
             mac3_entered_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .expect("mini-3 miss wave must start before sibling timestamps are forced stale");
             let current = store_for_stale
                 .peek_admission_observation("mini-2")
@@ -1661,7 +1661,7 @@ mod tests {
                 .send(())
                 .expect("release mini-3 after mini-2 is stale");
             mac2_entered_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
                 .expect("expired mini-2 must re-enter the original round pool");
             let expire_at = planted_millis + OBSERVATION_TTL_MILLIS;
             if let Some(remaining) = expire_at.saturating_add(1).checked_sub(now()) {

@@ -27,7 +27,7 @@ pub const REMOTE_BINARY: &str = "~/.local/bin/worker";
 /// `std::env` in debug builds and POSIX-quotes this absolute path for Git/rsync.
 pub const TEST_SSH_ENV: &str = "MAC_WORKER_TEST_SSH";
 pub const LEADER_READY: &str = "controller leader acquired";
-pub const LEADER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+pub const LEADER_READY_TIMEOUT: Duration = crate::support::HANDSHAKE_TIMEOUT;
 pub const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const TERM_WAIT: Duration = Duration::from_secs(2);
 

@@ -2430,7 +2430,7 @@ fn status_list_advances_a_compatible_intermediate_update_queued_before_the_cas()
         (result, runner.requests())
     });
     entered_receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .expect("list status call did not reach the remote runner");
 
     let blocker_pause = store.pause_cleanup_after_move_once();
@@ -3561,7 +3561,7 @@ impl CancelObserver for BlockingCancelObserver {
         self.release
             .lock()
             .unwrap()
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .map_err(|_| WorkerError::Protocol("cancel handoff gate timed out".into()))?;
         Ok(())
     }
@@ -3576,7 +3576,7 @@ impl RunObserver for BlockingDispatchObserver {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .map_err(|_| WorkerError::Protocol("dispatch handoff gate timed out".into()))?;
         }
         Ok(())
@@ -4257,7 +4257,7 @@ fn remote_cancel_handoff_gate_matrix_preserves_exact_identity_across_100_cases()
                 .cancel(job_id)
         });
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap_or_else(|_| panic!("case {case} did not reach remote-cancel handoff"));
 
         let (reader_ready_tx, reader_ready_rx) = mpsc::channel();
@@ -4269,13 +4269,13 @@ fn remote_cancel_handoff_gate_matrix_preserves_exact_identity_across_100_cases()
         });
         if case % 2 == 0 {
             reader_ready_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap_or_else(|_| panic!("case {case} reader did not overlap handoff"));
             release_tx.send(()).unwrap();
         } else {
             release_tx.send(()).unwrap();
             reader_ready_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap_or_else(|_| panic!("case {case} reader did not observe durable state"));
         }
 
@@ -4709,7 +4709,7 @@ fn cancel_launch_handoff_matrix_has_one_terminal_outcome_and_no_lease_launch() {
             service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
         });
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap_or_else(|_| panic!("case {case} did not reach dispatch handoff"));
         let job_id = store
             .queue_snapshot()
@@ -4749,7 +4749,7 @@ fn cancel_launch_handoff_matrix_has_one_terminal_outcome_and_no_lease_launch() {
             1 => {
                 let (handle, ready) = spawn_reader();
                 ready
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reader did not start"));
                 reader = Some(handle);
                 start_cancel.send(()).unwrap();
@@ -4774,7 +4774,7 @@ fn cancel_launch_handoff_matrix_has_one_terminal_outcome_and_no_lease_launch() {
                 start_cancel.send(()).unwrap();
                 let (handle, ready) = spawn_reader();
                 ready
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reader did not start"));
                 reader = Some(handle);
             }

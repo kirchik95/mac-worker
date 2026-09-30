@@ -1260,16 +1260,18 @@ fn dag_same_pid_concurrent_advancers_submit_one_identity() {
     let fixture = prepared_frozen_dag_inner(Some(hook));
     let second_done = AtomicBool::new(false);
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let first = scope.spawn(|| advance_dags(&fixture));
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("first holder reached DagSubmit before TransferRepo");
         let second = scope.spawn(|| {
             let result = advance_dags(&fixture);
             second_done.store(true, Ordering::SeqCst);
             result
         });
-        let waiting = waiting_rx.recv_timeout(Duration::from_secs(5));
+        let waiting = waiting_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         let finished_before_release = second_done.load(Ordering::SeqCst);
         release_tx.send(()).unwrap();
         first.join().expect("first advancer").unwrap();
@@ -1301,8 +1303,12 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
     })));
     let config = dag_test_config();
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let first = scope.spawn(|| advance_dags(&fixture));
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         let before = fixture.store.load_run_dag(fixture.run_id).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         let client = TaskClient::new(
@@ -1319,7 +1325,7 @@ fn local_wait_deadline_bounds_same_process_submit_guard() {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
+        let elapsed = done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         let after = fixture.store.load_run_dag(fixture.run_id).unwrap();
         let task = fixture.store.load_task_optional(fixture.task_id).unwrap();
         release_tx.send(()).unwrap();
@@ -1476,9 +1482,11 @@ fn dag_submit_retries_rollback_cas_after_sidecar_change_and_keeps_latest_fields(
     plant_rollback_incomplete_matching_frozen(&fixture);
     occupy_worker_slot(&fixture);
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let advancer = scope.spawn(|| advance_dags(&fixture));
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("rollback recover reached CAS window");
         bump_rollback_sidecars(&fixture, SIDECAR_OBSERVED_AT);
         release_tx.send(()).unwrap();
@@ -1512,10 +1520,12 @@ fn dag_submit_reports_conflict_when_rollback_cas_cannot_catch_sidecar_writes() {
     let fixture = prepared_frozen_dag_inner(Some(hook));
     plant_rollback_incomplete_matching_frozen(&fixture);
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let advancer = scope.spawn(|| advance_dags(&fixture));
         for attempt in 0..2 {
             entered_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("rollback recover attempt");
             bump_rollback_sidecars(&fixture, SIDECAR_OBSERVED_AT + attempt);
             release_tx.send(()).unwrap();
@@ -2709,7 +2719,7 @@ fn local_wait_deadline_bounds_transfer_repository_lock() {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
+        let elapsed = done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         drop(held);
         let result = waiter.join().unwrap();
         assert!(elapsed.is_ok(), "transfer lock outlived wait deadline");

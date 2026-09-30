@@ -301,7 +301,7 @@ impl FleetReconcileObserver for BlockingFleetObserver {
             self.release
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .map_err(|_| {
                     mac_worker::error::WorkerError::Protocol(
                         "reconciliation handoff gate timed out".into(),
@@ -409,7 +409,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
         });
         let mut reconcile = Some(reconcile);
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap_or_else(|_| panic!("case {case} did not reach response handling"));
 
         let (start_reboot, wait_for_reboot) = mpsc::channel();
@@ -429,7 +429,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
             0 => {
                 start_reboot.send(()).unwrap();
                 reboot_ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
                 allow_reboot_read.send(()).unwrap();
                 let reboot_result = reboot.take().unwrap().join().unwrap();
@@ -440,7 +440,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
             1 => {
                 start_reboot.send(()).unwrap();
                 reboot_ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
                 release_tx.send(()).unwrap();
                 let report = reconcile.take().unwrap().join().unwrap().unwrap();
@@ -453,7 +453,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
                 let report = reconcile.take().unwrap().join().unwrap().unwrap();
                 start_reboot.send(()).unwrap();
                 reboot_ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
                 allow_reboot_read.send(()).unwrap();
                 let reboot_result = reboot.take().unwrap().join().unwrap();
@@ -462,7 +462,7 @@ fn reboot_reconcile_handoff_matrix_retains_ambiguity_and_applies_only_authoritat
             3 => {
                 start_reboot.send(()).unwrap();
                 reboot_ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .unwrap_or_else(|_| panic!("case {case} reboot did not reopen state"));
                 release_tx.send(()).unwrap();
                 allow_reboot_read.send(()).unwrap();

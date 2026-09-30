@@ -1719,6 +1719,9 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
         });
         request.attached = mode == "submit";
         let report = thread::scope(|scope| {
+            let _stop_on_panic = support::on_drop(|| {
+                let _ = starts.send(None);
+            });
             let child = {
                 let (runner, config, paths, state) = (&runner, &config, &paths, &state);
                 scope.spawn(move || {
@@ -5235,7 +5238,7 @@ impl ProcessRunner for BlockingResultFetch<'_> {
             self.resume
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
         self.inner.run(request)
@@ -5263,8 +5266,12 @@ fn operator_fetch_serializes_result_updates_for_the_same_task() {
         &fixture.executor,
     );
     let second = thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let resume_tx = crate::support::ScopedSender(resume_tx);
         let first = scope.spawn(|| client.fetch(fixture.task_id));
-        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         let second = client.fetch(fixture.task_id);
         resume_tx.send(()).unwrap();
         first.join().unwrap().unwrap();
@@ -5289,7 +5296,7 @@ impl ClientStateConcurrencyHook for FetchLoadGate {
             self.resume
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .unwrap();
         }
     }
@@ -5342,6 +5349,8 @@ fn operator_fetch_fences_a_turn_replaced_after_its_initial_read() {
     .unwrap();
     let before = result_fetch_count(&fixture.runner);
     let result = thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let resume_tx = crate::support::ScopedSender(resume_tx);
         let fetch = scope.spawn(|| {
             TaskClient::new(
                 &fixture.runner,
@@ -5352,7 +5361,9 @@ fn operator_fetch_fences_a_turn_replaced_after_its_initial_read() {
             )
             .fetch(fixture.task_id)
         });
-        entered_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         assert!(
             fixture
                 .state
@@ -6222,6 +6233,8 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     state.inject_write_failure_once(ClientStateWritePoint::AfterParkedTaskTurnPublication);
 
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let release_tx = crate::support::ScopedSender(release_tx);
         let submit = scope.spawn(|| {
             TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
                 request(),
@@ -6229,7 +6242,9 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
                 &mut Vec::new(),
             )
         });
-        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         let owner = InlineRunnerExecutor
             .start(&paths, TaskId::generate(), TurnId::generate())
             .unwrap()
@@ -6306,6 +6321,9 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
     };
 
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let submit_release_tx = crate::support::ScopedSender(submit_release_tx);
+        let reconciliation_release_tx = crate::support::ScopedSender(reconciliation_release_tx);
         let submit = scope.spawn(|| {
             TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
                 request(),
@@ -6314,13 +6332,13 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
             )
         });
         submit_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
         let reconcile = scope.spawn(|| {
             TaskClient::new(&runner, &config, &paths, &state, &executor).reconcile_runners()
         });
         reconciliation_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
         submit_release_tx.send(()).unwrap();
         let report = submit.join().unwrap().unwrap();
@@ -6406,6 +6424,8 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
     };
 
     thread::scope(|scope| {
+        // Disconnect parked hooks before the scope joins if an assertion panics.
+        let clear_release_tx = crate::support::ScopedSender(clear_release_tx);
         let submit = scope.spawn(|| {
             TaskClient::new(&runner, &config, &paths, &state, &executor).submit(
                 request(),
@@ -6414,7 +6434,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
             )
         });
         clear_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
 
         let published = state.list_tasks().unwrap().pop().unwrap();
@@ -7058,7 +7078,7 @@ impl ClientStateConcurrencyHook for ContentionHook {
             self.resume
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("release contending runner");
         }
     }
@@ -7083,7 +7103,7 @@ impl ProcessRunner for RefreshFenceRemote<'_> {
                 self.resume
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(20))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("release fenced refresh");
             }
             return canonical_process(&TaskStatusResponse::new(self.status.clone()));
@@ -7149,7 +7169,7 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
             })
             .unwrap();
         refresh_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("refresh owns journal");
         let runner = scope.spawn(|| {
             TurnRunner::new(
@@ -7162,7 +7182,7 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
             .run(fixture.task_id, fixture.turn_id, None)
         });
         contended_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("runner encountered refresh fence before admission");
         assert!(matches!(
             state.queue_entry(fixture.turn_id).unwrap().unwrap().state(),
@@ -7330,7 +7350,7 @@ fn runner_parent_publication_contention(revoke_token: bool) {
             .run(fixture.task_id, fixture.turn_id, None)
         });
         contended_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("published child waits for the parent's journal fence");
         if revoke_token {
             state
@@ -7470,7 +7490,7 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             done_tx.send(started.elapsed()).unwrap();
             result
         });
-        let elapsed = done_rx.recv_timeout(Duration::from_secs(3));
+        let elapsed = done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT);
         if elapsed.is_err() {
             // Revoke the test permit before releasing the fence on RED: a
             // failed regression must never launch a real detached child.
@@ -7681,7 +7701,7 @@ impl DelayedProjectionRemote<'_> {
             self.release_response
                 .lock()
                 .unwrap()
-                .recv_timeout(Duration::from_secs(20))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("release delayed projection");
         }
     }
@@ -7706,7 +7726,7 @@ impl ProcessRunner for DelayedProjectionRemote<'_> {
                 self.drain
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(20))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("release accepted turn drain");
             }
             let response = TaskStatusResponse::new(self.terminal());
@@ -7787,14 +7807,14 @@ fn delayed_task_projection_cannot_overwrite_publication(case: ProjectionCase) {
                 .unwrap()
         } else {
             accepted_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("A accepted before cancellation");
             let cancel = thread::Builder::new()
                 .name("delayed-projection".into())
                 .spawn_scoped(scope, || client.cancel(fixture.task_id).map(|_| ()))
                 .unwrap();
             response_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("remote cancellation applied; response delayed");
             if case == ProjectionCase::CancelResponsive {
                 release_response.release();
@@ -7833,7 +7853,7 @@ fn delayed_task_projection_cannot_overwrite_publication(case: ProjectionCase) {
         };
         if refresh {
             response_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                 .expect("idle refresh response delayed");
         }
         let completed = fixture.state.load_task(fixture.task_id).unwrap();
@@ -9002,6 +9022,7 @@ fn automatic_cold_admission_runs_three_host_probes_before_the_fourth() {
         },
     };
     let submit = thread::scope(|scope| {
+        let _release_on_panic = support::on_drop(|| gate.release_all());
         let handle = scope.spawn(|| {
             TaskClient::new(
                 &runner,
@@ -9515,7 +9536,7 @@ fn parent_handoff_survives_transient_pre_spawn_journal_fence() {
             Err(_) => {
                 drop(flock);
                 result_rx
-                    .recv_timeout(Duration::from_secs(8))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("submit finishes after journal flock is released")
                     .expect("submit succeeds after transient pre-spawn fence");
             }
@@ -9570,7 +9591,7 @@ fn parent_handoff_survives_transient_post_spawn_journal_fence() {
             Err(_) => {
                 drop(flock);
                 result_rx
-                    .recv_timeout(Duration::from_secs(8))
+                    .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
                     .expect("submit finishes after journal flock is released")
                     .expect("submit succeeds after transient post-spawn fence");
             }
@@ -9618,7 +9639,7 @@ fn parent_handoff_pre_spawn_journal_fence_timeout_releases_slot() {
         let _flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
         gate.release();
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("submitter must time out within the handoff budget");
         let error = outcome.expect_err("persistent pre-spawn fence must fail submit");
         assert!(
@@ -9670,7 +9691,7 @@ fn parent_handoff_post_spawn_journal_fence_timeout_keeps_reservation() {
         let _flock = hold_published_journal_flock(&setup.paths.state, task_id, turn_id);
         gate.release();
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("submitter must time out within the handoff budget");
         let error = outcome.expect_err("persistent post-spawn fence must fail submit");
         assert!(
@@ -9734,7 +9755,7 @@ fn parent_handoff_pre_spawn_row_retired_during_fence_goes_busy() {
             .unwrap();
         gate.release();
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("submitter must answer after the row is retired");
         let error = outcome.expect_err("retired row must not hand off");
         assert_eq!(error.public_code(), "TASK_BUSY", "{error:?}");
@@ -9784,7 +9805,7 @@ fn parent_handoff_post_spawn_row_retired_during_fence_goes_busy() {
             .unwrap();
         gate.release();
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .expect("submitter must answer after the row is retired");
         let error = outcome.expect_err("retired row must not hand off");
         assert_eq!(error.public_code(), "QUEUE_NOT_FOUND", "{error:?}");

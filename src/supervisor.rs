@@ -5229,7 +5229,9 @@ mod tests {
                 }
             }
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         let writer_stop = Arc::clone(&writing);
@@ -5343,7 +5345,9 @@ mod tests {
                 }
             }
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        started_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
         let writer_stop = Arc::clone(&writing);
@@ -6860,7 +6864,9 @@ mod tests {
                 let identity = wait_for_group_identity(leader);
                 let (trigger, triggered) = mpsc::channel();
                 let releaser = std::thread::spawn(move || {
-                    triggered.recv_timeout(Duration::from_secs(2)).unwrap();
+                    triggered
+                        .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                        .unwrap();
                     std::thread::sleep(Duration::from_millis(50));
                     let byte = 1_u8;
                     assert_eq!(
