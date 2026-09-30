@@ -133,12 +133,27 @@ mod tests {
         home
     }
 
+    /// Small output limits; a deadline that login-shell startup on a loaded
+    /// machine cannot reach. Tests that exercise the deadline set their own.
     fn short_policy() -> ProcessPolicy {
         ProcessPolicy {
             stdout_limit: 2048,
             stderr_limit: 1024,
-            deadline: Duration::from_secs(2),
+            deadline: Duration::from_secs(30),
         }
+    }
+
+    fn wait_until_dead(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     fn assert_reaped(home: &TempDir) {
@@ -261,31 +276,44 @@ printf '%s\n' '{output}'
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for argv in [CODEX, OPENCODE] {
-            let home = fixture(
-                argv,
-                "printf '%s' $$ > \"$HOME/leader.pid\"\n(sleep 2; printf leaked > \"$HOME/descendant-ran\") &\nwait",
-            );
-            let started = Instant::now();
-            assert!(
-                discover(
-                    home.path(),
+            // The deadline must fire after the fixture has started its pipe-holding
+            // descendant. Startup speed is not what this test checks, so a
+            // deadline that fired first is retried with a longer one.
+            let mut exercised = false;
+            for deadline in [2, 6, 18].map(Duration::from_secs) {
+                let home = fixture(
                     argv,
-                    &SystemProcessRunner,
-                    ProcessPolicy {
-                        deadline: Duration::from_secs(1),
-                        ..short_policy()
-                    }
-                )
-                .is_none()
-            );
-            // Upper bounds only rule out waiting for the script; the descendant
-            // check below proves the group died at the deadline.
-            assert!(started.elapsed() < Duration::from_secs(10));
-            assert_reaped(&home);
-            std::thread::sleep(Duration::from_millis(2200));
+                    "printf '%s' $$ > \"$HOME/leader.pid\"\nsleep 60 &\nprintf '%s' $! > \"$HOME/descendant.pid\"\nwait",
+                );
+                let started = Instant::now();
+                assert!(
+                    discover(
+                        home.path(),
+                        argv,
+                        &SystemProcessRunner,
+                        ProcessPolicy {
+                            deadline,
+                            ..short_policy()
+                        }
+                    )
+                    .is_none()
+                );
+                let Ok(descendant) = fs::read_to_string(home.path().join("descendant.pid")) else {
+                    continue;
+                };
+                // Without the group kill the script would wait 60 s for its child.
+                assert!(started.elapsed() < deadline + Duration::from_secs(20));
+                assert_reaped(&home);
+                assert!(
+                    wait_until_dead(descendant.trim().parse().unwrap()),
+                    "process-group descendant survived the deadline"
+                );
+                exercised = true;
+                break;
+            }
             assert!(
-                !home.path().join("descendant-ran").exists(),
-                "process-group descendant survived"
+                exercised,
+                "the fixture never started before an 18 s deadline"
             );
         }
     }
