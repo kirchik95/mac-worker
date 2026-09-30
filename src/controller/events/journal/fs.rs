@@ -1,5 +1,5 @@
 //! Journal storage primitives. Public event contracts are adapted by the facade.
-use std::io;
+use std::{fs::File, io, os::fd::AsRawFd, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -367,6 +367,19 @@ fn audit(root: &RootedDir) -> io::Result<DiskUsage> {
                 if depth == 0 && binding.mode != 0o600 {
                     return Err(unavailable());
                 }
+                if depth == 0 {
+                    let known = valid_segment_name(name)
+                        || name == "journal.lock"
+                        || RoleKind::ALL.iter().any(|role| {
+                            name == role.evidence()
+                                || name == role.stage()
+                                || (*role != RoleKind::Segment
+                                    && name == format!("{}.json", role.name()))
+                        });
+                    if !known {
+                        return Err(unavailable());
+                    }
+                }
                 let size =
                     usize::try_from(root.open_private_regular_handle(name)?.metadata()?.len())
                         .map_err(|_| unavailable())?;
@@ -553,6 +566,13 @@ fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
             || evidence.kind != kind
             || !valid_role_target(kind, &evidence.target)
             || evidence.old_binding.is_some() != evidence.old_digest.is_some()
+            || evidence.old_len
+                > if kind == RoleKind::Segment {
+                    SEGMENT_BYTES
+                } else {
+                    METADATA_BYTES
+                }
+            || (evidence.old_binding.is_none() && evidence.old_len != 0)
             || evidence.new_len
                 > if kind == RoleKind::Segment {
                     SEGMENT_BYTES
@@ -917,6 +937,10 @@ fn publish_append(
 ) -> io::Result<Manifest> {
     let manifest = recover_append(root, faults)?;
     let bytes = pending_bytes(pending)?;
+    if digest(&bounded_json(&manifest, METADATA_BYTES)?) == pending.next_digest {
+        predecessor(&manifest, pending, &bytes)?;
+        return Ok(manifest);
+    }
     verify_pending(&manifest, pending, &bytes)?;
     let target = &pending.delta.appended;
     if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
@@ -997,6 +1021,71 @@ fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manif
     Ok(next)
 }
 
+pub(super) trait FsClock {
+    fn now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+    fn cancelled(&self) -> bool;
+}
+
+pub(super) fn retry_same_binding<T>(
+    root: &RootedDir,
+    binding: Binding,
+    deadline: Duration,
+    clock: &dyn FsClock,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    for attempt in 0..=3 {
+        root.verify_bound().map_err(|_| unavailable())?;
+        if Binding::from(root.identity()?) != binding {
+            return Err(unavailable());
+        }
+        if clock.cancelled() || clock.now() >= deadline {
+            return Err(unavailable());
+        }
+        match operation() {
+            Err(error) if error.raw_os_error() == Some(libc::ESTALE) && attempt < 3 => {}
+            result => return result,
+        }
+    }
+    unreachable!("the last retry returns its result")
+}
+
+pub(super) fn acquire_lock(
+    root: &RootedDir,
+    binding: Binding,
+    shared: bool,
+    deadline: Duration,
+    clock: &dyn FsClock,
+) -> io::Result<File> {
+    let admission_end = deadline.min(clock.now().saturating_add(Duration::from_millis(50)));
+    if binding.mode != 0o600
+        || Binding::from(root.private_entry_identity("journal.lock")?) != binding
+    {
+        return Err(unavailable());
+    }
+    let file = root.open_existing_private_lock("journal.lock")?;
+    root.validate_private_regular_binding("journal.lock", &file, binding.into())?;
+    loop {
+        if clock.cancelled() || clock.now() >= admission_end {
+            return Err(unavailable());
+        }
+        let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+        if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
+            root.validate_private_regular_binding("journal.lock", &file, binding.into())?;
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+        let remaining = admission_end.saturating_sub(clock.now());
+        if remaining.is_zero() {
+            return Err(unavailable());
+        }
+        clock.sleep(remaining.min(Duration::from_millis(1)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1106,122 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    struct ManualClock(std::sync::atomic::AtomicU64);
+    impl FsClock for ManualClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.0.load(std::sync::atomic::Ordering::Acquire))
+        }
+        fn sleep(&self, duration: Duration) {
+            self.0.fetch_add(
+                duration.as_millis() as u64,
+                std::sync::atomic::Ordering::AcqRel,
+            );
+        }
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn estale_retries_with_same_binding_and_original_deadline() {
+        let (_temp, root, _manifest) = fixture(&record(1), false);
+        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let binding = root.identity().unwrap().into();
+        let mut calls = 0;
+        let value = retry_same_binding(&root, binding, Duration::from_secs(1), &clock, || {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from_raw_os_error(libc::ESTALE))
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(calls, 3);
+        calls = 0;
+        let failed =
+            retry_same_binding::<()>(&root, binding, Duration::from_secs(1), &clock, || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(libc::ESTALE))
+            });
+        assert!(failed.is_err());
+        assert_eq!(calls, 4);
+        calls = 0;
+        let expired =
+            retry_same_binding::<()>(&root, binding, Duration::from_millis(50), &clock, || {
+                calls += 1;
+                clock.sleep(Duration::from_millis(50));
+                Err(io::Error::from_raw_os_error(libc::ESTALE))
+            });
+        assert!(expired.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn estale_retry_never_adopts_a_replaced_root() {
+        let (temp, root, _manifest) = fixture(&record(1), false);
+        let binding = root.identity().unwrap().into();
+        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let mut calls = 0;
+        let result =
+            retry_same_binding::<()>(&root, binding, Duration::from_secs(1), &clock, || {
+                calls += 1;
+                fs::rename(root.path(), temp.path().join("old-root")).unwrap();
+                RootedDir::create(root.path()).unwrap();
+                Err(io::Error::from_raw_os_error(libc::ESTALE))
+            });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn shared_locks_coexist_and_exclusive_admission_has_injected_bound() {
+        let (_temp, root, _manifest) = fixture(&record(1), false);
+        root.open_private_lock("journal.lock").unwrap();
+        let binding = root.private_entry_identity("journal.lock").unwrap().into();
+        let clock = ManualClock(std::sync::atomic::AtomicU64::new(0));
+        let first = acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).unwrap();
+        let second = acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).unwrap();
+        assert!(acquire_lock(&root, binding, false, Duration::from_secs(30), &clock).is_err());
+        assert_eq!(clock.now(), Duration::from_millis(50));
+        drop(first);
+        drop(second);
+        let lock = acquire_lock(&root, binding, false, Duration::from_secs(1), &clock).unwrap();
+        drop(lock);
+        fs::remove_file(root.path().join("journal.lock")).unwrap();
+        assert!(acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).is_err());
+        assert!(!root.entry_exists("journal.lock").unwrap());
+    }
+
+    #[test]
+    fn retry_of_same_committed_prepared_append_does_not_reassign_sequence_range() {
+        let (_temp, root, pending) = append_fixture();
+        assert_eq!(publish_append(&root, &pending, &NoFaults).unwrap().head, 3);
+        assert_eq!(publish_append(&root, &pending, &NoFaults).unwrap().head, 3);
+        let manifest = recover_append(&root, &NoFaults).unwrap();
+        assert_eq!(
+            committed_records(&root, &manifest.segments[0], EPOCH, false)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn unknown_and_over_budget_residue_is_preserved_before_allocation() {
+        let (_temp, root, _pending) = append_fixture();
+        root.write_new_private_file("manifest.stage-unknown", b"private residue")
+            .unwrap();
+        assert!(recover_append(&root, &NoFaults).is_err());
+        assert!(root.entry_exists("manifest.stage-unknown").unwrap());
+        fs::remove_file(root.path().join("manifest.stage-unknown")).unwrap();
+        let oversized = root.write_new_private_file("pending.stage", b"").unwrap();
+        oversized.set_len(18 * 1024 * 1024).unwrap();
+        assert!(recover_append(&root, &NoFaults).is_err());
+        assert_eq!(oversized.metadata().unwrap().len(), 18 * 1024 * 1024);
     }
 
     fn role_fault_matrix(iterations: usize) {
