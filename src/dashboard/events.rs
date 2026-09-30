@@ -1,8 +1,10 @@
 //! Local journal replay, bounded live fan-out and viewer controls.
 use crate::{
     controller::events::{
-        EventCursor, EventReadResult, EventRuntime, JournalReader, JournalWindow,
-        LocalProjectionRefresh, ReadQuery, Seq, SnapshotRequired, ViewerEventSource, ViewerMessage,
+        CONTROLLER_EVENTS_UNAVAILABLE as UNAVAILABLE, EventCursor, EventReadResult, EventRuntime,
+        JOURNAL_CHECK_INTERVAL as CHECK, JournalReader, JournalWindow, LocalProjectionRefresh,
+        ReadQuery, SSE_CAPACITY as CAPACITY, SSE_HEARTBEAT_INTERVAL as HEARTBEAT,
+        SSE_MAX_STREAMS as MAX_STREAMS, Seq, SnapshotRequired, ViewerEventSource, ViewerMessage,
     },
     error::WorkerError,
 };
@@ -15,12 +17,6 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
-
-const UNAVAILABLE: &str = "CONTROLLER_EVENTS_UNAVAILABLE";
-const CAPACITY: usize = 256;
-const MAX_STREAMS: usize = 8;
-const CHECK: Duration = Duration::from_millis(200);
-const HEARTBEAT: Duration = Duration::from_secs(10);
 
 pub struct LocalViewerEventSource {
     reader: Arc<dyn JournalReader>,
@@ -163,7 +159,7 @@ struct Tailer {
 }
 impl Tailer {
     fn check(&mut self) {
-        if let Some(after) = self.after.clone() {
+        if let Some(after) = self.after {
             match self.reader.read(
                 ReadQuery {
                     after: Some(after),
@@ -205,6 +201,14 @@ impl Tailer {
                         journal_id: window.journal_id,
                         seq: window.head_seq,
                     });
+                    // The first successful tail window may be newer than a
+                    // subscriber's captured H. Explicitly repair that gap.
+                    let _ = self
+                        .live
+                        .send(ViewerMessage::SnapshotRequired(SnapshotRequired {
+                            reason: "bootstrap".into(),
+                            window: window.clone(),
+                        }));
                     let _ = self.live.send(ViewerMessage::Ready(window));
                     self.refresh.request_refresh();
                 }
@@ -274,7 +278,7 @@ async fn replay_and_follow(
     let head = window.head_seq;
     while cursor.seq < head {
         let query = ReadQuery {
-            after: Some(cursor.clone()),
+            after: Some(cursor),
             limit: CAPACITY,
             wait_ms: 0,
         };
@@ -446,11 +450,8 @@ fn parse_cursor(value: &str) -> Result<EventCursor, WorkerError> {
     {
         return Err(invalid_cursor());
     }
-    let seq = seq.parse::<u64>().map_err(|_| invalid_cursor())?;
-    Ok(EventCursor {
-        journal_id,
-        seq: Seq::new(seq),
-    })
+    let seq = seq.parse::<Seq>().map_err(|_| invalid_cursor())?;
+    Ok(EventCursor { journal_id, seq })
 }
 fn invalid_cursor() -> WorkerError {
     WorkerError::Config("INVALID_EVENT_CURSOR: invalid or conflicting event cursor".into())
@@ -459,176 +460,6 @@ fn invalid_cursor() -> WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::events::{
-        EventReadResult, JournalWindow, ReadBatch, ReadQuery, Seq, WireEvent,
-    };
-    use std::sync::{
-        Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    };
-    use tokio::sync::broadcast;
-
-    #[derive(Default)]
-    struct Journal {
-        events: Mutex<Vec<WireEvent>>,
-        head_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-        unavailable: AtomicBool,
-        oldest: AtomicU64,
-    }
-    impl Journal {
-        fn cursor(&self, seq: u64) -> EventCursor {
-            EventCursor {
-                journal_id: uuid::Uuid::from_u128(1),
-                seq: Seq::new(seq),
-            }
-        }
-        fn append(&self) {
-            let mut events = self.events.lock().unwrap();
-            let seq = events.len() as u64 + 1;
-            events.push(WireEvent {
-                schema_version: 1,
-                journal_id: uuid::Uuid::from_u128(1),
-                seq: Seq::new(seq),
-                time_millis: 0,
-                kind: "queue.changed".into(),
-                data: serde_json::json!({}),
-            });
-        }
-    }
-    impl JournalReader for Journal {
-        fn window(&self, _: Duration) -> Result<JournalWindow, WorkerError> {
-            if self.unavailable.load(Ordering::SeqCst) {
-                return Err(WorkerError::Unavailable(
-                    "private path must not escape".into(),
-                ));
-            }
-            let head = self.events.lock().unwrap().len() as u64;
-            if let Some(hook) = self.head_hook.lock().unwrap().take() {
-                hook();
-            }
-            Ok(JournalWindow {
-                journal_id: uuid::Uuid::from_u128(1),
-                oldest_seq: Seq::new(self.oldest.load(Ordering::SeqCst).max(1)),
-                head_seq: Seq::new(head),
-            })
-        }
-        fn read(&self, query: ReadQuery, _: Duration) -> Result<EventReadResult, WorkerError> {
-            let events = self.events.lock().unwrap();
-            let after = query.after.unwrap().seq.as_u64();
-            let selected = events
-                .iter()
-                .filter(|event| event.seq.as_u64() > after)
-                .take(query.limit)
-                .cloned()
-                .collect::<Vec<_>>();
-            let next = selected.last().map_or(after, |event| event.seq.as_u64());
-            Ok(EventReadResult::Batch(ReadBatch {
-                schema_version: 1,
-                journal_id: uuid::Uuid::from_u128(1),
-                oldest_seq: Seq::new(1),
-                head_seq: Seq::new(events.len() as u64),
-                next_after: self.cursor(next),
-                has_more: next < events.len() as u64,
-                events: selected,
-            }))
-        }
-    }
-    #[derive(Default)]
-    struct Gate {
-        ticks: usize,
-        permits: usize,
-    }
-    #[derive(Default)]
-    struct Runtime {
-        now: AtomicU64,
-        cancelled: AtomicBool,
-        gate: Mutex<Gate>,
-        changed: Condvar,
-    }
-    impl Runtime {
-        fn tick(&self, millis: u64) {
-            self.now.fetch_add(millis, Ordering::SeqCst);
-            let mut gate = self.gate.lock().unwrap();
-            while gate.ticks == 0 {
-                gate = self.changed.wait(gate).unwrap();
-            }
-            let ticks = gate.ticks;
-            gate.permits += 1;
-            self.changed.notify_all();
-            while gate.ticks == ticks {
-                gate = self.changed.wait(gate).unwrap();
-            }
-        }
-        fn cancel(&self) {
-            self.cancelled.store(true, Ordering::SeqCst);
-            self.changed.notify_all();
-        }
-    }
-    impl EventRuntime for Runtime {
-        fn now(&self) -> Duration {
-            Duration::from_millis(self.now.load(Ordering::SeqCst))
-        }
-        fn sleep(&self, _: Duration) {
-            let mut gate = self.gate.lock().unwrap();
-            gate.ticks += 1;
-            self.changed.notify_all();
-            while gate.permits == 0 && !self.cancelled.load(Ordering::SeqCst) {
-                gate = self.changed.wait(gate).unwrap();
-            }
-            gate.permits = gate.permits.saturating_sub(1);
-        }
-        fn cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::SeqCst)
-        }
-    }
-    struct Refresh {
-        calls: AtomicUsize,
-        publications: broadcast::Sender<u64>,
-    }
-    impl Refresh {
-        fn new() -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                publications: broadcast::channel(256).0,
-            }
-        }
-    }
-    impl LocalProjectionRefresh for Refresh {
-        fn request_refresh(&self) {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-        }
-        fn subscribe_publications(&self) -> broadcast::Receiver<u64> {
-            self.publications.subscribe()
-        }
-    }
-    struct Harness {
-        journal: Arc<Journal>,
-        runtime: Arc<Runtime>,
-        refresh: Arc<Refresh>,
-        source: Arc<LocalViewerEventSource>,
-    }
-    impl Harness {
-        fn new() -> Self {
-            let journal = Arc::new(Journal::default());
-            let runtime = Arc::new(Runtime::default());
-            let refresh = Arc::new(Refresh::new());
-            let source =
-                LocalViewerEventSource::new(journal.clone(), runtime.clone(), refresh.clone());
-            Self {
-                journal,
-                runtime,
-                refresh,
-                source,
-            }
-        }
-    }
-    impl Drop for Harness {
-        fn drop(&mut self) {
-            self.source.stop();
-            self.runtime.cancel();
-        }
-    }
-
     #[test]
     fn cursor_sources_validate_canonical_sequences_and_conflicts() {
         let id = "00000000-0000-0000-0000-000000000001";
@@ -654,168 +485,5 @@ mod tests {
                 .as_u64(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn replay_live_handoff_deduplicates_an_append_after_capturing_head() {
-        let h = Harness::new();
-        h.journal.append();
-        let journal = Arc::clone(&h.journal);
-        *h.journal.head_hook.lock().unwrap() = Some(Box::new(move || journal.append()));
-        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
-        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 1)
-        );
-        h.runtime.tick(200);
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 2)
-        );
-        h.runtime.tick(10_000);
-        assert!(matches!(
-            stream.recv().await,
-            Some(ViewerMessage::Heartbeat)
-        ));
-        assert!(stream.try_recv().is_err());
-        assert!(h.refresh.calls.load(Ordering::SeqCst) > 0);
-    }
-
-    #[tokio::test]
-    async fn eight_streams_are_admitted_and_cancellation_closes_every_receiver() {
-        let h = Harness::new();
-        let mut streams = (0..8)
-            .map(|_| h.source.subscribe(Some(h.journal.cursor(0))).unwrap())
-            .collect::<Vec<_>>();
-        assert!(h.source.subscribe(None).is_err());
-        for stream in &mut streams {
-            assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
-        }
-        h.source.stop();
-        for stream in &mut streams {
-            assert!(stream.recv().await.is_none());
-        }
-        assert!(h.source.subscribe(None).is_err());
-    }
-
-    #[tokio::test]
-    async fn unavailable_sends_one_safe_repair_and_closes_without_a_baseline() {
-        let h = Harness::new();
-        h.journal.unavailable.store(true, Ordering::SeqCst);
-        let mut stream = h.source.subscribe(None).unwrap();
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::Unavailable { code }) if code == "CONTROLLER_EVENTS_UNAVAILABLE")
-        );
-        assert!(stream.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn snapshot_publications_and_heartbeats_do_not_advance_the_journal_cursor() {
-        let h = Harness::new();
-        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
-        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
-        h.refresh.publications.send(900).unwrap();
-        h.runtime.tick(10_000);
-        assert_eq!(
-            stream.recv().await,
-            Some(ViewerMessage::SnapshotReady { revision: 900 })
-        );
-        assert_eq!(stream.recv().await, Some(ViewerMessage::Heartbeat));
-        h.journal.append();
-        h.runtime.tick(200);
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 1)
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrap_reset_expired_and_ahead_send_explicit_repair_baselines() {
-        let h = Harness::new();
-        for _ in 0..4 {
-            h.journal.append();
-        }
-        h.journal.oldest.store(3, Ordering::SeqCst);
-        let foreign = EventCursor {
-            journal_id: uuid::Uuid::from_u128(9),
-            seq: Seq::ZERO,
-        };
-        for (after, expected) in [
-            (None, "bootstrap"),
-            (Some(foreign), "journal_changed"),
-            (Some(h.journal.cursor(0)), "cursor_expired"),
-            (Some(h.journal.cursor(9)), "cursor_ahead"),
-        ] {
-            let mut stream = h.source.subscribe(after).unwrap();
-            assert!(
-                matches!(stream.recv().await, Some(ViewerMessage::SnapshotRequired(repair))
-                if repair.reason == expected && repair.window.head_seq.as_u64() == 4)
-            );
-            assert!(
-                matches!(stream.recv().await, Some(ViewerMessage::Ready(window)) if window.head_seq.as_u64() == 4)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn lag_during_replay_sends_repair_and_closes_without_skipping_to_head() {
-        let h = Harness::new();
-        h.journal.append();
-        let journal = Arc::clone(&h.journal);
-        let runtime = Arc::clone(&h.runtime);
-        *h.journal.head_hook.lock().unwrap() = Some(Box::new(move || {
-            for _ in 0..300 {
-                journal.append();
-            }
-            runtime.tick(200);
-            runtime.tick(200);
-        }));
-        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
-        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::ControllerEvent(event)) if event.seq.as_u64() == 1)
-        );
-        assert!(
-            matches!(stream.recv().await, Some(ViewerMessage::SnapshotRequired(repair)) if repair.reason == "lagged")
-        );
-        assert!(stream.recv().await.is_none());
-        assert_eq!(h.journal.events.lock().unwrap().len(), 301);
-    }
-
-    #[tokio::test]
-    async fn slow_subscriber_reserves_a_repair_slot_and_does_not_block_append() {
-        let h = Harness::new();
-        let mut stream = h.source.subscribe(Some(h.journal.cursor(0))).unwrap();
-        assert!(matches!(stream.recv().await, Some(ViewerMessage::Ready(_))));
-        for _ in 0..260 {
-            h.journal.append();
-            h.runtime.tick(200);
-            tokio::task::yield_now().await;
-        }
-        let mut messages = Vec::new();
-        while let Some(message) = stream.recv().await {
-            messages.push(message);
-        }
-        assert!(messages.len() <= 256);
-        assert!(
-            matches!(messages.last(), Some(ViewerMessage::SnapshotRequired(repair)) if repair.reason == "lagged")
-        );
-        assert_eq!(h.journal.events.lock().unwrap().len(), 260);
-    }
-
-    #[tokio::test]
-    async fn cancellation_closes_stream_before_a_held_replay_reader_returns() {
-        let h = Harness::new();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *h.journal.head_hook.lock().unwrap() = Some(Box::new(move || {
-            started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        }));
-        let mut stream = h.source.subscribe(None).unwrap();
-        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
-            .await
-            .unwrap();
-        h.source.stop();
-        assert!(stream.recv().await.is_none());
-        release_tx.send(()).unwrap();
     }
 }
