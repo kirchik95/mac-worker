@@ -1,6 +1,6 @@
 pub mod agent_launch_fixture;
 #[allow(dead_code)]
-mod fixture_pid;
+pub mod fixture_pid;
 #[allow(dead_code, unused_imports)]
 pub use fixture_pid::{FIXTURE_PID_BASE, fixture_pid};
 pub mod fake_herdr;
@@ -14,6 +14,17 @@ use std::{
     process::{Command, Output},
 };
 
+/// Build the libtest name for a fixture in the caller's `module_path!()`.
+/// Libtest omits the crate component, including for nested test modules.
+#[allow(dead_code)]
+pub fn libtest_name(module_path: &str, test_name: &str) -> String {
+    match module_path.split_once("::") {
+        Some((_, module)) => format!("{module}::{test_name}"),
+        None => test_name.to_owned(),
+    }
+}
+
+#[allow(dead_code)]
 const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -27,10 +38,12 @@ const GIT_ENVIRONMENT_REMOVALS: &[&str] = &[
     "GIT_CONFIG_PARAMETERS",
 ];
 
+#[allow(dead_code)]
 pub struct GitRepo {
     directory: tempfile::TempDir,
 }
 
+#[allow(dead_code)]
 impl GitRepo {
     pub fn init() -> Self {
         let directory = tempfile::tempdir().expect("create repository directory");
@@ -88,6 +101,7 @@ impl GitRepo {
     }
 }
 
+#[allow(dead_code)]
 pub fn create_directory(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref().to_path_buf();
     fs::create_dir_all(&path).expect("create fixture directory");
