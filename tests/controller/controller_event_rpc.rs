@@ -912,3 +912,477 @@ mod state_reads {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
+
+mod reconciliation {
+    use super::*;
+    use mac_worker::controller::events::{
+        ChangeCause, EventBatch, EventReconciler, JournalReader, JournalWriter, NewEvent,
+        PreviousProjection, ReconcileInput, Reconciliation, RepairProgress, TaskFactsBatch,
+        TaskHint, TaskProjectionReader, TaskRepairPage, TurnHint, WireEvent,
+        client::TaskReconciler, testing::ScriptedEventSource,
+    };
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    struct Source {
+        journal: MemoryJournal,
+        tasks: MemoryTaskReader,
+        operations: Mutex<Vec<&'static str>>,
+        read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl Source {
+        fn new(runtime: Arc<dyn EventRuntime>) -> Self {
+            Self {
+                journal: MemoryJournal::with_runtime(runtime.clone()),
+                tasks: MemoryTaskReader::with_runtime(runtime),
+                operations: Mutex::new(Vec::new()),
+                read_hook: Mutex::new(None),
+            }
+        }
+        fn hint(&self, id: u128, terminal: bool) {
+            let event = if terminal {
+                NewEvent::TurnFinished(TurnHint {
+                    task_id: task_id(id),
+                    turn_id: TurnId::new(uuid::Uuid::from_u128(id + 100)),
+                    run_id: None,
+                    outcome: SafeOutcome::Done,
+                    code: None,
+                })
+            } else {
+                NewEvent::TaskChanged(TaskHint {
+                    task_id: task_id(id),
+                    run_id: None,
+                    turn_id: None,
+                    state: "open".into(),
+                    code: None,
+                })
+            };
+            self.journal
+                .append(EventBatch::try_new(vec![event]).unwrap(), deadline())
+                .unwrap();
+        }
+    }
+    impl EventSource for Source {
+        fn discover(&self, _: Duration) -> Result<EventSupport, WorkerError> {
+            Ok(EventSupport::Supported)
+        }
+        fn read(
+            &self,
+            query: ReadQuery,
+            deadline: Duration,
+        ) -> Result<EventReadResult, WorkerError> {
+            self.operations.lock().unwrap().push("read");
+            let result = self.journal.read(query, deadline);
+            if let Some(hook) = self.read_hook.lock().unwrap().take() {
+                hook();
+            }
+            result
+        }
+        fn tasks(
+            &self,
+            query: TaskAddressQuery,
+            deadline: Duration,
+        ) -> Result<TaskFactsBatch, WorkerError> {
+            self.operations.lock().unwrap().push("tasks");
+            self.tasks.addressed(query, deadline)
+        }
+        fn repair(
+            &self,
+            query: TaskRepairQuery,
+            deadline: Duration,
+        ) -> Result<TaskRepairPage, WorkerError> {
+            self.operations.lock().unwrap().push("repair");
+            self.tasks.repair(query, deadline)
+        }
+    }
+    struct Harness {
+        runtime: Arc<ManualEventRuntime>,
+        source: Arc<Source>,
+        reconciler: TaskReconciler,
+    }
+    impl Harness {
+        fn new(
+            previous: PreviousProjection,
+            cursor: Option<EventCursor>,
+            pending: Vec<TaskId>,
+        ) -> Self {
+            let runtime = Arc::new(ManualEventRuntime::new());
+            let source = Arc::new(Source::new(runtime.clone()));
+            let reconciler = TaskReconciler::new(previous, cursor, pending, runtime.clone());
+            Self {
+                runtime,
+                source,
+                reconciler,
+            }
+        }
+        fn tick(&mut self, read: Option<EventReadResult>, due: bool) -> Reconciliation {
+            let result = self
+                .reconciler
+                .reconcile(
+                    self.source.as_ref(),
+                    ReconcileInput {
+                        read,
+                        repair_due: due,
+                        include_titles: true,
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            result.validate().unwrap();
+            result
+        }
+        fn sweep(&mut self) -> Vec<mac_worker::controller::events::DerivedTaskChange> {
+            let mut changes = Vec::new();
+            for index in 0..200 {
+                let result = self.tick(None, index == 0);
+                changes.extend(result.changes);
+                if result.repair == RepairProgress::Complete {
+                    for _ in 0..16 {
+                        changes.extend(self.tick(None, false).changes);
+                    }
+                    return changes;
+                }
+            }
+            panic!("bounded frozen sweep never completed")
+        }
+        fn feed(&self, after: EventCursor) -> EventReadResult {
+            self.source
+                .journal
+                .read(
+                    ReadQuery {
+                        after: Some(after),
+                        limit: 256,
+                        wait_ms: 0,
+                    },
+                    deadline(),
+                )
+                .unwrap()
+        }
+    }
+    fn warm(facts: TaskFacts) -> PreviousProjection {
+        PreviousProjection::Present(BTreeMap::from([(facts.task_id, facts)]))
+    }
+
+    #[test]
+    fn lost_hint_warm_busy_to_quiescent_is_derived_change() {
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, false)), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        let changes = h.sweep();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].cause, ChangeCause::RepairDifference);
+        assert_eq!(changes[0].previous.as_ref().unwrap().quiescent, Some(false));
+        assert_eq!(changes[0].current.as_ref().unwrap().quiescent, Some(true));
+        assert!(!format!("{changes:?}").contains("seq:"));
+    }
+    #[test]
+    fn absent_baseline_even_with_valid_cursor_baselines_lost_completion() {
+        let mut h = Harness::new(
+            PreviousProjection::Absent,
+            Some(EventCursor {
+                journal_id: uuid::Uuid::from_u128(1),
+                seq: Seq::ZERO,
+            }),
+            vec![],
+        );
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        assert!(h.sweep().is_empty());
+        let PreviousProjection::Present(rows) = h.reconciler.previous_projection() else {
+            panic!("cold sweep must establish an actual baseline")
+        };
+        assert_eq!(rows.len(), 1);
+    }
+    #[test]
+    fn present_empty_detects_new_row() {
+        let mut h = Harness::new(PreviousProjection::Present(BTreeMap::new()), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        let changes = h.sweep();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].previous.is_none());
+    }
+    #[test]
+    fn unchanged_history_after_ring_eviction_has_no_change() {
+        let facts = terminal(1, SafeOutcome::Done, true);
+        let mut h = Harness::new(warm(facts.clone()), None, vec![]);
+        h.source.tasks.insert(facts).unwrap();
+        h.source
+            .journal
+            .replace_epoch(uuid::Uuid::from_u128(2))
+            .unwrap();
+        assert!(h.sweep().is_empty());
+        assert!(
+            matches!(h.reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.len()==1)
+        );
+    }
+    #[test]
+    fn replay_hint_after_saved_cursor_is_separate_and_matches_current_turn() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            Some(after),
+            vec![],
+            h.runtime.clone(),
+        );
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(1, true);
+        let read = h.feed(after);
+        let result = h.tick(Some(read), false);
+        assert_eq!(result.changes.len(), 1);
+        assert!(matches!(
+            result.changes[0].cause,
+            ChangeCause::ReplayTerminal {
+                outcome: SafeOutcome::Done,
+                ..
+            }
+        ));
+        h.source
+            .tasks
+            .insert(terminal(2, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        h.source.hint(2, true);
+        let read = h.feed(h.reconciler.cursor().unwrap());
+        assert!(
+            h.tick(Some(read), false).changes.is_empty(),
+            "Done hint must not confirm NeedsInput"
+        );
+    }
+    #[test]
+    fn generic_hint_on_cold_history_is_not_completion() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.hint(1, false);
+        let read = h.feed(after);
+        let result = h.tick(Some(read), false);
+        assert!(result.changes.is_empty());
+        assert_eq!(result.confirmed.len(), 1);
+    }
+    #[test]
+    fn closing_quiescent_done_is_not_new_completion_and_closed_attention_is_false() {
+        let done = terminal(1, SafeOutcome::Done, true);
+        let mut closed = done.clone();
+        closed.state = "closed".into();
+        let mut h = Harness::new(warm(done), None, vec![]);
+        h.source.tasks.insert(closed).unwrap();
+        assert!(h.sweep().is_empty());
+        let mut input = terminal(2, SafeOutcome::NeedsInput, true);
+        input.state = "closed".into();
+        assert!(!input.eligibility_signature().current_attention);
+    }
+    #[test]
+    fn pending_confirmation_has_priority_titles_and_bounded_proof_groups() {
+        let mut h = Harness::new(
+            PreviousProjection::Absent,
+            None,
+            (1..=20).map(task_id).collect(),
+        );
+        for id in 1..=20 {
+            h.source
+                .tasks
+                .insert(terminal(id, SafeOutcome::Done, true))
+                .unwrap();
+        }
+        h.source.tasks.set_proof_work(task_id(1), 40).unwrap();
+        h.source.tasks.set_proof_budget(16);
+        let first = h.tick(None, true);
+        assert!(!first.pending_ids.is_empty());
+        assert_eq!(h.source.operations.lock().unwrap()[0], "tasks");
+        for _ in 0..8 {
+            h.tick(None, false);
+        }
+        let queries = h.source.tasks.addressed_requests();
+        assert!(queries.len() >= 3);
+        assert!(
+            queries
+                .iter()
+                .all(|q| q.task_ids.len() <= 16 && q.include_titles)
+        );
+        assert!(queries.iter().any(|q| q.proof_after.is_some()));
+        assert!(
+            h.source
+                .tasks
+                .repair_requests()
+                .iter()
+                .all(|q| q.limit <= 128)
+        );
+    }
+    #[test]
+    fn partial_sweep_keeps_previous_rows_and_over_cap_keeps_addressed_reads() {
+        let mut h = Harness::new(warm(terminal(9, SafeOutcome::Done, true)), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.source
+            .tasks
+            .insert(terminal(2, SafeOutcome::Done, true))
+            .unwrap();
+        h.source.tasks.set_page_budget(1);
+        let first = h.tick(None, true);
+        assert_ne!(first.repair, RepairProgress::Complete);
+        assert!(
+            matches!(h.reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.contains_key(&task_id(9)))
+        );
+        h.source.tasks.set_directory_entries(100001);
+        let error = h
+            .reconciler
+            .reconcile(
+                h.source.as_ref(),
+                ReconcileInput {
+                    read: None,
+                    repair_due: false,
+                    include_titles: false,
+                },
+                deadline(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.public_code(),
+            "CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE"
+        );
+        assert!(
+            matches!(h.reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.contains_key(&task_id(9)))
+        );
+        h.source
+            .tasks
+            .addressed(
+                TaskAddressQuery::try_new(vec![task_id(1)], false, None).unwrap(),
+                deadline(),
+            )
+            .unwrap();
+        h.source.tasks.set_directory_entries(2);
+        let changes = h.sweep();
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.task_id == task_id(9) && change.current.is_none())
+        );
+    }
+    #[test]
+    fn continuous_events_do_not_starve_nonoverlapping_repair() {
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, true)), None, vec![]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::Done, true))
+            .unwrap();
+        h.sweep();
+        let old = h.source.tasks.repair_requests().len();
+        h.runtime.advance(Duration::from_secs(15));
+        let after = h.source.journal.window(deadline()).unwrap().cursor();
+        h.source.hint(1, false);
+        let read = h.feed(after);
+        h.tick(Some(read), false);
+        assert!(h.source.tasks.repair_requests().len() > old);
+    }
+    #[test]
+    fn unknown_kind_requests_global_repair_without_trusting_raw_task_id() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+        let id = h.source.journal.window(deadline()).unwrap().journal_id;
+        let read = EventReadResult::Batch(mac_worker::controller::events::ReadBatch {
+            schema_version: 1,
+            journal_id: id,
+            oldest_seq: Seq::new(1),
+            head_seq: Seq::new(1),
+            next_after: EventCursor {
+                journal_id: id,
+                seq: Seq::new(1),
+            },
+            events: vec![WireEvent {
+                schema_version: 1,
+                journal_id: id,
+                seq: Seq::new(1),
+                time_millis: 0,
+                kind: "future.changed".into(),
+                data: json!({"task_id":task_id(8)}),
+            }],
+            has_more: false,
+        });
+        let result = h.tick(Some(read), false);
+        assert!(!h.source.tasks.repair_requests().is_empty());
+        assert!(result.changes.is_empty());
+        assert!(h.source.tasks.addressed_requests().is_empty());
+    }
+    #[test]
+    fn unknown_outcome_is_non_notifying() {
+        let wire = json!({"task_id":task_id(1),"run_id":null,"state":"open","latest_turn_id":TurnId::new(uuid::Uuid::from_u128(101)),"outcome":"future_outcome","code":null,"runner_present":false,"close_intent":false,"auto_continue_intent":false,"queue_dispatching":false,"result_imported":true,"busy":false,"quiescent":true,"fact_digest":"a".repeat(64),"title":null});
+        let facts: TaskFacts = serde_json::from_value(wire).unwrap();
+        assert_eq!(facts.quiescent, None);
+        let mut h = Harness::new(warm(terminal(1, SafeOutcome::Done, false)), None, vec![]);
+        h.source.tasks.insert(facts).unwrap();
+        assert!(h.sweep().iter().all(|change| {
+            change
+                .current
+                .as_ref()
+                .is_none_or(|facts| facts.quiescent != Some(true))
+        }));
+    }
+    #[test]
+    fn repeated_restart_preserves_last_complete_view() {
+        let runtime = Arc::new(ManualEventRuntime::new());
+        let source = ScriptedEventSource::new();
+        let baseline = EventCursor {
+            journal_id: uuid::Uuid::from_u128(1),
+            seq: Seq::ZERO,
+        };
+        for _ in 0..3 {
+            source
+                .queue_read(Ok(EventReadResult::SnapshotRequired(
+                    mac_worker::controller::events::SnapshotRequired {
+                        reason: "bootstrap".into(),
+                        window: mac_worker::controller::events::JournalWindow {
+                            journal_id: baseline.journal_id,
+                            oldest_seq: Seq::new(1),
+                            head_seq: Seq::ZERO,
+                        },
+                    },
+                )))
+                .unwrap();
+            source
+                .queue_repair(Ok(TaskRepairPage {
+                    rows: vec![],
+                    next: None,
+                    complete: false,
+                    restart: true,
+                    baseline_after: Some(baseline),
+                }))
+                .unwrap();
+        }
+        let mut reconciler = TaskReconciler::new(
+            warm(terminal(9, SafeOutcome::Done, true)),
+            None,
+            vec![],
+            runtime,
+        );
+        for _ in 0..3 {
+            let result = reconciler
+                .reconcile(
+                    &source,
+                    ReconcileInput {
+                        read: None,
+                        repair_due: true,
+                        include_titles: false,
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            assert_eq!(result.repair, RepairProgress::Restarted);
+            assert!(
+                matches!(reconciler.previous_projection(),PreviousProjection::Present(rows) if rows.contains_key(&task_id(9)))
+            );
+        }
+    }
+}
