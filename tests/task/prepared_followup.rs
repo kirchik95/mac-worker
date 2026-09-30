@@ -4,11 +4,9 @@
 //! [`ClientStateStore`], queue, and prompt tree; runner spawns are faked and
 //! nothing touches the network.
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
-#[path = "support/task_state.rs"]
-mod task_state_fixture;
+use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
 
 use std::{

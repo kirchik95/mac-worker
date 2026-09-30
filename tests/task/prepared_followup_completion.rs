@@ -9,8 +9,7 @@
 //! failure there is the baseline; do not treat a later production correction
 //! as this tests-only checkpoint.
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     ffi::{OsStr, OsString},

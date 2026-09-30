@@ -1,8 +1,6 @@
-#[path = "support/fixture_pid.rs"]
-mod fixture_pid;
+use crate::fixture_pid;
 
-#[path = "support/task_state.rs"]
-mod task_state_fixture;
+use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
 
 use std::sync::{Arc, Barrier};

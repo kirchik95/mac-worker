@@ -23,7 +23,7 @@ test-group = 'stress'
 slow-timeout = { period = "300s", terminate-after = 4 }
 
 [[profile.default.overrides]]
-filter = 'binary(supervisor) | binary(job_queries) | binary(task_turn)'
+filter = 'binary(/^(supervisor|job_queries|task_turn|host|task)$/) & (test(/^(supervisor|job_queries|task_turn)::/) | !test(/::/))'
 test-group = 'fork_heavy'
 
 [profile.ci]

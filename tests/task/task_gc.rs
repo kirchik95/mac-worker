@@ -1,5 +1,4 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     collections::BTreeMap,
@@ -224,8 +223,8 @@ fn write_legacy_fixture_job(store: &HostStore) -> (String, JobId) {
     write_legacy_fixture_job_from(
         store,
         LEGACY_JOB_ID,
-        include_bytes!("fixtures/gc/legacy-job-meta-v3.json"),
-        include_bytes!("fixtures/gc/legacy-job-status.json"),
+        include_bytes!("../fixtures/gc/legacy-job-meta-v3.json"),
+        include_bytes!("../fixtures/gc/legacy-job-status.json"),
     )
 }
 
@@ -859,8 +858,8 @@ fn gc_preview_reports_legacy_job_metadata_without_aborting_other_records() {
     let (legacy_mini2_identifier, legacy_mini2_job) = write_legacy_fixture_job_from(
         &store,
         LEGACY_JOB_ID_MINI2,
-        include_bytes!("fixtures/gc/legacy-job-meta-v3-mini2.json"),
-        include_bytes!("fixtures/gc/legacy-job-status-v3-mini2.json"),
+        include_bytes!("../fixtures/gc/legacy-job-meta-v3-mini2.json"),
+        include_bytes!("../fixtures/gc/legacy-job-status-v3-mini2.json"),
     );
     let valid_job = job_id(99);
     write_job(&store, valid_job, &JobStatus::succeeded(1, 0, 0).unwrap());

@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use std::{
     collections::VecDeque, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus,
@@ -65,7 +65,10 @@ fn inspection_and_fixture_ignore_ambient_git_config_overrides() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "inspection_and_fixture_ignore_ambient_git_config_overrides",
+                &crate::support::libtest_name(
+                    module_path!(),
+                    "inspection_and_fixture_ignore_ambient_git_config_overrides",
+                ),
             ])
             .env(CHILD, "1")
             .env("GIT_CONFIG_COUNT", "1")

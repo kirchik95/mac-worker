@@ -488,7 +488,7 @@ fn agent_from_stem(stem: &str) -> AgentKind {
 }
 
 /// Every recorded transcript with its agent and reference rendering, the
-/// same set `tests/turn_log.rs` holds `task logs` to.
+/// same set `tests/task/turn_log.rs` holds `task logs` to.
 fn recorded_fixtures() -> Vec<(PathBuf, AgentKind, PathBuf)> {
     let dirs: [(&str, Option<AgentKind>); 3] = [
         ("agents", None),

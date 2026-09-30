@@ -1,5 +1,4 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     fs,
@@ -2461,7 +2460,10 @@ fn herdr_reporter_marks_the_turn_unavailable_without_a_socket_wrapper() {
     let home = temp.path().join("home");
     fs::create_dir_all(&home).unwrap();
     support::agent_launch_fixture::assert_subprocess_success(
-        "herdr_reporter_marks_the_turn_unavailable_without_a_socket",
+        &crate::support::libtest_name(
+            module_path!(),
+            "herdr_reporter_marks_the_turn_unavailable_without_a_socket",
+        ),
         &[("HOME", home.to_str().unwrap())],
         false,
     );
@@ -2504,7 +2506,10 @@ fn a_turn_without_the_flag_never_touches_herdr_wrapper() {
     fs::create_dir_all(&home).unwrap();
     let server = support::fake_herdr::FakeHerdr::start_in_home(&home);
     support::agent_launch_fixture::assert_subprocess_success(
-        "a_turn_without_the_flag_never_touches_herdr",
+        &crate::support::libtest_name(
+            module_path!(),
+            "a_turn_without_the_flag_never_touches_herdr",
+        ),
         &[("HOME", home.to_str().unwrap())],
         false,
     );
@@ -2602,7 +2607,10 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab_wrapper() {
     );
 
     support::agent_launch_fixture::assert_subprocess_success(
-        "herdr_reporter_attaches_the_turn_and_close_removes_its_tab",
+        &crate::support::libtest_name(
+            module_path!(),
+            "herdr_reporter_attaches_the_turn_and_close_removes_its_tab",
+        ),
         &[("HOME", home.to_str().unwrap())],
         false,
     );
@@ -2867,7 +2875,10 @@ fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home_wrapper() {
     let server = support::fake_herdr::FakeHerdr::start_in_home(&account_home);
     queue_herdr_turn_and_close_replies(&server);
     support::agent_launch_fixture::assert_subprocess_success(
-        "auto_close_done_turn_closes_herdr_tabs_from_the_account_home",
+        &crate::support::libtest_name(
+            module_path!(),
+            "auto_close_done_turn_closes_herdr_tabs_from_the_account_home",
+        ),
         &[
             ("HOME", job_home.to_str().unwrap()),
             ("MAC_WORKER_ACCOUNT_HOME", account_home.to_str().unwrap()),
@@ -3013,7 +3024,10 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt_wrapper() {
     fs::create_dir_all(&home).unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
     support::agent_launch_fixture::assert_subprocess_success(
-        "cancelling_setup_during_recipe_hands_off_without_agent_or_receipt",
+        &crate::support::libtest_name(
+            module_path!(),
+            "cancelling_setup_during_recipe_hands_off_without_agent_or_receipt",
+        ),
         &[("HOME", home.to_str().unwrap())],
         false,
     );
@@ -3108,7 +3122,10 @@ fn supervisor_death_during_setup_does_not_start_a_second_heavy_job_wrapper() {
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(&data).unwrap();
     support::agent_launch_fixture::assert_subprocess_success(
-        "supervisor_death_during_setup_does_not_start_a_second_heavy_job",
+        &crate::support::libtest_name(
+            module_path!(),
+            "supervisor_death_during_setup_does_not_start_a_second_heavy_job",
+        ),
         &[
             ("HOME", home.to_str().unwrap()),
             ("XDG_DATA_HOME", data.to_str().unwrap()),
@@ -3276,7 +3293,10 @@ fn setup_and_agent_share_one_total_turn_budget_wrapper() {
     fs::create_dir_all(&home).unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
     support::agent_launch_fixture::assert_subprocess_success(
-        "setup_and_agent_share_one_total_turn_budget",
+        &crate::support::libtest_name(
+            module_path!(),
+            "setup_and_agent_share_one_total_turn_budget",
+        ),
         &[("HOME", home.to_str().unwrap())],
         false,
     );

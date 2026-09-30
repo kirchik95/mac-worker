@@ -1,5 +1,4 @@
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     ffi::CString,
@@ -152,7 +151,7 @@ fn task_client_uses_the_project_default_agent_when_cli_omits_one() {
         data: state_root_path.join("data"),
     };
     let state = ClientStateStore::open(&paths.state).unwrap();
-    let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+    let config = Config::parse(include_str!("../../config.example.toml")).unwrap();
     let runner = SystemProcessRunner;
     let executor = InlineRunnerExecutor;
     let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
@@ -490,7 +489,7 @@ fn herdr_keys_parse_with_their_defaults_and_reject_unknown_neighbours() {
         "the worker flag is a boolean"
     );
 
-    let example = Config::parse(include_str!("../config.example.toml")).unwrap();
+    let example = Config::parse(include_str!("../../config.example.toml")).unwrap();
     assert!(example.notifications.herdr);
     assert!(!example.workers[0].herdr);
 }

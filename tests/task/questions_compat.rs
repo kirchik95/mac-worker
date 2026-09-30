@@ -1,5 +1,4 @@
-#[path = "support/questions_v7_dtos.rs"]
-mod v7;
+use crate::v7;
 
 use mac_worker::{prepared_submit::FrozenSubmitBody, task::QuestionsPolicy};
 use serde_json::json;
