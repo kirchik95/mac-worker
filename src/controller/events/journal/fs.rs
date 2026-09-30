@@ -2,8 +2,10 @@
 use std::io;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::rooted_fs::{PrivateEntryIdentity, RootedDir};
+use crate::rooted_fs::PrivateRolePoint;
+use crate::rooted_fs::{PrivateEntryIdentity, PrivateRegularRole, PrivateRoleHooks, RootedDir};
 
 pub(super) const SEGMENT_BYTES: usize = 256 * 1024;
 pub(super) const RETAINED_SEGMENTS: usize = 64;
@@ -208,6 +210,416 @@ fn completion_suffix<'a>(pending: &'a [u8], tail: &[u8]) -> io::Result<&'a [u8]>
     Ok(&pending[tail.len()..])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RoleKind {
+    Initialization,
+    Manifest,
+    Pending,
+    Segment,
+    Retirement,
+}
+
+impl RoleKind {
+    const ALL: [Self; 5] = [
+        Self::Initialization,
+        Self::Manifest,
+        Self::Pending,
+        Self::Segment,
+        Self::Retirement,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Initialization => "initialization",
+            Self::Manifest => "manifest",
+            Self::Pending => "pending",
+            Self::Segment => "segment",
+            Self::Retirement => "retirement",
+        }
+    }
+
+    fn stage(self) -> String {
+        format!("{}.stage", self.name())
+    }
+    fn evidence(self) -> String {
+        format!("{}.role", self.name())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FaultPoint {
+    Role(RoleKind, PrivateRolePoint),
+    PendingDurable,
+    PartialAppend,
+    SegmentSynced,
+    ManifestCommitted,
+    PendingRemoved,
+    Retired,
+}
+
+pub(super) trait FaultHooks: Send + Sync {
+    fn at(&self, point: FaultPoint) -> io::Result<()>;
+}
+
+pub(super) struct NoFaults;
+impl FaultHooks for NoFaults {
+    fn at(&self, _: FaultPoint) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn bounded_json<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(value).map_err(|_| unavailable())?;
+    if bytes.len() > limit {
+        return Err(unavailable());
+    }
+    Ok(bytes)
+}
+
+fn read_json<T: Serialize + serde::de::DeserializeOwned>(
+    root: &RootedDir,
+    name: &str,
+    limit: usize,
+) -> io::Result<T> {
+    let bytes = root.read_private_regular(name, limit as u64)?;
+    let value: T = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    if bounded_json(&value, limit)? != bytes {
+        return Err(unavailable());
+    }
+    Ok(value)
+}
+
+#[derive(Default, Debug)]
+pub(super) struct DiskUsage {
+    pub(super) bytes: usize,
+    pub(super) files: usize,
+    pub(super) evidence_bytes: usize,
+    pub(super) evidence_files: usize,
+    entries: usize,
+}
+
+impl DiskUsage {
+    fn admit(&self, bytes: usize, files: usize) -> io::Result<()> {
+        if self
+            .bytes
+            .checked_add(bytes)
+            .is_none_or(|sum| sum > TOTAL_BYTES)
+            || self
+                .files
+                .checked_add(files)
+                .is_none_or(|sum| sum > TOTAL_FILES)
+            || self.evidence_bytes > EVIDENCE_BYTES
+            || self.evidence_files > EVIDENCE_FILES
+        {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+}
+
+fn valid_segment_name(name: &str) -> bool {
+    name.strip_prefix("segment-")
+        .and_then(|s| s.strip_suffix(".jsonl"))
+        .is_some_and(|s| s.parse::<u64>().is_ok_and(|n| n > 0 && n.to_string() == s))
+}
+
+fn valid_role_target(kind: RoleKind, target: &str) -> bool {
+    if kind == RoleKind::Segment {
+        valid_segment_name(target)
+    } else {
+        target == format!("{}.json", kind.name())
+    }
+}
+
+fn audit(root: &RootedDir) -> io::Result<DiskUsage> {
+    fn visit(root: &RootedDir, device: u64, depth: usize, usage: &mut DiskUsage) -> io::Result<()> {
+        if depth > 4 {
+            return Err(unavailable());
+        }
+        let names = root.list_names()?;
+        usage.entries = usage
+            .entries
+            .checked_add(names.len())
+            .ok_or_else(unavailable)?;
+        if usage.entries > TOTAL_FILES * 2 {
+            return Err(unavailable());
+        }
+        for raw in names {
+            let name = std::str::from_utf8(&raw).map_err(|_| unavailable())?;
+            let binding = root.private_entry_identity(name)?;
+            if binding.device != device {
+                return Err(unavailable());
+            }
+            if binding.kind == libc::S_IFDIR as u32 {
+                if depth == 0 && name != ".mac-worker-rooted-fs" {
+                    return Err(unavailable());
+                }
+                let child = root.open_private_direct_child_on_device(name, device)?;
+                visit(&child, device, depth + 1, usage)?;
+            } else {
+                if depth == 0 && binding.mode != 0o600 {
+                    return Err(unavailable());
+                }
+                let size =
+                    usize::try_from(root.open_private_regular_handle(name)?.metadata()?.len())
+                        .map_err(|_| unavailable())?;
+                usage.bytes = usage.bytes.checked_add(size).ok_or_else(unavailable)?;
+                usage.files += 1;
+                if depth > 0 || name.ends_with(".role") {
+                    usage.evidence_bytes = usage
+                        .evidence_bytes
+                        .checked_add(size)
+                        .ok_or_else(unavailable)?;
+                    usage.evidence_files += 1;
+                }
+                usage.admit(0, 0)?;
+            }
+        }
+        root.verify_bound()?;
+        Ok(())
+    }
+    let root_binding = root.identity()?;
+    if root_binding.mode != 0o700 {
+        return Err(unavailable());
+    }
+    let mut usage = DiskUsage::default();
+    visit(root, root_binding.device, 0, &mut usage)?;
+    Ok(usage)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleEvidence {
+    schema_version: u32,
+    journal_id: String,
+    transaction_id: String,
+    root: Binding,
+    kind: RoleKind,
+    target: String,
+    old_binding: Option<Binding>,
+    old_len: usize,
+    old_digest: Option<String>,
+    stage_binding: Binding,
+    new_len: usize,
+    new_digest: String,
+}
+
+struct CreationRecorder<'a> {
+    root: &'a RootedDir,
+    epoch: &'a str,
+    kind: RoleKind,
+    target: &'a str,
+    old: Option<&'a [u8]>,
+    old_binding: Option<Binding>,
+    replacement: &'a [u8],
+    faults: &'a dyn FaultHooks,
+}
+
+impl PrivateRoleHooks for CreationRecorder<'_> {
+    fn record_creation(&self, binding: PrivateEntryIdentity) -> io::Result<()> {
+        let evidence = RoleEvidence {
+            schema_version: 1,
+            journal_id: self.epoch.into(),
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            root: self.root.identity()?.into(),
+            kind: self.kind,
+            target: self.target.into(),
+            old_binding: self.old_binding,
+            old_len: self.old.map_or(0, <[u8]>::len),
+            old_digest: self.old.map(digest),
+            stage_binding: binding.into(),
+            new_len: self.replacement.len(),
+            new_digest: digest(self.replacement),
+        };
+        let bytes = bounded_json(&evidence, 4096)?;
+        self.root
+            .write_new_private_file(&self.kind.evidence(), &bytes)?
+            .sync_all()?;
+        self.root.sync_root()
+    }
+
+    fn at(&self, point: PrivateRolePoint) -> io::Result<()> {
+        self.faults.at(FaultPoint::Role(self.kind, point))
+    }
+}
+
+fn remove_bound(root: &RootedDir, name: &str, binding: Binding) -> io::Result<()> {
+    root.retry_pending_owned_regulars_matching(|target, identity| {
+        target == name.as_bytes() && Binding::from(identity) == binding
+    })?;
+    if root.entry_exists(name)? {
+        if Binding::from(root.private_entry_identity(name)?) != binding {
+            return Err(unavailable());
+        }
+        root.remove_owned_regular(name)?;
+    }
+    root.sync_root()
+}
+
+fn replace_role(
+    root: &RootedDir,
+    epoch: &str,
+    kind: RoleKind,
+    target: &str,
+    replacement: &[u8],
+    faults: &dyn FaultHooks,
+) -> io::Result<()> {
+    recover_roles(root, epoch)?;
+    let limit = if kind == RoleKind::Segment {
+        SEGMENT_BYTES
+    } else {
+        METADATA_BYTES
+    };
+    if !canonical_uuid(epoch) || !valid_role_target(kind, target) || replacement.len() > limit {
+        return Err(unavailable());
+    }
+    audit(root)?.admit(
+        replacement.len() + 4096 + EVIDENCE_BYTES,
+        2 + EVIDENCE_FILES,
+    )?;
+    let old = if root.entry_exists(target)? {
+        Some(root.read_private_regular(target, limit as u64)?)
+    } else {
+        None
+    };
+    let old_binding = old
+        .as_ref()
+        .map(|_| root.private_entry_identity(target).map(Binding::from))
+        .transpose()?;
+    let hooks = CreationRecorder {
+        root,
+        epoch,
+        kind,
+        target,
+        old: old.as_deref(),
+        old_binding,
+        replacement,
+        faults,
+    };
+    root.replace_private_regular_exact_in_role(
+        PrivateRegularRole {
+            target,
+            stage: &kind.stage(),
+            expected_target: old_binding.map(Into::into),
+        },
+        old.as_deref(),
+        replacement,
+        &hooks,
+    )?;
+    let evidence_binding = root.private_entry_identity(&kind.evidence())?.into();
+    remove_bound(root, &kind.evidence(), evidence_binding)?;
+    audit(root)?.admit(0, 0)
+}
+
+fn matches_file(
+    root: &RootedDir,
+    name: &str,
+    binding: Binding,
+    length: usize,
+    expected_digest: &str,
+) -> io::Result<bool> {
+    if !root.entry_exists(name)? {
+        return Ok(false);
+    }
+    if Binding::from(root.private_entry_identity(name)?) != binding {
+        return Ok(false);
+    }
+    let bytes = root.read_private_regular(name, length as u64)?;
+    Ok(bytes.len() == length && digest(&bytes) == expected_digest)
+}
+
+fn recover_roles(root: &RootedDir, epoch: &str) -> io::Result<()> {
+    audit(root)?;
+    for kind in RoleKind::ALL {
+        root.resume_pending_owned_regular_cleanup(&kind.evidence())?;
+        if !root.entry_exists(&kind.evidence())? {
+            if root.entry_exists(&kind.stage())? {
+                return Err(unavailable());
+            }
+            continue;
+        }
+        let evidence: RoleEvidence = read_json(root, &kind.evidence(), 4096)?;
+        if evidence.schema_version != 1
+            || evidence.journal_id != epoch
+            || !canonical_uuid(&evidence.transaction_id)
+            || evidence.root != Binding::from(root.identity()?)
+            || evidence.kind != kind
+            || !valid_role_target(kind, &evidence.target)
+            || evidence.old_binding.is_some() != evidence.old_digest.is_some()
+            || evidence.new_len
+                > if kind == RoleKind::Segment {
+                    SEGMENT_BYTES
+                } else {
+                    METADATA_BYTES
+                }
+        {
+            return Err(unavailable());
+        }
+        let new_published = matches_file(
+            root,
+            &evidence.target,
+            evidence.stage_binding,
+            evidence.new_len,
+            &evidence.new_digest,
+        )?;
+        if new_published {
+            // Either side of the first directory fsync may be durable. Validate
+            // both bindings before making the new generation a recovery fact.
+            if let (Some(old), Some(old_digest)) =
+                (evidence.old_binding, evidence.old_digest.as_deref())
+            {
+                root.retry_pending_owned_regulars_matching(|name, id| {
+                    name == kind.stage().as_bytes() && Binding::from(id) == old
+                })?;
+                if root.entry_exists(&kind.stage())? {
+                    if !matches_file(root, &kind.stage(), old, evidence.old_len, old_digest)? {
+                        return Err(unavailable());
+                    }
+                    root.sync_root()?;
+                    remove_bound(root, &kind.stage(), old)?;
+                }
+            } else if root.entry_exists(&kind.stage())? {
+                return Err(unavailable());
+            }
+            root.sync_root()?;
+        } else {
+            let old_matches = match (evidence.old_binding, evidence.old_digest.as_deref()) {
+                (Some(old), Some(expected)) => {
+                    matches_file(root, &evidence.target, old, evidence.old_len, expected)?
+                }
+                (None, None) => !root.entry_exists(&evidence.target)?,
+                _ => false,
+            };
+            if !old_matches {
+                return Err(unavailable());
+            }
+            root.retry_pending_owned_regulars_matching(|name, id| {
+                name == kind.stage().as_bytes() && Binding::from(id) == evidence.stage_binding
+            })?;
+            if root.entry_exists(&kind.stage())? {
+                if Binding::from(root.private_entry_identity(&kind.stage())?)
+                    != evidence.stage_binding
+                {
+                    return Err(unavailable());
+                }
+                let bytes = root.read_private_regular(&kind.stage(), evidence.new_len as u64)?;
+                if bytes.len() == evidence.new_len && digest(&bytes) != evidence.new_digest {
+                    return Err(unavailable());
+                }
+                remove_bound(root, &kind.stage(), evidence.stage_binding)?;
+            }
+        }
+        let binding = root.private_entry_identity(&kind.evidence())?.into();
+        remove_bound(root, &kind.evidence(), binding)?;
+    }
+    audit(root)?.admit(0, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +628,103 @@ mod tests {
     use tempfile::TempDir;
 
     const EPOCH: &str = "614dc3be-668f-4922-bd31-b1d7a0056790";
+
+    struct FailOnce(std::sync::Mutex<Option<FaultPoint>>);
+    impl FaultHooks for FailOnce {
+        fn at(&self, point: FaultPoint) -> io::Result<()> {
+            let mut selected = self.0.lock().unwrap();
+            if *selected == Some(point) {
+                *selected = None;
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn role_fault_matrix(iterations: usize) {
+        let points = [
+            PrivateRolePoint::CreationRecorded,
+            PrivateRolePoint::PartialStage,
+            PrivateRolePoint::StageSynced,
+            PrivateRolePoint::Published,
+            PrivateRolePoint::DirectorySynced,
+            PrivateRolePoint::DisplacedRemoved,
+            PrivateRolePoint::FinalSynced,
+        ];
+        for _ in 0..iterations {
+            for role in RoleKind::ALL {
+                for point in points {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = RootedDir::create(&temp.path().join("events")).unwrap();
+                    let target = if role == RoleKind::Segment {
+                        "segment-1.jsonl".into()
+                    } else {
+                        format!("{}.json", role.name())
+                    };
+                    root.write_new_private_file(&target, b"old generation")
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    let fault =
+                        FailOnce(std::sync::Mutex::new(Some(FaultPoint::Role(role, point))));
+                    assert!(
+                        replace_role(&root, EPOCH, role, &target, b"new generation", &fault)
+                            .is_err(),
+                        "{role:?} {point:?}"
+                    );
+                    recover_roles(&root, EPOCH).unwrap();
+                    let expected: &[u8] = if matches!(
+                        point,
+                        PrivateRolePoint::CreationRecorded
+                            | PrivateRolePoint::PartialStage
+                            | PrivateRolePoint::StageSynced
+                    ) {
+                        b"old generation"
+                    } else {
+                        b"new generation"
+                    };
+                    assert_eq!(
+                        root.read_private_regular(&target, 64).unwrap(),
+                        expected,
+                        "{role:?} {point:?}"
+                    );
+                    assert!(!root.entry_exists(&role.stage()).unwrap());
+                    assert!(!root.entry_exists(&role.evidence()).unwrap());
+                    replace_role(&root, EPOCH, role, &target, b"next generation", &NoFaults)
+                        .unwrap();
+                    assert_eq!(
+                        root.read_private_regular(&target, 64).unwrap(),
+                        b"next generation"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_named_role_recovers_each_exchange_and_sync_boundary() {
+        role_fault_matrix(1);
+    }
+
+    #[test]
+    #[ignore = "stress: repeat every journal role fault at least 200 times"]
+    fn journal_role_fault_matrix_stress() {
+        role_fault_matrix(200);
+    }
+
+    #[test]
+    fn stage_without_creation_evidence_is_preserved_and_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootedDir::create(&temp.path().join("events")).unwrap();
+        root.write_new_private_file("manifest.stage", b"unexplained")
+            .unwrap();
+        assert!(recover_roles(&root, EPOCH).is_err());
+        assert_eq!(
+            root.read_private_regular("manifest.stage", 64).unwrap(),
+            b"unexplained"
+        );
+    }
 
     fn record(seq: u64) -> Vec<u8> {
         format!(
