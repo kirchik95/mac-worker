@@ -1573,7 +1573,9 @@ mod reconciliation {
         ChangeCause, EventBatch, EventReconciler, JournalReader, JournalWriter, NewEvent,
         PreviousProjection, ReconcileInput, Reconciliation, RepairProgress, TaskFactsBatch,
         TaskHint, TaskProjectionReader, TaskRepairPage, TurnHint, WireEvent,
-        client::TaskReconciler, testing::ScriptedEventSource,
+        client::TaskReconciler,
+        notify::{NotifyOptions, NotifyState, plan_notifications},
+        testing::ScriptedEventSource,
     };
     use std::{collections::BTreeMap, sync::Mutex};
 
@@ -1714,6 +1716,139 @@ mod reconciliation {
     }
     fn warm(facts: TaskFacts) -> PreviousProjection {
         PreviousProjection::Present(BTreeMap::from([(facts.task_id, facts)]))
+    }
+
+    #[test]
+    fn review_cold_attention_reaches_notifier_as_startup_summary() {
+        for count in 1..=256 {
+            for (saved_cursor, delayed_proof) in [(false, false), (true, false), (true, true)] {
+                let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
+                let cursor =
+                    saved_cursor.then(|| h.source.journal.window(deadline()).unwrap().cursor());
+                h.reconciler = TaskReconciler::new(
+                    PreviousProjection::Absent,
+                    cursor,
+                    vec![],
+                    h.runtime.clone(),
+                );
+                for id in 1..=count {
+                    h.source
+                        .tasks
+                        .insert(terminal(id, SafeOutcome::NeedsInput, true))
+                        .unwrap();
+                }
+                if delayed_proof {
+                    h.source.tasks.set_proof_work(task_id(1), 96).unwrap();
+                }
+                let mut saved = NotifyState::empty();
+                saved.consumed_after = cursor;
+                let mut notices = Vec::new();
+                let mut completed = false;
+                for step in 0..40 {
+                    // Refresh the installed projection while the initial
+                    // addressed proof is still unknown.
+                    if delayed_proof && step == 1 {
+                        h.runtime.advance(Duration::from_secs(15));
+                    }
+                    let result = h.tick(None, step == 0);
+                    assert!(
+                        result.changes.is_empty(),
+                        "cold history cannot become a completion"
+                    );
+                    if let Some(attention) = &result.attention {
+                        assert_eq!(attention.count, count as usize);
+                        completed = true;
+                    }
+                    let plan =
+                        plan_notifications(&saved, &result, &NotifyOptions::default(), 16_000);
+                    saved = plan.next;
+                    notices.extend(plan.notices);
+                    if completed {
+                        break;
+                    }
+                }
+                assert!(
+                    completed,
+                    "startup proof did not complete for {count} tasks"
+                );
+                assert_eq!(
+                    notices.len(),
+                    1,
+                    "count={count}, cursor={saved_cursor}, delayed={delayed_proof}"
+                );
+                assert_eq!(notices[0].title, "Tasks need attention");
+                assert_eq!(
+                    notices[0].body,
+                    if count == 1 {
+                        "1 task".into()
+                    } else {
+                        format!("{count} tasks")
+                    }
+                );
+                // Persisting the summary consumes it across later sweeps.
+                for step in 0..24 {
+                    let result = h.tick(None, step == 0);
+                    let plan =
+                        plan_notifications(&saved, &result, &NotifyOptions::default(), 16_001);
+                    saved = plan.next;
+                    assert!(plan.notices.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cold_attention_summary_preserves_simultaneous_warm_completion() {
+        let mut h = Harness::new(PreviousProjection::Absent, None, vec![task_id(2)]);
+        h.source
+            .tasks
+            .insert(terminal(1, SafeOutcome::NeedsInput, true))
+            .unwrap();
+        h.source
+            .tasks
+            .insert(terminal(2, SafeOutcome::Done, false))
+            .unwrap();
+        h.source
+            .tasks
+            .insert(terminal(3, SafeOutcome::Done, true))
+            .unwrap();
+        let mut saved = NotifyState::empty();
+        let first = h.tick(None, true);
+        let plan = plan_notifications(&saved, &first, &NotifyOptions::default(), 1_000);
+        assert!(plan.notices.is_empty());
+        saved = plan.next;
+
+        h.source
+            .tasks
+            .insert(terminal(2, SafeOutcome::Done, true))
+            .unwrap();
+        let warm = h.tick(None, false);
+        assert_eq!(
+            warm.baseline,
+            mac_worker::controller::events::BaselineKind::Warm
+        );
+        assert_eq!(warm.changes.len(), 1);
+        assert_eq!(warm.changes[0].task_id, task_id(2));
+        assert_eq!(warm.changes[0].cause, ChangeCause::RepairDifference);
+        assert!(
+            warm.attention.is_none(),
+            "the cold summary needs its own chunk"
+        );
+        let plan = plan_notifications(&saved, &warm, &NotifyOptions::default(), 1_001);
+        assert_eq!(plan.notices.len(), 1);
+        assert_eq!(plan.notices[0].title, "Done");
+        saved = plan.next;
+
+        let cold = h.tick(None, false);
+        assert_eq!(
+            cold.baseline,
+            mac_worker::controller::events::BaselineKind::Cold
+        );
+        assert!(cold.changes.is_empty());
+        assert_eq!(cold.attention.as_ref().unwrap().count, 1);
+        let plan = plan_notifications(&saved, &cold, &NotifyOptions::default(), 1_002);
+        assert_eq!(plan.notices.len(), 1);
+        assert_eq!(plan.notices[0].title, "Tasks need attention");
     }
 
     #[test]

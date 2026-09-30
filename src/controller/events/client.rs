@@ -224,6 +224,7 @@ struct Sweep {
 }
 struct Comparison {
     old: PreviousProjection,
+    cold: bool,
     ids: VecDeque<TaskId>,
     attention: BTreeMap<TaskId, TaskEligibilitySignature>,
     waiting: BTreeSet<TaskId>,
@@ -840,6 +841,7 @@ impl TaskReconciler {
                         comparison
                     }
                     None => Comparison {
+                        cold: matches!(old, PreviousProjection::Absent),
                         old,
                         ids: ids.into_iter().collect(),
                         attention: BTreeMap::new(),
@@ -958,6 +960,10 @@ impl TaskReconciler {
             && comparison.hashed_count == comparison.attention.len()
             && self.sweep.is_none()
             && !self.attention_refresh_required
+            // A startup summary needs a cold chunk, but actual warm changes
+            // must keep their provenance. Drain those changes first and retain
+            // the verified set for the next chunk.
+            && !(comparison.cold && self.has_warm_changes())
         {
             comparison
                 .hash
@@ -971,6 +977,11 @@ impl TaskReconciler {
             Ok(None)
         }
     }
+    fn has_warm_changes(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|change| change.cause == ChangeCause::RepairDifference)
+    }
 }
 impl EventReconciler for TaskReconciler {
     fn reconcile(
@@ -980,11 +991,11 @@ impl EventReconciler for TaskReconciler {
         deadline: Duration,
     ) -> Result<Reconciliation, WorkerError> {
         check(self.runtime.as_ref(), deadline)?;
-        let baseline = if matches!(self.previous, PreviousProjection::Absent) {
-            BaselineKind::Cold
-        } else {
-            BaselineKind::Warm
-        };
+        let cold = matches!(self.previous, PreviousProjection::Absent)
+            || self
+                .comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.cold);
         let mut captured = None;
         if let Some(read) = input.read {
             read.validate()?;
@@ -1039,7 +1050,11 @@ impl EventReconciler for TaskReconciler {
         check(self.runtime.as_ref(), deadline)?;
         let result = Reconciliation {
             consumed_after: self.cursor,
-            baseline,
+            baseline: if cold && !self.has_warm_changes() {
+                BaselineKind::Cold
+            } else {
+                BaselineKind::Warm
+            },
             changes: self.changes.drain(..).collect(),
             confirmed: std::mem::take(&mut self.confirmed).into_values().collect(),
             pending_ids: self.order.iter().copied().collect(),
