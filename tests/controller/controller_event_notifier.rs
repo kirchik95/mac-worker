@@ -1341,7 +1341,7 @@ mod channels {
     use std::{
         fs,
         io::{BufRead, BufReader, Write},
-        os::unix::{net::UnixListener, process::ExitStatusExt},
+        os::unix::{fs::FileTypeExt, net::UnixListener, process::ExitStatusExt},
         process::ExitStatus,
         sync::{Arc, Mutex},
         thread,
@@ -1484,6 +1484,30 @@ mod channels {
         assert!(!herdr_socket_reachable(&HerdrSocket::default_for_home(
             controller.path()
         )));
+    }
+
+    #[test]
+    fn auto_selects_macos_when_a_bound_herdr_socket_is_closed_without_unlinking() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("laptop.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let socket = HerdrSocket::at(&path);
+        assert!(herdr_socket_reachable(&socket));
+        drop(listener);
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("socket name")
+                .file_type()
+                .is_socket()
+        );
+        assert!(!herdr_socket_reachable(&socket));
+        let selected = select_channels(
+            &NotifyOptions::default(),
+            &NotificationsConfig { herdr: true },
+            herdr_socket_reachable(&socket),
+        );
+        assert_eq!(selected.0, vec![SelectedChannel::Macos]);
+        assert!(selected.1.is_none());
     }
 
     #[test]

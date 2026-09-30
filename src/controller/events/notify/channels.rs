@@ -181,9 +181,21 @@ pub fn channels_for(
 }
 
 pub fn herdr_socket_reachable(socket: &HerdrSocket) -> bool {
-    fs::symlink_metadata(socket.path())
+    herdr_socket_reachable_with(socket, unix_connect_probe)
+}
+
+/// Auto selection uses this probe. A leftover socket pathname is not reachable
+/// unless `probe` connects. Callers keep save-before-display and do not retry
+/// a delivery that may already have been shown.
+pub fn herdr_socket_reachable_with(socket: &HerdrSocket, probe: impl Fn(&Path) -> bool) -> bool {
+    let is_socket = fs::symlink_metadata(socket.path())
         .map(|metadata| metadata.file_type().is_socket())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    is_socket && probe(socket.path())
+}
+
+fn unix_connect_probe(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 pub fn laptop_notification_socket<F>(home: &Path, lookup: F) -> HerdrSocket
