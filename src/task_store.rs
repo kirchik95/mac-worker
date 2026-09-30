@@ -1665,6 +1665,12 @@ impl<'a> TaskStore<'a> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
+        // An agent with dialects deletes in the form of the generation
+        // installed now: OpenCode 2 needs `--standalone` to stay out of its
+        // background service, and the session may be older than an upgrade.
+        let argv = crate::agent::identity::installed_adapter(binding.agent(), self.runner, &home)
+            .delete_session(binding.session_ref())
+            .unwrap_or(argv);
         let request = crate::agent::prebind_login_request(&argv, &home, &[])?;
         let result = self.runner.run(&request)?;
         if !result.status.success() {

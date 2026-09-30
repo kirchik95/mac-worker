@@ -139,6 +139,39 @@ fn observe(runner: &dyn ProcessRunner, executable: &Path, deadline: Duration) ->
     }
 }
 
+/// The adapter for a command this host runs on its own account outside a
+/// turn, such as a session delete. An agent with dialects is asked for its
+/// `--version` in the account's login shell first, so the command takes the
+/// form of the generation installed now rather than of a recorded one.
+pub(crate) fn installed_adapter(
+    kind: super::AgentKind,
+    runner: &dyn ProcessRunner,
+    account_home: &Path,
+) -> &'static dyn super::AgentAdapter {
+    if !super::has_dialects(kind) {
+        return super::adapter_for(kind);
+    }
+    let version = login_shell_version(runner, super::adapter_for(kind).binary(), account_home);
+    super::adapter_for_host(kind, version.as_deref())
+}
+
+/// `--version` of `binary` as the account's login shell resolves it. `None`
+/// when the command fails, exceeds its bound or prints no version.
+fn login_shell_version(
+    runner: &dyn ProcessRunner,
+    binary: &str,
+    account_home: &Path,
+) -> Option<String> {
+    let argv = [binary.to_owned(), "--version".to_owned()];
+    let request = super::prebind_login_request(&argv, account_home, &[]).ok()?;
+    let result = runner.run(&request).ok()?;
+    if !result.status.success() {
+        return None;
+    }
+    crate::agent_facts::parse_version(&result.stdout)
+        .or_else(|| crate::agent_facts::parse_version(&result.stderr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +254,80 @@ mod tests {
         );
         assert!(REQUIRED_VERSION_DEADLINE > VERSION_DEADLINE);
         assert_eq!(last.version_observation, VersionObservation::TimedOut);
+    }
+
+    /// The account login shell answering `<agent> --version`.
+    struct VersionShell {
+        /// stdout, stderr and exit status; `None` runs into the deadline.
+        answer: Option<(&'static [u8], &'static [u8], i32)>,
+        requests: std::sync::Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl ProcessRunner for VersionShell {
+        fn run(
+            &self,
+            request: &ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            self.requests.lock().unwrap().push(request.clone());
+            match self.answer {
+                Some((stdout, stderr, status)) => Ok(crate::process::ProcessResult {
+                    status: std::process::ExitStatus::from_raw(status << 8),
+                    stdout: stdout.to_vec(),
+                    stderr: stderr.to_vec(),
+                }),
+                None => Err(ProcessError::DeadlineExceeded {
+                    deadline: request.policy.deadline,
+                }
+                .into()),
+            }
+        }
+    }
+
+    #[test]
+    fn installed_adapter_takes_its_dialect_from_the_login_shell_version() {
+        use crate::agent::AgentKind;
+        let home = Path::new("/Users/worker");
+        let shell = |answer| VersionShell {
+            answer,
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        for (answer, standalone) in [
+            (Some((&b"1.18.32\n"[..], &b""[..], 0)), false),
+            (Some((b"", b"1.18.32\n", 0)), false),
+            (Some((b"opencode v2.0.18\n", b"", 0)), true),
+            // Without a version the generation is unknown and may be v2.
+            (Some((b"development build\n", b"", 0)), true),
+            (Some((b"", b"", 0)), true),
+            (Some((b"1.18.32\n", b"", 3)), true),
+            (None, true),
+        ] {
+            let shell = shell(answer);
+            let delete = installed_adapter(AgentKind::Opencode, &shell, home)
+                .delete_session("ses_1")
+                .unwrap();
+            assert_eq!(
+                delete.last().map(String::as_str) == Some("--standalone"),
+                standalone,
+                "{answer:?}"
+            );
+            let requests = shell.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{answer:?}");
+            assert_eq!(requests[0].program, "/bin/zsh");
+            assert_eq!(requests[0].args, ["-lc", "exec 'opencode' '--version'"]);
+            assert!(requests[0].isolate_parent_environment);
+            assert!(
+                requests[0]
+                    .environment
+                    .iter()
+                    .any(|(name, value)| name == "HOME" && value == home.as_os_str())
+            );
+        }
+        // An agent with one dialect is not asked for its version.
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Cursor] {
+            let shell = shell(None);
+            installed_adapter(kind, &shell, home);
+            assert!(shell.requests.lock().unwrap().is_empty(), "{kind:?}");
+        }
     }
 }
