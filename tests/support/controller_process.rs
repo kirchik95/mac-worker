@@ -1,8 +1,8 @@
 //! Isolated laptop/controller process fixture.
 //!
-//! Loaded from `tests/controller_process_runtime.rs` and
-//! `tests/controller_batch_process_runtime.rs` via `#[path]`. Not registered in
-//! `tests/support/mod.rs`. Fake SSH is labeled and never a live network host.
+//! Shared by the controller runtime test modules via `tests/controller/main.rs`.
+//! Not registered in `tests/support/mod.rs`. Fake SSH is labeled and never a
+//! live network host.
 //! Child env/cwd are per-Command; the test process HOME/cwd are not mutated.
 
 #![allow(dead_code)]

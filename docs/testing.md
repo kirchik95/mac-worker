@@ -1,7 +1,13 @@
 # Testing
 
-The suite has about 3,000 tests: the library's unit tests and one integration test binary per file in `tests/`.
-Most of its cost is filesystem sync and real processes, not CPU.
+The suite has about 3,000 tests: the library's unit tests and nine integration test binaries grouped by product
+area. Most of its cost is filesystem sync and real processes, not CPU.
+
+Cargo discovers each `tests/<area>/main.rs` as an integration target: `agents`, `cli`, `controller`, `dashboard`,
+`host`, `scheduler`, `setup`, `task`, and `transfer`. Former test files are modules within those targets, so a
+test such as `task_turn::setup_and_agent_share_one_total_turn_budget` runs in the `task` binary. Shared fixtures
+remain in `tests/support/` and are declared once in each area's root.
+New integration test modules go in an existing area and must be declared in that area's `main.rs`.
 
 ## Commands
 
@@ -20,9 +26,24 @@ passes any extra arguments through. It needs cargo-nextest (`brew install cargo-
 While you work, run only the binaries you touched:
 
 ```sh
-CARGO_BUILD_JOBS=4 cargo test --locked --test <binary>
-cargo test --locked --lib <module>::tests::
+CARGO_BUILD_JOBS=4 cargo nextest run --locked --test <area>
+CARGO_BUILD_JOBS=4 cargo nextest run --locked --test task -E 'test(/^task_turn::/)'
+CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/<module>::/)'
 ```
+
+**Integration binaries must run under nextest, or serially under plain Cargo:**
+
+```sh
+CARGO_BUILD_JOBS=4 cargo test --locked --test task -- --test-threads=1
+```
+
+Tests in different modules can change process-wide state such as the current directory or environment. Their
+existing module-local locks do not synchronize an entire area binary. Do not run plain integration targets with
+multiple test threads, even when selecting a subset of modules.
+
+When a fixture re-executes its test binary, pass `support::libtest_name(module_path!(), "test_name")` to
+`--exact` or `support::agent_launch_fixture::assert_subprocess_success`. The helper drops the crate component
+and preserves all module components, including nested fixture modules.
 
 ## Why nextest and a RAM disk
 
@@ -48,8 +69,9 @@ cargo test --locked --lib <module>::tests::
 Two test groups limit how many tests run at once:
 
 - **`stress`**: one at a time, for the `_stress` tests.
-- **`fork_heavy`**: four at a time, for the `supervisor`, `job_queries` and `task_turn` binaries, which fork, signal
-  and reap real process groups against deadlines.
+- **`fork_heavy`**: four at a time, for the `supervisor` and `job_queries` modules in `host` and the `task_turn`
+  module in `task`, which fork, signal and reap real process groups against deadlines. The filter is scoped to
+  those binaries so similarly named library unit tests keep their existing scheduling.
 
 ## Stress tests
 
@@ -83,7 +105,8 @@ concurrent clients, and the real 10 s supervisor TERM grace.
   The production defaults do not change.
 - **Fixture process identities with made-up pids** are built with `fixture_pid` (`FIXTURE_PID_BASE` in
   `tests/support/fixture_pid.rs` and `src/fixture_pid.rs`), so the pid cannot exist. A fake `ProcessInspector`,
-  for example `AbsentOwnerInspector` in `tests/run_command.rs` or `LiveSetInspector` in `tests/scheduler_queue.rs`,
+  for example `AbsentOwnerInspector` in `tests/scheduler/run_command.rs` or `LiveSetInspector` in
+  `tests/scheduler/scheduler_queue.rs`,
   is how a test chooses Alive, Reused, or Ambiguous. With the system inspector and a pid in the real range:
   - the result depends on whichever real process holds that pid at the moment;
   - a root-owned process reads as `Ambiguous`, which never confirms absence.
