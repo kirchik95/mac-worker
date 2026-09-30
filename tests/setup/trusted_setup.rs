@@ -148,5 +148,4 @@ fn frozen_setup_reads_original_commit_even_after_workspace_and_head_change() {
     assert_eq!(encoded["digest"].as_str().unwrap().len(), 64);
 }
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
