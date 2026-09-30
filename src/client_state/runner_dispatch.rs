@@ -83,13 +83,15 @@ impl ClientStateStore {
             return Ok(None);
         };
         let recipient = &tasks[&snapshot.entries[target_index].job_id()];
-        if self.task_project_path(recipient)?.is_none() {
-            let source_path = self.task_project_path(source_record)?.ok_or_else(|| {
-                queue_error(
-                    "TASK_PROJECT_CONTEXT_MISSING",
-                    "legacy recipient requires a saved donor project context",
-                )
-            })?;
+        if self.task_project_path_locked(recipient)?.is_none() {
+            let source_path = self
+                .task_project_path_locked(source_record)?
+                .ok_or_else(|| {
+                    queue_error(
+                        "TASK_PROJECT_CONTEXT_MISSING",
+                        "legacy recipient requires a saved donor project context",
+                    )
+                })?;
             self.write_task_project_path_locked(recipient, &source_path)?;
         }
         snapshot.entries[source_index].park()?;
@@ -136,7 +138,7 @@ impl ClientStateStore {
             return Ok(records);
         }
         for record in self.list_tasks_locked()? {
-            for turn in self.turn_ids_for_task(record.meta().task_id())? {
+            for turn in self.turn_ids_for_task_locked(record.meta().task_id())? {
                 if queued.contains(&turn) && records.insert(turn, record.clone()).is_some() {
                     return Err(queue_error(
                         "TASK_INCONSISTENT",
@@ -180,7 +182,7 @@ impl ClientStateStore {
                 "queued turn and task project identities differ",
             ));
         }
-        match self.read_turn_prompt(record.meta().task_id(), entry.job_id()) {
+        match self.read_turn_prompt_locked(record.meta().task_id(), entry.job_id()) {
             Ok(_) => Ok(true),
             Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
@@ -196,7 +198,7 @@ impl ClientStateStore {
         let Some(record) = tasks.get(&entry.job_id()) else {
             return Ok(false);
         };
-        if self.task_project_path(record)?.is_some() {
+        if self.task_project_path_locked(record)?.is_some() {
             return Ok(true);
         }
         if entry.project_id() != runner_entry.project_id()
@@ -207,7 +209,7 @@ impl ClientStateStore {
         let Some(donor) = tasks.get(&runner_entry.job_id()) else {
             return Ok(false);
         };
-        Ok(self.task_project_path(donor)?.is_some())
+        Ok(self.task_project_path_locked(donor)?.is_some())
     }
 
     #[allow(clippy::too_many_arguments)]

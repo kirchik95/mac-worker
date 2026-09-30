@@ -1125,7 +1125,19 @@ fn questions_close_conflict_after_host_effect_stays_retryable() {
         release: Mutex::new(host_release_rx),
         used: AtomicBool::new(false),
     };
-    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
+    let (mutation_entered_tx, mutation_entered_rx) = mpsc::channel();
+    let (mutation_release_tx, mutation_release_rx) = mpsc::channel();
+    let operation_state = ClientStateStore::open_with_concurrency_hook(
+        &harness.paths.state,
+        Arc::new(MutationGate {
+            point: ClientStateConcurrencyPoint::BeforeTaskMutation,
+            entered: mutation_entered_tx,
+            release: Mutex::new(mutation_release_rx),
+            used: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    let handler = TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &operation_state);
     let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
     let (writer_release_tx, writer_release_rx) = mpsc::channel();
     let writer_state = ClientStateStore::open_with_concurrency_hook(
@@ -1141,6 +1153,7 @@ fn questions_close_conflict_after_host_effect_stays_retryable() {
     let error = std::thread::scope(|scope| {
         // Disconnect parked hooks before the scope joins if an assertion panics.
         let host_release_tx = crate::support::ScopedSender(host_release_tx);
+        let mutation_release_tx = crate::support::ScopedSender(mutation_release_tx);
         let writer_release_tx = crate::support::ScopedSender(writer_release_tx);
         let operation =
             scope.spawn(|| journal.handle_with(&envelope, &handler, ControllerFault::None));
@@ -1149,13 +1162,21 @@ fn questions_close_conflict_after_host_effect_stays_retryable() {
             .unwrap();
         let current = harness.store.load_task(task_id).unwrap();
         assert!(current.close_intent().is_some());
+        host_release_tx.send(()).unwrap();
+        // Readers share StateLock now. Wait until close has completed its
+        // post-effect read before parking the competing writer, so contention
+        // proves the final CAS is blocked rather than the snapshot read.
+        mutation_entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert_eq!(host.host.status.lock().unwrap().state(), TaskState::Closed);
         let changed = current.with_status_observed_at(Some(999)).unwrap();
         let writer = scope.spawn(move || writer_state.update_task_if_current(&current, changed));
         writer_entered_rx
             .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
-        let contention = harness.store.observe_next_lock_contention();
-        host_release_tx.send(()).unwrap();
+        let contention = operation_state.observe_next_lock_contention();
+        mutation_release_tx.send(()).unwrap();
         let contended = contention.confirmed_within(crate::support::HANDSHAKE_TIMEOUT);
         writer_release_tx.send(()).unwrap();
         assert!(writer.join().unwrap().unwrap());

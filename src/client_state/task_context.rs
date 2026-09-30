@@ -115,7 +115,7 @@ impl ClientStateStore {
         match task_dir.write_private_atomic_no_replace(PROJECT_CONTEXT_FILE, &bytes) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if self.task_project_path(record)? == Some(project_path) {
+                if self.task_project_path_locked(record)? == Some(project_path) {
                     Ok(())
                 } else {
                     Err(queue_error(
@@ -128,10 +128,19 @@ impl ClientStateStore {
         }
     }
 
-    /// Reads immutable private context without taking StateLock. QueueLock
-    /// callers can use this while selecting a runner handoff. Legacy records
-    /// have no context and retain the caller's existing cwd fallback.
+    /// Reads private context under the same lock as submission rollback,
+    /// which can retire the containing turn tree. Legacy records have no
+    /// context and retain the caller's existing cwd fallback.
     pub fn task_project_path(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<Option<PathBuf>, WorkerError> {
+        let _lock = self.acquire_state_lock()?;
+        self.task_project_path_locked(record)
+    }
+
+    /// QueueLock callers already hold StateLock while selecting a handoff.
+    pub(super) fn task_project_path_locked(
         &self,
         record: &LocalTaskRecord,
     ) -> Result<Option<PathBuf>, WorkerError> {

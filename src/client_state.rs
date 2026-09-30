@@ -1186,7 +1186,7 @@ impl ClientStateStore {
         require_queue_client(&snapshot, self.inner.client_id)?;
         self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
         publish_queue_snapshot(self, &snapshot, identity)?;
-        let record = self.load_task(task_id)?;
+        let record = self.load_task_locked(task_id)?;
         self.update_task_locked_before_final_sync(
             record.with_runner(Some(RunnerIdentity::new(child)))?,
             || Ok(()),
@@ -2539,7 +2539,7 @@ impl ClientStateStore {
         let mut turn_to_task = HashMap::new();
         for task in &tasks {
             let task_id = task.meta().task_id();
-            for turn_id in self.turn_ids_for_task(task_id)? {
+            for turn_id in self.turn_ids_for_task_locked(task_id)? {
                 turn_to_task.insert(turn_id, task_id);
             }
             for turn in task.status().turns() {
@@ -2936,6 +2936,14 @@ impl ClientStateStore {
     }
 
     pub fn load_task(&self, task_id: TaskId) -> Result<LocalTaskRecord, WorkerError> {
+        // A task replacement retires the previous inode. Keep the read under
+        // the writer's existing lock so its rooted snapshot cannot go stale
+        // halfway through, and never retry through a replaced store directory.
+        let _lock = self.acquire_state_lock()?;
+        self.load_task_locked(task_id)
+    }
+
+    fn load_task_locked(&self, task_id: TaskId) -> Result<LocalTaskRecord, WorkerError> {
         let tasks = self.tasks_dir()?;
         let name = task_file_name(task_id)?;
         read_task_from_dir(&tasks, &name, task_id)
@@ -3010,7 +3018,7 @@ impl ClientStateStore {
     {
         self.reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
         let _lock = self.acquire_state_lock()?;
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_locked(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) != expected_turn {
             return Err(queue_error(
                 "TASK_STALE",
@@ -3095,7 +3103,7 @@ impl ClientStateStore {
     ) -> Result<LocalTaskRecord, WorkerError> {
         let _lock = self.acquire_state_lock()?;
         let task_id = expected.meta().task_id();
-        let current = self.load_task(task_id)?;
+        let current = self.load_task_locked(task_id)?;
         if !same_result_turn(&current, expected) {
             return Err(WorkerError::task(
                 "TASK_REVISION_CONFLICT",
@@ -3108,7 +3116,7 @@ impl ClientStateStore {
                 "discarded tasks cannot be fetched",
             ));
         }
-        let turns = self.turn_ids_for_task(task_id)?;
+        let turns = self.turn_ids_for_task_locked(task_id)?;
         let (snapshot, _) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         let entry = snapshot.entries().iter().find(|entry| {
@@ -3718,7 +3726,7 @@ impl ClientStateStore {
                     let task = self.task_optional_from_dir(&tasks, node.task_id)?;
                     let task_exists = task.is_some();
                     let has_turn = self
-                        .turn_ids_for_task(node.task_id)?
+                        .turn_ids_for_task_locked(node.task_id)?
                         .contains(&node.turn_id);
                     let submission_complete =
                         task.as_ref().is_some_and(dag_submission_complete) && has_turn;
@@ -4338,6 +4346,11 @@ impl ClientStateStore {
     /// removed as soon as the host accepts a turn, so the directory itself is
     /// the stable task-to-turn locator for both queued and accepted turns.
     pub fn turn_ids_for_task(&self, task_id: TaskId) -> Result<Vec<TurnId>, WorkerError> {
+        let _lock = self.acquire_state_lock()?;
+        self.turn_ids_for_task_locked(task_id)
+    }
+
+    fn turn_ids_for_task_locked(&self, task_id: TaskId) -> Result<Vec<TurnId>, WorkerError> {
         let turns = self.turns_dir()?;
         let task_dir =
             match turns.open_child_directory(&relative_path(&task_id.to_string())?, false) {
@@ -4620,6 +4633,8 @@ impl ClientStateStore {
         task_id: TaskId,
         turn_id: TurnId,
     ) -> Result<String, WorkerError> {
+        // Submission rollback can retire the entire turn tree under StateLock.
+        let _lock = self.acquire_state_lock()?;
         let turns = self.turns_dir()?;
         let task_dir = turns
             .open_child_directory(&relative_path(&task_id.to_string())?, false)
@@ -4656,6 +4671,15 @@ impl ClientStateStore {
     }
 
     pub fn read_turn_prompt(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<String, WorkerError> {
+        let _lock = self.acquire_state_lock()?;
+        self.read_turn_prompt_locked(task_id, turn_id)
+    }
+
+    fn read_turn_prompt_locked(
         &self,
         task_id: TaskId,
         turn_id: TurnId,

@@ -1507,7 +1507,7 @@ impl RootedDir {
         Ok(bytes)
     }
 
-    fn read_private_regular_with_hook(
+    pub(crate) fn read_private_regular_with_hook(
         &self,
         name: &str,
         maximum: u64,

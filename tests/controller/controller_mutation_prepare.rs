@@ -109,6 +109,7 @@ impl ProcessRunner for QuestionsCloseHost {
 
 struct StopQuestionsRetirement {
     state: Mutex<Option<ClientStateStore>>,
+    task_record: PathBuf,
     keep_row: bool,
     used: AtomicBool,
 }
@@ -120,7 +121,10 @@ impl ClientStateConcurrencyHook for StopQuestionsRetirement {
         }
         let guard = self.state.lock().unwrap();
         let Some(state) = guard.as_ref() else { return };
-        let record = state.load_task(task_n(0x5001)).unwrap();
+        // QueuePublication already holds StateLock. Read only this fixture's
+        // snapshot instead of recursively calling the locking public reader.
+        let record: LocalTaskRecord =
+            serde_json::from_slice(&std::fs::read(&self.task_record).unwrap()).unwrap();
         if record.runner().is_none()
             && serde_json::to_value(record).unwrap()["auto_continue_intent"].is_object()
             && !self.used.swap(true, Ordering::SeqCst)
@@ -436,6 +440,11 @@ impl Fixture {
         set_drained(&self.paths.controller_state_root(), true).unwrap();
         let hook = Arc::new(StopQuestionsRetirement {
             state: Mutex::new(None),
+            task_record: self
+                .paths
+                .state
+                .join("tasks")
+                .join(format!("{}.json", task_n(0x5001))),
             keep_row,
             used: AtomicBool::new(false),
         });

@@ -1844,7 +1844,7 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
                         state.bootstrap_active_task_index().unwrap();
                         let hook = Arc::new(QuestionsRetirementFault {
                             state: Mutex::new(None),
-                            task_id: task,
+                            task_record: paths.state.join("tasks").join(format!("{task}.json")),
                             used: AtomicBool::new(false),
                         });
                         let fault_state = ClientStateStore::open_with_concurrency_hook(
@@ -2368,7 +2368,7 @@ fn questions_auto_reconcile_completed_dead_runner_starts_one_continuation() {
 
 struct QuestionsRetirementFault {
     state: Mutex<Option<ClientStateStore>>,
-    task_id: TaskId,
+    task_record: PathBuf,
     used: AtomicBool,
 }
 
@@ -2379,7 +2379,10 @@ impl ClientStateConcurrencyHook for QuestionsRetirementFault {
         }
         let guard = self.state.lock().unwrap();
         let Some(state) = guard.as_ref() else { return };
-        let record = state.load_task(self.task_id).unwrap();
+        // QueuePublication already holds StateLock. Read only this fixture's
+        // snapshot instead of recursively calling the locking public reader.
+        let record: LocalTaskRecord =
+            serde_json::from_slice(&std::fs::read(&self.task_record).unwrap()).unwrap();
         if record.status().state() == TaskState::Open
             && record.status().last_outcome() == Some(&TaskOutcome::NeedsInput)
             && record.runner().is_none()
@@ -2399,7 +2402,11 @@ fn questions_pending_intent_fixture() -> AcceptedThenTerminalFixture {
     fixture.state.bootstrap_active_task_index().unwrap();
     let hook = Arc::new(QuestionsRetirementFault {
         state: Mutex::new(None),
-        task_id: fixture.task_id,
+        task_record: fixture
+            .paths
+            .state
+            .join("tasks")
+            .join(format!("{}.json", fixture.task_id)),
         used: AtomicBool::new(false),
     });
     let state =

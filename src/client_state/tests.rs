@@ -159,6 +159,112 @@ fn matching_cas_still_persists_a_changed_runner() {
     );
 }
 
+#[test]
+fn task_record_read_can_observe_a_peer_retiring_its_opened_inode() {
+    let (_dir, store, _) = open_store();
+    let original = sample_record();
+    let task_id = original.meta().task_id();
+    let replacement = original.clone().with_runner(None).unwrap();
+    store.create_task(original.clone()).unwrap();
+    let tasks = store.tasks_dir().unwrap();
+
+    // Replay the exact unlocked load_task read: a peer publishes a changed
+    // runner and retires the previous record after our descriptor is open.
+    let error = tasks
+        .read_private_regular_with_hook(
+            &task_file_name(task_id).unwrap(),
+            MAX_STATE_FILE_BYTES as u64,
+            || {
+                assert!(
+                    store
+                        .update_task_if_current(&original, replacement.clone())
+                        .unwrap()
+                );
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ESTALE));
+    assert_eq!(store.load_task(task_id).unwrap(), replacement);
+}
+
+#[test]
+fn task_read_waits_for_the_bound_record_writer() {
+    let (_dir, store, _) = open_store();
+    let original = sample_record();
+    let task_id = original.meta().task_id();
+    let replacement = original.clone().with_runner(None).unwrap();
+    store.create_task(original.clone()).unwrap();
+
+    std::thread::scope(|scope| {
+        let lock = store.acquire_state_lock().unwrap();
+        let contention = store.observe_next_lock_contention();
+        let reader = scope.spawn(|| store.load_task(task_id));
+        let contended = contention.confirmed_within(crate::test_support::HANDSHAKE_TIMEOUT);
+        assert!(
+            store
+                .replace_task_locked_if_current(
+                    replacement.clone(),
+                    || Ok(()),
+                    Some(&original),
+                    IdenticalTaskWrite::Skip,
+                )
+                .unwrap()
+        );
+        drop(lock);
+        let observed = reader.join().unwrap().unwrap();
+        assert!(contended, "task read must wait for record replacement");
+        assert_eq!(observed, replacement);
+    });
+}
+
+#[test]
+fn turn_reads_wait_for_submission_retirement() {
+    for operation in ["prompt", "binding", "ids", "context"] {
+        let (_dir, store, _) = open_store();
+        let record = sample_record();
+        let task_id = record.meta().task_id();
+        let turn_id = record.status().turns()[0].turn_id();
+        store.create_task(record.clone()).unwrap();
+        store
+            .write_turn_prompt(task_id, turn_id, "private prompt")
+            .unwrap();
+        store
+            .write_turn_prepared_binding(task_id, turn_id, "binding")
+            .unwrap();
+        store.write_task_project_path(&record, _dir.path()).unwrap();
+
+        std::thread::scope(|scope| {
+            let lock = store.acquire_state_lock().unwrap();
+            let contention = store.observe_next_lock_contention();
+            let reader = scope.spawn(|| match operation {
+                "prompt" => store.read_turn_prompt(task_id, turn_id).map(|_| false),
+                "binding" => store
+                    .read_turn_prepared_binding(task_id, turn_id)
+                    .map(|_| false),
+                "ids" => store.turn_ids_for_task(task_id).map(|ids| ids.is_empty()),
+                "context" => store.task_project_path(&record).map(|path| path.is_none()),
+                _ => unreachable!(),
+            });
+            let contended = contention.confirmed_within(crate::test_support::HANDSHAKE_TIMEOUT);
+            store
+                .turns_dir()
+                .unwrap()
+                .remove_owned_child(&task_id.to_string())
+                .unwrap();
+            drop(lock);
+            let observed = reader.join().unwrap();
+            assert!(contended, "{operation} read must wait for turn retirement");
+            if matches!(operation, "ids" | "context") {
+                assert!(observed.unwrap());
+            } else {
+                assert!(
+                    matches!(observed, Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound)
+                );
+            }
+        });
+    }
+}
+
 struct MutationGate {
     entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,

@@ -2828,6 +2828,8 @@ impl<'a> TaskClient<'a> {
                 current.deliveries(),
                 response.deliveries(),
             ))?;
+        self.client_state
+            .reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
         if !self.client_state.update_task_if_current(&current, closed)? {
             let after = self.client_state.load_task(task_id)?;
             if matches!(
