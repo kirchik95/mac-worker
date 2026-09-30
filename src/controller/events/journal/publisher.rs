@@ -212,6 +212,41 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    struct ManualClock(AtomicU64);
+    impl GraceClock for ManualClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.0.load(Ordering::Acquire))
+        }
+        fn sleep(&self, duration: Duration) {
+            self.0
+                .fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
+        }
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn exit_grace_is_capped_while_writer_remains_blocked() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sink, handle) = start(
+            move |_: Vec<u8>| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+            Vec::len,
+        );
+        assert_eq!(sink.try_enqueue(vec![1]), EnqueueResult::Queued);
+        entered_rx.recv().unwrap();
+        let clock = ManualClock(AtomicU64::new(0));
+        handle.finish_with_grace(Duration::from_secs(30), &clock);
+        assert_eq!(clock.now(), Duration::from_millis(50));
+        assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Stopping);
+        release_tx.send(()).unwrap();
+    }
+
     #[test]
     fn blocked_writer_does_not_block_admission_or_stop() {
         let (entered_tx, entered_rx) = mpsc::channel();
