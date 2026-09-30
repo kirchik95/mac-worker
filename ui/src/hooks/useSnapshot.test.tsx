@@ -263,7 +263,13 @@ function lifecycleEvent(seq: string) {
     seq,
     time_millis: 10,
     kind: 'turn.finished',
-    data: { task_id: TASK, outcome: 'needs_input' },
+    data: {
+      task_id: TASK,
+      turn_id: 'b'.repeat(32),
+      run_id: null,
+      outcome: 'needs_input',
+      code: null,
+    },
   })
 }
 

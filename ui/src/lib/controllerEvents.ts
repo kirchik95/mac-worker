@@ -1,66 +1,48 @@
 /**
- * Local mirror of the T1 browser contract until `controllerEvents.contract.ts`
- * is on this branch. Decimal sequences stay strings; never coerce them with Number.
+ * Browser stream client. Wire types and fixtures come from the frozen T1 contract.
+ * Decimal sequences stay strings; never coerce them with Number.
+ * Cadences match `events::contracts` (anti-entropy 15s, fallback 2s, debounce 100ms,
+ * watchdog 30s, reconnect 1/2/4/5s). An event's JSON plus its JSONL newline must
+ * fit in 1024 bytes.
  */
+
+import type { EventCursor, JournalWindow } from './controllerEvents.contract'
 
 export const FALLBACK_POLL_MS = 2_000
 export const HEALTHY_ANTI_ENTROPY_MS = 15_000
 export const INVALIDATION_DEBOUNCE_MS = 100
 export const WATCHDOG_MS = 30_000
-export const RECONNECT_BASE_MS = 1_000
-export const RECONNECT_MAX_MS = 15_000
-export const MAX_FRAME_BYTES = 1_024
+export const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 5_000] as const
+export const MAX_EVENT_BYTES = 1_024
 export const EVENTS_PATH = '/api/v1/events'
 
 const MAX_U64 = 18446744073709551615n
+const MAX_U32 = 4_294_967_295
+const NIL_JOURNAL = '00000000-0000-0000-0000-000000000000'
 const JOURNAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SEQ = /^(0|[1-9][0-9]{0,19})$/
-const KIND = /^[a-z][a-z0-9_]{0,48}(?:\.[a-z0-9_]{1,48}){0,4}$/
-const REASON = /^[a-z0-9_][a-z0-9_.-]{0,63}$/i
+const KIND = /^[a-z0-9._]{1,64}$/
+const REASON = /^[a-z0-9_]{1,64}$/
+const SIMPLE_ID = /^[0-9a-f]{32}$/
 const SSE_NAMES = ['controller.event', 'snapshot_required', 'ready', 'snapshot.ready', 'heartbeat']
-
-const LIFECYCLE_KINDS = new Set([
-  'task.created',
-  'task.changed',
-  'task.removed',
-  'turn.started',
-  'turn.finished',
-  'turn.outcome_changed',
-  'task.auto_continue_scheduled',
-  'task.closed',
-  'task.abandoned',
-  'dag.child_admitted',
+const UNAVAILABLE_CODES = new Set([
+  'CONTROLLER_EVENTS_UNAVAILABLE',
+  'CONTROLLER_EVENTS_CANCELLED',
+  'CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE',
 ])
-
-const SNAPSHOT_KINDS = new Set([
-  'queue.changed',
-  'run.changed',
-  'worker.changed',
-  'controller.drained',
-  'controller.undrained',
+const TASK_STATES = new Set(['queued', 'active', 'open', 'closed', 'abandoned', 'lost'])
+const QUEUE_STATES = new Set(['waiting', 'dispatching', 'parked'])
+const QUEUE_KINDS = new Set(['batch', 'task_turn'])
+const OUTCOMES = new Set([
+  'done',
+  'needs_input',
+  'blocked',
+  'unknown',
+  'failed',
+  'cancelled',
+  'timed_out',
+  'lost',
 ])
-
-export type EventCursor = { journal_id: string; seq: string }
-export type JournalWindow = {
-  journal_id: string
-  oldest_seq: string
-  head_seq: string
-}
-export type WireEvent = {
-  schema_version: number
-  journal_id: string
-  seq: string
-  time_millis: number
-  kind: string
-  data: Record<string, unknown>
-}
-export type SnapshotRequired = { reason: string; window: JournalWindow | null }
-export type ViewerMessage =
-  | { event: 'controller.event'; data: WireEvent }
-  | { event: 'snapshot_required'; data: SnapshotRequired }
-  | { event: 'ready'; data: JournalWindow }
-  | { event: 'snapshot.ready'; data: { revision: number } }
-  | { event: 'heartbeat'; data: Record<string, never> }
 
 export type EventClientOptions = {
   makeSource: (url: string) => EventSource
@@ -187,10 +169,7 @@ export function createControllerEvents(options: EventClientOptions): EventClient
       connect()
       return
     }
-    const delay = Math.min(
-      RECONNECT_BASE_MS * 2 ** Math.min(reconnectAttempt, 4),
-      RECONNECT_MAX_MS,
-    )
+    const delay = RECONNECT_BACKOFF_MS[Math.min(reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)]
     reconnectAttempt += 1
     reconnect = options.setTimer(() => {
       reconnect = null
@@ -255,7 +234,7 @@ export function createControllerEvents(options: EventClientOptions): EventClient
 
   const handle = (name: string, event: MessageEvent) => {
     const raw = typeof event.data === 'string' ? event.data : ''
-    if (byteLength(raw) > MAX_FRAME_BYTES) {
+    if (byteLength(raw) + 1 > MAX_EVENT_BYTES) {
       fail(false)
       return
     }
@@ -292,12 +271,12 @@ export function createControllerEvents(options: EventClientOptions): EventClient
 }
 
 function interpretFrame(name: string, raw: string, lastEventId: string): Frame {
-  if (name === 'heartbeat') {
-    if (raw === '' || raw === '{}') return { type: 'heartbeat' }
-    const parsed = parseJson(raw)
-    return isRecord(parsed) ? { type: 'heartbeat' } : { type: 'malformed' }
-  }
   const parsed = parseJson(raw)
+  if (name === 'heartbeat') {
+    return isRecord(parsed) && Object.keys(parsed).length === 0
+      ? { type: 'heartbeat' }
+      : { type: 'malformed' }
+  }
   if (!isRecord(parsed)) return { type: 'malformed' }
   if (name === 'snapshot.ready') {
     return Number.isSafeInteger(parsed.revision) && (parsed.revision as number) >= 0
@@ -307,23 +286,29 @@ function interpretFrame(name: string, raw: string, lastEventId: string): Frame {
   if (name === 'ready') {
     return parseWindow(parsed) ? { type: 'ready' } : { type: 'malformed' }
   }
-  if (name === 'snapshot_required') {
-    if (typeof parsed.reason !== 'string' || !REASON.test(parsed.reason)) return { type: 'malformed' }
-    if (parsed.window == null) return { type: 'snapshot_required' }
-    return parseWindow(parsed.window) ? { type: 'snapshot_required' } : { type: 'malformed' }
-  }
+  if (name === 'snapshot_required') return interpretRepair(parsed)
   if (name !== 'controller.event') return { type: 'malformed' }
   return interpretEvent(parsed, lastEventId)
+}
+
+function interpretRepair(parsed: Record<string, unknown>): Frame {
+  if (parsed.reason === 'unavailable' && parsed.window === null) {
+    return typeof parsed.code === 'string' && UNAVAILABLE_CODES.has(parsed.code)
+      ? { type: 'snapshot_required' }
+      : { type: 'malformed' }
+  }
+  if (typeof parsed.reason !== 'string' || !REASON.test(parsed.reason)) return { type: 'malformed' }
+  return parseWindow(parsed.window) ? { type: 'snapshot_required' } : { type: 'malformed' }
 }
 
 function interpretEvent(parsed: Record<string, unknown>, lastEventId: string): Frame {
   const schema = schemaClass(parsed.schema_version)
   if (schema === 'bad') return { type: 'malformed' }
-  if (!isJournalId(parsed.journal_id) || !isSeq(parsed.seq)) return { type: 'malformed' }
+  if (!isJournalId(parsed.journal_id) || !isPositiveSeq(parsed.seq)) return { type: 'malformed' }
   if (!isTime(parsed.time_millis)) return { type: 'malformed' }
   if (typeof parsed.kind !== 'string' || !KIND.test(parsed.kind)) return { type: 'malformed' }
   if (!isRecord(parsed.data)) return { type: 'malformed' }
-  const cursor = { journal_id: parsed.journal_id, seq: parsed.seq }
+  const cursor: EventCursor = { journal_id: parsed.journal_id, seq: parsed.seq }
   if (lastEventId !== '') {
     const advertised = parseCursorId(lastEventId)
     if (!advertised || advertised.journal_id !== cursor.journal_id || advertised.seq !== cursor.seq) {
@@ -337,32 +322,110 @@ function interpretEvent(parsed: Record<string, unknown>, lastEventId: string): F
 }
 
 function targetsForKind(kind: string, data: Record<string, unknown>): string[] | null | 'bad' {
-  if (!LIFECYCLE_KINDS.has(kind) && !SNAPSHOT_KINDS.has(kind)) return null
-  if (kind === 'run.changed') return optionalTask(data)
-  if (SNAPSHOT_KINDS.has(kind)) return []
-  return requiredTask(data)
+  switch (kind) {
+    case 'task.created':
+    case 'task.changed':
+    case 'task.removed':
+    case 'task.closed':
+    case 'task.abandoned':
+      return taskHint(data)
+    case 'turn.started':
+      return acceptedHint(data)
+    case 'turn.finished':
+    case 'turn.outcome_changed':
+      return turnHint(data)
+    case 'task.auto_continue_scheduled':
+      return continuationHint(data)
+    case 'queue.changed':
+      return queueHint(data)
+    case 'run.changed':
+      return runHint(data)
+    case 'dag.child_admitted':
+      return dagHint(data)
+    case 'worker.changed':
+      return workerHint(data)
+    case 'controller.drained':
+      return drainHint(data, true)
+    case 'controller.undrained':
+      return drainHint(data, false)
+    default:
+      return null
+  }
 }
 
-function optionalTask(data: Record<string, unknown>): string[] | 'bad' {
+function taskHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.task_id) || !isOptionalId(data.run_id) || !isOptionalId(data.turn_id)) {
+    return 'bad'
+  }
+  if (typeof data.state !== 'string' || !TASK_STATES.has(data.state) || !isOptionalCode(data.code)) {
+    return 'bad'
+  }
+  return [data.task_id]
+}
+
+function acceptedHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.task_id) || !isSimpleId(data.turn_id) || !isOptionalId(data.run_id)) return 'bad'
+  if (!isWorkerName(data.worker)) return 'bad'
+  return [data.task_id]
+}
+
+function turnHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.task_id) || !isSimpleId(data.turn_id) || !isOptionalId(data.run_id)) return 'bad'
+  if (typeof data.outcome !== 'string' || !OUTCOMES.has(data.outcome) || !isOptionalCode(data.code)) {
+    return 'bad'
+  }
+  return [data.task_id]
+}
+
+function continuationHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.task_id) || !isOptionalId(data.run_id)) return 'bad'
+  if (!isSimpleId(data.previous_turn_id) || !isSimpleId(data.next_turn_id)) return 'bad'
+  return [data.task_id]
+}
+
+function queueHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isOptionalId(data.turn_id) || !isOptionalCode(data.code)) return 'bad'
+  if (data.state != null && (typeof data.state !== 'string' || !QUEUE_STATES.has(data.state))) return 'bad'
+  if (data.kind != null && (typeof data.kind !== 'string' || !QUEUE_KINDS.has(data.kind))) return 'bad'
+  return []
+}
+
+function runHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.run_id)) return 'bad'
   if (data.task_id == null) return []
-  const id = canonicalTaskId(data.task_id)
-  return id ? [id] : 'bad'
+  return isSimpleId(data.task_id) ? [data.task_id] : 'bad'
 }
 
-function requiredTask(data: Record<string, unknown>): string[] | null | 'bad' {
-  if (data.task_id == null) return null
-  const id = canonicalTaskId(data.task_id)
-  return id ? [id] : 'bad'
+function dagHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isSimpleId(data.run_id) || !isSimpleId(data.task_id) || !isSimpleId(data.turn_id)) return 'bad'
+  return [data.task_id]
+}
+
+function workerHint(data: Record<string, unknown>): string[] | 'bad' {
+  if (!isWorkerName(data.worker) || !isTime(data.observed_at_millis) || !isOptionalCode(data.code)) {
+    return 'bad'
+  }
+  if (data.ready != null && typeof data.ready !== 'boolean') return 'bad'
+  return []
+}
+
+function drainHint(data: Record<string, unknown>, drained: boolean): string[] | 'bad' {
+  return data.drained === drained ? [] : 'bad'
 }
 
 function schemaClass(value: unknown): 'current' | 'future' | 'bad' {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 1_000) return 'bad'
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_U32) {
+    return 'bad'
+  }
   return value === 1 ? 'current' : 'future'
 }
 
 function parseWindow(value: unknown): JournalWindow | null {
   if (!isRecord(value)) return null
-  if (!isJournalId(value.journal_id) || !isSeq(value.oldest_seq) || !isSeq(value.head_seq)) return null
+  if (!isJournalId(value.journal_id) || !isPositiveSeq(value.oldest_seq) || !isSeq(value.head_seq)) {
+    return null
+  }
+  if (BigInt(value.oldest_seq) - 1n > BigInt(value.head_seq)) return null
   return {
     journal_id: value.journal_id,
     oldest_seq: value.oldest_seq,
@@ -375,26 +438,42 @@ function parseCursorId(value: string): EventCursor | null {
   if (split <= 0) return null
   const journal_id = value.slice(0, split)
   const seq = value.slice(split + 1)
-  if (!isJournalId(journal_id) || !isSeq(seq)) return null
+  if (!isJournalId(journal_id) || !isPositiveSeq(seq)) return null
   return { journal_id, seq }
 }
 
-function canonicalTaskId(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  if (/^[0-9a-f]{32}$/.test(value)) return value
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)) {
-    return value.replaceAll('-', '')
-  }
-  return null
-}
-
 function isJournalId(value: unknown): value is string {
-  return typeof value === 'string' && JOURNAL_ID.test(value)
+  return typeof value === 'string' && value !== NIL_JOURNAL && JOURNAL_ID.test(value)
 }
 
 function isSeq(value: unknown): value is string {
   if (typeof value !== 'string' || !SEQ.test(value)) return false
   return BigInt(value) <= MAX_U64
+}
+
+function isPositiveSeq(value: unknown): value is string {
+  return isSeq(value) && value !== '0'
+}
+
+function isSimpleId(value: unknown): value is string {
+  return typeof value === 'string' && SIMPLE_ID.test(value)
+}
+
+function isOptionalId(value: unknown): boolean {
+  return value == null || isSimpleId(value)
+}
+
+function isOptionalCode(value: unknown): boolean {
+  return value == null || typeof value === 'string'
+}
+
+function isWorkerName(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    byteLength(value) <= 128 &&
+    /^[A-Za-z0-9._@-]+$/.test(value)
+  )
 }
 
 function isTime(value: unknown): boolean {

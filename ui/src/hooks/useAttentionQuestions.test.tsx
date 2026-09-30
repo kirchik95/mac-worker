@@ -239,7 +239,13 @@ describe('attention questions follow task revisions', () => {
           seq: '9',
           time_millis: 10,
           kind: 'turn.finished',
-          data: { task_id: taskId, turn_id: 'b'.repeat(32), outcome: 'needs_input' },
+          data: {
+            task_id: taskId,
+            turn_id: 'b'.repeat(32),
+            run_id: null,
+            outcome: 'needs_input',
+            code: null,
+          },
         }),
         `${journal}:9`,
       )
@@ -274,7 +280,13 @@ describe('attention questions follow task revisions', () => {
           seq: '10',
           time_millis: 11,
           kind: 'turn.outcome_changed',
-          data: { task_id: taskId, outcome: 'imaginary_outcome' },
+          data: {
+            task_id: taskId,
+            turn_id: 'b'.repeat(32),
+            run_id: null,
+            outcome: 'imaginary_outcome',
+            code: null,
+          },
         }),
         `${journal}:10`,
       )

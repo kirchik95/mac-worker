@@ -1,49 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { controllerEventFixtureMessages } from './controllerEvents.contract'
+import fixtures from './controllerEvents.fixtures.json'
 import { createControllerEvents } from './controllerEvents'
 
-/**
- * Local copy of T1's controllerEvents.fixtures.json. Phase B should import
- * `controllerEventFixtureMessages` once that file is on the branch.
- */
-const FIXTURES = {
-  bootstrap: {
-    event: 'snapshot_required',
-    data: {
-      reason: 'bootstrap',
-      window: {
-        journal_id: '614dc3be-668f-4922-bd31-b1d7a0056790',
-        oldest_seq: '1',
-        head_seq: '9007199254740993',
-      },
-    },
-  },
-  event_above_2pow53: {
-    event: 'controller.event',
-    data: {
-      schema_version: 1,
-      journal_id: '614dc3be-668f-4922-bd31-b1d7a0056790',
-      seq: '9007199254740993',
-      time_millis: 1790726400000,
-      kind: 'turn.finished',
-      data: {
-        task_id: '0e7b7f915a914dbdbcc2c33338890752',
-        turn_id: '16366c4ca0aa419c8b783dcd61e68102',
-        run_id: null,
-        outcome: 'needs_input',
-        code: null,
-      },
-    },
-  },
-  'snapshot.ready': {
-    event: 'snapshot.ready',
-    data: { revision: 42 },
-  },
-  heartbeat: {
-    event: 'heartbeat',
-    data: {},
-  },
-} as const
+const FIXTURES = controllerEventFixtureMessages
 
 const JOURNAL = '614dc3be-668f-4922-bd31-b1d7a0056790'
 const TASK = '0e7b7f915a914dbdbcc2c33338890752'
@@ -212,7 +173,7 @@ describe('controller events client', () => {
 
     h.emit(
       'controller.event',
-      eventFrame('5', 'turn.finished', { task_id: TASK, outcome: 'needs_input' }, 2),
+      eventFrame('5', 'turn.finished', { task_id: TASK, outcome: 'needs_input' }, 1001),
       `${JOURNAL}:5`,
     )
     h.advance(100)
@@ -229,13 +190,39 @@ describe('controller events client', () => {
     h.client.start()
     h.emit(
       'controller.event',
-      eventFrame('6', 'turn.finished', { task_id: TASK, outcome: 'imaginary_outcome' }),
+      eventFrame('6', 'turn.finished', {
+        task_id: TASK,
+        turn_id: 'b'.repeat(32),
+        run_id: null,
+        outcome: 'imaginary_outcome',
+        code: null,
+      }),
       `${JOURNAL}:6`,
     )
-    h.advance(100)
-    expect(h.invalidations()).toEqual([[TASK]])
+    expect(h.closedSources()).toBeGreaterThan(0)
     expect(JSON.stringify(h.invalidations())).not.toContain('imaginary_outcome')
+    expect(JSON.stringify(h.invalidations())).not.toContain(TASK)
     expect(saved.last_outcome.kind).toBe('done')
+    h.advance(1_000)
+    expect(h.lastReconnectUrl()).not.toContain(':6')
+  })
+
+  it('reconnects on the frozen 1s, 2s, 4s, then 5s schedule', () => {
+    const h = makeEventHarness()
+    h.client.start()
+    for (const delay of [1_000, 2_000, 4_000, 5_000, 5_000]) {
+      const opened = h.sourceCount()
+      h.error()
+      h.advance(delay - 1)
+      expect(h.sourceCount()).toBe(opened)
+      h.advance(1)
+      expect(h.sourceCount()).toBe(opened + 1)
+    }
+    expect(controllerEventFixtureMessages.event_above_2pow53).toEqual({
+      event: fixtures.event_above_2pow53.event,
+      data: fixtures.event_above_2pow53.data,
+    })
+    expect(fixtures.event_above_2pow53.data.seq).toBe('9007199254740993')
   })
 
   it('malformed_payload_closes_source', () => {

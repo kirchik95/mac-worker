@@ -835,7 +835,13 @@ describe('task detail follows invalidation', () => {
         seq,
         time_millis: 12,
         kind: 'turn.finished',
-        data: { task_id: taskId, outcome },
+        data: {
+          task_id: taskId,
+          turn_id: 'b'.repeat(32),
+          run_id: null,
+          outcome,
+          code: null,
+        },
       }),
       id: `${journal}:${seq}`,
     }
