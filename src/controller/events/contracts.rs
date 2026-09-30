@@ -65,6 +65,7 @@ pub const MAX_RECONCILIATION_ROWS: usize = 256;
 pub const NOTIFY_COALESCE_AFTER: Duration = Duration::from_secs(60);
 pub const NOTIFY_COALESCE_COUNT: usize = 5;
 pub const NOTICE_CHANNEL_BUDGET: Duration = Duration::from_secs(2);
+pub const MAX_NOTIFY_STATE_BYTES: usize = MAX_FRAME_BYTES;
 pub const CONTROLLER_EVENTS_INVALID: &str = "CONTROLLER_EVENTS_INVALID";
 pub const CONTROLLER_EVENTS_UNAVAILABLE: &str = "CONTROLLER_EVENTS_UNAVAILABLE";
 pub const CONTROLLER_EVENTS_UNSUPPORTED: &str = "CONTROLLER_EVENTS_UNSUPPORTED";
@@ -140,7 +141,6 @@ impl<'de> Deserialize<'de> for Seq {
 /// Journal UUID and publication position. Ordering across different UUIDs
 /// is deterministic for containers only; it never establishes causality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EventCursor {
     #[serde(with = "uuid_wire")]
     pub journal_id: uuid::Uuid,
@@ -175,7 +175,8 @@ impl EventSelector {
         if let Self::Tasks(query) = self {
             query.validate()?;
         }
-        Ok(serde_json::json!({"controller_events": self}))
+        let selector = serde_json::to_value(self).map_err(|_| invalid("selector encoding failed"))?;
+        Ok(serde_json::json!({"controller_events": selector}))
     }
 
     /// Strict request grammar; a selector cannot be combined with old filters.
@@ -185,6 +186,14 @@ impl EventSelector {
             .ok_or_else(|| invalid("selector body is not an object"))?;
         if object.len() != 1 {
             return Err(invalid("selector cannot be combined with filters"));
+        }
+        if let Some(selector) = object.get("controller_events").and_then(serde_json::Value::as_object) {
+            for key in ["after", "baseline_after"] {
+                if let Some(cursor) = selector.get(key).and_then(serde_json::Value::as_object)
+                    && (cursor.len() != 2 || !cursor.contains_key("journal_id") || !cursor.contains_key("seq")) {
+                    return Err(invalid("invalid request cursor keys"));
+                }
+            }
         }
         let selector: Self = serde_json::from_value(
             object
@@ -326,7 +335,7 @@ impl Default for TaskRepairQuery {
 }
 
 /// Committed manifest window. Empty journals have oldest=1 and head=0.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JournalWindow {
     #[serde(with = "uuid_wire")]
     pub journal_id: uuid::Uuid,
@@ -351,7 +360,7 @@ impl JournalWindow {
     }
 }
 /// Tolerant envelope. Unknown schema/kinds only invalidate globally.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WireEvent {
     pub schema_version: u32,
     #[serde(with = "uuid_wire")]
@@ -474,7 +483,7 @@ pub fn ensure_frame_bound<T: Serialize>(reply: &T) -> Result<(), WorkerError> {
     }
     Ok(())
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadBatch {
     pub schema_version: u32,
     #[serde(with = "uuid_wire")]
@@ -485,7 +494,7 @@ pub struct ReadBatch {
     pub events: Vec<WireEvent>,
     pub has_more: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SnapshotRequired {
     pub reason: String,
     pub window: JournalWindow,
@@ -1057,14 +1066,14 @@ impl TaskFacts {
         (Some(false), Some(false))
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskFactsBatch {
     pub rows: Vec<TaskFacts>,
     pub missing: Vec<TaskId>,
     pub proof_after: Option<OpaqueCursor>,
     pub baseline_after: Option<EventCursor>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskRepairPage {
     pub rows: Vec<TaskFacts>,
     pub next: Option<OpaqueCursor>,
@@ -1235,6 +1244,12 @@ pub trait ViewerEventSource: Send + Sync {
     ) -> Result<tokio::sync::mpsc::Receiver<ViewerMessage>, WorkerError>;
     fn stop(&self);
 }
+impl Serialize for ViewerMessage {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let data = self.data_value().map_err(serde::ser::Error::custom)?;
+        serde_json::json!({"event": self.event_name(), "data": data}).serialize(s)
+    }
+}
 pub trait LocalProjectionRefresh: Send + Sync {
     fn request_refresh(&self);
     fn subscribe_publications(&self) -> tokio::sync::broadcast::Receiver<u64>;
@@ -1274,7 +1289,7 @@ pub struct PendingCandidate {
     pub turn_id: Option<TurnId>,
 }
 /// Transport-only cache; complete projections, titles and prose are excluded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NotifyState {
     pub schema_version: u32,
     pub consumed_after: Option<EventCursor>,
@@ -1315,6 +1330,7 @@ impl<'de> Deserialize<'de> for TaskFacts {
 impl TryFrom<TaskFactsWire> for TaskFacts {
     type Error = WorkerError;
     fn try_from(wire: TaskFactsWire) -> Result<Self, Self::Error> {
+        if serde_json::to_vec(&wire).map_err(|_| invalid("fact encoding failed"))?.len() > MAX_TASK_FACT_BYTES { return Err(invalid("wire facts exceed their byte bound")); }
         let outcome = wire.outcome.as_ref().and_then(|value| {
             serde_json::from_value::<SafeOutcome>(serde_json::Value::String(value.clone())).ok()
         });
@@ -1345,9 +1361,100 @@ impl TryFrom<TaskFactsWire> for TaskFacts {
     }
 }
 
+impl ReadBatch {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        JournalWindow { journal_id: self.journal_id, oldest_seq: self.oldest_seq, head_seq: self.head_seq }.validate()?;
+        if self.schema_version == 0 || self.events.len() > READ_MAX_LIMIT || self.next_after.journal_id != self.journal_id || self.next_after.seq > self.head_seq
+            || self.next_after.seq.as_u64() < self.oldest_seq.as_u64().saturating_sub(1) { return Err(invalid("invalid read batch cursor/bounds")); }
+        let mut previous: Option<Seq> = None;
+        for event in &self.events {
+            event.validate()?;
+            if event.journal_id != self.journal_id || event.seq < self.oldest_seq || event.seq > self.head_seq || previous.is_some_and(|seq| seq.checked_increment() != Some(event.seq)) { return Err(invalid("invalid committed event order")); }
+            previous = Some(event.seq);
+        }
+        if previous.is_some_and(|seq| seq != self.next_after.seq) || self.has_more != (self.next_after.seq < self.head_seq) || (self.events.is_empty() && self.has_more) { return Err(invalid("next_after is not last delivered")); }
+        Ok(())
+    }
+}
+fn stable_reason(value: &str) -> bool { !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') }
+impl SnapshotRequired {
+    pub fn validate(&self) -> Result<(), WorkerError> { if !stable_reason(&self.reason) { return Err(invalid("invalid repair reason")); } self.window.validate() }
+}
+impl EventReadResult { pub fn validate(&self) -> Result<(), WorkerError> { match self { Self::Batch(batch) => batch.validate(), Self::SnapshotRequired(control) => control.validate() } } }
+fn distinct_ids(ids: impl IntoIterator<Item = TaskId>) -> bool {
+    let mut seen = std::collections::BTreeSet::new(); ids.into_iter().all(|id| seen.insert(id))
+}
+impl TaskFactsBatch {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.rows.len() + self.missing.len() > ADDRESSED_MAX_TASKS || !distinct_ids(self.rows.iter().map(|row| row.task_id).chain(self.missing.iter().copied())) { return Err(invalid("invalid addressed reply IDs/count")); }
+        for row in &self.rows { row.validate()?; } Ok(())
+    }
+}
+impl TaskRepairPage {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.rows.len() > REPAIR_MAX_LIMIT || !distinct_ids(self.rows.iter().map(|row| row.task_id)) || (self.complete && (self.next.is_some() || self.restart)) || (!self.complete && !self.restart && self.next.is_none()) { return Err(invalid("invalid repair page bounds/continuation")); }
+        for row in &self.rows { row.validate()?; if row.title.is_some() { return Err(invalid("repair contains display titles")); } } Ok(())
+    }
+}
+fn digest_text(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+impl NotifyState {
+    /// Decision/overflow fingerprints are lowercase SHA-256 hex, preventing
+    /// free text in persisted dedup. Complete projections remain in memory.
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.schema_version != SCHEMA_VERSION || self.decisions.len() > NOTIFY_DECISION_CAPACITY || self.pending.len() > NOTIFY_PENDING_CAPACITY
+            || self.decisions.iter().any(|v| !digest_text(v)) || self.attention_overflow.as_deref().is_some_and(|v| !digest_text(v))
+            || !distinct_ids(self.pending.iter().map(|v| v.task_id)) { return Err(invalid("invalid notifier cache bounds/fingerprints")); }
+        if serde_json::to_vec(self).map_err(|_| invalid("cache encoding failed"))?.len() > MAX_NOTIFY_STATE_BYTES { return Err(invalid("notifier cache exceeds byte bound")); } Ok(())
+    }
+}
+impl Reconciliation {
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.changes.len() > MAX_RECONCILIATION_ROWS || self.confirmed.len() > MAX_RECONCILIATION_ROWS || self.pending_ids.len() > NOTIFY_PENDING_CAPACITY || !distinct_ids(self.pending_ids.iter().copied()) { return Err(invalid("reconciliation chunk exceeds bound")); }
+        for facts in &self.confirmed { facts.validate()?; }
+        for change in &self.changes {
+            if self.baseline == BaselineKind::Cold && change.cause == ChangeCause::RepairDifference { return Err(invalid("cold repair cannot invent historical changes")); }
+            if change.previous.is_none() && change.current.is_none() { return Err(invalid("derived change has no facts")); }
+            for facts in [&change.previous, &change.current].into_iter().flatten() { facts.validate()?; if facts.task_id != change.task_id { return Err(invalid("derived change task identity mismatch")); } }
+        }
+        if self.attention.as_ref().is_some_and(|v| !digest_text(&v.fingerprint)) { return Err(invalid("invalid attention fingerprint")); } Ok(())
+    }
+}
+impl ViewerMessage {
+    /// SSE data only; Serialize additionally wraps the frozen event name.
+    pub fn data_value(&self) -> Result<serde_json::Value, WorkerError> {
+        match self {
+            Self::ControllerEvent(event) => { event.validate()?; serde_json::to_value(event) }
+            Self::SnapshotRequired(control) => { control.validate()?; serde_json::to_value(control) }
+            Self::Ready(window) => { window.validate()?; serde_json::to_value(window) }
+            Self::SnapshotReady { revision } => Ok(serde_json::json!({"revision": revision})), Self::Heartbeat => Ok(serde_json::json!({})),
+            Self::Unavailable { code } => { let safe = match code.as_str() { CONTROLLER_EVENTS_UNAVAILABLE | CONTROLLER_EVENTS_CANCELLED | CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE => code.as_str(), _ => CONTROLLER_EVENTS_UNAVAILABLE }; Ok(serde_json::json!({"reason":"unavailable","code":safe,"window":null})) }
+        }.map_err(|_| invalid("SSE data encoding failed"))
+    }
+}
+// Reply structs tolerate additive fields while checking required identity and bounds.
+macro_rules! validated_deserialize {
+    ($name:ident, $raw:ident, { $($(#[$attr:meta])* $field:ident: $type:ty),* $(,)? }) => {
+        #[derive(Deserialize)] struct $raw { $($(#[$attr])* $field: $type),* }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = $raw::deserialize(d)?; let result = Self { $($field: raw.$field),* };
+                result.validate().map_err(de::Error::custom)?; Ok(result)
+            }
+        }
+    };
+}
+validated_deserialize!(JournalWindow, RawWindow, { #[serde(with = "uuid_wire")] journal_id: uuid::Uuid, oldest_seq: Seq, head_seq: Seq });
+validated_deserialize!(WireEvent, RawEvent, { schema_version: u32, #[serde(with = "uuid_wire")] journal_id: uuid::Uuid, seq: Seq, time_millis: u64, kind: String, data: serde_json::Value });
+validated_deserialize!(ReadBatch, RawBatch, { schema_version: u32, #[serde(with = "uuid_wire")] journal_id: uuid::Uuid, oldest_seq: Seq, head_seq: Seq, next_after: EventCursor, events: Vec<WireEvent>, has_more: bool });
+validated_deserialize!(SnapshotRequired, RawSnapshot, { reason: String, window: JournalWindow });
+validated_deserialize!(TaskFactsBatch, RawFactsBatch, { rows: Vec<TaskFacts>, missing: Vec<TaskId>, proof_after: Option<OpaqueCursor>, baseline_after: Option<EventCursor> });
+validated_deserialize!(TaskRepairPage, RawRepairPage, { rows: Vec<TaskFacts>, next: Option<OpaqueCursor>, complete: bool, restart: bool, baseline_after: Option<EventCursor> });
+validated_deserialize!(NotifyState, RawNotifyState, { schema_version: u32, consumed_after: Option<EventCursor>, last_complete_repair_millis: Option<u64>, decisions: Vec<String>, pending: Vec<PendingCandidate>, attention_overflow: Option<String>, repair_needed: bool });
+
 mod uuid_wire {
     use super::*;
     pub fn serialize<S: Serializer>(id: &uuid::Uuid, s: S) -> Result<S::Ok, S::Error> {
+        if id.is_nil() { return Err(serde::ser::Error::custom("nil journal UUID")); }
         s.serialize_str(&id.to_string())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<uuid::Uuid, D::Error> {

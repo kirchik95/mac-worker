@@ -1,0 +1,38 @@
+{
+  "bootstrap": {
+    "event": "snapshot_required",
+    "data": {
+      "reason": "bootstrap",
+      "window": {
+        "journal_id": "614dc3be-668f-4922-bd31-b1d7a0056790",
+        "oldest_seq": "1",
+        "head_seq": "9007199254740993"
+      }
+    }
+  },
+  "event_above_2pow53": {
+    "event": "controller.event",
+    "data": {
+      "schema_version": 1,
+      "journal_id": "614dc3be-668f-4922-bd31-b1d7a0056790",
+      "seq": "9007199254740993",
+      "time_millis": 1790726400000,
+      "kind": "turn.finished",
+      "data": {
+        "task_id": "0e7b7f915a914dbdbcc2c33338890752",
+        "turn_id": "16366c4ca0aa419c8b783dcd61e68102",
+        "run_id": null,
+        "outcome": "needs_input",
+        "code": null
+      }
+    }
+  },
+  "snapshot.ready": {
+    "event": "snapshot.ready",
+    "data": { "revision": 42 }
+  },
+  "heartbeat": {
+    "event": "heartbeat",
+    "data": {}
+  }
+}
