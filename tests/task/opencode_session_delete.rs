@@ -8,7 +8,7 @@
 //! The OpenCode commands are scripted. No OpenCode runs.
 
 #[allow(dead_code)]
-mod support;
+use crate::support;
 
 use std::{
     fs, os::unix::process::ExitStatusExt, path::Path, process::ExitStatus, sync::Mutex,

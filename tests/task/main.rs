@@ -8,6 +8,7 @@ mod task_state_fixture;
 mod v7;
 
 mod follow_turn;
+mod opencode_session_delete;
 mod prepared_followup;
 mod prepared_followup_completion;
 mod project_config;

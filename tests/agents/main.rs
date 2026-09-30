@@ -15,4 +15,6 @@ mod agent_settings_catalog;
 mod agent_settings_profile;
 mod keychain;
 mod launch_identity;
+mod opencode_facts;
+mod opencode_launch_guard;
 mod result_parse_reasons;
