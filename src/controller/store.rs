@@ -464,23 +464,35 @@ impl ControllerStore {
         fault: ControllerFault,
     ) -> Result<ControllerAck, WorkerError> {
         let _per_request = self.lock_request(request.request_id())?;
-        if let Some(existing) = self.load(request.request_id())? {
+        let result = if let Some(existing) = self.load(request.request_id())? {
             check_replay(&existing, request)?;
-            return self.drive_to_ack(existing, executor, fault, 0);
-        }
-        // Discoverability BEFORE publication: a crash from here on leaves a
-        // pending receipt that bootstrap keeps and the next `handle` heals.
-        self.ensure_pending_receipt(request)?;
-        if fault == ControllerFault::StopAfterActiveReceiptBeforePublish {
-            return Err(store_io(injected_fault()));
-        }
-        // Stable identity/time frozen BEFORE any executor effect.
-        let meta = executor.prepare(request)?;
-        let record = self.publish_with(request, &meta)?;
-        if fault == ControllerFault::StopAfterPublish {
-            return Ok(ack_from(&record));
-        }
-        self.drive_to_ack(record, executor, fault, 0)
+            self.drive_to_ack(existing, executor, fault, 0)
+        } else {
+            // Discoverability BEFORE publication: a crash from here on leaves a
+            // pending receipt that bootstrap keeps and the next `handle` heals.
+            self.ensure_pending_receipt(request)?;
+            if fault == ControllerFault::StopAfterActiveReceiptBeforePublish {
+                return Err(store_io(injected_fault()));
+            }
+            // Stable identity/time frozen BEFORE any executor effect.
+            let meta = executor.prepare(request)?;
+            let record = self.publish_with(request, &meta)?;
+            if fault == ControllerFault::StopAfterPublish {
+                return Ok(ack_from(&record));
+            }
+            self.drive_to_ack(record, executor, fault, 0)
+        };
+        result.map_err(|error| {
+            // Inspect the durable outcome while still holding the request lock.
+            // Preparation and replay-identity failures return before this point.
+            if self.load(request.request_id()).is_ok_and(|row| {
+                row.is_some_and(|row| row.phase == RequestPhase::Published && row.result.is_none())
+            }) {
+                WorkerError::ControllerResumable(Box::new(error))
+            } else {
+                error
+            }
+        })
     }
 
     /// Bounded idle tick over the pending index ONLY: enumerates the
@@ -1482,8 +1494,166 @@ pub fn serve_rpc(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_stored_size;
+    use super::*;
     use crate::controller::protocol::MAX_STORED_REQUEST_BYTES;
+    use serde_json::json;
+
+    struct FailingHandler {
+        prepare_fails: bool,
+        terminal: bool,
+    }
+
+    impl ControllerCommandHandler for FailingHandler {
+        fn prepare(&self, _: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
+            if self.prepare_fails {
+                return Err(WorkerError::task("TASK_NOT_FOUND", "task was not found"));
+            }
+            Ok(OperationMeta {
+                task_id: None,
+                turn_id: None,
+                created_at_millis: 1,
+                prepared: Value::Null,
+            })
+        }
+
+        fn execute(&self, _: &DurableRequest) -> Result<Value, WorkerError> {
+            if self.terminal {
+                Err(WorkerError::capacity_public(
+                    "CAPACITY_BUSY",
+                    "all slots occupied".into(),
+                ))
+            } else {
+                Err(io::Error::other("PRIVATE executor failure").into())
+            }
+        }
+    }
+
+    fn submit_request(body: Value) -> ControllerRequest {
+        crate::controller::parse_request(
+            &serde_json::to_vec(&json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": "018f0f4a6b5c7d8e9f00112233445566",
+                "command": "task.submit",
+                "body": body,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resumable_errors_are_flagged_on_the_wire_and_legacy_laptops_ignore_the_flag() {
+        // Wire shapes copied from the 772e83e HostControlError decoders:
+        // the outer object is strict; its error detail accepts unknown fields.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyError {
+            protocol_version: u32,
+            error: LegacyDetail,
+        }
+        #[derive(Deserialize)]
+        struct LegacyDetail {
+            code: String,
+            message: String,
+            #[serde(default)]
+            category: Option<String>,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let request = submit_request(json!({}));
+        let handler = FailingHandler {
+            prepare_fails: false,
+            terminal: false,
+        };
+        for _ in 0..2 {
+            let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+            let error = store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 74);
+            assert_eq!(error.public_code(), "IO");
+            assert_eq!(error.public_message(), "I/O error");
+            let row = store.load(request.request_id()).unwrap().unwrap();
+            assert_eq!(row.phase(), RequestPhase::Published);
+            assert!(row.result().is_none());
+            let frame =
+                crate::controller::encode_json_frame(&crate::versioned_host_error(&error)).unwrap();
+            let bytes = crate::controller::decode_frame(&frame).unwrap();
+            let value: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(value["error"]["resumable"], true);
+            assert!(!String::from_utf8_lossy(bytes).contains("PRIVATE"));
+            let legacy: LegacyError = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(legacy.protocol_version, 7);
+            assert_eq!(legacy.error.code, "HOST_IO");
+            assert_eq!(legacy.error.message, "host state operation failed");
+            assert_eq!(legacy.error.category, None);
+            let current: crate::job::HostControlError = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(current).unwrap()["error"]["resumable"],
+                true
+            );
+        }
+        let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+        let report = store
+            .resume_active_bounded(&FakeControllerExecutor, &ActiveResumeConfig::default())
+            .unwrap();
+        assert_eq!(report.completed.len(), 1);
+        assert!(report.failed.is_empty());
+        let replay = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .unwrap();
+        assert_eq!(replay, report.completed[0]);
+        assert_eq!(store.request_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn prepare_failures_saved_rejections_and_payload_conflicts_are_not_resumable() {
+        for (prepare_fails, terminal, code) in [
+            (true, false, "TASK_NOT_FOUND"),
+            (false, true, "CAPACITY_BUSY"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+            let request = submit_request(json!({}));
+            let handler = FailingHandler {
+                prepare_fails,
+                terminal,
+            };
+            for _ in 0..2 {
+                let error = store
+                    .handle_with(&request, &handler, ControllerFault::None)
+                    .unwrap_err();
+                let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+                assert_eq!(wire["error"]["code"], code);
+                assert!(wire["error"].get("resumable").is_none());
+            }
+            let row = store.load(request.request_id()).unwrap();
+            if prepare_fails {
+                assert!(row.is_none());
+            } else {
+                assert_eq!(row.unwrap().phase(), RequestPhase::Acked);
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+        let handler = FailingHandler {
+            prepare_fails: false,
+            terminal: false,
+        };
+        store
+            .handle_with(&submit_request(json!({})), &handler, ControllerFault::None)
+            .unwrap_err();
+        let error = store
+            .handle_with(
+                &submit_request(json!({"changed": true})),
+                &handler,
+                ControllerFault::None,
+            )
+            .unwrap_err();
+        let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+        assert_eq!(wire["error"]["code"], "CONTROLLER_REQUEST_CONFLICT");
+        assert!(wire["error"].get("resumable").is_none());
+    }
 
     #[test]
     fn oversized_encoded_records_are_rejected_before_publication() {

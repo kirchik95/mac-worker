@@ -625,6 +625,9 @@ fn classify_mutation_exchange(
         Err(_) => return MutationOutcome::Ambiguous(invalid_controller_reply()),
     };
     if let Ok(error) = serde_json::from_slice::<HostControlError>(reply) {
+        if error.error().resumable() {
+            return MutationOutcome::Ambiguous(host_control_to_worker(&error));
+        }
         return MutationOutcome::Rejected(host_control_to_worker(&error));
     }
     let ack: ControllerAck = match serde_json::from_slice(reply) {
@@ -1945,6 +1948,10 @@ mod mutation_retry_tests {
         let mut wrong = good.clone();
         wrong["request_id"] = json!("018f0f4a6b5c7d8e9f00112233445599");
         let rejection = HostControlError::new("CONTROLLER_UNAVAILABLE", "typed rejection").unwrap();
+        let mut resumable = serde_json::to_value(&rejection).unwrap();
+        resumable["error"]["resumable"] = json!(true);
+        let mut definitive = resumable.clone();
+        definitive["error"]["resumable"] = json!(false);
         for (name, result, expected) in [
             ("ack", output(encode_json_frame(&good).unwrap(), 0), "ack"),
             (
@@ -1958,6 +1965,16 @@ mod mutation_retry_tests {
                 "rejected",
             ),
             ("empty", missing(), "ambiguous"),
+            (
+                "resumable typed error",
+                output(encode_json_frame(&resumable).unwrap(), 69),
+                "ambiguous",
+            ),
+            (
+                "explicit definitive error",
+                output(encode_json_frame(&definitive).unwrap(), 69),
+                "rejected",
+            ),
             ("truncated", output(vec![0, 0, 0, 5, b'{'], 0), "ambiguous"),
             (
                 "invalid json",
@@ -2158,6 +2175,76 @@ mod mutation_retry_tests {
         assert_eq!(error.exit_code(), 75);
         assert_eq!(runner.replies.frames.lock().unwrap().len(), 1);
         assert!(!String::from_utf8(stderr).unwrap().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn resumable_errors_retry_the_same_frame_until_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let frame = encode_json_frame(&json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {"code": "HOST_IO", "message": "PRIVATE detail", "resumable": true}
+        }))
+        .unwrap();
+        let runner = Replies::new(vec![
+            output(frame.clone(), 74),
+            output(frame, 74),
+            output(encode_json_frame(&ack(&request())).unwrap(), 0),
+        ]);
+        let cache = temp.path().join("cache");
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        let result = send(&runner, &cache, &mut stderr, &mut delays).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), ack(&request()));
+        let frames = runner.frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(frames.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(delays.len(), 2);
+        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("PRIVATE"));
+        assert_eq!(
+            load_operation_envelope(&cache, request().request_id())
+                .unwrap()
+                .unwrap()
+                .outcome(),
+            Some(&OperationOutcome::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn exhausted_resumable_errors_leave_the_envelope_pending_with_a_recovery_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let frame = encode_json_frame(&json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {"code": "HOST_IO", "message": "PRIVATE detail", "resumable": true}
+        }))
+        .unwrap();
+        let runner = Replies::new((0..4).map(|_| output(frame.clone(), 74)).collect());
+        let cache = temp.path().join("cache");
+        let (mut stderr, mut delays) = (Vec::new(), Vec::new());
+        assert_eq!(
+            send(&runner, &cache, &mut stderr, &mut delays)
+                .unwrap_err()
+                .public_code(),
+            "HOST_IO"
+        );
+        let frames = runner.frames.lock().unwrap();
+        assert_eq!(frames.len(), 4);
+        assert!(frames.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(delays.len(), 3);
+        for (delay, seconds) in delays.iter().zip([1., 3., 9.]) {
+            assert!((seconds * 0.75..=seconds * 1.25).contains(&delay.as_secs_f64()));
+        }
+        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.contains(&format!("controller request {} outcome is unknown; check `worker task list` or run `worker controller retry {}`", request().request_id(), request().request_id())));
+        assert!(!text.contains("PRIVATE"));
+        assert!(
+            load_operation_envelope(&cache, request().request_id())
+                .unwrap()
+                .unwrap()
+                .outcome()
+                .is_none()
+        );
     }
 
     #[test]

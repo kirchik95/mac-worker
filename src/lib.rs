@@ -4179,6 +4179,9 @@ where
 }
 
 fn versioned_host_error(error: &WorkerError) -> HostControlError {
+    if let WorkerError::ControllerResumable(error) = error {
+        return versioned_host_error(error).with_resumable();
+    }
     if let WorkerError::Protocol(message) = error
         && let Some((code, detail)) = message.split_once(": ")
         && crate::error::is_stable_public_code(code)
@@ -4187,8 +4190,8 @@ fn versioned_host_error(error: &WorkerError) -> HostControlError {
         return encoded;
     }
     let (code, message) = host_error_parts(error);
-    // Older laptops reject unknown detail fields. Keep host emission on the
-    // original wire shape; current laptops classify known codes locally.
+    // Keep ordinary errors on the original wire shape. The controller-only
+    // resumable detail above is additive; older laptops ignore unknown details.
     HostControlError::new(code, message).expect("fixed host error is valid")
 }
 

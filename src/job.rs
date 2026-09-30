@@ -5362,6 +5362,8 @@ pub struct HostControlErrorDetail {
     /// Optional category from a future helper. The laptop's catalog takes
     /// precedence; current helpers omit this field for older laptops.
     category: Option<String>,
+    /// A published controller request that may still complete on the leader.
+    resumable: bool,
 }
 
 impl HostControlErrorDetail {
@@ -5386,6 +5388,7 @@ impl HostControlErrorDetail {
             code: code.into(),
             message: message.into(),
             category,
+            resumable: false,
         };
         detail.validate()?;
         Ok(detail)
@@ -5411,17 +5414,24 @@ impl HostControlErrorDetail {
     pub fn category(&self) -> Option<&str> {
         self.category.as_deref()
     }
+
+    pub fn resumable(&self) -> bool {
+        self.resumable
+    }
 }
 
 impl Serialize for HostControlErrorDetail {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
-        let fields = 2 + usize::from(self.category.is_some());
+        let fields = 2 + usize::from(self.category.is_some()) + usize::from(self.resumable);
         let mut record = serializer.serialize_struct("HostControlErrorDetail", fields)?;
         record.serialize_field("code", &self.code)?;
         record.serialize_field("message", &self.message)?;
         if let Some(category) = &self.category {
             record.serialize_field("category", category)?;
+        }
+        if self.resumable {
+            record.serialize_field("resumable", &true)?;
         }
         record.end()
     }
@@ -5435,9 +5445,14 @@ impl<'de> Deserialize<'de> for HostControlErrorDetail {
             message: String,
             #[serde(default)]
             category: Option<String>,
+            #[serde(default)]
+            resumable: bool,
         }
         let wire = Wire::deserialize(deserializer)?;
-        Self::from_parts(wire.code, wire.message, wire.category).map_err(de::Error::custom)
+        let mut detail =
+            Self::from_parts(wire.code, wire.message, wire.category).map_err(de::Error::custom)?;
+        detail.resumable = wire.resumable;
+        Ok(detail)
     }
 }
 
@@ -5448,6 +5463,11 @@ pub struct HostControlError {
 }
 
 impl HostControlError {
+    pub(crate) fn with_resumable(mut self) -> Self {
+        self.error.resumable = true;
+        self
+    }
+
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, WorkerError> {
         Self::from_detail(HostControlErrorDetail::new(code, message)?)
     }
@@ -6127,6 +6147,7 @@ mod tests {
                 code: "HOST_REQUEST_FAILED".into(),
                 message: message.into(),
                 category: None,
+                resumable: false,
             };
             assert!(
                 serde_json::to_string(&invalid_detail).is_err(),

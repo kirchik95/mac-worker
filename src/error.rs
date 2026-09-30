@@ -72,6 +72,10 @@ pub enum WorkerError {
     /// Remote message text is deliberately not retained or displayed.
     #[error("host error [{code}]")]
     HostControl { code: String, category: ExitKind },
+    /// The controller published this request but has not saved its result.
+    /// Preserve the underlying error while carrying this fact to the RPC frame.
+    #[error("{0}")]
+    ControllerResumable(#[source] Box<WorkerError>),
     #[error("project error [{code}]: {message}")]
     Project { code: &'static str, message: String },
     #[error("snapshot error [{code}]: {message}")]
@@ -123,6 +127,7 @@ impl From<crate::agent::AdapterError> for WorkerError {
 impl WorkerError {
     pub fn exit_kind(&self) -> ExitKind {
         match self {
+            Self::ControllerResumable(error) => error.exit_kind(),
             Self::Config(_) => ExitKind::Usage,
             Self::Project { .. } => ExitKind::Usage,
             Self::Unavailable(message) if coded_prefix(message) == Some("HOST_LAYOUT_OUTDATED") => {
@@ -145,6 +150,7 @@ impl WorkerError {
 
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::ControllerResumable(error) => error.exit_code(),
             Self::CommandExit { code } => *code,
             Self::Agent {
                 code: "AGENT_LIMIT_REACHED",
@@ -156,6 +162,7 @@ impl WorkerError {
 
     pub fn public_code(&self) -> String {
         match self {
+            Self::ControllerResumable(error) => error.public_code(),
             Self::Project { code, .. } => stable_public_code(code, "PROJECT"),
             Self::Snapshot { code, .. } => stable_public_code(code, "SNAPSHOT"),
             Self::Capacity { code, .. } => stable_public_code(code, "CAPACITY"),
@@ -176,6 +183,7 @@ impl WorkerError {
 
     pub fn public_message(&self) -> String {
         match self {
+            Self::ControllerResumable(error) => error.public_message(),
             Self::Project { .. } => "project error".into(),
             Self::Snapshot { .. } => "snapshot error".into(),
             Self::Capacity {
@@ -259,6 +267,7 @@ impl WorkerError {
     /// attached to origin-auth publication failures (`stage=publish`).
     pub fn failure_receipt(&self) -> Option<FailureReceipt> {
         match self {
+            Self::ControllerResumable(error) => error.failure_receipt(),
             Self::HostIo { receipt, .. } => Some(receipt.clone()),
             Self::Protocol(message) => FailureReceipt::parse_protocol_message(message),
             Self::Git {
