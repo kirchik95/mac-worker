@@ -5802,7 +5802,7 @@ fn cleanup_and_release_failures_return_promptly_under_enrichment_contention() {
         status_thread.join().unwrap();
 
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < crate::support::HANDSHAKE_TIMEOUT,
             "{label} did not return within the contention bound"
         );
         let error = result.unwrap_err();

@@ -1019,6 +1019,8 @@ fn watch_exits_between_pump_cycles_when_the_binary_is_replaced() {
     };
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
+        let release_tx = crate::support::ScopedSender(release_tx);
+        let _stop_on_panic = crate::support::on_drop(|| stop.store(true, Ordering::SeqCst));
         let watcher = scope.spawn(|| {
             let result = OriginOutbox::new(&store, &runner).run_watch_with_identity(
                 &stop,

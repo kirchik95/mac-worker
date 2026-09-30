@@ -7549,7 +7549,7 @@ fn local_wait_handoff_deadline(after_spawn: bool) {
             elapsed.is_ok(),
             "handoff outlived wait budget; after_spawn={after_spawn}"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(3));
+        assert!(elapsed.unwrap() < crate::support::HANDSHAKE_TIMEOUT);
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);

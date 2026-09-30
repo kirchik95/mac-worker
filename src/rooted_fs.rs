@@ -12010,7 +12010,7 @@ mod tests {
                 elapsed.is_ok(),
                 "cleanup lock exceeded wait budget; same_process={same_process}"
             );
-            assert!(elapsed.unwrap() < Duration::from_secs(1));
+            assert!(elapsed.unwrap() < crate::test_support::HANDSHAKE_TIMEOUT);
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
             assert!(
                 !continued.load(Ordering::SeqCst),

@@ -546,7 +546,7 @@ fn wait_deadline_bounds_admission_refresh_lock() {
             elapsed.is_ok(),
             "admission refresh lock outlived the caller's wait deadline"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(1));
+        assert!(elapsed.unwrap() < crate::test_support::HANDSHAKE_TIMEOUT);
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert!(

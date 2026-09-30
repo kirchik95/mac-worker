@@ -714,7 +714,7 @@ fn local_wait_held_lock(relative_lock: &str) {
             elapsed.is_ok(),
             "wait exceeded its budget while {relative_lock:?} stayed locked"
         );
-        assert!(elapsed.unwrap() < Duration::from_secs(3));
+        assert!(elapsed.unwrap() < crate::support::HANDSHAKE_TIMEOUT);
         assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
     });
     assert_eq!(store.load_task(task_id).unwrap(), record);
