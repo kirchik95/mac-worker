@@ -11,6 +11,11 @@ use std::{
 
 use crate::error::{ProcessError, ProcessStream, WorkerError};
 
+// A fork racing killpg can survive the first signal in the owned group.
+const PROCESS_GROUP_KILL_BUDGET: Duration = Duration::from_secs(2);
+// Escaped descendants can retain pipe FDs even after the owned group is gone.
+const TERMINATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessPolicy {
     pub stdout_limit: usize,
@@ -362,9 +367,9 @@ fn spawn_capture<R: Read + Send + 'static>(
                             stream,
                             Ok(CaptureOutcome::LimitExceeded),
                         ));
-                        // PERF drain is bounded on the new-group path because
-                        // terminate/reap makes EOF. Inherit setup does not join
-                        // these threads while grandchildren can retain FDs.
+                        // Keep draining so a finite writer can exit. Teardown
+                        // bounds the wait for this thread if a descendant
+                        // retains the pipe, including outside the owned group.
                         drain_remaining(&mut reader);
                         let _ = release_receiver.recv();
                         return;
@@ -403,15 +408,28 @@ fn finish_terminated_child(
         // ENV setup runs inside the recorded gated child's group. Local
         // timeout/cap/cancel must not killpg that group (it would suicide the
         // exec'd helper) and must not join capture threads: grandchildren can
-        // keep pipe FDs, and joining would wait until they exit. Forget the
+        // keep pipe FDs, and joining would wait until they exit. Detach the
         // handles and `_exit` the helper so supervisor `killpg` finishes reap.
-        // PERF's bounded drain_remaining belongs only on the new-group path
-        // below, where termination already makes EOF bounded.
         abandon_capture_threads(stdout, stderr, stdin);
-        Ok(())
-    } else {
-        join_threads(stdout, stderr, stdin)
+        return Ok(());
     }
+
+    // Overflow captures wait on this gate after draining. Release it before
+    // polling completion, otherwise they cannot finish even after EOF.
+    let _ = stdout.limit_release.send(());
+    let _ = stderr.limit_release.send(());
+    let started = Instant::now();
+    while !stdout.handle.is_finished()
+        || !stderr.handle.is_finished()
+        || stdin.as_ref().is_some_and(|handle| !handle.is_finished())
+    {
+        if started.elapsed() >= TERMINATED_DRAIN_GRACE {
+            abandon_capture_threads(stdout, stderr, stdin);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    join_threads(stdout, stderr, stdin)
 }
 
 fn abandon_capture_threads(
@@ -421,11 +439,9 @@ fn abandon_capture_threads(
 ) {
     let _ = stdout.limit_release.send(());
     let _ = stderr.limit_release.send(());
-    std::mem::forget(stdout.handle);
-    std::mem::forget(stderr.handle);
-    if let Some(stdin) = stdin {
-        std::mem::forget(stdin);
-    }
+    // Dropping a JoinHandle detaches the thread without leaking the handle's
+    // allocation. Late event sends already ignore a disconnected receiver.
+    drop((stdout.handle, stderr.handle, stdin));
 }
 
 fn reap_owned_child(child: &mut Child) -> io::Result<()> {
@@ -468,10 +484,23 @@ fn recover_after_killpg_eperm(
 
 fn terminate_child(child: &mut Child, process_group: Option<libc::pid_t>) -> io::Result<()> {
     if let Some(process_group) = process_group {
-        if let Err(error) = terminate_process_group(process_group) {
-            return recover_after_killpg_eperm(child, process_group, error);
+        let started = Instant::now();
+        loop {
+            if let Err(error) = terminate_process_group(process_group) {
+                return recover_after_killpg_eperm(child, process_group, error);
+            }
+            // Reap before probing: our own zombie leader would keep the group
+            // present. Child caches this status on subsequent iterations.
+            child.wait()?;
+            if saved_process_group_is_gone(process_group)
+                || started.elapsed() >= PROCESS_GROUP_KILL_BUDGET
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(2));
         }
-    } else if let Err(error) = child.kill()
+    }
+    if let Err(error) = child.kill()
         && error.raw_os_error() != Some(libc::ESRCH)
     {
         return Err(error);
@@ -618,6 +647,55 @@ mod tests {
         let child_pgid = parsed_pgid(&result.stdout);
         let caller_pgid = unsafe { libc::getpgid(0) };
         assert_ne!(child_pgid, caller_pgid);
+    }
+
+    #[test]
+    fn termination_bounds_drain_when_pipe_holders_outlive_the_child() {
+        use std::os::unix::net::UnixStream;
+
+        for session in [SessionKind::NewProcessGroup, SessionKind::NewSession] {
+            let (stdout, stdout_writer) = UnixStream::pair().unwrap();
+            let (stderr, stderr_writer) = UnixStream::pair().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let stdout = spawn_capture(stdout, ProcessStream::Stdout, 32, sender.clone());
+            let stderr = spawn_capture(stderr, ProcessStream::Stderr, 32, sender);
+            let (finished, completion) = mpsc::channel();
+            let finishing = thread::spawn(move || {
+                let result = finish_terminated_child(stdout, stderr, None, session);
+                let _ = finished.send(result);
+            });
+
+            // The writers stay open until after the result: unbounded joins
+            // cannot complete. This wide bound tolerates a loaded test host.
+            let result = completion.recv_timeout(Duration::from_secs(20));
+            drop(receiver);
+            drop((stdout_writer, stderr_writer));
+            finishing.join().unwrap();
+            result
+                .expect("termination waited for the pipe holders")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_tolerates_a_dropped_event_receiver() {
+        use std::os::unix::net::UnixStream;
+
+        for bytes in [
+            &b"within limit"[..],
+            &b"past the sixteen byte output limit"[..],
+        ] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let capture = spawn_capture(reader, ProcessStream::Stdout, 16, sender);
+            drop(receiver);
+            // Abandonment releases this gate even when overflow is still
+            // draining. EOF after the runner returns must not panic or block.
+            drop(capture.limit_release);
+            writer.write_all(bytes).unwrap();
+            drop(writer);
+            capture.handle.join().unwrap();
+        }
     }
 
     fn grandchild_pipe_request(
