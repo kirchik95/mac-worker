@@ -434,8 +434,8 @@ impl ControllerStore {
         Ok(self.request_names()?.len())
     }
 
-    /// Read under the same request lock as result and ACK publication, so a
-    /// concurrent publisher cannot retire this read's opened record inode.
+    /// Read without waiting for request execution. Atomic row replacement is
+    /// rechecked within this store's bound root if the opened inode retires.
     pub fn load(&self, request_id: &str) -> Result<Option<DurableRequest>, WorkerError> {
         self.load_with_hook(request_id, || {})
     }
@@ -443,10 +443,41 @@ impl ControllerStore {
     fn load_with_hook(
         &self,
         request_id: &str,
-        after_open: impl FnOnce(),
+        mut after_open: impl FnMut(),
     ) -> Result<Option<DurableRequest>, WorkerError> {
-        let _per_request = self.lock_request(request_id)?;
-        self.load_locked(request_id, after_open)
+        let name = request_file_name(request_id)?;
+        if !self
+            .root
+            .entry_exists(&name)
+            .map_err(|error| op_io("probe-row", &name, error))?
+        {
+            return Ok(None);
+        }
+
+        let mut attempts = 0;
+        loop {
+            match self.read_record_with_hook(&name, &mut after_open) {
+                Ok(record) => return Ok(Some(record)),
+                Err(WorkerError::Io(error))
+                    if error.kind() == io::ErrorKind::StaleNetworkFileHandle && attempts < 3 =>
+                {
+                    // Keep the read on this store's bound root while retrying
+                    // atomic request-row publication without its slow-work lock.
+                    self.root
+                        .verify_bound()
+                        .map_err(|error| op_io("verify-root", &name, error))?;
+                    attempts += 1;
+                    if !self
+                        .root
+                        .entry_exists(&name)
+                        .map_err(|error| op_io("probe-row", &name, error))?
+                    {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn load_locked(
@@ -1574,7 +1605,40 @@ mod tests {
     }
 
     #[test]
-    fn request_load_excludes_ack_replacement_while_its_record_is_open() {
+    fn request_load_does_not_wait_for_the_executor_request_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("controller");
+        let store = ControllerStore::open(&root).unwrap();
+        let request = submit_request(json!({}));
+        store
+            .handle_with(
+                &request,
+                &FailingHandler {
+                    prepare_fails: false,
+                    terminal: false,
+                },
+                ControllerFault::StopAfterPublish,
+            )
+            .unwrap();
+        let loaded = std::thread::scope(|scope| {
+            let held_lock = store.lock_request(request.request_id()).unwrap();
+            let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+            let request_id = request.request_id().to_owned();
+            scope.spawn(move || {
+                let _ = loaded_tx.send(store.load(&request_id));
+            });
+            let loaded = loaded_rx.recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT);
+            drop(held_lock);
+            loaded
+        })
+        .expect("request load must complete while executor lock is held")
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.phase(), RequestPhase::Published);
+    }
+
+    #[test]
+    fn request_load_rechecks_after_ack_replaces_its_opened_record() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("controller");
         let store = ControllerStore::open(&root).unwrap();
@@ -1590,29 +1654,28 @@ mod tests {
         let published = store.load(request.request_id()).unwrap().unwrap();
         let mut peer_acquired = false;
 
-        // A cooperative publisher can replace the opened inode only if this
-        // public read failed to retain the same request's authority lock.
+        // Replace the row at the after-open boundary. The reader must retry
+        // ESTALE against its retained root and return the current record.
         let observed = store
             .load_with_hook(request.request_id(), || {
-                if let Some(_lock) = peer.try_lock_request(request.request_id()).unwrap() {
-                    peer_acquired = true;
-                    peer.drive_to_ack(
-                        published.clone(),
-                        &FakeControllerExecutor,
-                        ControllerFault::None,
-                        0,
-                    )
-                    .unwrap();
+                if !peer_acquired {
+                    if let Some(_lock) = peer.try_lock_request(request.request_id()).unwrap() {
+                        peer_acquired = true;
+                        peer.drive_to_ack(
+                            published.clone(),
+                            &FakeControllerExecutor,
+                            ControllerFault::None,
+                            0,
+                        )
+                        .unwrap();
+                    }
                 }
             })
             .unwrap()
             .unwrap();
 
-        assert_eq!(observed, published);
-        assert!(
-            !peer_acquired,
-            "ACK replacement must wait for the bound read"
-        );
+        assert_eq!(observed.phase(), RequestPhase::Acked);
+        assert!(peer_acquired, "the reader must not retain the request lock");
         let ack = peer.handle(&request, ControllerFault::None).unwrap();
         assert_eq!(ack.status(), "acked");
         assert_eq!(
