@@ -1455,7 +1455,10 @@ fn mutation_busy_and_close_terminal_execution_errors_remain_retryable() {
             .handle_with(&request, &executor, ControllerFault::None)
             .unwrap_err();
         assert_eq!(error.public_code(), code);
-        assert!(matches!(error, WorkerError::Task { .. }));
+        assert_eq!(error.exit_code(), 64);
+        assert!(
+            matches!(error, WorkerError::ControllerResumable(inner) if matches!(*inner, WorkerError::Task { .. }))
+        );
         let pending = store.load(ID_R5).unwrap().unwrap();
         assert_eq!(pending.phase(), RequestPhase::Published);
         assert!(pending.result().is_none());
