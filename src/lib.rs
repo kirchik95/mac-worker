@@ -209,14 +209,17 @@ pub struct ControllerEventRuntime {
     stopped: std::sync::atomic::AtomicBool,
 }
 
-struct SystemControllerEventClock(std::time::Instant);
+struct SystemControllerEventClock;
 
 impl controller::events::EventRuntime for SystemControllerEventClock {
     fn now(&self) -> std::time::Duration {
-        self.0.elapsed()
+        crate::transfer::ResolutionRuntime::monotonic_now(&crate::transfer::SystemResolutionRuntime)
     }
     fn sleep(&self, duration: std::time::Duration) {
-        std::thread::sleep(duration);
+        crate::transfer::ResolutionRuntime::sleep(
+            &crate::transfer::SystemResolutionRuntime,
+            duration,
+        );
     }
     fn cancelled(&self) -> bool {
         false
@@ -225,15 +228,19 @@ impl controller::events::EventRuntime for SystemControllerEventClock {
 
 impl ControllerEventRuntime {
     pub fn new(clock: std::sync::Arc<dyn controller::events::EventRuntime>) -> Self {
-        Self { clock, stopped: std::sync::atomic::AtomicBool::new(false) }
+        Self {
+            clock,
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub fn system() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::new(std::sync::Arc::new(SystemControllerEventClock(std::time::Instant::now()))))
+        std::sync::Arc::new(Self::new(std::sync::Arc::new(SystemControllerEventClock)))
     }
 
     pub fn cancel(&self) {
-        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -265,8 +272,14 @@ impl ControllerEventPublisher {
         journal: std::sync::Arc<controller::events::journal::ControllerJournal>,
         runtime: std::sync::Arc<ControllerEventRuntime>,
     ) -> Self {
-        let (sink, publisher) = controller::events::journal::BoundedPublisher::start(journal.clone(), runtime.clone());
-        Self { journal, sink, publisher, runtime }
+        let (sink, publisher) =
+            controller::events::journal::BoundedPublisher::start(journal.clone(), runtime.clone());
+        Self {
+            journal,
+            sink,
+            publisher,
+            runtime,
+        }
     }
 
     /// Attach a journal already initialized by a leader or opened existing-only.
@@ -297,8 +310,20 @@ impl Drop for ControllerEventPublisher {
     fn drop(&mut self) {
         // Every entry-point guard outlives its authoritative work and fences.
         // Grace is bounded; a stalled fsync is never joined.
-        self.publisher.finish_with_grace(controller::events::PUBLISHER_EXIT_GRACE);
+        self.publisher
+            .finish_with_grace(controller::events::PUBLISHER_EXIT_GRACE);
         self.runtime.cancel();
+        let count = client_state::events::dropped_hint_count();
+        if count != 0 {
+            let diagnostics = self
+                .publisher
+                .diagnostics()
+                .iter()
+                .map(|item| format!("{}={}", item.code, item.count))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!("CONTROLLER_EVENT_HINTS_DROPPED count={count} publisher=[{diagnostics}]");
+        }
     }
 }
 
@@ -310,8 +335,12 @@ pub(crate) fn open_existing_controller_event_publisher(
     // The journal is optional. Unsafe bindings disable hints, never state.
     let journal = controller::events::journal::ControllerJournal::open_existing(
         paths,
-        controller::events::journal::JournalOptions { runtime: runtime.clone() },
-    ).ok().flatten()?;
+        controller::events::journal::JournalOptions {
+            runtime: runtime.clone(),
+        },
+    )
+    .ok()
+    .flatten()?;
     Some(ControllerEventPublisher::start(journal, runtime))
 }
 
@@ -450,7 +479,8 @@ fn execute_with_context(
         Command::Status { job_id } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
-            let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+            let (client_state, _events) =
+                open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
             if job_id.is_none() {
                 FleetReconciler {
                     config: &config,
@@ -474,7 +504,8 @@ fn execute_with_context(
         Command::Cancel { job_id } => {
             let paths = discover_paths(cli.config, runtime)?;
             let config = Config::load(&paths.config)?;
-            let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+            let (client_state, _events) =
+                open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
             let service = CancelService::new(runner, &config, &client_state);
             Ok(CommandOutput::Cancel(service.cancel(job_id)?))
         }
@@ -734,7 +765,8 @@ fn run_public_streaming_body(
     let paths = discover_paths(cli.config, runtime)?;
     let config = Config::load(&paths.config)?;
     config.require_local_inventory()?;
-    let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+    let (client_state, _events) =
+        open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
     let remote = RemoteJobClient::new(runner);
     let follow_runtime = SystemFollowRuntime;
     let logs = LogsService {
@@ -1251,7 +1283,8 @@ async fn run_local_dashboard(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), WorkerError> {
-    let (client_state, _events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+    let (client_state, _events) =
+        open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
     let client_state = std::sync::Arc::new(client_state);
     let launch_directory = runtime.current_dir().ok();
     let mut launcher = SystemDashboardLauncher::from_system_with_config(
@@ -1265,7 +1298,9 @@ async fn run_local_dashboard(
     );
     let event_runtime = if controller_viewer && let Some(events) = &_events {
         let source = crate::dashboard::events::LocalViewerEventSource::new(
-            events.journal(), events.runtime(), launcher.state.service.clone(),
+            events.journal(),
+            events.runtime(),
+            launcher.state.service.clone(),
         );
         launcher = launcher.with_events(source);
         Some(events.runtime())
@@ -1279,6 +1314,9 @@ async fn run_local_dashboard(
         }
     });
     let opener = SystemBrowserOpener;
+    // EOF and heartbeat timeout resolve this signal. run_dashboard calls
+    // server.shutdown(), stopping admission and SSE before HTTP joins;
+    // started journal reads remain detached across Tokio runtime teardown.
     run_dashboard(request, &launcher, &opener, shutdown_signal, stdout, stderr).await?;
     Ok(())
 }
@@ -1444,7 +1482,14 @@ fn run_controller_command(
         }
         if let ControllerCommand::Drain { off } = command {
             let config = Config::load(&paths.config)?;
-            let _events = (!config.controller.enabled).then(|| open_existing_controller_event_publisher(&paths, ControllerEventRuntime::system())).flatten();
+            let _events = (!config.controller.enabled)
+                .then(|| {
+                    open_existing_controller_event_publisher(
+                        &paths,
+                        ControllerEventRuntime::system(),
+                    )
+                })
+                .flatten();
             let drained = if config.controller.enabled {
                 crate::controller::control::drain_via_controller(
                     runner,
@@ -1452,7 +1497,11 @@ fn run_controller_command(
                     Some(!off),
                 )?
             } else {
-                crate::controller::drain::set_drained_with_event_sink(&paths.controller_state_root(), !off, _events.as_ref().map(ControllerEventPublisher::sink))?;
+                crate::controller::drain::set_drained_with_event_sink(
+                    &paths.controller_state_root(),
+                    !off,
+                    _events.as_ref().map(ControllerEventPublisher::sink),
+                )?;
                 !off
             };
             if json {
@@ -1570,15 +1619,21 @@ fn run_controller_command(
         let client_state = ClientStateStore::open(&paths.state)?;
         let event_runtime = ControllerEventRuntime::system();
         // Initialization is leader-only, after leadership is actually held.
-        let (client_state, _events) = match controller::events::journal::ControllerJournal::initialize_for_leader(
-            &paths, &leader, controller::events::journal::JournalOptions { runtime: event_runtime.clone() },
-        ) {
-            Ok(journal) => {
-                let (store, publisher) = ControllerEventPublisher::attach(client_state, journal, event_runtime);
-                (store, Some(publisher))
-            }
-            Err(_) => (client_state, None),
-        };
+        let (client_state, _events) =
+            match controller::events::journal::ControllerJournal::initialize_for_leader(
+                &paths,
+                &leader,
+                controller::events::journal::JournalOptions {
+                    runtime: event_runtime.clone(),
+                },
+            ) {
+                Ok(journal) => {
+                    let (store, publisher) =
+                        ControllerEventPublisher::attach(client_state, journal, event_runtime);
+                    (store, Some(publisher))
+                }
+                Err(_) => (client_state, None),
+            };
         let health_store = HealthStore::open(&state_root)?;
         let mut health = ControllerHealth::new(leader.identity(), now_millis()?);
         health.config_path = Some(std::path::absolute(&paths.config)?);
@@ -1781,7 +1836,8 @@ fn run_task_command(
                 stderr,
             );
         }
-        let (client_state, events) = open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
+        let (client_state, events) =
+            open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
         _events = events;
         let command = cli.command;
         let inline = matches!(

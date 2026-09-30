@@ -15,6 +15,10 @@ const MAX_HINTS: usize = 32;
 // Stable, title-free diagnostic: events are best effort and repair handles drops.
 static CONTROLLER_EVENT_HINTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+pub fn dropped_hint_count() -> u64 {
+    CONTROLLER_EVENT_HINTS_DROPPED.load(Ordering::Relaxed)
+}
+
 #[derive(Default)]
 struct PendingHints {
     scopes: usize,
