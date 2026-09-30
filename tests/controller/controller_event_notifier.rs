@@ -78,9 +78,10 @@ mod policy {
         config::ControllerConfig,
         controller::events::contracts::{
             AttentionSummary, BaselineKind, ChangeCause, DerivedTaskChange, EventCursor,
-            EventReconciler, MAX_NOTIFY_STATE_BYTES, NOTIFY_DECISION_CAPACITY, Notice,
-            NoticeChannel, NoticeSound, NotifyOptions, NotifyState, ReconcileInput, Reconciliation,
-            RepairProgress, SafeCode, SafeOutcome, Seq, TaskFacts,
+            EventReconciler, MAX_NOTIFY_STATE_BYTES, MAX_RECONCILIATION_ROWS,
+            NOTIFY_DECISION_CAPACITY, Notice, NoticeChannel, NoticeSound, NotifyOptions,
+            NotifyState, ReconcileInput, Reconciliation, RepairProgress, SafeCode, SafeOutcome,
+            Seq, TaskFacts,
         },
         error::WorkerError,
         paths::PathLayout,
@@ -159,8 +160,7 @@ mod policy {
         }
 
         fn consume_more_than_4096_decisions(&mut self) {
-            let mut changes = Vec::with_capacity(4_097);
-            let mut confirmed = Vec::with_capacity(4_097);
+            let mut facts = Vec::with_capacity(4_097);
             for index in 1..=4_097_u128 {
                 let task_id = TaskId::new(Uuid::from_u128(index));
                 let turn_id = TurnId::new(Uuid::from_u128(100_000 + index));
@@ -168,14 +168,20 @@ mod policy {
                     self.evicted_task = task_id;
                     self.evicted_turn = turn_id;
                 }
-                let facts = done_facts(task_id, turn_id);
-                changes.push(change(facts.clone()));
-                confirmed.push(facts);
+                facts.push(done_facts(task_id, turn_id));
             }
-            self.consume(
-                warm_complete(self.journal_id, 2, changes, confirmed),
-                NotifyOptions::default(),
-            );
+            let mut seq = 2_u64;
+            for chunk in facts.chunks(MAX_RECONCILIATION_ROWS) {
+                let result = warm_complete(
+                    self.journal_id,
+                    seq,
+                    chunk.iter().cloned().map(change).collect(),
+                    chunk.to_vec(),
+                );
+                seq += 1;
+                result.validate().expect("decision chunk");
+                self.consume(result, NotifyOptions::default());
+            }
             assert_eq!(self.decisions().len(), NOTIFY_DECISION_CAPACITY);
             let evicted = decision_text(&done_facts(self.evicted_task, self.evicted_turn));
             assert!(
@@ -188,20 +194,59 @@ mod policy {
         }
 
         fn consume_attention_overflow_quiet(&mut self) {
-            let fingerprint = format!("{:064x}", 257_u128);
+            let mut facts = Vec::with_capacity(257);
+            for index in 0..257_u128 {
+                let outcome = if index % 2 == 0 {
+                    SafeOutcome::NeedsInput
+                } else {
+                    SafeOutcome::Blocked
+                };
+                facts.push(proved(
+                    TaskId::new(Uuid::from_u128(50_000 + index)),
+                    Some(TurnId::new(Uuid::from_u128(80_000 + index))),
+                    "open",
+                    Some(outcome),
+                ));
+            }
+            let fingerprint = attention_set_digest(&facts);
+            assert_ne!(fingerprint, format!("{:064x}", 257_u128));
             self.overflow = Some(fingerprint.clone());
-            let mut result = cold_complete(self.journal_id, 3, Vec::new());
-            result.attention = Some(AttentionSummary {
-                count: 257,
-                fingerprint: fingerprint.clone(),
-            });
-            self.consume(
-                result,
-                NotifyOptions {
-                    quiet: true,
-                    ..NotifyOptions::default()
-                },
-            );
+            let quiet = NotifyOptions {
+                quiet: true,
+                ..NotifyOptions::default()
+            };
+            let mut seq = 100_u64;
+            let chunks: Vec<_> = facts.chunks(MAX_RECONCILIATION_ROWS).collect();
+            let last = chunks.len() - 1;
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let mut result = warm_complete(
+                    self.journal_id,
+                    seq,
+                    chunk.iter().cloned().map(change).collect(),
+                    chunk.to_vec(),
+                );
+                seq += 1;
+                if index == last {
+                    result.repair = RepairProgress::Complete;
+                    result.repair_needed = false;
+                    result.attention = Some(AttentionSummary {
+                        count: facts.len(),
+                        fingerprint: fingerprint.clone(),
+                    });
+                } else {
+                    result.repair = RepairProgress::InProgress;
+                    result.repair_needed = true;
+                    result.attention = None;
+                }
+                result.validate().expect("attention chunk");
+                self.consume(result, quiet.clone());
+                if index != last {
+                    assert_ne!(
+                        self.saved.attention_overflow.as_deref(),
+                        Some(fingerprint.as_str())
+                    );
+                }
+            }
             assert_eq!(
                 self.saved.attention_overflow.as_deref(),
                 Some(fingerprint.as_str())
@@ -228,6 +273,7 @@ mod policy {
                         fingerprint,
                     });
             result.consumed_after = self.saved.consumed_after;
+            result.validate().expect("cold history");
             self.consume(result, NotifyOptions::default());
         }
 
@@ -253,6 +299,7 @@ mod policy {
                 count: 257,
                 fingerprint,
             });
+            result.validate().expect("unchanged overflow");
             self.consume(result, NotifyOptions::default());
         }
 
@@ -367,6 +414,38 @@ mod policy {
             attention: None,
             repair_needed: false,
         }
+    }
+
+    fn attention_set_digest(facts: &[TaskFacts]) -> String {
+        let mut lines = Vec::new();
+        for facts in facts {
+            let Some(outcome) = facts.outcome else {
+                continue;
+            };
+            if facts.state != "open" || facts.latest_turn_id.is_none() {
+                continue;
+            }
+            if !matches!(outcome, SafeOutcome::NeedsInput | SafeOutcome::Blocked) {
+                continue;
+            }
+            let turn = facts
+                .latest_turn_id
+                .map(|turn| turn.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            lines.push(format!(
+                "{}|{turn}|{}",
+                facts.task_id,
+                outcome_token(outcome)
+            ));
+        }
+        lines.sort();
+        lines.dedup();
+        let mut payload = format!("count={}\n", lines.len());
+        for line in &lines {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+        sha256_hex(&payload)
     }
 
     fn decision_text(facts: &TaskFacts) -> String {
