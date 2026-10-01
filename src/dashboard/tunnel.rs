@@ -1,12 +1,13 @@
 use std::{
-    ffi::OsStr,
     io::{self, Read, Write},
     os::fd::AsRawFd,
     os::unix::process::CommandExt,
-    path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+use std::{ffi::OsStr, path::Path};
 
 use crate::{
     RuntimeContext,
@@ -156,7 +157,7 @@ pub async fn run_controller_dashboard_tunnel_with_readiness_timeout(
 #[allow(clippy::too_many_arguments)]
 async fn run_controller_dashboard_tunnel_with_timings(
     config: &Config,
-    runtime: &RuntimeContext,
+    _runtime: &RuntimeContext,
     requested_port: Option<u16>,
     no_open: bool,
     no_facts_refresh: bool,
@@ -204,9 +205,14 @@ async fn run_controller_dashboard_tunnel_with_timings(
             }
         }
 
+        #[cfg_attr(
+            not(any(debug_assertions, feature = "test-support")),
+            allow(unused_mut)
+        )]
         let mut request =
             controller_dashboard_ssh_request(&config.controller, port, no_facts_refresh)?;
-        apply_labelled_fake_ssh(&mut request, runtime);
+        #[cfg(any(debug_assertions, feature = "test-support"))]
+        apply_labelled_fake_ssh(&mut request, _runtime);
         let mut child = match spawn_held_stdin_ssh(&request) {
             Ok(child) => child,
             Err(error) => {
@@ -580,6 +586,7 @@ fn allocate_loopback_port(requested: Option<u16>) -> Result<u16, WorkerError> {
     Ok(port)
 }
 
+#[cfg(any(debug_assertions, feature = "test-support"))]
 fn apply_labelled_fake_ssh(request: &mut ProcessRequest, runtime: &RuntimeContext) {
     let Some(path) = runtime.environment().get(OsStr::new("MAC_WORKER_FAKE_SSH")) else {
         return;
@@ -903,6 +910,127 @@ mod tests {
         record_reconnect_failure, should_rotate_port,
     };
     use std::time::{Duration, Instant};
+
+    // Cargo's self dev-dependency always enables test-support. Compile the
+    // actual request selection and helper separately to exercise production
+    // release cfgs too, without starting an SSH process.
+    fn compiled_ssh_selection(debug_assertions: bool, test_support: bool) -> String {
+        let source = include_str!("tunnel.rs");
+        let request_call = source
+            .find("controller_dashboard_ssh_request(&config.controller, port, no_facts_refresh)?")
+            .unwrap();
+        let request_start = source[..request_call].rfind("\n\n").unwrap();
+        let request_end = source[request_call..]
+            .find("        let mut child = match spawn_held_stdin_ssh(&request)")
+            .unwrap()
+            + request_call;
+        let helper_start = source[..source.find("fn apply_labelled_fake_ssh(").unwrap()]
+            .rfind("\n\n")
+            .unwrap();
+        let helper_end = source.find("\nfn spawn_held_stdin_ssh(").unwrap();
+        let fixture = format!(
+            r#"
+use std::{{cell::Cell, collections::BTreeMap, ffi::OsString}};
+#[allow(unused_imports)]
+use std::{{ffi::OsStr, path::Path}};
+
+struct ProcessRequest {{ program: OsString }}
+struct Config {{ controller: () }}
+struct RuntimeContext {{
+    environment: BTreeMap<OsString, OsString>,
+    environment_reads: Cell<usize>,
+}}
+impl RuntimeContext {{
+    #[allow(dead_code)]
+    fn environment(&self) -> &BTreeMap<OsString, OsString> {{
+        self.environment_reads.set(self.environment_reads.get() + 1);
+        &self.environment
+    }}
+}}
+fn controller_dashboard_ssh_request(_: &(), _: u16, _: bool) -> Result<ProcessRequest, ()> {{
+    Ok(ProcessRequest {{ program: "/usr/bin/ssh".into() }})
+}}
+fn select_request(runtime: &RuntimeContext) -> Result<ProcessRequest, ()> {{
+    let _runtime = runtime;
+    let config = Config {{ controller: () }};
+    let port = 1234;
+    let no_facts_refresh = false;
+    {}
+    Ok(request)
+}}
+{}
+fn main() {{
+    for value in [None, Some("/fixture/fake-ssh"), Some("relative-ssh"), Some("")] {{
+        let mut environment = BTreeMap::new();
+        if let Some(value) = value {{
+            environment.insert("MAC_WORKER_FAKE_SSH".into(), value.into());
+        }}
+        let runtime = RuntimeContext {{ environment, environment_reads: Cell::new(0) }};
+        let request = select_request(&runtime).unwrap();
+        println!("{{}} {{}}", request.program.to_str().unwrap(), runtime.environment_reads.get());
+    }}
+}}
+"#,
+            &source[request_start..request_end],
+            &source[helper_start..helper_end],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("ssh_selection.rs");
+        let binary_path = directory.path().join("ssh_selection");
+        std::fs::write(&source_path, fixture).unwrap();
+        let mut compiler = std::process::Command::new("rustc");
+        compiler
+            .arg(&source_path)
+            .args([
+                "--edition=2024",
+                "--deny=warnings",
+                "--check-cfg=cfg(feature, values(\"test-support\"))",
+                if debug_assertions {
+                    "-Cdebug-assertions=yes"
+                } else {
+                    "-Cdebug-assertions=no"
+                },
+            ])
+            .arg("-o")
+            .arg(&binary_path);
+        if test_support {
+            compiler.args(["--cfg", "feature=\"test-support\""]);
+        }
+        let output = compiler.output().unwrap();
+        assert!(
+            output.status.success(),
+            "SSH selection fixture did not compile: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let output = std::process::Command::new(binary_path).output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn debug_build_honors_only_absolute_fake_ssh_paths() {
+        assert_eq!(
+            compiled_ssh_selection(true, false),
+            "/usr/bin/ssh 1\n/fixture/fake-ssh 1\n/usr/bin/ssh 1\n/usr/bin/ssh 1\n",
+        );
+    }
+
+    #[test]
+    fn release_build_ignores_fake_ssh_without_reading_the_environment() {
+        assert_eq!(
+            compiled_ssh_selection(false, false),
+            "/usr/bin/ssh 0\n/usr/bin/ssh 0\n/usr/bin/ssh 0\n/usr/bin/ssh 0\n",
+        );
+    }
+
+    #[test]
+    fn release_test_support_build_honors_only_absolute_fake_ssh_paths() {
+        assert_eq!(
+            compiled_ssh_selection(false, true),
+            "/usr/bin/ssh 1\n/fixture/fake-ssh 1\n/usr/bin/ssh 1\n/usr/bin/ssh 1\n",
+        );
+    }
 
     #[test]
     fn production_timings_match_the_operator_defaults() {
