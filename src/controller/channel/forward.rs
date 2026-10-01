@@ -9,7 +9,7 @@ use crate::{
     config::{SshConfig, valid_ssh_destination},
     error::{ProcessError, WorkerError},
     paths::PathLayout,
-    process::{ProcessPolicy, ProcessRunner},
+    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::RootedDir,
     transport,
 };
@@ -17,7 +17,7 @@ use std::{
     ffi::CString,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub struct MasterForwardControl {
@@ -120,17 +120,284 @@ impl ForwardControl for MasterForwardControl {
     }
     fn open(
         &self,
-        _: &dyn ProcessRunner,
-        _: &MasterPlan,
-        _: &SocketIdentity,
-        _: &ClientContext<'_>,
+        raw: &dyn ProcessRunner,
+        master: &MasterPlan,
+        identity: &SocketIdentity,
+        ctx: &ClientContext<'_>,
     ) -> Result<Box<dyn ForwardLease>, ForwardOpenFailure> {
-        let _ = (&self.paths, &self.files);
-        Err(ForwardOpenFailure {
-            failure: ChannelFailure::Unavailable(ChannelReason::Unsupported),
+        let clean_failure = |failure| ForwardOpenFailure {
+            failure,
             disposition: ForwardDisposition::Cleaned,
+        };
+        check_client(ctx).map_err(clean_failure)?;
+        if !self.ssh.multiplex {
+            return Err(clean_failure(unavailable(ChannelReason::Unsupported)));
+        }
+        if !safe_socket_path(&identity.service.socket_path)
+            || master.control_path.parent()
+                != transport::channel_control_directory(&self.ssh).as_deref()
+        {
+            return Err(clean_failure(unavailable(ChannelReason::UnsafePath)));
+        }
+        let endpoint = MasterEndpoint::capture(master).map_err(clean_failure)?;
+        let deadline = ctx
+            .deadline
+            .min(ctx.runtime.now().saturating_add(SETUP_GUARD));
+        let check = transport::channel_control_request(
+            master,
+            "check",
+            None,
+            policy(deadline.saturating_sub(ctx.runtime.now())),
+        )
+        .map_err(|error| clean_failure(process_failure(error)))?;
+        run_control(raw, check, ctx, deadline).map_err(clean_failure)?;
+        endpoint.verify().map_err(clean_failure)?;
+        check_client(ctx).map_err(clean_failure)?;
+        if ctx.runtime.now() >= deadline {
+            return Err(clean_failure(unavailable(ChannelReason::Timeout)));
+        }
+        let path = self.files.allocate(&self.paths).map_err(clean_failure)?;
+        let retained = |failure| ForwardOpenFailure {
+            failure,
+            disposition: ForwardDisposition::Retained,
+        };
+        validate_allocation(&path).map_err(retained)?;
+        check_client(ctx).map_err(retained)?;
+        if ctx.runtime.now() >= deadline {
+            return Err(retained(unavailable(ChannelReason::Timeout)));
+        }
+        let pair = format!(
+            "{}:{}",
+            path.socket_path
+                .to_str()
+                .ok_or_else(|| retained(unavailable(ChannelReason::UnsafePath)))?,
+            identity
+                .service
+                .socket_path
+                .to_str()
+                .ok_or_else(|| retained(unavailable(ChannelReason::UnsafePath)))?
+        );
+        let cancel =
+            transport::channel_control_request(master, "cancel", Some(&pair), policy(SETUP_GUARD))
+                .map_err(|error| retained(process_failure(error)))?;
+        let open = transport::channel_control_request(
+            master,
+            "forward",
+            Some(&pair),
+            policy(deadline.saturating_sub(ctx.runtime.now())),
+        )
+        .map_err(|error| retained(process_failure(error)))?;
+        if let Err(failure) = run_control(raw, open, ctx, deadline) {
+            // Reaping local ssh, refusal, and even best-effort cancel success
+            // cannot prove the shared master's open has settled.
+            let cleanup = cleanup_context();
+            cancel_owned(raw, &endpoint, &cancel, &cleanup);
+            return Err(retained(failure));
+        }
+        // Only a successful terminal open establishes the producer precondition
+        // for refusal cleanup. Validation failure still needs positive proof.
+        let socket = self.files.validate_socket(&path);
+        let validation = socket
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|binding| validate_socket_identity(binding))
+            .and_then(|()| endpoint.verify())
+            .and_then(|()| check_client(ctx));
+        if let Err(failure) = validation {
+            let cleanup = cleanup_context();
+            cancel_owned(raw, &endpoint, &cancel, &cleanup);
+            let disposition = self.files.cleanup_if_refused(&path, socket.ok(), &cleanup);
+            return Err(ForwardOpenFailure {
+                failure,
+                disposition,
+            });
+        }
+        Ok(Box::new(MasterForwardLease {
+            files: self.files.clone(),
+            path,
+            socket: socket.map_err(retained)?,
+            endpoint,
+            cancel,
+            disposition: None,
+        }))
+    }
+}
+
+struct MasterEndpoint {
+    parent: RootedDir,
+    parent_binding: EntryIdentity,
+    path: PathBuf,
+    socket: EntryIdentity,
+}
+impl MasterEndpoint {
+    fn capture(master: &MasterPlan) -> Result<Self, ChannelFailure> {
+        if !safe_socket_path(&master.control_path) {
+            return Err(unavailable(ChannelReason::UnsafePath));
+        }
+        let parent = RootedDir::open_anchored_absolute(
+            master
+                .control_path
+                .parent()
+                .ok_or_else(|| unavailable(ChannelReason::UnsafePath))?,
+        )
+        .map_err(|_| unavailable(ChannelReason::UnsafePath))?;
+        let parent_binding = directory_binding(&parent)?;
+        if parent_binding != master.parent {
+            return Err(unavailable(ChannelReason::UnsafePath));
+        }
+        let socket = socket_binding(&parent, &master.control_path)
+            .map_err(|_| unavailable(ChannelReason::ForwardLost))?;
+        Ok(Self {
+            parent,
+            parent_binding,
+            path: master.control_path.clone(),
+            socket,
         })
     }
+    fn verify(&self) -> Result<(), ChannelFailure> {
+        if directory_binding(&self.parent)? != self.parent_binding
+            || socket_binding(&self.parent, &self.path)
+                .map_err(|_| unavailable(ChannelReason::ForwardLost))?
+                != self.socket
+        {
+            return Err(unavailable(ChannelReason::ForwardLost));
+        }
+        Ok(())
+    }
+}
+
+struct MasterForwardLease {
+    files: Arc<dyn ForwardPaths>,
+    path: ForwardPath,
+    socket: EntryIdentity,
+    endpoint: MasterEndpoint,
+    cancel: ProcessRequest,
+    disposition: Option<ForwardDisposition>,
+}
+impl ForwardLease for MasterForwardLease {
+    fn local_socket(&self) -> &Path {
+        &self.path.socket_path
+    }
+    fn verify(&self) -> Result<(), ChannelFailure> {
+        if self.disposition.is_some() {
+            return Err(unavailable(ChannelReason::ForwardLost));
+        }
+        self.endpoint.verify()?;
+        let socket = self.files.validate_socket(&self.path)?;
+        validate_socket_identity(&socket)?;
+        if socket != self.socket {
+            return Err(unavailable(ChannelReason::UnsafePath));
+        }
+        Ok(())
+    }
+    fn cancel(&mut self, raw: &dyn ProcessRunner, ctx: &CleanupContext) -> ForwardDisposition {
+        if let Some(disposition) = &self.disposition {
+            return disposition.clone();
+        }
+        // The scoped client closes its stream first. No destructor guesses at
+        // cleanup or alters the shared SSH master.
+        let disposition = if cleanup_remaining(ctx).is_zero() {
+            ForwardDisposition::Retained
+        } else if self.files.validate_socket(&self.path).ok().as_ref() != Some(&self.socket) {
+            ForwardDisposition::Retained
+        } else {
+            cancel_owned(raw, &self.endpoint, &self.cancel, ctx);
+            if cleanup_remaining(ctx).is_zero() {
+                ForwardDisposition::Retained
+            } else {
+                self.files
+                    .cleanup_if_refused(&self.path, Some(self.socket.clone()), ctx)
+            }
+        };
+        self.disposition = Some(disposition.clone());
+        disposition
+    }
+}
+
+fn validate_allocation(path: &ForwardPath) -> Result<(), ChannelFailure> {
+    if !safe_socket_path(&path.socket_path)
+        || path.socket_path.parent() != Some(path.directory.as_path())
+    {
+        return Err(unavailable(ChannelReason::UnsafePath));
+    }
+    let directory = RootedDir::open_anchored_absolute(&path.directory)
+        .map_err(|_| unavailable(ChannelReason::UnsafePath))?;
+    if directory_binding(&directory)? != path.directory_identity {
+        return Err(unavailable(ChannelReason::UnsafePath));
+    }
+    Ok(())
+}
+fn validate_socket_identity(socket: &EntryIdentity) -> Result<(), ChannelFailure> {
+    if socket.kind != libc::S_IFSOCK as u32
+        || socket.mode != 0o600
+        || socket.owner != unsafe { libc::geteuid() }
+    {
+        return Err(unavailable(ChannelReason::UnsafePath));
+    }
+    Ok(())
+}
+fn run_control(
+    raw: &dyn ProcessRunner,
+    mut request: ProcessRequest,
+    ctx: &ClientContext<'_>,
+    deadline: Duration,
+) -> Result<ProcessResult, ChannelFailure> {
+    check_client(ctx)?;
+    if ctx.runtime.now() >= deadline {
+        return Err(unavailable(ChannelReason::Timeout));
+    }
+    request.policy.deadline = deadline.saturating_sub(ctx.runtime.now()).min(SETUP_GUARD);
+    let result = raw.run_interruptible(&request, &|| {
+        check_client(ctx).is_err() || ctx.runtime.now() >= deadline
+    });
+    check_client(ctx)?;
+    if ctx.runtime.now() >= deadline {
+        return Err(unavailable(ChannelReason::Timeout));
+    }
+    let result = result.map_err(process_failure)?;
+    if !result.status.success() {
+        return Err(unavailable(ChannelReason::ForwardLost));
+    }
+    Ok(result)
+}
+
+struct CleanupClock(Instant);
+impl ChannelRuntime for CleanupClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+fn cleanup_context() -> CleanupContext {
+    CleanupContext {
+        runtime: Arc::new(CleanupClock(Instant::now())),
+        deadline: SETUP_GUARD,
+    }
+}
+fn cleanup_remaining(ctx: &CleanupContext) -> Duration {
+    ctx.deadline
+        .saturating_sub(ctx.runtime.now())
+        .min(SETUP_GUARD)
+}
+fn cancel_owned(
+    raw: &dyn ProcessRunner,
+    endpoint: &MasterEndpoint,
+    captured: &ProcessRequest,
+    ctx: &CleanupContext,
+) {
+    if cleanup_remaining(ctx).is_zero() || endpoint.verify().is_err() {
+        return;
+    }
+    let deadline = ctx
+        .deadline
+        .min(ctx.runtime.now().saturating_add(SETUP_GUARD));
+    let mut request = captured.clone();
+    request.policy.deadline = deadline.saturating_sub(ctx.runtime.now());
+    // Cleanup ignores foreground cancellation. Its result is never deletion
+    // evidence, and its clock budget cannot admit application setup/read work.
+    let _ = raw.run_interruptible(&request, &|| ctx.runtime.now() >= deadline);
 }
 
 fn unavailable(reason: ChannelReason) -> ChannelFailure {

@@ -1202,6 +1202,58 @@ pub(crate) fn channel_bootstrap_request(
     })
 }
 
+pub(crate) fn channel_control_request(
+    master: &crate::controller::channel::contracts::MasterPlan,
+    operation: &str,
+    forward: Option<&str>,
+    policy: ProcessPolicy,
+) -> Result<ProcessRequest, WorkerError> {
+    let destination = master
+        .bootstrap_request
+        .args
+        .windows(2)
+        .find(|pair| pair[0] == "--")
+        .and_then(|pair| pair[1].to_str())
+        .filter(|destination| valid_ssh_destination(destination))
+        .ok_or_else(|| {
+            WorkerError::Protocol("CONTROLLER_UNAVAILABLE: invalid captured SSH destination".into())
+        })?;
+    let mut args = vec![OsString::from("-F"), OsString::from("/dev/null")];
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "ForwardAgent=no",
+        "ExitOnForwardFailure=yes",
+        "ControlMaster=no",
+        "StreamLocalBindMask=0177",
+        "StreamLocalBindUnlink=no",
+        "ServerAliveInterval=10",
+        "ServerAliveCountMax=3",
+    ] {
+        args.extend([OsString::from("-o"), option.into()]);
+    }
+    args.extend([
+        OsString::from("-S"),
+        master.control_path.as_os_str().to_owned(),
+        OsString::from("-O"),
+        operation.into(),
+    ]);
+    if let Some(forward) = forward {
+        args.extend([OsString::from("-L"), forward.into()]);
+    }
+    args.extend([OsString::from("--"), destination.into()]);
+    // Config edits cannot redirect cancellation's program, endpoint or pair.
+    Ok(ProcessRequest {
+        program: master.bootstrap_request.program.clone(),
+        args,
+        environment: master.bootstrap_request.environment.clone(),
+        environment_remove: master.bootstrap_request.environment_remove.clone(),
+        stdin: None,
+        policy,
+        isolate_parent_environment: master.bootstrap_request.isolate_parent_environment,
+    })
+}
+
 /// SSH argv for a same-port local forward. Unlike [`ssh_request`], this keeps
 /// local forwards (`ExitOnForwardFailure=yes`, no `ClearAllForwardings`) so the
 /// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`. The forward is always
