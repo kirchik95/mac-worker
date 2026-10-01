@@ -31,7 +31,7 @@ Enabled remote controller: without `--wait`, those commands return on a durable 
 
 `list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
 
-`--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events, with log chunks base64-encoded as in v1.
+`--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events. Serialized log chunks use standard padded base64 in the `data` field.
 
 The current release accepts `source = local|origin` and `publish = fetch|push`; `--publish-branch` is valid only with `push`, and a `--wip` base cannot push (`PUBLISH_REQUIRES_COMMITTED_BASE`). Agents on this pool:
 
@@ -162,14 +162,14 @@ A finished task owes exactly one decision after `fetch`: a follow-up with `say` 
 
 ## Exit Codes
 
-CLI exit codes keep v1 semantics. New stable codes sit in the v1 classes plus two new classes:
+Stable public error codes are grouped by error class:
 
 - `project`: `TASK_CONFIG_INVALID`, `PUBLISH_REQUIRES_COMMITTED_BASE`, `AGENT_UNSUPPORTED`, `BASE_NOT_ON_ORIGIN`.
-- `snapshot`: `SNAPSHOT_CHANGED`, `SENSITIVE_PATH`, `UNTRACKED_INPUT` as in v1.
-- `capacity`: unchanged, plus `CAPABILITY_MISSING` for pins.
-- `git` (new): `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`. After origin credentials are repaired, re-drive a terminal failed delivery with `worker task publish-retry <task_id>` instead of resubmitting.
+- `snapshot`: `SNAPSHOT_CHANGED`, `SENSITIVE_PATH`, `UNTRACKED_INPUT` (exit `70`).
+- `capacity`: `CAPACITY_BUSY`, plus `CAPABILITY_MISSING` for pins (exit `75`).
+- `git`: `BASE_PUSH_FAILED`, `BASE_UNAVAILABLE`, `WORKTREE_CREATE_FAILED`, `WORKTREE_INCONSISTENT`, `RESULT_FETCH_FAILED`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`. After origin credentials are repaired, re-drive a terminal failed delivery with `worker task publish-retry <task_id>` instead of resubmitting.
 - `infrastructure`: `HOST_LAYOUT_OUTDATED`, reported by the probe as unavailable until `worker setup` migrates the worker.
-- `agent` (new): `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
+- `agent`: `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
 - `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, `RESULT_NOT_RETAINED` (closed task whose mirror commits are gone: `task workspace is closed and its result is no longer retained`), and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
 
 CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70` protocol or infrastructure, `74` local I/O, `75` capacity. Commands that end with a turn map the turn's outcome as follows:
@@ -179,7 +179,7 @@ CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70
 | agent exited zero, status `done`, `needs_input`, or `unknown` | `0` | `0` if every task ended this way |
 | agent exited zero, status `blocked` | `1` | `1` |
 | agent exited non-zero with code N | `N`, unchanged, public code `AGENT_EXITED` | `1` |
-| signalled, timed out, or cancelled | the status v1 assigns to a signalled, timed-out, or cancelled command | `1` |
+| signalled, timed out, or cancelled | `1` | `1` |
 | turn `lost`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`, `RESULT_UNPARSEABLE` | `70` | `1` |
 | `wait --timeout` elapsed | not applicable | `70`, nothing cancelled |
 
