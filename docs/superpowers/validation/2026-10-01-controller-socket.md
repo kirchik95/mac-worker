@@ -243,7 +243,7 @@ structure. They do not establish a deployed speedup.
 | --- | --- |
 | T8 `cargo fmt --all --check` | passed, exit 0 |
 | T8 `CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings` | passed, exit 0; no warnings |
-| Full `scripts/test-gate.sh` / all-target nextest gate | **pending — integrator** |
+| Full `scripts/test-gate.sh` / all-target nextest gate | Run by the integrator on `8398b0a` (all Phase 3 code; this docs commit changes no code): `CARGO_BUILD_JOBS=8 NEXTEST_TEST_THREADS=12 MAC_WORKER_GATE_RAMDISK_MB=0 scripts/test-gate.sh --profile ci`, exit 0. 3,752 tests run: 3,752 passed, 22 skipped, no flaky retries; 632.0 s nextest, 666 s wall |
 | Deployment and live paired measurement | **pending — live, after deploy** |
 
 ## Live acceptance checklist
