@@ -14,16 +14,13 @@ use uuid::Uuid;
 
 use crate::{
     agent::{
-        AgentKind, PermissionPolicy, Question, TurnLaunch, TurnLimits, adapter_for,
-        parse_prebind_session_ref, prebind_login_request, render_shell,
+        AgentKind, PermissionPolicy, Question, TurnLimits, adapter_for, parse_prebind_session_ref,
+        prebind_login_request,
     },
     error::WorkerError,
     host_store::{HostStore, PublicationReceipt, StagedJob, StagingNonce},
     job::JobId,
-    job::{
-        CommandSpec, JobMeta, LeaseRecord, MAX_LOG_CHUNK_BYTES, RequestFingerprintMaterial,
-        SubmitRequest, SubmitResponse,
-    },
+    job::{JobMeta, MAX_LOG_CHUNK_BYTES, SubmitRequest, SubmitResponse},
     outbox::{DeliveryCommit, OriginOutbox},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     redaction::RedactionBoundary,
@@ -35,6 +32,12 @@ use crate::{
     task_store::{
         SessionBinding, TaskCloseRequest, TaskPrebindRequest, TaskSessionResponse, TaskStore,
     },
+};
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    agent::{TurnLaunch, render_shell},
+    job::{CommandSpec, LeaseRecord, RequestFingerprintMaterial},
 };
 
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
@@ -304,6 +307,7 @@ impl TurnMaterial {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn v1_material(
         &self,
         lease: &LeaseRecord,
@@ -590,6 +594,7 @@ impl PublicationReceipt for TurnReceipt {
 }
 
 impl TurnSection {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         turn: TurnMaterial,
         project_id: impl Into<String>,
@@ -716,6 +721,7 @@ impl fmt::Debug for TaskTurnRequest {
 }
 
 impl TaskTurnRequest {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(submit: SubmitRequest, turn: TurnMaterial, prompt: impl Into<String>) -> Self {
         Self {
             submit,
@@ -846,6 +852,7 @@ impl TaskTurnResponse {
         Self { submit, task }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn submit(&self) -> &SubmitResponse {
         &self.submit
     }
@@ -1990,6 +1997,7 @@ impl EnvProfile {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn load(path: &Path) -> Result<Self, WorkerError> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -2087,6 +2095,7 @@ impl EnvProfile {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn names(&self) -> &[String] {
         &self.names
     }

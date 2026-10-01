@@ -32,6 +32,7 @@ macro_rules! canonical_uuid_id {
         pub struct $name(Uuid);
 
         impl $name {
+            #[cfg(any(test, feature = "test-support"))]
             pub fn new(value: Uuid) -> Self {
                 Self(value)
             }
@@ -245,6 +246,7 @@ impl PushTarget {
         &self.url
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn requirement(&self) -> &str {
         &self.requirement
     }
@@ -309,6 +311,7 @@ impl TaskState {
         matches!(self, Self::Closed | Self::Abandoned | Self::Lost)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -529,10 +532,12 @@ impl OriginDelivery {
         &self.oid
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn origin(&self) -> &str {
         &self.origin
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn target(&self) -> &str {
         &self.target
     }
@@ -541,6 +546,7 @@ impl OriginDelivery {
         self.attempt
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn next_attempt_at_millis(&self) -> u64 {
         self.next_attempt_at_millis
     }
@@ -549,6 +555,7 @@ impl OriginDelivery {
         self.last_error.as_deref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn superseded_by(&self) -> Option<&BaseOid> {
         self.superseded_by.as_ref()
     }
@@ -575,7 +582,7 @@ impl OriginDelivery {
     }
 }
 
-pub fn merge_origin_deliveries(
+pub(crate) fn merge_origin_deliveries(
     local: &[OriginDelivery],
     remote: &[OriginDelivery],
 ) -> Vec<OriginDelivery> {
@@ -918,6 +925,7 @@ impl TaskMeta {
         &self.git_identity
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn summary(&self) -> TaskSummary {
         TaskSummary {
             task_id: self.task_id,
@@ -1100,6 +1108,7 @@ impl<'de> Deserialize<'de> for TaskMeta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct TaskSummary {
     task_id: TaskId,
     run_id: Option<RunId>,
@@ -1113,6 +1122,7 @@ pub struct TaskSummary {
     updated_at_millis: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TaskSummary {
     pub fn task_id(&self) -> TaskId {
         self.task_id
@@ -1155,6 +1165,7 @@ impl TaskSummary {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Serialize for TaskSummary {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut record = serializer.serialize_struct("TaskSummary", 10)?;
@@ -1823,6 +1834,7 @@ impl LocalTaskRecord {
         &self.repo_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn summary(&self) -> TaskSummary {
         TaskSummary {
             task_id: self.meta.task_id,
@@ -2020,6 +2032,7 @@ impl LocalTaskRecord {
         Ok(replacement)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_delivery(&self, delivery: Option<OriginDelivery>) -> Result<Self, WorkerError> {
         match delivery {
             Some(delivery) => {
@@ -2304,6 +2317,7 @@ impl RunRecord {
         self.created_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_branches(&self) -> &[BranchName] {
         &self.reserved_publish_branches
     }

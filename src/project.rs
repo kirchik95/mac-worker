@@ -52,6 +52,7 @@ impl<'a> ProjectInspector<'a> {
         Self { runner }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inspect(&self, cwd: &Path) -> Result<ProjectContext, WorkerError> {
         self.inspect_with_origin(cwd).map(|(context, _)| context)
     }
@@ -260,7 +261,7 @@ fn parse_scalar(output: &[u8]) -> Result<Vec<u8>, WorkerError> {
     Ok(scalar.to_vec())
 }
 
-pub fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
+pub(crate) fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
     if let Ok(mut url) = Url::parse(origin)
         && matches!(url.scheme(), "http" | "https" | "ssh")
     {
@@ -291,7 +292,7 @@ pub fn normalize_origin(origin: &str) -> Result<String, WorkerError> {
     Err(invalid_origin())
 }
 
-pub fn canonical_file_origin(origin: &str) -> Result<Option<String>, WorkerError> {
+pub(crate) fn canonical_file_origin(origin: &str) -> Result<Option<String>, WorkerError> {
     let Ok(url) = Url::parse(origin) else {
         return Ok(None);
     };
@@ -312,7 +313,7 @@ pub fn canonical_file_origin(origin: &str) -> Result<Option<String>, WorkerError
     Ok(Some(canonical))
 }
 
-pub fn origin_host(origin: &str) -> Result<String, WorkerError> {
+pub(crate) fn origin_host(origin: &str) -> Result<String, WorkerError> {
     let normalized = normalize_origin(origin)?;
     if let Ok(url) = Url::parse(&normalized) {
         return url

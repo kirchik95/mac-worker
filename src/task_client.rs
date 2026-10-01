@@ -1137,6 +1137,7 @@ pub struct TaskClient<'a> {
     pub(crate) executor: &'a dyn RunnerExecutor,
     pub(crate) herdr_notifier: Option<crate::herdr::HerdrSocket>,
     json_events: bool,
+    #[cfg(any(test, feature = "test-support"))]
     drain_wait: Option<&'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync)>,
 }
 
@@ -1156,6 +1157,7 @@ impl<'a> TaskClient<'a> {
             executor,
             herdr_notifier: None,
             json_events: false,
+            #[cfg(any(test, feature = "test-support"))]
             drain_wait: None,
         }
     }
@@ -1175,6 +1177,7 @@ impl<'a> TaskClient<'a> {
 
     /// Deterministic drain polling for embedders and admission tests.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_drain_wait(
         mut self,
         wait: &'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync),
@@ -1190,6 +1193,7 @@ impl<'a> TaskClient<'a> {
         Ok(agent)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn submit(
         &self,
         request: TaskSubmitRequest,
@@ -5641,6 +5645,9 @@ impl<'a> TaskClient<'a> {
         let result: Result<(), WorkerError> = (|| {
             loop {
                 let delay = self.client_state.wait_deadline().poll_delay()?;
+                #[cfg(not(any(test, feature = "test-support")))]
+                std::thread::sleep(delay);
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(wait) = self.drain_wait {
                     wait(delay)?;
                 } else {

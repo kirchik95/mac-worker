@@ -15,7 +15,7 @@ pub mod model {
         HerdrTurnState, LocalTaskRecord, MAX_FOLLOWUPS, MAX_PROMPT_BYTES, OriginDelivery,
         PublishMode, PushTarget, QuestionsPolicy, RunId, RunProgress, RunRecord, RunnerIdentity,
         RunnerState, TaskCloseIntent, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        TaskSource, TaskState, TaskStatus, TaskSummary, TurnId, TurnSummary, TurnTerminal,
     };
 }
 pub mod prepare_turn {

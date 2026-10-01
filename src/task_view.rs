@@ -37,6 +37,7 @@ pub enum ReviewState {
 /// fence is unresolved, and while a local drain diagnostic must remain visible.
 /// Extra local-only guards AND onto this predicate so CLI `status`/`list`
 /// and the dashboard cannot drift.
+#[cfg(any(test, feature = "test-support"))]
 pub fn remote_status_refresh_allowed(record: &LocalTaskRecord) -> bool {
     record.close_intent().is_none()
         && matches!(record.status().state(), TaskState::Active | TaskState::Open)
@@ -46,14 +47,14 @@ pub fn remote_status_refresh_allowed(record: &LocalTaskRecord) -> bool {
 /// Same guards as [`remote_status_refresh_allowed`], plus closed tasks whose
 /// origin delivery is still pending or retrying. Status, list, result, and
 /// the dashboard share this so a failed push stays visible after close.
-pub fn remote_observation_allowed(record: &LocalTaskRecord) -> bool {
+pub(crate) fn remote_observation_allowed(record: &LocalTaskRecord) -> bool {
     record.close_intent().is_none()
         && record.abandon_code() != Some("LOG_DRAIN_UNAVAILABLE")
         && record.needs_remote_observation()
 }
 
 /// One CLI line per origin delivery. Short turn IDs match the dashboard chip.
-pub fn format_delivery_line(delivery: &OriginDelivery) -> String {
+pub(crate) fn format_delivery_line(delivery: &OriginDelivery) -> String {
     let mut line = format!(
         "delivery: {} turn={} branch={} attempt={}",
         delivery.state().as_str(),
@@ -69,7 +70,7 @@ pub fn format_delivery_line(delivery: &OriginDelivery) -> String {
 }
 
 /// `push: retrying` suffix for text `task list`, only when publish includes push.
-pub fn format_list_push_suffix(row: &TaskListRow) -> Option<String> {
+pub(crate) fn format_list_push_suffix(row: &TaskListRow) -> Option<String> {
     if !row.publish_push {
         return None;
     }
@@ -80,7 +81,7 @@ pub fn format_list_push_suffix(row: &TaskListRow) -> Option<String> {
 }
 
 /// Delivery for the latest turn, else the newest recorded delivery.
-pub fn last_turn_delivery<'a>(
+pub(crate) fn last_turn_delivery<'a>(
     status: &TaskStatus,
     deliveries: &'a [OriginDelivery],
 ) -> Option<&'a OriginDelivery> {
@@ -322,6 +323,7 @@ impl fmt::Display for TaskViewError {
 
 impl std::error::Error for TaskViewError {}
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn project_task_list(
     records: &[LocalTaskRecord],
     runs: &[RunRecord],
@@ -596,7 +598,7 @@ pub(crate) fn queue_blocking_code(reason: Option<&QueueBlockingReason>) -> &'sta
 
 /// Blocking code a task row reports. Busy-but-capable workers stay
 /// `WAITING_FOR_DISPATCH`; a requirement no configured worker offers is named.
-pub fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
+pub(crate) fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
     match reason {
         Some(QueueBlockingReason::CapabilityMissing { missing }) => {
             format!("NO_WORKER_OFFERS:{}", missing.join(","))
@@ -609,7 +611,7 @@ pub fn task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
 
 /// Parked rows must name the stall: a missing requirement, full eligible
 /// workers, or the existing waiting codes for pin/run-cap cases.
-pub fn parked_task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
+pub(crate) fn parked_task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> String {
     match reason {
         Some(QueueBlockingReason::CapabilityMissing { missing }) => {
             format!("CAPABILITY_MISSING:{}", missing.join(","))
@@ -620,7 +622,7 @@ pub fn parked_task_row_blocking_code(reason: Option<&QueueBlockingReason>) -> St
     }
 }
 
-pub fn task_row_blocking_code_for_queue_state(
+pub(crate) fn task_row_blocking_code_for_queue_state(
     state: &QueueState,
     reason: Option<&QueueBlockingReason>,
 ) -> String {

@@ -409,10 +409,12 @@ impl TaskPrepareResponse {
         self.protocol_version
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn head(&self) -> &BaseOid {
         &self.head
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reused(&self) -> bool {
         self.reused
     }
@@ -563,6 +565,7 @@ impl TaskDiffResponse {
         &self.text
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn truncated(&self) -> bool {
         self.truncated
     }
@@ -633,6 +636,7 @@ pub(crate) struct RetentionClose {
 }
 
 impl TaskCloseResponse {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(status: TaskStatus) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -1141,6 +1145,7 @@ impl<'a> TaskStore<'a> {
         }))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_branch_into_mirror(
         &self,
         project_id: &str,

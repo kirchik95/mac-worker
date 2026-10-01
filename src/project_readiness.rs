@@ -308,11 +308,11 @@ struct SetupIdentityMaterial<'a> {
     inputs: &'a BTreeMap<String, String>,
 }
 
-pub fn setup_cache_dir(cache_root: &Path) -> PathBuf {
+pub(crate) fn setup_cache_dir(cache_root: &Path) -> PathBuf {
     cache_root.join(SETUP_CACHE_DIR)
 }
 
-pub fn compute_setup_identity(
+pub(crate) fn compute_setup_identity(
     account_home: &Path,
     project_id: &str,
     env_profile_name: Option<&str>,
@@ -347,7 +347,10 @@ pub fn compute_setup_identity(
 /// Called by the prepare-turn helper, which a cancel can kill mid-write. Stage
 /// the record in the turn's `tmp` scope; the supervisor adopts it before it
 /// reads the setup outcome.
-pub fn persist_setup_stage_result(turn_dir: &Path, error: &WorkerError) -> Result<(), WorkerError> {
+pub(crate) fn persist_setup_stage_result(
+    turn_dir: &Path,
+    error: &WorkerError,
+) -> Result<(), WorkerError> {
     let result = SetupStageResult {
         code: error.public_code(),
         message: setup_stage_message(error),
@@ -369,7 +372,7 @@ pub fn persist_setup_stage_result(turn_dir: &Path, error: &WorkerError) -> Resul
 }
 
 #[cfg(test)]
-pub fn write_setup_stage_result(
+pub(crate) fn write_setup_stage_result(
     turn_dir: &RootedDir,
     error: &WorkerError,
 ) -> Result<(), WorkerError> {
@@ -396,7 +399,9 @@ pub fn write_setup_stage_result(
     }
 }
 
-pub fn load_setup_stage_result(job: &RootedDir) -> Result<Option<SetupStageResult>, WorkerError> {
+pub(crate) fn load_setup_stage_result(
+    job: &RootedDir,
+) -> Result<Option<SetupStageResult>, WorkerError> {
     match job.read_private_regular(SETUP_RESULT_FILE, SETUP_RESULT_MAX_BYTES) {
         Ok(bytes) => {
             let result = serde_json::from_slice(&bytes)
@@ -416,7 +421,7 @@ fn setup_stage_message(error: &WorkerError) -> String {
     }
 }
 
-pub fn prepare_project_setup(
+pub(crate) fn prepare_project_setup(
     runner: &dyn ProcessRunner,
     request: SetupRequest<'_>,
 ) -> Result<SetupAction, WorkerError> {

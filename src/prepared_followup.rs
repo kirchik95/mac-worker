@@ -218,6 +218,7 @@ impl PreparedFollowup {
         self.created_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn message(&self) -> &str {
         &self.message
     }

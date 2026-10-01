@@ -535,6 +535,7 @@ impl<'a> TurnRunner<'a> {
 
     /// Bound the wait for a waiting row held by another identity.  Tests
     /// shorten it; the default covers the detached handoff twice over.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_adoption_wait(mut self, wait: Duration) -> Self {
         self.adoption_wait = wait;
         self

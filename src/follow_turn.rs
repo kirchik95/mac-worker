@@ -171,7 +171,7 @@ pub fn follow_turn_with_poll_interval(
 /// root, arms `SIGTERM` and `SIGHUP` as the stop request herdr sends when the
 /// tab closes, and follows the turn on `stdout`. Returns the process exit
 /// code.
-pub fn run_host_follow_turn(
+pub(crate) fn run_host_follow_turn(
     config_override: Option<PathBuf>,
     runtime: &RuntimeContext,
     project_id: &str,
