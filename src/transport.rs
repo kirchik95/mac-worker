@@ -1117,6 +1117,91 @@ pub(crate) fn ssh_exec_request(
     })
 }
 
+// Channel bootstrap deliberately does not use resolve_ssh_route: its directory
+// scan can unlink unrelated stale sockets. The channel retains one endpoint.
+pub(crate) fn channel_control_directory(ssh: &crate::config::SshConfig) -> Option<PathBuf> {
+    control_directory(
+        &SshSettings {
+            multiplex: ssh.multiplex,
+            config_file: ssh.config_file.clone(),
+            control_dir: None,
+        },
+        SshTarget::Worker,
+    )
+}
+
+fn channel_master_args(ssh: &crate::config::SshConfig, control_path: &Path) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some(config) = &ssh.config_file {
+        args.extend([OsString::from("-F"), config.as_os_str().to_owned()]);
+    }
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+        "ExitOnForwardFailure=yes",
+        "ControlMaster=auto",
+        "ControlPersist=60",
+        "StreamLocalBindMask=0177",
+        "StreamLocalBindUnlink=no",
+        "ServerAliveInterval=10",
+        "ServerAliveCountMax=3",
+    ] {
+        args.extend([OsString::from("-o"), OsString::from(option)]);
+    }
+    // -S preserves paths with spaces/quotes as a single argv value. OpenSSH,
+    // rather than Rust, expands the template during -G resolution.
+    args.extend([OsString::from("-S"), control_path.as_os_str().to_owned()]);
+    args
+}
+
+pub(crate) fn channel_resolution_request(
+    ssh: &crate::config::SshConfig,
+    destination: &str,
+    directory: &Path,
+    policy: ProcessPolicy,
+) -> Result<ProcessRequest, WorkerError> {
+    let mut args = channel_master_args(ssh, &directory.join("%C"));
+    args.extend([
+        OsString::from("-G"),
+        OsString::from("--"),
+        destination.into(),
+    ]);
+    Ok(ProcessRequest {
+        program: ssh_program()?,
+        args,
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy,
+        isolate_parent_environment: false,
+    })
+}
+
+pub(crate) fn channel_bootstrap_request(
+    ssh: &crate::config::SshConfig,
+    destination: &str,
+    endpoint: &Path,
+    policy: ProcessPolicy,
+) -> Result<ProcessRequest, WorkerError> {
+    let mut args = channel_master_args(ssh, endpoint);
+    args.extend([
+        OsString::from("--"),
+        destination.into(),
+        HostOperation::ControllerRpc.command().into(),
+    ]);
+    Ok(ProcessRequest {
+        program: ssh_program()?,
+        args,
+        environment: Vec::new(),
+        environment_remove: Vec::new(),
+        stdin: None,
+        policy,
+        isolate_parent_environment: false,
+    })
+}
+
 /// SSH argv for a same-port local forward. Unlike [`ssh_request`], this keeps
 /// local forwards (`ExitOnForwardFailure=yes`, no `ClearAllForwardings`) so the
 /// dashboard tunnel can bind `-L 127.0.0.1:N:127.0.0.1:N`. The forward is always
