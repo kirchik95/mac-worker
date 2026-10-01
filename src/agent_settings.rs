@@ -23,14 +23,14 @@ use std::fs::OpenOptions;
 use crate::rooted_fs::RootedDir;
 
 pub const SETTINGS_AGENT_IDS: [&str; 4] = ["codex", "cursor", "opencode", "claude"];
-pub const MAX_SETTINGS_SOURCE_BYTES: usize = 1024 * 1024;
-pub const MAX_SETTINGS_MODEL_BYTES: usize = 256;
-pub const MAX_SETTINGS_LABEL_BYTES: usize = 256;
-pub const MAX_SETTINGS_EFFORT_BYTES: usize = 32;
-pub const MAX_SETTINGS_MODEL_OPTIONS: usize = 128;
-pub const MAX_SETTINGS_EFFORT_OPTIONS: usize = 32;
-pub const MAX_SETTINGS_REVISION_BYTES: usize = 128;
-pub const MAX_OPENCODE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SETTINGS_SOURCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_SETTINGS_MODEL_BYTES: usize = 256;
+pub(crate) const MAX_SETTINGS_LABEL_BYTES: usize = 256;
+pub(crate) const MAX_SETTINGS_EFFORT_BYTES: usize = 32;
+pub(crate) const MAX_SETTINGS_MODEL_OPTIONS: usize = 128;
+pub(crate) const MAX_SETTINGS_EFFORT_OPTIONS: usize = 32;
+pub(crate) const MAX_SETTINGS_REVISION_BYTES: usize = 128;
+pub(crate) const MAX_OPENCODE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 
 // Cursor exposes effort as a model-specific parameter but the installed CLI
 // does not publish a stable global enum.  Keep the current value readable and
@@ -1652,7 +1652,9 @@ impl std::fmt::Display for AgentSettingsError {
 
 impl std::error::Error for AgentSettingsError {}
 
-pub fn validate_save_request(request: &AgentSettingsSaveRequest) -> Result<(), AgentSettingsError> {
+pub(crate) fn validate_save_request(
+    request: &AgentSettingsSaveRequest,
+) -> Result<(), AgentSettingsError> {
     validate_env_profile(request.env_profile.as_deref())?;
     let kind = AgentKind::parse(&request.agent)?;
     if request.revision.is_empty() || request.revision.len() > MAX_SETTINGS_REVISION_BYTES {
@@ -1692,7 +1694,9 @@ pub fn validate_save_request(request: &AgentSettingsSaveRequest) -> Result<(), A
     Ok(())
 }
 
-pub fn validate_get_request(request: &AgentSettingsGetRequest) -> Result<(), AgentSettingsError> {
+pub(crate) fn validate_get_request(
+    request: &AgentSettingsGetRequest,
+) -> Result<(), AgentSettingsError> {
     validate_env_profile(request.env_profile.as_deref())
 }
 

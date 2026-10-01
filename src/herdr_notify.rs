@@ -17,12 +17,12 @@ use crate::{
 };
 
 /// The whole notification, connect included, fits in this.
-pub const NOTIFY_BUDGET: Duration = Duration::from_secs(2);
+pub(crate) const NOTIFY_BUDGET: Duration = Duration::from_secs(2);
 const BODY_LIMIT: usize = 512;
 
 /// What herdr is told: a title, an optional body, and a sound.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Notification {
+pub(crate) struct Notification {
     pub title: String,
     pub body: Option<String>,
     pub sound: NotificationSound,
@@ -30,7 +30,7 @@ pub struct Notification {
 
 /// Compose the notification for a finished turn from values that already
 /// passed the redaction boundary on the worker.
-pub fn notification_for(
+pub(crate) fn notification_for(
     task_id: TaskId,
     title: &str,
     outcome: &TaskOutcome,
@@ -92,12 +92,12 @@ pub fn notification_for(
 
 /// The laptop-side notifier for one herdr session.
 #[derive(Debug, Clone)]
-pub struct HerdrNotifier {
+pub(crate) struct HerdrNotifier {
     client: HerdrClient,
 }
 
 impl HerdrNotifier {
-    pub fn new(socket: HerdrSocket) -> Self {
+    pub(crate) fn new(socket: HerdrSocket) -> Self {
         Self {
             client: HerdrClient::with_deadlines(
                 socket,
@@ -107,7 +107,7 @@ impl HerdrNotifier {
         }
     }
 
-    pub fn show(&self, notification: &Notification) -> Result<(), HerdrError> {
+    pub(crate) fn show(&self, notification: &Notification) -> Result<(), HerdrError> {
         self.client.notification_show(
             &notification.title,
             notification.body.as_deref(),
@@ -116,7 +116,7 @@ impl HerdrNotifier {
     }
 
     /// One notification for a finished turn; the caller ignores the result.
-    pub fn turn_finished(
+    pub(crate) fn turn_finished(
         &self,
         task_id: TaskId,
         title: &str,

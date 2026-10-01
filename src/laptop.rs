@@ -16,10 +16,12 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
 };
 
-pub use crate::binary_identity::{
-    BinaryIdentity, BinaryIdentitySource, FixedBinaryIdentitySource, SystemBinaryIdentitySource,
-    binary_is_outdated,
+pub(crate) use crate::binary_identity::{
+    BinaryIdentitySource, SystemBinaryIdentitySource, binary_is_outdated,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::binary_identity::{BinaryIdentity, FixedBinaryIdentitySource};
 
 /// One row from the laptop process table. Args are `ps` argv tokens.
 ///
@@ -36,7 +38,7 @@ pub struct LaptopProcess {
 
 /// The binary currently installed for this laptop CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledBuild {
+pub(crate) struct InstalledBuild {
     pub mtime: SystemTime,
     pub build_id: Option<String>,
     pub binary_sha256: Option<String>,
@@ -56,12 +58,12 @@ const LAPTOP_PS_POLICY: ProcessPolicy = ProcessPolicy {
 ///
 /// Library code never spawns `ps` itself; tests' fake runners therefore
 /// cannot observe the real machine.
-pub struct SystemLaptopProcessTable<'a> {
+pub(crate) struct SystemLaptopProcessTable<'a> {
     runner: &'a dyn ProcessRunner,
 }
 
 impl<'a> SystemLaptopProcessTable<'a> {
-    pub fn new(runner: &'a dyn ProcessRunner) -> Self {
+    pub(crate) fn new(runner: &'a dyn ProcessRunner) -> Self {
         Self { runner }
     }
 }
@@ -102,8 +104,10 @@ fn laptop_ps_request() -> ProcessRequest {
 }
 
 /// Empty table for tests that must not observe the real machine.
+#[cfg(any(test, feature = "test-support"))]
 pub struct EmptyLaptopProcessTable;
 
+#[cfg(any(test, feature = "test-support"))]
 impl LaptopProcessTable for EmptyLaptopProcessTable {
     fn list(&self) -> Result<Vec<LaptopProcess>, WorkerError> {
         Ok(Vec::new())
@@ -112,10 +116,12 @@ impl LaptopProcessTable for EmptyLaptopProcessTable {
 
 /// Test double that returns a fixed process list.
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct FixedLaptopProcessTable {
     pub processes: Vec<LaptopProcess>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl LaptopProcessTable for FixedLaptopProcessTable {
     fn list(&self) -> Result<Vec<LaptopProcess>, WorkerError> {
         Ok(self.processes.clone())
@@ -123,13 +129,13 @@ impl LaptopProcessTable for FixedLaptopProcessTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaptopCliKind {
+pub(crate) enum LaptopCliKind {
     Dashboard,
     ControllerRun,
 }
 
 impl LaptopCliKind {
-    pub fn command(self) -> &'static str {
+    pub(crate) fn command(self) -> &'static str {
         match self {
             Self::Dashboard => "worker dashboard",
             Self::ControllerRun => "worker controller run",
@@ -138,7 +144,7 @@ impl LaptopCliKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutdatedLaptopCli {
+pub(crate) struct OutdatedLaptopCli {
     pub pid: u32,
     pub kind: LaptopCliKind,
     /// Set when build identity, not mtime, decided the process is outdated.
@@ -152,7 +158,7 @@ pub struct OutdatedLaptopCli {
 /// comparison wins. Otherwise both build ids win. Otherwise the process
 /// start time is compared with the installed file mtime. Fail-open callers
 /// treat an empty result as "no warning".
-pub fn outdated_laptop_cli(
+pub(crate) fn outdated_laptop_cli(
     processes: &[LaptopProcess],
     installed: &InstalledBuild,
 ) -> Vec<OutdatedLaptopCli> {
@@ -201,7 +207,7 @@ pub fn outdated_laptop_cli(
     outdated
 }
 
-pub fn format_outdated_laptop_cli(outdated: &[OutdatedLaptopCli]) -> Option<String> {
+pub(crate) fn format_outdated_laptop_cli(outdated: &[OutdatedLaptopCli]) -> Option<String> {
     if outdated.is_empty() {
         return None;
     }

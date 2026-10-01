@@ -6,10 +6,11 @@ mod opencode;
 
 pub use identity::AgentIdentity;
 #[cfg(test)]
-pub use identity::VersionObservation;
+pub(crate) use identity::VersionObservation;
+pub(crate) use opencode::launch_dialect as opencode_launch_dialect;
 pub use opencode::{
     OPENCODE_DIALECT_MISMATCH, OPENCODE_VERSION_UNVERIFIED, OpencodeDialect,
-    launch_dialect as opencode_launch_dialect, verify_launch as verify_opencode_launch,
+    verify_launch as verify_opencode_launch,
 };
 
 use std::{ffi::OsString, path::Path, time::Duration};
@@ -30,19 +31,19 @@ pub(crate) use cursor::LOGIN_UNVERIFIED_REASON;
 const PREBIND_OUTPUT_LIMIT: usize = 4 * 1024;
 const PREBIND_DEADLINE: Duration = Duration::from_secs(15);
 
-pub const MAX_SUMMARY_BYTES: usize = 512;
+pub(crate) const MAX_SUMMARY_BYTES: usize = 512;
 /// Structured result schema handed to every agent. Strict structured-output
 /// backends (Codex over the OpenAI Responses API) reject a schema unless
 /// `required` lists every property and `additionalProperties` is false, so
 /// optional fields are required-but-possibly-empty arrays; the parser still
 /// defaults them when an agent omits them.
 pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":{"enum":["done","needs_input","blocked"]},"summary":{"type":"string"},"questions":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["text","options"],"additionalProperties":false}},"files_changed":{"type":"array","items":{"type":"string"}},"checks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"status":{"enum":["pass","fail","not_run","error"]},"detail":{"type":"string"}},"required":["name","command","status","detail"],"additionalProperties":false}}},"required":["status","summary","questions","files_changed","checks"],"additionalProperties":false}"#;
-pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
-pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
-pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
+pub(crate) const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
+pub(crate) const SCHEMA_FILE_NAME: &str = "result.schema.json";
+pub(crate) const LAST_MESSAGE_FILE_NAME: &str = "last.md";
 pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
-pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
-pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
+pub(crate) const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
+pub(crate) const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
 
 const SCHEMA_PLACEHOLDER: &str = "{schema}";
 const LAST_MESSAGE_PLACEHOLDER: &str = "{last_message}";
@@ -77,7 +78,7 @@ impl AgentKind {
     }
 }
 
-pub fn result_instruction(agent: AgentKind) -> Option<&'static str> {
+pub(crate) fn result_instruction(agent: AgentKind) -> Option<&'static str> {
     match agent {
         AgentKind::Opencode => Some(OPENCODE_RESULT_INSTRUCTION),
         AgentKind::Cursor => Some(CURSOR_RESULT_INSTRUCTION),
@@ -88,7 +89,7 @@ pub fn result_instruction(agent: AgentKind) -> Option<&'static str> {
 /// Max declared-acceptance lines ENV may pass into the composed prompt.
 pub const MAX_DECLARED_ACCEPTANCE: usize = 16;
 /// Max bytes per declared-acceptance line.
-pub const MAX_DECLARED_ACCEPTANCE_BYTES: usize = 256;
+pub(crate) const MAX_DECLARED_ACCEPTANCE_BYTES: usize = 256;
 
 /// Pure formatter for ENV-owned prompt composition.
 ///
@@ -144,19 +145,19 @@ impl PermissionPolicy {
 /// Codex is the only adapter with a workspace-write sandbox. The others have
 /// no setting between "ask" and full bypass, so a requested `workspace`
 /// permission is either rejected or an explicit fallback to `unattended`.
-pub fn agent_supports_workspace(agent: AgentKind) -> bool {
+pub(crate) fn agent_supports_workspace(agent: AgentKind) -> bool {
     matches!(agent, AgentKind::Codex)
 }
 
 /// Requested permission and the policy the adapter will actually launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedPermission {
+pub(crate) struct ResolvedPermission {
     pub requested: PermissionPolicy,
     pub effective: PermissionPolicy,
     pub fallback: bool,
 }
 
-pub fn resolve_permission(
+pub(crate) fn resolve_permission(
     agent: AgentKind,
     requested: PermissionPolicy,
     allow_fallback: bool,
@@ -251,9 +252,9 @@ pub struct TurnParams {
 
 /// Reasoning effort is interpolated into agent configuration arguments, so it
 /// is restricted to the characters every supported agent accepts unquoted.
-pub const MAX_EFFORT_BYTES: usize = 32;
+pub(crate) const MAX_EFFORT_BYTES: usize = 32;
 
-pub fn validate_effort(effort: &str) -> Result<(), AdapterError> {
+pub(crate) fn validate_effort(effort: &str) -> Result<(), AdapterError> {
     if effort.is_empty() {
         return Err(AdapterError::new("effort must not be empty"));
     }
@@ -309,10 +310,12 @@ impl TurnLaunch {
         self.prompt_delivery
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn env_names(&self) -> &[&'static str] {
         &self.env_names
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn permission_fallback(&self) -> bool {
         self.permission_fallback
     }
@@ -462,11 +465,11 @@ impl<'de> serde::Deserialize<'de> for Question {
     }
 }
 
-pub const MAX_REPORTED_CHECKS: usize = 32;
-pub const MAX_CHECK_NAME_BYTES: usize = 128;
-pub const MAX_CHECK_COMMAND_BYTES: usize = 256;
-pub const MAX_CHECK_DETAIL_BYTES: usize = 1024;
-pub const AGENT_REPORTED_CHECK_SOURCE: &str = "agent_reported";
+pub(crate) const MAX_REPORTED_CHECKS: usize = 32;
+pub(crate) const MAX_CHECK_NAME_BYTES: usize = 128;
+pub(crate) const MAX_CHECK_COMMAND_BYTES: usize = 256;
+pub(crate) const MAX_CHECK_DETAIL_BYTES: usize = 1024;
+pub(crate) const AGENT_REPORTED_CHECK_SOURCE: &str = "agent_reported";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -478,6 +481,7 @@ pub enum ReportedCheckStatus {
 }
 
 impl ReportedCheckStatus {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pass => "pass",
@@ -657,6 +661,7 @@ pub enum AuthFailureSignature {
 }
 
 impl AuthFailureSignature {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn matches(self, stdout: &str, stderr: &str) -> bool {
         streams_show_auth_failure(
             std::slice::from_ref(&self),

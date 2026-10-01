@@ -40,7 +40,7 @@ pub const DISPLAY_AGENT: &str = "mac-worker";
 pub const FOLLOW_TURN_COMMAND: &str = "exec ~/.local/bin/worker host follow-turn";
 
 pub const START_BUDGET: Duration = Duration::from_secs(10);
-pub const TERMINAL_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const TERMINAL_BUDGET: Duration = Duration::from_secs(5);
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(5);
 /// Tabs closed or inspected in one `close` or orphan sweep. A later pass
 /// continues; one pass must not walk an unbounded sidebar.
@@ -103,14 +103,14 @@ static START_REPORTS: Mutex<BTreeMap<String, HerdrTurnReport>> = Mutex::new(BTre
 /// find nothing here, and open the tab again.  Nothing is written to disk
 /// mid-turn, because the task status is being written by the output pump at
 /// exactly that time.
-pub fn remember_start(job_id: &str, report: HerdrTurnReport) {
+pub(crate) fn remember_start(job_id: &str, report: HerdrTurnReport) {
     if let Ok(mut reports) = START_REPORTS.lock() {
         reports.insert(job_id.to_owned(), report);
     }
 }
 
 /// Take the `start` result for a turn, if this process produced it.
-pub fn take_start(job_id: &str) -> Option<HerdrTurnReport> {
+pub(crate) fn take_start(job_id: &str) -> Option<HerdrTurnReport> {
     START_REPORTS
         .lock()
         .ok()
@@ -139,7 +139,7 @@ pub fn title_line(task_id: TaskId, title: &str) -> String {
 }
 
 /// Herdr's kind name for an adapter, so the sidebar shows the right icon.
-pub fn herdr_agent_kind(agent: AgentKind) -> &'static str {
+pub(crate) fn herdr_agent_kind(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",

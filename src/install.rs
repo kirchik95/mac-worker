@@ -29,6 +29,7 @@ impl<'a> Installer<'a> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_installation_id(runner: &'a dyn ProcessRunner, installation_id: Uuid) -> Self {
         Self {
             runner,
@@ -800,7 +801,10 @@ pub fn prepare_candidate(
     })
 }
 
-pub fn host_preflight_failure(worker: &WorkerEntry, error: &CandidateError) -> SetupHostResult {
+pub(crate) fn host_preflight_failure(
+    worker: &WorkerEntry,
+    error: &CandidateError,
+) -> SetupHostResult {
     failed(
         worker,
         "LOCAL_BINARY_INVALID",

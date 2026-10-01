@@ -22,17 +22,15 @@
 //! returning ESTALE), so a facts refresh and a turn must not overlap that
 //! window. Unchanged bytes skip replacement.
 
+use std::{fs::File, io, os::fd::AsRawFd, path::Path, sync::Mutex, time::UNIX_EPOCH};
+
+#[cfg(any(test, feature = "test-support"))]
 use std::{
     cell::Cell,
-    fs::File,
-    io,
-    os::fd::AsRawFd,
-    path::Path,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::UNIX_EPOCH,
 };
 
 use serde::{Deserialize, Serialize};
@@ -47,11 +45,11 @@ use crate::{
 /// Sibling of `facts.json` under the host state root.
 pub const AUTH_INCIDENTS_FILE: &str = "auth-incidents.json";
 /// Exclusive flock covering one load-transform-publish of [`AUTH_INCIDENTS_FILE`].
-pub const AUTH_INCIDENTS_LOCK_FILE: &str = "auth-incidents.lock";
+pub(crate) const AUTH_INCIDENTS_LOCK_FILE: &str = "auth-incidents.lock";
 /// Fixed reason stored on the incident. Never a log excerpt.
 pub const AUTH_INCIDENT_REASON: &str = "auth failed in a turn";
 /// Public task-outcome text for an authentication failure observed in a turn.
-pub const AGENT_AUTHENTICATION_FAILED: &str = "agent authentication failed";
+pub(crate) const AGENT_AUTHENTICATION_FAILED: &str = "agent authentication failed";
 /// Overlay when the private incident file cannot be read. Interned, bounded.
 pub const AUTH_INCIDENTS_UNREADABLE_REASON: &str = "auth incidents unreadable";
 /// Incidents and successes older than this are ignored and pruned.
@@ -182,6 +180,7 @@ fn mutate(
     host_state_root: &Path,
     mut transform: impl FnMut(&mut AuthIncidentStore) -> Result<(), WorkerError>,
 ) -> Result<(), WorkerError> {
+    #[cfg(any(test, feature = "test-support"))]
     run_before_lock_hook();
     let _threads = INCIDENT_THREADS
         .lock()
@@ -189,9 +188,11 @@ fn mutate(
     let lock = IncidentLock::acquire(host_state_root)?;
     for _ in 0..INCIDENTS_WRITE_RETRIES {
         let (expected, mut state) = load_with_bytes(host_state_root)?;
+        #[cfg(any(test, feature = "test-support"))]
         run_after_load_hook();
         transform(&mut state)?;
         state.canonicalize();
+        #[cfg(any(test, feature = "test-support"))]
         run_before_publish_hook();
         match commit(host_state_root, &expected, &state)? {
             Commit::Done => {
@@ -446,6 +447,7 @@ pub fn record_success(
 /// rooted lock still covers the publish; only the parse/validate step is
 /// skipped.
 pub fn clear_all(host_state_root: &Path) -> Result<(), WorkerError> {
+    #[cfg(any(test, feature = "test-support"))]
     run_before_lock_hook();
     let _threads = INCIDENT_THREADS
         .lock()
@@ -454,6 +456,7 @@ pub fn clear_all(host_state_root: &Path) -> Result<(), WorkerError> {
     let empty = AuthIncidentStore::default();
     for _ in 0..INCIDENTS_WRITE_RETRIES {
         let expected = load_raw_bytes(host_state_root)?;
+        #[cfg(any(test, feature = "test-support"))]
         run_before_publish_hook();
         match commit(host_state_root, &expected, &empty)? {
             Commit::Done => {
@@ -473,7 +476,7 @@ pub fn clear_all(host_state_root: &Path) -> Result<(), WorkerError> {
 /// `auth failed in a turn at <ISO minute>`. Expired incidents, incidents
 /// older than a later success, and Codex incidents whose `auth.json` is
 /// newer are dropped from the private file.
-pub fn merge_into_facts(
+pub(crate) fn merge_into_facts(
     facts: &mut AgentFacts,
     host_state_root: &Path,
     account_home: &Path,
@@ -498,7 +501,7 @@ pub fn merge_into_facts(
 /// [`AgentFacts::collected_at_millis`]. Unreadable stores get
 /// [`apply_unreadable_overlay`]. Codex `auth.json` re-login is left to
 /// [`merge_into_facts`] on refresh.
-pub fn overlay_current_incidents(
+pub(crate) fn overlay_current_incidents(
     facts: &mut AgentFacts,
     host_state_root: &Path,
     now_millis: u64,
@@ -522,7 +525,7 @@ pub fn overlay_current_incidents(
 ///
 /// Used when the incident store cannot be applied: facts stay conservative
 /// (no `agent:<kind>` capability) and the reason is visible to operators.
-pub fn apply_unreadable_overlay(facts: &mut AgentFacts) {
+pub(crate) fn apply_unreadable_overlay(facts: &mut AgentFacts) {
     for agent in &mut facts.agents {
         if !matches!(agent.auth, AgentAuth::UnknownWithReason(_)) {
             agent.auth = AgentAuth::UnknownWithReason(AUTH_INCIDENTS_UNREADABLE_REASON);
@@ -562,13 +565,20 @@ fn overlay_facts(facts: &mut AgentFacts, state: &AuthIncidentStore) {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static AFTER_LOAD_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
 static AFTER_LOAD_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-support"))]
 static BEFORE_LOCK_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
 static BEFORE_LOCK_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-support"))]
 static BEFORE_PUBLISH_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
 static BEFORE_PUBLISH_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static AFTER_LOAD_SEEN_GENERATION: Cell<usize> = const { Cell::new(0) };
     static BEFORE_LOCK_SEEN_GENERATION: Cell<usize> = const { Cell::new(0) };
@@ -578,6 +588,7 @@ thread_local! {
 
 /// Test hook fired after each first load of a mutate generation (retries skip).
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_after_load_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
     AFTER_LOAD_GENERATION.fetch_add(1, Ordering::SeqCst);
     *AFTER_LOAD_HOOK
@@ -588,6 +599,7 @@ pub fn set_after_load_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
 /// Test hook fired once per mutate generation before the in-process mutex
 /// and rooted flock. Start barriers belong here, not under the lock.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_before_lock_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
     BEFORE_LOCK_GENERATION.fetch_add(1, Ordering::SeqCst);
     *BEFORE_LOCK_HOOK
@@ -598,6 +610,7 @@ pub fn set_before_lock_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
 /// Test hook fired after the transform and before publishing, while the
 /// rooted lock is still held. Exercises the replace_exact exchange window.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_before_publish_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
     BEFORE_PUBLISH_GENERATION.fetch_add(1, Ordering::SeqCst);
     *BEFORE_PUBLISH_HOOK
@@ -608,10 +621,12 @@ pub fn set_before_publish_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
 /// Enables every mutate test hook on this thread (`before_lock`, `after_load`,
 /// and `before_publish`). Other tests must not pause.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn enable_after_load_hook_on_this_thread() {
     MUTATE_HOOKS_ENABLED.set(true);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn run_after_load_hook() {
     run_generation_hook(
         &AFTER_LOAD_HOOK,
@@ -620,6 +635,7 @@ fn run_after_load_hook() {
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn run_before_lock_hook() {
     run_generation_hook(
         &BEFORE_LOCK_HOOK,
@@ -628,6 +644,7 @@ fn run_before_lock_hook() {
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn run_before_publish_hook() {
     run_generation_hook(
         &BEFORE_PUBLISH_HOOK,
@@ -636,6 +653,7 @@ fn run_before_publish_hook() {
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn run_generation_hook(
     hook: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     generation: &AtomicUsize,

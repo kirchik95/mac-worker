@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent_facts::{
         AgentFacts, EnvProfile as AgentEnvProfile, FactsClock, FactsTiming, SystemFactsClock,
-        collect_agent_facts_at_host_with_overlay, facts_refresh_budget_from_env,
+        collect_agent_facts_at_host_with_overlay,
     },
     auth_incidents,
     error::{ProcessError, WorkerError},
@@ -25,6 +25,9 @@ use crate::{
     rooted_fs::RootedDir,
     turn::EnvProfile as TurnEnvProfile,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::agent_facts::facts_refresh_budget_from_env;
 
 const CONTROLLED_HOST_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const CONTROLLED_HOST_PATHS: &[&str] = &[
@@ -191,7 +194,8 @@ impl MemoryPressureQuery for SystemMemoryPressureQuery {
 pub struct ProbeCollector;
 
 impl ProbeCollector {
-    pub fn collect() -> Result<ProbeResponse, WorkerError> {
+    #[cfg(test)]
+    fn collect() -> Result<ProbeResponse, WorkerError> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
@@ -241,6 +245,7 @@ impl ProbeCollector {
     /// Refreshes the cached agent, profile, and Git-identity facts. This is
     /// deliberately separate from [`Self::collect_at`] so the probe hot path
     /// never starts an agent process.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_facts_at(
         host_state_root: &Path,
         home: &Path,
@@ -252,6 +257,7 @@ impl ProbeCollector {
     /// Refreshes cached facts and records how long each collection step took.
     /// Timing is measured during the same probes that produce the facts; the
     /// facts file is unchanged.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_facts_at_with_timing(
         host_state_root: &Path,
         home: &Path,
@@ -262,6 +268,7 @@ impl ProbeCollector {
 
     /// Like [`Self::refresh_facts_at_with_timing`], optionally wiping auth
     /// incidents first so a later collect advertises the agent again.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_facts_at_with_options(
         host_state_root: &Path,
         home: &Path,

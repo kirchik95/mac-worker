@@ -204,7 +204,7 @@ impl AgentAdapter for OpencodeAdapter {
 /// The dialect an OpenCode turn launch was built for, read from the argv the
 /// worker is about to exec. `None` for any other command: only `opencode run`
 /// is guarded here.
-pub fn launch_dialect(argv: &[OsString]) -> Option<OpencodeDialect> {
+pub(crate) fn launch_dialect(argv: &[OsString]) -> Option<OpencodeDialect> {
     let program = Path::new(argv.first()?).file_name()?;
     if program != BINARY || argv.get(1)? != "run" {
         return None;

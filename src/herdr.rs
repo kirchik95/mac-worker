@@ -37,9 +37,9 @@ pub const SOCKET_ENV_NAME: &str = "HERDR_SOCKET_PATH";
 /// authority on it.
 pub const SOURCE: &str = "mac-worker";
 /// Bound on connecting and writing one request.
-pub const CONNECT_DEADLINE: Duration = Duration::from_millis(500);
+pub(crate) const CONNECT_DEADLINE: Duration = Duration::from_millis(500);
 /// Bound on waiting for one answer.
-pub const RESPONSE_DEADLINE: Duration = Duration::from_secs(3);
+pub(crate) const RESPONSE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Why a call did not produce a result.
 #[derive(Debug)]
@@ -240,7 +240,7 @@ fn next_request_id() -> String {
 
 /// A monotonic-enough sequence number for reports, in the scheme herdr's
 /// own hooks use.
-pub fn report_seq() -> u64 {
+pub(crate) fn report_seq() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
@@ -603,6 +603,7 @@ impl HerdrClient {
             .map(|_| ())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pane_release_agent(&self, pane_id: &str, agent: &str) -> Result<(), HerdrError> {
         self.request(
             "pane.release_agent",

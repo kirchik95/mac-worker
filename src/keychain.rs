@@ -12,14 +12,14 @@ use crate::{
     redaction::RedactionBoundary,
 };
 
-pub const PASSWORD_ENV_NAME: &str = "MAC_WORKER_KEYCHAIN_PASSWORD";
-pub const PATH_ENV_NAME: &str = "MAC_WORKER_KEYCHAIN_PATH";
-pub const DEFAULT_KEYCHAIN_RELATIVE_PATH: &str = "Library/Keychains/login.keychain-db";
-pub const UNLOCK_FAILED_REASON: &str = "keychain unlock failed";
-pub const KEYCHAIN_LOCKED_REASON: &str = "keychain locked";
+pub(crate) const PASSWORD_ENV_NAME: &str = "MAC_WORKER_KEYCHAIN_PASSWORD";
+pub(crate) const PATH_ENV_NAME: &str = "MAC_WORKER_KEYCHAIN_PATH";
+pub(crate) const DEFAULT_KEYCHAIN_RELATIVE_PATH: &str = "Library/Keychains/login.keychain-db";
+pub(crate) const UNLOCK_FAILED_REASON: &str = "keychain unlock failed";
+pub(crate) const KEYCHAIN_LOCKED_REASON: &str = "keychain locked";
 const SECURITY_PROGRAM: &str = "/usr/bin/security";
 /// Bound on `security unlock-keychain` during a facts probe.
-pub const UNLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const UNLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const UNLOCK_OUTPUT_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl fmt::Debug for KeychainUnlockConfig {
     }
 }
 
-pub fn is_reserved_env_name(name: &str) -> bool {
+pub(crate) fn is_reserved_env_name(name: &str) -> bool {
     matches!(name, PASSWORD_ENV_NAME | PATH_ENV_NAME)
 }
 
@@ -78,7 +78,7 @@ pub fn unlock_keychain(
 
 /// Like [`unlock_keychain`], but the process deadline is `deadline` capped by
 /// [`UNLOCK_TIMEOUT`]. A zero deadline fails without starting `security`.
-pub fn unlock_keychain_within(
+pub(crate) fn unlock_keychain_within(
     runner: &dyn ProcessRunner,
     config: &KeychainUnlockConfig,
     boundary: &RedactionBoundary,
@@ -133,7 +133,7 @@ pub fn unlock_keychain_within(
     )))
 }
 
-pub fn unlock_keychain_if_supported(
+pub(crate) fn unlock_keychain_if_supported(
     runner: &dyn ProcessRunner,
     config: &KeychainUnlockConfig,
     boundary: &RedactionBoundary,

@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-pub struct InitRequest {
+pub(crate) struct InitRequest {
     pub destination: String,
     pub name: Option<String>,
     pub agent: String,
@@ -103,7 +103,7 @@ impl InitReport {
     }
 }
 
-pub fn identifier(value: &str) -> Result<String, String> {
+pub(crate) fn identifier(value: &str) -> Result<String, String> {
     if value.is_empty()
         || value.len() > 128
         || value == "."
@@ -117,14 +117,14 @@ pub fn identifier(value: &str) -> Result<String, String> {
     Ok(value.into())
 }
 
-pub fn worker_name(value: &str) -> Result<String, String> {
+pub(crate) fn worker_name(value: &str) -> Result<String, String> {
     if !crate::config::valid_identifier(value) {
         return Err("use a non-empty worker name containing letters, numbers, dots, underscores, hyphens or @".into());
     }
     Ok(value.into())
 }
 
-pub fn ssh_destination(value: &str) -> Result<String, String> {
+pub(crate) fn ssh_destination(value: &str) -> Result<String, String> {
     if value.len() > 253
         || !valid_ssh_destination(value)
         || value.matches('@').count() > 1
@@ -159,7 +159,7 @@ fn remote_ok(runner: &dyn ProcessRunner, worker: &WorkerEntry, command: &str) ->
         .map(|r| r.stdout)
 }
 
-pub fn initialize(
+pub(crate) fn initialize(
     runner: &dyn ProcessRunner,
     config_path: &Path,
     request: InitRequest,

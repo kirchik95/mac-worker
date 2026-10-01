@@ -76,7 +76,7 @@ pub(crate) fn discover_for_profile(
 
 /// Uses the account's existing authentication; never initiates login or inference.
 /// Unsupported CLI versions and unavailable catalogues have no fallback snapshot.
-pub fn discover(home: &Path, environment: &BTreeMap<OsString, OsString>) -> Option<Value> {
+pub(crate) fn discover(home: &Path, environment: &BTreeMap<OsString, OsString>) -> Option<Value> {
     discover_with_environment(home, environment, false)
 }
 

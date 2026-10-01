@@ -32,20 +32,20 @@ use crate::{
 pub const FACTS_TTL: u64 = 15 * 60 * 1000;
 /// Prefix of the interned reason written when a turn died of an authentication
 /// failure. The rest is an ISO-8601 UTC minute so the string stays bounded.
-pub const TURN_AUTH_FAILURE_REASON_PREFIX: &str = "auth failed in a turn at ";
+pub(crate) const TURN_AUTH_FAILURE_REASON_PREFIX: &str = "auth failed in a turn at ";
 
 const PROBE_OUTPUT_LIMIT: usize = 4 * 1024;
 /// Bound on each locate, version, and auth probe during facts collection.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 /// Kept below the 30s facts-refresh SSH deadline.
-pub const FACTS_REFRESH_MARGIN: Duration = Duration::from_secs(5);
+pub(crate) const FACTS_REFRESH_MARGIN: Duration = Duration::from_secs(5);
 /// Used when the caller does not name a shorter or longer budget.
-pub const DEFAULT_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(25);
+pub(crate) const DEFAULT_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(25);
 /// Installer SSH allows 120s; collection stops a few seconds earlier.
-pub const MAX_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(115);
+pub(crate) const MAX_FACTS_REFRESH_BUDGET: Duration = Duration::from_secs(115);
 /// Remote shell assignment read by `host refresh-facts`. Absent means
 /// [`DEFAULT_FACTS_REFRESH_BUDGET`].
-pub const FACTS_BUDGET_ENV: &str = "MAC_WORKER_FACTS_BUDGET_MS";
+pub(crate) const FACTS_BUDGET_ENV: &str = "MAC_WORKER_FACTS_BUDGET_MS";
 /// Shown as `unknown (facts refresh budget exhausted)`.
 pub const FACTS_REFRESH_BUDGET_REASON: &str = "facts refresh budget exhausted";
 const MAX_TEXT_BYTES: usize = 128;
@@ -440,6 +440,7 @@ impl EnvProfile {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn probe(&self) -> ProfileProbe {
         ProfileProbe {
             name: self.name.clone(),
@@ -732,6 +733,7 @@ impl AgentFacts {
         now_millis.saturating_sub(self.collected_at_millis)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_stale(&self, now_millis: u64) -> bool {
         self.age_millis(now_millis) > FACTS_TTL
     }
@@ -996,12 +998,12 @@ pub trait FactsClock: Send + Sync {
 }
 
 /// Wall clock origin captured when a collection starts.
-pub struct SystemFactsClock {
+pub(crate) struct SystemFactsClock {
     origin: Instant,
 }
 
 impl SystemFactsClock {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             origin: Instant::now(),
         }
@@ -1049,7 +1051,7 @@ impl<'a> FactsBudget<'a> {
 /// Caller deadline for `host refresh-facts`, clamped so a huge value cannot
 /// outrun the installer SSH allowance. Missing or unreadable values use the
 /// default that fits under the 30s refresh transport.
-pub fn facts_refresh_budget_from_env() -> Duration {
+pub(crate) fn facts_refresh_budget_from_env() -> Duration {
     match std::env::var(FACTS_BUDGET_ENV) {
         Ok(text) => match text.parse::<u64>() {
             Ok(millis) => Duration::from_millis(millis).min(MAX_FACTS_REFRESH_BUDGET),
@@ -1081,6 +1083,7 @@ fn is_deadline_error(error: &WorkerError) -> bool {
 /// Collect facts under an explicit budget and clock. The collection stops
 /// when the clock reaches `budget` and records
 /// [`FACTS_REFRESH_BUDGET_REASON`] for agents it did not finish.
+#[cfg(any(test, feature = "test-support"))]
 pub fn collect_agent_facts_at_with_budget<P>(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -1105,6 +1108,7 @@ where
 }
 
 /// Deterministic-time variant used by local tests and cache callers.
+#[cfg(any(test, feature = "test-support"))]
 pub fn collect_agent_facts_at<P>(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -1118,6 +1122,7 @@ where
 }
 
 /// Deterministic-time collection that also returns per-step durations.
+#[cfg(any(test, feature = "test-support"))]
 pub fn collect_agent_facts_at_with_timing<P>(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -1152,6 +1157,7 @@ where
 /// If the incident store is corrupt or unreadable, advertised authentication
 /// is replaced with [`crate::auth_incidents::AUTH_INCIDENTS_UNREADABLE_REASON`]
 /// so the scheduler never treats the overlay miss as a successful login.
+#[cfg(any(test, feature = "test-support"))]
 pub fn collect_agent_facts_at_host_with_timing<P>(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -1197,6 +1203,7 @@ where
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn collect_agent_facts_with_optional_host<P>(
     runner: &dyn ProcessRunner,
     account_home: &Path,
@@ -2477,13 +2484,13 @@ fn parse_jsonc(bytes: &[u8]) -> Option<Value> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AgentFleetNote {
+pub(crate) struct AgentFleetNote {
     pub code: &'static str,
     pub agent: String,
     pub message: String,
 }
 
-pub fn agent_fleet_notes(workers: &[crate::protocol::WorkerHealth]) -> Vec<AgentFleetNote> {
+pub(crate) fn agent_fleet_notes(workers: &[crate::protocol::WorkerHealth]) -> Vec<AgentFleetNote> {
     let boundary = crate::redaction::RedactionBoundary::from_env();
     let mut versions: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
     let mut notes = vec![];
@@ -2530,7 +2537,7 @@ pub fn agent_fleet_notes(workers: &[crate::protocol::WorkerHealth]) -> Vec<Agent
     notes
 }
 
-pub fn render_agent_fleet_notes(notes: &[AgentFleetNote]) -> String {
+pub(crate) fn render_agent_fleet_notes(notes: &[AgentFleetNote]) -> String {
     notes
         .iter()
         .map(|note| format!("note [{}]: {}", note.code, note.message))
