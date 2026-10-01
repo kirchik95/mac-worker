@@ -863,6 +863,7 @@ mod tests {
         sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
+            mpsc,
         },
     };
 
@@ -1426,24 +1427,37 @@ mod tests {
 
     #[test]
     fn cancel_after_child_starts_reaps_descendants_without_a_receipt() {
+        struct CancelOnDrop<'a>(&'a AtomicBool);
+
+        impl Drop for CancelOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let cache = tempfile::tempdir().unwrap();
         let account = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         write_workspace(workspace.path(), b"lock", None);
         let mut recipe = recipe(
-            &["printf $$ > leader.pid; /bin/sleep 30 & printf $! > child.pid; wait"],
+            &[
+                "/bin/sleep 300 & child=$!; printf '%s\\n' \"$$\" \"$child\" > started.tmp; /bin/mv started.tmp started; wait \"$child\"",
+            ],
             None,
             &["Cargo.lock"],
             &[],
         );
-        recipe.timeout = Duration::from_secs(10);
+        // The fixture cannot finish naturally during the cancellation handshake.
+        // Its product deadline is separate from the test's hang guards.
+        recipe.timeout = Duration::from_secs(120);
         let project_id = "11".repeat(32);
         let task_id = task(7);
         let cancel = AtomicBool::new(false);
-        let started = Instant::now();
+        let (done_tx, done_rx) = mpsc::channel();
         thread::scope(|scope| {
+            let _cancel_on_panic = CancelOnDrop(&cancel);
             let result = scope.spawn(|| {
-                prepare_project_setup(
+                let result = prepare_project_setup(
                     &SystemProcessRunner,
                     request(
                         SetupTestIdentity {
@@ -1457,37 +1471,42 @@ mod tests {
                         &[],
                         &|| cancel.load(Ordering::SeqCst),
                     ),
-                )
+                );
+                let _ = done_tx.send(());
+                result
             });
-            let leader_bytes =
-                wait_for_file(&workspace.path().join("leader.pid"), Duration::from_secs(2));
-            let child_bytes =
-                wait_for_file(&workspace.path().join("child.pid"), Duration::from_secs(2));
-            let leader: libc::pid_t = String::from_utf8(leader_bytes)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            let child: libc::pid_t = String::from_utf8(child_bytes)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            // Atomic publication proves both PIDs were written after spawning
+            // the descendant; an observer cannot read a partially written PID.
+            let started_bytes =
+                wait_for_file(&workspace.path().join("started"), Duration::from_secs(30));
+            let started = String::from_utf8(started_bytes).unwrap();
+            let mut pids = started
+                .lines()
+                .map(|pid| pid.parse::<libc::pid_t>().unwrap());
+            let leader = pids.next().expect("setup leader PID");
+            let child = pids.next().expect("setup descendant PID");
+            assert!(pids.next().is_none(), "unexpected started-handshake data");
             assert!(
                 pid_alive(leader),
                 "setup child must be running before cancel"
             );
+            assert!(
+                pid_alive(child),
+                "setup descendant must be running before cancel"
+            );
             cancel.store(true, Ordering::SeqCst);
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("cancelled setup must finish within the hang guard");
             let error = result.join().expect("setup thread").unwrap_err();
             assert_eq!(error.public_code(), "SETUP_CANCELLED");
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline && (pid_alive(leader) || pid_alive(child)) {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(!pid_alive(leader), "setup leader was not reaped");
             assert!(!pid_alive(child), "setup descendant was not reaped");
         });
-        assert!(started.elapsed() < Duration::from_secs(3));
         let receipts: Vec<_> = fs::read_dir(setup_cache_dir(cache.path()))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())

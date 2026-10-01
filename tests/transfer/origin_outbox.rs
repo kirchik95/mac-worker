@@ -1743,6 +1743,8 @@ fn persistent_pin_fsync_fault_keeps_payload_across_recovery_paths() {
 
 #[test]
 fn identity_hit_restores_missing_due_for_a_running_watcher() {
+    use std::sync::mpsc;
+
     let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
     fs::write(origin.join("reject"), b"1").unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1750,67 +1752,107 @@ fn identity_hit_restores_missing_due_for_a_running_watcher() {
     let cloned = store.clone();
     let stop_thread = stop.clone();
     let now_thread = now.clone();
-    let join = thread::spawn(move || {
-        OriginOutbox::new(&cloned, &SystemProcessRunner)
-            .run_watch_with(&stop_thread, || now_thread.load(Ordering::SeqCst), 5)
-            .unwrap();
-    });
-    wait_until(
-        8,
-        || outbox(&store).live_watch().unwrap(),
-        || panic!("watcher did not publish liveness"),
-    );
-    let scans_after_start = task_directory_scans_for(store.root());
-    commit(&store, &origin_url, &oid, turn_id(2), 1);
-    wait_until(
-        8,
-        || {
+    let (poll_tx, poll_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let release_tx = support::ScopedSender(release_tx);
+        let _stop_on_panic = support::on_drop(|| stop.store(true, Ordering::SeqCst));
+        let watcher = scope.spawn(move || {
+            let result = OriginOutbox::new(&cloned, &SystemProcessRunner).run_watch_with(
+                &stop_thread,
+                || {
+                    // The first clock read follows startup recovery; later
+                    // reads follow the preceding pump and its due-index reads.
+                    if poll_tx.send(()).is_err()
+                        || release_rx.recv_timeout(support::HANDSHAKE_TIMEOUT).is_err()
+                    {
+                        stop_thread.store(true, Ordering::SeqCst);
+                    }
+                    now_thread.load(Ordering::SeqCst)
+                },
+                5,
+            );
+            let _ = done_tx.send(());
+            result
+        });
+        poll_rx
+            .recv_timeout(support::HANDSHAKE_TIMEOUT)
+            .expect("watcher must finish startup recovery before its first poll");
+        assert!(
+            outbox(&store).live_watch().unwrap(),
+            "watcher must publish liveness"
+        );
+        let scans_after_start = task_directory_scans_for(store.root());
+        commit(&store, &origin_url, &oid, turn_id(2), 1);
+        release_tx.send(()).unwrap();
+        poll_rx
+            .recv_timeout(support::HANDSHAKE_TIMEOUT)
+            .expect("watcher must complete the rejected delivery attempt");
+        assert_eq!(
             outbox(&store)
                 .dto(PROJECT_ID, task_id(1))
-                .ok()
-                .flatten()
-                .is_some()
-        },
-        || panic!("intent was not committed"),
-    );
-    let due_dir = store.root().join("locks/outbox-due");
-    for entry in fs::read_dir(&due_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "json") {
-            fs::remove_file(path).unwrap();
+                .unwrap()
+                .unwrap()
+                .state(),
+            DeliveryState::Retrying
+        );
+
+        // Parked in the clock, the watcher cannot observe the deliberately
+        // missing due key or recreate it before the identity-hit commit.
+        let due_dir = store.root().join("locks/outbox-due");
+        let due_key = due_dir.join(format!("{}-{}.json", task_id(1), turn_id(2)));
+        assert!(due_key.is_file(), "initial delivery must have a due key");
+        for entry in fs::read_dir(&due_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                fs::remove_file(path).unwrap();
+            }
         }
-    }
-    commit(&store, &origin_url, &oid, turn_id(2), 2);
-    assert!(
-        due_dir
-            .join(format!("{}-{}.json", task_id(1), turn_id(2)))
-            .is_file(),
-        "identity-hit must restore the missing due key"
-    );
-    fs::remove_file(origin.join("reject")).unwrap();
-    // The watcher may have pumped the restored due key before `reject` was
-    // removed; that attempt fails and parks the intent at now + backoff on the
-    // injected clock. Move the clock past any backoff so the next pump is due
-    // regardless of that interleaving (seen on the slow CI runner).
-    now.fetch_add(3_600_000, Ordering::SeqCst);
-    wait_until(
-        8,
-        || {
-            outbox(&store)
-                .dto(PROJECT_ID, task_id(1))
-                .ok()
-                .flatten()
-                .is_some_and(|delivery| delivery.state() == DeliveryState::Delivered)
-        },
-        || panic!("running watcher did not deliver after identity-hit due repair"),
-    );
-    let scans_after_repair = task_directory_scans_for(store.root());
-    assert_eq!(
-        scans_after_repair, scans_after_start,
-        "idle polls must not rescan task history"
-    );
-    stop.store(true, Ordering::SeqCst);
-    join.join().unwrap();
+        assert!(
+            !due_key.exists(),
+            "fixture must remove the due key before repair"
+        );
+        commit(&store, &origin_url, &oid, turn_id(2), 2);
+        assert!(
+            due_key.is_file(),
+            "identity-hit must restore the missing due key"
+        );
+        fs::remove_file(origin.join("reject")).unwrap();
+        now.fetch_add(3_600_000, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        poll_rx
+            .recv_timeout(support::HANDSHAKE_TIMEOUT)
+            .expect("running watcher must finish delivery after identity-hit due repair");
+        let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
+        assert_eq!(delivery.state(), DeliveryState::Delivered);
+        assert_eq!(delivery.turn_id(), turn_id(2));
+        assert_eq!(delivery.oid(), &oid);
+        assert_eq!(
+            git(&origin, &["rev-parse", "refs/heads/release-candidate"]),
+            oid.as_str()
+        );
+
+        let reads_after_delivery = due_index_reads_for(store.root());
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+            poll_rx
+                .recv_timeout(support::HANDSHAKE_TIMEOUT)
+                .expect("watcher must finish an idle poll");
+        }
+        assert!(due_index_reads_for(store.root()) > reads_after_delivery);
+        assert_eq!(
+            task_directory_scans_for(store.root()),
+            scans_after_start,
+            "idle polls must not rescan task history"
+        );
+        stop.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(support::HANDSHAKE_TIMEOUT)
+            .expect("watcher must stop within the teardown hang guard");
+        watcher.join().unwrap().unwrap();
+    });
 }
 
 #[test]
