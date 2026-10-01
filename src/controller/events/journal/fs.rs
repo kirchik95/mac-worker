@@ -310,6 +310,23 @@ fn empty_unproved_stages(root: &RootedDir) -> io::Result<Vec<(RoleKind, Binding)
     Ok(stages)
 }
 
+/// The caller holds stable journal EX across recovery. Since writers hold EX
+/// throughout creation, no other writer can still be preparing these stages.
+fn discard_empty_unproved_stages(root: &RootedDir) -> io::Result<()> {
+    // Validate every candidate before removing the first one.
+    let stages = empty_unproved_stages(root)?;
+    let device = root.identity()?.device;
+    for (kind, binding) in stages {
+        if root.entry_exists(&kind.evidence())?
+            || empty_stage_binding(root, kind, device)? != binding
+        {
+            return Err(stage_unavailable(kind));
+        }
+        remove_bound(root, &kind.stage(), binding)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FaultPoint {
     Role(RoleKind, PrivateRolePoint),
@@ -1223,6 +1240,9 @@ fn recover_append_in(
 ) -> io::Result<Manifest> {
     let full = owned_pending.is_none() && recovery_work(root, proposal)?;
     let initial: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
+    // Preserve the cold-recovery classification before discarding residue.
+    // Reader-triggered recovery and appenders both hold stable journal EX here.
+    discard_empty_unproved_stages(root)?;
     recover_roles_in(root, &initial.journal_id)?;
     root.resume_pending_owned_regular_cleanup("pending.json")?;
     let manifest: Manifest = read_json(root, "manifest.json", METADATA_BYTES)?;
@@ -1465,18 +1485,7 @@ pub(super) fn initialize_storage(
     drop(lock);
     let lock_binding: Binding = root.private_entry_identity("journal.lock")?.into();
     let _exclusive = acquire_lock(root, lock_binding, false, deadline, clock)?;
-    // Only leader initialization may discard these provably uncommitted files.
-    // Validate all candidates under EX before removing the first one.
-    let stages = empty_unproved_stages(root)?;
-    let device = root.identity()?.device;
-    for (kind, binding) in stages {
-        if root.entry_exists(&kind.evidence())?
-            || empty_stage_binding(root, kind, device)? != binding
-        {
-            return Err(stage_unavailable(kind));
-        }
-        remove_bound(root, &kind.stage(), binding)?;
-    }
+    discard_empty_unproved_stages(root)?;
     let epoch = if root.entry_exists("initialization.json")? {
         load_initialization(root)?.journal_id
     } else if root.entry_exists(&RoleKind::Initialization.evidence())? {

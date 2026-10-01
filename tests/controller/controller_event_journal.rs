@@ -918,7 +918,7 @@ fn write_empty_stage(h: &JournalHarness, role: &str) {
 }
 
 #[test]
-fn leader_alone_discards_evidence_less_empty_stages_without_resetting_head() {
+fn exclusive_recovery_discards_empty_stages_without_resetting_head() {
     for role in [
         "initialization",
         "manifest",
@@ -931,13 +931,14 @@ fn leader_alone_discards_evidence_less_empty_stages_without_resetting_head() {
         let before = h.head();
         write_empty_stage(&h, role);
         let stage = h.root().join(format!("{role}.stage"));
-        let inode = fs::metadata(&stage).unwrap().ino();
-        assert!(h.reopen().is_err(), "reader cannot discard {role} stage");
-        assert!(
-            h.append_one().is_err(),
-            "append cannot discard {role} stage"
-        );
-        assert_eq!(fs::metadata(&stage).unwrap().ino(), inode);
+        let batch = read_from_journal(&h.journal, before.journal_id, 0, 256);
+        assert_eq!(batch.head_seq, Seq::new(1));
+        assert!(!stage.exists());
+        assert_eq!(h.head(), before);
+        write_empty_stage(&h, role);
+        assert_eq!(h.append_one().unwrap().seq, Seq::new(2));
+        assert!(!stage.exists());
+        write_empty_stage(&h, role);
         let journal = ControllerJournal::initialize_for_leader(
             &h.paths,
             &h._leader,
@@ -947,13 +948,124 @@ fn leader_alone_discards_evidence_less_empty_stages_without_resetting_head() {
         )
         .expect("leader must recover every fixed empty role stage");
         assert!(!stage.exists());
-        assert_eq!(journal.window(DEADLINE).unwrap(), before);
+        assert_eq!(
+            journal.window(DEADLINE).unwrap().journal_id,
+            before.journal_id
+        );
+        assert_eq!(journal.window(DEADLINE).unwrap().head_seq, Seq::new(2));
         assert_eq!(
             journal.append(drain_batch(1), DEADLINE).unwrap().seq,
-            Seq::new(2)
+            Seq::new(3)
         );
         h.assert_budget();
     }
+}
+
+fn interrupt_manifest_before_evidence(h: &JournalHarness) -> Vec<u8> {
+    assert_eq!(
+        h.journal.append(drain_batch(4), DEADLINE).unwrap().seq,
+        Seq::new(4)
+    );
+    h.inject(JournalFaultPoint::Role(
+        JournalRole::Manifest,
+        JournalRoleBoundary::StageCreated,
+    ));
+    assert_eq!(
+        h.journal
+            .append(drain_batch(7), DEADLINE)
+            .unwrap_err()
+            .public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(h.faults.hits.load(Ordering::SeqCst), 1);
+    let stage = fs::metadata(h.root().join("manifest.stage")).unwrap();
+    assert_eq!(stage.len(), 0);
+    assert_eq!(stage.mode() & 0o7777, 0o600);
+    assert!(!h.root().join("manifest.role").exists());
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(h.root().join("pending.json")).unwrap()).unwrap();
+    assert_eq!(pending["previous_head"], 4);
+    // All exact pending bytes are already synced, but the manifest still exposes 1..4.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(h.root().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["head"], 4);
+    fs::read(h.root().join("segment-1.jsonl")).unwrap()
+}
+
+#[test]
+fn plain_reader_recovers_manifest_stage_created_before_evidence() {
+    let h = JournalHarness::new();
+    let journal_id = h.head().journal_id;
+    let bytes = interrupt_manifest_before_evidence(&h);
+    let provider = ExistingJournalProvider::new(h.paths.clone(), h.runtime.clone());
+    let reader = provider.open_existing(DEADLINE).unwrap().unwrap();
+    let EventReadResult::Batch(batch) = reader
+        .read(
+            ReadQuery {
+                after: Some(mac_worker::controller::events::EventCursor {
+                    journal_id,
+                    seq: Seq::new(4),
+                }),
+                limit: 256,
+                wait_ms: 0,
+            },
+            DEADLINE,
+        )
+        .unwrap()
+    else {
+        panic!("reader must serve the recovered pending events");
+    };
+    batch.validate().unwrap();
+    assert_eq!(batch.head_seq, Seq::new(11));
+    assert_eq!(
+        batch
+            .events
+            .iter()
+            .map(|event| event.seq.as_u64())
+            .collect::<Vec<_>>(),
+        (5..=11).collect::<Vec<_>>()
+    );
+    assert_eq!(fs::read(h.root().join("segment-1.jsonl")).unwrap(), bytes);
+    assert!(!h.root().join("manifest.stage").exists());
+    assert!(!h.root().join("pending.json").exists());
+    let EventReadResult::Batch(next) = reader
+        .read(
+            ReadQuery {
+                after: Some(batch.next_after),
+                limit: 256,
+                wait_ms: 0,
+            },
+            DEADLINE,
+        )
+        .unwrap()
+    else {
+        panic!("expected batch");
+    };
+    assert!(next.events.is_empty());
+    assert_eq!(next.head_seq, Seq::new(11));
+    h.assert_budget();
+}
+
+#[test]
+fn next_append_recovers_manifest_stage_created_before_evidence() {
+    let h = JournalHarness::new();
+    let bytes = interrupt_manifest_before_evidence(&h);
+    assert_eq!(h.append_one().unwrap().seq, Seq::new(12));
+    let batch = h.read_from(0, 256);
+    assert_eq!(
+        batch
+            .events
+            .iter()
+            .map(|event| event.seq.as_u64())
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<_>>()
+    );
+    assert_eq!(batch.head_seq, Seq::new(12));
+    let committed = fs::read(h.root().join("segment-1.jsonl")).unwrap();
+    assert_eq!(&committed[..bytes.len()], bytes);
+    assert!(!h.root().join("manifest.stage").exists());
+    assert!(!h.root().join("pending.json").exists());
+    h.assert_budget();
 }
 
 fn assert_evidence_less_stage_preserved(h: &JournalHarness, role: &str) {
@@ -972,6 +1084,27 @@ fn assert_evidence_less_stage_preserved(h: &JournalHarness, role: &str) {
         names
     };
     let before_names = names();
+    // Appenders hold EX before inspecting recovery residue. Neither party may
+    // discard a safe earlier stage when a later evidence-less stage is unsafe.
+    assert_eq!(
+        h.append_one().unwrap_err().public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(
+        h.journal
+            .read(
+                ReadQuery {
+                    after: None,
+                    limit: 256,
+                    wait_ms: 0
+                },
+                DEADLINE
+            )
+            .unwrap_err()
+            .public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(names(), before_names);
     let error = ControllerJournal::initialize_for_leader(
         &h.paths,
         &h._leader,
@@ -1609,6 +1742,132 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
     // Completion is observed only after append has released EX; no clock polling.
     finished.recv().unwrap();
     assert_eq!(h.head().head_seq, Seq::new(1));
+}
+
+struct FsyncGatedPublisher {
+    sink: Arc<dyn mac_worker::controller::events::EventSink>,
+    handle: mac_worker::controller::events::journal::PublisherHandle,
+    release: std::sync::mpsc::Sender<()>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+fn fsync_gated_publisher(h: &JournalHarness) -> FsyncGatedPublisher {
+    use mac_worker::controller::events::PublishAttempt;
+    use std::sync::mpsc;
+    let (reached, wait) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let once = std::sync::atomic::AtomicBool::new(true);
+    let hook = Arc::new(move |point| {
+        if point == JournalFaultPoint::SegmentSynced && once.swap(false, Ordering::SeqCst) {
+            reached.send(()).unwrap();
+            gate.lock().unwrap().recv().unwrap();
+        }
+        Ok(())
+    });
+    let journal = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hook,
+    )
+    .unwrap()
+    .unwrap();
+    let (complete, finished) = mpsc::channel();
+    let (sink, handle) = BoundedPublisher::start(
+        Arc::new(CompletionWriter { journal, complete }),
+        h.runtime.clone(),
+    );
+    assert_eq!(sink.try_publish(drain_batch(1)), PublishAttempt::Queued);
+    wait.recv().unwrap();
+    FsyncGatedPublisher {
+        sink,
+        handle,
+        release,
+        finished,
+    }
+}
+
+#[test]
+fn publisher_exit_grace_commits_in_flight_and_queued_batches_within_bound() {
+    use mac_worker::controller::events::{EventRuntime, PublishAttempt};
+    let h = JournalHarness::new();
+    let publisher = fsync_gated_publisher(&h);
+    assert_eq!(
+        publisher.sink.try_publish(drain_batch(2)),
+        PublishAttempt::Queued
+    );
+    let release = Arc::new(Mutex::new(Some(publisher.release)));
+    let finished = Arc::new(Mutex::new(publisher.finished));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let (clock, gate, completion, count) = (
+        h.runtime.clone(),
+        release.clone(),
+        finished.clone(),
+        commits.clone(),
+    );
+    h.runtime.on_sleep(move |_| {
+        if clock.now() >= Duration::from_millis(200)
+            && let Some(release) = gate.lock().unwrap().take()
+        {
+            release.send(()).unwrap();
+            // Channel closure follows worker completion, so scheduling never
+            // advances the injected exit clock while the released fsync runs.
+            count.store(completion.lock().unwrap().iter().count(), Ordering::SeqCst);
+        }
+    });
+    publisher.handle.finish_with_grace(Duration::from_secs(30));
+    h.runtime.clear_sleep_hook();
+    // Release even on the red path, where exit returns before 200 ms.
+    if let Some(release) = release.lock().unwrap().take() {
+        release.send(()).unwrap();
+        commits.store(finished.lock().unwrap().iter().count(), Ordering::SeqCst);
+    }
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        2,
+        "exit must drain the already-queued batch"
+    );
+    assert_eq!(h.runtime.now(), Duration::from_millis(200));
+    assert_eq!(
+        publisher.sink.try_publish(drain_batch(1)),
+        PublishAttempt::Dropped
+    );
+    let batch = h.read_from(0, 256);
+    assert_eq!(batch.head_seq, Seq::new(3));
+    assert_eq!(
+        batch
+            .events
+            .iter()
+            .map(|event| event.seq.as_u64())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn publisher_exit_grace_returns_at_bound_without_joining_held_fsync() {
+    use mac_worker::controller::events::{EventRuntime, PublishAttempt};
+    let h = JournalHarness::new();
+    let publisher = fsync_gated_publisher(&h);
+    assert_eq!(
+        publisher.sink.try_publish(drain_batch(2)),
+        PublishAttempt::Queued
+    );
+    publisher.handle.finish_with_grace(Duration::from_secs(30));
+    let elapsed = h.runtime.now();
+    assert_eq!(
+        publisher.sink.try_publish(drain_batch(1)),
+        PublishAttempt::Dropped
+    );
+    // Returning before release proves exit did not join the blocked disk write.
+    publisher.release.send(()).unwrap();
+    assert_eq!(publisher.finished.iter().count(), 1);
+    assert_eq!(elapsed, Duration::from_secs(3));
+    // The exit deadline limits waiting, not the already-started append itself.
+    assert_eq!(h.head().head_seq, Seq::new(1));
+    assert!(!h.root().join("pending.json").exists());
 }
 
 #[test]

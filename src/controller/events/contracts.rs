@@ -16,7 +16,9 @@ pub const MAX_JOURNAL_FILES: usize = 128;
 pub const PUBLISHER_CAPACITY: usize = 128;
 pub const MAX_PUBLISHER_BYTES: usize = PUBLISHER_CAPACITY * MAX_BATCH_BYTES;
 pub const JOURNAL_ADMISSION_BUDGET: Duration = Duration::from_millis(50);
-pub const PUBLISHER_EXIT_GRACE: Duration = Duration::from_millis(50);
+/// Maximum exit wait for in-flight and queued appends; never a disk I/O deadline.
+/// Raised after the live incident on 2026-10-01 to let slower F_FULLFSYNC appends finish.
+pub const PUBLISHER_EXIT_GRACE: Duration = Duration::from_secs(3);
 pub const JOURNAL_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 pub const MAX_STALE_RETRIES: usize = 3;
 pub use crate::controller::protocol::MAX_FRAME_BYTES;

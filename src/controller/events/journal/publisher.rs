@@ -334,9 +334,9 @@ mod tests {
         entered_rx.recv().unwrap();
         let clock = ManualEventRuntime::new();
         handle.finish_with_grace(Duration::from_secs(30), &clock);
-        assert_eq!(clock.now(), Duration::from_millis(50));
         assert_eq!(sink.try_enqueue(vec![2]), EnqueueResult::Stopping);
         release_tx.send(()).unwrap();
+        assert_eq!(clock.now(), Duration::from_secs(3));
     }
 
     #[test]

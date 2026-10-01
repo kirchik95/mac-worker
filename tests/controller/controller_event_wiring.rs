@@ -999,7 +999,7 @@ fn prove_fsync_gate(paths: PathLayout) {
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
     assert!(runtime.cancelled());
-    assert!(clock.sleeps().iter().copied().sum::<Duration>() <= Duration::from_millis(50));
+    assert!(clock.sleeps().iter().copied().sum::<Duration>() <= Duration::from_secs(3));
     assert_eq!(
         sink.try_publish(
             EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: false }]).unwrap()
