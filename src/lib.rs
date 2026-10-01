@@ -99,6 +99,7 @@ pub mod job_service;
 pub mod keychain;
 pub mod laptop;
 pub mod lease;
+pub mod legacy_snapshot_receipt;
 pub mod manifest;
 mod model_catalog;
 pub mod onboarding;

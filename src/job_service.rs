@@ -23,8 +23,9 @@ use crate::{
         SubmitRequest, SubmitResponse,
     },
     lease::LeaseService,
+    legacy_snapshot_receipt::LegacySnapshotReceiptService as RemoteSnapshotService,
     process::SystemProcessRunner,
-    remote_snapshot::{RemoteSnapshotService, VerifiedRemoteSnapshot},
+    remote_snapshot::VerifiedRemoteSnapshot,
     rooted_fs::{RootedDir, is_log_offset_beyond_eof},
     supervisor::{
         ProcessObservation, ReconciliationRuntime, SystemReconciliationRuntime,
