@@ -13,7 +13,7 @@ use crate::{
         AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, StagedJob, WorkspaceReceipt,
     },
     inputs::RelativePath,
-    job::{JobId, LeaseRecord, LeaseToken, RequestFingerprint},
+    job::{LeaseRecord, RequestFingerprint},
     lease::LeaseService,
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
     rooted_fs::{RootedDir, SnapshotFsKind, SnapshotProjection, SnapshotTreeInspection},
@@ -23,7 +23,8 @@ pub use crate::legacy_snapshot_receipt::{
     LegacySnapshotReceiptService as RemoteSnapshotService, SnapshotCacheKey, VerifiedReceipt,
 };
 use crate::legacy_snapshot_receipt::{
-    decode_canonical_json, unsafe_remote_snapshot, validate_digest,
+    decode_canonical_json, lease_identity_mismatch, lease_token_hash, protocol_code,
+    unsafe_remote_snapshot, validate_digest, validate_receipt_identity,
 };
 
 const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
@@ -450,18 +451,6 @@ impl<'a> RemoteSnapshotService<'a> {
                 _ => return Err(unsafe_remote_snapshot()),
             }
         }
-    }
-
-    fn read_receipt_optional(&self, job_id: JobId) -> Result<Option<VerifiedReceipt>, WorkerError> {
-        let directory = self.store.open_directory("verified", false)?;
-        let name = format!("{job_id}.json");
-        if !directory.entry_exists(&name)? {
-            return Ok(None);
-        }
-        let bytes = directory
-            .read_private_regular(&name, 1024 * 1024)
-            .map_err(|_| unsafe_remote_snapshot())?;
-        decode_canonical_json(&bytes, "verified receipt").map(Some)
     }
 
     fn publish_receipt(&self, desired: &VerifiedReceipt) -> Result<VerifiedReceipt, WorkerError> {
@@ -1000,25 +989,6 @@ fn receipt_for_lease(
     )
 }
 
-fn validate_receipt_identity(
-    receipt: &VerifiedReceipt,
-    lease: &LeaseRecord,
-    request_fingerprint: &RequestFingerprint,
-) -> Result<(), WorkerError> {
-    receipt.validate()?;
-    if receipt.job_id != lease.job_id()
-        || receipt.client_id != lease.client_id()
-        || receipt.lease_token_sha256 != lease_token_hash(lease.lease_token())
-        || &receipt.request_fingerprint != request_fingerprint
-        || receipt.project_id != lease.project_id()
-        || receipt.worktree_id != lease.worktree_id()
-        || receipt.manifest_digest != lease.manifest_digest()
-    {
-        return Err(lease_identity_mismatch());
-    }
-    Ok(())
-}
-
 fn receipt_identity_equal(left: &VerifiedReceipt, right: &VerifiedReceipt) -> bool {
     left.version == right.version
         && left.job_id == right.job_id
@@ -1053,10 +1023,6 @@ fn snapshot_from_parts(
         verified_at_millis,
         cache_reused,
     })
-}
-
-fn lease_token_hash(token: LeaseToken) -> String {
-    format!("{:x}", Sha256::digest(token.to_string().as_bytes()))
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {
@@ -1098,15 +1064,4 @@ fn map_verified_cleanup_io(error: io::Error) -> WorkerError {
     } else {
         WorkerError::Io(error)
     }
-}
-
-fn lease_identity_mismatch() -> WorkerError {
-    protocol_code(
-        "LEASE_IDENTITY_MISMATCH",
-        "live lease identity was rejected",
-    )
-}
-
-fn protocol_code(code: &'static str, message: &str) -> WorkerError {
-    WorkerError::Protocol(format!("{code}: {message}"))
 }

@@ -1,5 +1,7 @@
 use std::io;
 
+use sha2::{Digest, Sha256};
+
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de,
     de::DeserializeOwned,
@@ -11,7 +13,7 @@ use crate::{
     host_store::{
         AdmissionGuard, HostStore, HostStoreWritePoint, ResolutionIdentity, TransferGuard,
     },
-    job::{ClientId, JobId, RequestFingerprint},
+    job::{ClientId, JobId, LeaseRecord, LeaseToken, RequestFingerprint},
 };
 
 const VERIFIED_RECEIPT_VERSION: u32 = 1;
@@ -23,6 +25,21 @@ pub struct LegacySnapshotReceiptService<'a> {
 impl<'a> LegacySnapshotReceiptService<'a> {
     pub fn new(store: &'a HostStore) -> Self {
         Self { store }
+    }
+
+    pub(crate) fn read_receipt_optional(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<VerifiedReceipt>, WorkerError> {
+        let directory = self.store.open_directory("verified", false)?;
+        let name = format!("{job_id}.json");
+        if !directory.entry_exists(&name)? {
+            return Ok(None);
+        }
+        let bytes = directory
+            .read_private_regular(&name, 1024 * 1024)
+            .map_err(|_| unsafe_remote_snapshot())?;
+        decode_canonical_json(&bytes, "verified receipt").map(Some)
     }
 
     pub(crate) fn validate_resolution_evidence_after(
@@ -379,6 +396,40 @@ pub(crate) fn validate_digest(value: &str, field: &str) -> Result<(), WorkerErro
 
 pub(crate) fn protocol_error(message: &str) -> WorkerError {
     WorkerError::Protocol(message.into())
+}
+
+pub(crate) fn validate_receipt_identity(
+    receipt: &VerifiedReceipt,
+    lease: &LeaseRecord,
+    request_fingerprint: &RequestFingerprint,
+) -> Result<(), WorkerError> {
+    receipt.validate()?;
+    if receipt.job_id != lease.job_id()
+        || receipt.client_id != lease.client_id()
+        || receipt.lease_token_sha256 != lease_token_hash(lease.lease_token())
+        || &receipt.request_fingerprint != request_fingerprint
+        || receipt.project_id != lease.project_id()
+        || receipt.worktree_id != lease.worktree_id()
+        || receipt.manifest_digest != lease.manifest_digest()
+    {
+        return Err(lease_identity_mismatch());
+    }
+    Ok(())
+}
+
+pub(crate) fn lease_token_hash(token: LeaseToken) -> String {
+    format!("{:x}", Sha256::digest(token.to_string().as_bytes()))
+}
+
+pub(crate) fn lease_identity_mismatch() -> WorkerError {
+    protocol_code(
+        "LEASE_IDENTITY_MISMATCH",
+        "live lease identity was rejected",
+    )
+}
+
+pub(crate) fn protocol_code(code: &'static str, message: &str) -> WorkerError {
+    WorkerError::Protocol(format!("{code}: {message}"))
 }
 
 #[cfg(test)]
