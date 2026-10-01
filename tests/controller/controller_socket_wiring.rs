@@ -2396,7 +2396,7 @@ mod t7a {
             let mut writer = Command::new("/usr/bin/python3")
                 .args([
                     "-c",
-                    "import fcntl,sys\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('locked',flush=True)\nsys.stdin.buffer.read(1)\n",
+                    "import fcntl,sys\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('locked',flush=True)\nsys.stdin.buffer.read(1)\nfcntl.flock(f,fcntl.LOCK_UN)\nsys.stdin.buffer.read(1)\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:\n sys.exit(0)\nsys.exit(1)\n",
                 ])
                 .arg(fixture.paths.state.join("jobs.lock"))
                 .stdin(Stdio::piped())
@@ -2421,7 +2421,11 @@ mod t7a {
                 }
             });
             assert!(contended, "the real writer must hold the state fence first");
-            assert!(writer.wait().unwrap().success());
+            writer.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+            assert!(
+                writer.wait().unwrap().success(),
+                "the returned guard must exclude the real writer"
+            );
             drop(lock);
         }
 

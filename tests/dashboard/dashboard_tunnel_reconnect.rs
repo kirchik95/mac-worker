@@ -431,6 +431,11 @@ fn signal_during_backoff_exits_cleanly() {
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(0), "stderr={stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 0, "{stderr}");
+    assert_eq!(
+        read_pid(&homes.generation_file),
+        1,
+        "backoff signal must precede the next SSH attempt: {stderr}"
+    );
 }
 
 #[test]
