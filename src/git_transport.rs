@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{WorkerEntry, valid_ssh_destination},
     error::{ProcessError, WorkerError},
-    host_store::{HostStore, HostStoreWritePoint},
+    host_store::{HostStore, HostStoreWritePoint, TransferGuard},
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::RootedDir,
@@ -646,6 +646,17 @@ pub trait GitServerExecutor: Send + Sync {
         mirror: &RootedDir,
         environment: &[(OsString, OsString)],
     ) -> Result<Infallible, WorkerError>;
+
+    fn exec_with_transfer_lock(
+        &self,
+        program: &str,
+        mirror: &RootedDir,
+        environment: &[(OsString, OsString)],
+        transfer: &TransferGuard,
+    ) -> Result<Infallible, WorkerError> {
+        transfer.raw_lock_fd_for_exec()?;
+        self.exec(program, mirror, environment)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -658,6 +669,33 @@ impl GitServerExecutor for SystemGitServerExecutor {
         mirror: &RootedDir,
         environment: &[(OsString, OsString)],
     ) -> Result<Infallible, WorkerError> {
+        self.exec_server(program, mirror, environment, None)
+    }
+
+    fn exec_with_transfer_lock(
+        &self,
+        program: &str,
+        mirror: &RootedDir,
+        environment: &[(OsString, OsString)],
+        transfer: &TransferGuard,
+    ) -> Result<Infallible, WorkerError> {
+        self.exec_server(
+            program,
+            mirror,
+            environment,
+            Some(transfer.raw_lock_fd_for_exec()?),
+        )
+    }
+}
+
+impl SystemGitServerExecutor {
+    fn exec_server(
+        &self,
+        program: &str,
+        mirror: &RootedDir,
+        environment: &[(OsString, OsString)],
+        transfer_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<Infallible, WorkerError> {
         let executable = match program {
             "git-receive-pack" => GIT_RECEIVE_PACK_PROGRAM,
             "git-upload-pack" => GIT_UPLOAD_PACK_PROGRAM,
@@ -665,6 +703,11 @@ impl GitServerExecutor for SystemGitServerExecutor {
         };
         mirror.verify_descriptors_cloexec()?;
         let directory_fd = mirror.raw_directory_fd();
+        let fd_ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if fd_ceiling < 0 || fd_ceiling > i64::from(i32::MAX) {
+            return Err(WorkerError::Io(std::io::Error::last_os_error()));
+        }
+        let fd_ceiling = fd_ceiling as i32;
         let mut command = Command::new(executable);
         apply_isolated_git_environment(&mut command);
         command
@@ -678,10 +721,46 @@ impl GitServerExecutor for SystemGitServerExecutor {
                 if libc::fchdir(directory_fd) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                for descriptor in 3..fd_ceiling {
+                    if Some(descriptor) != transfer_fd {
+                        let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                        if flags == -1 {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::EBADF) {
+                                return Err(error);
+                            }
+                        } else if flags & libc::FD_CLOEXEC == 0
+                            && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC)
+                                == -1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
+                if let Some(transfer_fd) = transfer_fd {
+                    let flags = libc::fcntl(transfer_fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(transfer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
-        Err(WorkerError::Io(command.exec()))
+        let error = command.exec();
+        if let Some(transfer_fd) = transfer_fd {
+            // Exec failure returns to the caller with the original lock still
+            // held. Restore its close-on-exec discipline before any retry.
+            let flags = unsafe { libc::fcntl(transfer_fd, libc::F_GETFD) };
+            if flags == -1
+                || unsafe { libc::fcntl(transfer_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) }
+                    == -1
+            {
+                return Err(WorkerError::Io(std::io::Error::last_os_error()));
+            }
+        }
+        Err(WorkerError::Io(error))
     }
 }
 
@@ -726,13 +805,14 @@ impl<'a> HostGitService<'a> {
         let _transfer_fd = transfer.raw_lock_fd_for_exec()?;
         self.store.verify_descriptors_cloexec()?;
         drop(admission);
-        executor.exec(
+        executor.exec_with_transfer_lock(
             "git-receive-pack",
             &mirror,
             &[
                 (GIT_CONFIG_GLOBAL.into(), "/dev/null".into()),
                 (GIT_CONFIG_NOSYSTEM.into(), "1".into()),
             ],
+            &transfer,
         )
     }
 

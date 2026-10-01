@@ -2740,12 +2740,13 @@ mod exec_inheritance_tests {
         hooks: PathBuf,
     }
 
-    impl crate::git_transport::GitServerExecutor for ProbedSystemGitExecutor {
-        fn exec(
+    impl ProbedSystemGitExecutor {
+        fn exec_probe(
             &self,
             program: &str,
             mirror: &RootedDir,
             environment: &[(OsString, OsString)],
+            transfer: Option<&TransferGuard>,
         ) -> Result<std::convert::Infallible, WorkerError> {
             let metadata = std::fs::metadata(&self.lock_path)?;
             let ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
@@ -2779,12 +2780,43 @@ mod exec_inheritance_tests {
             assert_eq!(unsafe { libc::dup2(9, 1) }, 1);
             assert_eq!(unsafe { libc::close(8) }, 0);
             assert_eq!(unsafe { libc::close(9) }, 0);
-            crate::git_transport::GitServerExecutor::exec(
-                &crate::git_transport::SystemGitServerExecutor,
-                program,
-                mirror,
-                &environment,
-            )
+            let executor = crate::git_transport::SystemGitServerExecutor;
+            match transfer {
+                Some(transfer) => crate::git_transport::GitServerExecutor::exec_with_transfer_lock(
+                    &executor,
+                    program,
+                    mirror,
+                    &environment,
+                    transfer,
+                ),
+                None => crate::git_transport::GitServerExecutor::exec(
+                    &executor,
+                    program,
+                    mirror,
+                    &environment,
+                ),
+            }
+        }
+    }
+
+    impl crate::git_transport::GitServerExecutor for ProbedSystemGitExecutor {
+        fn exec(
+            &self,
+            program: &str,
+            mirror: &RootedDir,
+            environment: &[(OsString, OsString)],
+        ) -> Result<std::convert::Infallible, WorkerError> {
+            self.exec_probe(program, mirror, environment, None)
+        }
+
+        fn exec_with_transfer_lock(
+            &self,
+            program: &str,
+            mirror: &RootedDir,
+            environment: &[(OsString, OsString)],
+            transfer: &TransferGuard,
+        ) -> Result<std::convert::Infallible, WorkerError> {
+            self.exec_probe(program, mirror, environment, Some(transfer))
         }
     }
 
