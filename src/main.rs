@@ -7,6 +7,13 @@ use clap::{Parser, error::ErrorKind};
 use mac_worker::{cli::Cli, process::SystemProcessRunner, run_with_stdio};
 
 fn main() -> ExitCode {
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("MAC_WORKER_TEST_SUPPORT_PROBE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        println!("{}", mac_worker::test_support::runtime::FEATURE_MARKER);
+        return ExitCode::SUCCESS;
+    }
     if mac_worker::prepare_turn::requested() {
         return mac_worker::prepare_turn::run();
     }

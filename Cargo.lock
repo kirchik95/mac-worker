@@ -698,6 +698,7 @@ dependencies = [
  "globset",
  "humantime",
  "libc",
+ "mac-worker",
  "predicates",
  "proptest",
  "serde",

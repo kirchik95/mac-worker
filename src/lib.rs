@@ -133,9 +133,9 @@ pub mod turn_runner;
 
 #[cfg(test)]
 pub(crate) mod fixture_pid;
-#[cfg(test)]
-#[path = "../tests/support/test_sync.rs"]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(test)]
 pub(crate) mod test_sync;
 
