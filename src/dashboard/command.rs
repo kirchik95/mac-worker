@@ -71,28 +71,6 @@ impl SystemDashboardLauncher {
         self.events = Some(source);
         self
     }
-    pub fn from_system(
-        config: Arc<Config>,
-        local_jobs: Arc<ClientStateStore>,
-        paths: PathLayout,
-    ) -> Self {
-        Self::from_system_for_directory(config, local_jobs, None, paths)
-    }
-
-    pub fn from_system_for_directory(
-        config: Arc<Config>,
-        local_jobs: Arc<ClientStateStore>,
-        launch_directory: Option<&Path>,
-        paths: PathLayout,
-    ) -> Self {
-        Self::from_system_with_config(
-            config,
-            local_jobs,
-            launch_directory,
-            DashboardConfig::default(),
-            paths,
-        )
-    }
 
     pub fn from_system_with_config(
         config: Arc<Config>,

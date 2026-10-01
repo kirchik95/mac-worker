@@ -522,15 +522,6 @@ impl<'a> OriginOutbox<'a> {
         )
     }
 
-    pub fn is_enabled(&self) -> Result<bool, WorkerError> {
-        let locks = self.store.open_directory("locks", false)?;
-        if !locks.entry_exists("outbox-enabled.json")? {
-            return Ok(false);
-        }
-        let enabled: OutboxEnabled = read_json(&locks, "outbox-enabled.json")?;
-        Ok(enabled.watch)
-    }
-
     pub fn watch_args(host_root: &Path) -> Result<Vec<OsString>, WorkerError> {
         let root = validate_host_root(host_root)?;
         Ok(vec![

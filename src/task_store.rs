@@ -1196,28 +1196,6 @@ impl<'a> TaskStore<'a> {
         self.read_status(&task)
     }
 
-    pub fn prepared_turn(
-        &self,
-        project_id: &str,
-        task_id: TaskId,
-        turn_id: JobId,
-    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
-        let task = self.open_existing_task(project_id, task_id)?;
-        let meta = self.read_meta(&task)?;
-        let status = self.read_status(&task)?;
-        let pending = status
-            .turns()
-            .last()
-            .filter(|turn| turn.turn_id() == turn_id && turn.terminal().is_none());
-        if status.state() != TaskState::Active || pending.is_none() {
-            return Err(task_error(
-                "TASK_BUSY",
-                "task does not have the requested prepared active turn",
-            ));
-        }
-        Ok((meta, status))
-    }
-
     /// Reopens an existing task workspace for a follow-up turn without
     /// recreating it from the original base. The caller must already hold
     /// the exact task-turn lease; this method is the host-side durable

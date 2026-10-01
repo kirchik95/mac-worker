@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -73,12 +73,6 @@ pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, WorkerError> {
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
-}
-
-pub fn write_frame(writer: &mut dyn Write, payload: &[u8]) -> Result<(), WorkerError> {
-    let frame = encode_frame(payload)?;
-    writer.write_all(&frame).map_err(WorkerError::Io)?;
-    writer.flush().map_err(WorkerError::Io)
 }
 
 pub fn encode_json_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, WorkerError> {

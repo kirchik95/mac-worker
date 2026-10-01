@@ -6,7 +6,6 @@ use crate::{
     agent::{PermissionPolicy, TurnLimits},
     error::WorkerError,
     job::ProcessIdentity,
-    supervisor::ProcessObservation,
     task::{
         BaseOid, BranchName, ClosePolicy, LocalTaskRecord, RunId, RunProgress, TaskId, TaskLimits,
         TaskOutcome, TaskState, TurnId,
@@ -400,16 +399,6 @@ pub fn dag_pin_ref(run_id: RunId, batch_id: &str) -> String {
 pub fn parse_from_base(base: &str) -> Option<&str> {
     base.strip_prefix("from:")
         .filter(|parent| !parent.is_empty())
-}
-
-/// Observation-only Matching|Ambiguous check. First `Absent` is not live
-/// here, so this helper must not drive production occupancy: slot and DAG claim
-/// paths use `runner_identity_verdict` and occupy until `Exited`.
-pub fn claim_owner_is_live(observation: ProcessObservation) -> bool {
-    matches!(
-        observation,
-        ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous
-    )
 }
 
 /// Recoverable claim authority: live foreign owners skip; dead/absent owners

@@ -271,14 +271,6 @@ impl<'a> LeaseService<'a> {
         Ok(())
     }
 
-    pub fn promotion_blocked(&self) -> Result<(), WorkerError> {
-        self.store.validate_layout()?;
-        if !self.load_all_locked()?.is_empty() {
-            return Err(upgrade_drain_required("a live lease is still present"));
-        }
-        Ok(())
-    }
-
     pub(crate) fn load_after(
         &self,
         admission: &crate::host_store::AdmissionGuard,
@@ -563,10 +555,6 @@ fn validate_slot_count(slot_count: u8) -> Result<(), WorkerError> {
         )));
     }
     Ok(())
-}
-
-fn upgrade_drain_required(message: &str) -> WorkerError {
-    WorkerError::Unavailable(format!("HOST_UPGRADE_DRAIN_REQUIRED: {message}"))
 }
 
 fn read_slot_count(leases: &RootedDir) -> Result<u8, WorkerError> {

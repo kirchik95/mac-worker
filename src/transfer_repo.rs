@@ -1006,19 +1006,6 @@ impl TransferRepo {
         }
     }
 
-    /// Pin a frozen OID as the task base without recapturing HEAD or WIP.
-    pub fn attach_pinned_base(
-        &self,
-        runner: &dyn ProcessRunner,
-        task_id: TaskId,
-        oid: &BaseOid,
-        wip: bool,
-    ) -> Result<BaseCommit, WorkerError> {
-        self.require_owned_frozen_commit(runner, oid)?;
-        self.update_ref(runner, &base_ref(task_id), Some(oid.as_str()))?;
-        Ok(BaseCommit::from_pinned(oid.clone(), wip))
-    }
-
     /// Copy the reachable graph into this repository's own object store.
     /// Does not mutate `objects/info/alternates`; concurrent transfer users
     /// keep their live alternate.

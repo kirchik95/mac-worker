@@ -1153,16 +1153,6 @@ impl TaskSummary {
     pub fn updated_at_millis(&self) -> u64 {
         self.updated_at_millis
     }
-
-    /// Replaces the advisory runner state used by read-only client views.
-    ///
-    /// The durable task record only stores the runner identity.  Callers that
-    /// project a summary can therefore attach the result of a process-table
-    /// observation without changing the task record itself.
-    pub fn with_runner_state(mut self, runner: Option<RunnerState>) -> Self {
-        self.runner = runner;
-        self
-    }
 }
 
 impl Serialize for TaskSummary {

@@ -175,16 +175,6 @@ pub fn read_health_status(path: &Path) -> Result<ControllerHealthStatus, WorkerE
     read_health_status_with_features(path, features)
 }
 
-pub fn read_health_status_with_paths(
-    paths: &crate::paths::PathLayout,
-    home: &Path,
-) -> Result<ControllerHealthStatus, WorkerError> {
-    read_health_status_with_features(
-        &paths.controller_state_root(),
-        serving_features(paths, home),
-    )
-}
-
 fn read_health_status_with_features(
     path: &Path,
     features: Vec<String>,

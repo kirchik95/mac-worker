@@ -3854,17 +3854,6 @@ impl ClientStateStore {
         self.list_pending_index_ids_locked()
     }
 
-    pub fn retire_pending_dag_if_quiescent(&self, run_id: RunId) -> Result<(), WorkerError> {
-        let _lock = self.acquire_state_lock()?;
-        let Some(dag) = self.load_run_dag_locked(run_id)? else {
-            return Ok(());
-        };
-        if dag_run_is_quiescent(&dag) {
-            self.retire_pending_dag_locked(run_id)?;
-        }
-        Ok(())
-    }
-
     pub fn claim_next_eligible_dag_node(
         &self,
         run_id: RunId,
@@ -4442,37 +4431,6 @@ impl ClientStateStore {
             return Err(invalid_state("run filename and record identity differ"));
         }
         let replacement = existing.reserve_publish_branch_for_task(task_id, branch)?;
-        let bytes = run_record_bytes(&replacement)?;
-        self.replace_run_record(&runs, &name, &old, &bytes)?;
-        Ok(replacement)
-    }
-
-    pub fn release_run_publish_branch(
-        &self,
-        run_id: RunId,
-        branch: &BranchName,
-    ) -> Result<RunRecord, WorkerError> {
-        if self.take_fault(ClientStateWritePoint::BeforeRunPublishBranchRelease) {
-            return Err(injected_failure(
-                ClientStateWritePoint::BeforeRunPublishBranchRelease,
-            ));
-        }
-        let _lock = self.acquire_state_lock()?;
-        let runs = self.runs_dir()?;
-        let names = runs.list_names().map_err(WorkerError::Io)?;
-        self.recover_run_replacement_residue(&runs, &names)?;
-        let name = run_file_name(run_id)?;
-        let old = runs
-            .read_private_regular(&name, MAX_STATE_FILE_BYTES as u64)
-            .map_err(WorkerError::Io)?;
-        let existing = parse_run_record(&old)?;
-        if existing.run_id() != run_id {
-            return Err(invalid_state("run filename and record identity differ"));
-        }
-        let replacement = existing.release_publish_branch(branch);
-        if replacement == existing {
-            return Ok(existing);
-        }
         let bytes = run_record_bytes(&replacement)?;
         self.replace_run_record(&runs, &name, &old, &bytes)?;
         Ok(replacement)

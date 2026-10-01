@@ -444,10 +444,6 @@ impl ScriptedEventSource {
     pub fn discovery_deadlines(&self) -> Vec<Duration> {
         self.discovery_deadlines.lock().unwrap().clone()
     }
-    pub fn clear_requests(&self) {
-        self.requests.lock().unwrap().clear();
-        self.discovery_deadlines.lock().unwrap().clear();
-    }
 }
 impl EventSource for ScriptedEventSource {
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
@@ -599,9 +595,6 @@ impl MemoryTaskReader {
     }
     pub fn set_baseline(&self, baseline: Option<EventCursor>) {
         self.inner.lock().unwrap().baseline = baseline;
-    }
-    pub fn set_binding(&self, binding: u64) {
-        self.inner.lock().unwrap().binding = binding;
     }
     pub fn set_directory_entries(&self, count: usize) {
         self.inner.lock().unwrap().directory_entries = count;

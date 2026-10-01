@@ -298,34 +298,6 @@ impl<'a> GitTransport<'a> {
         }
     }
 
-    /// True when the delivery pin already names this OID. Does not pack or fsync.
-    pub fn delivery_pin_matches(
-        &self,
-        mirror: &RootedDir,
-        task_id: TaskId,
-        turn_id: crate::task::TurnId,
-        oid: &BaseOid,
-    ) -> Result<bool, WorkerError> {
-        let reference = delivery_pin_ref(task_id, turn_id);
-        let current = self
-            .runner
-            .run(&git_request(
-                mirror.path(),
-                None,
-                vec![
-                    OsString::from("rev-parse"),
-                    OsString::from("--verify"),
-                    OsString::from("--quiet"),
-                    reference.into(),
-                ],
-            ))
-            .map_err(|_| git_error("REF_UPDATE_FAILED", "delivery pin could not be read"))?;
-        if !current.status.success() {
-            return Ok(false);
-        }
-        Ok(String::from_utf8_lossy(&current.stdout).trim() == oid.as_str())
-    }
-
     pub fn list_delivery_pins(
         &self,
         mirror: &RootedDir,

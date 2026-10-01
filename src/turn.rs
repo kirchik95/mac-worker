@@ -39,10 +39,6 @@ use crate::{
 
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const LOG_TAIL_BYTES: usize = 64 * 1024;
-/// stderr.log is not a strict `LOG_CAP_BYTES` file: the pump writes a prefix of
-/// at most `LOG_CAP_BYTES`, then may append up to `LOG_TAIL_BYTES` of the late
-/// stream so a post-cap failure remains visible. Disk bound, not a cap.
-pub const STDERR_LOG_BOUND_BYTES: u64 = LOG_CAP_BYTES + LOG_TAIL_BYTES as u64;
 pub(crate) const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_ENV_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
@@ -798,28 +794,6 @@ impl TaskTurnRequest {
 
     pub fn herdr_reporter(&self) -> bool {
         self.herdr_reporter
-    }
-
-    #[doc(hidden)]
-    pub fn with_turn(&self, turn: TurnMaterial) -> Self {
-        Self {
-            submit: self.submit.clone(),
-            turn,
-            prompt: self.prompt.clone(),
-            origin_url: self.origin_url.clone(),
-            herdr_reporter: self.herdr_reporter,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn with_prompt(&self, prompt: impl Into<String>) -> Self {
-        Self {
-            submit: self.submit.clone(),
-            turn: self.turn.clone(),
-            prompt: prompt.into(),
-            origin_url: self.origin_url.clone(),
-            herdr_reporter: self.herdr_reporter,
-        }
     }
 }
 

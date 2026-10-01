@@ -50,8 +50,8 @@ use crate::{
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
     turn_runner::{
-        DetachedRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
-        last_post_acceptance_public_code, start_runner_with_reservation,
+        RunnerExecutor, RunnerStart, TurnRunner, last_post_acceptance_public_code,
+        start_runner_with_reservation,
     },
 };
 
@@ -1181,15 +1181,6 @@ impl<'a> TaskClient<'a> {
     ) -> Self {
         self.drain_wait = Some(wait);
         self
-    }
-
-    pub fn with_detached_executor(
-        runner: &'a dyn ProcessRunner,
-        config: &'a Config,
-        paths: &'a PathLayout,
-        client_state: &'a ClientStateStore,
-    ) -> Self {
-        Self::new(runner, config, paths, client_state, &DetachedRunnerExecutor)
     }
 
     pub fn default_task_agent(&self, project: &Path) -> Result<AgentKind, WorkerError> {
@@ -4658,15 +4649,6 @@ impl<'a> TaskClient<'a> {
             quiescent,
             exit_code,
         })
-    }
-
-    pub fn preview_batch(&self, file: &Path) -> Result<BatchPreview, WorkerError> {
-        preview_batch_plan(
-            self.runner,
-            self.config,
-            file,
-            &std::env::current_dir().map_err(WorkerError::Io)?,
-        )
     }
 }
 

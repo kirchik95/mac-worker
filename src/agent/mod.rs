@@ -38,7 +38,6 @@ pub const RESULT_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"status":
 pub const TURN_DIR_ENV: &str = "MAC_WORKER_TURN_DIR";
 pub const SCHEMA_FILE_NAME: &str = "result.schema.json";
 pub const LAST_MESSAGE_FILE_NAME: &str = "last.md";
-pub const PROMPT_FILE_NAME: &str = "prompt.md";
 pub const PROMPT_POINTER: &str = "Read the task from $MAC_WORKER_TURN_DIR/prompt.md and follow it.";
 pub const OPENCODE_RESULT_INSTRUCTION: &str = "OpenCode: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence or add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
 pub const CURSOR_RESULT_INSTRUCTION: &str = "Cursor: end your final message with exactly the JSON object and nothing after it. Do not wrap it in a Markdown code fence, do not render it as Markdown, and do not add prose. The object must have \"status\" set to \"done\", \"needs_input\", or \"blocked\", plus string \"summary\", string-array \"files_changed\", array \"questions\" whose items are objects with string \"text\" and string-array \"options\" (empty \"options\" for an open question), and array \"checks\" of objects with string \"name\", \"command\", \"detail\" and \"status\" one of pass/fail/not_run/error. Use an empty \"checks\" array if you did not run tests. mac-worker will not treat a reported pass as laptop-verified.";
@@ -774,18 +773,6 @@ fn tail_bytes(bytes: &[u8], tail: usize) -> &[u8] {
     } else {
         &bytes[bytes.len() - tail..]
     }
-}
-
-/// Last `tail` bytes of `value`, snapped to a UTF-8 boundary.
-pub fn tail_utf8(value: &str, tail: usize) -> &str {
-    if value.len() <= tail {
-        return value;
-    }
-    let start = value.len() - tail;
-    let start = (start..=value.len())
-        .find(|index| value.is_char_boundary(*index))
-        .unwrap_or(value.len());
-    &value[start..]
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {

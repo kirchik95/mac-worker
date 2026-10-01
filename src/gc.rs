@@ -85,18 +85,6 @@ impl GcRequest {
         }
     }
 
-    pub fn with_retention(
-        mut self,
-        task_retention_millis: u64,
-        branch_retention_millis: u64,
-        job_retention_millis: u64,
-    ) -> Self {
-        self.task_retention_millis = task_retention_millis;
-        self.branch_retention_millis = branch_retention_millis;
-        self.job_retention_millis = job_retention_millis;
-        self
-    }
-
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }

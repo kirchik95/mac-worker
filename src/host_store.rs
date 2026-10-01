@@ -2228,13 +2228,6 @@ impl HostStore {
         self.with_installation_lock(|| self.inspect_protocol_upgrade_locked())
     }
 
-    pub fn require_protocol_upgrade_drain_at(root: &Path) -> Result<(), WorkerError> {
-        match Self::open_if_present(root)? {
-            Some(store) => store.require_protocol_upgrade_drain(),
-            None => Ok(()),
-        }
-    }
-
     fn inspect_protocol_upgrade_locked(&self) -> Result<(), WorkerError> {
         inspect_protocol_upgrade_namespaces(&self.inner.namespaces)
     }

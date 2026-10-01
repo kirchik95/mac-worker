@@ -5,7 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::{
@@ -30,7 +30,6 @@ use crate::{
 
 /// Agent facts remain usable for fifteen minutes before a runner must refresh them.
 pub const FACTS_TTL: u64 = 15 * 60 * 1000;
-pub const FACTS_TTL_MILLIS: u64 = FACTS_TTL;
 /// Prefix of the interned reason written when a turn died of an authentication
 /// failure. The rest is an ISO-8601 UTC minute so the string stays bounded.
 pub const TURN_AUTH_FAILURE_REASON_PREFIX: &str = "auth failed in a turn at ";
@@ -1079,30 +1078,6 @@ fn is_deadline_error(error: &WorkerError) -> bool {
     )
 }
 
-/// Collect facts using the current wall-clock time in milliseconds.
-pub fn collect_agent_facts<P>(
-    runner: &dyn ProcessRunner,
-    account_home: &Path,
-    profiles: &[P],
-) -> AgentFacts
-where
-    P: ProfileInput,
-{
-    collect_agent_facts_with_timing(runner, account_home, profiles).0
-}
-
-/// Collect facts and the per-step durations that produced them.
-pub fn collect_agent_facts_with_timing<P>(
-    runner: &dyn ProcessRunner,
-    account_home: &Path,
-    profiles: &[P],
-) -> (AgentFacts, FactsTiming)
-where
-    P: ProfileInput,
-{
-    collect_agent_facts_at_with_timing(runner, account_home, profiles, current_time_millis())
-}
-
 /// Collect facts under an explicit budget and clock. The collection stops
 /// when the clock reaches `budget` and records
 /// [`FACTS_REFRESH_BUDGET_REASON`] for agents it did not finish.
@@ -1754,13 +1729,6 @@ fn herdr_locate_and_version(
         HERDR_VERSION_MAX_BYTES,
         deadline,
     )
-}
-
-fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn agent_name(kind: AgentKind) -> &'static str {

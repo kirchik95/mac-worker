@@ -490,11 +490,6 @@ impl HerdrClient {
             .map(|_| ())
     }
 
-    /// Close a whole workspace with every tab in it.
-    pub fn workspace_close(&self, workspace_id: &str) -> Result<(), HerdrError> {
-        self.workspace_close_limited(workspace_id, None)
-    }
-
     pub fn workspace_close_within(
         &self,
         workspace_id: &str,

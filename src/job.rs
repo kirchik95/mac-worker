@@ -3437,25 +3437,6 @@ impl ExecutionScope {
     pub fn is_job(&self) -> bool {
         matches!(self, Self::Job)
     }
-
-    pub fn require_job(&self) -> Result<(), WorkerError> {
-        if self.is_job() {
-            Ok(())
-        } else {
-            Err(protocol_error(
-                "EXECUTION_SCOPE_CONFLICT: live lease is bound to a task workspace",
-            ))
-        }
-    }
-
-    pub fn require_task(&self, task_id: crate::task::TaskId) -> Result<(), WorkerError> {
-        match self {
-            Self::Task { task_id: bound } if *bound == task_id => Ok(()),
-            _ => Err(protocol_error(
-                "EXECUTION_SCOPE_CONFLICT: live lease is not bound to this task workspace",
-            )),
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
