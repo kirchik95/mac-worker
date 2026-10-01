@@ -1,6 +1,6 @@
 # Prepare a Mac worker
 
-Start with one Apple Silicon Mac and one agent. Commands below say whether they run on the **laptop** (controller) or the **worker**. Replace `yourname@mini.local` with the worker account and hostname or IP address.
+Start with one Apple Silicon Mac and one agent. Commands below say whether they run on the **laptop** or the **worker**. Replace `yourname@mini.local` with the worker account and hostname or IP address.
 
 ## 1. Prepare the worker
 
