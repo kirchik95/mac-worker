@@ -47,6 +47,13 @@ struct FrozenFixture {
     runtime: Arc<ManualRuntime>,
 }
 impl FrozenFixture {
+    fn for_channel(
+        reads: Vec<Result<ProcessResult, ChannelFailure>>,
+        mut raw: Vec<Result<ProcessResult, WorkerError>>,
+    ) -> Self {
+        raw.insert(0, Ok(marker("raw", 0)));
+        Self::new(reads, raw)
+    }
     fn new(
         reads: Vec<Result<ProcessResult, ChannelFailure>>,
         raw: Vec<Result<ProcessResult, WorkerError>>,
@@ -84,6 +91,23 @@ impl FrozenFixture {
             paths(),
             self.deps(),
         )
+    }
+    fn primed_runner(&self, scope: ReadLoopScope) -> ChannelProcessRunner<Arc<dyn ProcessRunner>> {
+        let runner = self.runner(scope);
+        self.prime(&runner, scope);
+        runner
+    }
+    fn prime<R: ProcessRunner>(&self, runner: &ChannelProcessRunner<R>, scope: ReadLoopScope) {
+        let first = scoped_read(scope, u64::MAX);
+        assert_eq!(runner.run(&first).unwrap().stdout, b"raw");
+        assert_eq!(self.raw.calls(), [first]);
+        assert_eq!(self.forwards.resolutions(), 0);
+        assert_eq!(self.forwards.opens(), 0);
+        assert_eq!(self.connector.connections(), 0);
+        assert!(self.pins.pin().is_none());
+    }
+    fn raw_calls_after_first_read(&self) -> Vec<ProcessRequest> {
+        self.raw.calls()[1..].to_vec()
     }
 }
 fn read_result(request: &ProcessRequest) -> ProcessResult {
@@ -147,6 +171,22 @@ impl Fixture {
             paths(),
             self.deps(),
         )
+    }
+    fn primed_runner(&self, scope: ReadLoopScope) -> ChannelProcessRunner<Arc<dyn ProcessRunner>> {
+        let runner = self.runner(scope);
+        self.prime(&runner, scoped_read(scope, u64::MAX));
+        runner
+    }
+    fn prime<R: ProcessRunner>(&self, runner: &ChannelProcessRunner<R>, first: ProcessRequest) {
+        assert_eq!(runner.run(&first).unwrap().stdout, b"raw");
+        assert!(self.steps().is_empty());
+        assert!(self.0.frames.lock().unwrap().is_empty());
+        assert_eq!(
+            self.0.raw_calls.lock().unwrap().as_slice(),
+            [("interruptible", first)]
+        );
+        // Later policy assertions count calls after the verified initial raw read.
+        self.0.raw_calls.lock().unwrap().clear();
     }
     fn deps(&self) -> ClientDeps {
         ClientDeps {
@@ -475,6 +515,103 @@ fn socket_result(result: &ProcessResult) -> bool {
     result.stdout.windows(6).any(|value| value == b"socket")
 }
 
+fn scoped_read(scope: ReadLoopScope, sequence: u64) -> ProcessRequest {
+    match scope {
+        ReadLoopScope::Wait => wait(sequence),
+        ReadLoopScope::LogsFollow => process_request(
+            "task.logs",
+            serde_json::json!({"task_id":"11111111111141118111111111111111"}),
+            sequence,
+        ),
+        ReadLoopScope::EventsFollow | ReadLoopScope::Notify => process_request(
+            "task.list",
+            serde_json::json!({"controller_events":{"op":"read"}}),
+            sequence,
+        ),
+    }
+}
+
+#[test]
+fn first_eligible_read_is_raw_and_second_read_sets_up_the_channel() {
+    for scope in [
+        ReadLoopScope::Wait,
+        ReadLoopScope::LogsFollow,
+        ReadLoopScope::EventsFollow,
+        ReadLoopScope::Notify,
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(scope);
+        let first = scoped_read(scope, 1);
+        assert_eq!(runner.run(&first).unwrap().stdout, b"raw");
+        assert_eq!(
+            fixture.0.raw_calls.lock().unwrap().as_slice(),
+            [("interruptible", first)]
+        );
+        assert!(
+            fixture.steps().is_empty(),
+            "first read must not resolve or read identity"
+        );
+        assert!(fixture.0.frames.lock().unwrap().is_empty());
+
+        let second = scoped_read(scope, 2);
+        assert!(socket_result(&runner.run(&second).unwrap()));
+        assert_eq!(fixture.count("resolve"), 1);
+        assert_eq!(fixture.count("identity"), 1);
+        assert_eq!(fixture.count("open"), 1);
+        assert_eq!(*fixture.0.frames.lock().unwrap(), [second.stdin.unwrap()]);
+        assert_eq!(fixture.0.raw_calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn a_loop_ending_after_one_read_never_sets_up_the_channel() {
+    for scope in [
+        ReadLoopScope::Wait,
+        ReadLoopScope::LogsFollow,
+        ReadLoopScope::EventsFollow,
+        ReadLoopScope::Notify,
+    ] {
+        let fixture = Fixture::new();
+        let request = scoped_read(scope, 1);
+        {
+            let runner = fixture.runner(scope);
+            assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
+            assert_eq!(runner.close(), ForwardDisposition::Cleaned);
+        }
+        assert!(fixture.steps().is_empty());
+        assert!(fixture.0.frames.lock().unwrap().is_empty());
+        assert!(!fixture.0.residue.load(Ordering::SeqCst));
+        assert_eq!(
+            fixture.0.raw_calls.lock().unwrap().as_slice(),
+            [("interruptible", request)]
+        );
+    }
+}
+
+#[test]
+fn excluded_reads_do_not_advance_second_read_setup() {
+    for scope in [
+        ReadLoopScope::Wait,
+        ReadLoopScope::LogsFollow,
+        ReadLoopScope::EventsFollow,
+        ReadLoopScope::Notify,
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(scope);
+        let excluded = process_request("task.status", serde_json::json!({}), 9);
+        assert_eq!(runner.run(&excluded).unwrap().stdout, b"raw");
+        let first = scoped_read(scope, 1);
+        assert_eq!(runner.run(&first).unwrap().stdout, b"raw");
+        assert!(fixture.steps().is_empty());
+        assert!(socket_result(&runner.run(&scoped_read(scope, 2)).unwrap()));
+        assert_eq!(fixture.count("open"), 1);
+        assert_eq!(
+            fixture.0.raw_calls.lock().unwrap().as_slice(),
+            [("run", excluded), ("interruptible", first)]
+        );
+    }
+}
+
 #[test]
 fn exact_controller_rpc_reads_use_only_their_loop_scope() {
     let mut cases = vec![
@@ -540,14 +677,14 @@ fn exact_controller_rpc_reads_use_only_their_loop_scope() {
         }
     }
     for (scope, request) in cases {
-        let fixture = FrozenFixture::new(vec![Ok(read_result(&request))], Vec::new());
-        let runner = fixture.runner(scope);
+        let fixture = FrozenFixture::for_channel(vec![Ok(read_result(&request))], Vec::new());
+        let runner = fixture.primed_runner(scope);
         assert!(
             socket_result(&runner.run(&request).unwrap()),
             "scope {scope:?}"
         );
         assert_eq!(fixture.connector.frames(), [request.stdin.unwrap()]);
-        assert!(fixture.raw.calls().is_empty());
+        assert!(fixture.raw_calls_after_first_read().is_empty());
         assert_eq!(fixture.forwards.opens(), 1);
         assert_eq!(
             fixture.pins.pin(),
@@ -721,7 +858,7 @@ fn raw_methods_preserve_new_session_and_borrowed_interruptible_modes() {
 #[test]
 fn adapter_accepts_a_borrowed_raw_runner() {
     let request = wait(1);
-    let fixture = FrozenFixture::new(vec![Ok(read_result(&request))], Vec::new());
+    let fixture = FrozenFixture::for_channel(vec![Ok(read_result(&request))], Vec::new());
     let runner = ChannelProcessRunner::new(
         &*fixture.raw as &dyn ProcessRunner,
         ReadLoopScope::Wait,
@@ -729,14 +866,15 @@ fn adapter_accepts_a_borrowed_raw_runner() {
         paths(),
         fixture.deps(),
     );
+    fixture.prime(&runner, ReadLoopScope::Wait);
     assert!(socket_result(&runner.run(&request).unwrap()));
-    assert!(fixture.raw.calls().is_empty());
+    assert!(fixture.raw_calls_after_first_read().is_empty());
 }
 
 #[test]
 fn setup_is_lazy_ordered_and_reuses_one_session() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(fixture.steps().is_empty());
     assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
@@ -757,7 +895,7 @@ fn setup_is_lazy_ordered_and_reuses_one_session() {
 fn cold_short_budget_skips_setup_but_ready_session_can_read() {
     for budget in [Duration::from_millis(1), Duration::from_secs(5)] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         let mut request = wait(1);
         request.policy.deadline = budget;
         assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
@@ -774,7 +912,7 @@ fn cold_short_budget_skips_setup_but_ready_session_can_read() {
 #[test]
 fn setup_guard_and_application_share_the_original_budget() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture.0.advances.lock().unwrap().extend([
         ("resolve", Duration::from_millis(250)),
         ("identity", Duration::from_millis(500)),
@@ -815,7 +953,7 @@ fn setup_guard_and_application_share_the_original_budget() {
 fn setup_failure_falls_back_before_application_with_remaining_budget() {
     for stage in ["resolve", "identity", "pin", "open", "connect"] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         fixture.fail(
             stage,
             ChannelFailure::Unavailable(ChannelReason::ServiceUnavailable),
@@ -848,7 +986,7 @@ fn setup_failure_falls_back_before_application_with_remaining_budget() {
 #[test]
 fn setup_guard_expiry_can_use_the_live_application_budget() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture
         .0
         .advances
@@ -876,7 +1014,7 @@ fn unsafe_or_unavailable_identity_and_pin_never_send_socket_reads() {
         "generation",
     ] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         match case {
             "route" => {
                 let mut different = route();
@@ -927,7 +1065,7 @@ fn absent_journal_does_not_disable_wait_or_logs_channel() {
         ),
     ] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(scope);
+        let runner = fixture.primed_runner(scope);
         assert!(
             fixture
                 .0
@@ -945,7 +1083,7 @@ fn absent_journal_does_not_disable_wait_or_logs_channel() {
 #[test]
 fn concurrent_poll_uses_raw_without_queueing_or_second_setup() {
     let fixture = Fixture::new();
-    let runner = Arc::new(fixture.runner(ReadLoopScope::Wait));
+    let runner = Arc::new(fixture.primed_runner(ReadLoopScope::Wait));
     let (entered, release) = fixture.gate("read");
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| runner.run(&wait(1)));
@@ -977,6 +1115,9 @@ fn configured_ssh_file_is_matched_exactly() {
     request
         .args
         .splice(0..0, ["-F".into(), "/config/managed file".into()]);
+    let mut first = wait(u64::MAX);
+    first.args = request.args.clone();
+    fixture.prime(&runner, first);
     assert!(socket_result(&runner.run(&request).unwrap()));
     let mut other = request.clone();
     other.args[1] = "/config/other".into();
@@ -995,7 +1136,7 @@ fn partial_write_or_lost_reply_has_one_identical_raw_fallback() {
         ("read", ChannelReason::Busy),
     ] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         fixture.fail(stage, ChannelFailure::Unavailable(reason));
         fixture
             .0
@@ -1047,7 +1188,7 @@ fn partial_write_or_lost_reply_has_one_identical_raw_fallback() {
 #[test]
 fn fallback_error_is_returned_without_an_adapter_retry() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture.fail(
         "read",
         ChannelFailure::Unavailable(ChannelReason::ForwardLost),
@@ -1073,14 +1214,21 @@ fn same_read_outer_retry_stays_raw_after_eligibility_advances() {
             Err(ChannelFailure::Unavailable(ChannelReason::ForwardLost)),
             Ok(read_result(&next)),
         ],
-        vec![Ok(marker("raw", 0)), Ok(marker("raw", 0))],
+        vec![
+            Ok(marker("raw", 0)),
+            Ok(marker("raw", 0)),
+            Ok(marker("raw", 0)),
+        ],
     );
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
     fixture.runtime.advance(Duration::from_secs(100));
     assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
     assert_eq!(fixture.connector.frames(), [request.stdin.clone().unwrap()]);
-    assert_eq!(fixture.raw.calls(), [request.clone(), request]);
+    assert_eq!(
+        fixture.raw_calls_after_first_read(),
+        [request.clone(), request]
+    );
     assert_eq!(fixture.forwards.opens(), 1);
     assert!(socket_result(&runner.run(&next).unwrap()));
     assert_eq!(fixture.forwards.opens(), 2);
@@ -1090,7 +1238,7 @@ fn same_read_outer_retry_stays_raw_after_eligibility_advances() {
 #[test]
 fn review_interleaved_fallback_keeps_same_read_retries_on_stdio() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     let read_a = wait(1);
     fixture.fail(
         "read",
@@ -1137,9 +1285,9 @@ fn review_interleaved_fallback_keeps_same_read_retries_on_stdio() {
 #[test]
 fn attempted_read_tracking_exhaustion_permanently_retires_the_channel() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     let mut first_raw_id = None;
-    // A command remembers at most 4096 channel attempts. Observe retirement
+    // Tracking includes the initial raw read and is bounded at 4096 IDs. Observe retirement
     // through the adapter rather than accessing its private tracking state.
     for sequence in 1..=4097 {
         let request = wait(sequence);
@@ -1184,16 +1332,16 @@ fn attempted_read_tracking_exhaustion_permanently_retires_the_channel() {
 
 #[test]
 fn unverified_complete_reply_never_replays_and_retires_the_command() {
-    let fixture = FrozenFixture::new(
+    let fixture = FrozenFixture::for_channel(
         vec![Err(ChannelFailure::UnverifiedReply)],
         vec![Ok(marker("raw", 0))],
     );
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(matches!(
         runner.run(&wait(1)),
         Err(WorkerError::Unavailable(_))
     ));
-    assert!(fixture.raw.calls().is_empty());
+    assert!(fixture.raw_calls_after_first_read().is_empty());
     assert_eq!(fixture.connector.closes(), 1);
     assert_eq!(fixture.forwards.cancels(), 1);
     fixture.runtime.advance(Duration::from_secs(100));
@@ -1215,7 +1363,7 @@ fn verified_application_error_preserves_stdout_status_and_stderr() {
             )
             .unwrap()
         };
-        let fixture = FrozenFixture::new(
+        let fixture = FrozenFixture::for_channel(
             vec![Ok(ProcessResult {
                 status: ExitStatus::from_raw(exit << 8),
                 stdout: stdout.clone(),
@@ -1223,12 +1371,12 @@ fn verified_application_error_preserves_stdout_status_and_stderr() {
             })],
             Vec::new(),
         );
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         let outcome = runner.run(&request).unwrap();
         assert_eq!(outcome.status.code(), Some(exit));
         assert_eq!(outcome.stdout, stdout);
         assert_eq!(outcome.stderr, b"bounded original");
-        assert!(fixture.raw.calls().is_empty());
+        assert!(fixture.raw_calls_after_first_read().is_empty());
         assert_eq!(fixture.connector.closes(), 0);
     }
 }
@@ -1236,7 +1384,7 @@ fn verified_application_error_preserves_stdout_status_and_stderr() {
 #[test]
 fn changed_forward_binding_is_checked_before_application_bytes() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
     fixture.fail(
         "verify",
@@ -1252,7 +1400,7 @@ fn changed_forward_binding_is_checked_before_application_bytes() {
 fn independent_borrowed_cancellation_stays_live_inside_every_stage() {
     for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         let (entered, release) = fixture.gate(stage);
         let stopped = Arc::new(AtomicBool::new(false));
         let local = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1295,7 +1443,7 @@ fn independent_borrowed_cancellation_stays_live_inside_every_stage() {
 fn cancellation_after_a_dependency_returns_success_still_closes_and_stops() {
     for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         let stopped = Arc::new(AtomicBool::new(false));
         *fixture.0.return_cancel.lock().unwrap() = Some((stage, stopped.clone()));
         let local = std::rc::Rc::new(());
@@ -1322,7 +1470,7 @@ fn cancellation_after_a_dependency_returns_success_still_closes_and_stops() {
 fn original_deadline_expiry_at_each_stage_never_falls_back() {
     for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         fixture
             .0
             .advances
@@ -1343,7 +1491,7 @@ fn original_deadline_expiry_at_each_stage_never_falls_back() {
 #[test]
 fn cancellation_before_next_call_closes_an_existing_session() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
     let token = std::rc::Rc::new(true);
     assert!(matches!(
@@ -1359,7 +1507,7 @@ fn cancellation_before_next_call_closes_an_existing_session() {
 #[test]
 fn command_cancellation_allows_only_clock_bounded_cleanup() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
     fixture.0.runtime.advance(Duration::from_secs(10));
     fixture.0.runtime.cancel();
@@ -1379,7 +1527,7 @@ fn command_cancellation_allows_only_clock_bounded_cleanup() {
 #[test]
 fn cleanup_time_consumes_original_budget_before_fallback() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture.fail(
         "read",
         ChannelFailure::Unavailable(ChannelReason::ForwardLost),
@@ -1402,7 +1550,7 @@ fn cleanup_time_consumes_original_budget_before_fallback() {
 #[test]
 fn raw_fallback_preserves_the_live_borrowed_predicate() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture.fail(
         "read",
         ChannelFailure::Unavailable(ChannelReason::ForwardLost),
@@ -1449,7 +1597,7 @@ fn zero_call_budget_expires_without_application_or_setup() {
 #[test]
 fn application_guard_caps_an_extended_process_policy() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     let mut request = wait(1);
     request.policy.deadline = Duration::from_secs(60);
     fixture
@@ -1468,7 +1616,7 @@ fn application_guard_caps_an_extended_process_policy() {
 #[test]
 fn reconnect_eligibility_uses_one_two_four_then_five_seconds() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     let mut sequence = 0;
     for (index, delay) in [1, 2, 4, 5, 5].into_iter().enumerate() {
         fixture.fail(
@@ -1500,7 +1648,7 @@ fn reconnect_eligibility_uses_one_two_four_then_five_seconds() {
 #[test]
 fn reconnect_backoff_resets_only_after_a_verified_application_reply() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     fixture.fail(
         "read",
         ChannelFailure::Unavailable(ChannelReason::ForwardLost),
@@ -1541,7 +1689,7 @@ fn recoverable_setup_and_application_failures_can_reconnect() {
         ("read", ChannelReason::Timeout),
     ] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         fixture.fail(stage, ChannelFailure::Unavailable(reason));
         assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
         let resolutions = fixture.count("resolve");
@@ -1563,7 +1711,7 @@ fn recoverable_setup_and_application_failures_can_reconnect() {
 #[test]
 fn one_caller_owns_setup_while_a_concurrent_caller_uses_raw() {
     let fixture = Fixture::new();
-    let runner = Arc::new(fixture.runner(ReadLoopScope::Wait));
+    let runner = Arc::new(fixture.primed_runner(ReadLoopScope::Wait));
     let (entered, release) = fixture.gate("resolve");
     std::thread::scope(|scope| {
         let opening = scope.spawn(|| runner.run(&wait(1)));
@@ -1590,7 +1738,7 @@ fn unsupported_unsafe_and_mismatched_routes_retire_until_command_exit() {
         ("verify", ChannelReason::UnsafePath),
     ] {
         let fixture = Fixture::new();
-        let runner = fixture.runner(ReadLoopScope::Wait);
+        let runner = fixture.primed_runner(ReadLoopScope::Wait);
         fixture.fail(stage, ChannelFailure::Unavailable(reason));
         assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
         let resolutions = fixture.count("resolve");
@@ -1614,7 +1762,7 @@ fn retained_cancel_from_exit_zero_error_keeps_one_owned_residue() {
     // T5 interprets the control exit/error/refusal evidence. T6 consumes only
     // its published Retained disposition; exit zero is never client proof.
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     *fixture.0.disposition.lock().unwrap() = ForwardDisposition::Retained;
     fixture.fail(
         "read",
@@ -1638,7 +1786,7 @@ fn retained_cancel_from_exit_zero_error_keeps_one_owned_residue() {
 #[test]
 fn retained_open_failure_never_attempts_another_allocation() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     *fixture.0.forward_failure.lock().unwrap() = Some(ForwardOpenFailure {
         failure: ChannelFailure::Unavailable(ChannelReason::ForwardLost),
         disposition: ForwardDisposition::Retained,
@@ -1659,7 +1807,7 @@ fn retained_open_failure_never_attempts_another_allocation() {
 #[test]
 fn interrupted_unacknowledged_open_retains_and_permanently_retires() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     *fixture.0.forward_failure.lock().unwrap() = Some(ForwardOpenFailure {
         failure: ChannelFailure::Unavailable(ChannelReason::Cancelled),
         disposition: ForwardDisposition::Retained,
@@ -1702,7 +1850,7 @@ fn interrupted_unacknowledged_open_retains_and_permanently_retires() {
 #[test]
 fn close_and_drop_are_idempotent_and_do_not_reopen_the_command() {
     let fixture = Fixture::new();
-    let runner = fixture.runner(ReadLoopScope::Wait);
+    let runner = fixture.primed_runner(ReadLoopScope::Wait);
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
     assert_eq!(runner.close(), ForwardDisposition::Cleaned);
     assert_eq!(runner.close(), ForwardDisposition::Cleaned);

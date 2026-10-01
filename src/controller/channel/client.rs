@@ -27,6 +27,7 @@ struct State {
     disposition: ForwardDisposition,
     retired: bool,
     read_ids: HashSet<String>,
+    eligible_read_seen: bool,
     failures: u8,
     eligible_at: Duration,
 }
@@ -58,6 +59,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 disposition: ForwardDisposition::Cleaned,
                 retired: false,
                 read_ids: HashSet::new(),
+                eligible_read_seen: false,
                 failures: 0,
                 eligible_at: Duration::ZERO,
             }),
@@ -213,6 +215,11 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             return self.raw_read(request, &ctx);
         }
         state.read_ids.insert(parsed.request_id().to_owned());
+        if !state.eligible_read_seen {
+            state.eligible_read_seen = true;
+            drop(state);
+            return self.raw_read(request, &ctx);
+        }
         if state.session.is_none() {
             if ctx.runtime.now() < state.eligible_at || ctx.remaining() <= SETUP_GUARD {
                 drop(state);

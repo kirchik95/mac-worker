@@ -3867,23 +3867,27 @@ fn loop_wait_mutation_separation() {
         let fixture = Fixture::new();
         let (exit, _, stderr) = fixture.run(&args);
         assert_eq!(exit, 0, "{args:?}: {stderr}");
+        assert!(fixture.connector.requests.lock().unwrap().is_empty());
         assert_eq!(
-            commands(&fixture.connector.requests),
-            ["task.wait.poll"],
+            commands(&fixture.endpoint.calls)
+                .iter()
+                .filter(|command| command.as_str() == "task.wait.poll")
+                .count(),
+            1,
             "{args:?}"
         );
-        assert!(!commands(&fixture.endpoint.calls).contains(&"task.wait.poll".into()));
-        assert_eq!(fixture.forwards.opens(), 1);
-        assert_eq!(fixture.forwards.cancels(), 1);
-        fixture.assert_authenticated_pin();
+        assert_eq!(fixture.forwards.resolutions(), 0);
+        assert_eq!(fixture.forwards.opens(), 0);
+        assert_eq!(fixture.forwards.cancels(), 0);
+        assert!(fixture.endpoint.identity_calls.lock().unwrap().is_empty());
+        assert!(fixture.pin().is_none());
         if args.contains(&"--interrupt") {
             assert_eq!(
                 *fixture.order.lock().unwrap(),
                 [
                     "stdio:task.status",
                     "stdio:task.cancel",
-                    "stdio:channel.identity",
-                    "socket:task.wait.poll",
+                    "stdio:task.wait.poll",
                     "stdio:task.status",
                     "stdio:task.say"
                 ]
@@ -3893,8 +3897,7 @@ fn loop_wait_mutation_separation() {
                 *fixture.order.lock().unwrap(),
                 [
                     "stdio:task.say",
-                    "stdio:channel.identity",
-                    "socket:task.wait.poll",
+                    "stdio:task.wait.poll",
                     "stdio:task.status"
                 ]
             );
@@ -3949,12 +3952,13 @@ fn loop_submit_and_batch_transfer_finish_before_wait_setup() {
                 }
             ]
         );
-        assert_eq!(order[4], "stdio:channel.identity");
-        assert_eq!(order[5], "socket:task.wait.poll");
-        assert_eq!(commands(&fixture.connector.requests), ["task.wait.poll"]);
-        assert_eq!(fixture.forwards.opens(), 1);
-        assert_eq!(fixture.forwards.cancels(), 1);
-        fixture.assert_authenticated_pin();
+        assert_eq!(order[4], "stdio:task.wait.poll");
+        assert!(fixture.connector.requests.lock().unwrap().is_empty());
+        assert_eq!(fixture.forwards.resolutions(), 0);
+        assert_eq!(fixture.forwards.opens(), 0);
+        assert_eq!(fixture.forwards.cancels(), 0);
+        assert!(fixture.endpoint.identity_calls.lock().unwrap().is_empty());
+        assert!(fixture.pin().is_none());
     }
 }
 
@@ -4113,11 +4117,13 @@ fn route_loop_scopes_only() {
     let (exit, _, stderr) = fixture.run(&["worker", "task", "logs", TASK, "--follow", "--raw"]);
     assert_eq!(exit, 0, "{stderr}");
     let requests = fixture.connector.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].body(), &json!({"controller_health":true}));
-    assert_eq!(requests[1].command(), "task.logs");
-    assert_eq!(requests[1].body()["wait_ms"], 15_000);
-    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].command(), "task.logs");
+    assert_eq!(requests[0].body()["wait_ms"], 15_000);
+    let raw = fixture.endpoint.calls.lock().unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].command(), "task.list");
+    assert_eq!(raw[0].body(), &json!({"controller_health":true}));
     assert_eq!(fixture.forwards.opens(), 1);
     assert_eq!(fixture.forwards.cancels(), 1);
     fixture.assert_authenticated_pin();
@@ -4203,14 +4209,17 @@ fn route_events_and_notify_own_one_scoped_runner() {
                     )
                     .unwrap();
             }
-            assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+            let raw = fixture.endpoint.calls.lock().unwrap();
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].command(), "task.list");
+            assert_eq!(raw[0].body(), &json!({"controller_health":true}));
             assert_eq!(fixture.forwards.opens(), 1);
         }
         assert_eq!(fixture.forwards.cancels(), 1);
         fixture.assert_authenticated_pin();
         assert_eq!(
             fixture.connector.requests.lock().unwrap().len(),
-            if scope == ReadLoopScope::Notify { 4 } else { 2 }
+            if scope == ReadLoopScope::Notify { 3 } else { 1 }
         );
     }
 }
@@ -4261,10 +4270,18 @@ fn route_event_runtime_cancellation_is_shared_with_channel_setup() {
         clock.clone(),
         deps,
     );
-    assert!(source.discover(Duration::from_secs(30)).is_err());
+    assert!(source.discover(Duration::from_secs(30)).is_ok());
+    assert!(
+        source
+            .read(Default::default(), Duration::from_secs(30))
+            .is_err()
+    );
     assert_eq!(fixture.forwards.resolutions(), 1);
     assert_eq!(fixture.forwards.opens(), 0);
-    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+    let raw = fixture.endpoint.calls.lock().unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].command(), "task.list");
+    assert_eq!(raw[0].body(), &json!({"controller_health":true}));
 }
 
 #[test]
@@ -4431,7 +4448,10 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
             .filter_map(|(_, request)| request.body()["controller_events"]["wait_ms"].as_u64())
             .all(|wait| wait <= 15_000)
     );
-    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+    let raw = fixture.endpoint.calls.lock().unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].command(), "task.list");
+    assert_eq!(raw[0].body(), &json!({"controller_health":true}));
 }
 
 // T7b end-to-end checks. Only SSH control is fake: the leader, identity RPC,
@@ -4854,10 +4874,12 @@ fn route_real_server_wait_logs_and_raw_reads() {
     let task = fixture.task.to_string();
     let (exit, _, errors) = fixture.run(&["worker", "task", "wait", "--task-id", &task]);
     assert_eq!(exit, 0, "{errors}");
-    assert_eq!(commands(&fixture.connector.calls), ["task.wait.poll"]);
-    fixture.assert_only_identity_was_stdio();
-    assert_eq!(fixture.forwards.opens(), 1);
-    assert_eq!(fixture.forwards.cancels(), 1);
+    assert!(fixture.connector.calls.lock().unwrap().is_empty());
+    assert_eq!(commands(&fixture.raw.calls), ["task.wait.poll"]);
+    assert_eq!(fixture.forwards.resolutions(), 0);
+    assert_eq!(fixture.forwards.opens(), 0);
+    assert_eq!(fixture.forwards.cancels(), 0);
+    assert!(fixture.laptop.pin().is_none());
     let expected = fixture.record.service.controller_client_id.to_string();
     let cache = fixture
         .laptop
@@ -4879,14 +4901,20 @@ fn route_real_server_wait_logs_and_raw_reads() {
         fixture.clear_calls();
         let (exit, output, errors) = fixture.run(&args);
         assert_eq!(exit, 0, "{errors}");
-        fixture.assert_only_identity_was_stdio();
         assert!(fixture.connector.calls.lock().unwrap().is_empty());
-        assert_eq!(fixture.forwards.opens(), 1);
-        assert_eq!(fixture.forwards.cancels(), 1);
+        assert_eq!(fixture.forwards.opens(), 0);
+        assert_eq!(fixture.forwards.cancels(), 0);
         if args.contains(&"identity") {
+            let raw = fixture.raw.calls.lock().unwrap();
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].command(), "task.list");
+            assert_eq!(raw[0].body()["controller_socket"]["op"], "identity");
+            assert!(fixture.laptop.pin().is_none());
             let identity: mac_worker::controller::channel::SocketIdentity =
                 serde_json::from_str(&output).unwrap();
             assert_eq!(identity.service, fixture.record.service);
+        } else {
+            fixture.assert_only_identity_was_stdio();
         }
     }
     assert_eq!(
@@ -4899,16 +4927,26 @@ fn route_real_server_wait_logs_and_raw_reads() {
     assert_eq!(exit, 0, "{errors}");
     assert_eq!(logs, "fixture log\n");
     let reads = fixture.connector.calls.lock().unwrap();
-    assert_eq!(reads[0].body(), &json!({"controller_health":true}));
+    assert!(!reads.is_empty());
     assert!(
-        reads[1..]
+        reads
             .iter()
             .all(|request| request.command() == "task.logs" && request.body()["wait_ms"] == 15_000)
     );
     drop(reads);
-    fixture.assert_only_identity_was_stdio();
-    assert_eq!(fixture.forwards.opens(), 2);
-    assert_eq!(fixture.forwards.cancels(), 2);
+    let raw = fixture.raw.calls.lock().unwrap();
+    assert_eq!(raw.len(), 2);
+    assert_eq!(raw[0].command(), "task.list");
+    assert_eq!(raw[0].body(), &json!({"controller_health":true}));
+    assert_eq!(raw[1].command(), "task.list");
+    assert_eq!(raw[1].body()["controller_socket"]["op"], "identity");
+    assert_eq!(
+        fixture.laptop.pin().unwrap().controller_client_id,
+        fixture.record.service.controller_client_id
+    );
+    drop(raw);
+    assert_eq!(fixture.forwards.opens(), 1);
+    assert_eq!(fixture.forwards.cancels(), 1);
     for args in [
         vec!["worker", "task", "status", &task],
         vec!["worker", "task", "list"],
@@ -4919,7 +4957,7 @@ fn route_real_server_wait_logs_and_raw_reads() {
         assert_eq!(exit, 0, "{errors}");
         assert_eq!(fixture.raw.calls.lock().unwrap().len(), 1);
         assert!(fixture.connector.calls.lock().unwrap().is_empty());
-        assert_eq!(fixture.forwards.opens(), 2);
+        assert_eq!(fixture.forwards.opens(), 1);
     }
     fixture.stop();
 }
@@ -4973,13 +5011,22 @@ fn route_real_server_owned_events_and_notify_reads() {
                 assert!(page.complete);
                 assert_eq!(page.rows.len(), 1);
             }
-            fixture.assert_only_identity_was_stdio();
+            let raw = fixture.raw.calls.lock().unwrap();
+            assert_eq!(raw.len(), 2);
+            assert_eq!(raw[0].command(), "task.list");
+            assert_eq!(raw[0].body(), &json!({"controller_health":true}));
+            assert_eq!(raw[1].command(), "task.list");
+            assert_eq!(raw[1].body()["controller_socket"]["op"], "identity");
+            assert_eq!(
+                fixture.laptop.pin().unwrap().controller_client_id,
+                fixture.record.service.controller_client_id
+            );
             assert_eq!(fixture.forwards.opens(), index + 1);
         }
         assert_eq!(fixture.forwards.cancels(), index + 1);
         assert_eq!(
             fixture.connector.calls.lock().unwrap().len(),
-            if scope == ReadLoopScope::Notify { 4 } else { 2 }
+            if scope == ReadLoopScope::Notify { 3 } else { 1 }
         );
     }
     fixture.stop();
