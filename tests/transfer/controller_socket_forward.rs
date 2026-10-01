@@ -987,6 +987,394 @@ fn interrupted_open_bind_before_listen_never_uses_refusal_cleanup() {
     );
 }
 
+// T7c's exclusive test lease: consume the real T4 filesystem implementation
+// through T5's bind/listen barrier and the accepted T6 command owner.
+#[derive(Default)]
+struct ObservedPrivateFiles {
+    inner: mac_worker::controller::channel::files::PrivateChannelFiles,
+    allocations: Mutex<Vec<ForwardPath>>,
+    cleanups: AtomicUsize,
+}
+impl ForwardPaths for ObservedPrivateFiles {
+    fn allocate(&self, paths: &PathLayout) -> Result<ForwardPath, ChannelFailure> {
+        let allocation = self.inner.allocate(paths)?;
+        self.allocations.lock().unwrap().push(allocation.clone());
+        Ok(allocation)
+    }
+    fn validate_socket(&self, path: &ForwardPath) -> Result<EntryIdentity, ChannelFailure> {
+        self.inner.validate_socket(path)
+    }
+    fn cleanup_if_refused(
+        &self,
+        path: &ForwardPath,
+        socket: Option<EntryIdentity>,
+        ctx: &CleanupContext,
+    ) -> ForwardDisposition {
+        self.cleanups.fetch_add(1, Ordering::SeqCst);
+        self.inner.cleanup_if_refused(path, socket, ctx)
+    }
+}
+struct ScopedRaw<R> {
+    inner: R,
+    identity: SocketIdentity,
+    reads: Mutex<Vec<ProcessRequest>>,
+    bootstraps: Mutex<Vec<ProcessRequest>>,
+}
+impl<R: ProcessRunner> ProcessRunner for ScopedRaw<R> {
+    fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if let Some(frame) = &process.stdin {
+            let request = mac_worker::controller::decode_request(frame).unwrap();
+            if request.body().get("controller_socket").is_some() {
+                self.bootstraps.lock().unwrap().push(process.clone());
+                assert_eq!(
+                    request.body()["controller_socket"]["route_sha256"],
+                    self.identity.route_sha256.as_str()
+                );
+                return Ok(mac_worker::controller::channel::testing::result_fixture(
+                    &request,
+                    serde_json::to_value(SocketIdentityResult::Available(self.identity.clone()))
+                        .unwrap(),
+                    0,
+                ));
+            }
+            self.reads.lock().unwrap().push(process.clone());
+            return Ok(mac_worker::controller::channel::testing::result_fixture(
+                &request,
+                serde_json::json!({"task_ids":[request.body()["task_id"]],"quiescent":true,"exit_code":0}),
+                0,
+            ));
+        }
+        self.inner.run(process)
+    }
+}
+fn scoped_request(route: &ConfiguredRoute) -> ProcessRequest {
+    let frame = mac_worker::controller::encode_json_frame(&serde_json::json!({
+        "protocol_version":7,"request_id":mac_worker::job::ClientId::generate(),
+        "command":"task.wait.poll","body":{"task_id":"018f0f4a6b5c7d8e9f00112233445566"}
+    }))
+    .unwrap();
+    let config =
+        mac_worker::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='fixture'\n")
+            .unwrap();
+    let mut process =
+        mac_worker::controller::controller_rpc_ssh_request(&config.controller).unwrap();
+    if let Some(config) = &route.ssh_config_file {
+        process
+            .args
+            .splice(0..0, ["-F".into(), config.as_os_str().to_owned()]);
+    }
+    process.stdin = Some(frame);
+    process
+}
+#[test]
+fn scoped_client_unacknowledged_bind_before_listen_retires_across_all_eligibility_advances() {
+    if isolated(
+        "scoped_client_unacknowledged_bind_before_listen_retires_across_all_eligibility_advances",
+    ) {
+        return;
+    }
+    use mac_worker::controller::channel::{
+        client::ChannelProcessRunner, identity::StdioIdentitySource, pin::PrivatePinStore,
+        testing::ScriptedConnector,
+    };
+    let (paths, ssh, route, master) = fixture();
+    let files = Arc::new(ObservedPrivateFiles::default());
+    let mut identity = identity();
+    identity.route_sha256 = route.digest().unwrap();
+    let raw = ScopedRaw {
+        inner: UnacknowledgedRunner {
+            base: ControlRunner::new(master, Mode::Success),
+            release: Mutex::default(),
+            producer: Mutex::default(),
+        },
+        identity,
+        reads: Mutex::default(),
+        bootstraps: Mutex::default(),
+    };
+    let clock = Arc::new(Clock::default());
+    let connector = Arc::new(ScriptedConnector::new(vec![]));
+    let client = ChannelProcessRunner::new(
+        &raw,
+        ReadLoopScope::Wait,
+        route.clone(),
+        paths.clone(),
+        ClientDeps {
+            identity: Arc::new(StdioIdentitySource::new()),
+            pins: Arc::new(PrivatePinStore::new()),
+            forwards: Arc::new(MasterForwardControl::new(paths.clone(), files.clone(), ssh)),
+            connector: connector.clone(),
+            runtime: clock.clone(),
+        },
+    );
+    assert!(client.run(&scoped_request(&route)).is_err());
+    let allocation = files.allocations.lock().unwrap()[0].clone();
+    let parent = entry(&allocation.directory);
+    let socket = entry(&allocation.socket_path);
+    assert_eq!(
+        std::os::unix::net::UnixStream::connect(&allocation.socket_path)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ECONNREFUSED)
+    );
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    for _ in 0..64 {
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            client
+                .run(&scoped_request(&route))
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(files.allocations.lock().unwrap().len(), 1);
+        assert_eq!(entry(&allocation.directory), parent);
+        assert_eq!(entry(&allocation.socket_path), socket);
+    }
+    raw.inner
+        .release
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+    let _listener = raw
+        .inner
+        .producer
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(std::os::unix::net::UnixStream::connect(&allocation.socket_path).is_ok());
+    for _ in 0..64 {
+        clock.advance(Duration::from_secs(5));
+        client.run(&scoped_request(&route)).unwrap();
+    }
+    assert_eq!(client.close(), ForwardDisposition::Retained);
+    assert_eq!(files.allocations.lock().unwrap().len(), 1);
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.connections(), 0);
+    assert_eq!(raw.reads.lock().unwrap().len(), 128);
+    let calls = raw.inner.base.calls.lock().unwrap();
+    for op in ["forward", "cancel"] {
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|request| has_pair(&strings(request), "-O", op))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(entry(&allocation.directory), parent);
+    assert_eq!(entry(&allocation.socket_path), socket);
+}
+
+#[test]
+fn scoped_client_exit_zero_cancel_error_preserves_one_real_allocation_after_config_edit() {
+    if isolated(
+        "scoped_client_exit_zero_cancel_error_preserves_one_real_allocation_after_config_edit",
+    ) {
+        return;
+    }
+    use mac_worker::controller::channel::{
+        client::ChannelProcessRunner, identity::StdioIdentitySource, pin::PrivatePinStore,
+        testing::ScriptedConnector,
+    };
+    let (paths, ssh, route, master) = fixture();
+    let files = Arc::new(ObservedPrivateFiles::default());
+    let mut identity = identity();
+    identity.route_sha256 = route.digest().unwrap();
+    let raw = ScopedRaw {
+        inner: ControlRunner::new(master.clone(), Mode::CancelError),
+        identity,
+        reads: Mutex::default(),
+        bootstraps: Mutex::default(),
+    };
+    let clock = Arc::new(Clock::default());
+    let connector = Arc::new(ScriptedConnector::new(vec![Err(
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    )]));
+    let client = ChannelProcessRunner::new(
+        &raw,
+        ReadLoopScope::Wait,
+        route.clone(),
+        paths.clone(),
+        ClientDeps {
+            identity: Arc::new(StdioIdentitySource::new()),
+            pins: Arc::new(PrivatePinStore::new()),
+            forwards: Arc::new(MasterForwardControl::new(paths, files.clone(), ssh)),
+            connector: connector.clone(),
+            runtime: clock.clone(),
+        },
+    );
+    let first = scoped_request(&route);
+    assert!(client.run(&first).unwrap().status.success());
+    assert_eq!(connector.frames(), [first.stdin.clone().unwrap()]);
+    assert_eq!(raw.reads.lock().unwrap()[0].stdin, first.stdin);
+    // This has all three config forwarding families; teardown continues to
+    // address the captured endpoint/pair after the route file is replaced.
+    fs::write(route.ssh_config_file.as_ref().unwrap(), "Host fixture\n ControlPath /different/master\n LocalForward 1 localhost:2\n RemoteForward 3 localhost:4\n DynamicForward 5\n").unwrap();
+    for _ in 0..128 {
+        clock.advance(Duration::from_secs(5));
+        client.run(&scoped_request(&route)).unwrap();
+    }
+    assert_eq!(client.close(), ForwardDisposition::Retained);
+    assert_eq!(files.allocations.lock().unwrap().len(), 1);
+    assert_eq!(connector.connections(), 1);
+    assert_eq!(connector.closes(), 1);
+    let calls = raw.inner.calls.lock().unwrap();
+    for op in ["check", "forward", "cancel"] {
+        let matching: Vec<_> = calls
+            .iter()
+            .filter(|request| has_pair(&strings(request), "-O", op))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let args = strings(matching[0]);
+        assert!(has_pair(&args, "-S", master.to_str().unwrap()));
+        assert!(has_pair(&args, "-F", "/dev/null"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("localhost") || arg.contains("/different/master"))
+        );
+    }
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 1);
+    assert!(
+        std::os::unix::net::UnixStream::connect(&files.allocations.lock().unwrap()[0].socket_path)
+            .is_ok()
+    );
+}
+
+fn scoped_offline_mux(master_lost: bool) {
+    use mac_worker::controller::channel::{
+        client::ChannelProcessRunner,
+        identity::StdioIdentitySource,
+        pin::PrivatePinStore,
+        testing::{ScriptedConnector, result_fixture},
+    };
+    let (paths, ssh, route, _) = fixture();
+    let files = Arc::new(ObservedPrivateFiles::default());
+    let mut identity = identity();
+    identity.route_sha256 = route.digest().unwrap();
+    let raw = ScopedRaw {
+        inner: LocalMuxRunner::default(),
+        identity,
+        reads: Mutex::default(),
+        bootstraps: Mutex::default(),
+    };
+    let first = scoped_request(&route);
+    let request = mac_worker::controller::decode_request(first.stdin.as_ref().unwrap()).unwrap();
+    let connector = Arc::new(ScriptedConnector::new(vec![
+        Ok(result_fixture(
+            &request,
+            serde_json::json!({"task_ids":[request.body()["task_id"]],"quiescent":true,"exit_code":0}),
+            0,
+        )),
+        Err(ChannelFailure::Unavailable(ChannelReason::ForwardLost)),
+    ]));
+    let clock = Arc::new(Clock::default());
+    let client = ChannelProcessRunner::new(
+        &raw,
+        ReadLoopScope::Wait,
+        route.clone(),
+        paths.clone(),
+        ClientDeps {
+            identity: Arc::new(StdioIdentitySource::new()),
+            pins: Arc::new(PrivatePinStore::new()),
+            forwards: Arc::new(MasterForwardControl::new(paths, files.clone(), ssh)),
+            connector: connector.clone(),
+            runtime: clock.clone(),
+        },
+    );
+    assert!(client.run(&first).unwrap().status.success());
+    assert!(raw.reads.lock().unwrap().is_empty());
+    let master = raw.inner.mux.lock().unwrap().as_ref().unwrap().path.clone();
+    let binding = entry(&master);
+    let bootstrap = strings(&raw.bootstraps.lock().unwrap()[0]);
+    assert!(has_pair(
+        &bootstrap,
+        "-F",
+        route.ssh_config_file.as_ref().unwrap().to_str().unwrap()
+    ));
+    assert!(has_pair(&bootstrap, "-S", master.to_str().unwrap()));
+    if master_lost {
+        // Fixture-owned mux exit, with the stale pathname/binding retained.
+        // Production teardown must keep addressing this captured endpoint.
+        drop(raw.inner.mux.lock().unwrap().take().unwrap());
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&master)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ECONNREFUSED)
+        );
+    } else {
+        fs::write(route.ssh_config_file.as_ref().unwrap(),"Host fixture\n HostName changed.invalid\n ControlPath /private/tmp/foreign-master\n LocalForward 32001 127.0.0.1:32002\n RemoteForward 32003 127.0.0.1:32004\n DynamicForward 32005\n").unwrap();
+    }
+    let second = scoped_request(&route);
+    assert!(client.run(&second).unwrap().status.success());
+    assert_eq!(raw.reads.lock().unwrap().len(), 1);
+    assert_eq!(raw.reads.lock().unwrap()[0].stdin, second.stdin);
+    assert_eq!(
+        connector.frames(),
+        [first.stdin.unwrap(), second.stdin.unwrap()]
+    );
+    assert_eq!(connector.connections(), 1);
+    assert_eq!(connector.closes(), 1);
+    assert_eq!(client.close(), ForwardDisposition::Cleaned);
+    assert_eq!(files.allocations.lock().unwrap().len(), 1);
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 1);
+    assert!(!files.allocations.lock().unwrap()[0].directory.exists());
+    assert_eq!(
+        entry(&master),
+        binding,
+        "scoped cleanup never deletes the shared master"
+    );
+    let calls = raw.inner.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| strings(call).contains(&"-G".into()))
+            .count(),
+        1
+    );
+    for operation in ["check", "forward", "cancel"] {
+        let matching: Vec<_> = calls
+            .iter()
+            .filter(|call| has_pair(&strings(call), "-O", operation))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        let args = strings(matching[0]);
+        assert!(has_pair(&args, "-S", master.to_str().unwrap()));
+        assert!(has_pair(&args, "-F", "/dev/null"));
+        assert!(!args.contains(&"-N".into()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("foreign-master") || arg.contains("3200"))
+        );
+    }
+    if let Some(mux) = raw.inner.mux.lock().unwrap().as_ref() {
+        assert_eq!(mux.messages.lock().unwrap().len(), 2);
+        assert!(mux.forward.lock().unwrap().is_none());
+    }
+}
+#[test]
+fn scoped_client_real_offline_mux_config_forwards_and_edit_use_captured_master() {
+    if isolated("scoped_client_real_offline_mux_config_forwards_and_edit_use_captured_master") {
+        return;
+    }
+    scoped_offline_mux(false);
+}
+#[test]
+fn scoped_client_real_offline_mux_master_loss_uses_one_fallback_and_proven_cleanup() {
+    if isolated("scoped_client_real_offline_mux_master_loss_uses_one_fallback_and_proven_cleanup") {
+        return;
+    }
+    scoped_offline_mux(true);
+}
+
 struct GateRunner {
     base: ControlRunner,
     stage: &'static str,
