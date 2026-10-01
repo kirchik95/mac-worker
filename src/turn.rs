@@ -2162,7 +2162,7 @@ fn snapshot_error(message: impl Into<String>) -> WorkerError {
     turn_error("REDACTION_SNAPSHOT_FAILED", message)
 }
 
-fn validate_existing_launched_redaction(job: &RootedDir) -> Result<(), WorkerError> {
+pub(crate) fn validate_existing_launched_redaction(job: &RootedDir) -> Result<(), WorkerError> {
     let bytes = job
         .read_private_regular(LAUNCHED_REDACTION_FILE, LAUNCHED_REDACTION_MAX_BYTES)
         .map_err(|error| {

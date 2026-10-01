@@ -1238,7 +1238,7 @@ impl<'a> JobService<'a> {
 
         let live = self.resolution_live_after(&admission, &identity)?;
         if matches!(
-            self.classify_resolution_final(&identity)?,
+            self.classify_resolution_final(&identity, live.as_ref())?,
             Some(ResolutionFinal::Complete)
         ) {
             if disposition.is_some() || live.is_none() {
@@ -1302,7 +1302,7 @@ impl<'a> JobService<'a> {
             (None, None) => None,
         };
 
-        let final_job = match self.classify_resolution_final(&identity)? {
+        let final_job = match self.classify_resolution_final(&identity, live.as_ref())? {
             Some(ResolutionFinal::Complete) => {
                 if disposition.is_some() || live.is_none() {
                     return Err(job_id_conflict(
@@ -1425,6 +1425,7 @@ impl<'a> JobService<'a> {
     fn classify_resolution_final(
         &self,
         identity: &ResolutionIdentity,
+        live: Option<&LeaseRecord>,
     ) -> Result<Option<ResolutionFinal>, WorkerError> {
         let job = match self.store.open_directory(
             &format!(
@@ -1483,13 +1484,13 @@ impl<'a> JobService<'a> {
             None
         };
         let payload_present = job.entry_exists("execution.json")?;
-        let mut turn_payload = false;
+        let mut turn_section = None;
         if payload_present {
             let payload: ExecutionPayload = read_canonical_json(&job, "execution.json")
                 .map_err(|_| job_id_conflict("incomplete execution payload is invalid"))?;
             payload.validate_for_resolution(identity)?;
             if let Some(section) = payload.turn() {
-                turn_payload = true;
+                turn_section = Some(section.clone());
                 if job.entry_exists("prompt.md")? {
                     let prompt = job
                         .read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)
@@ -1524,7 +1525,7 @@ impl<'a> JobService<'a> {
                 }
             }
         }
-        if !turn_payload
+        if turn_section.is_none()
             && names.iter().any(|name| {
                 matches!(
                     name.as_str(),
@@ -1582,6 +1583,24 @@ impl<'a> JobService<'a> {
                 }
             }
         }
+        // Complete Task evidence elects recovery only with its exact live scope.
+        // Failed positive checks retain the existing incomplete classification.
+        if indexed_turn_prelaunch_layout(&names)
+            && let (Some(lease), Some(meta), Some(section)) =
+                (live, meta.as_ref(), turn_section.as_ref())
+            && let Some(slot) = self.leases.occupied_slot_for_job(identity.job_id())?
+            && slot.lease == *lease
+            && slot.execution_scope == ExecutionScope::task(section.turn().task_id())
+            && let Ok((request, Some(validated_section))) =
+                self.reconstruct_prelaunch_request(&job, meta, lease)
+            && &validated_section == section
+            && validate_empty_prelaunch_private_directories(&job, &["tmp"]).is_ok()
+            && validate_indexed_turn_prelaunch_job(&job, &request, section).is_ok()
+            && (!names.contains(crate::turn::LAUNCHED_REDACTION_FILE)
+                || crate::turn::validate_existing_launched_redaction(&job).is_ok())
+        {
+            return Ok(Some(ResolutionFinal::Complete));
+        }
         let complete = [
             "execution.json",
             "home",
@@ -1601,7 +1620,9 @@ impl<'a> JobService<'a> {
             .chain(std::iter::once(String::from("supervisor.log")))
             .collect::<std::collections::BTreeSet<_>>();
         Ok(Some(
-            if (names == complete || names == complete_with_supervisor_log) && !turn_payload {
+            if (names == complete || names == complete_with_supervisor_log)
+                && turn_section.is_none()
+            {
                 ResolutionFinal::Complete
             } else {
                 ResolutionFinal::Incomplete(job)

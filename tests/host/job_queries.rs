@@ -9000,6 +9000,253 @@ mod task_turn_ports {
         );
     }
 
+    #[test]
+    fn standalone_resolve_accepts_a_complete_unindexed_task_turn_and_launches_once() {
+        // Complements the matrix's six preacceptance Abandoned rows: a complete
+        // final and matching live Task scope are already positive acceptance proof.
+        for namespace in [false, true] {
+            for redaction in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("host");
+                let marker = temp.path().join("executions");
+                let (store, lease, request) = interrupted_turn(&root, &marker, false);
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                if namespace {
+                    fs::create_dir(job.join(".mac-worker-rooted-fs")).unwrap();
+                    fs::set_permissions(
+                        job.join(".mac-worker-rooted-fs"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                }
+                if redaction {
+                    replace_bytes(
+                        &job.join("launched-redaction.json"),
+                        br#"["fixture-private-value"]"#,
+                    )
+                    .unwrap();
+                }
+                let launches = Arc::new(AtomicUsize::new(0));
+                let launcher = MatrixInlineLauncher {
+                    store: store.clone(),
+                    launches: Arc::clone(&launches),
+                };
+                let service = JobService::new(&store, &launcher);
+                let resolve =
+                    ResolveOrAbandonRequest::from_submit_request(request.submit()).unwrap();
+                let response = service.resolve_or_abandon(resolve.clone()).unwrap();
+                let accepted = match response.outcome() {
+                    ResolveOrAbandonOutcome::Accepted { response } => response,
+                    outcome => panic!("complete unindexed turn was not Accepted: {outcome:?}"),
+                };
+                matrix_assert_meta_identity(accepted.meta(), request.submit());
+                assert_eq!(accepted.status().state(), JobState::Succeeded);
+                assert_eq!(
+                    accepted.status().supervisor_identity(),
+                    Some(
+                        SystemProcessInspector
+                            .identity_for_pid(std::process::id())
+                            .unwrap()
+                    )
+                );
+                assert_eq!(fs::read(&marker).unwrap(), b"x");
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
+                assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+                let index: JobDisposition = serde_json::from_slice(
+                    &fs::read(store.job_index(lease.job_id()).unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    matches!(index, JobDisposition::Accepted { status, .. } if status == JobStatus::accepted(accepted.meta().created_at_millis()).unwrap())
+                );
+                let before = matrix_durable_snapshot(&root, &store, request.submit(), &marker);
+                assert_eq!(service.resolve_or_abandon(resolve).unwrap(), response);
+                assert_eq!(service.status(lease.job_id()).unwrap(), *accepted);
+                assert_eq!(
+                    matrix_durable_snapshot(&root, &store, request.submit(), &marker),
+                    before
+                );
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_resolve_keeps_unmatched_or_missing_task_scope_out_of_acceptance() {
+        for scope in ["job", "other-task", "missing-lease", "absent", "corrupt"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("must-not-execute");
+            let (store, lease, request) = interrupted_turn(&root, &marker, false);
+            let path = root.join("leases/slots/0/scope.json");
+            match scope {
+                "job" => replace_bytes(&path, br#"{"kind":"job"}"#).unwrap(),
+                "other-task" => replace_json(
+                    &path,
+                    &ExecutionScope::task(TaskId::new(uuid::Uuid::from_u128(99))),
+                )
+                .unwrap(),
+                "missing-lease" => fs::remove_dir_all(root.join("leases/slots/0")).unwrap(),
+                "absent" => remove_and_sync(&path),
+                "corrupt" => replace_bytes(&path, b"{").unwrap(),
+                _ => unreachable!(),
+            }
+            let before = prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker);
+            let tasks_before = matrix_snapshot_path(&root.join("tasks"));
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launcher = CountingRejectLauncher {
+                launches: Arc::clone(&launches),
+            };
+            let service = JobService::new(&store, &launcher);
+            let resolve = ResolveOrAbandonRequest::from_submit_request(request.submit()).unwrap();
+            if matches!(scope, "absent" | "corrupt") {
+                assert!(service.resolve_or_abandon(resolve).is_err(), "{scope}");
+                assert_eq!(
+                    prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker),
+                    before
+                );
+                assert!(LeaseService::new(&store).occupied_slots().is_err());
+            } else {
+                // Preserve today's exact-owned abandonment classification.
+                let response = service.resolve_or_abandon(resolve.clone()).unwrap();
+                assert_eq!(
+                    response.outcome(),
+                    &ResolveOrAbandonOutcome::Abandoned,
+                    "{scope}"
+                );
+                let disposition: JobDisposition = serde_json::from_slice(
+                    &fs::read(store.job_index(lease.job_id()).unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert!(matches!(disposition, JobDisposition::Abandoned { .. }));
+                assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+                let after = matrix_durable_snapshot(&root, &store, request.submit(), &marker);
+                assert_error_code(
+                    service.resolve_or_abandon(resolve).unwrap_err(),
+                    "JOB_ID_CONFLICT",
+                    "owned abandonment replay retains turn evidence without a payload",
+                );
+                assert_eq!(
+                    matrix_durable_snapshot(&root, &store, request.submit(), &marker),
+                    after
+                );
+            }
+            assert_eq!(matrix_snapshot_path(&root.join("tasks")), tasks_before);
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn standalone_resolve_preserves_incomplete_foreign_and_unsafe_turn_classifications() {
+        for (damage, expected) in [
+            ("missing-prompt", "abandoned"),
+            ("missing-schema", "abandoned"),
+            ("missing-log", "abandoned"),
+            ("nonempty-tmp", "abandoned"),
+            ("foreign-meta", "error"),
+            ("foreign-payload", "error"),
+            ("unsafe-tmp", "error"),
+            ("changed-prompt", "error"),
+            ("changed-schema", "error"),
+            ("nonempty-log", "error"),
+            ("unsafe-namespace", "pending"),
+            ("corrupt-redaction", "pending"),
+            ("unsafe-redaction", "pending"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("must-not-execute");
+            let (store, lease, request) = interrupted_turn(&root, &marker, false);
+            let job = store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap();
+            let outside = temp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("sentinel"), b"outside evidence").unwrap();
+            match damage {
+                "missing-prompt" => remove_and_sync(&job.join("prompt.md")),
+                "missing-schema" => remove_and_sync(&job.join("result.schema.json")),
+                "missing-log" => remove_and_sync(&job.join("stdout.log")),
+                "nonempty-tmp" => fs::write(job.join("tmp/foreign"), b"keep").unwrap(),
+                "foreign-meta" | "foreign-payload" => {
+                    let path = job.join(if damage == "foreign-meta" {
+                        "meta.json"
+                    } else {
+                        "execution.json"
+                    });
+                    let original = fs::read_to_string(&path).unwrap();
+                    let foreign = original.replace(CLIENT_ID, "112f0f4a6b5c7d8e9f00112233445566");
+                    assert_ne!(original, foreign);
+                    replace_bytes(&path, foreign.as_bytes()).unwrap();
+                }
+                "unsafe-tmp" => {
+                    fs::remove_dir(job.join("tmp")).unwrap();
+                    symlink(&outside, job.join("tmp")).unwrap();
+                }
+                "changed-prompt" => {
+                    replace_bytes(&job.join("prompt.md"), b"private damaged prompt").unwrap()
+                }
+                "changed-schema" => replace_bytes(&job.join("result.schema.json"), b"{}").unwrap(),
+                "nonempty-log" => fs::write(job.join("stdout.log"), b"possible execution").unwrap(),
+                "unsafe-namespace" => symlink(&outside, job.join(".mac-worker-rooted-fs")).unwrap(),
+                "corrupt-redaction" => {
+                    replace_bytes(&job.join("launched-redaction.json"), b"{").unwrap()
+                }
+                "unsafe-redaction" => symlink(
+                    outside.join("sentinel"),
+                    job.join("launched-redaction.json"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let before = prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker);
+            let outside_before = matrix_snapshot_path(&outside);
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launcher = CountingRejectLauncher {
+                launches: Arc::clone(&launches),
+            };
+            let result = JobService::new(&store, &launcher).resolve_or_abandon(
+                ResolveOrAbandonRequest::from_submit_request(request.submit()).unwrap(),
+            );
+            match expected {
+                "error" => {
+                    assert_error_code(result.unwrap_err(), "JOB_ID_CONFLICT", damage);
+                    assert_eq!(
+                        prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker),
+                        before,
+                        "{damage}"
+                    );
+                    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+                }
+                "abandoned" => {
+                    assert_eq!(
+                        result.unwrap().outcome(),
+                        &ResolveOrAbandonOutcome::Abandoned,
+                        "{damage}"
+                    );
+                    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+                }
+                "pending" => {
+                    assert_eq!(
+                        result.unwrap().outcome(),
+                        &ResolveOrAbandonOutcome::CleanupPending {
+                            code: "MUTABLE_CLEANUP_FAILED".into()
+                        },
+                        "{damage}"
+                    );
+                    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(matrix_snapshot_path(&outside), outside_before, "{damage}");
+            assert_eq!(launches.load(Ordering::SeqCst), 0, "{damage}");
+            assert!(!marker.exists());
+        }
+    }
+
     fn prepared_turn(store: &HostStore, marker: &Path) -> (LeaseRecord, TaskTurnRequest) {
         let (request, meta) =
             super::super::supervisor::task_turn_request_on(store, matrix_command(marker));
