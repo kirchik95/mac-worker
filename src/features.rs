@@ -6,6 +6,8 @@
 
 pub const HOST_FEATURES: &[&str] = &["host.outbox-retry", "host.status-logs"];
 pub const CONTROLLER_FEATURES: &[&str] = &["controller.events", "controller.task-logs-wait"];
+/// Added only after an existing-only live generation/hello proof.
+pub const CONTROLLER_SOCKET: &str = "controller.socket";
 
 #[cfg(test)]
 mod tests {

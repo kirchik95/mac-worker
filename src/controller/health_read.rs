@@ -155,21 +155,75 @@ pub fn assess_health(
 }
 
 pub fn read_health_status(path: &Path) -> Result<ControllerHealthStatus, WorkerError> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let paths = crate::paths::PathLayout {
+        state: path.parent().unwrap_or(path).join("mac-worker"),
+        config: home.join(".config/mac-worker/config.toml"),
+        cache: home.join(".cache/mac-worker"),
+        data: home.join(".local/share/mac-worker"),
+    };
+    let features = if paths.controller_state_root() == path {
+        serving_features(&paths, &home)
+    } else {
+        crate::features::CONTROLLER_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect()
+    };
+    read_health_status_with_features(path, features)
+}
+
+pub fn read_health_status_with_paths(
+    paths: &crate::paths::PathLayout,
+    home: &Path,
+) -> Result<ControllerHealthStatus, WorkerError> {
+    read_health_status_with_features(
+        &paths.controller_state_root(),
+        serving_features(paths, home),
+    )
+}
+
+fn read_health_status_with_features(
+    path: &Path,
+    features: Vec<String>,
+) -> Result<ControllerHealthStatus, WorkerError> {
     let health = HealthStore::read_existing(path)?;
     let observation = match &health {
         Some(record) => observe_leader(path, record.leader)?,
         None => ProcessObservation::Ambiguous,
     };
     let mut status = assess_health(health, observation, now_millis()?);
-    status.features = Some(serving_features());
+    status.features = Some(features);
     Ok(status)
 }
 
-fn serving_features() -> Vec<String> {
-    crate::features::CONTROLLER_FEATURES
+fn serving_features(paths: &crate::paths::PathLayout, home: &Path) -> Vec<String> {
+    use super::channel::{
+        codec::SessionCodec,
+        contracts::{ChannelRuntime, ClientContext, SETUP_GUARD},
+        identity::read_live_service,
+    };
+    let runtime = super::runtime::SystemChannelRuntime::default();
+    let ctx = ClientContext {
+        runtime: &runtime,
+        deadline: runtime.now().saturating_add(SETUP_GUARD),
+        should_stop: &|| false,
+    };
+    let mut features: Vec<_> = crate::features::CONTROLLER_FEATURES
         .iter()
         .map(|feature| (*feature).to_owned())
-        .collect()
+        .collect();
+    if read_live_service(paths, home, &SessionCodec::new(), &ctx)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        features.push(crate::features::CONTROLLER_SOCKET.to_owned());
+        features.sort();
+    }
+    features
 }
 
 pub(crate) fn observe_leader(
@@ -254,7 +308,33 @@ pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec
     // host's unsupported-command code stays distinguishable from record damage.
     let mut status = read_health_status(path)
         .unwrap_or_else(|error| ControllerHealthStatus::unavailable(&error));
-    status.features = Some(serving_features());
+    // read_health_status includes only positively proven dynamic features.
+    if status.features.is_none() {
+        status.features = Some(
+            crate::features::CONTROLLER_FEATURES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+    }
+    super::encode_json_frame(&ControllerReadReply::from_request(request, status))
+}
+
+pub fn serve_health_read_with_paths(
+    request: &ControllerRequest,
+    paths: &crate::paths::PathLayout,
+    home: &Path,
+) -> Result<Vec<u8>, WorkerError> {
+    if !valid_health_request(request) {
+        return Err(WorkerError::Protocol(
+            "INVALID_REQUEST: invalid controller health read".into(),
+        ));
+    }
+    let features = serving_features(paths, home);
+    let mut status =
+        read_health_status_with_features(&paths.controller_state_root(), features.clone())
+            .unwrap_or_else(|error| ControllerHealthStatus::unavailable(&error));
+    status.features = Some(features);
     super::encode_json_frame(&ControllerReadReply::from_request(request, status))
 }
 

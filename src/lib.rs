@@ -1628,7 +1628,8 @@ fn run_controller_command(
             leader::now_millis,
         };
         use std::sync::atomic::{AtomicBool, Ordering};
-        let leader = crate::controller::ControllerLeader::acquire(&state_root)?;
+        let leader =
+            std::sync::Arc::new(crate::controller::ControllerLeader::acquire(&state_root)?);
         let store = crate::controller::ControllerStore::open(&state_root)?;
         let client_state = ClientStateStore::open(&paths.state)?;
         let event_runtime = ControllerEventRuntime::system();
@@ -1659,7 +1660,7 @@ fn run_controller_command(
         ));
         health_store.write(&health)?;
         let mut logger = HealthLogger::default();
-        let shutdown = AtomicBool::new(false);
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
         let interruptible =
             crate::controller::runtime::ControllerProcessRunner::new(runner, &shutdown);
         let handler = crate::controller::TaskSubmitHandler::new(
@@ -1689,8 +1690,34 @@ fn run_controller_command(
         };
         writeln!(stdout, "controller leader acquired")?;
         stdout.flush()?;
+        let channel = {
+            use crate::controller::{
+                channel::{image::SystemRunningImageSource, server::NativeControl},
+                runtime::{
+                    LeaderChannel, LeaderChannelConfig, LeaderChannelDeps, SystemChannelRuntime,
+                },
+            };
+            let _entered = async_runtime.enter();
+            LeaderChannel::start(
+                LeaderChannelConfig {
+                    paths: paths.clone(),
+                    home: runtime.home().to_owned(),
+                    environment: runtime.environment().clone(),
+                    client_id: client_state.client_id(),
+                    journal: _events.as_ref().map(ControllerEventPublisher::journal),
+                },
+                leader.clone(),
+                LeaderChannelDeps {
+                    image: std::sync::Arc::new(SystemRunningImageSource::new()),
+                    runner: std::sync::Arc::new(crate::process::SystemProcessRunner),
+                    runtime: std::sync::Arc::new(SystemChannelRuntime::new(shutdown.clone())),
+                    control: std::sync::Arc::new(NativeControl::new()),
+                },
+                shutdown.clone(),
+            )
+        };
         let mut first_tick = true;
-        let result = crate::controller::runtime::run_tick_loop(
+        let result = crate::controller::runtime::run_tick_loop_with_shutdown(
             &async_runtime,
             &shutdown,
             || {
@@ -1734,6 +1761,9 @@ fn run_controller_command(
                 stderr.flush()?;
                 Ok(())
             },
+            async {
+                channel.shutdown().await;
+            },
         );
         // Join has finished: publish stopped before dropping the leader lock.
         health.stopped_at_millis = Some(now_millis()?);
@@ -1764,13 +1794,27 @@ fn run_host_controller_rpc(
         let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
         let config = load_controller_process_config(&paths, !explicit_config)?;
-        crate::controller::serve_rpc_with_runtime(
+        let configured_executor = runtime
+            .environment()
+            .get(std::ffi::OsStr::new(
+                crate::controller::channel::DETACHED_RUNNER_EXECUTABLE_ENV,
+            ))
+            .map(|input| DetachedRunnerExecutor::with_executable(PathBuf::from(input)))
+            .transpose()?;
+        let executor: &dyn crate::turn_runner::RunnerExecutor = configured_executor
+            .as_ref()
+            .map_or(&DETACHED_TASK_EXECUTOR, |executor| executor);
+        crate::controller::serve_rpc_with_execution(
             &paths,
             &config,
             runner,
             stdin,
             stdout,
             crate::controller::ControllerFault::None,
+            crate::controller::RpcExecution {
+                executor,
+                home: runtime.home(),
+            },
         )?;
         Ok(())
     })();

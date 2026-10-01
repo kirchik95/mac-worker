@@ -198,6 +198,12 @@ fn journal_root(paths: &PathLayout, create: bool) -> io::Result<Option<RootedDir
 }
 
 impl ControllerJournal {
+    /// Epoch already established by initialization/open. Optional transport
+    /// hints must not query journal health or acquire a journal fence.
+    pub fn initialized_journal_id(&self) -> uuid::Uuid {
+        self.journal_id
+    }
+
     pub fn initialize_for_leader(
         paths: &PathLayout,
         leader: &ControllerLeader,

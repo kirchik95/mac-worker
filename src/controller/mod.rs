@@ -48,8 +48,9 @@ pub use envelope::{
     load_operation_envelope, persist_operation_envelope,
 };
 pub use execute::{
-    TaskSubmitHandler, send_controller_mutation, send_controller_read, send_controller_request,
-    serve_rpc_with_runtime, tick_controller_leader,
+    RpcExecution, TaskSubmitHandler, send_controller_mutation, send_controller_read,
+    send_controller_request, serve_rpc_with_execution, serve_rpc_with_runtime,
+    tick_controller_leader,
 };
 pub use leader::ControllerLeader;
 pub use lifecycle::{

@@ -148,6 +148,86 @@ impl RunnerExecutor for InlineRunnerExecutor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DetachedRunnerExecutor;
 
+/// Explicit installed executable for runners launched by a generation-pinned
+/// RPC child. Keeping the unit executor preserves all existing callers.
+pub struct ConfiguredDetachedRunnerExecutor {
+    executable: std::path::PathBuf,
+}
+
+impl DetachedRunnerExecutor {
+    pub fn with_executable(
+        executable: std::path::PathBuf,
+    ) -> Result<ConfiguredDetachedRunnerExecutor, WorkerError> {
+        use std::os::unix::fs::MetadataExt;
+        let invalid = || {
+            WorkerError::Protocol(
+                "INVALID_REQUEST: invalid detached runner executable input".into(),
+            )
+        };
+        if !executable.is_absolute()
+            || executable
+                .to_str()
+                .is_none_or(|text| text.len() > 4096 || text.chars().any(char::is_control))
+            || executable.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(invalid());
+        }
+        let metadata = std::fs::symlink_metadata(&executable).map_err(|_| invalid())?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o7022 != 0
+            || metadata.mode() & 0o100 == 0
+        {
+            return Err(invalid());
+        }
+        Ok(ConfiguredDetachedRunnerExecutor { executable })
+    }
+}
+
+impl RunnerExecutor for ConfiguredDetachedRunnerExecutor {
+    fn start(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<RunnerIdentity, WorkerError> {
+        self.start_with_slot(paths, task_id, turn_id, None)
+    }
+
+    fn start_with_slot(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+    ) -> Result<RunnerIdentity, WorkerError> {
+        self.start_with_slot_until(paths, task_id, turn_id, slot_token, None)
+    }
+
+    fn start_with_slot_until(
+        &self,
+        paths: &PathLayout,
+        task_id: TaskId,
+        turn_id: TurnId,
+        slot_token: Option<Uuid>,
+        deadline: Option<Instant>,
+    ) -> Result<RunnerIdentity, WorkerError> {
+        start_detached_runner(
+            paths,
+            task_id,
+            turn_id,
+            slot_token,
+            deadline,
+            Some(&self.executable),
+        )
+    }
+}
+
 impl RunnerExecutor for DetachedRunnerExecutor {
     fn start(
         &self,
@@ -176,49 +256,63 @@ impl RunnerExecutor for DetachedRunnerExecutor {
         slot_token: Option<Uuid>,
         deadline: Option<Instant>,
     ) -> Result<RunnerIdentity, WorkerError> {
-        // Use the same rooted, locked initialization as the child. Never follow
-        // a substituted log or chmod an existing target through a pathname.
-        let store = ClientStateStore::open_until(&paths.state, deadline)?;
-        drop(open_handoff_journal_for_spawn(
-            &store, paths, task_id, turn_id, slot_token,
-        )?);
-        let executable = std::env::current_exe().map_err(WorkerError::Io)?;
-        let mut command = Command::new(executable);
-        if !paths.config.as_os_str().is_empty() {
-            command.arg("--config").arg(&paths.config);
-        }
-        command
-            .arg("runner")
-            .arg(task_id.to_string())
-            .arg(turn_id.to_string());
-        if let Some(token) = slot_token {
-            command.arg("--slot-token").arg(token.to_string());
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // The supervisor/runner must not share the caller's process group:
-        // Ctrl-C and terminal teardown are local client concerns.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-        store.wait_deadline().remaining()?;
-        let child = command.spawn().map_err(WorkerError::Io)?;
-        let identity = SystemProcessInspector
-            .identity_for_pid(child.id())
-            .or_else(|_| fallback_process_identity(child.id()))?;
-        // Dropping Child intentionally leaves the runner detached.  Its
-        // durable state and owner identity are what reconciliation observes.
-        drop(child);
-        Ok(RunnerIdentity::new(identity))
+        start_detached_runner(paths, task_id, turn_id, slot_token, deadline, None)
     }
+}
+
+fn start_detached_runner(
+    paths: &PathLayout,
+    task_id: TaskId,
+    turn_id: TurnId,
+    slot_token: Option<Uuid>,
+    deadline: Option<Instant>,
+    executable: Option<&std::path::Path>,
+) -> Result<RunnerIdentity, WorkerError> {
+    // Use the same rooted, locked initialization as the child. Never follow
+    // a substituted log or chmod an existing target through a pathname.
+    let store = ClientStateStore::open_until(&paths.state, deadline)?;
+    drop(open_handoff_journal_for_spawn(
+        &store, paths, task_id, turn_id, slot_token,
+    )?);
+    let executable = match executable {
+        Some(path) => path.to_owned(),
+        None => std::env::current_exe().map_err(WorkerError::Io)?,
+    };
+    let mut command = Command::new(executable);
+    if !paths.config.as_os_str().is_empty() {
+        command.arg("--config").arg(&paths.config);
+    }
+    command
+        .arg("runner")
+        .arg(task_id.to_string())
+        .arg(turn_id.to_string());
+    if let Some(token) = slot_token {
+        command.arg("--slot-token").arg(token.to_string());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The supervisor/runner must not share the caller's process group:
+    // Ctrl-C and terminal teardown are local client concerns.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    store.wait_deadline().remaining()?;
+    let child = command.spawn().map_err(WorkerError::Io)?;
+    let identity = SystemProcessInspector
+        .identity_for_pid(child.id())
+        .or_else(|_| fallback_process_identity(child.id()))?;
+    // Dropping Child intentionally leaves the runner detached.  Its
+    // durable state and owner identity are what reconciliation observes.
+    drop(child);
+    Ok(RunnerIdentity::new(identity))
 }
 
 /// Whether a queue row still authorizes this parent's spawn attempt.

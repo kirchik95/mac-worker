@@ -50,7 +50,7 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     task_client::{TaskClient, validate_close_target},
     transfer_repo::TransferRepo,
-    turn_runner::DetachedRunnerExecutor,
+    turn_runner::{DetachedRunnerExecutor, RunnerExecutor},
 };
 
 const GIT_PROGRAM: &str = "/usr/bin/git";
@@ -573,10 +573,59 @@ pub fn serve_rpc_with_runtime(
     stdout: &mut dyn Write,
     fault: ControllerFault,
 ) -> Result<(), WorkerError> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    serve_rpc_with_execution(
+        paths,
+        config,
+        runner,
+        stdin,
+        stdout,
+        fault,
+        RpcExecution {
+            executor: &DETACHED_EXECUTOR,
+            home: &home,
+        },
+    )
+}
+
+pub struct RpcExecution<'a> {
+    pub executor: &'a dyn RunnerExecutor,
+    pub home: &'a Path,
+}
+
+pub fn serve_rpc_with_execution(
+    paths: &PathLayout,
+    config: &Config,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    fault: ControllerFault,
+    execution: RpcExecution<'_>,
+) -> Result<(), WorkerError> {
     let payload = crate::controller::protocol::read_frame(stdin)?;
     let request = crate::controller::protocol::parse_request(&payload)?;
     let mut _events = None;
-    let frame = if crate::controller::events::rpc::is_event_selector(&request) {
+    let frame = if crate::controller::channel::identity::is_socket_selector(&request) {
+        use crate::controller::channel::{
+            codec::SessionCodec,
+            contracts::{ChannelRuntime, ClientContext, SETUP_GUARD},
+        };
+        let runtime = crate::controller::runtime::SystemChannelRuntime::default();
+        let ctx = ClientContext {
+            runtime: &runtime,
+            deadline: runtime.now().saturating_add(SETUP_GUARD),
+            should_stop: &|| false,
+        };
+        crate::controller::channel::identity::serve_identity_selector(
+            &request,
+            paths,
+            execution.home,
+            &SessionCodec::new(),
+            &ctx,
+        )?
+    } else if crate::controller::events::rpc::is_event_selector(&request) {
         use crate::controller::events::{
             EventRuntime, RPC_BUDGET,
             journal::ExistingJournalProvider,
@@ -588,7 +637,11 @@ pub fn serve_rpc_with_runtime(
         let tasks = ExistingTaskProjectionProvider::new(paths.clone(), runtime);
         serve_selector_with(&request, &journal, &tasks, deadline)?
     } else if crate::controller::health_read::is_health_read(&request) {
-        crate::controller::health_read::serve_health_read(&request, &paths.controller_state_root())?
+        crate::controller::health_read::serve_health_read_with_paths(
+            &request,
+            paths,
+            execution.home,
+        )?
     } else if request.command() == "controller.drain" {
         _events = crate::open_existing_controller_event_publisher(
             paths,
@@ -605,7 +658,7 @@ pub fn serve_rpc_with_runtime(
             crate::ControllerEventRuntime::system(),
         )?;
         _events = events;
-        let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
+        let client = TaskClient::new(runner, config, paths, &client_state, execution.executor);
         serve_read_command(&request, &client)?
     } else if is_lifecycle_command(request.command()) {
         let (client_state, events) = crate::open_with_existing_controller_events(
@@ -613,7 +666,7 @@ pub fn serve_rpc_with_runtime(
             crate::ControllerEventRuntime::system(),
         )?;
         _events = events;
-        let client = TaskClient::new(runner, config, paths, &client_state, &DETACHED_EXECUTOR);
+        let client = TaskClient::new(runner, config, paths, &client_state, execution.executor);
         serve_lifecycle_command(&request, &client)?
     } else if is_transfer_command(request.command()) {
         serve_transfer_command(&request, paths, runner)?
