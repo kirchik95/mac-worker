@@ -1047,6 +1047,207 @@ impl RootedDir {
         )?))
     }
 
+    fn channel_private_root(&self) -> io::Result<()> {
+        let metadata = self.root_metadata()?;
+        require_private_directory(&metadata)?;
+        if metadata.st_mode & 0o7777 != 0o700 {
+            return Err(os_error(libc::EACCES));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn channel_socket_entry(&self, name: &str) -> io::Result<PrivateEntryIdentity> {
+        self.channel_private_root()?;
+        let name = private_leaf_name(name)?;
+        let metadata = stat_at(self.root.as_raw_fd(), &name)?;
+        if file_type(metadata.st_mode) != libc::S_IFSOCK
+            || metadata.st_uid != unsafe { libc::geteuid() }
+            || metadata.st_mode & 0o7777 != 0o600
+            || metadata.st_nlink != 1
+        {
+            return Err(os_error(libc::EACCES));
+        }
+        self.channel_private_root()?;
+        Ok(PrivateEntryIdentity::from_stat(&metadata))
+    }
+
+    pub(crate) fn channel_executable_entry(&self, name: &str) -> io::Result<PrivateEntryIdentity> {
+        self.channel_private_root()?;
+        let name = private_leaf_name(name)?;
+        let metadata = stat_at(self.root.as_raw_fd(), &name)?;
+        require_channel_executable(&metadata)?;
+        self.channel_private_root()?;
+        Ok(PrivateEntryIdentity::from_stat(&metadata))
+    }
+
+    pub(crate) fn channel_bind_socket(
+        &self,
+        name: &str,
+    ) -> io::Result<(std::os::unix::net::UnixListener, PrivateEntryIdentity)> {
+        self.channel_bind_socket_with_hook(name, || {})
+    }
+
+    fn channel_bind_socket_with_hook(
+        &self,
+        name: &str,
+        after_bind: impl FnOnce(),
+    ) -> io::Result<(std::os::unix::net::UnixListener, PrivateEntryIdentity)> {
+        self.channel_private_root()?;
+        let leaf = private_leaf_name(name)?;
+        match stat_at(self.root.as_raw_fd(), &leaf) {
+            Ok(_) => return Err(os_error(libc::EEXIST)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let listener = std::os::unix::net::UnixListener::bind(self.path().join(name))?;
+        self.channel_private_root()?;
+        let created = stat_at(self.root.as_raw_fd(), &leaf)?;
+        if file_type(created.st_mode) != libc::S_IFSOCK
+            || created.st_uid != unsafe { libc::geteuid() }
+            || created.st_nlink != 1
+        {
+            return Err(os_error(libc::ESTALE));
+        }
+        after_bind();
+        self.channel_private_root()?;
+        let rebound = stat_at(self.root.as_raw_fd(), &leaf)?;
+        if PrivateEntryIdentity::from_stat(&rebound) != PrivateEntryIdentity::from_stat(&created) {
+            return Err(os_error(libc::ESTALE));
+        }
+        // Only the entry just created by bind is eligible for this mode change.
+        cvt(unsafe {
+            libc::fchmodat(
+                self.root.as_raw_fd(),
+                leaf.as_ptr(),
+                0o600,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })?;
+        let binding = self.channel_socket_entry(name)?;
+        if binding.device != created.st_dev as u64 || binding.inode != created.st_ino {
+            return Err(os_error(libc::ESTALE));
+        }
+        listener.set_nonblocking(true)?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        Ok((listener, binding))
+    }
+
+    pub(crate) fn channel_link_executable(
+        &self,
+        source: &Path,
+        device: u64,
+        inode: u64,
+        name: &str,
+    ) -> io::Result<PrivateEntryIdentity> {
+        self.channel_link_executable_with_hook(source, device, inode, name, || {})
+    }
+
+    fn channel_link_executable_with_hook(
+        &self,
+        source: &Path,
+        device: u64,
+        inode: u64,
+        name: &str,
+        after_open: impl FnOnce(),
+    ) -> io::Result<PrivateEntryIdentity> {
+        self.channel_private_root()?;
+        let destination = private_leaf_name(name)?;
+        let (source_parent, source_name) = split_root_path(source)?;
+        let parent = Self::open_anchored_absolute(source_parent)?;
+        let before = stat_at(parent.root.as_raw_fd(), &source_name)?;
+        require_channel_executable(&before)?;
+        if before.st_dev as u64 != device || before.st_ino != inode {
+            return Err(os_error(libc::ESTALE));
+        }
+        if self.root_metadata()?.st_dev as u64 != device {
+            return Err(os_error(libc::EXDEV));
+        }
+        let descriptor = open_regular_at(parent.root.as_raw_fd(), &source_name)?;
+        let opened = stat_fd(descriptor.as_raw_fd())?;
+        require_channel_executable(&opened)?;
+        if PrivateEntryIdentity::from_stat(&before) != PrivateEntryIdentity::from_stat(&opened) {
+            return Err(os_error(libc::ESTALE));
+        }
+        after_open();
+        parent.verify_bound()?;
+        self.channel_private_root()?;
+        let rebound = stat_at(parent.root.as_raw_fd(), &source_name)?;
+        if PrivateEntryIdentity::from_stat(&opened) != PrivateEntryIdentity::from_stat(&rebound) {
+            return Err(os_error(libc::ESTALE));
+        }
+        // linkat has no replacement behavior. Never chmod a linked executable.
+        cvt(unsafe {
+            libc::linkat(
+                parent.root.as_raw_fd(),
+                source_name.as_ptr(),
+                self.root.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        })?;
+        let linked = self.channel_executable_entry(name)?;
+        let retained = stat_fd(descriptor.as_raw_fd())?;
+        let final_source = stat_at(parent.root.as_raw_fd(), &source_name)?;
+        if linked != PrivateEntryIdentity::from_stat(&retained)
+            || linked != PrivateEntryIdentity::from_stat(&final_source)
+            || linked.device != device
+            || linked.inode != inode
+        {
+            // Missing creation evidence is residue, never permission to remove it.
+            return Err(os_error(libc::ESTALE));
+        }
+        parent.verify_bound()?;
+        self.channel_private_root()?;
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })?;
+        Ok(linked)
+    }
+
+    pub(crate) fn channel_unlink_exact(
+        &self,
+        name: &str,
+        expected: PrivateEntryIdentity,
+    ) -> io::Result<()> {
+        self.channel_unlink_exact_with_hook(name, expected, || {})
+    }
+
+    fn channel_unlink_exact_with_hook(
+        &self,
+        name: &str,
+        expected: PrivateEntryIdentity,
+        before_unlink: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.channel_private_root()?;
+        let leaf = private_leaf_name(name)?;
+        let check = || {
+            self.channel_private_root()?;
+            let metadata = stat_at(self.root.as_raw_fd(), &leaf)?;
+            match file_type(metadata.st_mode) {
+                libc::S_IFSOCK => {
+                    self.channel_socket_entry(name)?;
+                }
+                libc::S_IFREG if metadata.st_mode & 0o111 != 0 => {
+                    require_channel_executable(&metadata)?;
+                }
+                libc::S_IFREG => require_private_regular(&metadata)?,
+                _ => return Err(invalid_type_error()),
+            }
+            if PrivateEntryIdentity::from_stat(&metadata) != expected {
+                return Err(os_error(libc::ESTALE));
+            }
+            Ok(())
+        };
+        check()?;
+        before_unlink();
+        check()?;
+        unlink_at(self.root.as_raw_fd(), &leaf, 0)?;
+        self.channel_private_root()?;
+        match stat_at(self.root.as_raw_fd(), &leaf) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(os_error(libc::ESTALE)),
+        }
+        cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
+    }
+
     pub(crate) fn private_entry_identity(&self, name: &str) -> io::Result<PrivateEntryIdentity> {
         self.verify_root_name()?;
         let name = CString::new(name).map_err(interior_nul_error)?;
@@ -12118,6 +12319,17 @@ fn invalid_type_error() -> io::Error {
     os_error(libc::EINVAL)
 }
 
+fn require_channel_executable(metadata: &libc::stat) -> io::Result<()> {
+    if file_type(metadata.st_mode) != libc::S_IFREG
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o7022 != 0
+        || metadata.st_mode & 0o100 == 0
+    {
+        return Err(os_error(libc::EACCES));
+    }
+    Ok(())
+}
+
 fn os_error(errno: libc::c_int) -> io::Error {
     io::Error::from_raw_os_error(errno)
 }
@@ -12158,6 +12370,145 @@ fn current_errno() -> libc::c_int {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    #[test]
+    fn channel_socket_bind_creates_private_nonblocking_listener() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("rpc")).unwrap();
+        let (listener, binding) = root.channel_bind_socket("s").unwrap();
+        assert_eq!(binding.kind, libc::S_IFSOCK as u32);
+        assert_eq!(binding.mode, 0o600);
+        assert_eq!(
+            std::fs::metadata(root.path().join("s"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(root.channel_socket_entry("s").unwrap(), binding);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn channel_socket_bind_preserves_existing_entries_and_swapped_parent() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("rpc")).unwrap();
+        std::fs::write(root.path().join("file"), b"keep").unwrap();
+        symlink("file", root.path().join("link")).unwrap();
+        for name in ["file", "link"] {
+            assert!(root.channel_bind_socket(name).is_err());
+        }
+        let old = temp.path().join("old");
+        assert!(
+            root.channel_bind_socket_with_hook("s", || {
+                std::fs::rename(root.path(), &old).unwrap();
+                std::fs::create_dir(root.path()).unwrap();
+                std::fs::write(root.path().join("s"), b"replacement").unwrap();
+            })
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("s")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(std::fs::read(old.join("file")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn channel_socket_image_link_survives_install_replacement_without_chmod() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("worker");
+        std::fs::write(&source, b"#!/bin/sh\nprintf old").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let root = super::RootedDir::create(&temp.path().join("rpc")).unwrap();
+        let binding = root
+            .channel_link_executable(&source, metadata.dev(), metadata.ino(), "e-test")
+            .unwrap();
+        std::fs::rename(&source, temp.path().join("old")).unwrap();
+        std::fs::write(&source, b"#!/bin/sh\nprintf new").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(root.path().join("e-test"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"old");
+        assert_eq!(
+            std::fs::metadata(temp.path().join("old"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        root.channel_unlink_exact("e-test", binding).unwrap();
+        assert!(!root.path().join("e-test").exists());
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn channel_socket_image_link_rejects_source_swap_and_unsafe_executable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("worker");
+        std::fs::write(&source, b"old").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let root = super::RootedDir::create(&temp.path().join("rpc")).unwrap();
+        let replacement = temp.path().join("new");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            root.channel_link_executable_with_hook(
+                &source,
+                metadata.dev(),
+                metadata.ino(),
+                "e-swap",
+                || {
+                    std::fs::rename(&replacement, &source).unwrap();
+                }
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let changed = std::fs::metadata(&source).unwrap();
+        assert!(
+            root.channel_link_executable(&source, changed.dev(), changed.ino(), "e-unsafe")
+                .is_err()
+        );
+        assert!(!root.path().join("e-unsafe").exists());
+        assert!(
+            root.channel_link_executable(&source, changed.dev(), changed.ino(), "../escape")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn channel_socket_exact_unlink_preserves_socket_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = super::RootedDir::create(&temp.path().join("rpc")).unwrap();
+        let (listener, binding) = root.channel_bind_socket("s").unwrap();
+        drop(listener);
+        assert!(
+            root.channel_unlink_exact_with_hook("s", binding, || {
+                std::fs::rename(root.path().join("s"), root.path().join("old")).unwrap();
+                std::fs::write(root.path().join("s"), b"keep replacement").unwrap();
+            })
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("s")).unwrap(),
+            b"keep replacement"
+        );
+        assert!(root.path().join("old").exists());
+    }
+
     struct JournalCreationHooks<'a> {
         root: &'a super::RootedDir,
         fail_at: Option<super::PrivateRolePoint>,
