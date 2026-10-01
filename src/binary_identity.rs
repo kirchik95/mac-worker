@@ -86,11 +86,13 @@ impl BinaryIdentitySource for SystemBinaryIdentitySource {
 
 /// Test double that returns fixed identities.
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct FixedBinaryIdentitySource {
     pub started: Option<BinaryIdentity>,
     pub installed: Option<BinaryIdentity>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl BinaryIdentitySource for FixedBinaryIdentitySource {
     fn started(&self) -> Option<BinaryIdentity> {
         self.started.clone()

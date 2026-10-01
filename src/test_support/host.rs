@@ -40,10 +40,12 @@ pub mod rooted_fs {
     pub use crate::rooted_fs::{EntryKind, RootedDir};
 }
 pub mod store {
+    pub use crate::gc::{
+        BRANCH_RETENTION_MILLIS, HostGc, JOB_RETENTION_MILLIS, TASK_RETENTION_MILLIS,
+    };
     pub use crate::host_store::{
-        AdmissionGuard, BRANCH_RETENTION_MILLIS, CleanupReceipt, HOST_LAYOUT_VERSION, HostGc,
-        HostStore, HostStoreWritePoint, JOB_RETENTION_MILLIS, JobDisposition,
-        PREVIOUS_HOST_LAYOUT_VERSION, SupervisorGuard, TASK_RETENTION_MILLIS, TransferGuard,
+        AdmissionGuard, CleanupReceipt, HOST_LAYOUT_VERSION, HostStore, HostStoreWritePoint,
+        JobDisposition, PREVIOUS_HOST_LAYOUT_VERSION, SupervisorGuard, TransferGuard,
     };
 }
 pub mod supervisor {

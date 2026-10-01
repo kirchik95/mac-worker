@@ -301,10 +301,12 @@ impl<'a> HostGc<'a> {
         Self { store, runner }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn preview_at(&self, now_millis: u64) -> Result<GcReport, WorkerError> {
         self.run(&GcRequest::new(false, now_millis))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn apply_at(&self, now_millis: u64) -> Result<GcReport, WorkerError> {
         self.run(&GcRequest::new(true, now_millis))
     }

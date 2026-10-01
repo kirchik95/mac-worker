@@ -9,11 +9,11 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Arc,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -26,15 +26,18 @@ use crate::{
     },
     inputs::RelativePath,
     job::{
-        CancelRequest, ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseRecord, LeaseToken, RequestFingerprint, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, SubmitRequest,
+        CancelRequest, ClientId, CommandSummary, JobId, JobMeta, JobStatus, LeaseRecord,
+        LeaseToken, RequestFingerprint, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+        SubmitRequest,
     },
     rooted_fs::{PrivateEntryIdentity, RootedDir},
     task::{TaskId, TaskStatus},
 };
 
-pub use crate::gc::{BRANCH_RETENTION_MILLIS, HostGc, JOB_RETENTION_MILLIS, TASK_RETENTION_MILLIS};
+#[cfg(any(test, feature = "test-support"))]
+use crate::job::LeaseAcquireRequest;
+
+pub(crate) use crate::gc::BRANCH_RETENTION_MILLIS;
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 pub const HOST_LAYOUT_VERSION: u32 = 3;
@@ -192,7 +195,9 @@ struct HostStoreInner {
     namespaces: BTreeMap<&'static str, RootedDir>,
     root_identity: HostRootIdentity,
     layout: HostLayoutIdentity,
+    #[cfg(any(test, feature = "test-support"))]
     fault: AtomicU8,
+    #[cfg(any(test, feature = "test-support"))]
     secondary_fault: AtomicU8,
 }
 
@@ -1000,6 +1005,7 @@ impl HostStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_write_fault(
         root: &Path,
         point: HostStoreWritePoint,
@@ -1009,6 +1015,7 @@ impl HostStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_write_faults(
         root: &Path,
         first: HostStoreWritePoint,
@@ -1350,7 +1357,9 @@ impl HostStore {
                 namespaces,
                 root_identity,
                 layout,
+                #[cfg(any(test, feature = "test-support"))]
                 fault: AtomicU8::new(point.map_or(0, |point| point as u8)),
+                #[cfg(any(test, feature = "test-support"))]
                 secondary_fault: AtomicU8::new(0),
             }),
         };
@@ -1420,7 +1429,6 @@ impl HostStore {
         Ok(guard)
     }
 
-    #[allow(dead_code)] // Standalone capacity locking is exercised by host integrity tests.
     pub(crate) fn capacity_lock(&self) -> Result<AdmissionGuard, WorkerError> {
         // Installation then capacity. Callers that also need session.lock
         // must acquire this first: session then capacity deadlocks with GC
@@ -1531,11 +1539,13 @@ impl HostStore {
                 hex_16(*uuid::Uuid::new_v4().as_bytes())
             );
             let mut operation = job_locks.create_new_child_directory(&operation_name)?;
+            #[cfg(any(test, feature = "test-support"))]
             if self.consume_fault(HostStoreWritePoint::AfterTransferDirectoryCreate) {
                 return Err(injected_transfer_initialization());
             }
             drop(operation.open_private_lock(TRANSFER_LOCK_FILE)?);
             operation.sync_root()?;
+            #[cfg(any(test, feature = "test-support"))]
             if self.consume_fault(HostStoreWritePoint::AfterTransferLockSync) {
                 return Err(injected_transfer_initialization());
             }
@@ -1576,12 +1586,14 @@ impl HostStore {
                     "canonical transfer lock identity changed".into(),
                 ));
             }
+            #[cfg(any(test, feature = "test-support"))]
             if self.consume_fault(HostStoreWritePoint::AfterTransferIdentityPublish) {
                 return Err(injected_transfer_initialization());
             }
             operation.sync_root()?;
             admission.validate()?;
             operation.publish_owned_into(&job_locks, TRANSFER_DIRECTORY)?;
+            #[cfg(any(test, feature = "test-support"))]
             if self.consume_fault(HostStoreWritePoint::AfterTransferPublish) {
                 return Err(injected_transfer_initialization());
             }
@@ -1991,6 +2003,7 @@ impl HostStore {
                 "status capability belongs to another job",
             ));
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::BeforeJobStatusReplace) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected status replacement failure",
@@ -2035,6 +2048,7 @@ impl HostStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn incoming_job(&self, job: JobId, token: LeaseToken) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         Ok(self
@@ -2045,6 +2059,7 @@ impl HostStore {
             .join(token.to_string()))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn verified_receipt(&self, job: JobId) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         Ok(self
@@ -2054,6 +2069,7 @@ impl HostStore {
             .join(format!("{job}.json")))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn job(&self, project: &str, worktree: &str, job: JobId) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         validate_digest(project, "project ID")?;
@@ -2067,6 +2083,7 @@ impl HostStore {
             .join(job.to_string()))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn snapshot(
         &self,
         project: &str,
@@ -2086,6 +2103,7 @@ impl HostStore {
             .join(digest))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn job_index(&self, job: JobId) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         Ok(self
@@ -2131,6 +2149,7 @@ impl HostStore {
         Ok(Some(mirror))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_dir(&self, project_id: &str, task_id: TaskId) -> Result<PathBuf, WorkerError> {
         self.validate_layout()?;
         validate_digest(project_id, "project ID")?;
@@ -2227,6 +2246,7 @@ impl HostStore {
         Ok(SessionGuard { file })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn begin_job(
         &self,
         project: &str,
@@ -2294,6 +2314,7 @@ impl HostStore {
         Ok(published)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_accepted(
         &self,
         request: &LeaseAcquireRequest,
@@ -2349,6 +2370,7 @@ impl HostStore {
         published.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_abandoned(
         &self,
         request: &LeaseAcquireRequest,
@@ -2359,6 +2381,7 @@ impl HostStore {
         self.record_abandoned_after(&guard, request, now)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_abandoned_after(
         &self,
         guard: &AdmissionGuard,
@@ -2405,6 +2428,7 @@ impl HostStore {
             recorded_at_millis: now,
         };
         self.write_new_disposition(&disposition)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionTombstone) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution tombstone interruption",
@@ -2427,6 +2451,7 @@ impl HostStore {
             self.remove_owned_regular_committed(job, "execution.json")?;
             job.sync_root()?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionExecutionRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution execution cleanup interruption",
@@ -2456,6 +2481,7 @@ impl HostStore {
             }
             job.sync_root()?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionJobMutableRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution job cleanup interruption",
@@ -2476,6 +2502,7 @@ impl HostStore {
         let leases = self.open_directory("leases", false)?;
         self.remove_job_owned_lease_stages(&leases, identity.job_id())?;
         leases.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionJobStageRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution staging cleanup interruption",
@@ -2534,6 +2561,7 @@ impl HostStore {
             }
         }
         require_no_private_cleanup_residue(&leases, "lease staging")?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionAbsenceProof) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution absence proof interruption",
@@ -2660,6 +2688,7 @@ impl HostStore {
         )?;
         let marker: CleanupMarker = read_json_strict_at(&proof_dir, "cleanup-complete.json")?;
         require_resolution_marker(&marker, identity)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionCleanupMarker) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution cleanup marker interruption",
@@ -2700,6 +2729,7 @@ impl HostStore {
             self.remove_owned_child_committed(&incoming, &token)?;
             incoming.sync_root()?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterResolutionIncomingRemoval) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected resolution incoming cleanup interruption",
@@ -2901,6 +2931,7 @@ impl HostStore {
             },
             "cleanup marker",
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterJobCleanupProof) {
             return Err(WorkerError::Io(std::io::Error::other(
                 "injected cleanup-proof crash boundary",
@@ -2915,6 +2946,7 @@ impl HostStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn consume_fault(&self, point: HostStoreWritePoint) -> bool {
         if self
             .inner
@@ -2930,12 +2962,19 @@ impl HostStore {
             .is_ok()
     }
 
+    // Transfer-owned outbox call sites still use these tokens until their
+    // domain closes them. No injected state exists in an ordinary build.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(crate) fn consume_fault(&self, _point: HostStoreWritePoint) -> bool {
+        false
+    }
+
     fn after_cleanup_intent_commit(&self) -> std::io::Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.consume_fault(HostStoreWritePoint::AfterCleanupIntentCommit) {
-            Err(std::io::Error::from_raw_os_error(libc::EIO))
-        } else {
-            Ok(())
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
+        Ok(())
     }
 
     pub(crate) fn remove_owned_child_committed(
@@ -3512,6 +3551,15 @@ impl HostStore {
     }
 }
 
+#[cfg(not(any(test, feature = "test-support")))]
+fn inject_open_fault(
+    _selected: Option<HostStoreWritePoint>,
+    _boundary: HostStoreWritePoint,
+) -> Result<(), WorkerError> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn inject_open_fault(
     selected: Option<HostStoreWritePoint>,
     boundary: HostStoreWritePoint,
@@ -3524,6 +3572,7 @@ fn inject_open_fault(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn injected_transfer_initialization() -> WorkerError {
     WorkerError::Io(std::io::Error::other(
         "injected transfer lock initialization failure",
@@ -4236,6 +4285,12 @@ fn worker_error_as_io(error: WorkerError) -> std::io::Error {
     }
 }
 
+#[cfg(not(any(test, feature = "test-support")))]
+fn consume_write_fault_io(_store: &HostStore, _point: HostStoreWritePoint) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn consume_write_fault_io(store: &HostStore, point: HostStoreWritePoint) -> std::io::Result<()> {
     if store.consume_fault(point) {
         Err(std::io::Error::other("injected host-store write failure"))
@@ -4933,14 +4988,12 @@ impl PublishedJob {
 }
 
 impl CleanupReceipt {
-    #[allow(dead_code)] // Task 7 lifecycle consumes internal release receipts.
     pub(crate) fn matches(&self, lease: &LeaseRecord) -> bool {
         self.job_id == lease.job_id()
             && self.client_id == lease.client_id()
             && self.lease_token == lease.lease_token()
     }
 
-    #[allow(dead_code)] // Task 7 lifecycle consumes internal release receipts.
     pub(crate) fn validate_durable(
         &self,
         store: &HostStore,

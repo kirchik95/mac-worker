@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::WorkerError,
-    host_store::{CleanupReceipt, HostStore, HostStoreWritePoint, JobDisposition},
+    host_store::{CleanupReceipt, HostStore, JobDisposition},
     job::{ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord},
     protocol::MemoryPressure,
     rooted_fs::RootedDir,
     task::TaskId,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::host_store::HostStoreWritePoint;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Host and laptop slot counts are this `u8` inclusive maximum.
@@ -327,6 +330,7 @@ impl<'a> LeaseService<'a> {
         receipt.validate_durable(self.store, &live.1)?;
         guard.validate()?;
         capacity.validate()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::BeforeJobLeaseRetirement)
@@ -340,6 +344,7 @@ impl<'a> LeaseService<'a> {
         capacity.validate()?;
         live_dir.publish_owned_into(&slots, &retired)?;
         slots.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterJobLeaseRetirement)
@@ -390,6 +395,7 @@ impl<'a> LeaseService<'a> {
             WorkerError::Protocol(format!("failed to serialize execution scope: {error}"))
         })?;
         let scope_file = operation.write_new_private_file(SCOPE_FILE, &scope_bytes)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseWrite)
@@ -398,6 +404,7 @@ impl<'a> LeaseService<'a> {
         }
         file.sync_all()?;
         scope_file.sync_all()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseFileSync)
@@ -405,6 +412,7 @@ impl<'a> LeaseService<'a> {
             return Err(injected());
         }
         operation.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseDirectorySync)
@@ -412,6 +420,7 @@ impl<'a> LeaseService<'a> {
             return Err(injected());
         }
         slots.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeaseParentSync)
@@ -421,6 +430,7 @@ impl<'a> LeaseService<'a> {
         admission.validate()?;
         capacity.validate()?;
         operation.publish_owned_into(&slots, &slot_id.to_string())?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublish)
@@ -428,6 +438,7 @@ impl<'a> LeaseService<'a> {
             return Err(injected());
         }
         slots.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterLeasePublishSync)
@@ -631,7 +642,7 @@ pub(crate) fn initialize_slot_layout(leases: &RootedDir) -> Result<(), WorkerErr
 /// must invoke this **after** drain inspect and binary rename, while still
 /// holding the construction installation lock. Do not call
 /// [`HostStore::migrate_layout`] from that path (second flock fd).
-pub fn promote_slot_directories(leases: &RootedDir) -> Result<(), WorkerError> {
+pub(crate) fn promote_slot_directories(leases: &RootedDir) -> Result<(), WorkerError> {
     initialize_slot_layout(leases)
 }
 
@@ -700,6 +711,7 @@ fn parse_canonical_slot_id(name: &str) -> Result<u8, WorkerError> {
     Ok(slot_id)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn injected() -> WorkerError {
     WorkerError::Io(std::io::Error::other("injected lease crash boundary"))
 }

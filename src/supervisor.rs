@@ -68,6 +68,7 @@ impl Default for SupervisorTimings {
 impl SupervisorTimings {
     /// Short deadlines for fixtures with controlled child readiness.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn fast() -> Self {
         Self {
             term_grace: Duration::from_millis(250),
@@ -214,6 +215,7 @@ pub enum StdoutSink {
 }
 
 impl LaunchPlan {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn turn(
         command: &CommandSpec,
         lease: &LeaseRecord,
@@ -246,6 +248,7 @@ impl LaunchPlan {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn turn_at(
         command: &CommandSpec,
         lease: &LeaseRecord,
@@ -385,6 +388,7 @@ impl LaunchPlan {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prepare_turn_agent_args(&self) -> Option<&[String]> {
         let args = &self.args;
         if args.get(1).map(String::as_str) == Some(crate::prepare_turn::ARG)
@@ -434,26 +438,32 @@ impl LaunchPlan {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn program(&self) -> &str {
         &self.program
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn args(&self) -> &[String] {
         &self.args
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn env(&self) -> &[(OsString, OsString)] {
         &self.env
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stdin(&self) -> &StdinSource {
         &self.stdin
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stdout(&self) -> StdoutSink {
         self.stdout
     }
@@ -950,6 +960,7 @@ pub struct SystemSupervisorLauncher {
 }
 
 impl SystemSupervisorLauncher {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_timings(mut self, timings: SupervisorTimings) -> Self {
         self.timings = timings;
         self
@@ -1188,9 +1199,13 @@ unsafe fn detached_supervisor_child(
 pub struct Supervisor<'a> {
     store: &'a HostStore,
     inspector: &'a dyn ProcessInspector,
+    #[cfg(any(test, feature = "test-support"))]
     fault: Option<SupervisorFaultPoint>,
+    #[cfg(any(test, feature = "test-support"))]
     stdout_log_cap: Option<u64>,
+    #[cfg(any(test, feature = "test-support"))]
     stderr_log_cap: Option<u64>,
+    #[cfg(any(test, feature = "test-support"))]
     prepare_turn_helper: Option<PathBuf>,
     timings: SupervisorTimings,
 }
@@ -1293,6 +1308,7 @@ fn append_supervisor_note(job: &RootedDir, note: &str) {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum SupervisorFaultPoint {
     AfterSupervisorIdentity,
     AfterPayloadRead,
@@ -1311,11 +1327,13 @@ pub enum SupervisorFaultPoint {
 }
 
 impl<'a> Supervisor<'a> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_timings(mut self, timings: SupervisorTimings) -> Self {
         self.timings = timings;
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_term_grace(mut self, term_grace: Duration) -> Self {
         self.timings.term_grace = term_grace;
         self
@@ -1325,15 +1343,20 @@ impl<'a> Supervisor<'a> {
         Self {
             store,
             inspector,
+            #[cfg(any(test, feature = "test-support"))]
             fault: None,
+            #[cfg(any(test, feature = "test-support"))]
             stdout_log_cap: None,
+            #[cfg(any(test, feature = "test-support"))]
             stderr_log_cap: None,
+            #[cfg(any(test, feature = "test-support"))]
             prepare_turn_helper: None,
             timings: SupervisorTimings::default(),
         }
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_fault(
         store: &'a HostStore,
         inspector: &'a dyn ProcessInspector,
@@ -1351,6 +1374,7 @@ impl<'a> Supervisor<'a> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_log_caps(mut self, stdout: Option<u64>, stderr: Option<u64>) -> Self {
         self.stdout_log_cap = stdout;
         self.stderr_log_cap = stderr;
@@ -1358,14 +1382,29 @@ impl<'a> Supervisor<'a> {
     }
 
     fn stdout_pump_config(&self) -> StreamPumpConfig {
-        StreamPumpConfig::production().with_cap(self.stdout_log_cap)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            StreamPumpConfig::production().with_cap(self.stdout_log_cap)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            StreamPumpConfig::production()
+        }
     }
 
     fn stderr_pump_config(&self) -> StreamPumpConfig {
-        StreamPumpConfig::production().with_cap(self.stderr_log_cap)
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            StreamPumpConfig::production().with_cap(self.stderr_log_cap)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            StreamPumpConfig::production()
+        }
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_prepare_turn_helper(mut self, helper: PathBuf) -> Self {
         self.prepare_turn_helper = Some(helper);
         self
@@ -1445,6 +1484,7 @@ impl<'a> Supervisor<'a> {
         )?;
         status = supervised;
         status_bytes = canonical_json(&status)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterSupervisorIdentity) {
             return Err(injected_supervisor_fault("supervisor identity"));
         }
@@ -1565,6 +1605,7 @@ impl<'a> Supervisor<'a> {
                 );
             }
         };
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterPayloadRead) {
             return self.finish_turn_prelaunch_failure(
                 lease,
@@ -1667,6 +1708,9 @@ impl<'a> Supervisor<'a> {
             }
         };
         let turn_path = job.path().to_path_buf();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let helper = prepare_turn_executable()?;
+        #[cfg(any(test, feature = "test-support"))]
         let helper = match &self.prepare_turn_helper {
             Some(path) => path.clone(),
             None => prepare_turn_executable()?,
@@ -1871,6 +1915,7 @@ impl<'a> Supervisor<'a> {
             stdout: stdout_pump,
             stderr: stderr_pump,
         };
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
             let abort = child.abort_and_reap();
             let pump_result = stop_turn_pump(&mut pump);
@@ -1891,12 +1936,7 @@ impl<'a> Supervisor<'a> {
         }
 
         let child_identity = child.identity();
-        let child_status = if self.fault == Some(SupervisorFaultPoint::BeforeChildStatusAbortProof)
-        {
-            Err(WorkerError::Io(io::Error::other(
-                "injected child status write failure",
-            )))
-        } else {
+        let mut write_child_status = || {
             now_millis()
                 .and_then(|updated_at| status.with_child(child_identity, updated_at))
                 .and_then(|child_status| {
@@ -1912,6 +1952,17 @@ impl<'a> Supervisor<'a> {
                     )?;
                     Ok(child_status)
                 })
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let child_status = write_child_status();
+        #[cfg(any(test, feature = "test-support"))]
+        let child_status = if self.fault == Some(SupervisorFaultPoint::BeforeChildStatusAbortProof)
+        {
+            Err(WorkerError::Io(io::Error::other(
+                "injected child status write failure",
+            )))
+        } else {
+            write_child_status()
         };
         let mut status = match child_status {
             Ok(child_status) => child_status,
@@ -1936,7 +1987,10 @@ impl<'a> Supervisor<'a> {
         };
         let status_bytes = canonical_json(&status)?;
 
-        match child.allow_exec(self.fault) {
+        match child.allow_exec(
+            #[cfg(any(test, feature = "test-support"))]
+            self.fault,
+        ) {
             Ok(()) => {}
             Err(ExecStartError::ProvenPrelaunch { code, error }) => {
                 let abort = child.abort_and_reap();
@@ -1973,6 +2027,7 @@ impl<'a> Supervisor<'a> {
                 return result;
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterGo) {
             let result = self.finish_turn_ambiguous(
                 lease,
@@ -1989,11 +2044,7 @@ impl<'a> Supervisor<'a> {
             );
             return result;
         }
-        let running_result = if self.fault == Some(SupervisorFaultPoint::BeforeRunningStatus) {
-            Err(WorkerError::Io(io::Error::other(
-                "injected supervisor fault",
-            )))
-        } else {
+        let mut write_running_status = || {
             now_millis()
                 .and_then(|updated_at| status.into_running(updated_at))
                 .and_then(|running| {
@@ -2009,6 +2060,16 @@ impl<'a> Supervisor<'a> {
                     )?;
                     Ok(running)
                 })
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let running_result = write_running_status();
+        #[cfg(any(test, feature = "test-support"))]
+        let running_result = if self.fault == Some(SupervisorFaultPoint::BeforeRunningStatus) {
+            Err(WorkerError::Io(io::Error::other(
+                "injected supervisor fault",
+            )))
+        } else {
+            write_running_status()
         };
         status = match running_result {
             Ok(running) => running,
@@ -2040,6 +2101,7 @@ impl<'a> Supervisor<'a> {
             self.report_turn_start(job, lease, &section, &account_home);
         }
 
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
             let _ = wait_for_child(
                 child_identity,
@@ -2049,6 +2111,7 @@ impl<'a> Supervisor<'a> {
             )?;
             return Err(injected_supervisor_fault("running status"));
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::CrashAfterRunning) {
             return Err(injected_supervisor_fault("running crash"));
         }
@@ -2143,6 +2206,7 @@ impl<'a> Supervisor<'a> {
                 "turn stdout length differs from pump accounting",
             ));
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
             return Err(injected_supervisor_fault("log sync"));
         }
@@ -2349,6 +2413,7 @@ impl<'a> Supervisor<'a> {
             status,
             &terminal,
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.fault == Some(SupervisorFaultPoint::AfterTerminalStatus) {
             return Err(injected_supervisor_fault("terminal status"));
         }
@@ -2706,7 +2771,10 @@ impl GatedChild {
         self.identity
     }
 
-    fn allow_exec(&mut self, fault: Option<SupervisorFaultPoint>) -> Result<(), ExecStartError> {
+    fn allow_exec(
+        &mut self,
+        #[cfg(any(test, feature = "test-support"))] fault: Option<SupervisorFaultPoint>,
+    ) -> Result<(), ExecStartError> {
         if self.go.is_none() {
             return Err(ExecStartError::ProvenPrelaunch {
                 code: "CHILD_GATE_INVALID",
@@ -2743,6 +2811,7 @@ impl GatedChild {
             };
         }
         drop(go);
+        #[cfg(any(test, feature = "test-support"))]
         if fault == Some(SupervisorFaultPoint::AfterGo) {
             drop(result);
             return Err(ExecStartError::Ambiguous(injected_supervisor_fault(
@@ -2756,6 +2825,7 @@ impl GatedChild {
             .read_to_end(&mut bytes)
             .map_err(|error| ExecStartError::Ambiguous(WorkerError::Io(error)))?;
         if bytes.is_empty() {
+            #[cfg(any(test, feature = "test-support"))]
             if fault == Some(SupervisorFaultPoint::AfterExecAck) {
                 return Err(ExecStartError::Ambiguous(injected_supervisor_fault(
                     "exec acknowledgement",
@@ -2819,6 +2889,7 @@ impl StreamPumpConfig {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn with_cap(mut self, cap: Option<u64>) -> Self {
         if let Some(cap) = cap {
             self.cap = cap;
@@ -4114,6 +4185,7 @@ fn is_status_changed(error: &WorkerError) -> bool {
     matches!(error, WorkerError::Protocol(message) if message.starts_with("STATUS_CHANGED:"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn injected_supervisor_fault(boundary: &str) -> WorkerError {
     WorkerError::Io(io::Error::other(format!(
         "injected supervisor fault after {boundary}"

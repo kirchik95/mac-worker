@@ -22,7 +22,7 @@ use crate::{
 /// Network mutation envelopes stay strictly `PROTOCOL_VERSION`.
 pub const PREVIOUS_STORED_PROTOCOL_VERSION: u32 = 6;
 
-pub fn is_stored_protocol_version(version: u32) -> bool {
+pub(crate) fn is_stored_protocol_version(version: u32) -> bool {
     version == PREVIOUS_STORED_PROTOCOL_VERSION || version == PROTOCOL_VERSION
 }
 
@@ -35,11 +35,12 @@ pub const MAX_CONTROL_CODE_BYTES: usize = 128;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
 
 macro_rules! canonical_uuid_id {
-    ($name:ident) => {
+    ($name:ident $(, $new_cfg:meta)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name(Uuid);
 
         impl $name {
+            $(#[$new_cfg])?
             pub fn new(value: Uuid) -> Self {
                 Self(value)
             }
@@ -88,7 +89,7 @@ macro_rules! canonical_uuid_id {
 }
 
 canonical_uuid_id!(JobId);
-canonical_uuid_id!(ClientId);
+canonical_uuid_id!(ClientId, cfg(any(test, feature = "test-support")));
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(Uuid);
@@ -97,6 +98,7 @@ impl LeaseToken {
     pub fn new(value: Uuid) -> Self {
         Self(value)
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
@@ -615,6 +617,7 @@ impl RequestFingerprintMaterial {
         &self.command
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -1223,6 +1226,7 @@ impl QueueAbandonmentProof {
         self.queue_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn job_id(&self) -> JobId {
         self.job_id
     }
@@ -1247,6 +1251,7 @@ impl QueueAbandonmentProof {
         &self.command_summary
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request_fingerprint(&self) -> &RequestFingerprint {
         &self.request_fingerprint
     }
@@ -1255,6 +1260,7 @@ impl QueueAbandonmentProof {
         self.claimed_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn recorded_by(&self) -> &ProcessIdentity {
         &self.recorded_by
     }
@@ -1415,10 +1421,12 @@ impl ReplacementFailureBudget {
         self.last_failed_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn last_public_code(&self) -> &str {
         &self.last_public_code
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
@@ -1610,6 +1618,7 @@ impl QueueEntry {
         self.cancel_requested_at_millis.is_some()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cancel_requested_at_millis(&self) -> Option<u64> {
         self.cancel_requested_at_millis
     }
@@ -1926,6 +1935,7 @@ impl QueueSnapshot {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn next_id(&self) -> QueueId {
         self.next_id
     }
@@ -2322,6 +2332,7 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn running(
         updated_at_millis: u64,
         supervisor_pid: u32,
@@ -2345,6 +2356,7 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn succeeded(
         updated_at_millis: u64,
         stdout: u64,
@@ -2366,6 +2378,7 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn failed(
         updated_at_millis: u64,
         code: u8,
@@ -3102,12 +3115,14 @@ pub enum RemoteUncertainty {
 }
 
 impl RemoteUncertainty {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn unknown_remote(code: impl Into<String>) -> Result<Self, WorkerError> {
         let uncertainty = Self::UnknownRemote { code: code.into() };
         uncertainty.validate()?;
         Ok(uncertainty)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cleanup_pending(code: impl Into<String>) -> Result<Self, WorkerError> {
         let uncertainty = Self::CleanupPending { code: code.into() };
         uncertainty.validate()?;
@@ -3952,6 +3967,7 @@ impl SubmitResponse {
         response_status_validate(self)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn status(&self) -> &JobStatus {
         match self {
             Self::Accepted { status, .. } | Self::Existing { status } => status,
@@ -4531,6 +4547,7 @@ impl LogCursor {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request(&self, job_id: JobId) -> LogChunkRequest {
         LogChunkRequest::new(job_id, self.stream, self.next_offset, self.limit)
     }
@@ -4686,6 +4703,7 @@ impl TerminalLogDrain {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_complete(&self) -> bool {
         self.stdout.is_drained() && self.stderr.is_drained() && self.status_revalidated
     }
@@ -4719,6 +4737,7 @@ impl LogChunkResponse {
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn chunk(&self) -> &LogChunk {
         &self.chunk
     }
@@ -4896,12 +4915,14 @@ impl StatusLogsResponse {
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn status(&self) -> &StatusResponse {
         &self.status
     }
     pub fn stdout(&self) -> &LogChunk {
         &self.stdout
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stderr(&self) -> &LogChunk {
         &self.stderr
     }
@@ -5234,6 +5255,7 @@ impl HostControlErrorDetail {
         Self::from_parts(code, message, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_category(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -5335,6 +5357,7 @@ impl HostControlError {
         Self::from_detail(HostControlErrorDetail::new(code, message)?)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_category(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -5363,6 +5386,7 @@ impl HostControlError {
         self.error.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }

@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "test-support"))]
 use std::io;
 
 use sha2::{Digest, Sha256};
@@ -10,11 +11,12 @@ use serde::{
 
 use crate::{
     error::WorkerError,
-    host_store::{
-        AdmissionGuard, HostStore, HostStoreWritePoint, ResolutionIdentity, TransferGuard,
-    },
+    host_store::{AdmissionGuard, HostStore, ResolutionIdentity, TransferGuard},
     job::{ClientId, JobId, LeaseRecord, LeaseToken, RequestFingerprint},
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::host_store::HostStoreWritePoint;
 
 const VERIFIED_RECEIPT_VERSION: u32 = 1;
 
@@ -79,6 +81,7 @@ impl<'a> LegacySnapshotReceiptService<'a> {
         self.store
             .remove_owned_regular_committed(&directory, &receipt)?;
         directory.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval)
@@ -91,6 +94,7 @@ impl<'a> LegacySnapshotReceiptService<'a> {
         self.store
             .remove_owned_regular_committed(&directory, &staging)?;
         directory.sync_root()?;
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .store
             .consume_fault(HostStoreWritePoint::AfterResolutionVerificationStageRemoval)

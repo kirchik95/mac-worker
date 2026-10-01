@@ -10,10 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     error::WorkerError,
     failure_receipt::{STAGE_CANCEL, STAGE_CLEANUP, STAGE_DRAIN, STAGE_LEASE_RELEASE},
-    host_store::{
-        AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, ResolutionIdentity,
-        SupervisorGuard,
-    },
+    host_store::{AdmissionGuard, HostStore, JobDisposition, ResolutionIdentity, SupervisorGuard},
     inputs::RelativePath,
     job::{
         CancelRequest, CancelResponse, ClientId, CommandSpec, ExecutionScope, JobId, JobMeta,
@@ -37,6 +34,9 @@ use crate::{
         TurnTerminalHook, discard_launched_redaction, own_turn_publication_still_recoverable,
     },
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::host_store::HostStoreWritePoint;
 
 pub(crate) const EXECUTION_PAYLOAD_VERSION: u32 = 2;
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
@@ -306,7 +306,9 @@ pub struct JobService<'a> {
     legacy_snapshot_receipts: LegacySnapshotReceiptService<'a>,
     launcher: &'a dyn SupervisorLauncher,
     reconciliation: Arc<dyn ReconciliationRuntime>,
+    #[cfg(any(test, feature = "test-support"))]
     log_read_boundary: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(any(test, feature = "test-support"))]
     resolution_before_transfer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -318,12 +320,15 @@ impl<'a> JobService<'a> {
             legacy_snapshot_receipts: LegacySnapshotReceiptService::new(store),
             launcher,
             reconciliation: Arc::new(SystemReconciliationRuntime::new()),
+            #[cfg(any(test, feature = "test-support"))]
             log_read_boundary: None,
+            #[cfg(any(test, feature = "test-support"))]
             resolution_before_transfer: None,
         }
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_reconciliation(
         store: &'a HostStore,
         launcher: &'a dyn SupervisorLauncher,
@@ -341,6 +346,7 @@ impl<'a> JobService<'a> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_log_read_boundary(
         store: &'a HostStore,
         launcher: &'a dyn SupervisorLauncher,
@@ -358,6 +364,7 @@ impl<'a> JobService<'a> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_resolution_before_transfer(
         store: &'a HostStore,
         launcher: &'a dyn SupervisorLauncher,
@@ -685,6 +692,7 @@ impl<'a> JobService<'a> {
         limit: u32,
     ) -> Result<LogChunk, WorkerError> {
         let authoritative = self.authoritative_job_with_supervisor_ensure(job_id, true, false)?;
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(boundary) = &self.log_read_boundary {
             boundary();
         }
@@ -709,6 +717,7 @@ impl<'a> JobService<'a> {
         // status and the busy-lease proof diverge.
         let authoritative =
             self.authoritative_job_with_supervisor_ensure(request.job_id(), true, false)?;
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(boundary) = &self.log_read_boundary {
             boundary();
         }
@@ -773,6 +782,7 @@ impl<'a> JobService<'a> {
         LogChunk::new(stream, offset, bytes)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reconcile_job(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {
         self.authoritative_job_with_supervisor_ensure(job_id, true, true)
             .map(AuthoritativeJob::into_response)
@@ -1239,6 +1249,7 @@ impl<'a> JobService<'a> {
             return ResolveOrAbandonResponse::accepted(authoritative.into_response());
         }
 
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(boundary) = &self.resolution_before_transfer {
             boundary();
         }
@@ -1371,6 +1382,7 @@ impl<'a> JobService<'a> {
             }
         };
         if let (Some(lease), Some(receipt)) = (live, receipt) {
+            #[cfg(any(test, feature = "test-support"))]
             if self
                 .store
                 .consume_fault(HostStoreWritePoint::BeforeResolutionLeaseRelease)
@@ -2545,6 +2557,15 @@ fn write_new_canonical_json<T: Serialize>(
     Ok(())
 }
 
+#[cfg(not(any(test, feature = "test-support")))]
+fn consume_job_fault(
+    _store: &HostStore,
+    _point: crate::host_store::HostStoreWritePoint,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn consume_job_fault(
     store: &HostStore,
     point: crate::host_store::HostStoreWritePoint,
