@@ -112,6 +112,26 @@ pub(super) fn task_turn_request_on(
     store: &HostStore,
     command: CommandSpec,
 ) -> (TaskTurnRequest, TaskMeta) {
+    task_turn_request_with_identity(
+        store,
+        command,
+        JOB_ID,
+        LEASE_TOKEN,
+        10,
+        30_000,
+        TaskId::new(uuid::Uuid::from_u128(17)),
+    )
+}
+
+fn task_turn_request_with_identity(
+    store: &HostStore,
+    command: CommandSpec,
+    job_id: &str,
+    lease_token: &str,
+    created_at: u64,
+    timeout: u64,
+    task_id: TaskId,
+) -> (TaskTurnRequest, TaskMeta) {
     let source = crate::support::GitRepo::init();
     source.write("base.txt", b"base\n");
     source.commit_all("base");
@@ -120,7 +140,6 @@ pub(super) fn task_turn_request_on(
         .trim()
         .parse()
         .unwrap();
-    let task_id = TaskId::new(uuid::Uuid::from_u128(17));
     let mirror = store.mirror(PROJECT_ID).unwrap();
     assert!(
         source
@@ -133,7 +152,7 @@ pub(super) fn task_turn_request_on(
             .success()
     );
     let prompt = HOST_SAFETY_TURN_PROMPT;
-    let limits = TurnLimits::new(30_000, None, None).unwrap();
+    let limits = TurnLimits::new(timeout, None, None).unwrap();
     let turn = TurnMaterial::from_prompt(
         task_id,
         1,
@@ -166,21 +185,22 @@ pub(super) fn task_turn_request_on(
         ),
     };
     let seed = RequestFingerprintMaterial::new(
-        JOB_ID.parse().unwrap(),
+        job_id.parse().unwrap(),
         CLIENT_ID.parse().unwrap(),
-        LEASE_TOKEN.parse().unwrap(),
-        10,
+        lease_token.parse().unwrap(),
+        created_at,
         "mini-1".into(),
         PROJECT_ID.into(),
         WORKTREE_ID.into(),
         turn.digest(),
         String::new(),
-        30_000,
+        timeout,
         "heavy".into(),
         CommandSpec::shell("true".into()).unwrap(),
     )
     .unwrap();
-    let seed_lease = LeaseRecord::new(&seed, seed.fingerprint(), 10, 30_010).unwrap();
+    let seed_lease =
+        LeaseRecord::new(&seed, seed.fingerprint(), created_at, created_at + timeout).unwrap();
     let material = turn.v1_material(&seed_lease, &launch).unwrap();
     let request = TaskTurnRequest::new(
         SubmitRequest::new(material).with_execution_scope(ExecutionScope::task(task_id)),
@@ -210,7 +230,7 @@ pub(super) fn task_turn_request_on(
         git_identity: GitIdentity::new("Host Test", "host@example.test").unwrap(),
         title: None,
         prompt: prompt.into(),
-        created_at_millis: 10,
+        created_at_millis: created_at,
     })
     .unwrap();
     (request, meta)
@@ -268,6 +288,168 @@ fn prepared_task_host_with_command(
     let (request, meta) = task_turn_request_on(&store, command);
     let lease = acquire_task_turn(&store, &request);
     prepare_task_turn(&store, &request, meta);
+    (store, lease, request)
+}
+
+// Preserve the original assertions' shared SubmitResponse view while calling the real turn producer.
+struct TurnJobService<'a>(JobService<'a>);
+impl<'a> TurnJobService<'a> {
+    fn new(store: &'a HostStore, launcher: &'a dyn SupervisorLauncher) -> Self {
+        Self(JobService::new(store, launcher))
+    }
+    fn submit_at(
+        &self,
+        request: TaskTurnRequest,
+        _logical_now: u64,
+    ) -> Result<SubmitResponse, WorkerError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = self.0.submit_turn(request.clone())?;
+            if response.submit().status().supervisor_identity().is_some()
+                || Instant::now() >= deadline
+            {
+                return Ok(response.submit().clone());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+impl<'a> std::ops::Deref for TurnJobService<'a> {
+    type Target = JobService<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+trait TurnRequestFields {
+    fn material(&self) -> &RequestFingerprintMaterial;
+}
+impl TurnRequestFields for TaskTurnRequest {
+    fn material(&self) -> &RequestFingerprintMaterial {
+        self.submit().material()
+    }
+}
+// The agent fixture writes its structured result separately, preserving exact raw stdout/stderr probes.
+pub(super) fn task_probe_command(
+    store: &HostStore,
+    job: mac_worker::job::JobId,
+    command: CommandSpec,
+) -> CommandSpec {
+    let last = store
+        .job(PROJECT_ID, WORKTREE_ID, job)
+        .unwrap()
+        .join("last.md");
+    let mut argv = vec!["/bin/sh".into(), "-c".into(),
+        r#"umask 077; printf '%s' '$RESULT' > "$1"; shift; exec "$@""#.replace("$RESULT", r#"{"status":"done","summary":"probe complete","questions":[],"files_changed":[],"checks":[]}"#),
+        "task-safety-probe".into(), last.to_string_lossy().into_owned()];
+    match command {
+        CommandSpec::Argv { argv: command } => argv.extend(command),
+        CommandSpec::Shell { shell } => argv.extend(["/bin/sh".into(), "-c".into(), shell]),
+    }
+    CommandSpec::argv(argv).unwrap()
+}
+
+fn prepared_turn(root: &Path) -> (HostStore, LeaseRecord, TaskTurnRequest) {
+    prepared_turn_with_command(
+        root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    )
+}
+fn prepared_turn_with_command(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, TaskTurnRequest) {
+    prepared_turn_with_command_and_timeout(root, command, 30_000)
+}
+fn prepared_turn_with_command_and_timeout(
+    root: &Path,
+    command: CommandSpec,
+    timeout: u64,
+) -> (HostStore, LeaseRecord, TaskTurnRequest) {
+    let store = HostStore::open(root).unwrap();
+    let (lease, request) =
+        prepared_turn_on_with_timeout(&store, JOB_ID, LEASE_TOKEN, 3, command, timeout);
+    (store, lease, request)
+}
+fn prepared_turn_on(
+    store: &HostStore,
+    job_id: &str,
+    lease_token: &str,
+    created_at: u64,
+    command: CommandSpec,
+) -> (LeaseRecord, TaskTurnRequest) {
+    prepared_turn_on_with_timeout(store, job_id, lease_token, created_at, command, 30_000)
+}
+fn prepared_turn_on_with_timeout(
+    store: &HostStore,
+    job_id: &str,
+    lease_token: &str,
+    created_at: u64,
+    command: CommandSpec,
+    timeout: u64,
+) -> (LeaseRecord, TaskTurnRequest) {
+    let task = TaskId::new(uuid::Uuid::parse_str(job_id).unwrap());
+    let command = task_probe_command(store, job_id.parse().unwrap(), command);
+    let (request, meta) = task_turn_request_with_identity(
+        store,
+        command,
+        job_id,
+        lease_token,
+        created_at,
+        timeout,
+        task,
+    );
+    let lease = acquire_task_turn(store, &request);
+    prepare_task_turn(store, &request, meta);
+    (lease, request)
+}
+fn publish_unlaunched_turn(root: &Path, request: TaskTurnRequest) {
+    let job_id = request.material().job_id();
+    let faulted =
+        HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobIndexParentSync)
+            .unwrap();
+    assert!(
+        JobService::new(&faulted, &RejectLauncher)
+            .submit_turn(request)
+            .is_err()
+    );
+    assert!(faulted.job_index(job_id).unwrap().is_file());
+}
+
+fn archived_host(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
+    archived_host_with_command(
+        root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    )
+}
+fn archived_host_with_command(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let manifest = valid_manifest_bytes();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let acquire = LeaseAcquireRequest::new(
+        RequestFingerprintMaterial::new(
+            JOB_ID.parse().unwrap(),
+            CLIENT_ID.parse().unwrap(),
+            LEASE_TOKEN.parse().unwrap(),
+            3,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            digest,
+            String::new(),
+            30_000,
+            "heavy".into(),
+            command,
+        )
+        .unwrap(),
+    );
+    let now = wall_clock_millis();
+    let lease = super::legacy_archive::lease(&store, &acquire, now);
+    super::legacy_archive::snapshot(&store, &lease, &manifest, now);
+    let request = SubmitRequest::new(acquire.material().clone());
+    super::legacy_archive::accepted(&store, &request, 3, true);
     (store, lease, request)
 }
 
@@ -346,83 +528,6 @@ fn prepared_host_with_command_and_timeout(
         .verify_and_promote_at(&lease, &digest, now)
         .unwrap();
     (store, lease, SubmitRequest::new(request.material().clone()))
-}
-
-fn prepared_host_on(
-    store: &HostStore,
-    job_id: &str,
-    lease_token: &str,
-    created_at_millis: u64,
-    command: CommandSpec,
-) -> (LeaseRecord, SubmitRequest) {
-    let manifest = valid_manifest_bytes();
-    let digest = format!("{:x}", Sha256::digest(&manifest));
-    let request = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            job_id.parse().unwrap(),
-            CLIENT_ID.parse().unwrap(),
-            lease_token.parse().unwrap(),
-            created_at_millis,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            digest.clone(),
-            String::new(),
-            30_000,
-            "heavy".into(),
-            command,
-        )
-        .unwrap(),
-    );
-    // The request timestamp is fingerprint material; execution consumes the
-    // lease deadline against the supervisor's real clock.
-    let now = wall_clock_millis();
-    let lease = match LeaseService::new(store)
-        .acquire(&request, &healthy(), now)
-        .unwrap()
-    {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
-    };
-    let incoming = store
-        .incoming_job(lease.job_id(), lease.lease_token())
-        .unwrap();
-    fs::create_dir_all(incoming.join("tree")).unwrap();
-    for private in [
-        incoming.parent().unwrap().parent().unwrap(),
-        incoming.parent().unwrap(),
-        incoming.as_path(),
-    ] {
-        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(incoming.join("manifest.json"), manifest).unwrap();
-    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
-    fs::set_permissions(
-        incoming.join("manifest.json"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(
-        incoming.join("tree/payload.txt"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
-    RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, now)
-        .unwrap();
-    (lease, SubmitRequest::new(request.material().clone()))
-}
-
-fn publish_unlaunched_job(root: &Path, request: SubmitRequest) {
-    let job_id = request.material().job_id();
-    let faulted =
-        HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobIndexParentSync)
-            .unwrap();
-    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request, 10);
-    assert!(result.is_err());
-    assert!(faulted.job_index(job_id).unwrap().is_file());
-    drop(faulted);
 }
 
 fn prepared_host_with_nested_cwd(
@@ -795,7 +900,8 @@ impl SupervisorLauncher for TimedSupervisorLauncher {
     ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        let mut supervisor = Supervisor::new(&self.store, &inspector);
+        let mut supervisor = Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")));
         if let Some(grace) = self.term_grace {
             supervisor = supervisor.with_term_grace(grace);
         }
@@ -832,7 +938,9 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
     ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -846,6 +954,7 @@ impl SupervisorLauncher for FaultingInlineSupervisorLauncher {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         Supervisor::new_with_fault(&self.store, &inspector, self.point)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
             .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
@@ -883,7 +992,9 @@ impl SupervisorLauncher for TamperingInlineSupervisorLauncher {
 
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -956,7 +1067,9 @@ impl SupervisorLauncher for CountingInlineSupervisorLauncher {
         self.launches.fetch_add(1, Ordering::SeqCst);
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -971,7 +1084,9 @@ impl SupervisorLauncher for MarkingInlineSupervisorLauncher {
         fs::write(&self.marker, b"launched")?;
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -1217,7 +1332,7 @@ fn every_command_bearing_debug_is_content_free() {
 #[test]
 fn supervisor_recomputes_the_fingerprint_from_exact_command_and_cwd_before_fork() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host_with_command(
+    let (store, lease, request) = prepared_turn_with_command(
         &temp.path().join("tampered-command"),
         CommandSpec::argv(vec!["/bin/true".into()]).unwrap(),
     );
@@ -1229,7 +1344,7 @@ fn supervisor_recomputes_the_fingerprint_from_exact_command_and_cwd_before_fork(
         job_path: job.clone(),
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 3)
         .unwrap_err();
 
@@ -1248,7 +1363,7 @@ fn supervisor_recomputes_the_fingerprint_from_exact_command_and_cwd_before_fork(
 #[test]
 fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("host"));
     let job_path = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -1259,7 +1374,7 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
         job_path: job_path.clone(),
         identity,
     };
-    let service = JobService::new(&store, &launcher);
+    let service = TurnJobService::new(&store, &launcher);
 
     let first = service.submit_at(request.clone(), 3).unwrap();
     assert_eq!(first.status().supervisor_identity(), Some(identity));
@@ -1272,14 +1387,15 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
         names,
         [
             "execution.json",
-            "home",
             "meta.json",
             "status.json",
             "stderr.log",
             "supervisor.log",
             "stdout.log",
             "tmp",
-            "workspace",
+            "prompt.md",
+            "result.schema.json",
+            "tail.log",
         ]
         .into_iter()
         .map(String::from)
@@ -1298,9 +1414,10 @@ fn submit_publishes_complete_job_before_index_and_is_idempotent_after_identity()
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = archived_host(&temp.path().join("host"));
     let supervisor = ProcessIdentity::new(fixture_pid::fixture_pid(41_101), 4_110_001).unwrap();
     let launcher = PrelaunchTerminalLauncher {
         job_path: store
@@ -1317,7 +1434,10 @@ fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted()
         error.to_string().contains("SUPERVISOR_PRELAUNCH_FAILED"),
         "{error}"
     );
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
 
     let retry_error = service.submit_at(request, 4).unwrap_err();
     assert!(
@@ -1329,13 +1449,14 @@ fn fast_prelaunch_terminal_with_child_identity_is_not_acknowledged_as_accepted()
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn retired_prelaunch_terminal_retry_repeats_the_typed_failure_without_relaunching() {
     // Break caught: the Accepted-without-a-live-lease retry path turns a real
     // prelaunch terminal into Existing even though no child ever launched.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("retired-prelaunch-terminal");
     let retry_marker = temp.path().join("retry-launch-marker");
-    let (store, lease, request) = prepared_host_with_command(
+    let (store, lease, request) = archived_host_with_command(
         &root,
         CommandSpec::argv(vec!["/definitely/not/a/program".into()]).unwrap(),
     );
@@ -1397,12 +1518,12 @@ fn retired_child_terminal_retries_remain_existing_without_relaunching() {
         let root = temp.path().join(label);
         let retry_marker = temp.path().join(format!("{label}-retry-launch-marker"));
         let (store, lease, request) =
-            prepared_host_with_command(&root, CommandSpec::argv(vec![program.into()]).unwrap());
+            prepared_turn_with_command(&root, CommandSpec::argv(vec![program.into()]).unwrap());
         let first_launcher = InlineSupervisorLauncher {
             store: store.clone(),
         };
 
-        let first = JobService::new(&store, &first_launcher)
+        let first = TurnJobService::new(&store, &first_launcher)
             .submit_at(request.clone(), 20)
             .unwrap();
 
@@ -1423,7 +1544,7 @@ fn retired_child_terminal_retries_remain_existing_without_relaunching() {
             marker: retry_marker.clone(),
         };
 
-        let retry = JobService::new(&store, &retry_launcher)
+        let retry = TurnJobService::new(&store, &retry_launcher)
             .submit_at(request, 21)
             .unwrap();
 
@@ -1440,7 +1561,7 @@ fn retired_child_terminal_retries_remain_existing_without_relaunching() {
 #[test]
 fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("conflict-host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("conflict-host"));
     let launches = Arc::new(AtomicUsize::new(0));
     let launcher = RecordingLauncher {
         launches: Arc::clone(&launches),
@@ -1449,7 +1570,7 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
             .unwrap(),
         identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_002), 4_100_002).unwrap(),
     };
-    let changed = SubmitRequest::new(
+    let changed_submit = SubmitRequest::new(
         RequestFingerprintMaterial::new(
             request.material().job_id(),
             request.material().client_id(),
@@ -1466,17 +1587,23 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
         )
         .unwrap(),
     );
-    let error = JobService::new(&store, &launcher)
+    let changed = TaskTurnRequest::new(
+        changed_submit.with_execution_scope(request.submit().execution_scope().clone()),
+        request.turn().clone(),
+        HOST_SAFETY_TURN_PROMPT,
+    );
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(changed, 3)
         .unwrap_err();
     assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
     assert_eq!(launches.load(Ordering::SeqCst), 0);
 
     let abandoned_root = temp.path().join("abandoned-host");
-    let (abandoned_store, abandoned_lease, abandoned_request) = prepared_host(&abandoned_root);
+    let (abandoned_store, abandoned_lease, abandoned_request) = prepared_turn(&abandoned_root);
     abandoned_store
         .record_abandoned(
-            &LeaseAcquireRequest::new(abandoned_request.material().clone()),
+            &LeaseAcquireRequest::new(abandoned_request.material().clone())
+                .with_execution_scope(abandoned_request.submit().execution_scope().clone()),
             3,
         )
         .unwrap();
@@ -1491,7 +1618,7 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
             .unwrap(),
         identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_003), 4_100_003).unwrap(),
     };
-    let error = JobService::new(&abandoned_store, &abandoned_launcher)
+    let error = TurnJobService::new(&abandoned_store, &abandoned_launcher)
         .submit_at(abandoned_request, 4)
         .unwrap_err();
     assert!(error.to_string().contains("JOB_ABANDONED"));
@@ -1501,9 +1628,13 @@ fn submit_conflicts_on_changed_request_and_honours_an_abandonment_tombstone() {
 #[test]
 fn submit_treats_a_mismatched_same_job_abandonment_as_a_conflict() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("host"));
     store
-        .record_abandoned(&LeaseAcquireRequest::new(request.material().clone()), 3)
+        .record_abandoned(
+            &LeaseAcquireRequest::new(request.material().clone())
+                .with_execution_scope(request.submit().execution_scope().clone()),
+            3,
+        )
         .unwrap();
     let disposition_path = store.job_index(request.material().job_id()).unwrap();
     let disposition = fs::read_to_string(&disposition_path).unwrap();
@@ -1525,7 +1656,7 @@ fn submit_treats_a_mismatched_same_job_abandonment_as_a_conflict() {
         identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_004), 4_100_004).unwrap(),
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 4)
         .unwrap_err();
 
@@ -1688,8 +1819,8 @@ fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
     .unwrap();
     let store = HostStore::open(&root).unwrap();
     LeaseService::new(&store).set_slot_count(2).unwrap();
-    let (lease_a, request_a) = prepared_host_on(&store, JOB_ID, LEASE_TOKEN, 3, command);
-    let (lease_b, request_b) = prepared_host_on(
+    let (lease_a, request_a) = prepared_turn_on(&store, JOB_ID, LEASE_TOKEN, 3, command);
+    let (lease_b, request_b) = prepared_turn_on(
         &store,
         JOB_ID_B,
         LEASE_TOKEN_B,
@@ -1697,16 +1828,11 @@ fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
         CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
     );
     drop(store);
-    publish_unlaunched_job(&root, request_b);
+    publish_unlaunched_turn(&root, request_b.clone());
     let store = HostStore::open(&root).unwrap();
     let workspace_b = store
-        .job(
-            lease_b.project_id(),
-            lease_b.worktree_id(),
-            lease_b.job_id(),
-        )
-        .unwrap()
-        .join("workspace");
+        .task_workspace(lease_b.project_id(), request_b.turn().task_id())
+        .unwrap();
     assert!(workspace_b.is_dir());
     drop(store);
 
@@ -1723,7 +1849,7 @@ fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
         point: SupervisorFaultPoint::AfterTerminalStatus,
     };
     assert!(
-        JobService::new(&faulted, &launcher)
+        TurnJobService::new(&faulted, &launcher)
             .submit_at(request_a.clone(), 10)
             .is_err()
     );
@@ -1741,14 +1867,14 @@ fn recovering_one_faulted_slot_leaves_the_other_lease_workspace_and_token() {
     let retry = InlineSupervisorLauncher {
         store: recovered.clone(),
     };
-    let response = JobService::new(&recovered, &retry)
+    let response = TurnJobService::new(&recovered, &retry)
         .submit_at(request_a, 11)
         .unwrap_or_else(|error| panic!("faulted slot was not recoverable: {error}"));
     assert_eq!(response.status().state(), JobState::Succeeded);
     assert_eq!(fs::read(&marker).unwrap(), b"x");
     // Submit of an already-supervised terminal job is Existing only. Cleanup
     // and exact lease release are the host status / reconcile path.
-    let cleaned = JobService::new(&recovered, &RejectLauncher)
+    let cleaned = TurnJobService::new(&recovered, &RejectLauncher)
         .status(lease_a.job_id())
         .unwrap_or_else(|error| panic!("terminal slot status cleanup failed: {error}"));
     assert_eq!(cleaned.status().state(), JobState::Succeeded);
@@ -1795,10 +1921,18 @@ fn rename_crash_recovery_durably_syncs_job_and_index_parents_before_launch() {
             marker.to_string_lossy().into_owned(),
         ])
         .unwrap();
-        let (store, _lease, request) = prepared_host_with_command(&root, command);
+        let (store, _lease, request) = archived_host_with_command(&root, command);
+        // Canonical archive at the original visible-rename frontier, before parent fsync.
+        if initial_fault == HostStoreWritePoint::AfterJobRename {
+            fs::remove_file(store.job_index(request.material().job_id()).unwrap()).unwrap();
+        }
         drop(store);
-
-        let faulted = HostStore::open_with_write_fault(&root, initial_fault).unwrap();
+        let pending_sync = if initial_fault == HostStoreWritePoint::AfterJobRename {
+            HostStoreWritePoint::AfterJobPublish
+        } else {
+            HostStoreWritePoint::AfterJobIndexParentSync
+        };
+        let faulted = HostStore::open_with_write_fault(&root, pending_sync).unwrap();
         let launcher = InlineSupervisorLauncher {
             store: faulted.clone(),
         };
@@ -1851,7 +1985,7 @@ fn conflicting_index_staging_is_preserved_and_never_adopted() {
         marker.to_string_lossy().into_owned(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&root, command);
+    let (store, lease, request) = prepared_turn_with_command(&root, command);
     drop(store);
     let faulted =
         HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobIndexFileSync)
@@ -1860,7 +1994,7 @@ fn conflicting_index_staging_is_preserved_and_never_adopted() {
         store: faulted.clone(),
     };
     assert!(
-        JobService::new(&faulted, &launcher)
+        TurnJobService::new(&faulted, &launcher)
             .submit_at(request.clone(), 10)
             .is_err()
     );
@@ -1884,7 +2018,7 @@ fn conflicting_index_staging_is_preserved_and_never_adopted() {
     let retry = InlineSupervisorLauncher {
         store: reopened.clone(),
     };
-    let error = JobService::new(&reopened, &retry)
+    let error = TurnJobService::new(&reopened, &retry)
         .submit_at(request, 11)
         .unwrap_err();
 
@@ -1892,10 +2026,14 @@ fn conflicting_index_staging_is_preserved_and_never_adopted() {
     assert!(staging.is_file());
     assert!(!reopened.job_index(lease.job_id()).unwrap().exists());
     assert!(!marker.exists());
-    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&reopened).load().unwrap(),
+        Some(lease.clone())
+    );
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn fresh_reopen_supervision_crash_matrix_never_executes_twice() {
     #[derive(Clone, Copy)]
     enum Boundary {
@@ -1985,7 +2123,7 @@ fn fresh_reopen_supervision_crash_matrix_never_executes_twice() {
             marker.to_string_lossy().into_owned(),
         ])
         .unwrap();
-        let (prepared, lease, request) = prepared_host_with_command(&root, command);
+        let (prepared, lease, request) = archived_host_with_command(&root, command);
         drop(prepared);
         let store = match boundary {
             Boundary::Store(point) => HostStore::open_with_write_fault(&root, point).unwrap(),
@@ -2082,13 +2220,17 @@ fn unindexed_final_with_corrupt_workspace_is_preserved_and_never_repaired_or_lau
         fs::read(job.join("workspace/tree/payload.txt")).unwrap(),
         b"corrupt"
     );
-    assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&reopened).load().unwrap(),
+        Some(lease.clone())
+    );
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn indexed_prelaunch_retry_rejects_incomplete_final_without_a_second_launch() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = archived_host(&temp.path().join("host"));
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2110,7 +2252,10 @@ fn indexed_prelaunch_retry_rejects_incomplete_final_without_a_second_launch() {
 
     assert!(retry_error.to_string().contains("JOB_ID_CONFLICT"));
     assert_eq!(launches.load(Ordering::SeqCst), 1);
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
 }
 
 #[test]
@@ -2123,12 +2268,12 @@ fn accepted_index_cannot_claim_a_lifecycle_identity_and_trigger_launch() {
         marker.to_string_lossy().into_owned(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&root, command);
+    let (store, lease, request) = prepared_turn_with_command(&root, command);
     let failing = FailingLauncher {
         launches: Arc::new(AtomicUsize::new(0)),
     };
     assert!(
-        JobService::new(&store, &failing)
+        TurnJobService::new(&store, &failing)
             .submit_at(request.clone(), 3)
             .is_err()
     );
@@ -2145,19 +2290,22 @@ fn accepted_index_cannot_claim_a_lifecycle_identity_and_trigger_launch() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 4)
         .unwrap_err();
 
     assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
     assert!(!marker.exists());
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
 }
 
 #[test]
 fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("host"));
     let job_path = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2177,7 +2325,7 @@ fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched(
         identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_005), 4_100_005).unwrap(),
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 3)
         .unwrap_err();
     assert!(error.to_string().contains("JOB_ID_CONFLICT"), "{error}");
@@ -2192,7 +2340,7 @@ fn unsafe_preexisting_final_evidence_is_preserved_and_never_indexed_or_launched(
 #[test]
 fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("host"));
     let job_path = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2202,7 +2350,7 @@ fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
         job_path: job_path.clone(),
         identity: ProcessIdentity::new(fixture_pid::fixture_pid(41_006), 4_100_006).unwrap(),
     };
-    let service = JobService::new(&store, &launcher);
+    let service = TurnJobService::new(&store, &launcher);
     let barrier = Arc::new(Barrier::new(100));
 
     std::thread::scope(|scope| {
@@ -2234,7 +2382,7 @@ fn one_hundred_concurrent_identical_submits_publish_and_launch_exactly_once() {
 #[test]
 fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, _lease, request) = prepared_host(&temp.path().join("dead-owner"));
+    let (store, _lease, request) = prepared_turn(&temp.path().join("dead-owner"));
     let held = Arc::new(Mutex::new(None));
     let (entered, observed) = mpsc::channel();
     let first_store = store.clone();
@@ -2245,7 +2393,7 @@ fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
             held: first_held,
             entered,
         };
-        JobService::new(&first_store, &launcher).submit_at(first_request, 10)
+        TurnJobService::new(&first_store, &launcher).submit_at(first_request, 10)
     });
     observed
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -2260,7 +2408,7 @@ fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
             store: retry_store.clone(),
             launches: retry_launches,
         };
-        JobService::new(&retry_store, &launcher).submit_at(retry_request, 11)
+        TurnJobService::new(&retry_store, &launcher).submit_at(retry_request, 11)
     });
     std::thread::sleep(Duration::from_millis(250));
     drop(held.lock().unwrap().take());
@@ -2276,7 +2424,7 @@ fn dead_preidentity_owner_is_reelected_once_after_the_bounded_wait() {
 #[test]
 fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("busy-owner"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("busy-owner"));
     let held = Arc::new(Mutex::new(None));
     let (entered, observed) = mpsc::channel();
     let first_store = store.clone();
@@ -2287,7 +2435,7 @@ fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
             held: first_held,
             entered,
         };
-        JobService::new(&first_store, &launcher).submit_at(first_request, 10)
+        TurnJobService::new(&first_store, &launcher).submit_at(first_request, 10)
     });
     observed
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -2297,7 +2445,7 @@ fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
     let launcher = FailingLauncher {
         launches: Arc::clone(&launches),
     };
-    let response = JobService::new(&store, &launcher)
+    let response = TurnJobService::new(&store, &launcher)
         .submit_at(request, 11)
         .unwrap();
 
@@ -2305,7 +2453,10 @@ fn still_busy_preidentity_owner_remains_ambiguous_without_a_second_launch() {
     assert!(response.status().supervisor_identity().is_none());
     assert!(response.status().child_identity().is_none());
     assert_eq!(launches.load(Ordering::SeqCst), 0);
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
     drop(held.lock().unwrap().take());
     assert!(first.join().unwrap().is_err());
 }
@@ -2475,12 +2626,12 @@ fn real_execution_records_exit_signal_timeout_and_binary_split_logs() {
 
     for (name, command, timeout, state, exit, signal) in cases {
         let (store, lease, request) =
-            prepared_host_with_command_and_timeout(&temp.path().join(name), command, timeout);
+            prepared_turn_with_command_and_timeout(&temp.path().join(name), command, timeout);
         let launcher = TimedSupervisorLauncher {
             store: store.clone(),
             term_grace: Some(TEST_TERM_GRACE),
         };
-        let response = JobService::new(&store, &launcher)
+        let response = TurnJobService::new(&store, &launcher)
             .submit_at(request, 10)
             .unwrap();
         assert_eq!(response.status().state(), state, "{name}");
@@ -2503,14 +2654,14 @@ fn real_execution_records_exit_signal_timeout_and_binary_split_logs() {
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("binary-logs"), command);
+        prepared_turn_with_command(&temp.path().join("binary-logs"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let response = JobService::new(&store, &launcher)
+    let response = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(response.status().state(), JobState::Succeeded);
@@ -2538,11 +2689,11 @@ fn terminal_status_counts_stderr_written_after_the_leader_exits() {
     ])
     .unwrap();
     let (store, _lease, request) =
-        prepared_host_with_command(&temp.path().join("late-stderr"), command);
+        prepared_turn_with_command(&temp.path().join("late-stderr"), command);
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let response = JobService::new(&store, &launcher)
+    let response = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(response.status().state(), JobState::Succeeded);
@@ -2564,14 +2715,14 @@ fn terminal_status_includes_a_one_byte_stdout_write_before_publication() {
     let temp = tempfile::tempdir().unwrap();
     let command = CommandSpec::argv(vec!["/usr/bin/printf".into(), "x".into()]).unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("one-byte-stdout"), command);
+        prepared_turn_with_command(&temp.path().join("one-byte-stdout"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let response = JobService::new(&store, &launcher)
+    let response = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(response.status().state(), JobState::Succeeded);
@@ -2603,7 +2754,7 @@ fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command_and_timeout(&temp.path().join("surviving-group"), command, 100);
+        prepared_turn_with_command_and_timeout(&temp.path().join("surviving-group"), command, 100);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2613,7 +2764,7 @@ fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
     };
 
     let started = Instant::now();
-    let result = JobService::new(&store, &launcher).submit_at(request, 10);
+    let result = TurnJobService::new(&store, &launcher).submit_at(request, 10);
     let elapsed = started.elapsed();
     let status: JobStatus =
         serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
@@ -2656,7 +2807,7 @@ fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
         "trap '' HUP TERM; /bin/sh -c 'exec /bin/sleep 120' & echo $!; exit 0".into(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command_and_timeout(
+    let (store, lease, request) = prepared_turn_with_command_and_timeout(
         &temp.path().join("background-group"),
         command,
         30_000,
@@ -2670,7 +2821,7 @@ fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
     };
 
     let started = Instant::now();
-    let result = JobService::new(&store, &launcher).submit_at(request, 10);
+    let result = TurnJobService::new(&store, &launcher).submit_at(request, 10);
     let elapsed = started.elapsed();
     let status: JobStatus =
         serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
@@ -2708,7 +2859,7 @@ fn mutable_cleanup_failure_preserves_command_outcome_and_retains_lease() {
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("cleanup-failure"), command);
+        archived_host_with_command(&temp.path().join("cleanup-failure"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2734,7 +2885,7 @@ fn mutable_cleanup_failure_preserves_command_outcome_and_retains_lease() {
 #[test]
 fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("incoming-evidence"));
+    let (store, lease, request) = archived_host(&temp.path().join("incoming-evidence"));
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2767,7 +2918,10 @@ fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
     assert_eq!(status.cleanup_error_code(), Some("MUTABLE_CLEANUP_FAILED"));
     assert!(foreign.is_dir());
     assert!(job.join("workspace").is_dir());
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
 }
 
 #[test]
@@ -2783,7 +2937,7 @@ fn lease_release_failure_preserves_terminal_outcome_and_live_lease_evidence() {
         lease_file.to_string_lossy().into_owned(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let (store, lease, request) = prepared_turn_with_command(&host_root, command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2791,7 +2945,7 @@ fn lease_release_failure_preserves_terminal_outcome_and_live_lease_evidence() {
         store: store.clone(),
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap_err();
 
@@ -2832,7 +2986,7 @@ fn terminal_status_write_conflict_retains_lease_and_mutable_job() {
         marker.to_string_lossy().into_owned(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let (store, lease, request) = archived_host_with_command(&host_root, command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2866,7 +3020,7 @@ fn payload_erase_failure_closes_the_gate_before_any_user_byte_and_retains_lease(
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("payload-erase-failure"), command);
+        archived_host_with_command(&temp.path().join("payload-erase-failure"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2890,7 +3044,10 @@ fn payload_erase_failure_closes_the_gate_before_any_user_byte_and_retains_lease(
     assert_eq!(status.error_code(), Some("PAYLOAD_ERASURE_FAILED"));
     assert!(status.child_identity().is_some());
     assert!(job.join("execution.json").is_file());
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
     assert!(job.join("workspace").is_dir());
 }
 
@@ -2904,7 +3061,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("payload-permission"), command);
+        archived_host_with_command(&temp.path().join("payload-permission"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2961,6 +3118,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-run");
@@ -2970,7 +3128,7 @@ fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease(
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("child-status-abort-ambiguity"), command);
+        archived_host_with_command(&temp.path().join("child-status-abort-ambiguity"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2991,11 +3149,15 @@ fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease(
     assert_eq!(status.error_code(), Some("CHILD_STATUS_WRITE_FAILED"));
     assert!(status.child_identity().is_none());
     assert!(!job.join("execution.json").exists());
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
     assert!(job.join("workspace").is_dir());
 }
 
 #[test]
+// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
 fn running_status_failure_reaps_the_post_go_child_and_retains_lease() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("ran-exactly-once");
@@ -3005,7 +3167,7 @@ fn running_status_failure_reaps_the_post_go_child_and_retains_lease() {
     ])
     .unwrap();
     let (store, lease, request) =
-        prepared_host_with_command(&temp.path().join("running-status-failure"), command);
+        archived_host_with_command(&temp.path().join("running-status-failure"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -3035,14 +3197,17 @@ fn running_status_failure_reaps_the_post_go_child_and_retains_lease() {
         Some(libc::ECHILD)
     );
     assert!(!job.join("execution.json").exists());
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
     assert!(job.join("workspace").is_dir());
 }
 
 #[test]
 fn supervisor_retains_a_sanitized_error_before_terminal_status() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host_with_command(
+    let (store, lease, request) = prepared_turn_with_command(
         &temp.path().join("supervisor-error-log"),
         CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
     );
@@ -3054,7 +3219,7 @@ fn supervisor_retains_a_sanitized_error_before_terminal_status() {
         point: SupervisorFaultPoint::AfterRunningStatus,
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap_err();
 
@@ -3079,7 +3244,10 @@ fn supervisor_retains_a_sanitized_error_before_terminal_status() {
             .state(),
         JobState::Running
     );
-    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert_eq!(
+        LeaseService::new(&store).load().unwrap(),
+        Some(lease.clone())
+    );
     assert!(
         !fs::read(job.join("supervisor.log"))
             .unwrap()
@@ -3106,7 +3274,7 @@ fn log_path_replacement_after_go_retains_running_status_and_lease() {
         stdout_path.to_string_lossy().into_owned(),
     ])
     .unwrap();
-    let (store, lease, request) = prepared_host_with_command(&host_root, command);
+    let (store, lease, request) = archived_host_with_command(&host_root, command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -3992,7 +4160,7 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
 #[test]
 fn a_diagnostic_left_by_a_failed_earlier_attempt_does_not_block_the_retry() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = prepared_host(&temp.path().join("host"));
+    let (store, lease, request) = prepared_turn(&temp.path().join("host"));
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -4000,7 +4168,7 @@ fn a_diagnostic_left_by_a_failed_earlier_attempt_does_not_block_the_retry() {
     let failing = FailingLauncher {
         launches: Arc::clone(&launches),
     };
-    let first_error = JobService::new(&store, &failing)
+    let first_error = TurnJobService::new(&store, &failing)
         .submit_at(request.clone(), 3)
         .unwrap_err();
     assert!(
@@ -4026,7 +4194,7 @@ fn a_diagnostic_left_by_a_failed_earlier_attempt_does_not_block_the_retry() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let response = JobService::new(&store, &launcher)
+    let response = TurnJobService::new(&store, &launcher)
         .submit_at(request, 4)
         .unwrap_or_else(|error| panic!("the retry must launch: {error}"));
     assert!(response.status().state().is_terminal());

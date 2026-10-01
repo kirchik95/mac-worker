@@ -11,6 +11,7 @@ mod host_hygiene;
 mod host_lease;
 mod job_protocol;
 mod job_queries;
+mod legacy_archive;
 mod process_runner;
 mod redaction;
 mod rooted_fs;

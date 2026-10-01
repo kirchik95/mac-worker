@@ -356,7 +356,9 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
     ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -1236,16 +1238,14 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("host");
     let store = HostStore::open(&root).unwrap();
-    let acquire = lease_request();
-    let submit = SubmitRequest::new(acquire.material().clone());
+    let (turn, meta) = super::supervisor::task_turn_request_on(
+        &store,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let submit = turn.submit().clone();
+    let acquire = LeaseAcquireRequest::new(submit.material().clone())
+        .with_execution_scope(submit.execution_scope().clone());
     let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
-    let synthetic = LeaseRecord::new(
-        acquire.material(),
-        acquire.request_fingerprint().clone(),
-        1,
-        30_001,
-    )
-    .unwrap();
     let (classified_tx, classified_rx) = mpsc::channel();
     let (continue_tx, continue_rx) = mpsc::channel();
     let continue_rx = Arc::new(Mutex::new(continue_rx));
@@ -1275,17 +1275,24 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
     });
     let verify_store = store.clone();
     let verify_attempting = attempting_tx.clone();
+    let prepare_submit = submit.clone();
     let delayed_verify = thread::spawn(move || {
-        verify_attempting.send("verify").unwrap();
-        RemoteSnapshotService::new(&verify_store).verify_and_promote_at(
-            &synthetic,
-            synthetic.manifest_digest(),
-            3,
+        verify_attempting.send("prepare").unwrap();
+        let admission = verify_store.admission_lock(prepare_submit.material().job_id())?;
+        let transfer =
+            verify_store.transfer_lock_after(&admission, prepare_submit.material().job_id())?;
+        mac_worker::task_store::TaskStore::new(&verify_store, &SystemProcessRunner).prepare(
+            &mac_worker::task_store::TaskPrepareRequest::new(
+                meta,
+                prepare_submit.material().job_id(),
+                "mini-1",
+            ),
+            &transfer,
         )
     });
     let submit_store = store.clone();
     let submit_attempting = attempting_tx.clone();
-    let submit_request = submit.clone();
+    let submit_request = turn.clone();
     let launches = Arc::new(AtomicUsize::new(0));
     let delayed_launches = Arc::clone(&launches);
     let delayed_submit = thread::spawn(move || {
@@ -1296,7 +1303,7 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
                 launches: delayed_launches,
             },
         )
-        .submit_at(submit_request, 4)
+        .submit_turn(submit_request)
     });
     drop(attempting_tx);
     let attempted = (0..3)
@@ -1304,7 +1311,7 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         attempted,
-        ["acquire", "submit", "verify"].into_iter().collect()
+        ["acquire", "submit", "prepare"].into_iter().collect()
     );
     continue_tx.send(()).unwrap();
     let response = resolver.join().unwrap().unwrap();
@@ -1459,7 +1466,11 @@ fn submit_and_supervisor_launch_first_make_resolution_accept_without_second_laun
     // launcher instead of returning the authoritative Accepted outcome.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("host");
-    let (store, lease, submit) = prepared_host(&root);
+    let (store, lease, submit) = prepared_query_turn_at(
+        &root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+        1,
+    );
     let job_path = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -1477,7 +1488,8 @@ fn submit_and_supervisor_launch_first_make_resolution_accept_without_second_laun
     let submit_request = submit.clone();
     let submit_launcher = Arc::clone(&launcher);
     let submit_thread = thread::spawn(move || {
-        JobService::new(&submit_store, submit_launcher.as_ref()).submit_at(submit_request, 10)
+        TaskQueryProducer::new(&submit_store, submit_launcher.as_ref())
+            .submit_at(submit_request, 10)
     });
     entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -3348,7 +3360,7 @@ fn terminal_statuses_remain_authoritative_after_the_lease_is_released() {
             lease.expires_at_millis() > matrix_execution_now_millis(),
             "terminal authority fixture must start with a live execution lease"
         );
-        let completed = JobService::new(&store, &launcher)
+        let completed = TaskQueryProducer::new(&store, &launcher)
             .submit_at(request, 10)
             .unwrap();
         assert_eq!(LeaseService::new(&store).load().unwrap(), None);
@@ -3368,7 +3380,7 @@ fn terminal_statuses_remain_authoritative_after_the_lease_is_released() {
             .unwrap();
         replace_json(&job.join("status.json"), &expected).unwrap();
 
-        let response = JobService::new(&store, &RejectLauncher)
+        let response = TaskQueryProducer::new(&store, &RejectLauncher)
             .status(lease.job_id())
             .unwrap();
 
@@ -3387,13 +3399,13 @@ fn post_release_success_binds_nonempty_stdout_to_the_recorded_length() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let submitted = JobService::new(&store, &launcher)
+    let submitted = TaskQueryProducer::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(submitted.status().final_stdout_bytes(), Some(5));
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 
-    let response = JobService::new(&store, &RejectLauncher)
+    let response = TaskQueryProducer::new(&store, &RejectLauncher)
         .status(lease.job_id())
         .unwrap();
 
@@ -3520,7 +3532,7 @@ fn status_logs_returns_a_terminal_tail_and_rejects_an_offset_beyond_eof() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let service = JobService::new(&store, &launcher);
+    let service = TaskQueryProducer::new(&store, &launcher);
     let submitted = service.submit_at(request, 10).unwrap();
     let status = StatusResponse::new(
         match &submitted {
@@ -3812,7 +3824,7 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let service = JobService::new(&store, &launcher);
+    let service = TaskQueryProducer::new(&store, &launcher);
     service.submit_at(request, 10).unwrap();
     let terminal = service.status(lease.job_id()).unwrap();
     assert_eq!(terminal.status().final_stdout_bytes(), Some(stdout_length));
@@ -3887,7 +3899,7 @@ fn terminal_status_is_published_after_one_byte_stdout_and_redirected_marker() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let submitted = JobService::new(&store, &launcher)
+    let submitted = TaskQueryProducer::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     let job = store
@@ -4354,7 +4366,11 @@ fn submit_uses_request_creation_time_while_lease_uses_the_host_clock() {
     // lease TTL accidentally starts from the client-bound job timestamp.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("request-and-lease-clocks");
-    let (store, lease, request) = prepared_host(&root);
+    let (store, lease, request) = prepared_query_turn_at(
+        &root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+        1,
+    );
     assert_eq!(request.material().created_at_millis(), 10);
     assert_eq!(lease.created_at_millis(), 1);
     assert_eq!(lease.expires_at_millis(), 30_001);
@@ -4363,7 +4379,7 @@ fn submit_uses_request_creation_time_while_lease_uses_the_host_clock() {
     let faulted =
         HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobIndexParentSync)
             .unwrap();
-    let error = JobService::new(&faulted, &RejectLauncher)
+    let error = TaskQueryProducer::new(&faulted, &RejectLauncher)
         .submit_at(request, 999)
         .unwrap_err();
     assert!(error.to_string().contains("injected"), "{error}");
@@ -4485,7 +4501,7 @@ fn terminal_status_rejects_log_length_mismatch_after_release() {
         lease.expires_at_millis() > matrix_execution_now_millis(),
         "log mismatch fixture must start with a live execution lease"
     );
-    JobService::new(&store, &launcher)
+    TaskQueryProducer::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
@@ -4499,7 +4515,7 @@ fn terminal_status_rejects_log_length_mismatch_after_release() {
         .write_all(b"x")
         .unwrap();
 
-    let error = JobService::new(&store, &RejectLauncher)
+    let error = TaskQueryProducer::new(&store, &RejectLauncher)
         .status(lease.job_id())
         .unwrap_err();
 
@@ -4521,7 +4537,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let original = JobService::new(&store, &launcher)
+    let original = TaskQueryProducer::new(&store, &launcher)
         .submit_at(request.clone(), 10)
         .unwrap();
     assert!(original.status().state().is_terminal());
@@ -4690,7 +4706,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
         let corrupt_launcher = InlineSupervisorLauncher {
             store: corrupt_store.clone(),
         };
-        JobService::new(&corrupt_store, &corrupt_launcher)
+        TaskQueryProducer::new(&corrupt_store, &corrupt_launcher)
             .submit_at(corrupt_request.clone(), 20)
             .unwrap();
         assert_eq!(LeaseService::new(&corrupt_store).load().unwrap(), None);
@@ -4743,7 +4759,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let original = JobService::new(&store, &launcher)
+    let original = TaskQueryProducer::new(&store, &launcher)
         .submit_at(request.clone(), 10)
         .unwrap();
     assert!(original.status().state().is_terminal());
@@ -4787,9 +4803,13 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     // Break caught: singleton occupancy by another job is mistaken for a
     // matching lease and reported as an immutable identity conflict.
     let temp = tempfile::tempdir().unwrap();
-    let request = SubmitRequest::new(lease_request().material().clone());
     let unrelated_root = temp.path().join("unrelated");
     let unrelated_store = HostStore::open(&unrelated_root).unwrap();
+    let (turn, _meta) = super::supervisor::task_turn_request_on(
+        &unrelated_store,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let request = turn.submit().clone();
     let unrelated = lease_request_with_identity(
         &request,
         JobId::new(uuid::Uuid::from_u128(93_001)),
@@ -4806,7 +4826,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     let unrelated_lease_bytes = fs::read(unrelated_root.join("leases/slots/0/lease.json")).unwrap();
 
     let error = JobService::new(&unrelated_store, &RejectLauncher)
-        .submit_at(request.clone(), 2)
+        .submit_turn(turn.clone())
         .unwrap_err();
 
     assert_error_code(error, "LEASE_MISSING", "unrelated live lease");
@@ -4824,7 +4844,12 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     let same_job_root = temp.path().join("same-job");
     let same_job_store = HostStore::open(&same_job_root).unwrap();
     let same_job_lease = match LeaseService::new(&same_job_store)
-        .acquire(&lease_request(), &healthy(), 3)
+        .acquire(
+            &LeaseAcquireRequest::new(request.material().clone())
+                .with_execution_scope(request.execution_scope().clone()),
+            &healthy(),
+            3,
+        )
         .unwrap()
     {
         LeaseAcquireResponse::Acquired { lease } => lease,
@@ -4843,7 +4868,11 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     );
 
     let error = JobService::new(&same_job_store, &RejectLauncher)
-        .submit_at(changed, 4)
+        .submit_turn(mac_worker::turn::TaskTurnRequest::new(
+            changed.with_execution_scope(request.execution_scope().clone()),
+            turn.turn().clone(),
+            super::supervisor::HOST_SAFETY_TURN_PROMPT,
+        ))
         .unwrap_err();
 
     assert_error_code(error, "JOB_ID_CONFLICT", "same-job lease identity");
@@ -4927,7 +4956,7 @@ fn a_missing_index_without_the_exact_live_lease_is_not_repaired_from_status_abse
         lease.expires_at_millis() > matrix_execution_now_millis(),
         "missing index fixture must start with a live execution lease"
     );
-    JobService::new(&store, &launcher)
+    TaskQueryProducer::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap();
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
@@ -6061,7 +6090,7 @@ fn endpoint_runtime_and_completed_job(
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let completed = JobService::new(&store, &launcher)
+    let completed = TaskQueryProducer::new(&store, &launcher)
         .submit_at(submit.clone(), 10)
         .unwrap();
     let response = StatusResponse::new(
@@ -6747,7 +6776,9 @@ impl SupervisorLauncher for MatrixInlineLauncher {
         self.launches.fetch_add(1, Ordering::SeqCst);
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
-        Supervisor::new(&self.store, &inspector).run_with_guard(job_id, guard)?;
+        Supervisor::new(&self.store, &inspector)
+            .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+            .run_with_guard(job_id, guard)?;
         Ok(LaunchCandidate::new(identity))
     }
 }
@@ -7540,29 +7571,19 @@ fn wall_clock_lease_expiry_saturates_epoch_one_and_live_acquire_runs() {
         let temp = tempfile::tempdir().unwrap();
         let (_, root) = matrix_runtime(&temp);
         let marker = temp.path().join("actual-child-marker");
-        let (store, lease, submit, manifest) =
-            matrix_acquired_host_at(&root, matrix_command(&marker), acquire_now);
+        let (store, lease, submit) =
+            prepared_query_turn_at(&root, matrix_command(&marker), acquire_now);
         assert_eq!(submit.material().created_at_millis(), 10);
         assert_eq!(submit.material().timeout_millis(), 30_000);
         assert_eq!(lease.timeout_millis(), 30_000);
         assert_eq!(lease.created_at_millis(), acquire_now);
         assert_eq!(lease.expires_at_millis(), acquire_now + 30_000);
-        matrix_receive_before_verification(
-            &store,
-            &lease,
-            &manifest,
-            temp.path(),
-            Arc::new(AtomicUsize::new(0)),
-        );
-        RemoteSnapshotService::new(&store)
-            .verify_and_promote_at(&lease, lease.manifest_digest(), 2)
-            .unwrap();
         let launches = Arc::new(AtomicUsize::new(0));
-        let launcher = MatrixInlineLauncher {
+        let launcher = task_turn_ports::MatrixInlineLauncher {
             store: store.clone(),
             launches: Arc::clone(&launches),
         };
-        let response = JobService::new(&store, &launcher).submit_at(submit, 10);
+        let response = TaskQueryProducer::new(&store, &launcher).submit_at(submit, 10);
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         (fs::read(&marker).ok(), lease, response)
     }
@@ -7570,8 +7591,8 @@ fn wall_clock_lease_expiry_saturates_epoch_one_and_live_acquire_runs() {
     let temp = tempfile::tempdir().unwrap();
     let (_, root) = matrix_runtime(&temp);
     let unused = temp.path().join("unexecuted-epoch-one-marker");
-    let (_, expired_lease, expired_submit, _) =
-        matrix_acquired_host_at(&root, matrix_command(&unused), 1);
+    let (_, expired_lease, expired_submit) =
+        prepared_query_turn_at(&root, matrix_command(&unused), 1);
     assert_eq!(expired_submit.material().created_at_millis(), 10);
     assert_eq!(expired_submit.material().timeout_millis(), 30_000);
     assert_eq!(expired_lease.created_at_millis(), 1);
@@ -8450,6 +8471,9 @@ fn lease_request() -> LeaseAcquireRequest {
         )
         .unwrap(),
     )
+    .with_execution_scope(mac_worker::job::ExecutionScope::task(
+        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(17)),
+    ))
 }
 
 fn lease_request_with_identity(
@@ -8476,6 +8500,9 @@ fn lease_request_with_identity(
         )
         .unwrap(),
     )
+    .with_execution_scope(mac_worker::job::ExecutionScope::task(
+        mac_worker::task::TaskId::new(uuid::Uuid::parse_str(&job_id.to_string()).unwrap()),
+    ))
 }
 
 fn healthy() -> AdmissionFacts {
@@ -8502,6 +8529,55 @@ fn valid_manifest_bytes() -> Vec<u8> {
     .into_bytes()
 }
 
+// Real task admission/preparation for tests that produce new executions.
+fn prepared_query_turn_at(
+    root: &Path,
+    command: CommandSpec,
+    now: u64,
+) -> (HostStore, LeaseRecord, SubmitRequest) {
+    let store = HostStore::open(root).unwrap();
+    let command = super::supervisor::task_probe_command(&store, JOB_ID.parse().unwrap(), command);
+    let (turn, meta) = super::supervisor::task_turn_request_on(&store, command);
+    let acquire = LeaseAcquireRequest::new(turn.submit().material().clone())
+        .with_execution_scope(turn.submit().execution_scope().clone());
+    let lease = match LeaseService::new(&store)
+        .acquire(&acquire, &healthy(), now)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        _ => panic!("fresh turn was already accepted"),
+    };
+    super::supervisor::prepare_task_turn(&store, &turn, meta);
+    (store, lease, turn.submit().clone())
+}
+struct TaskQueryProducer<'a> {
+    service: JobService<'a>,
+    store: &'a HostStore,
+}
+impl<'a> TaskQueryProducer<'a> {
+    fn new(store: &'a HostStore, launcher: &'a dyn SupervisorLauncher) -> Self {
+        Self {
+            service: JobService::new(store, launcher),
+            store,
+        }
+    }
+    fn submit_at(
+        &self,
+        request: SubmitRequest,
+        _logical_now: u64,
+    ) -> Result<SubmitResponse, WorkerError> {
+        self.service
+            .submit_turn(task_turn_ports::matrix_task_request(self.store, &request)?)
+            .map(|response| response.submit().clone())
+    }
+}
+impl<'a> std::ops::Deref for TaskQueryProducer<'a> {
+    type Target = JobService<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
 fn prepared_host(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
     prepared_host_with_command(
         root,
@@ -8522,16 +8598,7 @@ fn prepared_host_with_live_command(
     root: &Path,
     command: CommandSpec,
 ) -> (HostStore, LeaseRecord, SubmitRequest) {
-    // Supervisor::wait_for_child subtracts wall-clock now from expires_at.
-    // Epoch-one prepared_host saturates remaining_lease_millis to 0, so a
-    // still-starting child is SIGTERM'd before its last write — the same
-    // ordering that recorded final_stderr_bytes=0 and an empty retry marker
-    // on macos-15. Identity tests keep acquire-at-1 so they can assert
-    // expires_at=30_001.
-    let store = HostStore::open(root).unwrap();
-    let now = matrix_execution_now_millis();
-    let (lease, request) = prepared_host_on_at(&store, JOB_ID, LEASE_TOKEN, 10, now, now, command);
-    (store, lease, request)
+    prepared_query_turn_at(root, command, matrix_execution_now_millis())
 }
 
 fn prepared_host_on(
@@ -8573,40 +8640,10 @@ fn prepared_host_on_at(
         )
         .unwrap(),
     );
-    let lease = match LeaseService::new(store)
-        .acquire(&acquire, &healthy(), acquire_now)
-        .unwrap()
-    {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
-    };
-    let incoming = store
-        .incoming_job(lease.job_id(), lease.lease_token())
-        .unwrap();
-    fs::create_dir_all(incoming.join("tree")).unwrap();
-    for private in [
-        incoming.parent().unwrap().parent().unwrap(),
-        incoming.parent().unwrap(),
-        incoming.as_path(),
-    ] {
-        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(incoming.join("manifest.json"), manifest).unwrap();
-    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
-    fs::set_permissions(
-        incoming.join("manifest.json"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(
-        incoming.join("tree/payload.txt"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
-    RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, verify_now)
-        .unwrap();
+    // Seed the exact persisted archive queried by the read/recovery tests.
+    // No retiring Job-scope acquire, upload, verification or batch submit runs.
+    let lease = super::legacy_archive::lease(store, &acquire, acquire_now);
+    super::legacy_archive::snapshot(store, &lease, &manifest, verify_now);
     (lease, SubmitRequest::new(acquire.material().clone()))
 }
 
@@ -8618,14 +8655,8 @@ fn indexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitReque
 }
 
 fn index_identityless_submit(root: &Path, request: SubmitRequest) {
-    let job_id = request.material().job_id();
-    let faulted =
-        HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobIndexParentSync)
-            .unwrap();
-    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request, 10);
-    assert!(result.is_err());
-    assert!(faulted.job_index(job_id).unwrap().is_file());
-    drop(faulted);
+    let store = HostStore::open(root).unwrap();
+    super::legacy_archive::accepted(&store, &request, 10, true);
 }
 
 fn indexed_running_job(
@@ -8662,20 +8693,15 @@ fn indexed_running_job(
 
 fn unindexed_identityless_job(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
     let (store, lease, request) = prepared_host(root);
-    drop(store);
-    let faulted =
-        HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterJobPublish).unwrap();
-    let result = JobService::new(&faulted, &RejectLauncher).submit_at(request.clone(), 10);
-    assert!(result.is_err());
-    assert!(!faulted.job_index(lease.job_id()).unwrap().exists());
+    super::legacy_archive::accepted(&store, &request, 10, false);
+    assert!(!store.job_index(lease.job_id()).unwrap().exists());
     assert!(
-        faulted
+        store
             .job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap()
             .is_dir()
     );
-    drop(faulted);
-    (HostStore::open(root).unwrap(), lease, request)
+    (store, lease, request)
 }
 
 fn create_fifo(path: &Path) {
@@ -9222,7 +9248,7 @@ mod task_turn_ports {
         turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
     };
 
-    fn matrix_task_request(
+    pub(super) fn matrix_task_request(
         store: &HostStore,
         submit: &SubmitRequest,
     ) -> Result<TaskTurnRequest, WorkerError> {
@@ -9270,9 +9296,9 @@ mod task_turn_ports {
         Ok(())
     }
 
-    struct MatrixInlineLauncher {
-        store: HostStore,
-        launches: Arc<AtomicUsize>,
+    pub(super) struct MatrixInlineLauncher {
+        pub(super) store: HostStore,
+        pub(super) launches: Arc<AtomicUsize>,
     }
     impl SupervisorLauncher for MatrixInlineLauncher {
         fn launch(
