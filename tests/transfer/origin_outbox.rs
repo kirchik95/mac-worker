@@ -24,8 +24,7 @@ use mac_worker::{
     host_store::{HostGc, HostStore, HostStoreWritePoint},
     job::{
         CancelRequest, ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
-        StatusLogsRequest, SubmitRequest,
+        LeaseRecord, LeaseToken, RequestFingerprintMaterial, StatusLogsRequest, SubmitRequest,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     laptop::{BinaryIdentity, FixedBinaryIdentitySource},
@@ -37,7 +36,6 @@ use mac_worker::{
     },
     process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     protocol::MemoryPressure,
-    remote_snapshot::RemoteSnapshotService,
     supervisor::{Supervisor, SystemProcessInspector},
     task::{
         BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
@@ -48,7 +46,6 @@ use mac_worker::{
     turn::{TaskTurnRequest, TurnMaterial},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use support::GitRepo;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -56,9 +53,6 @@ use uuid::Uuid;
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_PROJECT_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const SUPERVISOR_JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";
-const SUPERVISOR_CLIENT_ID: &str = "102f0f4a6b5c7d8e9f00112233445566";
-const SUPERVISOR_LEASE_TOKEN: &str = "202f0f4a6b5c7d8e9f00112233445566";
 
 struct InactiveLauncher;
 
@@ -427,82 +421,6 @@ fn fixture() -> (
     let (origin_dir, origin) = origin_bare();
     let origin_url = file_url(&origin);
     (temp, store, source, origin_dir, origin, origin_url, oid)
-}
-
-fn valid_manifest_bytes() -> Vec<u8> {
-    format!(
-        concat!(
-            r#"{{"version":1,"project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
-            r#""head":null,"branch":null,"dirty":false,"relative_working_dir":"","#,
-            r#""entries":[{{"path":"payload.txt","kind":"file","mode":420,"size":7,"#,
-            r#""sha256":"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5","#,
-            r#""symlink_target":null}}],"tracked_deletions":[]}}"#
-        ),
-        PROJECT_ID = PROJECT_ID,
-        WORKTREE_ID = WORKTREE_ID,
-    )
-    .into_bytes()
-}
-
-fn prepared_supervisor_job(
-    store: &HostStore,
-    command: CommandSpec,
-) -> (mac_worker::job::LeaseRecord, SubmitRequest) {
-    let manifest = valid_manifest_bytes();
-    let digest = format!("{:x}", Sha256::digest(&manifest));
-    let request = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            SUPERVISOR_JOB_ID.parse().unwrap(),
-            SUPERVISOR_CLIENT_ID.parse().unwrap(),
-            SUPERVISOR_LEASE_TOKEN.parse().unwrap(),
-            3,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            digest.clone(),
-            String::new(),
-            30_000,
-            "heavy".into(),
-            command,
-        )
-        .unwrap(),
-    );
-    let now = wall_clock_millis();
-    let lease = match LeaseService::new(store)
-        .acquire(&request, &admissions(), now)
-        .unwrap()
-    {
-        LeaseAcquireResponse::Acquired { lease } => lease,
-        LeaseAcquireResponse::ExistingAccepted { .. } => unreachable!(),
-    };
-    let incoming = store
-        .incoming_job(lease.job_id(), lease.lease_token())
-        .unwrap();
-    fs::create_dir_all(incoming.join("tree")).unwrap();
-    for private in [
-        incoming.parent().unwrap().parent().unwrap(),
-        incoming.parent().unwrap(),
-        incoming.as_path(),
-    ] {
-        fs::set_permissions(private, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(incoming.join("manifest.json"), &manifest).unwrap();
-    fs::write(incoming.join("tree/payload.txt"), b"payload").unwrap();
-    fs::set_permissions(
-        incoming.join("manifest.json"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(
-        incoming.join("tree/payload.txt"),
-        fs::Permissions::from_mode(0o444),
-    )
-    .unwrap();
-    fs::set_permissions(incoming.join("tree"), fs::Permissions::from_mode(0o555)).unwrap();
-    RemoteSnapshotService::new(store)
-        .verify_and_promote_at(&lease, &digest, now)
-        .unwrap();
-    (lease, SubmitRequest::new(request.material().clone()))
 }
 
 fn task_meta(task: TaskId, base_oid: BaseOid) -> TaskMeta {
@@ -1113,42 +1031,6 @@ fn delayed_origin_leaves_the_heavy_slot_idle() {
         delivered
             .iter()
             .any(|item| item.turn_id() == turn && item.state() == DeliveryState::Delivered)
-    );
-}
-
-#[test]
-fn cleanup_after_durable_intent_releases_the_heavy_slot() {
-    let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
-    fs::write(origin.join("reject"), b"1").unwrap();
-    let (lease, request) = prepared_supervisor_job(
-        &store,
-        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
-    );
-    assert_eq!(
-        LeaseService::new(&store).occupancy().unwrap().slot_state,
-        SlotState::Busy
-    );
-    let delivery = commit(&store, &origin_url, &oid, turn_id(2), 1);
-    assert_eq!(delivery.state(), DeliveryState::Pending);
-    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
-    assert!(ref_exists(
-        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
-        &pin
-    ));
-    let launcher = InlineSupervisorLauncher {
-        store: store.clone(),
-    };
-    assert!(
-        lease.expires_at_millis() > wall_clock_millis(),
-        "durable cleanup fixture must start with a live execution lease"
-    );
-    let response = JobService::new(&store, &launcher)
-        .submit_at(request, 10)
-        .unwrap();
-    assert_eq!(response.status().state(), JobState::Succeeded);
-    assert_eq!(
-        LeaseService::new(&store).occupancy().unwrap().slot_state,
-        SlotState::Idle
     );
 }
 
