@@ -128,4 +128,3 @@ pub(crate) fn raw_exchange(
     reply.verify_envelope(query)?;
     Ok(reply.into_result())
 }
-

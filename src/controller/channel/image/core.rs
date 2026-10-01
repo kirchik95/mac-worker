@@ -13,6 +13,7 @@ pub(crate) struct LoadedImage {
     pub(crate) inode: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct RegionEvidence {
     returned_bytes: usize,
     address: u64,
@@ -26,6 +27,7 @@ struct RegionEvidence {
     owner: u32,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_region(
     region: &RegionEvidence,
     header: u64,

@@ -395,27 +395,39 @@ impl GenerationFiles {
             return false;
         }
         let clean = || -> io::Result<()> {
-            if let Some((bytes, binding)) = &self.published
-                && (self.root.private_entry_identity("service.json")? != *binding
-                    || self.root.read_private_regular("service.json", 8192)? != *bytes)
-            {
-                return Err(invalid());
-            }
+            let verify_record = || -> io::Result<()> {
+                if let Some((bytes, binding)) = &self.published
+                    && (self.root.private_entry_identity("service.json")? != *binding
+                        || self.root.read_private_regular("service.json", 8192)? != *bytes
+                        || self.root.private_entry_identity("service.json")? != *binding)
+                {
+                    return Err(invalid());
+                }
+                Ok(())
+            };
+            verify_record()?;
+            let executable_name = self
+                .executable
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(invalid)?;
             if self.root.identity()? != self.parent_binding
                 || self.root.channel_socket_entry("s")? != self.socket_binding
+                || self.root.channel_executable_entry(executable_name)? != self.executable_binding
                 || !probe_refused(&self.root.path().join("s"))?
             {
                 return Err(invalid());
             }
+            verify_record()?;
+            if self.root.channel_executable_entry(executable_name)? != self.executable_binding {
+                return Err(invalid());
+            }
             self.root.channel_unlink_exact("s", self.socket_binding)?;
-            self.root.channel_unlink_exact(
-                self.executable
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .ok_or_else(invalid)?,
-                self.executable_binding,
-            )?;
+            verify_record()?;
+            self.root
+                .channel_unlink_exact(executable_name, self.executable_binding)?;
             if let Some((_, binding)) = &self.published {
+                verify_record()?;
                 self.root.channel_unlink_exact("service.json", *binding)?;
             }
             Ok(())
@@ -423,4 +435,3 @@ impl GenerationFiles {
         clean().is_ok()
     }
 }
-

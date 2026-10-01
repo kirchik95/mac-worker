@@ -1,4 +1,5 @@
 //! Stable private pin storage; no volatile generation or journal fields.
+use super::Pin as PinDocument;
 use crate::{
     inputs::RelativePath,
     job::ClientId,
@@ -6,7 +7,6 @@ use crate::{
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
 use std::io;
-use super::Pin as PinDocument;
 
 fn invalid() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
@@ -114,4 +114,3 @@ fn repin_with_hook(
     }
     Ok(())
 }
-
