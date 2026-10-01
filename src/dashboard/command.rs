@@ -36,6 +36,7 @@ pub struct DashboardCommandRequest {
 }
 
 impl DashboardCommandRequest {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(port: Option<u16>, no_open: bool) -> Self {
         Self {
             port,
@@ -61,18 +62,19 @@ pub trait BrowserOpener: Send + Sync {
     fn open(&self, url: &str) -> Result<(), WorkerError>;
 }
 
-pub struct SystemDashboardLauncher {
-    pub state: Arc<DashboardHttpState<MacWorkerDashboardSource, SystemClock, SystemMonotonicClock>>,
+pub(crate) struct SystemDashboardLauncher {
+    pub(crate) state:
+        Arc<DashboardHttpState<MacWorkerDashboardSource, SystemClock, SystemMonotonicClock>>,
     events: Option<Arc<dyn ViewerEventSource>>,
 }
 
 impl SystemDashboardLauncher {
-    pub fn with_events(mut self, source: Arc<dyn ViewerEventSource>) -> Self {
+    pub(crate) fn with_events(mut self, source: Arc<dyn ViewerEventSource>) -> Self {
         self.events = Some(source);
         self
     }
 
-    pub fn from_system_with_config(
+    pub(crate) fn from_system_with_config(
         config: Arc<Config>,
         local_jobs: Arc<ClientStateStore>,
         launch_directory: Option<&Path>,
@@ -147,7 +149,7 @@ impl DashboardLauncher for SystemDashboardLauncher {
 }
 
 #[derive(Default)]
-pub struct SystemBrowserOpener;
+pub(crate) struct SystemBrowserOpener;
 
 impl BrowserOpener for SystemBrowserOpener {
     fn open(&self, url: &str) -> Result<(), WorkerError> {

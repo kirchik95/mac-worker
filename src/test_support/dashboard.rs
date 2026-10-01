@@ -3,13 +3,14 @@
 pub use crate::dashboard::run_controller_dashboard_tunnel_with_readiness_timeout;
 pub mod cache {
     pub use crate::dashboard::cache::{
-        CpuBusyPercent, CpuCounters, IDLE_PROBE_INTERVAL_MILLIS, MAX_SAMPLES_PER_WORKER,
-        OBSERVATION_TTL_MILLIS, Observation, ObservationCache,
+        CachedObservation, CpuBusyPercent, CpuCounters, IDLE_PROBE_INTERVAL_MILLIS,
+        MAX_SAMPLES_PER_WORKER, OBSERVATION_TTL_MILLIS, Observation, ObservationCache,
     };
 }
 pub mod command {
     pub use crate::dashboard::command::{
-        BrowserOpener, DashboardCommandRequest, DashboardLauncher, run_dashboard,
+        BrowserOpener, DashboardCommandRequest, DashboardLauncher, DashboardRunResult,
+        run_dashboard,
     };
 }
 pub mod events {
@@ -18,10 +19,11 @@ pub mod events {
 pub mod model {
     pub use crate::dashboard::model::{
         AgentFactsFreshness, ApiError, CollectionSummary, DASHBOARD_API_VERSION,
-        DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardLaptop,
-        DashboardLogChunk, DashboardMemoryPressure, DashboardQueueEntry, DashboardQueueEntryKind,
-        DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
-        SystemSummary, WorkerHealth,
+        DashboardActiveTask, DashboardAgent, DashboardAgentFacts, DashboardCommandMode,
+        DashboardCommandSummary, DashboardError, DashboardHerdr, DashboardLaptop,
+        DashboardLogChunk, DashboardMemoryPressure, DashboardProfileAuth, DashboardProjectDefaults,
+        DashboardQueueEntry, DashboardQueueEntryKind, DashboardSlotState, DashboardSnapshot,
+        DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
     };
 }
 pub mod queue {
@@ -31,10 +33,11 @@ pub mod queue {
 }
 pub mod service {
     pub use crate::dashboard::service::{
-        Clock, DashboardDataSource, DashboardDeadlines, DashboardQueueReader, DashboardService,
-        DashboardSnapshotRequest, DashboardTaskCollection, EmptyDashboardQueueReader,
-        GLOBAL_COLLECTION_DEADLINE, MAX_COLLECTION_ERRORS, MonotonicClock, SNAPSHOT_PENDING,
-        SystemClock, SystemMonotonicClock, WORKER_COLLECTION_DEADLINE, WorkerObservationResult,
+        Clock, CollectorHandle, DashboardDataSource, DashboardDeadlines, DashboardQueueReader,
+        DashboardService, DashboardSnapshotRequest, DashboardTaskCollection,
+        EmptyDashboardQueueReader, GLOBAL_COLLECTION_DEADLINE, LocalRefreshHandle,
+        MAX_COLLECTION_ERRORS, MonotonicClock, SNAPSHOT_PENDING, SystemClock, SystemMonotonicClock,
+        WORKER_COLLECTION_DEADLINE, WorkerObservationResult,
     };
 }
 pub mod settings {

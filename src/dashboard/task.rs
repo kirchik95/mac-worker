@@ -330,6 +330,7 @@ pub struct MacWorkerTaskMutationSource {
     paths: PathLayout,
     runner: Arc<dyn ProcessRunner>,
     executor: Arc<dyn RunnerExecutor>,
+    #[cfg(any(test, feature = "test-support"))]
     after_expected_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -341,20 +342,24 @@ impl MacWorkerTaskMutationSource {
             paths,
             runner: Arc::new(SystemProcessRunner),
             executor: Arc::new(DetachedRunnerExecutor),
+            #[cfg(any(test, feature = "test-support"))]
             after_expected_check: None,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_process_runner(mut self, runner: Arc<dyn ProcessRunner>) -> Self {
         self.runner = runner;
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_executor(mut self, executor: Arc<dyn RunnerExecutor>) -> Self {
         self.executor = executor;
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_after_expected_check(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.after_expected_check = Some(hook);
         self
@@ -395,6 +400,7 @@ impl MacWorkerTaskMutationSource {
         Ok(record)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn after_expected_check(&self) {
         if let Some(hook) = &self.after_expected_check {
             hook();
@@ -441,6 +447,7 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
             .filter(|message| !message.is_empty())
             .ok_or_else(|| ApiError::new("TASK_REQUEST_INVALID", "reply requires a message"))?
             .to_owned();
+        #[cfg(any(test, feature = "test-support"))]
         self.after_expected_check();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -456,6 +463,7 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         request: &TaskMutationRequest,
     ) -> Result<TaskDetailProjection, ApiError> {
         let expected = self.load_matching(task_id, request)?;
+        #[cfg(any(test, feature = "test-support"))]
         self.after_expected_check();
         self.client()
             .close_from_expected(&expected, false)

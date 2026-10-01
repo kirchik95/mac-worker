@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::dashboard::model::{DashboardError, DashboardWorker, Freshness};
 
-pub const SNAPSHOT_INTERVAL_MILLIS: u64 = 2_000;
+pub(crate) const SNAPSHOT_INTERVAL_MILLIS: u64 = 2_000;
 pub const OBSERVATION_TTL_MILLIS: u64 = 10_000;
 /// Idle, unchanged hosts are not probed again until this much dashboard time
 /// has passed. The UI snapshot stays on [`SNAPSHOT_INTERVAL_MILLIS`].
@@ -13,7 +13,7 @@ pub const IDLE_PROBE_INTERVAL_MILLIS: u64 = 10_000;
 /// The first observation has no `last`. A frozen clock (`now <= last`) probes
 /// again so tests that do not advance time keep collecting. Busy or changed
 /// hosts probe on every snapshot. An idle unchanged host waits out the interval.
-pub fn idle_probe_due(now: u64, last: Option<u64>, idle: bool, unchanged: bool) -> bool {
+pub(crate) fn idle_probe_due(now: u64, last: Option<u64>, idle: bool, unchanged: bool) -> bool {
     let Some(last) = last else {
         return true;
     };
@@ -44,10 +44,12 @@ impl CpuCounters {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn total_ticks(self) -> u64 {
         self.total_ticks
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn idle_ticks(self) -> u64 {
         self.idle_ticks
     }
@@ -82,11 +84,13 @@ pub struct Observation {
 #[derive(Debug, Clone)]
 pub struct CachedObservation {
     pub worker: DashboardWorker,
+    #[cfg(any(test, feature = "test-support"))]
     pub observed_at_millis: u64,
 }
 
 enum ObservationSample {
     Full(Box<Observation>),
+    #[cfg(any(test, feature = "test-support"))]
     CpuOnly {
         observed_at_millis: u64,
         counters: CpuCounters,
@@ -97,6 +101,7 @@ impl ObservationSample {
     fn observed_at_millis(&self) -> u64 {
         match self {
             Self::Full(observation) => observation.observed_at_millis,
+            #[cfg(any(test, feature = "test-support"))]
             Self::CpuOnly {
                 observed_at_millis, ..
             } => *observed_at_millis,
@@ -106,6 +111,7 @@ impl ObservationSample {
     fn cpu_counters(&self) -> Option<CpuCounters> {
         match self {
             Self::Full(observation) => observation.cpu_counters,
+            #[cfg(any(test, feature = "test-support"))]
             Self::CpuOnly { counters, .. } => Some(*counters),
         }
     }
@@ -138,6 +144,7 @@ impl ObservationCache {
 
         let cached = CachedObservation {
             worker: observation.worker.clone(),
+            #[cfg(any(test, feature = "test-support"))]
             observed_at_millis: observation.observed_at_millis,
         };
         push_bounded(samples, ObservationSample::Full(Box::new(observation)));
@@ -145,17 +152,25 @@ impl ObservationCache {
     }
 
     pub fn latest(&self, worker_name: &str) -> Option<&Observation> {
-        self.samples
-            .get(worker_name)?
-            .iter()
-            .rev()
-            .find_map(|sample| {
-                if let ObservationSample::Full(observation) = sample {
-                    Some(observation.as_ref())
-                } else {
-                    None
-                }
-            })
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.samples
+                .get(worker_name)?
+                .iter()
+                .rev()
+                .find_map(|sample| {
+                    if let ObservationSample::Full(observation) = sample {
+                        Some(observation.as_ref())
+                    } else {
+                        None
+                    }
+                })
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let ObservationSample::Full(observation) = self.samples.get(worker_name)?.back()?;
+            Some(observation.as_ref())
+        }
     }
 
     pub fn stale_worker(&self, worker_name: &str, now_millis: u64) -> Option<DashboardWorker> {
@@ -170,6 +185,7 @@ impl ObservationCache {
         Some(worker)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_cpu(
         &mut self,
         worker_name: &str,
@@ -193,6 +209,7 @@ impl ObservationCache {
         cpu_busy_percent
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn sample_count(&self, worker_name: &str) -> usize {
         self.samples.get(worker_name).map_or(0, VecDeque::len)
     }

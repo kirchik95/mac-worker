@@ -78,12 +78,12 @@ pub trait DashboardRemoteReader: Send + Sync + 'static {
     ) -> Result<LogChunk, WorkerError>;
 }
 
-pub struct SystemDashboardWorkerReader {
+pub(crate) struct SystemDashboardWorkerReader {
     runner: Arc<dyn ProcessRunner>,
 }
 
 impl SystemDashboardWorkerReader {
-    pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
+    pub(crate) fn new(runner: Arc<dyn ProcessRunner>) -> Self {
         Self { runner }
     }
 }
@@ -105,12 +105,12 @@ impl DashboardWorkerReader for SystemDashboardWorkerReader {
     }
 }
 
-pub struct SystemDashboardRemoteReader {
+pub(crate) struct SystemDashboardRemoteReader {
     runner: Arc<dyn ProcessRunner>,
 }
 
 impl SystemDashboardRemoteReader {
-    pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
+    pub(crate) fn new(runner: Arc<dyn ProcessRunner>) -> Self {
         Self { runner }
     }
 }

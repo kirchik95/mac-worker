@@ -35,8 +35,9 @@ pub const MAX_COLLECTION_ERRORS: usize = 64;
 pub const WORKER_COLLECTION_DEADLINE: Duration = Duration::from_secs(15);
 pub const GLOBAL_COLLECTION_DEADLINE: Duration = Duration::from_secs(20);
 pub const SNAPSHOT_PENDING: &str = "DASHBOARD_SNAPSHOT_PENDING";
-pub const COLLECTOR_START_FAILED: &str = "DASHBOARD_COLLECTOR_START_FAILED";
+const COLLECTOR_START_FAILED: &str = "DASHBOARD_COLLECTOR_START_FAILED";
 
+#[cfg(any(test, feature = "test-support"))]
 const INVALID_DEADLINES: &str = "INVALID_DASHBOARD_DEADLINES";
 const DEADLINE_OVERFLOW: &str = "DASHBOARD_DEADLINE_OVERFLOW";
 const REFRESH_TIMEOUT: &str = "DASHBOARD_REFRESH_TIMEOUT";
@@ -99,6 +100,7 @@ pub struct DashboardDeadlines {
 }
 
 impl DashboardDeadlines {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(worker: Duration, global: Duration) -> Result<Self, DashboardError> {
         if worker.is_zero() || global.is_zero() || worker > global {
             return Err(DashboardError::new(
@@ -197,8 +199,10 @@ pub trait DashboardQueueReader: Send + Sync + 'static {
     fn ordered_pending(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub struct EmptyDashboardQueueReader;
 
+#[cfg(any(test, feature = "test-support"))]
 impl DashboardQueueReader for EmptyDashboardQueueReader {
     fn ordered_pending(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
         Ok(Vec::new())
@@ -209,8 +213,8 @@ impl DashboardQueueReader for EmptyDashboardQueueReader {
 /// by default so an idle pool does not degrade to `unknown` after the TTL;
 /// `--no-facts-refresh` turns it off for a read-only dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DashboardConfig {
-    pub refresh_stale_facts: bool,
+pub(crate) struct DashboardConfig {
+    pub(crate) refresh_stale_facts: bool,
 }
 
 impl Default for DashboardConfig {
@@ -256,6 +260,7 @@ impl CollectorHandle {
         let _ = lock_recover(&self.thread).take();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn join(self) {
         self.signal_stop();
         if let Some(thread) = lock_recover(&self.thread).take() {
@@ -387,10 +392,12 @@ enum RefreshRole {
 }
 
 impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C, M> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(source: S, clock: C, monotonic: M) -> Self {
         Self::with_deadlines(source, clock, monotonic, DashboardDeadlines::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_deadlines(
         source: S,
         clock: C,
@@ -406,7 +413,7 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         )
     }
 
-    pub fn with_options(
+    pub(crate) fn with_options(
         source: S,
         clock: C,
         monotonic: M,
@@ -437,16 +444,19 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_binary_source(mut self, source: Arc<dyn BinaryIdentitySource>) -> Self {
         self.binary = source;
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_refresh_stale_facts(mut self, enabled: bool) -> Self {
         self.refresh_stale_facts = enabled;
         self
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_collection_interval(mut self, interval: Duration) -> Self {
         if !interval.is_zero() {
             self.collection_interval = interval;

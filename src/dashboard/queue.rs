@@ -11,8 +11,14 @@ use crate::{
         service::DashboardQueueReader,
     },
     error::WorkerError,
-    job::{CommandSummary, JobId, QueueEntryKind, QueueState},
-    task::{RunId, TaskId, TurnId},
+    job::{CommandSummary, QueueEntryKind, QueueState},
+    task::RunId,
+};
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    job::JobId,
+    task::{TaskId, TurnId},
 };
 
 /// A queue row already projected by the phase-4 scheduler boundary.
@@ -21,6 +27,7 @@ use crate::{
 /// the blocking reason. Keeping that work on the producer side prevents the
 /// dashboard from making a second scheduling decision from incomplete data.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct PhaseFourQueueEntry {
     pub position: u32,
     pub job_id: JobId,
@@ -39,6 +46,7 @@ pub struct PhaseFourQueueEntry {
     pub blocking_code: String,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait PhaseFourQueueReader: Send + Sync + 'static {
     fn ordered_pending(&self) -> Result<Vec<PhaseFourQueueEntry>, DashboardError>;
 }
@@ -130,10 +138,12 @@ impl DashboardQueueReader for ClientStateDashboardQueueReader {
 ///
 /// This adapter is deliberately read-only: it does not inspect jobs or worker
 /// probes, reorder rows, choose a worker, or alter queue state.
+#[cfg(any(test, feature = "test-support"))]
 pub struct SchedulerQueueAdapter<R> {
     reader: R,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<R: PhaseFourQueueReader + Send + Sync + 'static> SchedulerQueueAdapter<R> {
     pub fn new(reader: R) -> Self {
         Self { reader }
@@ -147,11 +157,13 @@ impl<R: PhaseFourQueueReader + Send + Sync + 'static> SchedulerQueueAdapter<R> {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ordered_pending(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
         self.queue_entries()
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<R: PhaseFourQueueReader + Send + Sync + 'static> DashboardQueueReader
     for SchedulerQueueAdapter<R>
 {
@@ -160,6 +172,7 @@ impl<R: PhaseFourQueueReader + Send + Sync + 'static> DashboardQueueReader
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn project_queue_entry(entry: PhaseFourQueueEntry) -> Result<DashboardQueueEntry, DashboardError> {
     let PhaseFourQueueEntry {
         position,

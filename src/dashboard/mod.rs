@@ -11,4 +11,5 @@ pub(crate) mod tunnel;
 pub mod web;
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub use tunnel::run_controller_dashboard_tunnel_with_readiness_timeout;

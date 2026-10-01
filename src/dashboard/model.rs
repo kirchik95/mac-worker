@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
+#[cfg(any(test, feature = "test-support"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{
     Serialize, Serializer,
@@ -8,14 +9,17 @@ use serde::{
 
 use crate::{
     agent_facts::{FACTS_TTL, HerdrFacts},
-    job::{JobId, LogChunk, LogStream, MAX_LOG_CHUNK_BYTES},
+    job::{JobId, LogChunk, LogStream},
     task::{RunId, RunProgress, RunnerState, TaskId, TurnId},
     task_view::TaskListProjection,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::job::MAX_LOG_CHUNK_BYTES;
+
 pub const DASHBOARD_API_VERSION: u32 = 1;
-pub const MAX_ERROR_MESSAGE_CHARS: usize = 512;
-pub const MAX_PROJECT_LABEL_CHARS: usize = 96;
+const MAX_ERROR_MESSAGE_CHARS: usize = 512;
+pub(crate) const MAX_PROJECT_LABEL_CHARS: usize = 96;
 
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const FALLBACK_ERROR_CODE: &str = "DASHBOARD_ERROR";
@@ -516,6 +520,7 @@ impl DashboardLogChunk {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_bytes(
         stream: LogStream,
         offset: u64,
@@ -539,18 +544,22 @@ impl DashboardLogChunk {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stream(&self) -> LogStream {
         self.stream
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn offset(&self) -> u64 {
         self.offset
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn data(&self) -> &str {
         &self.data
     }
@@ -601,7 +610,7 @@ impl Serialize for ApiError {
     }
 }
 
-pub fn sanitize_bounded(value: &str, limit: usize) -> String {
+pub(crate) fn sanitize_bounded(value: &str, limit: usize) -> String {
     let mut tokens = Vec::new();
     let mut used = 0;
     let mut truncated = false;

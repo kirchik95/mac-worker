@@ -103,7 +103,7 @@ fn parse_millis(value: &str) -> Option<Duration> {
     value.parse::<u64>().ok().map(Duration::from_millis)
 }
 
-pub async fn run_controller_dashboard_tunnel(
+pub(crate) async fn run_controller_dashboard_tunnel(
     config: &Config,
     runtime: &RuntimeContext,
     port: Option<u16>,
@@ -127,6 +127,7 @@ pub async fn run_controller_dashboard_tunnel(
 
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn run_controller_dashboard_tunnel_with_readiness_timeout(
     config: &Config,
     runtime: &RuntimeContext,
