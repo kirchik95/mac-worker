@@ -214,7 +214,7 @@ then initialize the controller:
 
 ```bash
 worker setup
-worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
+worker controller init mac1 --worker-ssh mini-2=yourname@10.0.0.2
 worker controller status
 ```
 

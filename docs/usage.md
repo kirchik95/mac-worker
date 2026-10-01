@@ -476,7 +476,7 @@ Run from the laptop with a worker inventory that includes the controller host:
 
 ```bash
 worker setup
-worker controller init mac1 --worker-ssh mini-2=kirchik@10.0.0.2
+worker controller init mac1 --worker-ssh mini-2=yourname@10.0.0.2
 worker controller status
 ```
 
