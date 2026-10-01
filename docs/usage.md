@@ -505,6 +505,162 @@ For manual foreground operation, stop/unload the service first, then run `worker
 
 These stay on the laptop in controller mode: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Controller-only hand-written laptop configs may omit workers, but inventory-based commands still require them. Turn runners run on the controller host.
 
+### Persistent controller read channel
+
+With `[ssh] multiplex = true`, repeated reads inside one foreground command can reuse a
+controller-owned Unix socket forwarded through the existing SSH ControlMaster. The channel still
+starts one isolated `worker host controller-rpc` child for every read. It removes the repeated SSH
+execution session, not worker startup or handler cost. It is used only by:
+
+- `worker task wait`, run waits, and the wait phase of commands such as `submit --wait`,
+  `say --wait`, and `batch --wait`;
+- `worker task logs -f`, including that loop's health discovery;
+- `worker events -f`;
+- `worker notify` and `worker notify --follow`.
+
+The mutation or transfer before a `--wait` remains on ordinary per-request SSH. So do submit, say,
+cancel, close, batch, checkpoint, controller retry, drain reads and writes, reconcile,
+publish-retry, transfers, one-shot status/list/logs/diff/result, events without follow, doctor,
+general health, setup and restart verification, service proof, and the channel identity/repin
+commands. This is an explicit read-loop allowlist, not a generic RPC connection. Mutations are not
+replayed over the channel.
+
+#### Eligibility and SSH paths
+
+The optimization is attempted only when all of these are true:
+
+1. controller mode is enabled and `[ssh] multiplex = true`;
+2. OpenSSH resolution yields one concrete ControlMaster endpoint, and authenticated bootstrap
+   leaves a live endpoint that mac-worker can validate; and
+3. authenticated controller discovery advertises `controller.socket`.
+
+Identity bootstrap and master creation use the configured SSH destination, trust settings, and
+original `-F` file. After the concrete endpoint is captured, `-O check`, forward, and cancel use
+that literal `-S` path with `-F /dev/null`; the forward calls carry only mac-worker's one owned
+`-L` pair. Configured LocalForward, RemoteForward, and DynamicForward entries are therefore not
+copied into channel control operations. Master creation explicitly uses
+`StreamLocalBindMask=0177` and `StreamLocalBindUnlink=no`; there is no private-umask hook.
+
+Unix socket paths must be absolute, private, and shorter than macOS's 104-byte `sun_path` limit.
+The ordinary default `~/.cache/mac-worker/ssh/%C` layout fits after OpenSSH expansion. A managed
+`-F` route uses a longer, config-specific directory and may not fit when a master must be created.
+For the current pilot account,
+`/Users/kirchik/.cache/mac-worker/ssh-<16hex>/<40hex>` is 94 bytes; OpenSSH needs a 17-byte
+temporary creation suffix, making 111 bytes. A cold channel setup declines that route and uses
+stdio. A safe, already-running 94-byte master can still qualify. Whether this also affects
+ordinary multiplexing on that managed route has not been established. Shortening the control
+directory is an owner follow-up, not part of this phase.
+
+#### Identity, pin, and controller replacement
+
+Inspect the authenticated raw-SSH identity and stable local pin input with:
+
+```sh
+worker controller channel identity
+worker controller channel identity --json
+```
+
+The pin contains the route, controller client id, and controller account. It deliberately excludes
+the leader pid, service generation, and optional journal id, so an ordinary leader or journal
+restart does not require repinning. The journal id is only a handshake hint: events continue to
+validate their own journal epoch and cursor. The notifier's cache key and `notify.lock` remain
+separate from the channel pin.
+
+After an intentional controller reinstall changes the controller client identity, first inspect
+the fresh identity over authenticated SSH. If the account, route, and displayed client id are the
+expected replacement, repin deliberately:
+
+```sh
+worker controller channel repin --expect-client-id <client-id>
+```
+
+The client id must be the canonical value printed by `identity`. Repin performs another fresh raw
+read before it safely creates or replaces the pin. There is no force flag and it does not delete
+controller state, notification state, or mutation envelopes. An unsafe or corrupt pin needs local
+operator inspection. A stable-identity mismatch makes read loops use authenticated stdio without
+sending application bytes to the socket; that fail-closed fallback is safe because stdio remains
+the configured SSH authority. A complete socket reply with the wrong request identity is instead
+treated as unverified evidence and is not replayed automatically.
+
+#### Fallback, cleanup, and limits
+
+An eligible read can make at most one channel application attempt followed by one immediate
+byte-identical stdio retry within the original per-call deadline. Existing outer retries of that
+same read stay on stdio. Cancellation or an expired deadline closes the stream and sends no
+post-cancel fallback. Closing a channel request cancels only its transient RPC child; it is not
+`worker task cancel` and does not roll back task state.
+
+Recoverable loss makes later reads eligible to reconnect after 1, 2, 4, then 5 seconds, without
+sleeping inside the adapter. Cleanup uncertainty is more conservative. The stream is closed before
+OpenSSH forward cancellation. Exit status 0 is not enough: a settled forward is removed only after
+an exact binding check and a local connect proves `ECONNREFUSED`. An interrupted or unacknowledged
+forward open is always retained because the producer may still bind or listen. A retained or
+otherwise unproved cleanup preserves at most one private allocation and retires channel setup for
+the rest of that foreground command, even after later reconnect times. mac-worker does not
+garbage-collect or automatically delete that uncertain residue.
+
+One leader generation admits at most 16 sessions and eight RPC supervisors, with one request in
+flight per session. The eight children account for at most eight supervisor threads, 16 capture
+threads, and eight stdin writers, plus one bounded channel-control thread. Frames are capped at
+1 MiB with an 8 KiB scratch buffer. Setup, handshake, and cleanup guards are 5 seconds, idle is
+60 seconds, and an application request is capped at 30 seconds; cold setup is skipped with
+5 seconds or less remaining. These are resource and hang guards, not performance promises.
+
+Mutations retain their existing stdio behavior. Their four ambiguous attempts, with jittered waits
+of about 1, 3, and 9 seconds, can all finish inside the LaunchAgent's 30-second
+`ThrottleInterval` and still end outcome-unknown. The read channel does not widen that budget or
+settle a mutation.
+
+#### Executable generation
+
+At leader startup, mac-worker verifies the inode of the running image and creates a private
+generation hard link. Socket RPC children execute that link, so replacing
+`~/.local/bin/worker` cannot mix binaries inside the running generation. Detached task runners
+started by those children use the captured installed path instead, and later runner handoffs use
+whatever verified binary is installed there, as they do on stdio. Shutdown removes the generation
+link only after every socket RPC child is proven exited; detached task groups are not cancelled or
+waited on for that cleanup.
+
+`worker setup` installs by replacing the installed path. For an enabled configured controller it
+also restarts and verifies the leader, so the next generation pins the new image. A manually
+started leader keeps its old pinned generation until the operator stops and restarts it; replacing
+the file alone does not change that running leader.
+
+#### Local fixture observations
+
+The ignored acceptance fixture used a local fake SSH/mux and real local RPC children. It does not
+measure live SSH, network, authentication, or fleet latency. Its model is:
+
+```text
+stdio  = S + W + H + D
+socket =     W + H + D + O
+expected difference = S - O
+```
+
+`S` is the SSH execution-session/process cost already using ControlMaster; `O` is channel
+socket/supervisor/wrapper overhead. Each cell below is command mean / p50 / p95 in milliseconds,
+copied from the 200-sample paired fixture:
+
+| Scenario | Stdio ms | Socket-path ms |
+| --- | --- | --- |
+| Cold CLI wait, pin create | 41.549 / 41.368 / 46.241 | 163.514 / 161.442 / 181.007 |
+| Cold CLI wait, pin verify | 41.608 / 41.010 / 45.947 | 153.670 / 149.634 / 167.944 |
+| Cold CLI followed logs, pin verify | 71.610 / 71.058 / 77.657 | 158.923 / 157.149 / 170.441 |
+| Retired after unacknowledged cancel | 35.526 / 35.142 / 38.538 | 35.103 / 35.060 / 37.940 |
+| Warm wait, zero requested wait | 35.031 / 35.024 / 37.990 | 10.209 / 10.079 / 12.368 |
+| Warm logs, zero requested wait | 34.357 / 33.574 / 38.380 | 10.228 / 10.316 / 10.902 |
+| Warm events, zero requested wait | 33.249 / 32.982 / 36.602 | 8.396 / 8.195 / 10.906 |
+| Warm events, 5-ms requested wait | 39.963 / 39.446 / 43.800 | 14.339 / 13.647 / 16.703 |
+| Fallback/reconnect, two wait reads | 72.890 / 71.241 / 82.558 | 189.272 / 184.220 / 211.990 |
+
+The run observed 4,400 application reads/children and 1,200 fresh CLI processes. Warm socket
+classes used zero SSH application execution sessions and one worker child per read. Every measured
+cold command completed positive cleanup; the retained-open case kept exactly one allocation and
+made no later channel attempt. These numbers show local cold overhead and warm structure, not a
+deployed speedup. Live paired measurement remains **pending**, after the owner approves deployment.
+
+Phase 4 phone/Tailscale access and Phase 5 per-mini daemons are out of scope by owner decision.
+
 ### Health and shutdown
 
 Use `worker controller status` or `worker controller status --json` on either host.
@@ -753,7 +909,10 @@ The 100,001 row is collection and the count only. Rejection happens before valid
 
 This wave does not change `worker task wait`, does not add run-level banners or run settlement, and does not treat worker TTL expiry as availability. There is no `worker events --since`, no snapshot of every subsystem, and no emulation of the feed on an old controller. The notifier is not a LaunchAgent. The CLI has no reset command and no journal delete.
 
-A later design may add a same-account Unix socket on the controller, forwarded with `ssh -N -L` and checked for protocol 7, identity, and generation before use, falling back to today's per-request SSH. That socket is not implemented. Phone access, Tailscale, and a daemon on every mini are outside this design. Build it only after a separate measurement and an authenticated identity design; this wave does not create socket files.
+The later persistent read channel is documented under
+[Persistent controller read channel](#persistent-controller-read-channel). It does not change the
+event journal or notifier semantics described in this section. Phone access, Tailscale, and a
+daemon on every mini remain outside both phases.
 
 ## What the pool will and will not do
 

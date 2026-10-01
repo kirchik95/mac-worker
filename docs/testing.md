@@ -41,6 +41,41 @@ Tests in different modules can change process-wide state such as the current dir
 existing module-local locks do not synchronize an entire area binary. Do not run plain integration targets with
 multiple test threads, even when selecting a subset of modules.
 
+## Persistent controller read channel
+
+The channel tests remain modules of the existing `controller`, `transfer`, and `cli` integration
+targets. Use six nextest workers and four Cargo build jobs for these focused selections:
+
+```sh
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_contracts::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_codec::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_service::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_identity::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_client::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_wiring::.*(loop|raw|route)/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test transfer -E 'test(/^controller_socket_forward::|^transport::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test cli -E 'test(/^controller_channel::|^cli_help::/)'
+```
+
+The final track runs recorded 13/13 contracts, 33/33 codec, 28/28 service, 33/33
+identity, 43/43 client, 16/16 loop/raw/route wiring, 20/20 integrated forward/transport,
+and 39/39 channel CLI/help tests. Counts can grow as cases are added; a filter selecting zero tests
+is always an error. The broader compatibility filters and exact per-track counts are retained in
+the [validation record](superpowers/validation/2026-10-01-controller-socket.md).
+
+The paired transport observation is intentionally ignored by the ordinary gate. Run it alone,
+with captured JSON output, when changing the channel's lifecycle or measurement fixture:
+
+```sh
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 NEXTEST_PROFILE=ci NEXTEST_RETRIES=0 \
+  cargo nextest run --locked --test controller --run-ignored only --no-capture \
+  -E 'test(/^controller_socket_benchmark::fixture_transport_cost_observations$/)'
+```
+
+The accepted run selected one test, passed one, and emitted 18 observation rows from 10 warmups
+and 200 paired samples per class. Its local fake SSH/mux timings are observations, not a latency
+threshold or a substitute for live acceptance.
+
 When a fixture re-executes its test binary, pass `support::libtest_name(module_path!(), "test_name")` to
 `--exact` or `support::agent_launch_fixture::assert_subprocess_success`. The helper drops the crate component
 and preserves all module components, including nested fixture modules.
