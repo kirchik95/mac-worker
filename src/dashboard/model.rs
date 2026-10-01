@@ -42,6 +42,36 @@ pub struct DashboardSnapshot {
     pub laptop: Option<DashboardLaptop>,
 }
 
+impl DashboardSnapshot {
+    /// Measurements and observation ages stay in the cache for anti-entropy
+    /// reads, but do not invalidate a healthy viewer on every collection.
+    /// Freshness, health, execution IDs and task/queue/run content still do.
+    pub(crate) fn same_refresh_content(&self, previous: &Self) -> bool {
+        let mut current = self.clone();
+        current.revision = previous.revision;
+        current.generated_at_millis = previous.generated_at_millis;
+        for (worker, previous_worker) in current.workers.iter_mut().zip(&previous.workers) {
+            worker.observed_at_millis = previous_worker.observed_at_millis;
+            worker.system = previous_worker.system.clone();
+            if let (Some(facts), Some(previous_facts)) =
+                (&mut worker.agent_facts, &previous_worker.agent_facts)
+            {
+                facts.collected_at_millis = previous_facts.collected_at_millis;
+                facts.freshness_age_at_observation_millis =
+                    previous_facts.freshness_age_at_observation_millis;
+                facts.freshness_observed_at_millis = previous_facts.freshness_observed_at_millis;
+            }
+            if let (Some(herdr), Some(previous_herdr)) = (&mut worker.herdr, &previous_worker.herdr)
+            {
+                herdr.age_millis = previous_herdr.age_millis;
+                herdr.age_at_observation_millis = previous_herdr.age_at_observation_millis;
+                herdr.observed_at_millis = previous_herdr.observed_at_millis;
+            }
+        }
+        current == *previous
+    }
+}
+
 /// Laptop-local observation about the dashboard process itself.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DashboardLaptop {

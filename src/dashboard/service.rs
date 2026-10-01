@@ -581,11 +581,20 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             age_cached_workers(&mut snapshot.workers, snapshot.generated_at_millis);
             enrich_active_tasks(&mut snapshot.workers, &snapshot.task_view);
         }
+        let changed = completed
+            .as_ref()
+            .is_none_or(|current| !snapshot.same_refresh_content(current));
+        let mut last_failure = lock_recover(&self.last_failure);
+        let recovered = last_failure.is_some();
+        // Revisions still fence every completed collection, including one
+        // whose only changes will be picked up by anti-entropy reads.
         snapshot.revision = self.next_revision()?;
         let snapshot = Arc::new(snapshot);
         *completed = Some(Arc::clone(&snapshot));
-        *lock_recover(&self.last_failure) = None;
-        let _ = self.publications.send(snapshot.revision);
+        *last_failure = None;
+        if changed || recovered {
+            let _ = self.publications.send(snapshot.revision);
+        }
         Ok(snapshot)
     }
 

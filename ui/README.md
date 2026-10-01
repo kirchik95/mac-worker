@@ -75,6 +75,6 @@ The diff is the whole tree, not only JS and CSS. `npm run build` passes
 ## Layout
 
 - `src/lib/api.ts` — types mirroring the Rust snapshot projection, and fetch helpers
-- `src/hooks/useSnapshot.ts` — two-second snapshot polling, matching the Rust client
+- `src/hooks/useSnapshot.ts` — event-driven snapshot refreshes, a 15-second healthy anti-entropy poll, and two-second fallback polling
 - `src/views/` — one file per view
 - `src/components/ui/` — shadcn components, owned by this repository

@@ -9,7 +9,7 @@ use std::{
 };
 
 use mac_worker::{
-    agent_facts::{AgentFacts, FACTS_TTL},
+    agent_facts::{AgentFacts, FACTS_TTL, HerdrFactState, HerdrFacts},
     dashboard::{
         cache::{CpuCounters, IDLE_PROBE_INTERVAL_MILLIS, OBSERVATION_TTL_MILLIS, Observation},
         model::{
@@ -33,7 +33,8 @@ use mac_worker::{
         HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
         WorkerHealth as ProbeWorkerHealth,
     },
-    task_view::TaskListProjection,
+    task::{BranchName, ClosePolicy, RunId, TaskId, TaskState},
+    task_view::{ReviewState, TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection},
 };
 
 #[test]
@@ -489,6 +490,286 @@ fn revisions_and_wall_generation_time_advance_only_for_completed_leaders() {
     source.set_finish_wall(wall.clone(), 300);
     let second = service.snapshot(Default::default()).unwrap();
     assert_eq!((second.revision, second.generated_at_millis), (2, 300));
+}
+
+#[test]
+fn volatile_only_collections_update_the_cache_without_snapshot_ready() {
+    let source = FakeSource::new();
+    let wall = ManualClock::new(100);
+    let mut first = observation_with_counters("mini-1", 100, "mini-1.local", 100, 80);
+    first.worker.slot = busy_slot(job_id(1));
+    source.set_workers(vec![WorkerObservationResult::Current(first)]);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+    let mut publications = service.subscribe_publications();
+    let first = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), first.revision);
+
+    wall.set(200);
+    let mut changed = observation_with_counters("mini-1", 200, "mini-1.local", 200, 100);
+    changed.worker.slot = busy_slot(job_id(1));
+    changed.worker.system.memory_pressure = Some(DashboardMemoryPressure::Warn);
+    changed.worker.system.free_disk_bytes = Some(50);
+    changed.worker.system.swap_used_bytes = Some(25);
+    source.set_workers(vec![WorkerObservationResult::Current(changed)]);
+    let second = service.snapshot(Default::default()).unwrap();
+    assert_eq!(second.revision, first.revision + 1);
+    assert_eq!(second.generated_at_millis, 200);
+    let cached = service.read_snapshot().unwrap();
+    assert_eq!(cached.workers[0].observed_at_millis, Some(200));
+    assert_eq!(cached.workers[0].system.cpu_busy_percent, Some(80.0));
+    assert_eq!(
+        cached.workers[0].system.memory_pressure,
+        Some(DashboardMemoryPressure::Warn)
+    );
+    assert_eq!(cached.workers[0].system.free_disk_bytes, Some(50));
+    assert_eq!(cached.workers[0].system.swap_used_bytes, Some(25));
+    assert!(matches!(
+        publications.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn fact_age_changes_publish_only_when_freshness_changes() {
+    let source = FakeSource::new();
+    let wall = ManualClock::new(100);
+    let observed = |stamp, collected, age| {
+        let mut probe = worker_with_facts(collected, age);
+        probe
+            .probe
+            .as_mut()
+            .unwrap()
+            .agent_facts
+            .as_mut()
+            .unwrap()
+            .herdr = Some(HerdrFacts {
+            state: HerdrFactState::Available,
+            version: Some("1.0".into()),
+            interactive_agents: Some(2),
+        });
+        let mut observed = project_worker(&probe, stamp).unwrap();
+        observed.worker.slot = busy_slot(job_id(1));
+        observed
+    };
+    source.set_workers(vec![WorkerObservationResult::Current(observed(
+        100, 1_000, 10,
+    ))]);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+    let mut publications = service.subscribe_publications();
+    let first = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), first.revision);
+
+    wall.set(200);
+    source.set_workers(vec![WorkerObservationResult::Current(observed(
+        200, 2_000, 20,
+    ))]);
+    service.snapshot(Default::default()).unwrap();
+    let cached = service.read_snapshot().unwrap();
+    assert_eq!(
+        cached.workers[0]
+            .agent_facts
+            .as_ref()
+            .unwrap()
+            .collected_at_millis,
+        2_000
+    );
+    assert_eq!(cached.workers[0].herdr.as_ref().unwrap().age_millis, 20);
+    assert!(matches!(
+        publications.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    wall.set(300);
+    source.set_workers(vec![WorkerObservationResult::Current(observed(
+        300,
+        2_000,
+        FACTS_TTL + 1,
+    ))]);
+    let stale = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), stale.revision);
+    assert_eq!(stale.workers[0].freshness, Freshness::Current);
+    assert_eq!(
+        stale.workers[0].agent_facts.as_ref().unwrap().freshness,
+        mac_worker::dashboard::model::AgentFactsFreshness::Stale
+    );
+    assert!(stale.workers[0].herdr.as_ref().unwrap().stale);
+}
+
+#[test]
+fn task_queue_and_run_changes_publish_without_waiting_for_anti_entropy() {
+    let source = FakeSource::new();
+    source.set_configured(Ok(Vec::new()));
+    let service = service(source.clone());
+    let mut publications = service.subscribe_publications();
+    let first = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), first.revision);
+
+    let task_id = TaskId::new(uuid::Uuid::from_u128(1));
+    let mut tasks = TaskListProjection::empty();
+    tasks.tasks.push(TaskListRow {
+        task_id,
+        run_id: None,
+        run_position: None,
+        title: "fixture task".into(),
+        agent: "codex".into(),
+        model: None,
+        effort: None,
+        permissions: None,
+        env_profile: None,
+        state: TaskState::Queued,
+        blocking_code: None,
+        stage: None,
+        residual: None,
+        last_outcome: None,
+        worker: None,
+        branch: BranchName::for_task(task_id),
+        turn_count: 0,
+        runner: None,
+        freshness: TaskFreshness::Current,
+        created_at_millis: 1,
+        updated_at_millis: 1,
+        active_turn_id: None,
+        close_policy: ClosePolicy::Never,
+        review_state: ReviewState::NotReviewable,
+        delivery: None,
+        deliveries: Vec::new(),
+        publish_push: false,
+    });
+    tasks.progress.total = 1;
+    tasks.progress.queued = 1;
+    source.set_tasks(tasks.clone());
+    let submitted = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), submitted.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().task_view.tasks[0].state,
+        TaskState::Queued
+    );
+
+    // Isolate a task-row change from the aggregate progress and other fields.
+    tasks.tasks[0].title = "renamed task".into();
+    source.set_tasks(tasks.clone());
+    let updated = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), updated.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().task_view.tasks[0].title,
+        "renamed task"
+    );
+
+    let mut entry = queue_entry(1, 1);
+    entry.entry_kind = DashboardQueueEntryKind::TaskTurn;
+    entry.task_id = Some(task_id);
+    entry.turn_id = Some(job_id(1));
+    source.set_queue(Ok(vec![entry.clone()]));
+    let queued = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), queued.revision);
+    assert_eq!(service.read_snapshot().unwrap().queue[0], entry);
+    entry.blocking_code = "PINNED_WORKER_BUSY".into();
+    source.set_queue(Ok(vec![entry.clone()]));
+    let blocked = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), blocked.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().queue[0].blocking_code,
+        "PINNED_WORKER_BUSY"
+    );
+
+    tasks.runs.push(TaskRunProjection {
+        run_id: RunId::new(uuid::Uuid::from_u128(2)),
+        name: Some("fixture run".into()),
+        max_parallel: 1,
+        created_at_millis: 1,
+        progress: tasks.progress,
+    });
+    source.set_tasks(tasks.clone());
+    let run = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), run.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().task_view.runs[0].max_parallel,
+        1
+    );
+    tasks.runs[0].max_parallel = 2;
+    source.set_tasks(tasks);
+    let expanded = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), expanded.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().task_view.runs[0].max_parallel,
+        2
+    );
+}
+
+#[test]
+fn slot_changes_and_worker_failures_publish_promptly() {
+    let source = FakeSource::new();
+    let wall = ManualClock::new(100);
+    let mut observed = observation("mini-1", 100, "mini-1.local");
+    observed.worker.slot = busy_slot(job_id(1));
+    source.set_workers(vec![WorkerObservationResult::Current(observed)]);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+    let mut publications = service.subscribe_publications();
+    let first = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), first.revision);
+
+    wall.set(200);
+    let mut observed = observation("mini-1", 200, "mini-1.local");
+    observed.worker.slot = busy_slot(job_id(2));
+    source.set_workers(vec![WorkerObservationResult::Current(observed)]);
+    let changed = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), changed.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().workers[0]
+            .slot
+            .active_job_id,
+        Some(job_id(2))
+    );
+
+    source.set_workers(vec![WorkerObservationResult::Failed {
+        worker_name: "mini-1".into(),
+        error: error("WORKER_DOWN", "current probe failed"),
+    }]);
+    let stale = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), stale.revision);
+    assert_eq!(
+        service.read_snapshot().unwrap().workers[0].freshness,
+        Freshness::Stale
+    );
+}
+
+#[test]
+fn recovery_from_a_failed_collection_publishes_even_with_unchanged_content() {
+    let source = FakeSource::new();
+    let wall = ManualClock::new(100);
+    let mut observed = observation("mini-1", 100, "mini-1.local");
+    observed.worker.slot = busy_slot(job_id(1));
+    source.set_workers(vec![WorkerObservationResult::Current(observed)]);
+    let service = DashboardService::new(source.clone(), wall.clone(), ManualMonotonic::new(0));
+    let mut publications = service.subscribe_publications();
+    let first = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), first.revision);
+
+    source.panic_collect_once();
+    assert_eq!(
+        service.snapshot(Default::default()).unwrap_err().code,
+        "DASHBOARD_REFRESH_ABORTED"
+    );
+    let stale = service.read_snapshot().unwrap();
+    assert_eq!(stale.collection.freshness, Freshness::Stale);
+    assert_eq!(stale.generated_at_millis, 100);
+    assert_eq!(stale.revision, first.revision);
+    assert!(matches!(
+        publications.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    wall.set(200);
+    let mut observed = observation("mini-1", 200, "mini-1.local");
+    observed.worker.slot = busy_slot(job_id(1));
+    source.set_workers(vec![WorkerObservationResult::Current(observed)]);
+    let recovered = service.snapshot(Default::default()).unwrap();
+    assert_eq!(publications.try_recv().unwrap(), recovered.revision);
+    assert_eq!(recovered.collection.freshness, Freshness::Current);
+    assert_eq!(
+        service.read_snapshot().unwrap().revision,
+        recovered.revision
+    );
 }
 
 #[test]
@@ -1287,6 +1568,7 @@ struct FakeSourceState {
     configured: Mutex<Result<Vec<String>, DashboardError>>,
     slots: Mutex<HashMap<String, u8>>,
     workers: Mutex<Vec<WorkerObservationResult>>,
+    tasks: Mutex<TaskListProjection>,
     queue: Mutex<Result<Vec<DashboardQueueEntry>, DashboardError>>,
     worker_budgets: Mutex<Vec<Duration>>,
     task_budgets: Mutex<Vec<Duration>>,
@@ -1314,6 +1596,7 @@ impl FakeSource {
                 100,
                 "mini-1.local",
             ))]),
+            tasks: Mutex::new(TaskListProjection::empty()),
             queue: Mutex::new(Ok(Vec::new())),
             worker_budgets: Mutex::new(Vec::new()),
             task_budgets: Mutex::new(Vec::new()),
@@ -1342,6 +1625,10 @@ impl FakeSource {
 
     fn set_workers(&self, workers: Vec<WorkerObservationResult>) {
         *lock(&self.0.workers) = workers;
+    }
+
+    fn set_tasks(&self, tasks: TaskListProjection) {
+        *lock(&self.0.tasks) = tasks;
     }
 
     fn set_queue(&self, queue: Result<Vec<DashboardQueueEntry>, DashboardError>) {
@@ -1435,7 +1722,10 @@ impl DashboardDataSource for FakeSource {
         deadline: Duration,
     ) -> Result<DashboardTaskCollection, DashboardError> {
         lock(&self.0.task_budgets).push(deadline);
-        Ok(DashboardTaskCollection::empty())
+        Ok(DashboardTaskCollection {
+            projection: lock(&self.0.tasks).clone(),
+            errors: Vec::new(),
+        })
     }
 
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
