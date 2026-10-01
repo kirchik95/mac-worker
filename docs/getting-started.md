@@ -51,7 +51,7 @@ worker --version
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` to make it available in new macOS terminal sessions. To choose a different location, pass `--bin-dir /your/bin` to the installer. The installer copies the `worker` binary only; laptop skills are a separate local install in [Get your first branch](#3-get-your-first-branch).
 
-**Before the first release is published**, use [Build from source](#build-from-source) below. The repository includes release automation and a Homebrew formula generator; a public release and tap must be published before their download/install commands are available. Check [Releases](https://github.com/kirchik95/mac-worker/releases) for downloadable versions.
+The latest published release is [v0.1.0](https://github.com/kirchik95/mac-worker/releases) from 2026-09-13. It predates most of what these docs describe: the supervised controller commands (everything under `worker controller` except `run`), `worker events`, `worker notify`, `--questions`, `say --interrupt`, `setup --allow-debug`, and the batch retirement. For the current behavior, use [Build from source](#build-from-source) below. There is no public Homebrew tap; the repository only generates the formula.
 
 ### 2. Connect one Mac
 
@@ -192,7 +192,7 @@ flowchart LR
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` (or a dashboard reply on that card’s current revision) starts another turn in the same task workspace and agent session.
 4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge. With `publish = push`, origin delivery is a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
 
-`--wip` preparation now uses fewer Git operations and compares two fresh captures so concurrent edits can be detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
+`--wip` preparation compares two fresh captures so concurrent edits are detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
 
 The dashboard is embedded in the CLI and listens only on loopback. It does not start or cancel tasks; it can reply and accept through the same task APIs as the CLI. In the default mode the queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. When `[controller] enabled = true`, the same `worker dashboard` command is a managed SSH local-forward to the controller host and does not open laptop task state. Use `worker gc` to preview retained worker data that can be reclaimed.
 
@@ -225,8 +225,13 @@ A LaunchAgent needs a logged-in session after reboot; init prints optional Launc
 for start at boot without executing them. `sudo pmset -a autorestart 1` is a separate power-loss
 recovery setting. Use `controller drain` before maintenance, `controller drain --off` to resume,
 and `controller disable` to unload the agent and return the laptop to local mode while keeping state.
-For this supervised pilot, `worker setup` restarts the controller after helper upgrades and reports
-the result. See [Remote controller](usage.md#remote-controller) for trust, logs, overrides and recovery.
+`worker setup` restarts the supervised controller after helper upgrades and reports the result.
+See [Remote controller](usage.md#remote-controller) for trust, logs, overrides and recovery.
+
+Once the controller is running, `worker notify --follow` posts a laptop notification when a task
+finishes or needs input, and `worker events -f` tails the controller's lifecycle events. Both need
+controller mode; see [Controller events](usage.md#controller-events) and
+[Laptop notifications](usage.md#laptop-notifications).
 
 ## Update or remove
 
@@ -241,7 +246,7 @@ worker workers --refresh
 
 `worker setup` with no names updates every configured worker. It does not install or update the agents themselves. It reads the laptop binary once and installs those same bytes on every host, then prints each host's build id and SHA-256. `worker --version` prints that build id (`0.1.0+<12-char git sha>-debug` or `release`, plus `.dirty` when the worktree was dirty; `unknown` when git is unavailable). A debug build is refused unless you pass `--allow-debug`. It warms each helper before verification and refreshes facts under a separate 120 s deadline. After successful verification, a warm-up failure is a `WARMUP_FAILED` warning and a slow facts refresh is a `FACTS_REFRESH_FAILED` warning; verification failure still rolls back the helper. The helper that was replaced is kept at `~/.local/bin/worker.previous` on that worker. To roll it back by hand, let tasks finish, then on the worker run `mv ~/.local/bin/worker.previous ~/.local/bin/worker` and restart any laptop dashboard or `worker controller run` that was started from the replaced binary. See [installation recovery](setup-recovery.md) if an older installation needs attention.
 
-A controller-only laptop configuration has no local worker list; run these commands from the controller host or use an explicit inventory configuration. After updating, restart `worker controller run` on the controller host with its existing configuration.
+A controller-only laptop configuration has no local worker list; run these commands from the controller host or use an explicit inventory configuration. A manually started `worker controller run` keeps the old binary until you stop and restart it by hand; `worker setup` restarts a supervised controller itself.
 
 **Restart any running dashboard after replacing the CLI.** Stop a foreground dashboard with Ctrl+C in its terminal, then start it again with the same configuration and port, for example:
 
@@ -274,6 +279,8 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 - [Prepare a Mac worker](setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
 - [Usage reference](usage.md): tasks, follow-ups, batches, defaults, dashboard and remote controller.
 - [Remote controller](usage.md#remote-controller): opt-in always-on queue; default remains the laptop.
+- [Controller events and notifications](usage.md#controller-events): the event journal, `worker events -f`, `worker notify` and the live dashboard.
+- [Persistent controller read channel](usage.md#persistent-controller-read-channel): the forwarded socket that wait, log-follow and event loops reuse.
 - [Batch DAG](dag-design.md): named `depends_on` / `from:` lifecycle, Closed+Done parent gate, freeze, wait, and reconcile.
 - [Multiple execution slots](superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
 - [Durable origin outbox](superpowers/specs/2026-09-10-origin-outbox.md): per-turn origin delivery, slot release, and host `--watch` / `--enable` / `--once`.
