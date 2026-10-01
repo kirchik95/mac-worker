@@ -2617,6 +2617,8 @@ struct SlowBindingGit<'a> {
     inner: &'a IsolatedDagRunner,
     command: &'static str,
     reached: AtomicBool,
+    wait_timeout: Duration,
+    entered: mpsc::Sender<()>,
 }
 
 impl ProcessRunner for SlowBindingGit<'_> {
@@ -2626,9 +2628,16 @@ impl ProcessRunner for SlowBindingGit<'_> {
             && (self.command != "cat-file" || request.args.iter().any(|arg| arg == "-e"))
         {
             self.reached.store(true, Ordering::SeqCst);
+            assert!(
+                request.policy.deadline <= self.wait_timeout,
+                "{} bypassed the wait process deadline: {:?}",
+                self.command,
+                request.policy.deadline
+            );
+            self.entered.send(()).unwrap();
             let mut slow = request.clone();
             slow.program = "/bin/sleep".into();
-            slow.args = vec!["2".into()];
+            slow.args = vec![(self.wait_timeout * 4).as_secs().to_string().into()];
             slow.stdin = None;
             // Exercise real subprocess timeout and cleanup, only replacing
             // the slow external Git executable. No worker is contacted.
@@ -2661,29 +2670,46 @@ base = "from:root"
     (harness, run.run_id(), dag)
 }
 
-fn local_wait_slow_binding_git(command: &'static str) {
+fn local_wait_slow_binding_git(command: &'static str, wait_timeout: Duration) {
     let (harness, run_id, dag) = ready_wait_dag();
     let parent = &dag.nodes["root"];
     let before = harness.store.load_task(parent.task_id).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
     let slow = SlowBindingGit {
         inner: &harness.runner,
         command,
         reached: AtomicBool::new(false),
+        wait_timeout,
+        entered: entered_tx,
     };
-    let started = Instant::now();
-    let result = harness
-        .client_with(&slow)
-        .wait(WaitSelector::Run(run_id), Some(Duration::from_millis(500)));
-    let elapsed = started.elapsed();
-    assert!(
-        slow.reached.load(Ordering::SeqCst),
-        "{command} bypassed the wait ProcessRunner"
-    );
-    assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
-    assert!(
-        elapsed < Duration::from_millis(3900),
-        "slow Git exceeded the remaining budget: {elapsed:?}"
-    );
+    let client = harness.client_with(&slow);
+    thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = scope.spawn(move || {
+            let started = Instant::now();
+            let result = client.wait(WaitSelector::Run(run_id), Some(wait_timeout));
+            done_tx.send(started.elapsed()).unwrap();
+            result
+        });
+        entered_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap_or_else(|error| panic!("{command} bypassed the wait ProcessRunner: {error}"));
+        // A completion watchdog, independent of the wait's functional budget.
+        let hang_guard = Duration::from_secs(60);
+        let elapsed = done_rx
+            .recv_timeout(hang_guard)
+            .expect("slow Git outlived the wait completion hang guard");
+        let result = waiter.join().unwrap();
+        assert!(
+            slow.reached.load(Ordering::SeqCst),
+            "{command} bypassed the wait ProcessRunner"
+        );
+        assert_eq!(result.unwrap_err().public_code(), "WAIT_TIMEOUT");
+        assert!(
+            elapsed < hang_guard,
+            "slow Git outlived the wait completion hang guard: {elapsed:?}"
+        );
+    });
     assert_eq!(harness.store.load_task(parent.task_id).unwrap(), before);
     assert_eq!(
         harness.store.load_run_dag(run_id).unwrap().unwrap(),
@@ -2702,12 +2728,14 @@ fn local_wait_slow_binding_git(command: &'static str) {
 
 #[test]
 fn local_wait_deadline_bounds_slow_dag_object_probe() {
-    local_wait_slow_binding_git("cat-file");
+    local_wait_slow_binding_git("cat-file", Duration::from_millis(500));
 }
 
 #[test]
 fn local_wait_deadline_bounds_slow_owned_view_initialization() {
-    local_wait_slow_binding_git("init");
+    // Allow setup to reach the owned-view runner even on a loaded host. Its
+    // 120 s sleeper still cannot finish naturally within this wait budget.
+    local_wait_slow_binding_git("init", Duration::from_secs(30));
 }
 
 #[test]
