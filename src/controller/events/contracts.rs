@@ -7,6 +7,7 @@ pub const MAX_BATCH_EVENTS: usize = 32;
 pub const MAX_BATCH_BYTES: usize = 32 * 1_024;
 pub const MAX_RETAINED_SEGMENTS: usize = 64;
 pub const MAX_SEGMENT_BYTES: usize = 256 * 1_024;
+#[cfg(any(test, feature = "test-support"))]
 pub const MAX_RETAINED_BYTES: usize = MAX_RETAINED_SEGMENTS * MAX_SEGMENT_BYTES;
 pub const MAX_METADATA_BYTES: usize = 64 * 1_024;
 pub const MAX_RECOVERY_EVIDENCE_BYTES: usize = 512 * 1_024;
@@ -43,6 +44,7 @@ pub const SSE_CAPACITY: usize = 256;
 pub const SSE_MAX_STREAMS: usize = 8;
 pub const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const REFRESH_DEBOUNCE: Duration = Duration::from_millis(100);
+#[cfg(any(test, feature = "test-support"))]
 pub const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RECONNECT_BACKOFF: [Duration; 4] = [
     Duration::from_secs(1),
@@ -215,7 +217,8 @@ impl ReadQuery {
         self.wait_ms = self.wait_ms.min(READ_MAX_WAIT_MS);
         self
     }
-    pub fn follow(after: EventCursor) -> Self {
+    #[cfg(test)]
+    pub(crate) fn follow(after: EventCursor) -> Self {
         Self {
             after: Some(after),
             limit: READ_DEFAULT_LIMIT,
@@ -249,6 +252,7 @@ impl OpaqueCursor {
             .map_err(|_| invalid("opaque cursor is not base64url"))?;
         Ok(Self(value))
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn encode<T: Serialize>(value: &T) -> Result<Self, WorkerError> {
         use base64::Engine;
         let bytes = serde_json::to_vec(value).map_err(|_| invalid("cursor encoding failed"))?;
@@ -615,7 +619,8 @@ impl WorkerName {
         }
         Ok(Self(value))
     }
-    pub fn as_str(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -910,6 +915,7 @@ impl EventBatch {
     pub fn events(&self) -> &[NewEvent] {
         &self.0
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_events(self) -> Vec<NewEvent> {
         self.0
     }

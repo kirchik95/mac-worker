@@ -153,11 +153,12 @@ fn committed_records_with_hook(
     segment: &Segment,
     journal_id: &str,
     allow_tail: bool,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<Vec<super::super::contracts::WireEvent>> {
     if Binding::from(root.private_entry_identity(&segment.name)?) != segment.binding {
         return Err(unavailable());
     }
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::SegmentRead(segment.first))?;
     let bytes = root.read_private_regular(&segment.name, SEGMENT_BYTES as u64)?;
     if Binding::from(root.private_entry_identity(&segment.name)?) != segment.binding
@@ -327,6 +328,7 @@ fn discard_empty_unproved_stages(root: &RootedDir) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FaultPoint {
     Role(RoleKind, PrivateRolePoint),
@@ -339,6 +341,7 @@ pub(super) enum FaultPoint {
     SegmentRead(u64),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) trait FaultHooks: Send + Sync {
     fn at(&self, point: FaultPoint) -> io::Result<()>;
 }
@@ -551,6 +554,7 @@ struct CreationRecorder<'a> {
     old: Option<&'a [u8]>,
     old_binding: Option<Binding>,
     replacement: &'a [u8],
+    #[cfg(any(test, feature = "test-support"))]
     faults: &'a dyn FaultHooks,
 }
 
@@ -578,7 +582,15 @@ impl PrivateRoleHooks for CreationRecorder<'_> {
     }
 
     fn at(&self, point: PrivateRolePoint) -> io::Result<()> {
-        self.faults.at(FaultPoint::Role(self.kind, point))
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.faults.at(FaultPoint::Role(self.kind, point))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = point;
+            Ok(())
+        }
     }
 }
 
@@ -601,10 +613,19 @@ fn replace_role(
     kind: RoleKind,
     target: &str,
     replacement: &[u8],
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<()> {
     audited(root, |budget| {
-        replace_role_in(root, epoch, kind, target, replacement, faults, budget)
+        replace_role_in(
+            root,
+            epoch,
+            kind,
+            target,
+            replacement,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+            budget,
+        )
     })
 }
 
@@ -614,7 +635,7 @@ fn replace_role_in(
     kind: RoleKind,
     target: &str,
     replacement: &[u8],
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
     budget: &mut AllocationBudget,
 ) -> io::Result<()> {
     recover_roles_in(root, epoch)?;
@@ -647,6 +668,7 @@ fn replace_role_in(
         old: old.as_deref(),
         old_binding,
         replacement,
+        #[cfg(any(test, feature = "test-support"))]
         faults,
     };
     root.replace_private_regular_exact_in_role(
@@ -993,7 +1015,7 @@ fn verify_retained(
     root: &RootedDir,
     manifest: &Manifest,
     pending: Option<&Pending>,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<()> {
     validate_manifest(manifest)?;
     let device = root.identity()?.device;
@@ -1002,7 +1024,14 @@ fn verify_retained(
             return Err(unavailable());
         }
         let allow_tail = pending.is_some_and(|p| p.delta.appended.name == segment.name);
-        committed_records_with_hook(root, segment, &manifest.journal_id, allow_tail, faults)?;
+        committed_records_with_hook(
+            root,
+            segment,
+            &manifest.journal_id,
+            allow_tail,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
     }
     Ok(())
 }
@@ -1045,7 +1074,7 @@ struct Retirement {
 fn recover_retirement(
     root: &RootedDir,
     manifest: &Manifest,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<()> {
     root.resume_pending_owned_regular_cleanup("retirement.json")?;
     if !root.entry_exists("retirement.json")? {
@@ -1074,10 +1103,12 @@ fn recover_retirement(
             &retirement.segment,
             &manifest.journal_id,
             false,
+            #[cfg(any(test, feature = "test-support"))]
             faults,
         )?;
         remove_bound(root, &retirement.segment.name, retirement.segment.binding)?;
     }
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::Retired)?;
     let binding = root.private_entry_identity("retirement.json")?.into();
     remove_bound(root, "retirement.json", binding)
@@ -1087,7 +1118,7 @@ fn finish_pending(
     root: &RootedDir,
     manifest: &Manifest,
     pending: &Pending,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
     budget: &mut AllocationBudget,
 ) -> io::Result<()> {
     if let Some(segment) = &pending.delta.retired {
@@ -1109,6 +1140,7 @@ fn finish_pending(
                 RoleKind::Retirement,
                 "retirement.json",
                 &bytes,
+                #[cfg(any(test, feature = "test-support"))]
                 faults,
                 budget,
             )?;
@@ -1116,27 +1148,46 @@ fn finish_pending(
     }
     let binding = root.private_entry_identity("pending.json")?.into();
     remove_bound(root, "pending.json", binding)?;
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::PendingRemoved)?;
-    recover_retirement(root, manifest, faults)
+    recover_retirement(
+        root,
+        manifest,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+    )
 }
 
 pub(super) fn publish_append(
     root: &RootedDir,
     pending: &Pending,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
     audited(root, |budget| {
-        publish_append_in(root, pending, faults, budget)
+        publish_append_in(
+            root,
+            pending,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+            budget,
+        )
     })
 }
 
 fn publish_append_in(
     root: &RootedDir,
     pending: &Pending,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
     budget: &mut AllocationBudget,
 ) -> io::Result<Manifest> {
-    let manifest = recover_append_in(root, faults, Some(pending), None, budget)?;
+    let manifest = recover_append_in(
+        root,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+        Some(pending),
+        None,
+        budget,
+    )?;
     let bytes = pending_bytes(pending)?;
     if digest(&bounded_json(&manifest, METADATA_BYTES)?) == pending.next_digest {
         predecessor(&manifest, pending, &bytes)?;
@@ -1154,23 +1205,40 @@ fn publish_append_in(
         RoleKind::Pending,
         "pending.json",
         &encoded,
+        #[cfg(any(test, feature = "test-support"))]
         faults,
         budget,
     )?;
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::PendingDurable)?;
     // This pending was created by this uninterrupted EX operation. Validate
     // its target, while cold recovery still decodes every retained segment.
-    recover_append_in(root, faults, None, Some(pending), budget)
+    recover_append_in(
+        root,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+        None,
+        Some(pending),
+        budget,
+    )
 }
 
-pub(super) fn recover_append(root: &RootedDir, faults: &dyn FaultHooks) -> io::Result<Manifest> {
-    recover_append_with_proposal(root, faults, None)
+pub(super) fn recover_append(
+    root: &RootedDir,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
+) -> io::Result<Manifest> {
+    recover_append_with_proposal(
+        root,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+        None,
+    )
 }
 
 /// A healthy SH read never mutates the journal. Ambiguous roles require EX recovery.
 pub(super) fn clean_manifest(
     root: &RootedDir,
-    _faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] _faults: &dyn FaultHooks,
 ) -> io::Result<Option<Manifest>> {
     audit(root)?.admit(0, 0)?;
     for role in RoleKind::ALL {
@@ -1209,11 +1277,18 @@ pub(super) fn rotation_required(manifest: &Manifest, bytes: usize) -> io::Result
 
 fn recover_append_with_proposal(
     root: &RootedDir,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
     proposal: Option<&Pending>,
 ) -> io::Result<Manifest> {
     audited(root, |budget| {
-        recover_append_in(root, faults, proposal, None, budget)
+        recover_append_in(
+            root,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+            proposal,
+            None,
+            budget,
+        )
     })
 }
 
@@ -1233,7 +1308,7 @@ fn recovery_work(root: &RootedDir, proposal: Option<&Pending>) -> io::Result<boo
 
 fn recover_append_in(
     root: &RootedDir,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
     proposal: Option<&Pending>,
     owned_pending: Option<&Pending>,
     budget: &mut AllocationBudget,
@@ -1265,9 +1340,20 @@ fn recover_append_in(
             proposed_rotation.is_none(),
         )?;
         if full || verify_retained_bindings(root, &manifest)? {
-            verify_retained(root, &manifest, None, faults)?;
+            verify_retained(
+                root,
+                &manifest,
+                None,
+                #[cfg(any(test, feature = "test-support"))]
+                faults,
+            )?;
         }
-        recover_retirement(root, &manifest, faults)?;
+        recover_retirement(
+            root,
+            &manifest,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
         verify_residue(root, &manifest, proposed_rotation)?;
         return Ok(manifest);
     }
@@ -1283,7 +1369,13 @@ fn recover_append_in(
         predecessor(&manifest, &pending, &bytes)?;
         reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
         if full {
-            verify_retained(root, &manifest, None, faults)?;
+            verify_retained(
+                root,
+                &manifest,
+                None,
+                #[cfg(any(test, feature = "test-support"))]
+                faults,
+            )?;
         } else {
             if verify_retained_bindings(root, &manifest)? {
                 return Err(unavailable());
@@ -1293,11 +1385,19 @@ fn recover_append_in(
                 &pending.delta.appended,
                 &manifest.journal_id,
                 false,
+                #[cfg(any(test, feature = "test-support"))]
                 faults,
             )?;
         }
         verify_residue(root, &manifest, Some(&pending))?;
-        finish_pending(root, &manifest, &pending, faults, budget)?;
+        finish_pending(
+            root,
+            &manifest,
+            &pending,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+            budget,
+        )?;
         verify_residue(root, &manifest, None)?;
         return Ok(manifest);
     }
@@ -1310,7 +1410,13 @@ fn recover_append_in(
     verify_residue(root, &manifest, Some(&pending))?;
     reconcile_segment_creation(root, &manifest, Some(&pending), true)?;
     if full {
-        verify_retained(root, &manifest, Some(&pending), faults)?;
+        verify_retained(
+            root,
+            &manifest,
+            Some(&pending),
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
     } else if verify_retained_bindings(root, &manifest)?
         && manifest
             .segments
@@ -1323,6 +1429,7 @@ fn recover_append_in(
     if Binding::from(root.private_entry_identity(&target.name)?) != target.binding {
         return Err(unavailable());
     }
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::SegmentRead(target.first))?;
     let existing = root.read_private_regular(&target.name, SEGMENT_BYTES as u64)?;
     let offset = target
@@ -1346,11 +1453,13 @@ fn recover_append_in(
     if !suffix.is_empty() {
         let split = suffix.len().div_ceil(2);
         file.write_all(&suffix[..split])?;
+        #[cfg(any(test, feature = "test-support"))]
         faults.at(FaultPoint::PartialAppend)?;
         file.write_all(&suffix[split..])?;
     }
     file.sync_all()?;
     root.validate_private_regular_binding(&target.name, &file, target.binding.into())?;
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::SegmentSynced)?;
     // The committed prefix in this manifest is the only visibility boundary.
     replace_role_in(
@@ -1359,19 +1468,41 @@ fn recover_append_in(
         RoleKind::Manifest,
         "manifest.json",
         &bounded_json(&next, METADATA_BYTES)?,
+        #[cfg(any(test, feature = "test-support"))]
         faults,
         budget,
     )?;
+    #[cfg(any(test, feature = "test-support"))]
     faults.at(FaultPoint::ManifestCommitted)?;
     if full {
-        verify_retained(root, &next, None, faults)?;
+        verify_retained(
+            root,
+            &next,
+            None,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
     } else {
         if verify_retained_bindings(root, &next)? {
             return Err(unavailable());
         }
-        committed_records_with_hook(root, target, &next.journal_id, false, faults)?;
+        committed_records_with_hook(
+            root,
+            target,
+            &next.journal_id,
+            false,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
     }
-    finish_pending(root, &next, &pending, faults, budget)?;
+    finish_pending(
+        root,
+        &next,
+        &pending,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+        budget,
+    )?;
     verify_residue(root, &next, None)?;
     Ok(next)
 }
@@ -1515,7 +1646,7 @@ pub(super) fn initialize_storage(
     root: &RootedDir,
     deadline: Duration,
     clock: &dyn FsClock,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<Manifest> {
     // Inspect every evidence-less stage before audit or any mutation, so unsafe
     // modes/types report the fixed role and cannot cause partial stage cleanup.
@@ -1573,16 +1704,27 @@ pub(super) fn initialize_storage(
             RoleKind::Initialization,
             "initialization.json",
             &bounded_json(&initialization, METADATA_BYTES)?,
+            #[cfg(any(test, feature = "test-support"))]
             faults,
         )?;
     }
     let initialization = load_initialization(root)?;
     if root.entry_exists("manifest.json")? {
-        let manifest = recover_append(root, faults)?;
+        let manifest = recover_append(
+            root,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
         if manifest.journal_id != initialization.journal_id {
             return Err(unavailable());
         }
-        verify_retained(root, &manifest, None, faults)?;
+        verify_retained(
+            root,
+            &manifest,
+            None,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )?;
         return Ok(manifest);
     }
     if root.entry_exists("pending.json")? || root.entry_exists("retirement.json")? {
@@ -1603,7 +1745,13 @@ pub(super) fn initialize_storage(
     {
         return Err(unavailable());
     }
-    let segment = create_empty_segment(root, &manifest.journal_id, 1, faults)?;
+    let segment = create_empty_segment(
+        root,
+        &manifest.journal_id,
+        1,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+    )?;
     manifest.segments.push(segment);
     validate_manifest(&manifest)?;
     replace_role(
@@ -1612,10 +1760,17 @@ pub(super) fn initialize_storage(
         RoleKind::Manifest,
         "manifest.json",
         &bounded_json(&manifest, METADATA_BYTES)?,
+        #[cfg(any(test, feature = "test-support"))]
         faults,
     )?;
     reconcile_segment_creation(root, &manifest, None, true)?;
-    verify_retained(root, &manifest, None, faults)?;
+    verify_retained(
+        root,
+        &manifest,
+        None,
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+    )?;
     verify_residue(root, &manifest, None)?;
     Ok(manifest)
 }
@@ -1638,7 +1793,7 @@ pub(super) fn create_empty_segment(
     root: &RootedDir,
     epoch: &str,
     first: u64,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<Segment> {
     if first == 0 || root.entry_exists(&RoleKind::Segment.evidence())? {
         return Err(unavailable());
@@ -1647,7 +1802,15 @@ pub(super) fn create_empty_segment(
     if root.entry_exists(&name)? {
         return Err(unavailable());
     }
-    replace_role(root, epoch, RoleKind::Segment, &name, b"", faults)?;
+    replace_role(
+        root,
+        epoch,
+        RoleKind::Segment,
+        &name,
+        b"",
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
+    )?;
     Ok(Segment {
         name: name.clone(),
         first,
@@ -1763,7 +1926,7 @@ pub(super) fn read_after(
     manifest: &Manifest,
     after: u64,
     limit: usize,
-    faults: &dyn FaultHooks,
+    #[cfg(any(test, feature = "test-support"))] faults: &dyn FaultHooks,
 ) -> io::Result<Vec<super::super::contracts::WireEvent>> {
     validate_manifest(manifest)?;
     let limit = limit.clamp(1, 256);
@@ -1772,9 +1935,14 @@ pub(super) fn read_after(
         if segment.last.is_none_or(|last| last <= after) {
             continue;
         }
-        for event in
-            committed_records_with_hook(root, segment, &manifest.journal_id, false, faults)?
-        {
+        for event in committed_records_with_hook(
+            root,
+            segment,
+            &manifest.journal_id,
+            false,
+            #[cfg(any(test, feature = "test-support"))]
+            faults,
+        )? {
             if event.seq.as_u64() > after {
                 delivered.push(event);
                 if delivered.len() == limit {

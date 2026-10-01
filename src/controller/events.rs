@@ -3,15 +3,16 @@
 //! Saved task state remains authoritative. This module advertises no feature
 //! and opens no state or journal. Component facades are filled by later tracks.
 
-pub mod client;
-pub mod contracts;
+pub(crate) mod client;
+pub(crate) mod contracts;
 pub(crate) mod foreground;
-pub mod journal;
-pub mod notify;
-pub mod rpc;
-pub mod tail;
-pub mod testing;
-pub use contracts::*;
+pub(crate) mod journal;
+pub(crate) mod notify;
+pub(crate) mod rpc;
+pub(crate) mod tail;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod testing;
+pub(crate) use contracts::*;
 
 #[cfg(test)]
 mod tests {

@@ -9,15 +9,15 @@ use std::{
     time::Duration,
 };
 
-use super::{NotifyCache, NotifyOptions, commit_then_deliver, plan_notifications};
+use super::{NotifyCache, commit_then_deliver, plan_notifications};
 use crate::{
     controller::events::{
         CONTROLLER_EVENTS_UNAVAILABLE, CONTROLLER_EVENTS_UNSUPPORTED, EventReadResult,
         EventReconciler, EventRuntime, EventSource, EventSupport, JOURNAL_CHECK_INTERVAL,
-        NOTIFY_PENDING_CAPACITY, Notice, NoticeChannel, NotifyState, PendingCandidate,
-        READ_DEFAULT_LIMIT, READ_FOLLOW_WAIT_MS, RECONNECT_BACKOFF, REPAIR_INTERVAL, RPC_BUDGET,
-        ReadQuery, ReconcileInput, RepairProgress, TaskAddressQuery, TaskFactsBatch,
-        TaskRepairPage, TaskRepairQuery,
+        NOTIFY_PENDING_CAPACITY, Notice, NoticeChannel, NotifyOptions, NotifyState,
+        PendingCandidate, READ_DEFAULT_LIMIT, READ_FOLLOW_WAIT_MS, RECONNECT_BACKOFF,
+        REPAIR_INTERVAL, RPC_BUDGET, ReadQuery, ReconcileInput, RepairProgress, TaskAddressQuery,
+        TaskFactsBatch, TaskRepairPage, TaskRepairQuery,
     },
     error::WorkerError,
 };
@@ -40,6 +40,7 @@ pub struct NotifyLoop<'a> {
 }
 
 impl NotifyLoop<'_> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn run(self, diagnostics: &mut dyn Write) -> Result<NotifyExit, WorkerError> {
         if self.runtime.cancelled() {
             return Ok(NotifyExit::Cancelled);

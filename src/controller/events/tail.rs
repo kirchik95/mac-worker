@@ -8,15 +8,15 @@ use super::{
 use crate::error::WorkerError;
 use std::{io::Write, sync::Arc, time::Duration};
 
-pub struct TailLoop<'a> {
-    pub source: &'a dyn EventSource,
-    pub runtime: Arc<dyn EventRuntime>,
-    pub json: bool,
-    pub stop_at: Option<Duration>,
+pub(crate) struct TailLoop<'a> {
+    pub(crate) source: &'a dyn EventSource,
+    pub(crate) runtime: Arc<dyn EventRuntime>,
+    pub(crate) json: bool,
+    pub(crate) stop_at: Option<Duration>,
 }
 
 impl TailLoop<'_> {
-    pub fn run(self, output: &mut dyn Write) -> Result<(), WorkerError> {
+    pub(crate) fn run(self, output: &mut dyn Write) -> Result<(), WorkerError> {
         if stopped(self.runtime.as_ref(), self.stop_at) {
             return Ok(());
         }

@@ -1,5 +1,5 @@
 //! Private, bounded controller journal and a try-only process-local publisher.
-pub use super::contracts::{
+use super::contracts::{
     EventBatch, EventCursor, EventReadResult, EventRuntime, EventSink, JournalProvider,
     JournalReader, JournalWindow, JournalWriter, PublishAttempt, ReadBatch, ReadQuery,
     SnapshotRequired,
@@ -12,11 +12,10 @@ use super::contracts::{
     CONTROLLER_EVENTS_CANCELLED, JOURNAL_CHECK_INTERVAL, MAX_BATCH_BYTES, MAX_EVENT_BYTES,
     RPC_BUDGET, SCHEMA_VERSION, Seq, unavailable,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::rooted_fs::PrivateRolePoint;
 use crate::{
-    controller::ControllerLeader,
-    error::WorkerError,
-    paths::PathLayout,
-    rooted_fs::{PrivateRolePoint, RootedDir},
+    controller::ControllerLeader, error::WorkerError, paths::PathLayout, rooted_fs::RootedDir,
 };
 use std::{io, sync::Arc, time::Duration};
 
@@ -25,6 +24,7 @@ pub struct JournalOptions {
 }
 
 /// Fixed roles admitted under the journal EX lock.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalRole {
     Initialization,
@@ -34,6 +34,7 @@ pub enum JournalRole {
     Retirement,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalRoleBoundary {
     /// Empty stage and directory are durable; creation evidence is not written yet.
@@ -50,6 +51,7 @@ pub enum JournalRoleBoundary {
 }
 
 /// Deterministic gates for the journal fault matrix; callbacks run on journal I/O only.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalFaultPoint {
     Role(JournalRole, JournalRoleBoundary),
@@ -65,24 +67,29 @@ pub enum JournalFaultPoint {
     SegmentRead { first_seq: u64 },
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub trait JournalFaultHook: Send + Sync {
     fn at(&self, point: JournalFaultPoint) -> io::Result<()>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<F: Fn(JournalFaultPoint) -> io::Result<()> + Send + Sync> JournalFaultHook for F {
     fn at(&self, point: JournalFaultPoint) -> io::Result<()> {
         self(point)
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct Hooks(Option<Arc<dyn JournalFaultHook>>);
+#[cfg(any(test, feature = "test-support"))]
 impl Hooks {
     fn at(&self, point: JournalFaultPoint) -> io::Result<()> {
         self.0.as_ref().map_or(Ok(()), |hook| hook.at(point))
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl fs::FaultHooks for Hooks {
     fn at(&self, point: fs::FaultPoint) -> io::Result<()> {
         use JournalFaultPoint as J;
@@ -142,6 +149,7 @@ pub struct ControllerJournal {
     lock: fs::Binding,
     journal_id: uuid::Uuid,
     clock: RuntimeClock,
+    #[cfg(any(test, feature = "test-support"))]
     hooks: Hooks,
 }
 
@@ -209,9 +217,16 @@ impl ControllerJournal {
         leader: &ControllerLeader,
         options: JournalOptions,
     ) -> Result<Arc<Self>, WorkerError> {
-        Self::initialize(paths, leader, options, Hooks(None))
+        Self::initialize(
+            paths,
+            leader,
+            options,
+            #[cfg(any(test, feature = "test-support"))]
+            Hooks(None),
+        )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn initialize_for_leader_with_hook(
         paths: &PathLayout,
@@ -226,7 +241,7 @@ impl ControllerJournal {
         paths: &PathLayout,
         leader: &ControllerLeader,
         options: JournalOptions,
-        hooks: Hooks,
+        #[cfg(any(test, feature = "test-support"))] hooks: Hooks,
     ) -> Result<Arc<Self>, WorkerError> {
         // Each flock has its own admission cap; successful filesystem work can
         // consume the longer cooperative operation budget between acquisitions.
@@ -243,10 +258,22 @@ impl ControllerJournal {
         let binding = root.identity().map_err(io_unavailable)?.into();
         let clock = RuntimeClock(options.runtime);
         fs::retry_same_binding(&root, binding, deadline, &clock, || {
-            fs::initialize_storage(&root, deadline, &clock, &hooks)
+            fs::initialize_storage(
+                &root,
+                deadline,
+                &clock,
+                #[cfg(any(test, feature = "test-support"))]
+                &hooks,
+            )
         })
         .map_err(|error| runtime_io(&clock, error))?;
-        Self::attach(root, clock, hooks, deadline)
+        Self::attach(
+            root,
+            clock,
+            #[cfg(any(test, feature = "test-support"))]
+            hooks,
+            deadline,
+        )
     }
 
     pub fn open_existing(
@@ -254,9 +281,16 @@ impl ControllerJournal {
         options: JournalOptions,
     ) -> Result<Option<Arc<Self>>, WorkerError> {
         let deadline = options.runtime.now().saturating_add(RPC_BUDGET);
-        Self::open_until(paths, options, deadline, Hooks(None))
+        Self::open_until(
+            paths,
+            options,
+            deadline,
+            #[cfg(any(test, feature = "test-support"))]
+            Hooks(None),
+        )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn open_existing_with_hook(
         paths: &PathLayout,
@@ -271,7 +305,7 @@ impl ControllerJournal {
         paths: &PathLayout,
         options: JournalOptions,
         deadline: Duration,
-        hooks: Hooks,
+        #[cfg(any(test, feature = "test-support"))] hooks: Hooks,
     ) -> Result<Option<Arc<Self>>, WorkerError> {
         check(options.runtime.as_ref(), deadline)?;
         let Some(root) = journal_root(paths, false).map_err(io_unavailable)? else {
@@ -280,6 +314,7 @@ impl ControllerJournal {
         Ok(Some(Self::attach(
             root,
             RuntimeClock(options.runtime),
+            #[cfg(any(test, feature = "test-support"))]
             hooks,
             deadline,
         )?))
@@ -288,7 +323,7 @@ impl ControllerJournal {
     fn attach(
         root: RootedDir,
         clock: RuntimeClock,
-        hooks: Hooks,
+        #[cfg(any(test, feature = "test-support"))] hooks: Hooks,
         deadline: Duration,
     ) -> Result<Arc<Self>, WorkerError> {
         let binding = root.identity().map_err(io_unavailable)?.into();
@@ -309,6 +344,7 @@ impl ControllerJournal {
             lock,
             journal_id,
             clock,
+            #[cfg(any(test, feature = "test-support"))]
             hooks,
         });
         // Healthy attachment checks retained bindings and sizes. Ambiguous
@@ -345,15 +381,25 @@ impl ControllerJournal {
         fs::retry_reader_same_binding(&self.root, self.binding, deadline, &self.clock, || {
             let shared = fs::acquire_lock(&self.root, self.lock, true, deadline, &self.clock)?;
             self.validate_epoch()?;
+            #[cfg(any(test, feature = "test-support"))]
             self.hooks.at(JournalFaultPoint::ReadAttempt)?;
-            if let Some(manifest) = fs::clean_manifest(&self.root, &self.hooks)? {
+            if let Some(manifest) = fs::clean_manifest(
+                &self.root,
+                #[cfg(any(test, feature = "test-support"))]
+                &self.hooks,
+            )? {
                 return read(&manifest);
             }
             drop(shared);
+            #[cfg(any(test, feature = "test-support"))]
             self.hooks.at(JournalFaultPoint::RecoveryAttempt)?;
             let _exclusive = fs::acquire_lock(&self.root, self.lock, false, deadline, &self.clock)?;
             self.validate_epoch()?;
-            let manifest = fs::recover_append(&self.root, &self.hooks)?;
+            let manifest = fs::recover_append(
+                &self.root,
+                #[cfg(any(test, feature = "test-support"))]
+                &self.hooks,
+            )?;
             read(&manifest)
         })
     }
@@ -380,9 +426,18 @@ impl ControllerJournal {
                     fs::acquire_lock(&self.root, self.lock, false, deadline, &self.clock)?;
                 self.validate_epoch()?;
                 if let Some(pending) = &prepared {
-                    return fs::publish_append(&self.root, pending, &self.hooks);
+                    return fs::publish_append(
+                        &self.root,
+                        pending,
+                        #[cfg(any(test, feature = "test-support"))]
+                        &self.hooks,
+                    );
                 }
-                let manifest = fs::recover_append(&self.root, &self.hooks)?;
+                let manifest = fs::recover_append(
+                    &self.root,
+                    #[cfg(any(test, feature = "test-support"))]
+                    &self.hooks,
+                )?;
                 if batch.is_empty() {
                     return Ok(manifest);
                 }
@@ -411,16 +466,19 @@ impl ControllerJournal {
                             .head
                             .checked_add(1)
                             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?,
+                        #[cfg(any(test, feature = "test-support"))]
                         &self.hooks,
                     )?)
                 } else {
                     None
                 };
                 prepared = Some(fs::prepare_append(&manifest, &bytes, segment)?);
+                #[cfg(any(test, feature = "test-support"))]
                 self.hooks.at(JournalFaultPoint::AppendPrepared)?;
                 fs::publish_append(
                     &self.root,
                     prepared.as_ref().expect("prepared append"),
+                    #[cfg(any(test, feature = "test-support"))]
                     &self.hooks,
                 )
             })
@@ -466,6 +524,7 @@ impl JournalReader for ControllerJournal {
                     manifest,
                     cursor.seq.as_u64(),
                     query.limit,
+                    #[cfg(any(test, feature = "test-support"))]
                     &self.hooks,
                 )?;
                 let next_after = events.last().map_or_else(
@@ -535,6 +594,7 @@ impl JournalProvider for ExistingJournalProvider {
                 runtime: self.runtime.clone(),
             },
             deadline,
+            #[cfg(any(test, feature = "test-support"))]
             Hooks(None),
         )?
         .map(|journal| journal as Arc<dyn JournalReader>))
@@ -592,6 +652,7 @@ impl PublisherHandle {
     pub fn finish_with_grace(&self, grace: Duration) {
         self.worker.finish_with_grace(grace, &self.clock);
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stop_without_join(&self) {
         self.worker.stop_without_join();
     }

@@ -1,10 +1,4 @@
 //! Laptop event/reconciliation facade. Transport and reconciliation are T4.
-pub use super::contracts::{
-    AttentionSummary, BaselineKind, ChangeCause, DerivedTaskChange, EventReconciler, EventSource,
-    EventSupport, PreviousProjection, ReconcileInput, Reconciliation, RepairProgress,
-    TaskEligibilitySignature,
-};
-
 use super::contracts::*;
 use crate::{
     config::ControllerConfig,
@@ -20,7 +14,7 @@ use crate::{
 use serde::de::DeserializeOwned;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-pub use super::foreground::EventChannelRuntime;
+use super::foreground::EventChannelRuntime;
 
 const LEGACY_SELECTOR_REJECTION: &str = "task.list body contained unexpected key controller_events";
 
@@ -404,9 +398,11 @@ impl TaskReconciler {
         }
         reconciler
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn previous_projection(&self) -> &PreviousProjection {
         &self.previous
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cursor(&self) -> Option<EventCursor> {
         self.cursor
     }

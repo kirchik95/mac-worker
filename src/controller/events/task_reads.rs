@@ -19,7 +19,7 @@ use crate::{
     task::{LocalTaskRecord, TaskId, TaskOutcome, TaskState},
 };
 
-pub use crate::controller::events::{
+use crate::controller::events::{
     EventRuntime, MAX_DISPATCH_ASSOCIATIONS, MAX_OPAQUE_CURSOR_BYTES as MAX_CONTINUATION_BYTES,
     MAX_STALE_RETRIES as SAME_BINDING_ESTALE_RETRIES,
     MAX_STATE_RECORD_BYTES as MAX_TASK_RECORD_BYTES, REPAIR_MAX_DIRECTORY_ENTRIES,
@@ -71,6 +71,7 @@ pub struct TaskReadStats {
 
 pub struct TaskReadResult<T> {
     pub value: T,
+    #[cfg(any(test, feature = "test-support"))]
     pub stats: TaskReadStats,
 }
 
@@ -189,6 +190,7 @@ impl TaskEventReadStore {
         }
         let token = proof_after.map(decode_token::<ProofToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
+        #[cfg(any(test, feature = "test-support"))]
         let started = Instant::now();
         let binding = ProofBinding {
             state: self.repair_binding()?,
@@ -329,9 +331,13 @@ impl TaskEventReadStore {
         }
         self.verify_bindings()?;
         self.check_deadline(deadline)?;
-        stats.work_elapsed = started.elapsed();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            stats.work_elapsed = started.elapsed();
+        }
         Ok(TaskReadResult {
             value: result,
+            #[cfg(any(test, feature = "test-support"))]
             stats,
         })
     }
@@ -342,10 +348,11 @@ impl TaskEventReadStore {
         limit: usize,
         deadline: Duration,
     ) -> Result<TaskReadResult<TaskRepairPage>, WorkerError> {
-        let (value, stats) = self.repair_measured(after, limit, deadline);
+        let (value, _stats) = self.repair_measured(after, limit, deadline);
         Ok(TaskReadResult {
             value: value?,
-            stats,
+            #[cfg(any(test, feature = "test-support"))]
+            stats: _stats,
         })
     }
 

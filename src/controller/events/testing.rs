@@ -414,7 +414,8 @@ impl ScriptedEventSource {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn queue_discovery(
+    #[cfg(test)]
+    pub(crate) fn queue_discovery(
         &self,
         result: Result<EventSupport, WorkerError>,
     ) -> Result<(), WorkerError> {
@@ -426,7 +427,8 @@ impl ScriptedEventSource {
     ) -> Result<(), WorkerError> {
         self.reads.push(result)
     }
-    pub fn queue_tasks(
+    #[cfg(test)]
+    pub(crate) fn queue_tasks(
         &self,
         result: Result<TaskFactsBatch, WorkerError>,
     ) -> Result<(), WorkerError> {
@@ -441,7 +443,8 @@ impl ScriptedEventSource {
     pub fn requests(&self) -> Vec<CapturedEventRequest> {
         self.requests.lock().unwrap().clone()
     }
-    pub fn discovery_deadlines(&self) -> Vec<Duration> {
+    #[cfg(test)]
+    pub(crate) fn discovery_deadlines(&self) -> Vec<Duration> {
         self.discovery_deadlines.lock().unwrap().clone()
     }
 }
@@ -477,29 +480,29 @@ impl EventSource for ScriptedEventSource {
     }
 }
 /// Standalone scripted JournalReader including batches and reset controls.
-pub struct FakeJournalReader {
-    pub window: JournalWindow,
+#[cfg(test)]
+struct FakeJournalReader {
+    window: JournalWindow,
     reads: Script<EventReadResult>,
     requests: Mutex<Vec<(ReadQuery, Duration)>>,
 }
+#[cfg(test)]
 impl FakeJournalReader {
-    pub fn new(window: JournalWindow) -> Self {
+    fn new(window: JournalWindow) -> Self {
         Self {
             window,
             reads: Script::default(),
             requests: Mutex::new(Vec::new()),
         }
     }
-    pub fn queue_read(
-        &self,
-        result: Result<EventReadResult, WorkerError>,
-    ) -> Result<(), WorkerError> {
+    fn queue_read(&self, result: Result<EventReadResult, WorkerError>) -> Result<(), WorkerError> {
         self.reads.push(result)
     }
-    pub fn requests(&self) -> Vec<(ReadQuery, Duration)> {
+    fn requests(&self) -> Vec<(ReadQuery, Duration)> {
         self.requests.lock().unwrap().clone()
     }
 }
+#[cfg(test)]
 impl JournalReader for FakeJournalReader {
     fn window(&self, _deadline: Duration) -> Result<JournalWindow, WorkerError> {
         self.window.validate()?;
@@ -593,7 +596,8 @@ impl MemoryTaskReader {
         state.generation += 1;
         Ok(())
     }
-    pub fn set_baseline(&self, baseline: Option<EventCursor>) {
+    #[cfg(test)]
+    pub(crate) fn set_baseline(&self, baseline: Option<EventCursor>) {
         self.inner.lock().unwrap().baseline = baseline;
     }
     pub fn set_directory_entries(&self, count: usize) {
@@ -806,7 +810,8 @@ impl FakeTaskProjectionProvider {
             opens: Arc::new(AtomicUsize::new(0)),
         }
     }
-    pub fn error(message: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn error(message: impl Into<String>) -> Self {
         Self {
             reader: None,
             error: Some(message.into()),
@@ -876,7 +881,8 @@ struct ViewerSubscribers {
     stopped: bool,
 }
 impl MemoryViewerEventSource {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::default()
     }
     /// Try-only fanout; a full subscriber is disconnected, never skips records.
@@ -1309,6 +1315,7 @@ mod tests {
             reader.read(ReadQuery::default(), deadline()).unwrap(),
             snapshot()
         );
+        assert_eq!(reader.requests(), vec![(ReadQuery::default(), deadline())]);
         let absent = FakeJournalProvider::absent();
         assert!(absent.open_existing(deadline()).unwrap().is_none());
         assert_eq!(absent.open_count(), 1);

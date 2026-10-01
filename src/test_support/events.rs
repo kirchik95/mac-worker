@@ -1,6 +1,6 @@
 //! Explicit integration-test access for events contracts.
 
-pub use crate::controller::events::{
+pub use crate::controller::events::contracts::{
     ADDRESSED_MAX_TASKS, AcceptedHint, AttentionSummary, BaselineKind, CONTROLLER_EVENTS_CANCELLED,
     CONTROLLER_EVENTS_INVALID, CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE,
     CONTROLLER_EVENTS_UNAVAILABLE, CONTROLLER_EVENTS_UNSUPPORTED, ChangeCause, DerivedTaskChange,
@@ -41,29 +41,46 @@ pub mod contracts {
 pub mod journal {
     pub use crate::controller::events::journal::{
         BoundedPublisher, ControllerJournal, ExistingJournalProvider, JournalFaultHook,
-        JournalFaultPoint, JournalOptions, JournalRole, JournalRoleBoundary, PublisherHandle,
+        JournalFaultPoint, JournalOptions, JournalRole, JournalRoleBoundary, PublisherDiagnostic,
+        PublisherHandle,
     };
 }
 pub mod notify {
-    pub use crate::controller::events::notify::{
-        ChannelOptions, HerdrChannel, MacosChannel, NotifyCache, NotifyOptions, NotifyPlan,
-        NotifyState, OSASCRIPT_HANDLER, SelectedChannel, UnconfirmedTask, channels_for,
-        commit_then_deliver, eligibility_unknown_diagnostic, herdr_socket_reachable, herdr_sound,
-        laptop_notification_socket, notices_for_support, plan_notifications, select_channels,
+    pub use crate::controller::events::contracts::{NotifyOptions, NotifyPlan, NotifyState};
+    pub use crate::controller::events::notify::cache::{
+        NotifyCache, commit_then_deliver, plan_notifications,
+    };
+    pub use crate::controller::events::notify::channels::{
+        ChannelOptions, HerdrChannel, MacosChannel, OSASCRIPT_HANDLER, SelectedChannel,
+        UnconfirmedTask, channels_for, eligibility_unknown_diagnostic, herdr_socket_reachable,
+        herdr_sound, laptop_notification_socket, notices_for_support, select_channels,
     };
     pub mod follow {
-        pub use crate::controller::events::notify::follow::NotifyLoop;
+        pub use crate::controller::events::notify::follow::{NotifyExit, NotifyLoop};
     }
 }
 pub mod rpc {
-    pub use crate::controller::events::rpc::{
-        ExistingTaskProjectionProvider, TaskEventReadStore, is_event_selector, serve_selector_with,
-        task_reads,
+    pub use crate::controller::events::rpc::task_reads::{
+        ExistingTaskProjectionProvider, TaskEventReadStore,
     };
+    pub use crate::controller::events::rpc::{is_event_selector, serve_selector_with};
+    pub mod task_reads {
+        pub use crate::controller::events::contracts::{
+            EventRuntime, MAX_DISPATCH_ASSOCIATIONS,
+            MAX_OPAQUE_CURSOR_BYTES as MAX_CONTINUATION_BYTES,
+            MAX_STALE_RETRIES as SAME_BINDING_ESTALE_RETRIES,
+            MAX_STATE_RECORD_BYTES as MAX_TASK_RECORD_BYTES, REPAIR_MAX_DIRECTORY_ENTRIES,
+            REPAIR_MAX_INPUT_BYTES, REPAIR_MAX_LIMIT as REPAIR_MAX_ROWS, REPAIR_WORK_BUDGET,
+        };
+        pub use crate::controller::events::rpc::task_reads::{
+            ExistingTaskProjectionProvider, TaskEventReadStore, TaskReadResult, TaskReadStats,
+            record_facts, sorted_task_ids,
+        };
+    }
 }
 pub mod testing {
     pub use crate::controller::events::testing::{
-        FakeEventReconciler, FakeJournalProvider, FakeLocalProjectionRefresh,
+        CapturedEventRequest, FakeEventReconciler, FakeJournalProvider, FakeLocalProjectionRefresh,
         FakeTaskProjectionProvider, ManualEventRuntime, MemoryJournal, MemoryTaskReader,
         MemoryViewerEventSource, RecordingNoticeChannel, RecordingSink, ScriptedEventSource,
     };

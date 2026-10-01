@@ -1,13 +1,11 @@
 //! Safe selector facade. Serving RPC and state-only readers are implemented by T4.
-pub use super::contracts::{
-    EventReadResult, EventSelector, JournalProvider, OpaqueCursor, ReadQuery, TaskAddressQuery,
-    TaskFacts, TaskFactsBatch, TaskProjectionProvider, TaskProjectionReader, TaskRepairPage,
-    TaskRepairQuery, ensure_frame_bound,
+use super::contracts::{
+    EventSelector, JournalProvider, TaskProjectionProvider, ensure_frame_bound,
 };
 
 #[path = "task_reads.rs"]
-pub mod task_reads;
-pub use task_reads::{ExistingTaskProjectionProvider, TaskEventReadStore};
+pub(crate) mod task_reads;
+pub(crate) use task_reads::ExistingTaskProjectionProvider;
 
 use crate::{
     controller::{ControllerRequest, encode_json_frame, read::ControllerReadReply},

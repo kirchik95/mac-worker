@@ -6,12 +6,15 @@ use std::{ffi::OsString, fs, os::unix::fs::FileTypeExt, path::Path, sync::Arc, t
 use crate::{
     config::NotificationsConfig,
     controller::events::contracts::{
-        EventSupport, NOTICE_CHANNEL_BUDGET, Notice, NoticeChannel, NoticeSound, NotifyChannel,
-        NotifyOptions, SafeOutcome,
+        NOTICE_CHANNEL_BUDGET, Notice, NoticeChannel, NoticeSound, NotifyChannel, NotifyOptions,
     },
     error::WorkerError,
     herdr::{HerdrClient, HerdrSocket, NotificationSound},
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+};
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    controller::events::contracts::{EventSupport, SafeOutcome},
     task::TaskId,
 };
 
@@ -92,6 +95,7 @@ impl HerdrChannel {
         Self { socket, options }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn socket(&self) -> &HerdrSocket {
         &self.socket
     }
@@ -187,7 +191,7 @@ pub fn herdr_socket_reachable(socket: &HerdrSocket) -> bool {
 /// Auto selection uses this probe. A leftover socket pathname is not reachable
 /// unless `probe` connects. Callers keep save-before-display and do not retry
 /// a delivery that may already have been shown.
-pub fn herdr_socket_reachable_with(socket: &HerdrSocket, probe: impl Fn(&Path) -> bool) -> bool {
+fn herdr_socket_reachable_with(socket: &HerdrSocket, probe: impl Fn(&Path) -> bool) -> bool {
     let is_socket = fs::symlink_metadata(socket.path())
         .map(|metadata| metadata.file_type().is_socket())
         .unwrap_or(false);
@@ -205,11 +209,13 @@ where
     HerdrSocket::from_env_or_home(lookup, home)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub struct UnconfirmedTask {
     pub task_id: TaskId,
     pub outcome: Option<SafeOutcome>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn outcome_token(outcome: SafeOutcome) -> &'static str {
     match outcome {
         SafeOutcome::Done => "done",
@@ -223,6 +229,7 @@ fn outcome_token(outcome: SafeOutcome) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn eligibility_unknown_diagnostic(rows: &[UnconfirmedTask]) -> String {
     let mut text = String::from("eligibility unknown");
     for row in rows {
@@ -236,6 +243,7 @@ pub fn eligibility_unknown_diagnostic(rows: &[UnconfirmedTask]) -> String {
     text
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn notices_for_support(support: EventSupport) -> Vec<Notice> {
     match support {
         EventSupport::Supported | EventSupport::Unsupported => Vec::new(),

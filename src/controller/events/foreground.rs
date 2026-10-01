@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Channel setup and reads share the foreground event clock and cancellation.
-pub struct EventChannelRuntime(pub Arc<dyn EventRuntime>);
+pub(crate) struct EventChannelRuntime(pub(crate) Arc<dyn EventRuntime>);
 impl crate::controller::channel::ChannelRuntime for EventChannelRuntime {
     fn now(&self) -> Duration {
         self.0.now()
