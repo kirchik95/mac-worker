@@ -64,18 +64,7 @@ impl ForwardControl for MasterForwardControl {
             policy(deadline.saturating_sub(ctx.runtime.now())),
         )
         .map_err(process_failure)?;
-        let result = raw
-            .run_interruptible(&request, &|| {
-                check_client(ctx).is_err() || ctx.runtime.now() >= deadline
-            })
-            .map_err(process_failure)?;
-        check_client(ctx)?;
-        if ctx.runtime.now() >= deadline {
-            return Err(unavailable(ChannelReason::Timeout));
-        }
-        if !result.status.success() {
-            return Err(unavailable(ChannelReason::ForwardLost));
-        }
+        let result = run_control(raw, request, ctx, deadline)?;
         let endpoint = resolved_control_path(&result.stdout)?;
         if endpoint.parent() != Some(directory.as_path()) {
             return Err(unavailable(ChannelReason::UnsafePath));
@@ -200,7 +189,7 @@ impl ForwardControl for MasterForwardControl {
         let validation = socket
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|binding| validate_socket_identity(binding))
+            .and_then(validate_socket_identity)
             .and_then(|()| endpoint.verify())
             .and_then(|()| check_client(ctx));
         if let Err(failure) = validation {
@@ -291,14 +280,14 @@ impl ForwardLease for MasterForwardLease {
         Ok(())
     }
     fn cancel(&mut self, raw: &dyn ProcessRunner, ctx: &CleanupContext) -> ForwardDisposition {
-        if let Some(disposition) = &self.disposition {
-            return disposition.clone();
+        if let Some(disposition) = self.disposition {
+            return disposition;
         }
         // The scoped client closes its stream first. No destructor guesses at
         // cleanup or alters the shared SSH master.
-        let disposition = if cleanup_remaining(ctx).is_zero() {
-            ForwardDisposition::Retained
-        } else if self.files.validate_socket(&self.path).ok().as_ref() != Some(&self.socket) {
+        let disposition = if cleanup_remaining(ctx).is_zero()
+            || self.files.validate_socket(&self.path).ok().as_ref() != Some(&self.socket)
+        {
             ForwardDisposition::Retained
         } else {
             cancel_owned(raw, &self.endpoint, &self.cancel, ctx);
@@ -309,7 +298,7 @@ impl ForwardLease for MasterForwardLease {
                     .cleanup_if_refused(&self.path, Some(self.socket.clone()), ctx)
             }
         };
-        self.disposition = Some(disposition.clone());
+        self.disposition = Some(disposition);
         disposition
     }
 }

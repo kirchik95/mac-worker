@@ -619,6 +619,7 @@ fn real_openssh_mux_controls_ignore_config_forwards_and_edits() {
     let ctx = context(&clock);
     let master = control.resolve(&raw, &route, &ctx).unwrap();
     let bootstrap_args = strings(&master.bootstrap_request);
+    assert!(has_pair(&bootstrap_args, "-o", "ClearAllForwardings=yes"));
     assert!(has_pair(
         &bootstrap_args,
         "-F",
@@ -679,6 +680,22 @@ fn real_openssh_mux_controls_ignore_config_forwards_and_edits() {
         assert!(!args.contains(&"-N".into()));
         assert!(!args.contains(&"exit".into()));
         assert!(!args.contains(&"ClearAllForwardings=yes".into()));
+        for option in [
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "ExitOnForwardFailure=yes",
+            "ControlMaster=no",
+            "StreamLocalBindMask=0177",
+            "StreamLocalBindUnlink=no",
+            "ServerAliveInterval=10",
+            "ServerAliveCountMax=3",
+        ] {
+            assert!(has_pair(&args, "-o", option), "{args:?}");
+        }
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-L").count(),
+            usize::from(!has_pair(&args, "-O", "check"))
+        );
     }
 }
 
@@ -945,8 +962,8 @@ fn interrupted_open_bind_before_listen_never_uses_refusal_cleanup() {
     let clock = Clock::default();
     let master = control.resolve(&raw, &route, &context(&clock)).unwrap();
     let result = control.open(&raw, &master, &identity(), &context(&clock));
-    // Release the test producer even if an assertion fails, so a regression
-    // cannot leave a barrier thread hanging.
+    // The producer remains held until refusal and exact residue preservation
+    // have been checked; the barrier has a 30-second hang guard.
     let allocation = files.allocated.lock().unwrap().first().cloned();
     let error = match result {
         Ok(_) => panic!("unacknowledged open admitted"),
@@ -978,4 +995,257 @@ fn interrupted_open_bind_before_listen_never_uses_refusal_cleanup() {
     assert_eq!(entry(&allocation.directory), parent);
     assert_eq!(entry(&allocation.socket_path), socket);
     assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        raw.base
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| has_pair(&strings(request), "-O", "cancel"))
+            .count(),
+        1
+    );
+}
+
+struct GateRunner {
+    base: ControlRunner,
+    stage: &'static str,
+    reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    expire: Option<Arc<Clock>>,
+}
+impl ProcessRunner for GateRunner {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.base.run(request)
+    }
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        let args = strings(request);
+        let selected = if self.stage == "resolution" {
+            args.contains(&"-G".into())
+        } else {
+            has_pair(&args, "-O", self.stage)
+        };
+        if !selected {
+            return self.base.run_interruptible(request, stop);
+        }
+        self.base.calls.lock().unwrap().push(request.clone());
+        if let Some(clock) = &self.expire {
+            clock.0.store(5000, Ordering::SeqCst);
+        }
+        if let Some(reached) = self.reached.lock().unwrap().take() {
+            reached.send(()).unwrap();
+        }
+        let hang_guard = std::time::Instant::now();
+        while !stop() {
+            assert!(
+                hang_guard.elapsed() < Duration::from_secs(30),
+                "predicate not polled while operation is live"
+            );
+            thread::yield_now();
+        }
+        Err(mac_worker::error::ProcessError::Cancelled.into())
+    }
+}
+
+#[test]
+fn borrowed_predicate_interrupts_resolution_check_and_open() {
+    if isolated("borrowed_predicate_interrupts_resolution_check_and_open") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    for (index, stage) in ["resolution", "check", "forward"].into_iter().enumerate() {
+        let mut paths = paths.clone();
+        paths.cache = paths.cache.join(format!("gate{index}"));
+        let files = Arc::new(Files::default());
+        let control = MasterForwardControl::new(paths, files.clone(), ssh.clone());
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let raw = GateRunner {
+            base: ControlRunner::new(master.with_file_name(format!("g{index}")), Mode::Success),
+            stage,
+            reached: Mutex::new(Some(reached_tx)),
+            expire: None,
+        };
+        let signal = thread::spawn(move || {
+            reached_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            cancel_tx.send(()).unwrap();
+        });
+        // Rc/Cell + Receiver prove this predicate need not be Send or Sync.
+        let stopped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let should_stop = || {
+            if cancel_rx.try_recv().is_ok() {
+                stopped.set(true);
+            }
+            stopped.get()
+        };
+        let clock = Clock::default();
+        let ctx = ClientContext {
+            runtime: &clock,
+            deadline: Duration::from_secs(30),
+            should_stop: &should_stop,
+        };
+        if stage == "resolution" {
+            assert!(matches!(
+                control.resolve(&raw, &route, &ctx),
+                Err(ChannelFailure::Unavailable(ChannelReason::Cancelled))
+            ));
+            assert_eq!(files.allocations.load(Ordering::SeqCst), 0);
+        } else {
+            let master = control.resolve(&raw, &route, &context(&clock)).unwrap();
+            let error = match control.open(&raw, &master, &identity(), &ctx) {
+                Ok(_) => panic!("cancelled open admitted"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error.failure,
+                ChannelFailure::Unavailable(ChannelReason::Cancelled)
+            ));
+            if stage == "forward" {
+                assert_eq!(error.disposition, ForwardDisposition::Retained);
+                assert_eq!(files.allocations.load(Ordering::SeqCst), 1);
+                assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(error.disposition, ForwardDisposition::Cleaned);
+                assert_eq!(files.allocations.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert!(stopped.get());
+        assert!(!clock.cancelled());
+        signal.join().unwrap();
+    }
+}
+
+#[test]
+fn resolution_guard_expiry_is_timeout_without_foreground_cancellation() {
+    if isolated("resolution_guard_expiry_is_timeout_without_foreground_cancellation") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    let files = Arc::new(Files::default());
+    let control = MasterForwardControl::new(paths, files.clone(), ssh);
+    let clock = Arc::new(Clock::default());
+    let raw = GateRunner {
+        base: ControlRunner::new(master, Mode::Success),
+        stage: "resolution",
+        reached: Mutex::default(),
+        expire: Some(clock.clone()),
+    };
+    let ctx = ClientContext {
+        runtime: clock.as_ref(),
+        deadline: Duration::from_secs(2),
+        should_stop: &|| false,
+    };
+    assert!(matches!(
+        control.resolve(&raw, &route, &ctx),
+        Err(ChannelFailure::Unavailable(ChannelReason::Timeout))
+    ));
+    let calls = raw.base.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].policy.deadline, Duration::from_secs(2));
+    assert!(!clock.cancelled());
+    assert_eq!(files.allocations.load(Ordering::SeqCst), 0);
+}
+
+struct AlreadyCancelledClock;
+impl ChannelRuntime for AlreadyCancelledClock {
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn cancelled(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn cleanup_ignores_foreground_cancel_but_retains_on_clock_expiry() {
+    if isolated("cleanup_ignores_foreground_cancel_but_retains_on_clock_expiry") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    for expired in [false, true] {
+        let mut paths = paths.clone();
+        paths.cache = paths.cache.join(format!("cleanup{expired}"));
+        let files = Arc::new(Files::default());
+        let control = MasterForwardControl::new(paths, files.clone(), ssh.clone());
+        let raw = ControlRunner::new(
+            master.with_file_name(format!("cleanup{expired}")),
+            Mode::Success,
+        );
+        let clock = Clock::default();
+        let ctx = context(&clock);
+        let master = control.resolve(&raw, &route, &ctx).unwrap();
+        let mut lease = control.open(&raw, &master, &identity(), &ctx).unwrap();
+        let local = lease.local_socket().to_path_buf();
+        let cleanup = CleanupContext {
+            runtime: Arc::new(AlreadyCancelledClock),
+            deadline: if expired {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(5)
+            },
+        };
+        let disposition = lease.cancel(&raw, &cleanup);
+        assert_eq!(
+            disposition,
+            if expired {
+                ForwardDisposition::Retained
+            } else {
+                ForwardDisposition::Cleaned
+            }
+        );
+        assert_eq!(local.exists(), expired);
+        assert_eq!(files.cleanups.load(Ordering::SeqCst), usize::from(!expired));
+        assert!(lease.verify().is_err());
+    }
+}
+
+#[test]
+fn swapped_socket_or_parent_is_preserved_without_cancel() {
+    if isolated("swapped_socket_or_parent_is_preserved_without_cancel") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    for swap_parent in [false, true] {
+        let mut paths = paths.clone();
+        paths.cache = paths.cache.join(format!("swap{swap_parent}"));
+        let files = Arc::new(Files::default());
+        let control = MasterForwardControl::new(paths, files.clone(), ssh.clone());
+        let raw = ControlRunner::new(
+            master.with_file_name(format!("swap{swap_parent}")),
+            Mode::Success,
+        );
+        let clock = Arc::new(Clock::default());
+        let ctx = context(&clock);
+        let master = control.resolve(&raw, &route, &ctx).unwrap();
+        let mut lease = control.open(&raw, &master, &identity(), &ctx).unwrap();
+        let local = lease.local_socket().to_path_buf();
+        if swap_parent {
+            let parent = local.parent().unwrap();
+            fs::rename(parent, parent.with_extension("held")).unwrap();
+            fs::create_dir(parent).unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            fs::rename(&local, local.with_extension("held")).unwrap();
+        }
+        let _replacement = std::os::unix::net::UnixListener::bind(&local).unwrap();
+        fs::set_permissions(&local, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = entry(&local);
+        assert!(lease.verify().is_err());
+        let cleanup = CleanupContext {
+            runtime: clock,
+            deadline: Duration::from_secs(5),
+        };
+        assert_eq!(lease.cancel(&raw, &cleanup), ForwardDisposition::Retained);
+        assert_eq!(entry(&local), replacement);
+        assert!(std::os::unix::net::UnixStream::connect(&local).is_ok());
+        assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+        assert!(!raw.calls.lock().unwrap().iter().any(|request| has_pair(
+            &strings(request),
+            "-O",
+            "cancel"
+        )));
+    }
 }
