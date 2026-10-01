@@ -61,6 +61,7 @@ struct Data {
     pin: Mutex<Option<SocketIdentity>>,
     cleanup_deadlines: Mutex<Vec<Duration>>,
     return_cancel: Mutex<Option<(&'static str, Arc<AtomicBool>)>>,
+    residue: AtomicBool,
 }
 #[derive(Clone)]
 struct Fixture(Arc<Data>);
@@ -101,6 +102,7 @@ impl Fixture {
             pin: Mutex::new(None),
             cleanup_deadlines: Mutex::new(Vec::new()),
             return_cancel: Mutex::new(None),
+            residue: AtomicBool::new(false),
         }))
     }
     fn runner(&self, scope: ReadLoopScope) -> ChannelProcessRunner<Arc<dyn ProcessRunner>> {
@@ -309,14 +311,30 @@ impl ForwardControl for Fixture {
             self.0.identity.lock().unwrap().route_sha256
         );
         if let Err(failure) = self.stage("open", ctx) {
+            let disposition = self
+                .0
+                .forward_failure
+                .lock()
+                .unwrap()
+                .take()
+                .map_or(ForwardDisposition::Cleaned, |failure| failure.disposition);
+            self.0.residue.store(
+                disposition == ForwardDisposition::Retained,
+                Ordering::SeqCst,
+            );
             return Err(ForwardOpenFailure {
                 failure,
-                disposition: ForwardDisposition::Cleaned,
+                disposition,
             });
         }
         if let Some(failure) = self.0.forward_failure.lock().unwrap().take() {
+            self.0.residue.store(
+                failure.disposition == ForwardDisposition::Retained,
+                Ordering::SeqCst,
+            );
             return Err(failure);
         }
+        self.0.residue.store(true, Ordering::SeqCst);
         Ok(Box::new(self.clone()))
     }
 }
@@ -340,7 +358,11 @@ impl ForwardLease for Fixture {
         if let Some(elapsed) = self.0.advances.lock().unwrap().get("cancel") {
             self.0.runtime.advance(*elapsed);
         }
-        *self.0.disposition.lock().unwrap()
+        let disposition = *self.0.disposition.lock().unwrap();
+        if disposition == ForwardDisposition::Cleaned {
+            self.0.residue.store(false, Ordering::SeqCst);
+        }
+        disposition
     }
 }
 impl SocketConnector for Fixture {
@@ -1250,4 +1272,254 @@ fn application_guard_caps_an_extended_process_policy() {
     );
     assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
     assert_eq!(fixture.count("close"), 1);
+}
+
+#[test]
+fn reconnect_eligibility_uses_one_two_four_then_five_seconds() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    let mut sequence = 0;
+    for (index, delay) in [1, 2, 4, 5, 5].into_iter().enumerate() {
+        fixture.fail(
+            "read",
+            ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+        );
+        sequence += 1;
+        assert_eq!(runner.run(&wait(sequence)).unwrap().stdout, b"raw");
+        assert_eq!(fixture.count("open"), index + 1);
+        let count = fixture.0.frames.lock().unwrap().len();
+        fixture
+            .0
+            .runtime
+            .advance(Duration::from_secs(delay) - Duration::from_millis(1));
+        sequence += 1;
+        assert_eq!(
+            runner.run(&wait(sequence)).unwrap().stdout,
+            b"raw",
+            "delay {delay}"
+        );
+        assert_eq!(fixture.count("open"), index + 1);
+        assert_eq!(fixture.0.frames.lock().unwrap().len(), count);
+        fixture.0.runtime.advance(Duration::from_millis(1));
+    }
+    assert!(socket_result(&runner.run(&wait(sequence + 1)).unwrap()));
+    assert_eq!(fixture.count("open"), 6);
+}
+
+#[test]
+fn reconnect_backoff_resets_only_after_a_verified_application_reply() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+    fixture.0.runtime.advance(Duration::from_secs(1));
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+    // The successful raw fallback did not reset the second channel backoff.
+    fixture.0.runtime.advance(Duration::from_secs(1));
+    assert_eq!(runner.run(&wait(3)).unwrap().stdout, b"raw");
+    assert_eq!(fixture.count("open"), 2);
+    fixture.0.runtime.advance(Duration::from_secs(1));
+    assert!(socket_result(&runner.run(&wait(4)).unwrap()));
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    assert_eq!(runner.run(&wait(5)).unwrap().stdout, b"raw");
+    fixture.0.runtime.advance(Duration::from_millis(999));
+    assert_eq!(runner.run(&wait(6)).unwrap().stdout, b"raw");
+    fixture.0.runtime.advance(Duration::from_millis(1));
+    assert!(socket_result(&runner.run(&wait(7)).unwrap()));
+    assert_eq!(fixture.count("open"), 4);
+}
+
+#[test]
+fn recoverable_setup_and_application_failures_can_reconnect() {
+    for (stage, reason) in [
+        ("resolve", ChannelReason::ServiceUnavailable),
+        ("identity", ChannelReason::ServiceUnavailable),
+        ("open", ChannelReason::Busy),
+        ("connect", ChannelReason::ForwardLost),
+        ("read", ChannelReason::InvalidFrame),
+        ("read", ChannelReason::Timeout),
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        fixture.fail(stage, ChannelFailure::Unavailable(reason));
+        assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+        let resolutions = fixture.count("resolve");
+        fixture.0.runtime.advance(Duration::from_millis(999));
+        assert_eq!(
+            runner.run(&wait(2)).unwrap().stdout,
+            b"raw",
+            "{stage}/{reason:?}"
+        );
+        assert_eq!(fixture.count("resolve"), resolutions);
+        fixture.0.runtime.advance(Duration::from_millis(1));
+        assert!(
+            socket_result(&runner.run(&wait(3)).unwrap()),
+            "{stage}/{reason:?}"
+        );
+    }
+}
+
+#[test]
+fn one_caller_owns_setup_while_a_concurrent_caller_uses_raw() {
+    let fixture = Fixture::new();
+    let runner = Arc::new(fixture.runner(ReadLoopScope::Wait));
+    let (entered, release) = fixture.gate("resolve");
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| runner.run(&wait(1)));
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("setup owner entry");
+        assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+        assert_eq!(fixture.count("resolve"), 1);
+        assert_eq!(fixture.count("open"), 0);
+        release.send(()).unwrap();
+        assert!(socket_result(&opening.join().unwrap().unwrap()));
+    });
+    assert_eq!(fixture.count("open"), 1);
+}
+
+#[test]
+fn unsupported_unsafe_and_mismatched_routes_retire_until_command_exit() {
+    for (stage, reason) in [
+        ("resolve", ChannelReason::Unsupported),
+        ("resolve", ChannelReason::UnsafePath),
+        ("pin", ChannelReason::PinMismatch),
+        ("pin", ChannelReason::UnsafePath),
+        ("connect", ChannelReason::PinMismatch),
+        ("verify", ChannelReason::UnsafePath),
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        fixture.fail(stage, ChannelFailure::Unavailable(reason));
+        assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+        let resolutions = fixture.count("resolve");
+        let opens = fixture.count("open");
+        for sequence in 2..50 {
+            fixture.0.runtime.advance(Duration::from_secs(60));
+            assert_eq!(
+                runner.run(&wait(sequence)).unwrap().stdout,
+                b"raw",
+                "{stage}/{reason:?}"
+            );
+        }
+        assert_eq!(fixture.count("resolve"), resolutions);
+        assert_eq!(fixture.count("open"), opens);
+        assert!(fixture.0.frames.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn retained_cancel_from_exit_zero_error_keeps_one_owned_residue() {
+    // T5 interprets the control exit/error/refusal evidence. T6 consumes only
+    // its published Retained disposition; exit zero is never client proof.
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    *fixture.0.disposition.lock().unwrap() = ForwardDisposition::Retained;
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+    assert_eq!(runner.close(), ForwardDisposition::Retained);
+    for sequence in 2..100 {
+        fixture.0.runtime.advance(Duration::from_secs(60));
+        assert_eq!(runner.run(&wait(sequence)).unwrap().stdout, b"raw");
+    }
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert!(fixture.0.residue.load(Ordering::SeqCst));
+    *fixture.0.disposition.lock().unwrap() = ForwardDisposition::Cleaned;
+    assert_eq!(runner.close(), ForwardDisposition::Retained);
+}
+
+#[test]
+fn retained_open_failure_never_attempts_another_allocation() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    *fixture.0.forward_failure.lock().unwrap() = Some(ForwardOpenFailure {
+        failure: ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+        disposition: ForwardDisposition::Retained,
+    });
+    assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+    for sequence in 2..100 {
+        fixture.0.runtime.advance(Duration::from_secs(60));
+        assert_eq!(runner.run(&wait(sequence)).unwrap().stdout, b"raw");
+    }
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("connect"), 0);
+    assert_eq!(fixture.count("cancel"), 0);
+    assert!(fixture.0.frames.lock().unwrap().is_empty());
+    assert!(fixture.0.residue.load(Ordering::SeqCst));
+    assert_eq!(runner.close(), ForwardDisposition::Retained);
+}
+
+#[test]
+fn interrupted_unacknowledged_open_retains_and_permanently_retires() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    *fixture.0.forward_failure.lock().unwrap() = Some(ForwardOpenFailure {
+        failure: ChannelFailure::Unavailable(ChannelReason::Cancelled),
+        disposition: ForwardDisposition::Retained,
+    });
+    let (entered, release) = fixture.gate("open");
+    let stopped = Arc::new(AtomicBool::new(false));
+    let local = std::rc::Rc::new(());
+    let should_stop = || {
+        let _ = &local;
+        stopped.load(Ordering::SeqCst)
+    };
+    std::thread::scope(|scope| {
+        let signal = stopped.clone();
+        scope.spawn(move || {
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("unacknowledged open entry");
+            signal.store(true, Ordering::SeqCst);
+            release.send(()).unwrap();
+        });
+        assert!(matches!(
+            runner.run_interruptible(&wait(1), &should_stop),
+            Err(WorkerError::Process(ProcessError::Cancelled))
+        ));
+    });
+    assert!(!fixture.0.runtime.cancelled());
+    *fixture.0.gate.lock().unwrap() = None;
+    for sequence in 2..100 {
+        fixture.0.runtime.advance(Duration::from_secs(60));
+        assert_eq!(runner.run(&wait(sequence)).unwrap().stdout, b"raw");
+    }
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("connect"), 0);
+    assert_eq!(fixture.count("cancel"), 0);
+    assert!(fixture.0.frames.lock().unwrap().is_empty());
+    assert!(fixture.0.residue.load(Ordering::SeqCst));
+    assert_eq!(runner.close(), ForwardDisposition::Retained);
+}
+
+#[test]
+fn close_and_drop_are_idempotent_and_do_not_reopen_the_command() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    assert_eq!(runner.close(), ForwardDisposition::Cleaned);
+    assert_eq!(runner.close(), ForwardDisposition::Cleaned);
+    fixture.0.runtime.advance(Duration::from_secs(60));
+    assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+    drop(runner);
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    assert!(!fixture.0.residue.load(Ordering::SeqCst));
 }

@@ -1,5 +1,5 @@
 //! Foreground-owned policy for the frozen controller read-loop scopes.
-use std::{ffi::OsStr, sync::Mutex};
+use std::{ffi::OsStr, sync::Mutex, time::Duration};
 
 pub use super::contracts::{
     CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ClientContext, ClientDeps,
@@ -23,6 +23,8 @@ struct State {
     disposition: ForwardDisposition,
     retired: bool,
     last_read_id: Option<String>,
+    failures: u8,
+    eligible_at: Duration,
 }
 /// Construct only inside one of the explicitly scoped foreground read loops.
 pub struct ChannelProcessRunner<R: ProcessRunner> {
@@ -52,6 +54,8 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 disposition: ForwardDisposition::Cleaned,
                 retired: false,
                 last_read_id: None,
+                failures: 0,
+                eligible_at: Duration::ZERO,
             }),
         }
     }
@@ -62,6 +66,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.retired = true;
         self.close_session(&mut state);
         state.disposition
     }
@@ -70,7 +75,39 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
         if let Some(mut session) = state.session.take() {
             session.socket.close();
             state.disposition = self.cancel_forward(&mut *session.forward);
+            if state.disposition == ForwardDisposition::Retained {
+                state.retired = true;
+            }
         }
+    }
+
+    fn record_failure(&self, state: &mut State, failure: &ChannelFailure) {
+        if state.disposition == ForwardDisposition::Retained
+            || matches!(
+                failure,
+                ChannelFailure::UnverifiedReply
+                    | ChannelFailure::Unavailable(
+                        ChannelReason::Unsupported
+                            | ChannelReason::PinMismatch
+                            | ChannelReason::UnsafePath
+                    )
+            )
+        {
+            state.retired = true;
+            return;
+        }
+        state.failures = state.failures.saturating_add(1);
+        let seconds = match state.failures {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => 5,
+        };
+        state.eligible_at = self
+            .deps
+            .runtime
+            .now()
+            .saturating_add(Duration::from_secs(seconds));
     }
 
     fn cancel_forward(&self, forward: &mut dyn ForwardLease) -> ForwardDisposition {
@@ -123,9 +160,8 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             .deps
             .connector
             .connect(forward.local_socket(), &identity, ctx)
-            .map_err(|failure| {
+            .inspect_err(|_| {
                 state.disposition = self.cancel_forward(&mut *forward);
-                failure
             })?;
         state.session = Some(Session { socket, forward });
         ctx.check()
@@ -170,7 +206,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
         }
         state.last_read_id = Some(parsed.request_id().to_owned());
         if state.session.is_none() {
-            if ctx.remaining() <= SETUP_GUARD {
+            if ctx.runtime.now() < state.eligible_at || ctx.remaining() <= SETUP_GUARD {
                 drop(state);
                 return self.raw_read(request, &ctx);
             }
@@ -183,6 +219,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             };
             if let Err(failure) = self.setup(&mut state, &setup_ctx) {
                 self.close_session(&mut state);
+                self.record_failure(&mut state, &failure);
                 drop(state);
                 if matches!(
                     failure,
@@ -199,8 +236,9 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             .expect("successful setup supplies a session")
             .forward
             .verify();
-        if let Err(_failure) = verified {
+        if let Err(failure) = verified {
             self.close_session(&mut state);
+            self.record_failure(&mut state, &failure);
             drop(state);
             return self.raw_read(request, &ctx);
         }
@@ -224,12 +262,14 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                     self.close_session(&mut state);
                     return Err(error);
                 }
+                state.failures = 0;
+                state.eligible_at = ctx.runtime.now();
                 Ok(result)
             }
             Err(failure) => {
                 self.close_session(&mut state);
+                self.record_failure(&mut state, &failure);
                 if matches!(failure, ChannelFailure::UnverifiedReply) {
-                    state.retired = true;
                     return Err(unavailable(failure));
                 }
                 drop(state);
@@ -341,7 +381,7 @@ fn matches_route(request: &ProcessRequest, route: &ConfiguredRoute) -> bool {
     if options.len() < 8 || !options.len().is_multiple_of(2) {
         return false;
     }
-    for (index, pair) in options.chunks_exact(2).enumerate() {
+    for (index, pair) in options.as_chunks::<2>().0.iter().enumerate() {
         if pair[0] != "-o" {
             return false;
         }
