@@ -16,7 +16,7 @@ This retirement keeps protocol **7**, supervision **3**, and host layout **3**. 
 ## What remains readable
 
 - Valid legacy `Batch` queue rows stay on disk. Task claims ignore them as candidates, FIFO blockers, worker reservations, and run-cap occupancy. The task runner does not reap them.
-- Legacy job records and dashboard projections remain readable. The read-only `/api/v1/jobs/{id}` and `/logs` routes, `active_jobs` / `recent_jobs`, and queue adapters remain available; they do not resume retired work.
+- Legacy job records stay on disk, but the dashboard no longer serves them: the `/api/v1/jobs/{id}` and `/api/v1/jobs/{id}/logs` routes and the `active_jobs` / `recent_jobs` snapshot fields were removed with the retirement. A valid legacy `Batch` queue row still appears in the dashboard queue with its kind; nothing resumes it.
 - Existing host leases with `Job` scope still count as busy in inventory, probe, and GC. Ignoring a local queue row does not free a remote lease.
 - Existing decoders remain strict. Unknown fields or kinds, corrupt records, mismatched identities or receipts, foreign ownership, unsafe permissions, symlinks, and replaced inode identities still fail closed.
 
