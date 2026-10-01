@@ -1,6 +1,6 @@
 # Controller events validation record
 
-Written 2026-10-01. Help and clap checks were taken on `faf29641f86f` before the T8c rebase. The tree was then rebased onto `integ/ev-wave` at `154f6e7e12a2` (`feat(controller): wire event producers and laptop consumers`). UI, parity, fmt, clippy, and targeted tests below are on that tree. A row that was not run is pending. Pending is not a pass.
+Written 2026-10-01. Help and clap checks were taken on `faf29641f86f` before the T8c rebase. T9's UI, parity, fmt, clippy, and targeted tests were run on `154f6e7e12a2`. The docs commit is `0802421`, already in `integ/ev-wave`. This record was finalized on wave head `b0c07d8`. A row that was not run is pending. Pending is not a pass. Gate counts supplied by the orchestrator are labeled as such.
 
 The live checklist is for an authorized integrator after deploy. Nothing in that table was run. No pool host, SSH session, LaunchAgent, credential, or Herdr command was used. `worker events` and `worker notify` were not started against a controller; only `--help` and clap usage errors, which exit before configuration is loaded.
 
@@ -8,8 +8,9 @@ The live checklist is for an authorized integrator after deploy. Nothing in that
 
 | Item | Value |
 | --- | --- |
-| Base commit | `154f6e7e12a2` on `integ/ev-wave` after `git rebase`. Help text was captured on the pre-rebase binary `faf29641f86f`. |
-| Docs commit | the commit that adds this file, subject `docs(controller): document event notifications and rebuild dashboard assets` |
+| Wave head | `b0c07d8` `fix(events): recover coalescing when a sweep finds its cursor expired` |
+| T9 measurement base | `154f6e7e12a2`. Help text was captured on the pre-rebase binary `faf29641f86f`. |
+| Docs commit | `0802421` `docs(controller): document event notifications and rebuild dashboard assets`, already in integ |
 | Binary measured for `--help` | Before the rebase: `target/debug/worker`, `worker 0.1.0+faf29641f86f-debug`. After the rebased test build, with these docs still uncommitted: `worker 0.1.0+154f6e7e12a2.dirty-debug`. Dev profile, not a release artifact. T8c phase 2 did not change the events or notify flags. |
 | rustc | 1.98.1 (48a229cea 2026-09-01) (Homebrew) |
 | Node on this machine | v24.13.0. Known deviation: CI is Node 22. Node 22 was not installed. |
@@ -42,11 +43,11 @@ The live checklist is for an authorized integrator after deploy. Nothing in that
 | dashboard nextest filter (`dashboard_events::`, `dashboard_tunnel_reconnect::`) | exit 0. 48 passed, 163 skipped, 10.047s |
 | cli nextest filter (`cli_help::`) | exit 0. 32 passed, 21 skipped, 10.537s |
 | library nextest filter (`events`) | exit 0. 122 passed (2 slow), 743 skipped, 80.401s |
-| `scripts/test-gate.sh` | pending — integrator. Not run by T9. |
+| `scripts/test-gate.sh` | not run by T9. The orchestrator's later gates are under Wave gates. |
 
 ## T4 repair results
 
-Source: `.briefs/ev-t4-report.md`, branch `feat/ev-t4-rpc`, verification date 2026-10-01. T4's final controller filter passed 107/107 and its kernel units passed 17/17. The post-rebase controller filter on this tree includes those tests. The four named integration tests passed there, except `real_names_cost_cap_and_independent_addressed_reads`, which the default 180s kill stopped and which then passed in 362.663s. The two cap units passed in the library filter (122). The table below stays T4's published observations. This machine's partial stdout (1,000 and 10,000 only) is not substituted for it.
+Source: `.briefs/ev-t4-report.md`, branch `feat/ev-t4-rpc`, verification date 2026-10-01. T4's final controller filter passed 107/107 and its kernel units passed 17/17. On `154f6e7` the combined names test was killed at 180s by the default nextest profile and then passed in 362.663s. `1fb565c` then split that fixture: the default test keeps the 1,000-entry sanity check and the addressed-read assertions, and the 10,000 / 100,000 / 100,001 measurement is the ignored `real_names_cost_cap_and_independent_addressed_reads_stress` in the nightly stress group. The first table stays T4's published observations from the 107-test run. The second table is the captured stress stdout from T4 follow-up 2. Neither table is a guarantee.
 
 | Behaviour | Test | T4 result |
 | --- | --- | --- |
@@ -69,6 +70,16 @@ Same fixture and numbers as `docs/usage.md`. Times are microseconds from T4's fi
 
 `list_names` allocates the whole directory before the cap rejects it. T4 makes no bounded whole-directory allocation or syscall-time claim.
 
+### Stress timings (T4 follow-up 2, observations)
+
+Captured once from the ignored stress test after `1fb565c` (`9fa548e` on the T4 branch, same subject). Default profile, `--run-ignored only`, 1 passed, test time 10.223 s, wall 10.45 s. The 100,001 row is still collection and the count only, so its names time is not a cheaper listing than the 100,000 row. Timings vary with machine load.
+
+| Entries | Name bytes | Names (µs) | Record and fact work (µs) | Records | Task input bytes | Queue reads | Associations |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 376,977 | 14,719 | 6,631 | 1 | 1,357 | 1 | 0 |
+| 100,000 | 3,769,977 | 147,856 | 874 | 1 | 1,357 | 1 | 0 |
+| 100,001 | 3,770,021 | 38,548 | 0 | 0 | 0 | 0 | 0 |
+
 ## T2 journal crash coverage
 
 Source: `.briefs/reports/ev-t2-report.md`. Ordinary injected-fault coverage, all recorded as passed by T2:
@@ -82,7 +93,7 @@ T2's last recorded controller filter was 76/76. The post-rebase controller filte
 
 ### Ignored 200× stress
 
-`tests/controller/controller_event_journal.rs` `public_journal_fault_matrix_stress` is `#[ignore]` ("200 deterministic role-matrix iterations; explicit stress gate only"). T2 defines 200 × 28 = 5,600 cases and did not execute them. Status: **not run**. It is a scheduled release gate, not a pass. On this tree the non-ignored sibling `public_append_fault_boundaries_and_repeated_crashes_never_duplicate_sequences` took 79.6s inside the controller filter. Two hundred iterations of that matrix would be far past 10 minutes, so T9 did not start the ignored test.
+`tests/controller/controller_event_journal.rs` `public_journal_fault_matrix_stress` is `#[ignore]` ("200 deterministic role-matrix iterations; explicit stress gate only"). T2 defines 200 × 28 = 5,600 cases and did not execute them. Status: **not run**. It is a scheduled release gate, not a pass. On `154f6e7` the non-ignored sibling `public_append_fault_boundaries_and_repeated_crashes_never_duplicate_sequences` took 79.6s inside the controller filter, so T9 did not start the ignored test. The final wave also left it unrun.
 
 ## Local gates still open
 
@@ -94,53 +105,79 @@ T2's last recorded controller filter was 76/76. The post-rebase controller filte
 | `cargo fmt --all --check` | passed, exit 0 |
 | clippy `-D warnings` | passed, exit 0 |
 | targeted nextest filters from the T9 brief | passed, with one default-profile timeout retried. Controller 247/248 then the names-cap test passed in 362.663s. Dashboard 48/48. CLI help 32/32. Library `events` 122/122 |
-| `scripts/test-gate.sh` | pending — integrator |
-| `git diff --stat integ/ev-wave...HEAD` scope check | empty until this commit, because `HEAD` is `154f6e7e12a2`. The working tree against that commit is only `docs/usage.md`, `ui/README.md`, `src/dashboard/static/app/assets/index.css`, `src/dashboard/static/app/assets/index.js`, and this new file |
+| `scripts/test-gate.sh` | recorded under Wave gates. T9 did not run it |
+| `git diff --stat integ/ev-wave...HEAD` at `0802421` | docs, `ui/README.md`, this file, and the two rebuilt asset files |
 | Source leases | none |
 
 ## Review passes
 
-Two review passes reported findings. The commits below are the ones named in `.briefs/ev-rev-a-pass2-report.md` and `.briefs/ev-rev-c-report.md`. T9 has not re-run those fixes. **Final status is pending** on every row until the orchestrator names the commit that closes it. A report verdict is not that final status.
-
-Operator docs already state the intended behaviour for the open consumer items: a first start summarizes current attention (C1), a cursor repair coalesces its fresh decisions (C2), the laptop keeps `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE` (C3), the notifier captures the journal head and the server only echoes `baseline_after` (N3), and banner titles are capped at 120 bytes (N4). Those sentences are the contract. They are not evidence that the client fixes have landed.
+SHAs below are the integ commits named for this wave. T9 did not re-run the fixes.
 
 ### Pass 1
 
-ev-rev-a (Claude Fable) reviewed T2 and T3 and returned F1–F7. ev-rev-b (Codex) reviewed T1, T5, T6, and T7 and returned H1, H2, and M1–M4. Pass 2 then checked those fixes.
+ev-rev-a (Claude Fable) reviewed T2 and T3 and returned F1–F7. ev-rev-b (Codex) reviewed T1, T5, T6, and T7 and returned H1, H2, and M1–M4.
 
-| Item | Report verdict | Commit named in the pass-2 reports | Final status |
-| --- | --- | --- | --- |
-| F1 full-content re-validation on every read | fixed completely | `b574483` fix(events): bound steady-state journal validation | pending |
-| F2 terminal hints delayed past notifier handoff | fixed completely | `85cfad3` fix(events): release terminal hints before runner handoff | pending |
-| F3 readers fail after the writer's 50 ms admission | fixed completely | `3496dec` fix(events): let readers wait within their admission deadline | pending |
-| F4 no runner-level terminal or publication-failure coverage | fixed completely | `3011aad` test(events): cover runner terminal and fetch failure hints | pending |
-| F5 write-only producer drop counter | not fixed in the pass-2 tree; left with T8a. No commit named | — | pending |
-| F6 evidence-less stage left the journal permanently unavailable | fixed (leader discards a provably empty stage; other residue stays) | `690abb1` fix(events): recover empty stages before creation evidence | pending |
-| F7 queue publication re-reads the queue file | fixed completely | `9007bcf` perf(events): reuse caller snapshots for queue hints | pending |
-| H1 browser bootstrap/reset loop | fixed completely | `e707af2` fix(ui): complete controller event bootstrap and reset recovery | pending |
-| H2 disconnect admits unbounded journal work | fixed completely | `68d6d2d` fix(dashboard): bound viewer journal work across disconnects | pending |
-| M1 oversized corrupt cache cannot rebaseline | fixed completely | `b0009c4` fix(events): rebaseline an oversized notifier cache without reading it | pending |
-| M2 stale Herdr socket selects the wrong auto channel | fixed completely | `110c55d` fix(events): probe a Herdr socket before auto selection | pending |
-| M3 same-epoch repair does not coalesce | partially fixed. Policy commit landed; ev-rev-c says the reconciler still drops the signal (see C2) | `d588a78` fix(events): coalesce notices across a same-epoch cursor repair | pending |
-| M4 invalid combined notifier regression | fixed completely | `33fba0e` test(events): validate chunked overflow membership in the notifier regression; `efd6083` test(events): avoid explicit loop counters in the overflow regression | pending |
+| Item | Commit | Final status |
+| --- | --- | --- |
+| F1 full-content re-validation on every read | `b574483` | landed |
+| F2 terminal hints delayed past notifier handoff | `85cfad3` | landed |
+| F3 readers fail after the writer's 50 ms admission | `3496dec` | landed |
+| F4 no runner-level terminal or publication-failure coverage | `3011aad` | landed |
+| F5 producer drop counter | `e52a2f7` | landed. `dropped_hint_count()` plus the `CONTROLLER_EVENT_HINTS_DROPPED` exit line |
+| F6 evidence-less stage left the journal permanently unavailable | `690abb1` | landed. Leader discards a provably empty stage; other residue stays |
+| F7 queue publication re-reads the queue file | `9007bcf` | landed |
+| H1 browser bootstrap/reset loop | `e707af2` | landed |
+| H2 disconnect admits unbounded journal work | `68d6d2d` | landed |
+| M1 oversized corrupt cache cannot rebaseline | `b0009c4` | landed |
+| M2 stale Herdr socket selects the wrong auto channel | `110c55d` | landed |
+| M3 same-epoch repair does not coalesce | `d588a78` | policy landed here. The remaining path is C2, then P3-M1 |
+| M4 invalid combined notifier regression | `33fba0e`, `efd6083` | landed |
 
 ### Pass 2
 
-ev-rev-a2 verified the pass-1 fixes, the T4 server side, and T8c routing, and returned **land** with Lows N1–N4. ev-rev-c verified H1, H2, M1, M2, and M4, found M3 only partially fixed, and returned C1–C3 on the T4 client. Neither pass-2 report contains a fix commit for N1–N4 or C1–C3.
+ev-rev-a2 (Fable) returned **land**. ev-rev-c (Codex) returned land after fixes.
 
-| Item | What the report says | Commit | Final status |
-| --- | --- | --- | --- |
-| N1 | every one-shot RPC event read validates full journal contents at attach | none named | pending |
-| N2 | `result_imported` differs between repair facts and the producer | none named | pending |
-| N3 | the server echoes the client's `baseline_after` and does not capture H | none required; documented in `docs/usage.md` | pending |
-| N4 | display titles are truncated to 120 bytes, not 512. The 120-byte cap stays | none required; documented in `docs/usage.md` | pending |
-| C1 | a cold start of current attention was consumed with no summary | none named. Intended: one-shot and first start show one summary of tasks waiting for attention | pending |
-| C2 | a same-epoch cursor repair emitted individual banners | none named. Intended: a cursor repair coalesces its fresh decisions into one summary. This is the rest of M3 | pending |
-| C3 | the RPC client rewrote `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE` as generic unavailable | none named. Intended: the laptop keeps the explicit code and the fixed message `repair unavailable, registry too large` | pending |
+| Item | Commit | Final status |
+| --- | --- | --- |
+| N1 healthy attach decodes 0 segment contents | `cfcf904` | landed |
+| N2 `result_imported` differs between repair facts and the producer | `266d913` | fixed completely (pass 3) |
+| N3 server echoes `baseline_after` and does not capture H | none | documented in `docs/usage.md` |
+| N4 display titles stay at 120 bytes | none | documented in `docs/usage.md` |
+| C1 cold start of current attention was consumed with no summary | `1c637b8` | fixed completely (pass 3) |
+| C2 same-epoch cursor repair emitted individual banners | `daa971a` | partial at pass 3. The remaining path is P3-M1 |
+| C3 RPC client rewrote `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE` as generic unavailable | `f3a2c3f` | fixed completely (pass 3) |
+
+### Pass 3
+
+ev-rev-c3 found C1, C3, and N2 fixed completely, and C2 partial. The remaining path, P3-M1, is a periodic sweep that finds its own validated cursor expired. It was fixed in `b0c07d8`, with two permanent T4-to-T7 regressions, one one-page and one paged. P3-M1 was not re-reviewed. Those regressions cover it.
+
+| Item | Commit | Final status |
+| --- | --- | --- |
+| P3-M1 periodic sweep finds its validated cursor expired | `b0c07d8` | landed, not re-reviewed. Covered by the one-page and paged regressions |
+
+## Test-robustness fixes from the full gate
+
+| Commit | What changed |
+| --- | --- |
+| `f9b98cf` | tunnel child-exit wait is a 30 s hang guard. This was a pre-existing flaky test |
+| `86a10c2` | wait-wiring deadlines are hang guards. This is a new T8c test that failed under gate load |
+| `1fb565c` | the real 10k/100k/100,001-entry names measurement is the ignored `real_names_cost_cap_and_independent_addressed_reads_stress`, in the nightly stress group. The default test keeps the 1k sanity check and the addressed-read assertions |
+
+## Wave gates
+
+These counts are the orchestrator's. This follow-up did not re-run them.
+
+| Gate | Result |
+| --- | --- |
+| Preliminary full gate at `154f6e7` | default profile, no RAM disk, loaded machine. 3,492 tests: 3,488 passed, 3 failed, 1 timed out, 1,184 s wall. Two of those four were new tests, later fixed by `86a10c2` and `1fb565c`. The other two were pre-existing load flakes in unchanged code: `project_readiness::tests::cancel_after_child_starts_reaps_descendants_without_a_receipt` (passed 30/30 in isolation) and `origin_outbox::identity_hit_restores_missing_due_for_a_running_watcher` (a test-side race between due-key deletion and the watcher poll) |
+| Final full gate at `1fb565c` | `CARGO_BUILD_JOBS=8 NEXTEST_TEST_THREADS=12 MAC_WORKER_GATE_RAMDISK_MB=0 scripts/test-gate.sh --profile ci`, exit 0. 3,500 tests run: 3,500 passed, 21 skipped, no flaky retries. 581.9 s nextest, 614 s wall |
+| After `b0c07d8` | P3-M1 touches `client.rs` and tests. Targeted controller + cli filter (`controller_event_`, `controller_features::`, `cli_help::`): 280/280. Library `events`: 122/122 |
+| fmt and clippy | clean on every track's final commit. The orchestrator re-checks at deploy time |
+| Ignored journal 200× fault-matrix stress | not run. Scheduled release gate |
 
 ## Live acceptance checklist
 
-Every item is `pending — live, after deploy`. The kit in `.briefs/acceptance-kit.md` is the integrator's script map. T9 did not run any kit script.
+Deploy, this live checklist, and push to main wait for the owner's explicit approval. Every item is `pending — live, after deploy`. The kit in `.briefs/acceptance-kit.md` is the integrator's script map. T9 did not run any kit script.
 
 | Plan item | Kit | Status |
 | --- | --- | --- |
