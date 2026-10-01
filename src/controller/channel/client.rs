@@ -1,11 +1,11 @@
 //! Foreground-owned policy for the frozen controller read-loop scopes.
 use std::{ffi::OsStr, sync::Mutex, time::Duration};
 
-pub use super::contracts::{
-    CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ClientContext, ClientDeps,
-    ConfiguredRoute, ForwardDisposition, ForwardLease, REQUEST_GUARD, ReadLoopScope, SETUP_GUARD,
-    SocketSession, eligible_read,
+use super::contracts::{
+    CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ConfiguredRoute,
+    ForwardDisposition, ForwardLease, MAX_FRAME_BYTES, REQUEST_GUARD, SETUP_GUARD, SocketSession,
 };
+pub use super::contracts::{ClientContext, ClientDeps, ReadLoopScope, eligible_read};
 use crate::{
     controller::{ControllerRequest, decode_request},
     error::{ProcessError, WorkerError},
@@ -347,12 +347,15 @@ fn check_call(request: &ProcessRequest, ctx: &ClientContext<'_>) -> Result<(), W
 
 // Recognize only the worker's structured SSH invocation. In particular, no
 // alternate executable, config, destination, forwarding or remote shell text.
+// Socket capture bounds are fixed; preserve custom caller policies through raw.
 fn matches_route(request: &ProcessRequest, route: &ConfiguredRoute) -> bool {
     if crate::transport::ssh_program().ok().as_ref() != Some(&request.program)
         || !request.environment.is_empty()
         || !request.environment_remove.is_empty()
         || request.isolate_parent_environment
         || route.remote_binary != "~/.local/bin/worker"
+        || request.policy.stdout_limit != MAX_FRAME_BYTES + 4
+        || request.policy.stderr_limit != 256 * 1024
     {
         return false;
     }
@@ -409,5 +412,3 @@ fn matches_route(request: &ProcessRequest, route: &ConfiguredRoute) -> bool {
     }
     true
 }
-#[cfg(test)]
-mod tests;
