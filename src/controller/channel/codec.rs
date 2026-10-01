@@ -8,6 +8,9 @@ use std::os::unix::process::ExitStatusExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod io;
+pub use io::FramedSocketConnector;
+
 use super::contracts::*;
 pub use super::contracts::{ChannelCodec, DecodeProgress, FrameDecoder, SocketConnector, SocketSession};
 use crate::{
@@ -405,7 +408,7 @@ mod tests {
             }
         })
     }
-    fn identity() -> SocketIdentity {
+    pub(super) fn identity() -> SocketIdentity {
         serde_json::from_value(identity_json()).unwrap()
     }
     fn hello() -> Value {
@@ -416,7 +419,7 @@ mod tests {
         let id = identity_json();
         json!({"kind": "ready", "route_sha256": id["route_sha256"], "service": id["service"]})
     }
-    fn bytes(value: &Value) -> Vec<u8> {
+    pub(super) fn bytes(value: &Value) -> Vec<u8> {
         serde_json::to_vec(value).unwrap()
     }
 
@@ -671,19 +674,19 @@ mod tests {
         }
     }
 
-    fn request() -> ControllerRequest {
+    pub(super) fn request() -> ControllerRequest {
         crate::controller::protocol::parse_request(&bytes(&json!({
             "protocol_version": 7, "request_id": "55555555555545558555555555555555",
             "command": "task.wait.poll", "body": {"task_id": "66666666666646668666666666666666"}
         })))
         .unwrap()
     }
-    fn read_payload(request: &ControllerRequest) -> Value {
+    pub(super) fn read_payload(request: &ControllerRequest) -> Value {
         json!({"protocol_version": 7, "request_id": request.request_id(),
             "command": request.command(), "payload_sha256": request.payload_sha256(),
             "result": {"message": "unchanged", "nested": [1, null, true]}})
     }
-    fn process(payload: &Value, code: i32) -> ProcessResult {
+    pub(super) fn process(payload: &Value, code: i32) -> ProcessResult {
         use std::os::unix::process::ExitStatusExt;
         ProcessResult {
             status: std::process::ExitStatus::from_raw(code << 8),
