@@ -1,5 +1,5 @@
 //! Foreground-owned policy for the frozen controller read-loop scopes.
-use std::{ffi::OsStr, sync::Mutex, time::Duration};
+use std::{collections::HashSet, ffi::OsStr, sync::Mutex, time::Duration};
 
 use super::contracts::{
     CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ConfiguredRoute,
@@ -18,11 +18,15 @@ struct Session {
     socket: Box<dyn SocketSession>,
     forward: Box<dyn ForwardLease>,
 }
+// Never evict a read ID back into channel eligibility. Exhaustion retires the
+// optional channel for this foreground command instead of growing evidence.
+const MAX_TRACKED_READ_IDS: usize = 4096;
+
 struct State {
     session: Option<Session>,
     disposition: ForwardDisposition,
     retired: bool,
-    last_read_id: Option<String>,
+    read_ids: HashSet<String>,
     failures: u8,
     eligible_at: Duration,
 }
@@ -53,7 +57,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 session: None,
                 disposition: ForwardDisposition::Cleaned,
                 retired: false,
-                last_read_id: None,
+                read_ids: HashSet::new(),
                 failures: 0,
                 eligible_at: Duration::ZERO,
             }),
@@ -198,13 +202,17 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             self.close_session(&mut state);
             return Err(error);
         }
-        // Existing retries of this same sequential read never re-enter the
-        // channel, even if reconnect eligibility advances between attempts.
-        if state.retired || state.last_read_id.as_deref() == Some(parsed.request_id()) {
+        if state.read_ids.len() >= MAX_TRACKED_READ_IDS {
+            state.retired = true;
+            self.close_session(&mut state);
+        }
+        // Keep every admitted ID even while its raw fallback runs outside the
+        // lock, so interleaved reads cannot restore its channel eligibility.
+        if state.retired || state.read_ids.contains(parsed.request_id()) {
             drop(state);
             return self.raw_read(request, &ctx);
         }
-        state.last_read_id = Some(parsed.request_id().to_owned());
+        state.read_ids.insert(parsed.request_id().to_owned());
         if state.session.is_none() {
             if ctx.runtime.now() < state.eligible_at || ctx.remaining() <= SETUP_GUARD {
                 drop(state);

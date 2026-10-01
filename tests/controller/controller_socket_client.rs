@@ -1088,6 +1088,101 @@ fn same_read_outer_retry_stays_raw_after_eligibility_advances() {
 }
 
 #[test]
+fn review_interleaved_fallback_keeps_same_read_retries_on_stdio() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    let read_a = wait(1);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    *fixture.0.raw_error.lock().unwrap() = Some(WorkerError::Io(std::io::Error::from(
+        std::io::ErrorKind::BrokenPipe,
+    )));
+    let (entered, release) = fixture.gate("raw");
+    std::thread::scope(|scope| {
+        let falling_back = scope.spawn(|| runner.run(&read_a));
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("A's failing raw fallback entry");
+        fixture.0.runtime.advance(Duration::from_secs(1));
+        let read_b_result = runner.run(&wait(2));
+        release.send(()).unwrap();
+        assert!(socket_result(&read_b_result.unwrap()));
+        assert!(
+            matches!(falling_back.join().unwrap(), Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    });
+    *fixture.0.gate.lock().unwrap() = None;
+
+    let retry = runner.run(&read_a).unwrap();
+    let frames = fixture.0.frames.lock().unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| Some(*frame) == read_a.stdin.as_ref())
+            .count(),
+        1,
+        "read A must attempt the socket only once despite interleaved B"
+    );
+    assert_eq!(frames.len(), 2, "only A and B may use the socket");
+    assert_eq!(retry.stdout, b"raw");
+    assert_eq!(fixture.count("open"), 2);
+    assert_eq!(
+        fixture.0.raw_calls.lock().unwrap().as_slice(),
+        [("interruptible", read_a.clone()), ("interruptible", read_a)]
+    );
+}
+
+#[test]
+fn attempted_read_tracking_exhaustion_permanently_retires_the_channel() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    let mut first_raw_id = None;
+    // A command remembers at most 4096 channel attempts. Observe retirement
+    // through the adapter rather than accessing its private tracking state.
+    for sequence in 1..=4097 {
+        let request = wait(sequence);
+        let result = runner.run(&request).unwrap();
+        if result.stdout == b"raw" {
+            first_raw_id = Some(sequence);
+            assert_eq!(fixture.0.raw_calls.lock().unwrap()[0].1, request);
+            break;
+        }
+        assert!(socket_result(&result));
+    }
+    let first_raw_id =
+        first_raw_id.expect("exhausted tracking must retire instead of evicting IDs");
+    let frame_count = fixture.0.frames.lock().unwrap().len();
+    assert_eq!(frame_count as u64, first_raw_id - 1);
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    assert!(!fixture.0.residue.load(Ordering::SeqCst));
+
+    for sequence in [
+        1,
+        first_raw_id - 1,
+        first_raw_id,
+        first_raw_id + 1,
+        first_raw_id + 100,
+    ] {
+        fixture.0.runtime.advance(Duration::from_secs(60));
+        let request = wait(sequence);
+        assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
+        assert_eq!(
+            fixture.0.raw_calls.lock().unwrap().last().unwrap().1,
+            request
+        );
+    }
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), frame_count);
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(runner.close(), ForwardDisposition::Cleaned);
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+}
+
+#[test]
 fn unverified_complete_reply_never_replays_and_retires_the_command() {
     let fixture = FrozenFixture::new(
         vec![Err(ChannelFailure::UnverifiedReply)],
