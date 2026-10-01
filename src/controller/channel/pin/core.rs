@@ -56,16 +56,24 @@ pub(crate) fn validate(pin: &PinDocument) -> io::Result<()> {
 }
 
 pub(crate) fn open_pin_directory(paths: &PathLayout) -> io::Result<RootedDir> {
+    let require_private = |directory: &RootedDir| -> io::Result<()> {
+        let metadata = directory.root_metadata()?;
+        if metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_mode & 0o7777 != 0o700 {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        Ok(())
+    };
     let root = RootedDir::open_or_create_anchored_absolute(&paths.controller_cache_root())?;
-    let metadata = root.root_metadata()?;
-    if metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_mode & 0o7777 != 0o700 {
-        return Err(io::Error::from_raw_os_error(libc::EACCES));
-    }
+    require_private(&root)?;
     let channel = root.open_child_directory(
         &RelativePath::parse(b"channel").map_err(|_| invalid())?,
         true,
     )?;
-    channel.open_child_directory(&RelativePath::parse(b"pins").map_err(|_| invalid())?, true)
+    require_private(&channel)?;
+    let pins = channel
+        .open_child_directory(&RelativePath::parse(b"pins").map_err(|_| invalid())?, true)?;
+    require_private(&pins)?;
+    Ok(pins)
 }
 
 fn read_pin(
@@ -139,7 +147,7 @@ fn repin_with_hook(
         return Err(invalid());
     }
     before_replace();
-    root.replace_private_regular_bound(&name, binding, bytes.len() as u64, &replacement)?;
+    root.channel_replace_private_exact(&name, binding, &bytes, &replacement)?;
     if read_pin(&root, &name)?.0 != *pin {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
     }
@@ -370,6 +378,38 @@ mod tests {
                 .mode()
                 & 0o7777,
             0o755
+        );
+    }
+
+    #[test]
+    fn repin_preserves_in_place_pin_changes_after_observation() {
+        let (_temp, paths, pin) = fixture();
+        verify_or_create(&paths, &pin).unwrap();
+        let file = path(&paths, &pin);
+        let mut peer = pin.clone();
+        peer.controller_client_id = "33333333333343338333333333333333".parse().unwrap();
+        let bytes = serde_json::to_vec(&peer).unwrap();
+        assert!(
+            repin_with_hook(&paths, &pin, pin.controller_client_id, || {
+                fs::write(&file, &bytes).unwrap();
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn unsafe_channel_container_is_rejected_before_creating_pin_directory() {
+        let (_temp, paths, pin) = fixture();
+        let root =
+            RootedDir::open_or_create_anchored_absolute(&paths.controller_cache_root()).unwrap();
+        let channel = root.create_new_child_directory("channel").unwrap();
+        fs::set_permissions(channel.path(), fs::Permissions::from_mode(0o1700)).unwrap();
+        assert!(verify_or_create(&paths, &pin).is_err());
+        assert!(!channel.path().join("pins").exists());
+        assert_eq!(
+            fs::metadata(channel.path()).unwrap().permissions().mode() & 0o7777,
+            0o1700
         );
     }
 }

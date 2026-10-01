@@ -173,6 +173,101 @@ pub(crate) struct GenerationFiles {
     listener: Option<UnixListener>,
     generation: String,
     published: Option<(Vec<u8>, PrivateEntryIdentity)>,
+    prior_record: Option<PriorRecord>,
+}
+
+pub(crate) struct PriorRecord {
+    bytes: Vec<u8>,
+    binding: PrivateEntryIdentity,
+}
+
+pub(crate) struct StaleEvidence {
+    pub(crate) record: Vec<u8>,
+    pub(crate) record_binding: PrivateEntryIdentity,
+    pub(crate) parent: PrivateEntryIdentity,
+    pub(crate) socket: PrivateEntryIdentity,
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_binding: PrivateEntryIdentity,
+}
+
+/// Requires an already schema/identity-validated prior service record. The
+/// caller observes its leader as absent/reused, never merely an absent PID.
+pub(crate) fn prepare_stale(
+    root: &RootedDir,
+    evidence: &StaleEvidence,
+    prior_leader_dead: bool,
+    rpc_exits_proven: bool,
+) -> io::Result<PriorRecord> {
+    private_root(root)?;
+    let verify_record = || -> io::Result<()> {
+        if !prior_leader_dead
+            || root.identity()? != evidence.parent
+            || evidence.record.len() > 8192
+            || root.private_entry_identity("service.json")? != evidence.record_binding
+            || root.read_private_regular("service.json", 8192)? != evidence.record
+            || root.private_entry_identity("service.json")? != evidence.record_binding
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    };
+    verify_record()?;
+    let mut decoder = serde_json::Deserializer::from_slice(&evidence.record);
+    let record = crate::task::deserialize_unique_json(&mut decoder).map_err(|_| invalid())?;
+    decoder.end().map_err(|_| invalid())?;
+    let generation = record["service"]["service_generation"]
+        .as_str()
+        .ok_or_else(invalid)?;
+    let uuid = uuid::Uuid::parse_str(generation).map_err(|_| invalid())?;
+    let name = format!("e{}", uuid.simple());
+    if uuid.is_nil()
+        || uuid.get_version_num() != 4
+        || uuid.get_variant() != uuid::Variant::RFC4122
+        || uuid.hyphenated().to_string() != generation
+        || record.as_object().is_none_or(|o| o.len() != 4)
+        || record["schema_version"] != 1
+        || record["binding"]
+            != serde_json::json!({"parent":binding_json(evidence.parent),"socket":binding_json(evidence.socket)})
+        || record["executable"]
+            != serde_json::json!({"path":evidence.executable,"binding":binding_json(evidence.executable_binding)})
+        || record["service"]["socket_path"].as_str() != root.path().join("s").to_str()
+        || evidence.executable != root.path().join(&name)
+    {
+        return Err(invalid());
+    }
+    let image_present = root.entry_exists(&name)?;
+    if image_present && root.channel_executable_entry(&name)? != evidence.executable_binding {
+        return Err(invalid());
+    }
+    if root.entry_exists("s")? {
+        if root.channel_socket_entry("s")? != evidence.socket
+            || !probe_refused(&root.path().join("s"))?
+        {
+            return Err(invalid());
+        }
+        verify_record()?;
+        root.channel_unlink_exact("s", evidence.socket)?;
+    }
+    verify_record()?;
+    if rpc_exits_proven && image_present {
+        root.channel_unlink_exact(&name, evidence.executable_binding)?;
+    }
+    verify_record()?;
+    Ok(PriorRecord {
+        bytes: evidence.record.clone(),
+        binding: evidence.record_binding,
+    })
+}
+
+pub(crate) fn bind_generation_replacing(
+    root: RootedDir,
+    installed: &Path,
+    device: u64,
+    inode: u64,
+    generation: &str,
+    prior: PriorRecord,
+) -> io::Result<GenerationFiles> {
+    bind_generation_inner(root, installed, device, inode, generation, Some(prior))
 }
 
 pub(crate) fn bind_generation(
@@ -181,6 +276,17 @@ pub(crate) fn bind_generation(
     device: u64,
     inode: u64,
     generation: &str,
+) -> io::Result<GenerationFiles> {
+    bind_generation_inner(root, installed, device, inode, generation, None)
+}
+
+fn bind_generation_inner(
+    root: RootedDir,
+    installed: &Path,
+    device: u64,
+    inode: u64,
+    generation: &str,
+    prior: Option<PriorRecord>,
 ) -> io::Result<GenerationFiles> {
     private_root(&root)?;
     validate_socket_path(&root.path().join("s"))?;
@@ -191,9 +297,18 @@ pub(crate) fn bind_generation(
         || uuid.hyphenated().to_string() != generation
         || !installed.is_absolute()
         || std::fs::canonicalize(installed)? != installed
-        || root.entry_exists("service.json")?
         || root.entry_exists("s")?
     {
+        return Err(invalid());
+    }
+    if let Some(record) = &prior {
+        if root.private_entry_identity("service.json")? != record.binding
+            || root.read_private_regular("service.json", 8192)? != record.bytes
+            || root.private_entry_identity("service.json")? != record.binding
+        {
+            return Err(invalid());
+        }
+    } else if root.entry_exists("service.json")? {
         return Err(invalid());
     }
     let name = format!("e{}", uuid.simple());
@@ -210,6 +325,7 @@ pub(crate) fn bind_generation(
         listener: Some(listener),
         generation: generation.into(),
         published: None,
+        prior_record: prior,
     })
 }
 
@@ -247,15 +363,27 @@ impl GenerationFiles {
         if bytes.len() > 8192 {
             return Err(invalid());
         }
-        let binding = self
-            .root
-            .write_private_atomic_no_replace_with_identity("service.json", |_| Ok(bytes.clone()))?;
+        let binding = if let Some(prior) = &self.prior_record {
+            self.root.channel_replace_private_exact(
+                "service.json",
+                prior.binding,
+                &prior.bytes,
+                &bytes,
+            )?;
+            self.root.private_entry_identity("service.json")?
+        } else {
+            self.root
+                .write_private_atomic_no_replace_with_identity("service.json", |_| {
+                    Ok(bytes.clone())
+                })?
+        };
         if self.root.private_entry_identity("service.json")? != binding
             || self.root.read_private_regular("service.json", 8192)? != bytes
         {
             return Err(invalid());
         }
         self.published = Some((bytes, binding));
+        self.prior_record = None;
         Ok(())
     }
     /// Admission stopped; proof covers generation RPCs only, never detached tasks.
@@ -265,12 +393,11 @@ impl GenerationFiles {
             return false;
         }
         let clean = || -> io::Result<()> {
-            if let Some((bytes, binding)) = &self.published {
-                if self.root.private_entry_identity("service.json")? != *binding
-                    || self.root.read_private_regular("service.json", 8192)? != *bytes
-                {
-                    return Err(invalid());
-                }
+            if let Some((bytes, binding)) = &self.published
+                && (self.root.private_entry_identity("service.json")? != *binding
+                    || self.root.read_private_regular("service.json", 8192)? != *bytes)
+            {
+                return Err(invalid());
             }
             if self.root.identity()? != self.parent_binding
                 || self.root.channel_socket_entry("s")? != self.socket_binding
@@ -517,5 +644,89 @@ mod tests {
             b"old"
         );
         assert!(lease.withdraw(true));
+    }
+
+    fn stale(lease: &GenerationFiles) -> StaleEvidence {
+        let (record, record_binding) = lease.published.as_ref().unwrap();
+        StaleEvidence {
+            record: record.clone(),
+            record_binding: *record_binding,
+            parent: lease.parent_binding,
+            socket: lease.socket_binding,
+            executable: lease.executable.clone(),
+            executable_binding: lease.executable_binding,
+        }
+    }
+
+    #[test]
+    fn stale_socket_requires_record_dead_leader_and_refusal_before_recovery() {
+        let (_temp, mut lease) = generation();
+        lease.publish(&service(&lease)).unwrap();
+        let evidence = stale(&lease);
+        assert!(prepare_stale(&lease.root, &evidence, true, false).is_err());
+        drop(lease.take_listener());
+        assert!(prepare_stale(&lease.root, &evidence, false, false).is_err());
+        assert!(lease.root.path().join("s").exists());
+        let prior = prepare_stale(&lease.root, &evidence, true, false).unwrap();
+        assert!(!lease.root.path().join("s").exists());
+        assert!(lease.executable.exists());
+        let metadata = fs::metadata(&lease.installed).unwrap();
+        let mut next = bind_generation_replacing(
+            RootedDir::open_anchored_absolute(lease.root.path()).unwrap(),
+            &lease.installed,
+            metadata.dev(),
+            metadata.ino(),
+            "22222222-2222-4222-8222-222222222222",
+            prior,
+        )
+        .unwrap();
+        let next_service = serde_json::json!({"socket_path":next.root.path().join("s"),"service_generation":"22222222-2222-4222-8222-222222222222"});
+        next.publish(&next_service).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(next.root.path().join("service.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            record["service"]["service_generation"],
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert!(lease.executable.exists());
+        assert!(next.withdraw(true));
+        assert!(lease.executable.exists());
+    }
+
+    #[test]
+    fn prior_link_cleanup_requires_rpc_exit_proof_even_with_missing_socket() {
+        let (_temp, mut lease) = generation();
+        lease.publish(&service(&lease)).unwrap();
+        let evidence = stale(&lease);
+        drop(lease.take_listener());
+        lease
+            .root
+            .channel_unlink_exact("s", lease.socket_binding)
+            .unwrap();
+        let _prior = prepare_stale(&lease.root, &evidence, true, false).unwrap();
+        assert!(lease.executable.exists());
+        let _prior = prepare_stale(&lease.root, &evidence, true, true).unwrap();
+        assert!(!lease.executable.exists());
+        assert!(lease.installed.exists());
+        assert!(lease.root.path().join("service.json").exists());
+    }
+
+    #[test]
+    fn stale_record_or_parent_substitution_never_authorizes_cleanup() {
+        let (_temp, mut lease) = generation();
+        lease.publish(&service(&lease)).unwrap();
+        let mut evidence = stale(&lease);
+        drop(lease.take_listener());
+        evidence.parent.inode += 1;
+        assert!(prepare_stale(&lease.root, &evidence, true, true).is_err());
+        evidence.parent = lease.parent_binding;
+        let file = lease.root.path().join("service.json");
+        fs::rename(&file, file.with_extension("old")).unwrap();
+        fs::write(&file, &evidence.record).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(prepare_stale(&lease.root, &evidence, true, true).is_err());
+        assert!(lease.root.path().join("s").exists());
+        assert!(lease.executable.exists());
     }
 }

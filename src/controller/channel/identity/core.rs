@@ -94,6 +94,10 @@ pub(crate) fn existing_service_record(paths: &PathLayout) -> io::Result<Option<V
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    let metadata = rpc.root_metadata()?;
+    if metadata.st_mode & 0o7777 != 0o700 {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
     let bytes = rpc.read_private_regular("service.json", 8192)?;
     if rpc.private_entry_identity("service.json")? != binding {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
