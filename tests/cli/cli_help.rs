@@ -125,7 +125,7 @@ fn events_and_notify_help_describes_every_control() {
 }
 
 #[test]
-fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
+fn help_exposes_surviving_public_commands_and_keeps_host_hidden() {
     let mut command = Command::cargo_bin("worker").unwrap();
     command.arg("--help");
 
@@ -136,27 +136,13 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("workers"))
         .stdout(predicate::str::contains("dashboard"))
-        .stdout(predicate::str::contains("run"))
-        .stdout(predicate::str::contains("status"))
-        .stdout(predicate::str::contains("logs"))
-        .stdout(predicate::str::contains("cancel"))
         .stdout(predicate::str::contains("gc"))
         .stdout(predicate::str::contains("skills"))
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains("host").not())
         .stdout(predicate::str::contains("controller-rpc").not());
 
-    for public_command in [
-        "dashboard",
-        "run",
-        "status",
-        "logs",
-        "cancel",
-        "task",
-        "gc",
-        "skills",
-        "controller",
-    ] {
+    for public_command in ["dashboard", "task", "gc", "skills", "controller"] {
         let mut command = Command::cargo_bin("worker").unwrap();
         command.args([public_command, "--help"]);
         let mut assertion = command
@@ -176,6 +162,49 @@ fn help_exposes_dashboard_run_status_logs_and_keeps_host_hidden() {
                 .stdout(predicate::str::contains("controller-viewer").not());
         }
     }
+}
+
+#[test]
+fn retired_batch_commands_are_rejected_before_loading_config_or_creating_state() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let config = root.join("missing-config.toml");
+    let job_id = "018f0f4a6b5c7d8e9f00112233445566";
+    let forms: [&[&str]; 4] = [
+        &["run", "--", "/usr/bin/true"],
+        &["status"],
+        &["logs", job_id],
+        &["cancel", job_id],
+    ];
+
+    for form in forms {
+        for json in [false, true] {
+            let mut args = vec!["worker", "--config", config.to_str().unwrap()];
+            if json {
+                args.push("--json");
+            }
+            args.extend(form.iter().copied());
+            let error = Cli::try_parse_from(args.iter().copied())
+                .expect_err("retired batch commands must not parse");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+            let mut command = Command::cargo_bin("worker").unwrap();
+            command
+                .current_dir(&root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .args(args.iter().skip(1));
+            command
+                .assert()
+                .code(64)
+                .stdout(predicate::str::is_empty())
+                .stderr(predicate::str::contains("unrecognized subcommand"))
+                .stderr(predicate::str::contains("configuration error").not());
+        }
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
 #[test]
@@ -513,23 +542,8 @@ fn gc_help_exposes_preview_usage_and_apply() {
 }
 
 #[test]
-fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
+fn host_cancel_parses_without_a_positional_job_id() {
     let job_id = "018f0f4a6b5c7d8e9f00112233445566";
-    let cli = Cli::try_parse_from(["worker", "cancel", job_id]).unwrap();
-    let WorkerCommand::Cancel { job_id: parsed } = cli.command else {
-        panic!("cancel arguments must select the cancel command");
-    };
-    assert_eq!(parsed.to_string(), job_id);
-
-    let mut command = Command::cargo_bin("worker").unwrap();
-    command.args(["cancel", "--help"]);
-    command
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Usage: worker cancel"))
-        .stdout(predicate::str::contains("<JOB_ID>"))
-        .stdout(predicate::str::contains("host").not());
-
     let host = Cli::try_parse_from(["worker", "host", "cancel"]).unwrap();
     assert!(matches!(
         host.command,
@@ -538,43 +552,6 @@ fn cancel_parses_one_job_id_and_exposes_no_hidden_arguments() {
         }
     ));
     assert!(Cli::try_parse_from(["worker", "host", "cancel", job_id]).is_err());
-}
-
-#[test]
-fn run_help_exposes_optional_pin_and_no_wait_scheduler_controls() {
-    // Break caught: the public grammar regresses to a mandatory worker, hides
-    // automatic selection, or omits immediate-capacity mode from discoverable
-    // help.
-    let mut command = Command::cargo_bin("worker").unwrap();
-    command.args(["run", "--help"]);
-
-    command
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "worker run [--worker NAME] [--no-wait] -- COMMAND",
-        ))
-        .stdout(predicate::str::contains("--worker <WORKER>"))
-        .stdout(predicate::str::contains("--no-wait"))
-        .stdout(predicate::str::contains("automatically"));
-
-    for arguments in [
-        vec!["worker", "run", "--", "npm", "test"],
-        vec!["worker", "run", "--worker", "mini-2", "--", "npm", "test"],
-        vec!["worker", "run", "--no-wait", "--", "npm", "test"],
-        vec![
-            "worker",
-            "run",
-            "--worker",
-            "mini-2",
-            "--no-wait",
-            "--",
-            "npm",
-            "test",
-        ],
-    ] {
-        Cli::try_parse_from(arguments).expect("documented scheduler run form must parse");
-    }
 }
 
 #[test]
@@ -590,45 +567,6 @@ fn public_help_exposes_gc_but_excludes_unimplemented_later_phase_commands() {
         .or(predicate::str::contains("Docker"));
 
     command.assert().success().stdout(forbidden.not());
-}
-
-#[test]
-fn run_rejects_an_unconfigured_worker_pin_before_remote_work() {
-    // Break caught: an arbitrary raw hostname is treated as a worker target
-    // rather than being rejected against the configured inventory.
-    let root = tempfile::tempdir().unwrap();
-    let root_path = std::fs::canonicalize(root.path()).unwrap();
-    let config = root_path.join("config.toml");
-    for directory in ["config", "state", "cache", "data"] {
-        std::fs::create_dir_all(root_path.join(directory)).unwrap();
-    }
-    std::fs::write(
-        &config,
-        "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
-    )
-    .unwrap();
-
-    let mut command = Command::cargo_bin("worker").unwrap();
-    command
-        .env("XDG_CONFIG_HOME", root_path.join("config"))
-        .env("XDG_STATE_HOME", root_path.join("state"))
-        .env("XDG_CACHE_HOME", root_path.join("cache"))
-        .env("XDG_DATA_HOME", root_path.join("data"))
-        .args([
-            "--config",
-            config.to_str().unwrap(),
-            "run",
-            "--worker",
-            "raw-hostname",
-            "--",
-            "/usr/bin/true",
-        ]);
-
-    command
-        .assert()
-        .code(64)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("WORKER_NOT_FOUND"));
 }
 
 #[test]

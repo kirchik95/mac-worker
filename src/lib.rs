@@ -28,9 +28,9 @@ use git_transport::{
 use host_store::HostStore;
 use install::Installer;
 use job::{
-    CancelRequest, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
-    FleetReconcileResponse, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
-    LogChunkResponse, ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
+    CancelRequest, FleetReconcileJobResult, FleetReconcileRequest, FleetReconcileResponse,
+    HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest, LogChunkResponse,
+    ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
 };
 use job_service::JobService;
 use laptop::{
@@ -44,10 +44,6 @@ use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport, SetupWarning, SetupWarningCode, WorkersReport};
 use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
-use run::{
-    CancelService, FleetReconciler, LogsService, RunRequest, RunService, StatusService,
-    SystemFollowRuntime, terminal_exit_code,
-};
 use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use supervisor::{
@@ -489,9 +485,6 @@ fn execute_with_context(
         Command::Dashboard { .. } => Err(WorkerError::Protocol(
             "public dashboard requires the stdio execution boundary".into(),
         )),
-        Command::Run { .. } => Err(WorkerError::Protocol(
-            "public run requires the stdio execution boundary".into(),
-        )),
         Command::Events { .. } | Command::Notify { .. } => Err(WorkerError::Protocol(
             "public event commands require the stdio execution boundary".into(),
         )),
@@ -507,39 +500,6 @@ fn execute_with_context(
         Command::Runner { .. } => Err(WorkerError::Protocol(
             "hidden runner requires the stdio execution boundary".into(),
         )),
-        Command::Status { job_id } => {
-            let paths = discover_paths(cli.config, runtime)?;
-            let config = Config::load(&paths.config)?;
-            let (client_state, _events) =
-                open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
-            if job_id.is_none() {
-                FleetReconciler {
-                    config: &config,
-                    client_state: &client_state,
-                    remote: RemoteJobClient::new(runner),
-                    reconcile_observer: None,
-                }
-                .reconcile()?;
-            }
-            let remote = RemoteJobClient::new(runner);
-            let service = StatusService {
-                config: &config,
-                client_state: &client_state,
-                remote: &remote,
-            };
-            Ok(CommandOutput::Status(service.inspect(job_id)?))
-        }
-        Command::Logs { .. } => Err(WorkerError::Protocol(
-            "public logs requires the stdio execution boundary".into(),
-        )),
-        Command::Cancel { job_id } => {
-            let paths = discover_paths(cli.config, runtime)?;
-            let config = Config::load(&paths.config)?;
-            let (client_state, _events) =
-                open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
-            let service = CancelService::new(runner, &config, &client_state);
-            Ok(CommandOutput::Cancel(service.cancel(job_id)?))
-        }
         Command::Host {
             command: HostCommand::Probe,
         } => {
@@ -757,111 +717,14 @@ pub fn run_with_stdio(
     run_with_stdio_in_context(cli, runner, &runtime, stdin, stdout, stderr)
 }
 
-fn run_public_streaming_command(
-    cli: Cli,
-    runner: &dyn ProcessRunner,
-    runtime: &RuntimeContext,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> u8 {
-    let json = cli.json;
-    if json {
-        let mut live = LiveJsonStdout::new(stdout);
-        return match run_public_streaming_body(cli, runner, runtime, &mut live, stderr) {
-            Ok(code) => code,
-            Err(_) if live.failed => crate::error::ExitKind::Io as u8,
-            Err(error) => match write_json_error_event(live.inner, &error) {
-                Ok(()) => error.exit_code(),
-                Err(_) => crate::error::ExitKind::Io as u8,
-            },
-        };
-    }
-    match run_public_streaming_body(cli, runner, runtime, stdout, stderr) {
-        Ok(code) => code,
-        Err(error) => {
-            write_public_diagnostic(stderr, &error);
-            error.exit_code()
-        }
-    }
-}
-
-fn run_public_streaming_body(
-    cli: Cli,
-    runner: &dyn ProcessRunner,
-    runtime: &RuntimeContext,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<u8, WorkerError> {
-    let json = cli.json;
-    let paths = discover_paths(cli.config, runtime)?;
-    let config = Config::load(&paths.config)?;
-    config.require_local_inventory()?;
-    let (client_state, _events) =
-        open_with_existing_controller_events(&paths, ControllerEventRuntime::system())?;
-    let remote = RemoteJobClient::new(runner);
-    let follow_runtime = SystemFollowRuntime;
-    let logs = LogsService {
-        config: &config,
-        client_state: &client_state,
-        remote: &remote,
-        runtime: &follow_runtime,
-    };
-    match cli.command {
-        Command::Run {
-            worker,
-            no_wait,
-            project,
-            includes,
-            timeout,
-            shell,
-            argv,
-        } => {
-            let project = match project {
-                Some(project) => project,
-                None => runtime.current_dir()?,
-            };
-            let command = match shell {
-                Some(shell) => CommandSpec::shell(shell)?,
-                None => CommandSpec::argv(argv)?,
-            };
-            let service = RunService::with_follower(runner, &config, &paths, &client_state, &logs);
-            let completion = service.submit_and_follow(
-                RunRequest {
-                    preference: match worker {
-                        Some(worker) => WorkerPreference::Pinned { worker },
-                        None => WorkerPreference::Automatic,
-                    },
-                    wait_for_capacity: !no_wait,
-                    project,
-                    cli_includes: includes,
-                    timeout,
-                    command,
-                },
-                json,
-                stdout,
-                stderr,
-            )?;
-            Ok(completion.exit_code)
-        }
-        Command::Logs { follow, job_id } => {
-            let response = logs.stream(job_id, follow, json, stdout, stderr)?;
-            if response.status().state().is_terminal() {
-                terminal_exit_code(response.status())
-            } else {
-                Ok(0)
-            }
-        }
-        _ => Err(WorkerError::Protocol(
-            "public streaming dispatcher received a non-streaming command".into(),
-        )),
-    }
-}
-
+// Retained as the writer fixture for the ported controller tests.
+#[cfg(test)]
 struct LiveJsonStdout<'a> {
     inner: &'a mut dyn Write,
     failed: bool,
 }
 
+#[cfg(test)]
 impl<'a> LiveJsonStdout<'a> {
     fn new(inner: &'a mut dyn Write) -> Self {
         Self {
@@ -871,6 +734,7 @@ impl<'a> LiveJsonStdout<'a> {
     }
 }
 
+#[cfg(test)]
 impl Write for LiveJsonStdout<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.failed {
@@ -997,9 +861,6 @@ pub fn run_with_stdio_in_context(
             stdout,
             stderr,
         );
-    }
-    if matches!(cli.command, Command::Run { .. } | Command::Logs { .. }) {
-        return run_public_streaming_command(cli, runner, runtime, stdout, stderr);
     }
     if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
         return run_task_command(cli, runner, runtime, stdout, stderr);
@@ -3459,7 +3320,6 @@ pub fn run_with_rsync_executor_in_context(
         return run_workers_refresh_command(cli, runner, runtime, stdout, stderr);
     }
     let json = cli.json;
-    let public_status = matches!(cli.command, Command::Status { .. } | Command::Cancel { .. });
     let raw_probe = matches!(
         &cli.command,
         Command::Host {
@@ -3473,23 +3333,15 @@ pub fn run_with_rsync_executor_in_context(
             match output.write_to(stdout, json, raw_probe) {
                 Ok(()) => exit,
                 Err(error) => {
-                    write_command_diagnostic(public_status, stderr, &error);
+                    write_error(stderr, &error);
                     error.exit_code()
                 }
             }
         }
         Err(error) => {
-            write_command_diagnostic(public_status, stderr, &error);
+            write_error(stderr, &error);
             error.exit_code()
         }
-    }
-}
-
-fn write_command_diagnostic(public_status: bool, stderr: &mut dyn Write, error: &WorkerError) {
-    if public_status {
-        write_public_diagnostic(stderr, error);
-    } else {
-        write_error(stderr, error);
     }
 }
 

@@ -2,7 +2,7 @@ use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr, 
 
 use clap::{Parser, Subcommand};
 
-use crate::{job::JobId, task::TaskId};
+use crate::task::TaskId;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -90,44 +90,6 @@ pub enum Command {
         #[arg(long, hide = true, action = clap::ArgAction::SetTrue, num_args = 0)]
         controller_viewer: bool,
     },
-    #[command(
-        override_usage = "worker run [--worker NAME] [--no-wait] -- COMMAND",
-        about = "Run a command on an automatically selected compatible worker, or pin one with --worker"
-    )]
-    Run {
-        /// Pin one inventory name instead of automatic selection
-        #[arg(long, value_parser = non_empty_worker)]
-        worker: Option<String>,
-        /// Reject the run when no heavy slot is free
-        #[arg(long)]
-        no_wait: bool,
-        /// Git project to snapshot (default: the current directory)
-        #[arg(long)]
-        project: Option<PathBuf>,
-        /// Extra snapshot include pattern (repeatable)
-        #[arg(long = "include", value_parser = non_empty_pattern)]
-        includes: Vec<String>,
-        /// Maximum runtime, from 1s to 24h
-        #[arg(long, value_parser = supported_duration)]
-        timeout: Option<Duration>,
-        /// Shell command to run instead of the trailing arguments
-        #[arg(long, value_parser = non_empty_shell, conflicts_with = "argv")]
-        shell: Option<String>,
-        /// Command and arguments to run on the worker
-        #[arg(last = true, num_args = 1.., required_unless_present = "shell")]
-        argv: Vec<String>,
-    },
-    Status {
-        /// Job to show; omit to list recent jobs
-        job_id: Option<JobId>,
-    },
-    Logs {
-        /// Keep printing new log lines until the job finishes
-        #[arg(short = 'f')]
-        follow: bool,
-        /// Job whose logs to print
-        job_id: JobId,
-    },
     #[command(about = "Follow future controller lifecycle events")]
     Events {
         /// Follow new events from the current journal head (required)
@@ -148,10 +110,6 @@ pub enum Command {
         /// Skip retrieving and displaying task titles
         #[arg(long)]
         no_titles: bool,
-    },
-    Cancel {
-        /// Job to cancel
-        job_id: JobId,
     },
     #[command(about = "Submit and manage durable agent tasks")]
     Task {
@@ -645,14 +603,6 @@ fn non_empty_pattern(value: &str) -> Result<String, String> {
 fn non_empty_worker(value: &str) -> Result<String, String> {
     if value.is_empty() {
         Err("worker name must not be empty".into())
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn non_empty_shell(value: &str) -> Result<String, String> {
-    if value.is_empty() {
-        Err("shell command must not be empty".into())
     } else {
         Ok(value.to_owned())
     }

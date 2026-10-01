@@ -445,17 +445,6 @@ impl StatusQueueBlockingReason {
             QueueBlockingReason::NoEligibleWorker => Self::NoEligibleWorker,
         }
     }
-
-    pub(crate) fn render_human(&self) -> String {
-        match self {
-            Self::PinnedWorkerBusy { worker } => format!("pinned_busy {worker}"),
-            Self::CapabilityMissing { missing } => {
-                format!("capability_missing {}", missing.join(","))
-            }
-            Self::RunCap => "run_cap".into(),
-            Self::NoEligibleWorker => "no_eligible_worker".into(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

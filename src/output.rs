@@ -6,8 +6,6 @@ pub enum CommandOutput {
     Doctor(crate::protocol::DoctorReport),
     Workers(crate::protocol::WorkersReport),
     Probe(crate::protocol::ProbeResponse),
-    Status(crate::run::StatusReport),
-    Cancel(crate::run::CancelReport),
     /// Laptop-only Markdown or name list. Not a host/task wire type.
     Plain {
         text: String,
@@ -127,18 +125,7 @@ impl CommandOutput {
                 "{}: {} (macOS {}; protocol {})",
                 probe.hostname, probe.arch, probe.os_version, probe.protocol_version
             ),
-            Self::Status(report) => render_status_report(report),
             Self::Plain { text } => text.clone(),
-            Self::Cancel(report) => match report {
-                crate::run::CancelReport::QueuedCancelled { job_id } => {
-                    format!("job {job_id} cancelled while queued")
-                }
-                crate::run::CancelReport::RemoteCancelled { response } => format!(
-                    "job {} cancellation resolved as {}",
-                    response.status().meta().job_id(),
-                    job_state_name(response.status().status().state())
-                ),
-            },
         };
         let notes = match self {
             Self::Workers(report) => crate::agent_facts::agent_fleet_notes(&report.workers),
@@ -641,76 +628,5 @@ fn setup_warning_code(code: &crate::protocol::SetupWarningCode) -> &'static str 
             crate::protocol::OUTBOX_WAKE_FAILED_CODE
         }
         crate::protocol::SetupWarningCode::ControllerRestartFailed => "CONTROLLER_RESTART_FAILED",
-    }
-}
-
-fn render_status_report(report: &crate::run::StatusReport) -> String {
-    let mut lines = report
-        .queued
-        .iter()
-        .map(render_queued_status_row)
-        .chain(report.jobs.iter().map(render_status_row))
-        .collect::<Vec<_>>();
-    if report.omitted > 0 {
-        lines.push(format!("{} older jobs omitted", report.omitted));
-    }
-    lines.join("\n")
-}
-
-fn render_queued_status_row(row: &crate::run::QueuedStatusRow) -> String {
-    let command = match row.command_summary.arg_count() {
-        Some(count) => format!("argv {count}"),
-        None => "shell".into(),
-    };
-    let requirements = if row.requirements.is_empty() {
-        "-".to_owned()
-    } else {
-        row.requirements.join(",")
-    };
-    let blocking = row
-        .blocking_reason
-        .as_ref()
-        .map_or_else(|| "none".to_owned(), |reason| reason.render_human());
-    format!(
-        "queued {} {} {} {command} {requirements} {blocking} age {}",
-        row.position, row.job_id, row.project_id, row.age_millis
-    )
-}
-
-fn render_status_row(row: &crate::run::StatusRow) -> String {
-    let state = row
-        .status
-        .as_ref()
-        .map_or("unknown", |status| job_state_name(status.state()));
-    let uncertainty = match &row.remote_uncertainty {
-        crate::job::RemoteUncertainty::None => "none".to_owned(),
-        crate::job::RemoteUncertainty::UnknownRemote { code } => {
-            format!("unknown_remote {code}")
-        }
-        crate::job::RemoteUncertainty::CleanupPending { code } => {
-            format!("cleanup_pending {code}")
-        }
-    };
-    let command = match row.command_summary.arg_count() {
-        Some(count) => format!("argv {count}"),
-        None => "shell".into(),
-    };
-    format!(
-        "{} {} {state} {uncertainty} {} {} {command}",
-        row.job_id, row.worker, row.created_at_millis, row.manifest_digest
-    )
-}
-
-fn job_state_name(state: crate::job::JobState) -> &'static str {
-    match state {
-        crate::job::JobState::Uploading => "uploading",
-        crate::job::JobState::Verified => "verified",
-        crate::job::JobState::Accepted => "accepted",
-        crate::job::JobState::Running => "running",
-        crate::job::JobState::Succeeded => "succeeded",
-        crate::job::JobState::Failed => "failed",
-        crate::job::JobState::Cancelled => "cancelled",
-        crate::job::JobState::TimedOut => "timed_out",
-        crate::job::JobState::Lost => "lost",
     }
 }
