@@ -23,8 +23,8 @@ use mac_worker::{
     git_transport::GitTransport,
     host_store::HostStore,
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprint,
-        RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+        RequestFingerprint, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
@@ -680,7 +680,9 @@ fn occupy_single_slot(paths: &PathLayout) {
     service.set_slot_count(1).unwrap();
     service
         .acquire(
-            &LeaseAcquireRequest::new(material),
+            &LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(
+                TaskId::new(Uuid::from_u128(0x9a_0004)),
+            )),
             &healthy_admission_facts(),
             now,
         )

@@ -1422,73 +1422,43 @@ fn v6_task_requests_are_refused_before_store_writes() {
 }
 
 #[test]
-fn prepare_rejects_job_scope_and_wrong_project_before_creating_a_task() {
+fn prepare_rejects_legacy_job_scope_before_creating_a_task() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    let (_request, lease) = acquire_task_lease(&store);
+    // Seed the canonical pre-retirement binding; new Job-scoped acquisition is refused.
+    let scope_path = store.root().join("leases/slots/0/scope.json");
+    fs::write(&scope_path, br#"{"kind":"job"}"#).unwrap();
+    let occupied = LeaseService::new(&store).occupied_slots().unwrap();
+    assert_eq!(occupied.len(), 1);
+    assert_eq!(occupied[0].execution_scope, ExecutionScope::Job);
+    assert_eq!(occupied[0].lease, lease);
+    let (admission, transfer) = transfer_guard(&store);
+    let error = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare(&prepare_request(base_oid), &transfer)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Task {
+                code: "EXECUTION_SCOPE_CONFLICT",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!store.task_dir(PROJECT_ID, task_id()).unwrap().exists());
+    drop(transfer);
+    drop(admission);
+}
+
+#[test]
+fn prepare_rejects_wrong_project_before_creating_a_task() {
     let (_temp, store, base_oid) = store_with_mirror();
     let other_project = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    let job_scope = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            job_id(),
-            client_id(),
-            lease_token(),
-            100,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            "c".repeat(64),
-            String::new(),
-            30_000,
-            "heavy".into(),
-            CommandSpec::shell("true".into()).unwrap(),
-        )
-        .unwrap(),
-    );
-    LeaseService::new(&store)
-        .acquire(&job_scope, &healthy_facts(), 100)
-        .unwrap();
-    {
-        let (admission, transfer) = transfer_guard(&store);
-        let error = TaskStore::new(&store, &SystemProcessRunner)
-            .prepare(&prepare_request(base_oid.clone()), &transfer)
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                WorkerError::Task {
-                    code: "EXECUTION_SCOPE_CONFLICT",
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-        assert!(!store.task_dir(PROJECT_ID, task_id()).unwrap().exists());
-        drop(transfer);
-        drop(admission);
-    }
-
     let other_job = job_id_for(11);
     let other_token = LeaseToken::new(Uuid::from_u128(31));
-    let task_scope = LeaseAcquireRequest::new(
-        RequestFingerprintMaterial::new(
-            other_job,
-            client_id(),
-            other_token,
-            100,
-            "mini-1".into(),
-            PROJECT_ID.into(),
-            WORKTREE_ID.into(),
-            "c".repeat(64),
-            String::new(),
-            30_000,
-            "heavy".into(),
-            CommandSpec::shell("true".into()).unwrap(),
-        )
-        .unwrap(),
-    )
-    .with_execution_scope(ExecutionScope::task(task_id()));
-    LeaseService::new(&store).set_slot_count(2).unwrap();
-    LeaseService::new(&store)
-        .acquire(&task_scope, &healthy_facts(), 100)
-        .unwrap();
+    let task_scope = task_lease_request(other_job, other_token, task_id());
+    acquire_task_lease_request(&store, &task_scope);
     let (admission, transfer) = transfer_guard_for(&store, other_job);
     let wrong_meta = TaskMeta::new(TaskMetaInput {
         task_id: task_id(),

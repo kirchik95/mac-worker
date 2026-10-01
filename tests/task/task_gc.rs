@@ -78,6 +78,7 @@ fn lease_request(job: JobId) -> LeaseAcquireRequest {
         )
         .unwrap(),
     )
+    .with_execution_scope(ExecutionScope::task(TaskId::new(job.as_uuid())))
 }
 
 fn git(path: &Path, args: &[&str]) -> String {

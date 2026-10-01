@@ -23,7 +23,8 @@ use mac_worker::{
     },
     host_store::{HOST_LAYOUT_VERSION, HostStore, PREVIOUS_HOST_LAYOUT_VERSION},
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
+        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+        RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
     process::{ProcessRequest, ProcessResult},
@@ -351,7 +352,8 @@ fn store_with_lease() -> (TempDir, HostStore) {
         CommandSpec::shell("true".into()).unwrap(),
     )
     .unwrap();
-    let request = LeaseAcquireRequest::new(material);
+    let request =
+        LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(task_id()));
     let facts = AdmissionFacts {
         free_disk_bytes: 100 * 1024 * 1024 * 1024,
         total_disk_bytes: 200 * 1024 * 1024 * 1024,
