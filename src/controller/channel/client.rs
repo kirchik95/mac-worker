@@ -2,14 +2,16 @@
 use std::{ffi::OsStr, sync::Mutex};
 
 pub use super::contracts::{
-    ChannelFailure, CleanupContext, ClientContext, ClientDeps, ConfiguredRoute, ForwardDisposition,
-    ForwardLease, ReadLoopScope, SETUP_GUARD, SocketSession, eligible_read,
+    CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ClientContext, ClientDeps,
+    ConfiguredRoute, ForwardDisposition, ForwardLease, ReadLoopScope, SETUP_GUARD, SocketSession,
+    eligible_read,
 };
 use crate::{
     controller::{ControllerRequest, decode_request},
-    error::WorkerError,
+    error::{ProcessError, WorkerError},
     paths::PathLayout,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
+    protocol::PROTOCOL_VERSION,
 };
 
 struct Session {
@@ -78,12 +80,29 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
     }
 
     fn setup(&self, state: &mut State, ctx: &ClientContext<'_>) -> Result<(), ChannelFailure> {
+        ctx.check()?;
         let master = self.deps.forwards.resolve(&self.raw, &self.route, ctx)?;
+        ctx.check()?;
         let identity = self
             .deps
             .identity
             .read(&self.raw, &self.route, Some(&master), ctx)?;
+        ctx.check()?;
+        if identity.route_sha256 != self.route.digest()? {
+            return Err(ChannelFailure::Unavailable(ChannelReason::PinMismatch));
+        }
+        if identity.service.protocol_version != PROTOCOL_VERSION
+            || identity.service.channel_version != CHANNEL_VERSION
+            || !identity
+                .service
+                .features
+                .iter()
+                .any(|feature| feature == "controller.socket")
+        {
+            return Err(ChannelFailure::Unavailable(ChannelReason::Unsupported));
+        }
         self.deps.pins.verify_or_create(&self.paths, &identity)?;
+        ctx.check()?;
         let mut forward = self
             .deps
             .forwards
@@ -92,6 +111,10 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 state.disposition = failure.disposition;
                 failure.failure
             })?;
+        if let Err(failure) = ctx.check() {
+            state.disposition = self.cancel_forward(&mut *forward);
+            return Err(failure);
+        }
         let socket = self
             .deps
             .connector
@@ -101,7 +124,7 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 failure
             })?;
         state.session = Some(Session { socket, forward });
-        Ok(())
+        ctx.check()
     }
 
     fn eligible(&self, request: &ProcessRequest) -> Option<ControllerRequest> {
@@ -119,9 +142,6 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
         parsed: &ControllerRequest,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
-        let Ok(mut state) = self.state.try_lock() else {
-            return self.raw.run_interruptible(request, should_stop);
-        };
         let ctx = ClientContext {
             runtime: &*self.deps.runtime,
             deadline: self
@@ -131,14 +151,44 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 .saturating_add(request.policy.deadline),
             should_stop,
         };
+        ctx.check().map_err(unavailable)?;
+        let Ok(mut state) = self.state.try_lock() else {
+            return self.raw_read(request, &ctx);
+        };
         if state.session.is_none() {
-            self.setup(&mut state, &ctx).map_err(unavailable)?;
+            if ctx.remaining() <= SETUP_GUARD {
+                drop(state);
+                return self.raw_read(request, &ctx);
+            }
+            let setup_ctx = ClientContext {
+                runtime: ctx.runtime,
+                should_stop: ctx.should_stop,
+                deadline: ctx
+                    .deadline
+                    .min(ctx.runtime.now().saturating_add(SETUP_GUARD)),
+            };
+            if let Err(failure) = self.setup(&mut state, &setup_ctx) {
+                self.close_session(&mut state);
+                drop(state);
+                if matches!(
+                    failure,
+                    ChannelFailure::Unavailable(ChannelReason::Cancelled)
+                ) {
+                    return Err(unavailable(failure));
+                }
+                return self.raw_read(request, &ctx);
+            }
         }
         let session = state
             .session
             .as_mut()
             .expect("successful setup supplies a session");
-        session.forward.verify().map_err(unavailable)?;
+        if let Err(_failure) = session.forward.verify() {
+            self.close_session(&mut state);
+            drop(state);
+            return self.raw_read(request, &ctx);
+        }
+        ctx.check().map_err(unavailable)?;
         session
             .socket
             .exchange(
@@ -147,6 +197,18 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 &ctx,
             )
             .map_err(unavailable)
+    }
+
+    fn raw_read(
+        &self,
+        request: &ProcessRequest,
+        ctx: &ClientContext<'_>,
+    ) -> Result<ProcessResult, WorkerError> {
+        ctx.check().map_err(unavailable)?;
+        let mut remaining = request.clone();
+        remaining.policy.deadline = ctx.remaining();
+        self.raw
+            .run_interruptible(&remaining, &|| ctx.check().is_err())
     }
 }
 impl<R: ProcessRunner> ProcessRunner for ChannelProcessRunner<R> {
@@ -176,8 +238,17 @@ impl<R: ProcessRunner> Drop for ChannelProcessRunner<R> {
     }
 }
 
-fn unavailable(_failure: ChannelFailure) -> WorkerError {
-    WorkerError::Unavailable("CONTROLLER_UNAVAILABLE: controller read channel unavailable".into())
+fn unavailable(failure: ChannelFailure) -> WorkerError {
+    match failure {
+        ChannelFailure::Unavailable(ChannelReason::Cancelled) => ProcessError::Cancelled.into(),
+        ChannelFailure::Unavailable(ChannelReason::Timeout) => ProcessError::DeadlineExceeded {
+            deadline: SETUP_GUARD,
+        }
+        .into(),
+        _ => WorkerError::Unavailable(
+            "CONTROLLER_UNAVAILABLE: controller read channel unavailable".into(),
+        ),
+    }
 }
 
 // Recognize only the worker's structured SSH invocation. In particular, no

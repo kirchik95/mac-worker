@@ -48,6 +48,7 @@ struct Data {
     runtime: Arc<ManualRuntime>,
     identity: Mutex<SocketIdentity>,
     steps: Mutex<Vec<&'static str>>,
+    contexts: Mutex<Vec<(&'static str, Duration, Duration)>>,
     raw_calls: Mutex<Vec<(&'static str, ProcessRequest)>>,
     frames: Mutex<Vec<Vec<u8>>>,
     replies: Mutex<VecDeque<Result<ProcessResult, ChannelFailure>>>,
@@ -85,6 +86,7 @@ impl Fixture {
                 },
             }),
             steps: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
             raw_calls: Mutex::new(Vec::new()),
             frames: Mutex::new(Vec::new()),
             replies: Mutex::new(VecDeque::new()),
@@ -118,6 +120,11 @@ impl Fixture {
     fn stage(&self, name: &'static str, ctx: &ClientContext<'_>) -> Result<(), ChannelFailure> {
         ctx.check()?;
         self.0.steps.lock().unwrap().push(name);
+        self.0
+            .contexts
+            .lock()
+            .unwrap()
+            .push((name, ctx.deadline, ctx.remaining()));
         if let Some(elapsed) = self.0.advances.lock().unwrap().get(name) {
             self.0.runtime.advance(*elapsed);
         }
@@ -269,7 +276,10 @@ impl ForwardControl for Fixture {
         ctx: &ClientContext<'_>,
     ) -> Result<Box<dyn ForwardLease>, ForwardOpenFailure> {
         assert_eq!(master.control_path, PathBuf::from("/cache/ssh/master"));
-        assert_eq!(identity.route_sha256, route().digest().unwrap());
+        assert_eq!(
+            identity.route_sha256,
+            self.0.identity.lock().unwrap().route_sha256
+        );
         if let Err(failure) = self.stage("open", ctx) {
             return Err(ForwardOpenFailure {
                 failure,
@@ -309,7 +319,10 @@ impl SocketConnector for Fixture {
         ctx: &ClientContext<'_>,
     ) -> Result<Box<dyn SocketSession>, ChannelFailure> {
         assert_eq!(local, Path::new("/cache/channel/owned/s"));
-        assert_eq!(identity.route_sha256, route().digest().unwrap());
+        assert_eq!(
+            identity.route_sha256,
+            self.0.identity.lock().unwrap().route_sha256
+        );
         self.stage("connect", ctx)?;
         Ok(Box::new(self.clone()))
     }
@@ -565,4 +578,256 @@ fn adapter_accepts_a_borrowed_raw_runner() {
         fixture.deps(),
     );
     assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+}
+
+#[test]
+fn setup_is_lazy_ordered_and_reuses_one_session() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    assert!(fixture.steps().is_empty());
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    assert_eq!(
+        fixture.steps(),
+        [
+            "resolve", "identity", "pin", "open", "connect", "verify", "write", "read"
+        ]
+    );
+    assert!(socket_result(&runner.run(&wait(2)).unwrap()));
+    assert_eq!(fixture.count("resolve"), 1);
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.count("connect"), 1);
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn cold_short_budget_skips_setup_but_ready_session_can_read() {
+    for budget in [Duration::from_millis(1), Duration::from_secs(5)] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        let mut request = wait(1);
+        request.policy.deadline = budget;
+        assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
+        assert!(fixture.steps().is_empty());
+        assert_eq!(fixture.0.raw_calls.lock().unwrap()[0].1, request);
+        assert!(socket_result(&runner.run(&wait(2)).unwrap()));
+        let mut request = wait(3);
+        request.policy.deadline = budget;
+        assert!(socket_result(&runner.run(&request).unwrap()));
+        assert_eq!(fixture.count("open"), 1);
+    }
+}
+
+#[test]
+fn setup_guard_and_application_share_the_original_budget() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.0.advances.lock().unwrap().extend([
+        ("resolve", Duration::from_millis(250)),
+        ("identity", Duration::from_millis(500)),
+        ("open", Duration::from_millis(750)),
+        ("connect", Duration::from_secs(1)),
+    ]);
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    assert_eq!(
+        *fixture.0.contexts.lock().unwrap(),
+        [
+            ("resolve", Duration::from_secs(5), Duration::from_secs(5)),
+            (
+                "identity",
+                Duration::from_secs(5),
+                Duration::from_millis(4750)
+            ),
+            ("open", Duration::from_secs(5), Duration::from_millis(4250)),
+            (
+                "connect",
+                Duration::from_secs(5),
+                Duration::from_millis(3500)
+            ),
+            (
+                "write",
+                Duration::from_secs(30),
+                Duration::from_millis(27500)
+            ),
+            (
+                "read",
+                Duration::from_secs(30),
+                Duration::from_millis(27500)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn setup_failure_falls_back_before_application_with_remaining_budget() {
+    for stage in ["resolve", "identity", "pin", "open", "connect"] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        fixture.fail(
+            stage,
+            ChannelFailure::Unavailable(ChannelReason::ServiceUnavailable),
+        );
+        if stage != "pin" {
+            fixture
+                .0
+                .advances
+                .lock()
+                .unwrap()
+                .insert(stage, Duration::from_secs(2));
+        }
+        let request = wait(1);
+        assert_eq!(
+            runner.run(&request).unwrap().stdout,
+            b"raw",
+            "stage {stage}"
+        );
+        assert!(fixture.0.frames.lock().unwrap().is_empty());
+        let calls = fixture.0.raw_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let mut expected = request.clone();
+        if stage != "pin" {
+            expected.policy.deadline = Duration::from_secs(28);
+        }
+        assert_eq!(calls[0], ("interruptible", expected));
+    }
+}
+
+#[test]
+fn setup_guard_expiry_can_use_the_live_application_budget() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture
+        .0
+        .advances
+        .lock()
+        .unwrap()
+        .insert("identity", Duration::from_secs(5));
+    assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw");
+    assert_eq!(fixture.count("open"), 0);
+    assert_eq!(
+        fixture.0.raw_calls.lock().unwrap()[0].1.policy.deadline,
+        Duration::from_secs(25)
+    );
+}
+
+#[test]
+fn unsafe_or_unavailable_identity_and_pin_never_send_socket_reads() {
+    for case in [
+        "route",
+        "protocol",
+        "channel",
+        "feature",
+        "pin",
+        "account",
+        "client",
+        "generation",
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        match case {
+            "route" => {
+                let mut different = route();
+                different.ssh = "elsewhere".into();
+                fixture.0.identity.lock().unwrap().route_sha256 = different.digest().unwrap();
+            }
+            "protocol" => fixture.0.identity.lock().unwrap().service.protocol_version = 6,
+            "channel" => fixture.0.identity.lock().unwrap().service.channel_version = 2,
+            "feature" => fixture.0.identity.lock().unwrap().service.features.clear(),
+            "pin" => fixture.fail(
+                "pin",
+                ChannelFailure::Unavailable(ChannelReason::UnsafePath),
+            ),
+            "account" | "client" => {
+                let mut pinned = fixture.0.identity.lock().unwrap().clone();
+                if case == "account" {
+                    pinned.service.account.uid = 999;
+                } else {
+                    pinned.service.controller_client_id = ClientId::generate();
+                }
+                *fixture.0.pin.lock().unwrap() = Some(pinned);
+            }
+            "generation" => fixture.fail(
+                "connect",
+                ChannelFailure::Unavailable(ChannelReason::PinMismatch),
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(runner.run(&wait(1)).unwrap().stdout, b"raw", "case {case}");
+        assert!(fixture.0.frames.lock().unwrap().is_empty());
+        if case != "generation" {
+            assert_eq!(fixture.count("open"), 0, "case {case}");
+        }
+    }
+}
+
+#[test]
+fn absent_journal_does_not_disable_wait_or_logs_channel() {
+    for (scope, request) in [
+        (ReadLoopScope::Wait, wait(1)),
+        (
+            ReadLoopScope::LogsFollow,
+            process_request(
+                "task.logs",
+                serde_json::json!({"task_id":"11111111111141118111111111111111"}),
+                2,
+            ),
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(scope);
+        assert!(
+            fixture
+                .0
+                .identity
+                .lock()
+                .unwrap()
+                .service
+                .journal_id
+                .is_none()
+        );
+        assert!(socket_result(&runner.run(&request).unwrap()));
+    }
+}
+
+#[test]
+fn concurrent_poll_uses_raw_without_queueing_or_second_setup() {
+    let fixture = Fixture::new();
+    let runner = Arc::new(fixture.runner(ReadLoopScope::Wait));
+    let (entered, release) = fixture.gate("read");
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| runner.run(&wait(1)));
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("read entry");
+        assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+        assert_eq!(fixture.count("open"), 1);
+        assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+        release.send(()).unwrap();
+        assert!(socket_result(&reader.join().unwrap().unwrap()));
+    });
+}
+
+#[test]
+fn configured_ssh_file_is_matched_exactly() {
+    let fixture = Fixture::new();
+    let mut configured = route();
+    configured.ssh_config_file = Some("/config/managed file".into());
+    fixture.0.identity.lock().unwrap().route_sha256 = configured.digest().unwrap();
+    let runner = ChannelProcessRunner::new(
+        &fixture,
+        ReadLoopScope::Wait,
+        configured,
+        paths(),
+        fixture.deps(),
+    );
+    let mut request = wait(1);
+    request
+        .args
+        .splice(0..0, ["-F".into(), "/config/managed file".into()]);
+    assert!(socket_result(&runner.run(&request).unwrap()));
+    let mut other = request.clone();
+    other.args[1] = "/config/other".into();
+    assert_eq!(runner.run(&other).unwrap().stdout, b"raw");
+    assert_eq!(fixture.count("resolve"), 1);
+    assert_eq!(fixture.0.raw_calls.lock().unwrap().last().unwrap().1, other);
 }
