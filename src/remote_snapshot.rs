@@ -4,10 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer, de,
-    ser::{self, SerializeStruct},
-};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -16,10 +13,9 @@ use crate::{
         AdmissionGuard, HostStore, HostStoreWritePoint, JobDisposition, StagedJob, WorkspaceReceipt,
     },
     inputs::RelativePath,
-    job::{ClientId, JobId, LeaseRecord, LeaseToken, RequestFingerprint},
+    job::{JobId, LeaseRecord, LeaseToken, RequestFingerprint},
     lease::LeaseService,
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
-    protocol::PROTOCOL_VERSION,
     rooted_fs::{RootedDir, SnapshotFsKind, SnapshotProjection, SnapshotTreeInspection},
 };
 
@@ -27,7 +23,7 @@ pub use crate::legacy_snapshot_receipt::{
     LegacySnapshotReceiptService as RemoteSnapshotService, SnapshotCacheKey, VerifiedReceipt,
 };
 use crate::legacy_snapshot_receipt::{
-    decode_canonical_json, protocol_error, unsafe_remote_snapshot, validate_digest,
+    decode_canonical_json, unsafe_remote_snapshot, validate_digest,
 };
 
 const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
@@ -105,36 +101,6 @@ impl<'a> RemoteSnapshotService<'a> {
             .try_into()
             .map_err(|_| WorkerError::Protocol("system clock timestamp overflowed".into()))?;
         self.verify_and_promote_at(lease, expected_digest, now)
-    }
-
-    pub fn verify_request(
-        &self,
-        request: &SnapshotVerifyRequest,
-    ) -> Result<VerifiedSnapshotResponse, WorkerError> {
-        request.validate()?;
-        let live = LeaseService::new(self.store)
-            .load_for_job(request.job_id())?
-            .ok_or_else(lease_identity_mismatch)?;
-        if request.job_id() != live.job_id()
-            || request.client_id() != live.client_id()
-            || request.lease_token() != live.lease_token()
-            || request.request_fingerprint() != live.request_fingerprint()
-            || request.project_id() != live.project_id()
-            || request.worktree_id() != live.worktree_id()
-            || request.manifest_digest() != live.manifest_digest()
-        {
-            return Err(lease_identity_mismatch());
-        }
-        let snapshot = self.verify_and_promote(&live, request.manifest_digest())?;
-        VerifiedSnapshotResponse::new(
-            live.job_id(),
-            live.client_id(),
-            snapshot.project_id().into(),
-            snapshot.worktree_id().into(),
-            snapshot.digest().into(),
-            snapshot.verified_at_millis(),
-            snapshot.cache_reused(),
-        )
     }
 
     #[doc(hidden)]
@@ -1143,275 +1109,4 @@ fn lease_identity_mismatch() -> WorkerError {
 
 fn protocol_code(code: &'static str, message: &str) -> WorkerError {
     WorkerError::Protocol(format!("{code}: {message}"))
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct SnapshotVerifyRequest {
-    protocol_version: u32,
-    job_id: JobId,
-    client_id: ClientId,
-    lease_token: LeaseToken,
-    request_fingerprint: RequestFingerprint,
-    project_id: String,
-    worktree_id: String,
-    manifest_digest: String,
-}
-
-impl SnapshotVerifyRequest {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        job_id: JobId,
-        client_id: ClientId,
-        lease_token: LeaseToken,
-        request_fingerprint: RequestFingerprint,
-        project_id: String,
-        worktree_id: String,
-        manifest_digest: String,
-    ) -> Result<Self, WorkerError> {
-        let request = Self {
-            protocol_version: PROTOCOL_VERSION,
-            job_id,
-            client_id,
-            lease_token,
-            request_fingerprint,
-            project_id,
-            worktree_id,
-            manifest_digest,
-        };
-        request.validate()?;
-        Ok(request)
-    }
-
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION {
-            return Err(protocol_error(
-                "snapshot verification protocol version mismatch",
-            ));
-        }
-        validate_digest(&self.project_id, "project ID")?;
-        validate_digest(&self.worktree_id, "worktree ID")?;
-        validate_digest(&self.manifest_digest, "manifest digest")
-    }
-
-    pub fn protocol_version(&self) -> u32 {
-        self.protocol_version
-    }
-
-    pub fn job_id(&self) -> JobId {
-        self.job_id
-    }
-
-    pub fn client_id(&self) -> ClientId {
-        self.client_id
-    }
-
-    pub fn lease_token(&self) -> LeaseToken {
-        self.lease_token
-    }
-
-    pub fn request_fingerprint(&self) -> &RequestFingerprint {
-        &self.request_fingerprint
-    }
-
-    pub fn project_id(&self) -> &str {
-        &self.project_id
-    }
-
-    pub fn worktree_id(&self) -> &str {
-        &self.worktree_id
-    }
-
-    pub fn manifest_digest(&self) -> &str {
-        &self.manifest_digest
-    }
-}
-
-impl fmt::Debug for SnapshotVerifyRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SnapshotVerifyRequest")
-            .field("protocol_version", &self.protocol_version)
-            .field("job_id", &self.job_id)
-            .field("client_id", &self.client_id)
-            .field("request_fingerprint", &self.request_fingerprint)
-            .field("project_id", &self.project_id)
-            .field("worktree_id", &self.worktree_id)
-            .field("manifest_digest", &self.manifest_digest)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Serialize for SnapshotVerifyRequest {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("SnapshotVerifyRequest", 8)?;
-        record.serialize_field("protocol_version", &self.protocol_version)?;
-        record.serialize_field("job_id", &self.job_id)?;
-        record.serialize_field("client_id", &self.client_id)?;
-        record.serialize_field("lease_token", &self.lease_token)?;
-        record.serialize_field("request_fingerprint", &self.request_fingerprint)?;
-        record.serialize_field("project_id", &self.project_id)?;
-        record.serialize_field("worktree_id", &self.worktree_id)?;
-        record.serialize_field("manifest_digest", &self.manifest_digest)?;
-        record.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for SnapshotVerifyRequest {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            protocol_version: u32,
-            job_id: JobId,
-            client_id: ClientId,
-            lease_token: LeaseToken,
-            request_fingerprint: RequestFingerprint,
-            project_id: String,
-            worktree_id: String,
-            manifest_digest: String,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        let request = Self {
-            protocol_version: wire.protocol_version,
-            job_id: wire.job_id,
-            client_id: wire.client_id,
-            lease_token: wire.lease_token,
-            request_fingerprint: wire.request_fingerprint,
-            project_id: wire.project_id,
-            worktree_id: wire.worktree_id,
-            manifest_digest: wire.manifest_digest,
-        };
-        request.validate().map_err(de::Error::custom)?;
-        Ok(request)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedSnapshotResponse {
-    protocol_version: u32,
-    job_id: JobId,
-    client_id: ClientId,
-    project_id: String,
-    worktree_id: String,
-    manifest_digest: String,
-    verified_at_millis: u64,
-    cache_reused: bool,
-}
-
-impl VerifiedSnapshotResponse {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        job_id: JobId,
-        client_id: ClientId,
-        project_id: String,
-        worktree_id: String,
-        manifest_digest: String,
-        verified_at_millis: u64,
-        cache_reused: bool,
-    ) -> Result<Self, WorkerError> {
-        let response = Self {
-            protocol_version: PROTOCOL_VERSION,
-            job_id,
-            client_id,
-            project_id,
-            worktree_id,
-            manifest_digest,
-            verified_at_millis,
-            cache_reused,
-        };
-        response.validate()?;
-        Ok(response)
-    }
-
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != PROTOCOL_VERSION {
-            return Err(protocol_error(
-                "snapshot response protocol version mismatch",
-            ));
-        }
-        validate_digest(&self.project_id, "project ID")?;
-        validate_digest(&self.worktree_id, "worktree ID")?;
-        validate_digest(&self.manifest_digest, "manifest digest")
-    }
-
-    pub fn protocol_version(&self) -> u32 {
-        self.protocol_version
-    }
-
-    pub fn job_id(&self) -> JobId {
-        self.job_id
-    }
-
-    pub fn client_id(&self) -> ClientId {
-        self.client_id
-    }
-
-    pub fn project_id(&self) -> &str {
-        &self.project_id
-    }
-
-    pub fn worktree_id(&self) -> &str {
-        &self.worktree_id
-    }
-
-    pub fn manifest_digest(&self) -> &str {
-        &self.manifest_digest
-    }
-
-    pub fn verified_at_millis(&self) -> u64 {
-        self.verified_at_millis
-    }
-
-    pub fn cache_reused(&self) -> bool {
-        self.cache_reused
-    }
-}
-
-impl Serialize for VerifiedSnapshotResponse {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.validate().map_err(ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("VerifiedSnapshotResponse", 8)?;
-        record.serialize_field("protocol_version", &self.protocol_version)?;
-        record.serialize_field("job_id", &self.job_id)?;
-        record.serialize_field("client_id", &self.client_id)?;
-        record.serialize_field("project_id", &self.project_id)?;
-        record.serialize_field("worktree_id", &self.worktree_id)?;
-        record.serialize_field("manifest_digest", &self.manifest_digest)?;
-        record.serialize_field("verified_at_millis", &self.verified_at_millis)?;
-        record.serialize_field("cache_reused", &self.cache_reused)?;
-        record.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for VerifiedSnapshotResponse {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            protocol_version: u32,
-            job_id: JobId,
-            client_id: ClientId,
-            project_id: String,
-            worktree_id: String,
-            manifest_digest: String,
-            verified_at_millis: u64,
-            cache_reused: bool,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        let response = Self {
-            protocol_version: wire.protocol_version,
-            job_id: wire.job_id,
-            client_id: wire.client_id,
-            project_id: wire.project_id,
-            worktree_id: wire.worktree_id,
-            manifest_digest: wire.manifest_digest,
-            verified_at_millis: wire.verified_at_millis,
-            cache_reused: wire.cache_reused,
-        };
-        response.validate().map_err(de::Error::custom)?;
-        Ok(response)
-    }
 }

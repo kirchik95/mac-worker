@@ -4141,124 +4141,6 @@ impl StatusResponse {
     }
 }
 
-pub const MAX_FLEET_RECONCILE_IDS: usize = 100;
-
-/// Fixed, bounded host request.  It is deliberately only a set of known job
-/// IDs: no path, namespace, or worker-wide discovery input is accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FleetReconcileRequest {
-    pub known_job_ids: Vec<JobId>,
-}
-
-impl FleetReconcileRequest {
-    pub fn new(known_job_ids: Vec<JobId>) -> Result<Self, WorkerError> {
-        let request = Self { known_job_ids };
-        request.validate()?;
-        Ok(request)
-    }
-
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.known_job_ids.len() > MAX_FLEET_RECONCILE_IDS {
-            return Err(protocol_error(
-                "fleet reconciliation request exceeds 100 job IDs",
-            ));
-        }
-        for (index, job_id) in self.known_job_ids.iter().enumerate() {
-            if self.known_job_ids[..index].contains(job_id) {
-                return Err(protocol_error(
-                    "fleet reconciliation request contains duplicate job IDs",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn known_job_ids(&self) -> &[JobId] {
-        &self.known_job_ids
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-pub enum FleetReconcileJobResult {
-    Status {
-        status: Box<StatusResponse>,
-    },
-    Error {
-        job_id: JobId,
-        error: HostControlError,
-    },
-}
-
-impl FleetReconcileJobResult {
-    pub fn job_id(&self) -> JobId {
-        match self {
-            Self::Status { status } => status.meta().job_id(),
-            Self::Error { job_id, .. } => *job_id,
-        }
-    }
-
-    pub fn status(&self) -> Option<&StatusResponse> {
-        match self {
-            Self::Status { status } => Some(status),
-            Self::Error { .. } => None,
-        }
-    }
-
-    pub fn error(&self) -> Option<&HostControlError> {
-        match self {
-            Self::Status { .. } => None,
-            Self::Error { error, .. } => Some(error),
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        match self {
-            Self::Status { status } => status.validate(),
-            Self::Error { error, .. } => error.validate(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FleetReconcileResponse {
-    pub results: Vec<FleetReconcileJobResult>,
-}
-
-impl FleetReconcileResponse {
-    pub fn new(results: Vec<FleetReconcileJobResult>) -> Result<Self, WorkerError> {
-        let response = Self { results };
-        response.validate()?;
-        Ok(response)
-    }
-
-    pub fn validate(&self) -> Result<(), WorkerError> {
-        if self.results.len() > MAX_FLEET_RECONCILE_IDS {
-            return Err(protocol_error(
-                "fleet reconciliation response exceeds 100 job IDs",
-            ));
-        }
-        for (index, result) in self.results.iter().enumerate() {
-            result.validate()?;
-            if self.results[..index]
-                .iter()
-                .any(|prior| prior.job_id() == result.job_id())
-            {
-                return Err(protocol_error(
-                    "fleet reconciliation response contains duplicate job IDs",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn results(&self) -> &[FleetReconcileJobResult] {
-        &self.results
-    }
-}
-
 /// Fixed-operation request for cancelling exactly one accepted job.  Unlike
 /// the general request envelopes it intentionally has no protocol-version
 /// field: the operation is bound by the immutable accepted identity, while
@@ -5519,18 +5401,6 @@ impl<'de> Deserialize<'de> for HostControlError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonEvent {
-    Accepted {
-        protocol_version: u32,
-        response: SubmitResponse,
-    },
-    Log {
-        protocol_version: u32,
-        chunk: LogChunk,
-    },
-    Status {
-        protocol_version: u32,
-        response: Box<StatusResponse>,
-    },
     TaskCreated {
         protocol_version: u32,
         task_id: crate::task::TaskId,
@@ -5573,18 +5443,6 @@ impl Serialize for JsonEvent {
         #[derive(Serialize)]
         #[serde(tag = "event", rename_all = "snake_case")]
         enum Wire<'a> {
-            Accepted {
-                protocol_version: u32,
-                response: &'a SubmitResponse,
-            },
-            Log {
-                protocol_version: u32,
-                chunk: &'a LogChunk,
-            },
-            Status {
-                protocol_version: u32,
-                response: &'a StatusResponse,
-            },
             TaskCreated {
                 protocol_version: u32,
                 task_id: crate::task::TaskId,
@@ -5622,30 +5480,6 @@ impl Serialize for JsonEvent {
         }
 
         match self {
-            Self::Accepted {
-                protocol_version,
-                response,
-            } => Wire::Accepted {
-                protocol_version: *protocol_version,
-                response,
-            }
-            .serialize(serializer),
-            Self::Log {
-                protocol_version,
-                chunk,
-            } => Wire::Log {
-                protocol_version: *protocol_version,
-                chunk,
-            }
-            .serialize(serializer),
-            Self::Status {
-                protocol_version,
-                response,
-            } => Wire::Status {
-                protocol_version: *protocol_version,
-                response,
-            }
-            .serialize(serializer),
             Self::TaskCreated {
                 protocol_version,
                 task_id,
@@ -5721,27 +5555,6 @@ impl Serialize for JsonEvent {
 impl JsonEvent {
     pub fn validate(&self) -> Result<(), WorkerError> {
         let version = match self {
-            Self::Accepted {
-                protocol_version,
-                response,
-            } => {
-                response_status_validate(response)?;
-                *protocol_version
-            }
-            Self::Log {
-                protocol_version,
-                chunk,
-            } => {
-                chunk.validate()?;
-                *protocol_version
-            }
-            Self::Status {
-                protocol_version,
-                response,
-            } => {
-                response.validate()?;
-                *protocol_version
-            }
             Self::TaskCreated {
                 protocol_version,
                 title,
@@ -5808,18 +5621,6 @@ impl<'de> Deserialize<'de> for JsonEvent {
         #[derive(Deserialize)]
         #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
-            Accepted {
-                protocol_version: u32,
-                response: SubmitResponse,
-            },
-            Log {
-                protocol_version: u32,
-                chunk: LogChunk,
-            },
-            Status {
-                protocol_version: u32,
-                response: Box<StatusResponse>,
-            },
             TaskCreated {
                 protocol_version: u32,
                 task_id: crate::task::TaskId,
@@ -5857,27 +5658,6 @@ impl<'de> Deserialize<'de> for JsonEvent {
         }
 
         let event = match Wire::deserialize(deserializer)? {
-            Wire::Accepted {
-                protocol_version,
-                response,
-            } => Self::Accepted {
-                protocol_version,
-                response,
-            },
-            Wire::Log {
-                protocol_version,
-                chunk,
-            } => Self::Log {
-                protocol_version,
-                chunk,
-            },
-            Wire::Status {
-                protocol_version,
-                response,
-            } => Self::Status {
-                protocol_version,
-                response,
-            },
             Wire::TaskCreated {
                 protocol_version,
                 task_id,

@@ -17,12 +17,12 @@ use crate::{
     gc::{GcReport, GcRequest},
     host_store::{HostStore, JobDisposition},
     job::{
-        CancelRequest, CancelResponse, ClientId, CommandSummary, FleetReconcileRequest,
-        FleetReconcileResponse, HostControlError, JobId, LeaseAcquireRequest, LeaseRecord,
-        LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream, MAX_LOG_CHUNK_BYTES,
-        PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse,
-        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        CancelRequest, CancelResponse, ClientId, CommandSummary, HostControlError, JobId,
+        LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
+        LogStream, MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint,
+        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
+        StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse, SubmitRequest,
+        SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRunner},
@@ -47,8 +47,6 @@ const MAX_CONTROL_POLICY_DEADLINE: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostOperation {
     LeaseAcquire,
-    SnapshotVerify,
-    Submit,
     Gc,
     Status,
     LogChunk,
@@ -65,7 +63,6 @@ pub enum HostOperation {
     RefreshFacts,
     RefreshFactsClear,
     Cancel,
-    Reconcile,
     AgentSettingsGet,
     AgentSettingsSet,
     ControllerConfigure,
@@ -83,8 +80,6 @@ impl HostOperation {
     pub fn command(self) -> &'static str {
         match self {
             Self::LeaseAcquire => "~/.local/bin/worker host lease-acquire",
-            Self::SnapshotVerify => "~/.local/bin/worker host snapshot-verify",
-            Self::Submit => "~/.local/bin/worker host submit",
             Self::Gc => "~/.local/bin/worker host gc",
             Self::Status => "~/.local/bin/worker host status",
             Self::LogChunk => "~/.local/bin/worker host log-chunk",
@@ -103,7 +98,6 @@ impl HostOperation {
                 "~/.local/bin/worker host refresh-facts --clear-auth-incidents"
             }
             Self::Cancel => "~/.local/bin/worker host cancel",
-            Self::Reconcile => "~/.local/bin/worker host reconcile",
             Self::AgentSettingsGet => "~/.local/bin/worker host agent-settings-get",
             Self::AgentSettingsSet => "~/.local/bin/worker host agent-settings-set",
             Self::ControllerConfigure => "~/.local/bin/worker host controller-configure",
@@ -704,33 +698,6 @@ impl<'a> RemoteJobClient<'a> {
             request,
             control_policy(MAX_CONTROL_DEADLINE),
         )
-    }
-
-    pub fn reconcile(
-        &self,
-        worker: &WorkerEntry,
-        request: &FleetReconcileRequest,
-    ) -> Result<FleetReconcileResponse, WorkerError> {
-        request.validate()?;
-        let response: FleetReconcileResponse = self.transport.request(
-            worker,
-            HostOperation::Reconcile,
-            request,
-            control_policy(MAX_CONTROL_DEADLINE),
-        )?;
-        response.validate().map_err(|_| invalid_remote_response())?;
-        if response.results().len() != request.known_job_ids().len()
-            || response.results().iter().any(|result| {
-                !request.known_job_ids().contains(&result.job_id())
-                    || result.status().is_some_and(|status| {
-                        status.meta().worker_name() != worker.name
-                            || status.meta().job_id() != result.job_id()
-                    })
-            })
-        {
-            return Err(invalid_remote_response());
-        }
-        Ok(response)
     }
 
     pub fn cancel(

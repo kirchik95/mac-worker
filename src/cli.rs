@@ -442,15 +442,11 @@ pub enum HostCommand {
     #[command(name = "resolve-or-abandon")]
     ResolveOrAbandon,
     Cancel,
-    Reconcile,
-    Submit,
     Supervise {
         job_id: HiddenComponent,
     },
     #[command(name = "lease-acquire")]
     LeaseAcquire,
-    #[command(name = "snapshot-verify")]
-    SnapshotVerify,
     #[command(name = "migrate-layout")]
     MigrateLayout,
     #[command(name = "complete-protocol-upgrade")]

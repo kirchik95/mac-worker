@@ -8,7 +8,6 @@ mod task_state_fixture;
 mod admission_cache;
 mod client_state;
 mod client_state_active_tasks;
-mod legacy_fleet_protocol;
 mod scheduler_adapter;
 mod scheduler_concurrency;
 mod scheduler_policy;

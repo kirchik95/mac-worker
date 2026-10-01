@@ -28,9 +28,8 @@ use git_transport::{
 use host_store::HostStore;
 use install::Installer;
 use job::{
-    CancelRequest, FleetReconcileJobResult, FleetReconcileRequest, FleetReconcileResponse,
-    HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest, LogChunkResponse,
-    ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest, SubmitRequest,
+    CancelRequest, HostControlError, JsonEvent, LeaseAcquireRequest, LogChunkRequest,
+    LogChunkResponse, ResolveOrAbandonRequest, StatusLogsRequest, StatusRequest,
 };
 use job_service::JobService;
 use laptop::{
@@ -43,7 +42,6 @@ use paths::PathLayout;
 use probe::ProbeCollector;
 use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport, SetupWarning, SetupWarningCode, WorkersReport};
-use remote_snapshot::{RemoteSnapshotService, SnapshotVerifyRequest, VerifiedSnapshotResponse};
 use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use supervisor::{
@@ -539,21 +537,6 @@ fn execute_with_context(
             command: HostCommand::Cancel,
         } => Err(WorkerError::Protocol(
             "host cancel requires the stdio execution boundary".into(),
-        )),
-        Command::Host {
-            command: HostCommand::Reconcile,
-        } => Err(WorkerError::Protocol(
-            "host reconcile requires the stdio execution boundary".into(),
-        )),
-        Command::Host {
-            command: HostCommand::SnapshotVerify,
-        } => Err(WorkerError::Protocol(
-            "host snapshot-verify requires the stdio execution boundary".into(),
-        )),
-        Command::Host {
-            command: HostCommand::Submit,
-        } => Err(WorkerError::Protocol(
-            "host submit requires the stdio execution boundary".into(),
         )),
         Command::Host {
             command: HostCommand::Supervise { .. },
@@ -2916,14 +2899,7 @@ fn run_command_with_stdio_in_context(
     ) {
         return run_host_controller_rpc(cli.config, runtime, runner, stdin, stdout, stderr);
     }
-    if matches!(
-        &cli.command,
-        Command::Host {
-            command: HostCommand::Submit
-        }
-    ) {
-        return run_host_submit(cli.config, runtime, stdin, stdout);
-    }
+
     if let Command::Host {
         command: HostCommand::Supervise { job_id },
     } = &cli.command
@@ -3068,14 +3044,7 @@ fn run_command_with_stdio_in_context(
     ) {
         return run_host_lease_acquire(cli.config, runtime, stdin, stdout);
     }
-    if matches!(
-        &cli.command,
-        Command::Host {
-            command: HostCommand::SnapshotVerify
-        }
-    ) {
-        return run_host_snapshot_verify(cli.config, runtime, stdin, stdout);
-    }
+
     if matches!(
         &cli.command,
         Command::Host {
@@ -3261,14 +3230,7 @@ fn run_command_with_stdio_in_context(
     ) {
         return run_host_cancel(cli.config, runtime, stdin, stdout);
     }
-    if matches!(
-        &cli.command,
-        Command::Host {
-            command: HostCommand::Reconcile
-        }
-    ) {
-        return run_host_reconcile(cli.config, runtime, stdin, stdout);
-    }
+
     if matches!(
         cli.command,
         Command::Workers {
@@ -3739,55 +3701,6 @@ fn current_time_millis() -> Result<u64, WorkerError> {
         })
 }
 
-fn run_host_submit(
-    config_override: Option<PathBuf>,
-    runtime: &RuntimeContext,
-    stdin: &mut dyn Read,
-    stdout: &mut dyn Write,
-) -> u8 {
-    const LIMIT: usize = 1024 * 1024;
-    let result = (|| -> Result<job::SubmitResponse, WorkerError> {
-        let mut bytes = Vec::new();
-        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
-        if bytes.len() > LIMIT {
-            return Err(WorkerError::Protocol(
-                "submit request exceeded 1 MiB".into(),
-            ));
-        }
-        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        let request = SubmitRequest::deserialize(&mut deserializer)
-            .map_err(|_| WorkerError::Protocol("invalid submit request".into()))?;
-        deserializer
-            .end()
-            .map_err(|_| WorkerError::Protocol("submit request contained trailing data".into()))?;
-        if serde_json::to_vec(&request)
-            .map_err(|_| WorkerError::Protocol("submit request serialization failed".into()))?
-            != bytes
-        {
-            return Err(WorkerError::Protocol(
-                "submit request was not canonical JSON".into(),
-            ));
-        }
-        let paths = discover_paths(config_override, runtime)?;
-        let store = HostStore::open(&paths.host_state_root())?;
-        let launcher = SystemSupervisorLauncher::new()?;
-        JobService::new(&store, &launcher).submit(request)
-    })();
-
-    let exit = match &result {
-        Ok(_) => 0,
-        Err(error) => error.exit_code(),
-    };
-    let write_result = match result {
-        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
-        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
-    };
-    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
-        return crate::error::ExitKind::Io as u8;
-    }
-    exit
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_host_outbox(
     config_override: Option<PathBuf>,
@@ -4144,40 +4057,6 @@ fn run_host_cancel(
         stdin,
         stdout,
         |request: CancelRequest, store, launcher| JobService::new(store, launcher).cancel(request),
-    )
-}
-
-fn run_host_reconcile(
-    config_override: Option<PathBuf>,
-    runtime: &RuntimeContext,
-    stdin: &mut dyn Read,
-    stdout: &mut dyn Write,
-) -> u8 {
-    run_host_control_endpoint(
-        config_override,
-        runtime,
-        stdin,
-        stdout,
-        |request: FleetReconcileRequest, store, launcher| {
-            request.validate()?;
-            let service = JobService::new(store, launcher);
-            FleetReconcileResponse::new(
-                request
-                    .known_job_ids()
-                    .iter()
-                    .copied()
-                    .map(|job_id| match service.reconcile_job(job_id) {
-                        Ok(status) => FleetReconcileJobResult::Status {
-                            status: Box::new(status),
-                        },
-                        Err(error) => FleetReconcileJobResult::Error {
-                            job_id,
-                            error: versioned_host_error(&error),
-                        },
-                    })
-                    .collect(),
-            )
-        },
     )
 }
 
@@ -5063,46 +4942,6 @@ fn run_host_lease_acquire(
             .try_into()
             .map_err(|_| WorkerError::Protocol("system clock overflow".into()))?;
         LeaseService::new(&store).acquire(&request, &facts, now)
-    })();
-
-    let exit = match &result {
-        Ok(_) => 0,
-        Err(error) => error.exit_code(),
-    };
-    let write_result = match result {
-        Ok(response) => serde_json::to_writer(&mut *stdout, &response),
-        Err(error) => serde_json::to_writer(&mut *stdout, &versioned_host_error(&error)),
-    };
-    if write_result.is_err() || stdout.write_all(b"\n").is_err() || stdout.flush().is_err() {
-        return crate::error::ExitKind::Io as u8;
-    }
-    exit
-}
-
-fn run_host_snapshot_verify(
-    config_override: Option<PathBuf>,
-    runtime: &RuntimeContext,
-    stdin: &mut dyn Read,
-    stdout: &mut dyn Write,
-) -> u8 {
-    const LIMIT: usize = 1024 * 1024;
-    let result = (|| -> Result<VerifiedSnapshotResponse, WorkerError> {
-        let mut bytes = Vec::new();
-        stdin.take((LIMIT + 1) as u64).read_to_end(&mut bytes)?;
-        if bytes.len() > LIMIT {
-            return Err(WorkerError::Protocol(
-                "snapshot-verify request exceeded 1 MiB".into(),
-            ));
-        }
-        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        let request = SnapshotVerifyRequest::deserialize(&mut deserializer)
-            .map_err(|_| WorkerError::Protocol("invalid snapshot-verify request".into()))?;
-        deserializer.end().map_err(|_| {
-            WorkerError::Protocol("snapshot-verify request contained trailing data".into())
-        })?;
-        let paths = discover_paths(config_override, runtime)?;
-        let store = HostStore::open(&paths.host_state_root())?;
-        RemoteSnapshotService::new(&store).verify_request(&request)
     })();
 
     let exit = match &result {
