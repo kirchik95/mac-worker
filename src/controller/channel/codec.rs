@@ -8,16 +8,14 @@ use std::os::unix::process::ExitStatusExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub mod io;
+pub(crate) mod io;
 pub use io::FramedSocketConnector;
 
 use super::contracts::{
     CHANNEL_VERSION, ChannelFailure, ChannelReason, IDENTITY_BYTES, RouteDigest, ServiceIdentity,
     SocketIdentity, verify_expected_service,
 };
-pub use super::contracts::{
-    ChannelCodec, DecodeProgress, FrameDecoder, SocketConnector, SocketSession,
-};
+use super::contracts::{ChannelCodec, DecodeProgress, FrameDecoder};
 use crate::{
     controller::{
         protocol::{self, ControllerRequest, MAX_FRAME_BYTES},
@@ -31,7 +29,7 @@ use crate::{
 
 /// At most one validated frame; coalesced trailing bytes remain with the caller.
 #[derive(Default)]
-pub struct BoundedFrameDecoder {
+struct BoundedFrameDecoder {
     prefix: [u8; 4],
     prefix_bytes: usize,
     length: Option<usize>,

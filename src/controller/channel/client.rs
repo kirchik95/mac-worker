@@ -5,7 +5,7 @@ use super::contracts::{
     CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ConfiguredRoute,
     ForwardDisposition, ForwardLease, MAX_FRAME_BYTES, REQUEST_GUARD, SETUP_GUARD, SocketSession,
 };
-pub use super::contracts::{ClientContext, ClientDeps, ReadLoopScope, eligible_read};
+use super::contracts::{ClientContext, ClientDeps, ReadLoopScope, eligible_read};
 use crate::{
     controller::{ControllerRequest, decode_request},
     error::{ProcessError, WorkerError},

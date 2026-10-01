@@ -1,7 +1,6 @@
 //! Explicit integration-test access for channel contracts.
 
-pub use crate::controller::channel::contracts::{ControllerAccount, Pin, ServiceIdentity};
-pub use crate::controller::channel::{
+pub use crate::controller::channel::contracts::{
     CHANNEL_VERSION, ChannelCodec, ChannelExecutor, ChannelFailure, ChannelReason, ChannelRuntime,
     ChildRpcSpec, CleanupContext, ClientContext, ClientDeps, ConfiguredRoute,
     DETACHED_RUNNER_EXECUTABLE_ENV, DecodeProgress, EntryIdentity, ForwardControl,
@@ -14,6 +13,7 @@ pub use crate::controller::channel::{
     SocketIdentity, SocketIdentityResult, SocketSession, UuidString, eligible_read,
     server_eligible_read, verify_expected_service,
 };
+pub use crate::controller::channel::contracts::{ControllerAccount, Pin, ServiceIdentity};
 pub mod client {
     pub use crate::controller::channel::client::ChannelProcessRunner;
 }
@@ -59,7 +59,8 @@ pub mod image {
     pub use crate::controller::channel::image::SystemRunningImageSource;
 }
 pub mod pin {
-    pub use crate::controller::channel::pin::{Pin, PrivatePinStore};
+    pub use crate::controller::channel::contracts::Pin;
+    pub use crate::controller::channel::pin::PrivatePinStore;
 }
 pub mod server {
     pub use crate::controller::channel::server::{

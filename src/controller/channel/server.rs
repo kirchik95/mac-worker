@@ -1,8 +1,8 @@
 //! Nonblocking controller read service and bounded native jobs.
-pub use super::contracts::{ChannelExecutor, ChildRpcSpec, ServerContext};
-pub use crate::process::{CleanupState, ProcessCompletion, TrackedProcessRunner};
-pub mod child;
-pub mod control;
+use super::contracts::{ChannelExecutor, ServerContext};
+use crate::process::{CleanupState, ProcessCompletion};
+mod child;
+mod control;
 use crate::{
     controller::{
         MAX_FRAME_BYTES,

@@ -4,16 +4,16 @@
 //! Each implementation facade is owned by its later track; shared interfaces
 //! and test doubles stay here so those tracks need no sibling implementations.
 
-pub mod client;
-pub mod codec;
-pub mod contracts;
-pub mod files;
-pub mod forward;
-pub mod identity;
-pub mod image;
-pub mod pin;
-pub mod server;
-#[doc(hidden)]
-pub mod testing;
+pub(crate) mod client;
+pub(crate) mod codec;
+pub(crate) mod contracts;
+pub(crate) mod files;
+pub(crate) mod forward;
+pub(crate) mod identity;
+pub(crate) mod image;
+pub(crate) mod pin;
+pub(crate) mod server;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod testing;
 
-pub use contracts::*;
+pub(crate) use contracts::*;

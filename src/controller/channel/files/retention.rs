@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, io, time::Duration};
 const FILE: &str = "links.json";
 const BYTES: u64 = 64 * 1024;
 const MAX_GENERATIONS: usize = 64;
-pub const LINK_GRACE: Duration = Duration::from_secs(10 * 60);
+const LINK_GRACE: Duration = Duration::from_secs(10 * 60);
 
 fn invalid() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)

@@ -7,9 +7,7 @@ use super::contracts::{
     ChannelFailure, ChannelReason, CleanupContext, ForwardDisposition, IDENTITY_BYTES,
     PinnedExecutable, RunningImage, ServiceIdentity, UuidString,
 };
-pub use super::contracts::{
-    EntryIdentity, ForwardPath, ForwardPaths, ServiceRecord, SocketBinding,
-};
+use super::contracts::{EntryIdentity, ForwardPath, ForwardPaths, ServiceRecord, SocketBinding};
 use crate::{
     controller::{ControllerLeader, health_read::observe_leader},
     error::WorkerError,
@@ -22,7 +20,7 @@ use crate::{
 use std::{io, os::unix::net::UnixListener, path::Path};
 mod core;
 mod retention;
-pub use retention::{LINK_GRACE, RetentionTime};
+pub use retention::RetentionTime;
 
 pub(crate) fn public_entry(value: PrivateEntryIdentity) -> EntryIdentity {
     EntryIdentity {
@@ -267,6 +265,7 @@ fn stale_evidence(
 
 /// Optional stale discovery cleanup on native work. The latest image remains
 /// protected, even with RPC-exit proof; age cleanup happens at later startups.
+#[cfg(any(test, feature = "test-support"))]
 pub fn cleanup_prior_generation(paths: &PathLayout, rpc_exits_proven: bool) -> ForwardDisposition {
     let clean = || -> Result<(), WorkerError> {
         if !rpc_exits_proven {

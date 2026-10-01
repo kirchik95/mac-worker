@@ -3,9 +3,8 @@ use super::contracts::{
     ChannelCodec, ChannelFailure, ChannelReason, ClientContext, ConfiguredRoute, MasterPlan,
     RouteDigest,
 };
-pub use super::contracts::{
+use super::contracts::{
     ControllerAccount, IdentitySource, ServiceIdentity, SocketIdentity, SocketIdentityResult,
-    verify_expected_service,
 };
 use super::files::{read_record, validate_live_bindings};
 use crate::{

@@ -1,6 +1,6 @@
 //! Independently verified loaded image and installed runner path. Blocking native work.
 use super::contracts::{ChannelFailure, ChannelReason};
-pub use super::contracts::{PinnedExecutable, RunningImage, RunningImageSource};
+use super::contracts::{RunningImage, RunningImageSource};
 mod core;
 
 #[derive(Default)]

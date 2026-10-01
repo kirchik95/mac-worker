@@ -1,6 +1,6 @@
 //! Stable private pin independent of the existing notify cache key. Blocking native work.
 use super::contracts::{ChannelFailure, ChannelReason, SocketIdentity};
-pub use super::contracts::{Pin, PinStore, RouteDigest};
+use super::contracts::{Pin, PinStore};
 use crate::{job::ClientId, paths::PathLayout};
 mod core;
 

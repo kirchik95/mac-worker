@@ -9,12 +9,12 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
@@ -497,9 +497,11 @@ pub struct ServerContext {
     pub cancelled: Arc<AtomicBool>,
 }
 impl ServerContext {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_sub(self.runtime.now())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn check(&self) -> Result<(), ChannelFailure> {
         if self.cancelled.load(Ordering::Acquire) || self.runtime.cancelled() {
             return Err(unavailable(ChannelReason::Cancelled));
