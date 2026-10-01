@@ -1,12 +1,6 @@
 use std::{
     collections::HashMap,
-    ffi::OsString,
-    fmt, fs,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        process::{CommandExt, ExitStatusExt},
-    },
-    process::{Command, Stdio},
+    fmt,
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -31,9 +25,7 @@ use crate::{
         StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
-    rooted_fs::RootedDir,
-    snapshot::Snapshot,
+    process::{ProcessPolicy, ProcessRunner},
     task::TaskId,
     task_store::{
         TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
@@ -52,14 +44,6 @@ const MAX_CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 /// Upper bound a caller may choose. Controller service changes wait out
 /// launchd, see `controller::service::SERVICE_CHANGE_DEADLINE`.
 const MAX_CONTROL_POLICY_DEADLINE: Duration = Duration::from_secs(90);
-const RSYNC_PROGRAM: &str = "/usr/bin/rsync";
-const RSYNC_POLICY: ProcessPolicy = ProcessPolicy {
-    stdout_limit: 256 * 1024,
-    stderr_limit: 256 * 1024,
-    deadline: Duration::from_secs(15 * 60),
-};
-const MAX_RSYNC_STATS_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostOperation {
     LeaseAcquire,
@@ -344,139 +328,9 @@ impl fmt::Debug for TransferIdentity {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TransferReceipt {
-    pub files_transferred: u64,
-    pub file_bytes_transferred: u64,
-    pub wire_bytes_sent: u64,
-    pub wire_bytes_received: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferFailureDisposition {
-    DefinitelyNotStarted,
-    ResolveOrAbandon,
-}
-
-pub fn transfer_failure_disposition(error: &WorkerError) -> TransferFailureDisposition {
-    match error {
-        WorkerError::Transport {
-            code:
-                "INVALID_TRANSFER_CONFIGURATION"
-                | "INVALID_SNAPSHOT_SOURCE"
-                | "INVALID_TRANSFER_IDENTITY",
-            ..
-        } => TransferFailureDisposition::DefinitelyNotStarted,
-        _ => TransferFailureDisposition::ResolveOrAbandon,
-    }
-}
-
-pub struct RsyncTransport<'a> {
-    runner: &'a dyn ProcessRunner,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbandonTransferResult {
     Abandoned,
-}
-
-pub struct RsyncServerInvocation<'a> {
-    server_args: &'a [OsString],
-    destination: &'a RootedDir,
-    transfer_guard: &'a TransferGuard,
-}
-
-impl<'a> RsyncServerInvocation<'a> {
-    pub fn server_args(&self) -> &'a [OsString] {
-        self.server_args
-    }
-
-    pub fn destination(&self) -> &'a RootedDir {
-        self.destination
-    }
-}
-
-pub trait RsyncServerExecutor: Send + Sync {
-    fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemRsyncServerExecutor;
-
-impl RsyncServerExecutor for SystemRsyncServerExecutor {
-    fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
-        let mut command = Command::new(RSYNC_PROGRAM);
-        command
-            .args(invocation.server_args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        execute_server_child(&mut command, invocation)
-    }
-}
-
-fn execute_server_child(
-    command: &mut Command,
-    invocation: RsyncServerInvocation<'_>,
-) -> Result<(), WorkerError> {
-    invocation.destination.verify_descriptors_cloexec()?;
-    let destination_fd = invocation.destination.raw_directory_fd();
-    let transfer_fd = invocation.transfer_guard.raw_lock_fd_for_exec()?;
-    let fd_ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    if fd_ceiling < 0 || fd_ceiling > i64::from(i32::MAX) {
-        return Err(WorkerError::Io(std::io::Error::last_os_error()));
-    }
-    let fd_ceiling = fd_ceiling as i32;
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(destination_fd) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for descriptor in 3..fd_ceiling {
-                if descriptor != transfer_fd {
-                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
-                    if flags == -1 {
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::EBADF) {
-                            return Err(error);
-                        }
-                    } else if flags & libc::FD_CLOEXEC == 0
-                        && libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-            }
-            let flags = libc::fcntl(transfer_fd, libc::F_GETFD);
-            if flags == -1
-                || libc::fcntl(transfer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let status = {
-        #[cfg(test)]
-        let _fork_exclusion = crate::test_sync::HeldFork::acquire();
-        command.spawn()?
-    }
-    .wait()?;
-    if status.success() {
-        return Ok(());
-    }
-    let code = status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .or_else(|| {
-            status
-                .signal()
-                .and_then(|signal| u8::try_from(signal).ok())
-                .and_then(|signal| 128_u8.checked_add(signal))
-        })
-        .ok_or_else(|| WorkerError::Protocol("rsync server child status was invalid".into()))?;
-    Err(WorkerError::CommandExit { code })
 }
 
 pub struct HostTransferService<'a> {
@@ -504,47 +358,6 @@ impl<'a> HostTransferService<'a> {
     }
 
     #[doc(hidden)]
-    pub fn receive(
-        &self,
-        identity: &TransferIdentity,
-        supplied_server_args: &[OsString],
-        executor: &dyn RsyncServerExecutor,
-    ) -> Result<(), WorkerError> {
-        let server_args = validated_server_args(supplied_server_args)?;
-        self.store.validate_layout()?;
-        let admission = self.store.admission_lock(identity.job_id)?;
-        admission.validate()?;
-        if crate::lease::LeaseService::new(self.store)
-            .load_for_job(identity.job_id)?
-            .is_none()
-        {
-            require_receivable_identity_disposition(self.store, identity)?;
-        }
-        let live = require_live_identity(self.store, identity)?;
-        require_receivable_disposition(self.store, &live)?;
-        let transfer = self
-            .store
-            .transfer_lock_after(&admission, identity.job_id)?;
-        admission.validate()?;
-        transfer.validate()?;
-        let live = require_live_identity(self.store, identity)?;
-        require_receivable_disposition(self.store, &live)?;
-        let destination = self.store.open_directory(
-            &format!("incoming/{}/{}", identity.job_id, identity.lease_token),
-            true,
-        )?;
-        admission.validate()?;
-        transfer.validate()?;
-        self.store.verify_descriptors_cloexec()?;
-        drop(admission);
-        executor.execute(RsyncServerInvocation {
-            server_args: &server_args,
-            destination: &destination,
-            transfer_guard: &transfer,
-        })
-    }
-
-    #[doc(hidden)]
     pub fn abandon(
         &self,
         request: &LeaseAcquireRequest,
@@ -566,89 +379,6 @@ impl<'a> HostTransferService<'a> {
                 "exact abandonment cleanup is pending",
             )),
         }
-    }
-}
-
-fn rsync_remote_shell() -> Result<OsString, WorkerError> {
-    crate::transport::rsync_ssh_shell(crate::transport::SshTarget::Worker)
-}
-
-impl<'a> RsyncTransport<'a> {
-    pub fn new(runner: &'a dyn ProcessRunner) -> Self {
-        Self { runner }
-    }
-
-    pub fn upload(
-        &self,
-        worker: &WorkerEntry,
-        snapshot: &Snapshot,
-        identity: &TransferIdentity,
-    ) -> Result<TransferReceipt, WorkerError> {
-        validate_rsync_worker(worker)?;
-        let metadata = fs::symlink_metadata(snapshot.publication_root()).map_err(|_| {
-            transport_error(
-                "INVALID_SNAPSHOT_SOURCE",
-                "verified snapshot publication is unavailable",
-            )
-        })?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(transport_error(
-                "INVALID_SNAPSHOT_SOURCE",
-                "verified snapshot publication is unavailable",
-            ));
-        }
-
-        let mut source = snapshot.publication_root().as_os_str().as_bytes().to_vec();
-        if !source.ends_with(b"/") {
-            source.push(b'/');
-        }
-        let remote_command = format!(
-            "--rsync-path=~/.local/bin/worker host rsync-receive {} {} {} {}",
-            identity.job_id, identity.client_id, identity.lease_token, identity.request_fingerprint
-        );
-        let request = ProcessRequest {
-            program: RSYNC_PROGRAM.into(),
-            args: vec![
-                "--archive".into(),
-                "--delete".into(),
-                "--no-owner".into(),
-                "--no-group".into(),
-                "--stats".into(),
-                "-e".into(),
-                rsync_remote_shell()?,
-                remote_command.into(),
-                OsString::from_vec(source),
-                format!("{}:incoming", worker.ssh).into(),
-            ],
-            environment: vec![("LC_ALL".into(), "C".into()), ("LANG".into(), "C".into())],
-            environment_remove: vec!["LANGUAGE".into()],
-            stdin: None,
-            policy: RSYNC_POLICY,
-            isolate_parent_environment: false,
-        };
-        let result = self.runner.run(&request).map_err(map_rsync_failure)?;
-        if result.stdout.len() > RSYNC_POLICY.stdout_limit {
-            return Err(transport_error(
-                "RSYNC_OUTPUT_TOO_LARGE",
-                "rsync output exceeded its limit",
-            ));
-        }
-        if result.stderr.len() > RSYNC_POLICY.stderr_limit {
-            return Err(transport_error(
-                "RSYNC_OUTPUT_TOO_LARGE",
-                "rsync output exceeded its limit",
-            ));
-        }
-        if !result.status.success() {
-            return Err(transport_error("RSYNC_FAILED", "rsync upload failed"));
-        }
-        if !result.stderr.is_empty() {
-            return Err(transport_error(
-                "RSYNC_DIAGNOSTIC_PRESENT",
-                "rsync emitted an unexpected diagnostic",
-            ));
-        }
-        parse_rsync_stats(&result.stdout)
     }
 }
 
@@ -1544,37 +1274,6 @@ fn validate_control_policy(policy: ProcessPolicy) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn validated_server_args(supplied: &[OsString]) -> Result<Vec<OsString>, WorkerError> {
-    const EXPECTED: &[&str] = &[
-        "--server",
-        "--delete-before",
-        "-l",
-        "-p",
-        "-D",
-        "-r",
-        "-t",
-        "--dirs",
-        ".",
-        "incoming",
-    ];
-    if supplied.len() != EXPECTED.len()
-        || supplied
-            .iter()
-            .zip(EXPECTED)
-            .any(|(actual, expected)| actual != expected)
-    {
-        return Err(host_transfer_error(
-            "INVALID_RSYNC_SERVER_ARGS",
-            "rsync server arguments were rejected",
-        ));
-    }
-    let mut validated = supplied.to_vec();
-    *validated
-        .last_mut()
-        .expect("the fixed rsync server shape has a sink") = ".".into();
-    Ok(validated)
-}
-
 pub(crate) fn require_live_identity(
     store: &HostStore,
     identity: &TransferIdentity,
@@ -1626,54 +1325,6 @@ pub(crate) fn require_receivable_disposition(
                 Err(job_id_conflict())
             }
         }
-    }
-}
-
-fn require_receivable_identity_disposition(
-    store: &HostStore,
-    identity: &TransferIdentity,
-) -> Result<(), WorkerError> {
-    match store.disposition(identity.job_id())? {
-        None => Ok(()),
-        Some(JobDisposition::Abandoned {
-            job_id,
-            client_id,
-            request_fingerprint,
-            lease_token_sha256,
-            ..
-        }) => {
-            let token_hash = format!(
-                "{:x}",
-                Sha256::digest(identity.lease_token.to_string().as_bytes())
-            );
-            if job_id == identity.job_id
-                && client_id == identity.client_id
-                && request_fingerprint == identity.request_fingerprint
-                && lease_token_sha256 == token_hash
-            {
-                Err(host_transfer_error(
-                    "JOB_ABANDONED",
-                    "job ID was permanently abandoned",
-                ))
-            } else {
-                Err(job_id_conflict())
-            }
-        }
-        Some(JobDisposition::Accepted {
-            job_id,
-            client_id,
-            request_fingerprint,
-            ..
-        }) if job_id == identity.job_id
-            && client_id == identity.client_id
-            && request_fingerprint == identity.request_fingerprint =>
-        {
-            Err(host_transfer_error(
-                "JOB_ACCEPTED",
-                "job ID was already accepted",
-            ))
-        }
-        Some(JobDisposition::Accepted { .. }) => Err(job_id_conflict()),
     }
 }
 
@@ -1742,25 +1393,6 @@ fn validate_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn validate_rsync_worker(worker: &WorkerEntry) -> Result<(), WorkerError> {
-    let valid_alias = worker
-        .ssh
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_alphanumeric)
-        && worker
-            .ssh
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'@'));
-    if !valid_alias || worker.remote_binary != "~/.local/bin/worker" {
-        return Err(transport_error(
-            "INVALID_TRANSFER_CONFIGURATION",
-            "worker transfer configuration is invalid",
-        ));
-    }
-    Ok(())
-}
-
 fn map_control_failure(error: WorkerError) -> WorkerError {
     match error {
         WorkerError::Process(ProcessError::DeadlineExceeded { .. }) => {
@@ -1784,128 +1416,6 @@ fn map_control_failure(error: WorkerError) -> WorkerError {
     }
 }
 
-fn map_rsync_failure(error: WorkerError) -> WorkerError {
-    match error {
-        WorkerError::Process(ProcessError::DeadlineExceeded { .. }) => {
-            transport_error("RSYNC_TIMEOUT", "rsync upload timed out")
-        }
-        WorkerError::Process(ProcessError::OutputLimitExceeded { .. }) => {
-            transport_error("RSYNC_OUTPUT_TOO_LARGE", "rsync output exceeded its limit")
-        }
-        _ => transport_error("RSYNC_LAUNCH_FAILED", "failed to launch rsync upload"),
-    }
-}
-
-fn parse_rsync_stats(bytes: &[u8]) -> Result<TransferReceipt, WorkerError> {
-    if bytes.len() > MAX_RSYNC_STATS_BYTES {
-        return Err(invalid_stats());
-    }
-    let text = std::str::from_utf8(bytes).map_err(|_| invalid_stats())?;
-    let lines = text.split('\n').collect::<Vec<_>>();
-    let optional_line_offset = match lines.len() {
-        13 => 0,
-        15 => {
-            millisecond_counter(lines[7], "File list generation time: ", " seconds")?;
-            millisecond_counter(lines[8], "File list transfer time: ", " seconds")?;
-            2
-        }
-        _ => return Err(invalid_stats()),
-    };
-    if !lines[9 + optional_line_offset].is_empty() || !lines[12 + optional_line_offset].is_empty() {
-        return Err(invalid_stats());
-    }
-
-    let files = counter(lines[0], "Number of files: ", "")?;
-    let files_transferred = counter(lines[1], "Number of files transferred: ", "")?;
-    let total_file_size = counter(lines[2], "Total file size: ", " B")?;
-    let transferred_size = counter(lines[3], "Total transferred file size: ", " B")?;
-    let unmatched = counter(lines[4], "Unmatched data: ", " B")?;
-    let matched = counter(lines[5], "Matched data: ", " B")?;
-    let _file_list_size = counter(lines[6], "File list size: ", " B")?;
-    let total_sent = counter(lines[7 + optional_line_offset], "Total sent: ", " B")?;
-    let total_received = counter(lines[8 + optional_line_offset], "Total received: ", " B")?;
-    if files_transferred > files
-        || transferred_size > total_file_size
-        || unmatched.checked_add(matched) != Some(transferred_size)
-    {
-        return Err(invalid_stats());
-    }
-
-    let summary = lines[10 + optional_line_offset]
-        .strip_prefix("sent ")
-        .and_then(|value| value.split_once(" bytes  received "))
-        .ok_or_else(invalid_stats)?;
-    let sent = decimal(summary.0)?;
-    let (received, rate) = summary.1.split_once(" bytes  ").ok_or_else(invalid_stats)?;
-    let received = decimal(received)?;
-    let rate = rate.strip_suffix(" bytes/sec").ok_or_else(invalid_stats)?;
-    let _rate = decimal(rate)?;
-    if sent != total_sent || received != total_received {
-        return Err(invalid_stats());
-    }
-
-    let total = lines[11 + optional_line_offset]
-        .strip_prefix("total size is ")
-        .and_then(|value| value.split_once("  speedup is "))
-        .ok_or_else(invalid_stats)?;
-    if decimal(total.0)? != total_file_size || !valid_decimal_fraction(total.1) {
-        return Err(invalid_stats());
-    }
-
-    Ok(TransferReceipt {
-        files_transferred,
-        file_bytes_transferred: transferred_size,
-        wire_bytes_sent: total_sent,
-        wire_bytes_received: total_received,
-    })
-}
-
-fn counter(line: &str, prefix: &str, suffix: &str) -> Result<u64, WorkerError> {
-    let value = line
-        .strip_prefix(prefix)
-        .and_then(|value| value.strip_suffix(suffix))
-        .ok_or_else(invalid_stats)?;
-    decimal(value)
-}
-
-fn millisecond_counter(line: &str, prefix: &str, suffix: &str) -> Result<(), WorkerError> {
-    let value = line
-        .strip_prefix(prefix)
-        .and_then(|value| value.strip_suffix(suffix))
-        .ok_or_else(invalid_stats)?;
-    let (seconds, milliseconds) = value.split_once('.').ok_or_else(invalid_stats)?;
-    if seconds.is_empty()
-        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
-        || milliseconds.len() != 3
-        || !milliseconds.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(invalid_stats());
-    }
-    Ok(())
-}
-
-fn decimal(value: &str) -> Result<u64, WorkerError> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(invalid_stats());
-    }
-    value.parse().map_err(|_| invalid_stats())
-}
-
-fn valid_decimal_fraction(value: &str) -> bool {
-    let mut components = value.split('.');
-    let whole = components.next().unwrap_or_default();
-    let fractional = components.next().unwrap_or_default();
-    components.next().is_none()
-        && !whole.is_empty()
-        && !fractional.is_empty()
-        && whole.bytes().all(|byte| byte.is_ascii_digit())
-        && fractional.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn invalid_stats() -> WorkerError {
-    transport_error("INVALID_RSYNC_STATS", "rsync statistics were invalid")
-}
-
 fn transport_error(code: &'static str, message: &'static str) -> WorkerError {
     WorkerError::Transport {
         code,
@@ -1920,14 +1430,14 @@ fn host_transfer_error(code: &'static str, message: &'static str) -> WorkerError
 #[cfg(test)]
 mod exec_inheritance_tests {
     use std::{
-        ffi::CString,
+        ffi::{CString, OsString},
         fs::{File, OpenOptions},
         io::{Read, Write},
         os::fd::{AsRawFd, RawFd},
         os::unix::ffi::OsStrExt,
         os::unix::fs::MetadataExt,
         path::{Path, PathBuf},
-        process::Stdio,
+        process::{Command, Stdio},
         sync::mpsc,
         thread,
     };
@@ -1939,6 +1449,7 @@ mod exec_inheritance_tests {
         job::{CommandSpec, ProcessIdentity, RequestFingerprintMaterial},
         lease::{AdmissionFacts, LeaseService},
         protocol::MemoryPressure,
+        rooted_fs::RootedDir,
         supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     };
 

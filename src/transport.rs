@@ -1373,7 +1373,7 @@ fn invalid_test_ssh() -> WorkerError {
     )
 }
 
-/// Quote an absolute SSH executable for `GIT_SSH_COMMAND` / rsync `-e`.
+/// Quote an absolute SSH executable for `GIT_SSH_COMMAND`.
 /// Safe unquoted paths (`/usr/bin/ssh`) stay unquoted so stock Git command
 /// lines do not change.
 pub(crate) fn posix_shell_quote(value: &OsStr) -> Result<String, WorkerError> {
@@ -1408,18 +1408,6 @@ pub(crate) fn git_ssh_command_line(
         posix_shell_quote(program)?,
         ssh_shell_options(target, true)?
     ))
-}
-
-pub(crate) fn rsync_ssh_shell(target: SshTarget) -> Result<OsString, WorkerError> {
-    let program = ssh_program()?;
-    let shell = format!(
-        "{} {} --",
-        posix_shell_quote(&program)?,
-        ssh_shell_options(target, true)?
-    );
-    // rsync's -e parser understands quote alternation but not backslash
-    // escapes. Keep Git's POSIX encoding and use literal apostrophes here.
-    Ok(shell.replace("'\\''", "'\"'\"'").into())
 }
 
 #[cfg(test)]

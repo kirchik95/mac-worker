@@ -1,4 +1,4 @@
-use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, str::FromStr, time::Duration};
+use std::{convert::Infallible, fmt, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, Subcommand};
 
@@ -535,15 +535,6 @@ pub enum HostCommand {
     #[command(name = "outbox-retry", hide = true)]
     OutboxRetry {
         task_id: TaskId,
-    },
-    #[command(name = "rsync-receive", trailing_var_arg = true)]
-    RsyncReceive {
-        job_id: HiddenComponent,
-        client_id: HiddenComponent,
-        lease_token: HiddenComponent,
-        request_fingerprint: HiddenComponent,
-        #[arg(num_args = 1.., allow_hyphen_values = true)]
-        server_args: Vec<OsString>,
     },
     #[command(name = "controller-rpc", hide = true)]
     ControllerRpc,
