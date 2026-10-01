@@ -4529,6 +4529,10 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
     let root = temp.path().join("terminal-submit-retry");
     let marker = temp.path().join("terminal-submit-marker");
     let (store, lease, request) = prepared_host_with_live_command(&root, matrix_command(&marker));
+    let frozen_turn = task_turn_ports::matrix_task_request(&store, &request)
+        .unwrap()
+        .turn()
+        .clone();
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
@@ -4560,13 +4564,13 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
         .collect::<BTreeSet<_>>();
     let launches = Arc::new(AtomicUsize::new(0));
 
-    let retry = JobService::new(
+    let retry = TaskQueryProducer::new(
         &store,
         &CountingRejectLauncher {
             launches: Arc::clone(&launches),
         },
     )
-    .submit_at(request.clone(), 11)
+    .submit_frozen(request.clone(), &frozen_turn)
     .unwrap();
 
     assert!(matches!(retry, SubmitResponse::Existing { .. }));
@@ -4602,6 +4606,13 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
         "resource",
         "command",
     ] {
+        let mutated_turn = if mutation == "digest" {
+            let mut value = serde_json::to_value(&frozen_turn).unwrap();
+            value["base_oid"] = serde_json::Value::String("f".repeat(40));
+            serde_json::from_value(value).unwrap()
+        } else {
+            frozen_turn.clone()
+        };
         let material = request.material();
         let changed = SubmitRequest::new(
             RequestFingerprintMaterial::new(
@@ -4637,7 +4648,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
                     material.worktree_id().into()
                 },
                 if mutation == "digest" {
-                    "f".repeat(64)
+                    mutated_turn.digest()
                 } else {
                     material.manifest_digest().into()
                 },
@@ -4664,13 +4675,13 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
             )
             .unwrap(),
         );
-        let error = JobService::new(
+        let error = TaskQueryProducer::new(
             &store,
             &CountingRejectLauncher {
                 launches: Arc::clone(&launches),
             },
         )
-        .submit_at(changed, 12)
+        .submit_frozen(changed, &mutated_turn)
         .unwrap_err();
         assert_error_code(error, "JOB_ID_CONFLICT", mutation);
     }
@@ -4679,8 +4690,8 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
     assert_eq!(LeaseService::new(&store).load().unwrap(), None);
 
     let absent = HostStore::open(&temp.path().join("absent")).unwrap();
-    let error = JobService::new(&absent, &RejectLauncher)
-        .submit_at(request.clone(), 13)
+    let error = TaskQueryProducer::new(&absent, &RejectLauncher)
+        .submit_frozen(request.clone(), &frozen_turn)
         .unwrap_err();
     assert_error_code(error, "LEASE_MISSING", "no durable disposition");
 
@@ -4725,7 +4736,7 @@ fn terminal_accepted_submit_retry_after_lease_retirement() {
             _ => unreachable!(),
         }
         let corrupt_launches = Arc::new(AtomicUsize::new(0));
-        let error = JobService::new(
+        let error = TaskQueryProducer::new(
             &corrupt_store,
             &CountingRejectLauncher {
                 launches: Arc::clone(&corrupt_launches),
@@ -4776,7 +4787,7 @@ fn terminal_accepted_submit_retry_ignores_an_unrelated_live_lease() {
     };
     let unrelated_lease_bytes = fs::read(root.join("leases/slots/0/lease.json")).unwrap();
 
-    let retry = JobService::new(&store, &RejectLauncher)
+    let retry = TaskQueryProducer::new(&store, &RejectLauncher)
         .submit_at(request, 12)
         .unwrap();
 
@@ -6994,6 +7005,21 @@ impl<'a> TaskQueryProducer<'a> {
     ) -> Result<SubmitResponse, WorkerError> {
         self.service
             .submit_turn(task_turn_ports::matrix_task_request(self.store, &request)?)
+            .map(|response| response.submit().clone())
+    }
+}
+impl TaskQueryProducer<'_> {
+    fn submit_frozen(
+        &self,
+        request: SubmitRequest,
+        turn: &mac_worker::turn::TurnMaterial,
+    ) -> Result<SubmitResponse, WorkerError> {
+        self.service
+            .submit_turn(mac_worker::turn::TaskTurnRequest::new(
+                request.with_execution_scope(mac_worker::job::ExecutionScope::task(turn.task_id())),
+                turn.clone(),
+                super::supervisor::HOST_SAFETY_TURN_PROMPT,
+            ))
             .map(|response| response.submit().clone())
     }
 }

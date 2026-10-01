@@ -546,6 +546,31 @@ fn assert_turnless_prelaunch_refusal(indexed: bool, resolve: bool) {
     }
 }
 
+fn seed_archived_succeeded_status(store: &HostStore, lease: &LeaseRecord) {
+    let path = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap()
+        .join("status.json");
+    let status: JobStatus = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let status = status
+        .with_supervisor(
+            ProcessIdentity::new(fixture_pid::fixture_pid(42_901), 42_901).unwrap(),
+            11,
+        )
+        .unwrap()
+        .with_child(
+            ProcessIdentity::new(fixture_pid::fixture_pid(42_902), 42_902).unwrap(),
+            12,
+        )
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    fs::write(&path, serde_json::to_vec(&status).unwrap()).unwrap();
+    File::open(&path).unwrap().sync_all().unwrap();
+}
+
 fn compile_exit_parking_dylib(directory: &Path) -> PathBuf {
     let source = directory.join("exit-parking.c");
     let library = directory.join("libexit-parking.dylib");
@@ -2357,17 +2382,21 @@ fn mutable_cleanup_failure_preserves_command_outcome_and_retains_lease() {
         "rmdir \"$HOME\" && : > \"$HOME\"".into(),
     ])
     .unwrap();
-    let (store, lease, request) =
+    let (store, lease, _request) =
         archived_host_with_command(&temp.path().join("cleanup-failure"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
+    fs::remove_dir(job.join("home")).unwrap();
+    fs::write(job.join("home"), b"").unwrap();
+    fs::set_permissions(job.join("home"), fs::Permissions::from_mode(0o600)).unwrap();
     let launcher = InlineSupervisorLauncher {
         store: store.clone(),
     };
 
+    seed_archived_succeeded_status(&store, &lease);
     let error = JobService::new(&store, &launcher)
-        .submit_at(request, 10)
+        .reconcile_job(lease.job_id())
         .unwrap_err();
 
     assert!(!error.to_string().contains(job.to_string_lossy().as_ref()));
@@ -2384,7 +2413,7 @@ fn mutable_cleanup_failure_preserves_command_outcome_and_retains_lease() {
 #[test]
 fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
     let temp = tempfile::tempdir().unwrap();
-    let (store, lease, request) = archived_host(&temp.path().join("incoming-evidence"));
+    let (store, lease, _request) = archived_host(&temp.path().join("incoming-evidence"));
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2401,8 +2430,9 @@ fn unexpected_incoming_evidence_is_preserved_and_blocks_cleanup_and_release() {
         store: store.clone(),
     };
 
+    seed_archived_succeeded_status(&store, &lease);
     let error = JobService::new(&store, &launcher)
-        .submit_at(request, 10)
+        .reconcile_job(lease.job_id())
         .unwrap_err();
 
     assert!(
@@ -2560,7 +2590,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
     ])
     .unwrap();
     let (store, lease, request) =
-        archived_host_with_command(&temp.path().join("payload-permission"), command);
+        prepared_turn_with_command(&temp.path().join("payload-permission"), command);
     let job = store
         .job(lease.project_id(), lease.worktree_id(), lease.job_id())
         .unwrap();
@@ -2569,7 +2599,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
         launches: Arc::clone(&launches),
     };
 
-    let error = JobService::new(&store, &launcher)
+    let error = TurnJobService::new(&store, &launcher)
         .submit_at(request, 10)
         .unwrap_err();
 
@@ -2604,7 +2634,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
     let recovery = InlineSupervisorLauncher {
         store: store.clone(),
     };
-    let recovered = JobService::new(&store, &recovery)
+    let recovered = TurnJobService::new(&store, &recovery)
         .status(lease.job_id())
         .unwrap();
     assert_eq!(recovered.status().state(), JobState::Succeeded);
@@ -2617,7 +2647,7 @@ fn transient_command_payload_is_placed_owner_only_before_child_launch() {
 }
 
 #[test]
-// Read/recover a canonical persisted v1 archive; no batch producer or Job acquire runs.
+// Exercise the surviving Task path and its shared safety assertions.
 fn pre_go_child_status_failure_erases_payload_but_abort_ambiguity_retains_lease() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-run");
