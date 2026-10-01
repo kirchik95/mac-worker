@@ -419,6 +419,12 @@ mod t7a {
             let fake_ssh = root.join("fake-ssh");
             fs::write(&fake_ssh, "#!/bin/sh\nexit 69\n").unwrap();
             fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            // This fixture always fails locally; assess its first exec before
+            // a controller tick can encounter a bounded SSH probe.
+            assert_eq!(
+                Command::new(&fake_ssh).env_clear().status().unwrap().code(),
+                Some(69)
+            );
             let environment = BTreeMap::from([
                 ("HOME".into(), home.clone().into_os_string()),
                 ("XDG_STATE_HOME".into(), root.join("s").into_os_string()),
@@ -437,13 +443,31 @@ mod t7a {
             .unwrap();
             let installed = root.join("worker");
             fs::copy(env!("CARGO_BIN_EXE_worker"), &installed).unwrap();
-            Self {
+            let fixture = Self {
                 _temp: temp,
                 home,
                 installed,
                 paths,
                 environment,
-            }
+            };
+            fixture.warm(&fixture.installed, "--version");
+            fixture
+        }
+
+        fn warm(&self, binary: &std::path::Path, argument: &str) {
+            // macOS assesses each fresh executable. Pay that cost outside the
+            // leader/RPC/courier guards, using a side-effect-free invocation.
+            let output = Command::new(binary)
+                .env_clear()
+                .envs(&self.environment)
+                .arg(argument)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture warm-up for {}: {output:?}",
+                binary.display()
+            );
         }
 
         fn command(&self, binary: &std::path::Path) -> Command {
@@ -484,6 +508,9 @@ mod t7a {
         }
 
         fn leader(&self) -> Leader {
+            // Tests can replace the image or change its permissions after
+            // construction; warm the exact current inode before readiness.
+            self.warm(&self.installed, "--version");
             let mut child = self
                 .command(&self.installed)
                 .args(["controller", "run"])
@@ -1101,8 +1128,9 @@ mod t7a {
         let courier_path = fixture.installed.with_file_name("runner-entry");
         let courier = UnixDatagram::bind(&courier_path).unwrap();
         courier.set_read_timeout(Some(GUARD)).unwrap();
-        fs::write(&marker, format!("#!/usr/bin/python3\nimport os,sys,socket,signal\ns=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)\ns.sendto(__import__('json').dumps([sys.argv,os.getpid(),os.getpgrp()]).encode(), {})\nwhile True: signal.pause()\n", serde_json::to_string(&courier_path).unwrap())).unwrap();
+        fs::write(&marker, format!("#!/usr/bin/python3\nimport sys\nif sys.argv[1:] == ['--fixture-warm']: sys.exit(0)\nimport os,socket,signal\ns=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)\ns.sendto(__import__('json').dumps([sys.argv,os.getpid(),os.getpgrp()]).encode(), {})\nwhile True: signal.pause()\n", serde_json::to_string(&courier_path).unwrap())).unwrap();
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.warm(&marker, "--fixture-warm");
         let request = request_fixture("task.wait.poll", json!({"task_id":task}));
         let output = fixture.rpc_at(&rpc_link, &request, Some(marker.as_os_str()));
         assert!(
@@ -1938,6 +1966,7 @@ mod t7a {
             let inode = fs::metadata(pin_path(&fixture)).unwrap().ino();
             let replacement = fixture.installed.with_file_name("replacement");
             fs::copy(env!("CARGO_BIN_EXE_worker"), &replacement).unwrap();
+            fixture.warm(&replacement, "--version");
             let new_inode = fs::metadata(&replacement).unwrap().ino();
             let rollback = fixture.installed.with_file_name("rollback");
             fs::rename(&fixture.installed, &rollback).unwrap();
@@ -2785,6 +2814,7 @@ mod t7a {
                 if replace {
                     let replacement = fixture.installed.with_file_name("next-worker");
                     fs::copy(env!("CARGO_BIN_EXE_worker"), &replacement).unwrap();
+                    fixture.warm(&replacement, "--version");
                     assert_ne!(
                         fs::metadata(&replacement).unwrap().ino(),
                         record.executable.binding.inode
