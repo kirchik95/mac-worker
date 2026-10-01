@@ -185,7 +185,13 @@ Review command record:
 | p3-rev-b: `cargo nextest run --locked --test transfer -E 'test(/^controller_socket_forward::/) & !test(real_openssh_mux_controls_ignore_config_forwards_and_edits)'` | 13 selected, 13 passed; the excluded local OpenSSH mux test was inspected but not executed by this review |
 | p3-rev-b: `cargo nextest run --locked --lib -E 'test(/^transport::tests::.*(multiplex|forward|managed|ssh_argv)/)'` | 7 selected, 7 passed |
 
-The fixes were verified by their owning tracks and integrated before T7. No additional independent
+Post-review fix:
+
+| Track | Incident / correction | Verification |
+| --- | --- | --- |
+| p3-link-retention | On 2026-10-01, eager unlink of a killed pinned RPC image left XProtect reading a removed pathname and wedged syspolicyd; fresh executable launches stalled before main. Retain links at RPC exit/shutdown. Native startup cleanup requires older-than-previous generation order, exact binding, proven RPC exits and an injected last-use age greater than ten minutes. Current/previous, unknown proof and incomparable clock epochs stay retained; E1 installed-path runners are unchanged. | Seven metadata-only injected-clock regressions passed after failing against eager withdrawal. Real-image test runs require `.briefs/scanner_guard.py`; final targeted counts and commit are recorded in `.briefs/p3-link-retention-report.md`. No validator stress or live-host test is claimed. |
+
+The original review fixes were verified by their owning tracks and integrated before T7. No additional independent
 post-fix review pass is claimed.
 
 ## Local fixture observations

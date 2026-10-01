@@ -1,7 +1,7 @@
 //! Blocking private channel files; call only on bounded native control jobs.
-//! Generation link withdrawal requires stopped admission and proven exit of all
-//! generation socket RPC children. Unknown proof retains it. Detached task
-//! groups have no link dependency and must never be awaited or cancelled for it.
+//! Discovery withdrawal requires stopped admission and proven RPC exit. Images
+//! remain through shutdown, the next generation, and a ten-minute grace period.
+//! Unknown proof retains them. Detached task groups have no link dependency.
 use super::contracts::{
     ChannelFailure, ChannelReason, CleanupContext, ForwardDisposition, IDENTITY_BYTES,
     PinnedExecutable, RunningImage, ServiceIdentity, UuidString,
@@ -20,6 +20,8 @@ use crate::{
 };
 use std::{io, os::unix::net::UnixListener, path::Path};
 mod core;
+mod retention;
+pub use retention::{LINK_GRACE, RetentionTime};
 
 pub(crate) fn public_entry(value: PrivateEntryIdentity) -> EntryIdentity {
     EntryIdentity {
@@ -98,13 +100,25 @@ pub struct LeaderSocketLease {
     controller_root: std::path::PathBuf,
 }
 
-/// Holds the leader lock. A prior generation has no RPC-exit proof at startup;
-/// its exactly recorded image is preserved while a safely stale socket recovers.
+/// Holds the leader lock. Recorded exit proof and age govern older-image
+/// cleanup; safely stale discovery recovers independently. Legacy/unknown
+/// generations never acquire exit proof merely because their leader died.
 pub fn bind_leader(
     paths: &PathLayout,
     leader: &ControllerLeader,
     image: &RunningImage,
     generation: &UuidString,
+) -> Result<LeaderSocketLease, WorkerError> {
+    bind_leader_at(paths, leader, image, generation, &RetentionTime::system()?)
+}
+
+/// Native startup with an injected, restart-comparable retention clock stamp.
+pub fn bind_leader_at(
+    paths: &PathLayout,
+    leader: &ControllerLeader,
+    image: &RunningImage,
+    generation: &UuidString,
+    now: &RetentionTime,
 ) -> Result<LeaderSocketLease, WorkerError> {
     if !matches!(
         observe_leader(&paths.controller_state_root(), leader.identity())?,
@@ -117,11 +131,14 @@ pub fn bind_leader(
     let root =
         parent.open_child_directory(&RelativePath::parse(b"rpc").map_err(|_| invalid())?, true)?;
     root.channel_private_root()?;
-    let files = if root.entry_exists("service.json")? {
+    let mut retained = retention::State::load(&root)?;
+    let prior = if root.entry_exists("service.json")? {
         let (record, bytes, binding) = read_record(&root)?;
+        retained.import_record(&root, &record, now)?;
+        retained.known_names(&root)?;
         let observation = observe_leader(&paths.controller_state_root(), record.service.leader)?;
         let stale = stale_evidence(&root, &record, bytes, binding)?;
-        let prior = core::prepare_stale(
+        Some(core::prepare_stale(
             &root,
             &stale,
             matches!(
@@ -129,24 +146,30 @@ pub fn bind_leader(
                 ProcessObservation::Absent | ProcessObservation::Reused
             ),
             false,
-        )?;
-        core::bind_generation_replacing(
-            root,
-            &image.path,
-            image.device,
-            image.inode,
-            generation.as_str(),
-            prior,
-        )?
+        )?)
     } else {
-        core::bind_generation(
-            root,
-            &image.path,
-            image.device,
-            image.inode,
-            generation.as_str(),
-        )?
+        retained.known_names(&root)?;
+        retained.recover_unpublished_socket(&root, &paths.controller_state_root())?;
+        None
     };
+    // Before allocating, reclaim eligible older residue without touching the
+    // still-current/previous pair. Recheck again after registering the new pair.
+    retained.sweep(&root, now)?;
+    retained.reserve()?;
+    let known = retained.known_names(&root)?;
+    let files = core::bind_generation(
+        root,
+        &image.path,
+        image.device,
+        image.inode,
+        generation.as_str(),
+        prior,
+        &known,
+    )?;
+    retained.register(&files.root, generation, &files, leader.identity(), now)?;
+    // Cleanup uncertainty never changes new-generation readiness or authorizes
+    // a replacement unlink. The persisted exact evidence remains retryable.
+    let _ = retained.sweep(&files.root, now);
     Ok(LeaderSocketLease {
         files,
         leader: leader.identity(),
@@ -241,9 +264,8 @@ fn stale_evidence(
     })
 }
 
-/// Optional prior-generation cleanup on native control work. `true` is proof
-/// that admission stopped and every prior socket RPC exited, never PID liveness
-/// or detached-group completion. The safely stale record stays for replacement.
+/// Optional stale discovery cleanup on native work. The latest image remains
+/// protected, even with RPC-exit proof; age cleanup happens at later startups.
 pub fn cleanup_prior_generation(paths: &PathLayout, rpc_exits_proven: bool) -> ForwardDisposition {
     let clean = || -> Result<(), WorkerError> {
         if !rpc_exits_proven {
@@ -262,6 +284,13 @@ pub fn cleanup_prior_generation(paths: &PathLayout, rpc_exits_proven: bool) -> F
             ),
             true,
         )?;
+        // Legacy records without history have no comparable last-use evidence
+        // and remain retained. This API never unlinks a generation image.
+        if let (Ok(mut retained), Ok(now)) =
+            (retention::State::load(&root), RetentionTime::system())
+        {
+            let _ = retained.closed(&root, &record.executable, &now);
+        }
         Ok(())
     };
     if clean().is_ok() {
@@ -311,10 +340,27 @@ impl LeaderSocketLease {
             .publish(&serde_json::to_value(service).map_err(|_| invalid())?)?;
         Ok(())
     }
-    /// Call after stopped admission/listener closure. `true` requires proven
-    /// exit of every generation RPC child. Unknown proof preserves all evidence.
+    /// Withdraw discovery after stopped admission/proven RPC exits. Cleaned
+    /// means socket/record removal and saved exit proof, never image deletion.
     pub fn withdraw(&mut self, rpc_exits_proven: bool) -> ForwardDisposition {
-        if self.files.withdraw(rpc_exits_proven) {
+        match RetentionTime::system() {
+            Ok(now) => self.withdraw_at(rpc_exits_proven, &now),
+            Err(_) => {
+                self.files.withdraw(false);
+                ForwardDisposition::Retained
+            }
+        }
+    }
+    pub fn withdraw_at(
+        &mut self,
+        rpc_exits_proven: bool,
+        now: &RetentionTime,
+    ) -> ForwardDisposition {
+        if self.files.withdraw(rpc_exits_proven)
+            && retention::State::load(&self.files.root)
+                .and_then(|mut retained| retained.closed(&self.files.root, &self.executable(), now))
+                .is_ok()
+        {
             ForwardDisposition::Cleaned
         } else {
             ForwardDisposition::Retained

@@ -363,7 +363,7 @@ fn pinned_image_survives_replacement_rollback_and_requires_rpc_exit_proof() {
     assert_eq!(lease.withdraw(false), ForwardDisposition::Retained);
     assert!(executable.path.exists());
     assert_eq!(lease.withdraw(true), ForwardDisposition::Cleaned);
-    assert!(!executable.path.exists());
+    assert!(executable.path.exists());
     assert!(installed.path.exists());
 }
 #[test]
@@ -824,7 +824,7 @@ fn missing_stale_socket_recovers_and_prior_image_cleanup_needs_rpc_exit_proof() 
         cleanup_prior_generation(&paths, true),
         ForwardDisposition::Cleaned
     );
-    assert!(!executable.path.exists());
+    assert!(executable.path.exists());
     assert!(
         paths
             .controller_state_root()
@@ -1328,6 +1328,7 @@ fn detached_task_lifetime_does_not_gate_generation_image_withdrawal() {
         .unwrap();
     assert_eq!(&ready, b"ready");
     assert_eq!(lease.withdraw(true), ForwardDisposition::Cleaned);
+    assert!(lease.executable().path.exists());
     assert!(detached.try_wait().unwrap().is_none());
     assert!(installed.path.exists());
     detached.stdin.take().unwrap().write_all(b"exit\n").unwrap();

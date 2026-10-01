@@ -169,7 +169,7 @@ pub(crate) struct GenerationFiles {
     pub(crate) executable_binding: PrivateEntryIdentity,
     pub(crate) socket_binding: PrivateEntryIdentity,
     pub(crate) parent_binding: PrivateEntryIdentity,
-    root: RootedDir,
+    pub(crate) root: RootedDir,
     listener: Option<UnixListener>,
     generation: String,
     published: Option<(Vec<u8>, PrivateEntryIdentity)>,
@@ -196,7 +196,7 @@ pub(crate) fn prepare_stale(
     root: &RootedDir,
     evidence: &StaleEvidence,
     prior_leader_dead: bool,
-    rpc_exits_proven: bool,
+    _rpc_exits_proven: bool,
 ) -> io::Result<PriorRecord> {
     private_root(root)?;
     let verify_record = || -> io::Result<()> {
@@ -249,25 +249,13 @@ pub(crate) fn prepare_stale(
         root.channel_unlink_exact("s", evidence.socket)?;
     }
     verify_record()?;
-    if rpc_exits_proven && image_present {
-        root.channel_unlink_exact(&name, evidence.executable_binding)?;
-    }
+    // A stale socket may recover now; its image always remains for the
+    // generation-history proof, exclusion and grace checks at a later startup.
     verify_record()?;
     Ok(PriorRecord {
         bytes: evidence.record.clone(),
         binding: evidence.record_binding,
     })
-}
-
-pub(crate) fn bind_generation_replacing(
-    root: RootedDir,
-    installed: &Path,
-    device: u64,
-    inode: u64,
-    generation: &str,
-    prior: PriorRecord,
-) -> io::Result<GenerationFiles> {
-    bind_generation_inner(root, installed, device, inode, generation, Some(prior))
 }
 
 pub(crate) fn bind_generation(
@@ -276,17 +264,8 @@ pub(crate) fn bind_generation(
     device: u64,
     inode: u64,
     generation: &str,
-) -> io::Result<GenerationFiles> {
-    bind_generation_inner(root, installed, device, inode, generation, None)
-}
-
-fn bind_generation_inner(
-    root: RootedDir,
-    installed: &Path,
-    device: u64,
-    inode: u64,
-    generation: &str,
     prior: Option<PriorRecord>,
+    known: &[Vec<u8>],
 ) -> io::Result<GenerationFiles> {
     private_root(&root)?;
     validate_socket_path(&root.path().join("s"))?;
@@ -308,7 +287,7 @@ fn bind_generation_inner(
         {
             return Err(invalid());
         }
-    } else if !root.list_names()?.is_empty() {
+    } else if root.list_names()?.iter().any(|name| !known.contains(name)) {
         // Without a valid prior record, even a bare generation link is a
         // creation gap. Preserve the private directory's residue and decline.
         return Err(invalid());
@@ -388,7 +367,8 @@ impl GenerationFiles {
         self.prior_record = None;
         Ok(())
     }
-    /// Admission stopped; proof covers generation RPCs only, never detached tasks.
+    /// Withdraw discovery only. The current image is retained even with proven
+    /// RPC exits; generation history may remove it at a later eligible startup.
     pub(crate) fn withdraw(&mut self, rpc_exits_proven: bool) -> bool {
         drop(self.listener.take());
         if !rpc_exits_proven {
@@ -424,8 +404,6 @@ impl GenerationFiles {
             }
             self.root.channel_unlink_exact("s", self.socket_binding)?;
             verify_record()?;
-            self.root
-                .channel_unlink_exact(executable_name, self.executable_binding)?;
             if let Some((_, binding)) = &self.published {
                 verify_record()?;
                 self.root.channel_unlink_exact("service.json", *binding)?;

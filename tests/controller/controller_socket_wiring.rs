@@ -33,12 +33,281 @@ mod t7a {
 
     const GUARD: Duration = Duration::from_secs(30);
 
+    // Metadata-only retention tests: these bytes are never executed. Advancing
+    // the injected clock must never accelerate unlinking a real worker image.
+    mod link_retention {
+        use super::*;
+        use mac_worker::controller::{
+            ControllerLeader,
+            channel::{
+                files::{LeaderSocketLease, RetentionTime, bind_leader_at},
+                testing::{ManualRuntime, identity_fixture},
+            },
+        };
+        use std::cell::Cell;
+
+        struct Fixture {
+            _temp: tempfile::TempDir,
+            paths: PathLayout,
+            image: RunningImage,
+            clock: ManualRuntime,
+            epoch: Cell<u64>,
+        }
+        struct Generation {
+            _leader: ControllerLeader,
+            lease: LeaderSocketLease,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let paths = PathLayout {
+                    config: root.join("c"),
+                    state: root.join("s"),
+                    cache: root.join("k"),
+                    data: root.join("d"),
+                };
+                let path = root.join("metadata-only-image");
+                fs::write(&path, b"never execute this fixture").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                let metadata = fs::metadata(&path).unwrap();
+                Self {
+                    _temp: temp,
+                    paths,
+                    image: RunningImage {
+                        path,
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                    clock: ManualRuntime::default(),
+                    epoch: Cell::new(1),
+                }
+            }
+            fn start(&self) -> Generation {
+                let leader =
+                    ControllerLeader::acquire(&self.paths.controller_state_root()).unwrap();
+                let generation = UuidString::new_v4();
+                let now = RetentionTime::new(self.epoch.get().to_string(), self.clock.now());
+                let mut lease =
+                    bind_leader_at(&self.paths, &leader, &self.image, &generation, &now)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "bind failed: {error:?}; entries {:?}",
+                                fs::read_dir(self.paths.controller_state_root().join("rpc"))
+                                    .unwrap()
+                                    .map(|entry| entry.unwrap().file_name())
+                                    .collect::<Vec<_>>()
+                            )
+                        });
+                let mut service = identity_fixture().service;
+                service.leader = leader.identity();
+                service.service_generation = generation;
+                service.socket_path = self.paths.controller_state_root().join("rpc/s");
+                lease.publish(&service).unwrap();
+                Generation {
+                    _leader: leader,
+                    lease,
+                }
+            }
+            fn stop(&self, mut generation: Generation, proven: bool) -> PinnedExecutable {
+                let image = generation.lease.executable();
+                let now = RetentionTime::new(self.epoch.get().to_string(), self.clock.now());
+                assert_eq!(
+                    generation.lease.withdraw_at(proven, &now),
+                    if proven {
+                        ForwardDisposition::Cleaned
+                    } else {
+                        ForwardDisposition::Retained
+                    }
+                );
+                image
+            }
+            fn links(&self) -> usize {
+                fs::read_dir(self.paths.controller_state_root().join("rpc"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.len() == 33 && name.starts_with('e')
+                    })
+                    .count()
+            }
+        }
+
+        #[test]
+        fn image_link_retention_current_shutdown_keeps_link_without_discovery() {
+            let fixture = Fixture::new();
+            let image = fixture.stop(fixture.start(), true);
+            assert!(
+                image.path.exists(),
+                "RPC exit/shutdown must retain the current generation image"
+            );
+            assert!(!fixture.paths.controller_state_root().join("rpc/s").exists());
+            assert!(
+                !fixture
+                    .paths
+                    .controller_state_root()
+                    .join("rpc/service.json")
+                    .exists()
+            );
+            assert_eq!(fixture.links(), 1);
+        }
+
+        #[test]
+        fn image_link_retention_previous_survives_new_generation_even_past_grace() {
+            let fixture = Fixture::new();
+            let old = fixture.stop(fixture.start(), true);
+            fixture.clock.advance(Duration::from_secs(3600));
+            let next = fixture.start();
+            assert!(
+                old.path.exists(),
+                "the previous generation is excluded from cleanup"
+            );
+            assert!(next.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 2);
+            fixture.stop(next, true);
+            assert!(old.path.exists());
+        }
+
+        #[test]
+        fn image_link_retention_older_link_waits_for_grace_and_normal_residue_is_two() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), true);
+            let second = fixture.stop(fixture.start(), true);
+            fixture.clock.advance(Duration::from_secs(600));
+            let third = fixture.start();
+            assert!(
+                first.path.exists(),
+                "exactly ten minutes is not older than the grace period"
+            );
+            assert!(second.path.exists());
+            let third = fixture.stop(third, true);
+            fixture.clock.advance(Duration::from_secs(1));
+            let fourth = fixture.start();
+            assert!(!first.path.exists());
+            assert!(!second.path.exists());
+            assert!(third.path.exists(), "previous link must remain");
+            assert!(fourth.lease.executable().path.exists());
+            assert_eq!(
+                fixture.links(),
+                2,
+                "settled eligible residue is bounded to current and previous"
+            );
+            fixture.stop(fourth, true);
+            assert_eq!(fixture.links(), 2);
+        }
+
+        #[test]
+        fn image_link_retention_last_proven_exit_refreshes_creation_age() {
+            let fixture = Fixture::new();
+            let first = fixture.start();
+            fixture.clock.advance(Duration::from_secs(599));
+            let first = fixture.stop(first, true);
+            fixture.stop(fixture.start(), true);
+            fixture.clock.advance(Duration::from_secs(2));
+            let third = fixture.start();
+            assert!(
+                first.path.exists(),
+                "creation age cannot replace the later proven exit stamp"
+            );
+            fixture.stop(third, true);
+            fixture.clock.advance(Duration::from_secs(599));
+            let fourth = fixture.start();
+            assert!(
+                !first.path.exists(),
+                "older-than-previous proven exits become eligible after grace"
+            );
+            fixture.stop(fourth, true);
+        }
+
+        #[test]
+        fn image_link_retention_unknown_exit_never_becomes_age_proof() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), false);
+            // Simulate the crashed old process identity, without exec or a PID
+            // liveness approximation as RPC cleanup proof.
+            let path = fixture
+                .paths
+                .controller_state_root()
+                .join("rpc/service.json");
+            let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record["service"]["leader"] =
+                serde_json::to_value(mac_worker::job::ProcessIdentity::new(999999, 1).unwrap())
+                    .unwrap();
+            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+            fixture.clock.advance(Duration::from_secs(3600));
+            fixture.stop(fixture.start(), true);
+            let third = fixture.start();
+            assert!(
+                first.path.exists(),
+                "age and dead leader are not proven RPC exit"
+            );
+            assert_eq!(
+                fixture.links(),
+                3,
+                "uncertain residue takes precedence over the normal bound"
+            );
+            fixture.stop(third, true);
+        }
+
+        #[test]
+        fn image_link_retention_exact_binding_mismatch_preserves_replacement() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), true);
+            assert!(first.path.exists());
+            fs::rename(&first.path, fixture._temp.path().join("saved-original")).unwrap();
+            fs::write(&first.path, b"substituted executable").unwrap();
+            fs::set_permissions(&first.path, fs::Permissions::from_mode(0o755)).unwrap();
+            fixture.clock.advance(Duration::from_secs(3600));
+            fixture.stop(fixture.start(), true);
+            let third = fixture.start();
+            assert_eq!(fs::read(&first.path).unwrap(), b"substituted executable");
+            fixture.stop(third, true);
+        }
+
+        #[test]
+        fn image_link_retention_unknown_clock_epoch_keeps_old_links() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), true);
+            fixture.stop(fixture.start(), true);
+            fixture.clock.advance(Duration::from_secs(3600));
+            fixture.epoch.set(2);
+            let third = fixture.start();
+            assert!(
+                first.path.exists(),
+                "a different boot/clock epoch cannot authorize age cleanup"
+            );
+            fixture.stop(third, true);
+        }
+    }
+
     struct Fixture {
         _temp: tempfile::TempDir,
         home: PathBuf,
         installed: PathBuf,
         paths: PathLayout,
         environment: BTreeMap<OsString, OsString>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Do not let TempDir defeat retention immediately after real-image
+            // execution. Preserve those fixture roots for conservative cleanup.
+            if self.installed.with_file_name("private-rpc").exists()
+                || fs::read_dir(self.paths.controller_state_root().join("rpc"))
+                    .ok()
+                    .is_some_and(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            name.len() == 33 && name.starts_with('e')
+                        })
+                    })
+            {
+                self._temp.disable_cleanup(true);
+            }
+        }
     }
 
     impl Fixture {
@@ -297,7 +566,7 @@ mod t7a {
         assert!(fixture.features().contains(&"controller.socket".to_owned()));
         leader.stop();
         assert!(!fixture.features().contains(&"controller.socket".to_owned()));
-        assert!(!record.executable.path.exists());
+        assert!(record.executable.path.exists());
         assert!(!record.service.socket_path.exists());
         assert!(
             !fixture
@@ -1539,7 +1808,7 @@ mod t7a {
                 assert_eq!(result["result"]["quiescent"], true);
             });
             first.stop();
-            assert!(!old.executable.path.exists());
+            assert!(old.executable.path.exists());
             let mut second = fixture.leader();
             let next = fixture.record();
             assert_eq!(next.executable.binding.inode, new_inode);
@@ -2320,12 +2589,12 @@ mod t7a {
                 assert_eq!(shutdown.rpc.completed, 2);
                 assert_eq!(shutdown.rpc.unknown, 0);
                 assert_eq!(shutdown.files, ForwardDisposition::Cleaned);
-                assert!(!record.executable.path.exists());
+                assert!(record.executable.path.exists());
                 assert!(!record.service.socket_path.exists());
                 assert_eq!(
                     unsafe { libc::kill(first.pid() as i32, 0) },
                     0,
-                    "detached runner survives link withdrawal"
+                    "detached runner survives discovery withdrawal with the image retained"
                 );
                 if replace {
                     let replacement = fixture.installed.with_file_name("next-worker");
@@ -2834,7 +3103,7 @@ mod t7a {
                         tail.is_empty(),
                         "RPC frames reached leader stdout: {tail:?}"
                     );
-                    assert!(!record.executable.path.exists());
+                    assert!(record.executable.path.exists());
                     assert!(!record.service.socket_path.exists());
                 }
             }

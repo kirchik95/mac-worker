@@ -617,9 +617,12 @@ At leader startup, mac-worker verifies the inode of the running image and create
 generation hard link. Socket RPC children execute that link, so replacing
 `~/.local/bin/worker` cannot mix binaries inside the running generation. Detached task runners
 started by those children use the captured installed path instead, and later runner handoffs use
-whatever verified binary is installed there, as they do on stdio. Shutdown removes the generation
-link only after every socket RPC child is proven exited; detached task groups are not cancelled or
-waited on for that cleanup.
+whatever verified binary is installed there, as they do on stdio. RPC exit and shutdown retain the
+generation link because macOS executable validation may still use its pathname. A later leader
+startup cleans up only exact-bound links older than the previous generation, after proven RPC
+exits and more than ten minutes since their last use. The current and previous links are kept;
+unknown exit proof or uncertain age keeps older residue too. Normally two links remain. Detached
+task groups are not cancelled or waited on for this cleanup.
 
 `worker setup` installs by replacing the installed path. For an enabled configured controller it
 also restarts and verifies the leader, so the next generation pins the new image. A manually
