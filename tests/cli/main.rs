@@ -3,4 +3,5 @@ mod support;
 
 mod build_id;
 mod cli_help;
+mod controller_channel;
 mod input_selection;

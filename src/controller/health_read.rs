@@ -172,7 +172,7 @@ fn serving_features() -> Vec<String> {
         .collect()
 }
 
-fn observe_leader(
+pub(crate) fn observe_leader(
     path: &Path,
     expected: ProcessIdentity,
 ) -> Result<ProcessObservation, WorkerError> {

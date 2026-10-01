@@ -13,6 +13,7 @@
 
 pub mod batch;
 pub mod batch_freeze;
+pub mod channel;
 pub mod control;
 pub mod drain;
 pub mod envelope;

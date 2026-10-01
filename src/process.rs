@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -61,6 +61,31 @@ pub struct ProcessResult {
     pub stderr: Vec<u8>,
 }
 
+/// Positive ownership cleanup evidence, independent of the application outcome.
+/// Completed requires reap/owned-group absence and joined capture/stdin threads
+/// (or proof no child existed). Expired grace, detachment or panic is Unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupState {
+    Completed,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct ProcessCompletion {
+    pub outcome: Result<ProcessResult, WorkerError>,
+    pub cleanup: CleanupState,
+}
+
+/// Companion seam; legacy ProcessRunner retains exactly its three methods.
+/// Implementors must supply evidence explicitly, including error/cancel paths.
+pub trait TrackedProcessRunner: ProcessRunner {
+    fn run_interruptible_with_cleanup(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> ProcessCompletion;
+}
+
 pub trait ProcessRunner: Send + Sync {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError>;
 
@@ -101,6 +126,41 @@ impl<T: ProcessRunner + ?Sized> ProcessRunner for &T {
     }
 }
 
+impl<T: ProcessRunner + ?Sized> ProcessRunner for Arc<T> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        (**self).run(request)
+    }
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        (**self).run_in_new_session(request)
+    }
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        (**self).run_interruptible(request, should_stop)
+    }
+}
+
+impl<T: TrackedProcessRunner + ?Sized> TrackedProcessRunner for &T {
+    fn run_interruptible_with_cleanup(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> ProcessCompletion {
+        (**self).run_interruptible_with_cleanup(request, should_stop)
+    }
+}
+impl<T: TrackedProcessRunner + ?Sized> TrackedProcessRunner for Arc<T> {
+    fn run_interruptible_with_cleanup(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> ProcessCompletion {
+        (**self).run_interruptible_with_cleanup(request, should_stop)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemProcessRunner;
 
@@ -122,10 +182,12 @@ enum SessionKind {
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         self.run_with_session(request, SessionKind::NewProcessGroup, &|| false)
+            .outcome
     }
 
     fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         self.run_with_session(request, SessionKind::NewSession, &|| false)
+            .outcome
     }
 
     fn run_interruptible(
@@ -134,16 +196,31 @@ impl ProcessRunner for SystemProcessRunner {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
         self.run_with_session(request, SessionKind::NewProcessGroup, should_stop)
+            .outcome
+    }
+}
+
+impl TrackedProcessRunner for SystemProcessRunner {
+    fn run_interruptible_with_cleanup(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> ProcessCompletion {
+        self.run_with_session(request, SessionKind::NewProcessGroup, should_stop)
     }
 }
 
 impl ProcessRunner for InheritProcessGroupRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        SystemProcessRunner.run_with_session(request, SessionKind::Inherit, &|| false)
+        SystemProcessRunner
+            .run_with_session(request, SessionKind::Inherit, &|| false)
+            .outcome
     }
 
     fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        SystemProcessRunner.run_with_session(request, SessionKind::NewSession, &|| false)
+        SystemProcessRunner
+            .run_with_session(request, SessionKind::NewSession, &|| false)
+            .outcome
     }
 
     fn run_interruptible(
@@ -151,7 +228,9 @@ impl ProcessRunner for InheritProcessGroupRunner {
         request: &ProcessRequest,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
-        SystemProcessRunner.run_with_session(request, SessionKind::Inherit, should_stop)
+        SystemProcessRunner
+            .run_with_session(request, SessionKind::Inherit, should_stop)
+            .outcome
     }
 }
 
@@ -161,6 +240,20 @@ impl SystemProcessRunner {
         request: &ProcessRequest,
         session: SessionKind,
         should_stop: &dyn Fn() -> bool,
+    ) -> ProcessCompletion {
+        // A spawn failure proves that no child or I/O threads existed. Once a
+        // child exists, only observed reap/group absence AND joins restore it.
+        let mut cleanup = CleanupState::Completed;
+        let outcome = self.run_with_session_inner(request, session, should_stop, &mut cleanup);
+        ProcessCompletion { outcome, cleanup }
+    }
+
+    fn run_with_session_inner(
+        &self,
+        request: &ProcessRequest,
+        session: SessionKind,
+        should_stop: &dyn Fn() -> bool,
+        cleanup: &mut CleanupState,
     ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
         if request.isolate_parent_environment {
@@ -197,6 +290,7 @@ impl SystemProcessRunner {
             .stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
+        *cleanup = CleanupState::Unknown;
         let process_group = match session {
             SessionKind::Inherit => None,
             SessionKind::NewProcessGroup | SessionKind::NewSession => {
@@ -259,8 +353,9 @@ impl SystemProcessRunner {
                         }
                     }
                     ProcessEvent::Captured(stream, Ok(CaptureOutcome::LimitExceeded)) => {
-                        terminate_child(&mut child, process_group)?;
-                        finish_terminated_child(
+                        *cleanup = cleanup_terminated_child(
+                            &mut child,
+                            process_group,
                             stdout_handle,
                             stderr_handle,
                             stdin_handle,
@@ -273,8 +368,9 @@ impl SystemProcessRunner {
                         return Err(ProcessError::OutputLimitExceeded { stream, limit }.into());
                     }
                     ProcessEvent::Captured(_, Err(error)) => {
-                        terminate_child(&mut child, process_group)?;
-                        finish_terminated_child(
+                        *cleanup = cleanup_terminated_child(
+                            &mut child,
+                            process_group,
                             stdout_handle,
                             stderr_handle,
                             stdin_handle,
@@ -298,14 +394,26 @@ impl SystemProcessRunner {
             }
 
             if should_stop() {
-                terminate_child(&mut child, process_group)?;
-                finish_terminated_child(stdout_handle, stderr_handle, stdin_handle, session)?;
+                *cleanup = cleanup_terminated_child(
+                    &mut child,
+                    process_group,
+                    stdout_handle,
+                    stderr_handle,
+                    stdin_handle,
+                    session,
+                )?;
                 return Err(ProcessError::Cancelled.into());
             }
 
             if started.elapsed() >= request.policy.deadline {
-                terminate_child(&mut child, process_group)?;
-                finish_terminated_child(stdout_handle, stderr_handle, stdin_handle, session)?;
+                *cleanup = cleanup_terminated_child(
+                    &mut child,
+                    process_group,
+                    stdout_handle,
+                    stderr_handle,
+                    stdin_handle,
+                    session,
+                )?;
                 return Err(ProcessError::DeadlineExceeded {
                     deadline: request.policy.deadline,
                 }
@@ -316,6 +424,9 @@ impl SystemProcessRunner {
         }
 
         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
+        if process_group.is_some_and(saved_process_group_is_gone) {
+            *cleanup = CleanupState::Completed;
+        }
         let status = status.expect("completed child must have an exit status");
         if status.success()
             && let Some(error) = stdin_error
@@ -403,7 +514,20 @@ fn finish_terminated_child(
     stderr: CaptureThread,
     stdin: Option<thread::JoinHandle<()>>,
     session: SessionKind,
-) -> io::Result<()> {
+) -> io::Result<CleanupState> {
+    let started = Instant::now();
+    finish_terminated_child_with_budget(stdout, stderr, stdin, session, &|| {
+        started.elapsed() >= TERMINATED_DRAIN_GRACE
+    })
+}
+
+fn finish_terminated_child_with_budget(
+    stdout: CaptureThread,
+    stderr: CaptureThread,
+    stdin: Option<thread::JoinHandle<()>>,
+    session: SessionKind,
+    expired: &dyn Fn() -> bool,
+) -> io::Result<CleanupState> {
     if session == SessionKind::Inherit {
         // ENV setup runs inside the recorded gated child's group. Local
         // timeout/cap/cancel must not killpg that group (it would suicide the
@@ -411,25 +535,24 @@ fn finish_terminated_child(
         // keep pipe FDs, and joining would wait until they exit. Detach the
         // handles and `_exit` the helper so supervisor `killpg` finishes reap.
         abandon_capture_threads(stdout, stderr, stdin);
-        return Ok(());
+        return Ok(CleanupState::Unknown);
     }
 
     // Overflow captures wait on this gate after draining. Release it before
     // polling completion, otherwise they cannot finish even after EOF.
     let _ = stdout.limit_release.send(());
     let _ = stderr.limit_release.send(());
-    let started = Instant::now();
     while !stdout.handle.is_finished()
         || !stderr.handle.is_finished()
         || stdin.as_ref().is_some_and(|handle| !handle.is_finished())
     {
-        if started.elapsed() >= TERMINATED_DRAIN_GRACE {
+        if expired() {
             abandon_capture_threads(stdout, stderr, stdin);
-            return Ok(());
+            return Ok(CleanupState::Unknown);
         }
         thread::sleep(Duration::from_millis(2));
     }
-    join_threads(stdout, stderr, stdin)
+    join_threads(stdout, stderr, stdin).map(|_| CleanupState::Completed)
 }
 
 fn abandon_capture_threads(
@@ -482,20 +605,62 @@ fn recover_after_killpg_eperm(
     Err(error)
 }
 
-fn terminate_child(child: &mut Child, process_group: Option<libc::pid_t>) -> io::Result<()> {
+fn terminate_child(
+    child: &mut Child,
+    process_group: Option<libc::pid_t>,
+) -> io::Result<CleanupState> {
+    let started = Instant::now();
+    terminate_child_with_evidence(
+        child,
+        process_group,
+        &|| started.elapsed() >= PROCESS_GROUP_KILL_BUDGET,
+        &saved_process_group_is_gone,
+    )
+}
+
+fn cleanup_terminated_child(
+    child: &mut Child,
+    process_group: Option<libc::pid_t>,
+    stdout: CaptureThread,
+    stderr: CaptureThread,
+    stdin: Option<thread::JoinHandle<()>>,
+    session: SessionKind,
+) -> io::Result<CleanupState> {
+    let process = terminate_child(child, process_group)?;
+    let captures = finish_terminated_child(stdout, stderr, stdin, session)?;
+    Ok(
+        if process == CleanupState::Completed && captures == CleanupState::Completed {
+            CleanupState::Completed
+        } else {
+            CleanupState::Unknown
+        },
+    )
+}
+
+fn terminate_child_with_evidence(
+    child: &mut Child,
+    process_group: Option<libc::pid_t>,
+    expired: &dyn Fn() -> bool,
+    group_is_gone: &dyn Fn(libc::pid_t) -> bool,
+) -> io::Result<CleanupState> {
     if let Some(process_group) = process_group {
-        let started = Instant::now();
         loop {
             if let Err(error) = terminate_process_group(process_group) {
-                return recover_after_killpg_eperm(child, process_group, error);
+                recover_after_killpg_eperm(child, process_group, error)?;
+                return Ok(if group_is_gone(process_group) {
+                    CleanupState::Completed
+                } else {
+                    CleanupState::Unknown
+                });
             }
             // Reap before probing: our own zombie leader would keep the group
             // present. Child caches this status on subsequent iterations.
             child.wait()?;
-            if saved_process_group_is_gone(process_group)
-                || started.elapsed() >= PROCESS_GROUP_KILL_BUDGET
-            {
-                return Ok(());
+            if group_is_gone(process_group) {
+                return Ok(CleanupState::Completed);
+            }
+            if expired() {
+                return Ok(CleanupState::Unknown);
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -505,7 +670,7 @@ fn terminate_child(child: &mut Child, process_group: Option<libc::pid_t>) -> io:
     {
         return Err(error);
     }
-    child.wait().map(|_| ())
+    child.wait().map(|_| CleanupState::Completed)
 }
 
 fn terminate_process_group(process_group: libc::pid_t) -> io::Result<()> {
@@ -532,20 +697,22 @@ fn join_threads(
 ) -> io::Result<()> {
     let _ = stdout.limit_release.send(());
     let _ = stderr.limit_release.send(());
-    stdout
+    let stdout_result = stdout
         .handle
         .join()
-        .map_err(|_| io::Error::other("stdout capture thread panicked"))?;
-    stderr
+        .map_err(|_| io::Error::other("stdout capture thread panicked"));
+    let stderr_result = stderr
         .handle
         .join()
-        .map_err(|_| io::Error::other("stderr capture thread panicked"))?;
-    if let Some(stdin) = stdin {
+        .map_err(|_| io::Error::other("stderr capture thread panicked"));
+    let stdin_result = if let Some(stdin) = stdin {
         stdin
             .join()
-            .map_err(|_| io::Error::other("stdin writer thread panicked"))?;
-    }
-    Ok(())
+            .map_err(|_| io::Error::other("stdin writer thread panicked"))
+    } else {
+        Ok(())
+    };
+    stdout_result.and(stderr_result).and(stdin_result)
 }
 
 /// Bounded rolling byte window for later fixed-phrase scanners.
@@ -608,6 +775,180 @@ mod tests {
             stderr_limit: 4096,
             deadline: Duration::from_secs(2),
         }
+    }
+
+    fn cleanup_request(script: &str) -> ProcessRequest {
+        ProcessRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: 4096,
+                stderr_limit: 4096,
+                deadline: Duration::from_secs(30),
+            },
+            isolate_parent_environment: false,
+        }
+    }
+
+    #[test]
+    fn tracked_success_and_nonzero_exit_preserve_legacy_outcomes() {
+        for script in [
+            "printf out; printf err >&2",
+            "printf out; printf err >&2; exit 75",
+        ] {
+            let request = cleanup_request(script);
+            let legacy = SystemProcessRunner.run(&request).unwrap();
+            let completion =
+                SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false);
+            assert_eq!(completion.cleanup, CleanupState::Completed);
+            let tracked = completion.outcome.unwrap();
+            assert_eq!(tracked.status, legacy.status);
+            assert_eq!(tracked.stdout, legacy.stdout);
+            assert_eq!(tracked.stderr, legacy.stderr);
+        }
+    }
+
+    #[test]
+    fn tracked_spawn_failure_proves_no_child_cleanup() {
+        let mut request = cleanup_request("exit 0");
+        request.program = "/nonexistent/mac-worker-cleanup-fixture".into();
+        let completion = SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false);
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        assert!(
+            matches!(completion.outcome, Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn tracked_deadline_and_cancel_report_completed_after_reap_and_join() {
+        let mut request = cleanup_request("while :; do :; done");
+        request.policy.deadline = Duration::ZERO;
+        let completion = SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false);
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        assert!(
+            matches!(completion.outcome, Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline == Duration::ZERO)
+        );
+
+        request.policy.deadline = Duration::from_secs(30);
+        let stopped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let predicate = || {
+            stopped.set(true);
+            stopped.get()
+        };
+        let completion = SystemProcessRunner.run_interruptible_with_cleanup(&request, &predicate);
+        assert!(stopped.get());
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        assert!(matches!(
+            completion.outcome,
+            Err(WorkerError::Process(ProcessError::Cancelled))
+        ));
+    }
+
+    #[test]
+    fn tracked_stdin_failure_has_joined_cleanup_and_original_error() {
+        let mut request = cleanup_request("exec 0<&-; printf done");
+        request.stdin = Some(vec![b'x'; 2 * 1024 * 1024]);
+        let completion = SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false);
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        assert!(
+            matches!(completion.outcome, Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(
+            matches!(SystemProcessRunner.run(&request), Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn tracked_success_with_live_owned_descendant_is_unknown_even_after_capture_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let gate = temp.path().join("gate");
+        let name = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let script = format!(
+            "/bin/cat >/dev/null 2>/dev/null <'{}' & printf '%s' $$",
+            gate.display()
+        );
+        let completion = SystemProcessRunner
+            .run_interruptible_with_cleanup(&cleanup_request(&script), &|| false);
+        let result = completion.outcome.unwrap();
+        let group = parsed_pgid(&result.stdout);
+        let mut guard = SavedGroup::new(group);
+        assert_eq!(completion.cleanup, CleanupState::Unknown);
+        assert!(result.status.success());
+        assert!(!saved_process_group_is_gone(group));
+        guard.cleanup_once();
+    }
+
+    #[test]
+    fn tracked_capture_abandonment_and_panic_never_prove_completion() {
+        use std::os::unix::net::UnixStream;
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let stdout = spawn_capture(reader, ProcessStream::Stdout, 32, sender.clone());
+        let stderr = spawn_capture(io::empty(), ProcessStream::Stderr, 32, sender);
+        let cleanup = finish_terminated_child_with_budget(
+            stdout,
+            stderr,
+            None,
+            SessionKind::NewProcessGroup,
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(cleanup, CleanupState::Unknown);
+        drop(writer);
+
+        struct PanickingReader;
+        impl Read for PanickingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                panic!("fixture capture panic")
+            }
+        }
+        let (sender, _receiver) = mpsc::channel();
+        let stdout = spawn_capture(PanickingReader, ProcessStream::Stdout, 32, sender.clone());
+        let stderr = spawn_capture(io::empty(), ProcessStream::Stderr, 32, sender);
+        assert!(join_threads(stdout, stderr, None).is_err());
+    }
+
+    #[test]
+    fn tracked_expired_kill_budget_is_unknown_even_with_joined_pipes() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = child.id() as libc::pid_t;
+        let cleanup =
+            terminate_child_with_evidence(&mut child, Some(group), &|| true, &|_| false).unwrap();
+        assert_eq!(cleanup, CleanupState::Unknown);
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn tracked_reference_and_arc_delegation_preserve_predicate_and_explicit_evidence() {
+        use crate::controller::channel::testing::RecordingTrackedRunner;
+        use std::sync::Arc;
+        let raw = Arc::new(RecordingTrackedRunner::new(vec![ProcessCompletion {
+            outcome: Err(ProcessError::Cancelled.into()),
+            cleanup: CleanupState::Completed,
+        }]));
+        let runner: Arc<dyn TrackedProcessRunner> = raw.clone();
+        let borrowed = &runner;
+        let flag = std::rc::Rc::new(std::cell::Cell::new(false));
+        let stop = || {
+            flag.set(true);
+            true
+        };
+        let completion = borrowed.run_interruptible_with_cleanup(&cleanup_request("exit 0"), &stop);
+        assert!(flag.get());
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        assert!(matches!(
+            completion.outcome,
+            Err(WorkerError::Process(ProcessError::Cancelled))
+        ));
+        assert_eq!(raw.calls().len(), 1);
     }
 
     fn pgid_request() -> ProcessRequest {

@@ -1,6 +1,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod controller_socket_forward;
 mod git_transport;
 mod origin_outbox;
 mod remote_snapshot;
