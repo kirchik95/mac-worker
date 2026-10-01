@@ -1,2 +1,248 @@
-//! T6 facade. Loop scope, live borrowed cancellation and dependency contracts.
-pub use super::contracts::{ClientContext, ClientDeps, ReadLoopScope, eligible_read};
+//! Foreground-owned policy for the frozen controller read-loop scopes.
+use std::{ffi::OsStr, sync::Mutex};
+
+pub use super::contracts::{
+    ChannelFailure, CleanupContext, ClientContext, ClientDeps, ConfiguredRoute, ForwardDisposition,
+    ForwardLease, ReadLoopScope, SETUP_GUARD, SocketSession, eligible_read,
+};
+use crate::{
+    controller::{ControllerRequest, decode_request},
+    error::WorkerError,
+    paths::PathLayout,
+    process::{ProcessRequest, ProcessResult, ProcessRunner},
+};
+
+struct Session {
+    socket: Box<dyn SocketSession>,
+    forward: Box<dyn ForwardLease>,
+}
+struct State {
+    session: Option<Session>,
+    disposition: ForwardDisposition,
+}
+/// Construct only inside one of the explicitly scoped foreground read loops.
+pub struct ChannelProcessRunner<R: ProcessRunner> {
+    raw: R,
+    scope: ReadLoopScope,
+    route: ConfiguredRoute,
+    paths: PathLayout,
+    deps: ClientDeps,
+    state: Mutex<State>,
+}
+impl<R: ProcessRunner> ChannelProcessRunner<R> {
+    pub fn new(
+        raw: R,
+        scope: ReadLoopScope,
+        route: ConfiguredRoute,
+        paths: PathLayout,
+        deps: ClientDeps,
+    ) -> Self {
+        Self {
+            raw,
+            scope,
+            route,
+            paths,
+            deps,
+            state: Mutex::new(State {
+                session: None,
+                disposition: ForwardDisposition::Cleaned,
+            }),
+        }
+    }
+
+    /// Close the application stream before cancelling its single owned forward.
+    pub fn close(&self) -> ForwardDisposition {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.close_session(&mut state);
+        state.disposition
+    }
+
+    fn close_session(&self, state: &mut State) {
+        if let Some(mut session) = state.session.take() {
+            session.socket.close();
+            state.disposition = self.cancel_forward(&mut *session.forward);
+        }
+    }
+
+    fn cancel_forward(&self, forward: &mut dyn ForwardLease) -> ForwardDisposition {
+        forward.cancel(
+            &self.raw,
+            &CleanupContext {
+                runtime: self.deps.runtime.clone(),
+                deadline: self.deps.runtime.now().saturating_add(SETUP_GUARD),
+            },
+        )
+    }
+
+    fn setup(&self, state: &mut State, ctx: &ClientContext<'_>) -> Result<(), ChannelFailure> {
+        let master = self.deps.forwards.resolve(&self.raw, &self.route, ctx)?;
+        let identity = self
+            .deps
+            .identity
+            .read(&self.raw, &self.route, Some(&master), ctx)?;
+        self.deps.pins.verify_or_create(&self.paths, &identity)?;
+        let mut forward = self
+            .deps
+            .forwards
+            .open(&self.raw, &master, &identity, ctx)
+            .map_err(|failure| {
+                state.disposition = failure.disposition;
+                failure.failure
+            })?;
+        let socket = self
+            .deps
+            .connector
+            .connect(forward.local_socket(), &identity, ctx)
+            .map_err(|failure| {
+                state.disposition = self.cancel_forward(&mut *forward);
+                failure
+            })?;
+        state.session = Some(Session { socket, forward });
+        Ok(())
+    }
+
+    fn eligible(&self, request: &ProcessRequest) -> Option<ControllerRequest> {
+        if !matches_route(request, &self.route) {
+            return None;
+        }
+        let frame = request.stdin.as_deref()?;
+        let parsed = decode_request(frame).ok()?;
+        eligible_read(self.scope, &parsed).then_some(parsed)
+    }
+
+    fn run_scoped(
+        &self,
+        request: &ProcessRequest,
+        parsed: &ControllerRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        let Ok(mut state) = self.state.try_lock() else {
+            return self.raw.run_interruptible(request, should_stop);
+        };
+        let ctx = ClientContext {
+            runtime: &*self.deps.runtime,
+            deadline: self
+                .deps
+                .runtime
+                .now()
+                .saturating_add(request.policy.deadline),
+            should_stop,
+        };
+        if state.session.is_none() {
+            self.setup(&mut state, &ctx).map_err(unavailable)?;
+        }
+        let session = state
+            .session
+            .as_mut()
+            .expect("successful setup supplies a session");
+        session.forward.verify().map_err(unavailable)?;
+        session
+            .socket
+            .exchange(
+                request.stdin.as_deref().expect("eligible frame"),
+                parsed,
+                &ctx,
+            )
+            .map_err(unavailable)
+    }
+}
+impl<R: ProcessRunner> ProcessRunner for ChannelProcessRunner<R> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        match self.eligible(request) {
+            Some(parsed) => self.run_scoped(request, &parsed, &|| false),
+            None => self.raw.run(request),
+        }
+    }
+    fn run_in_new_session(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        self.raw.run_in_new_session(request)
+    }
+    fn run_interruptible(
+        &self,
+        request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<ProcessResult, WorkerError> {
+        match self.eligible(request) {
+            Some(parsed) => self.run_scoped(request, &parsed, should_stop),
+            None => self.raw.run_interruptible(request, should_stop),
+        }
+    }
+}
+impl<R: ProcessRunner> Drop for ChannelProcessRunner<R> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn unavailable(_failure: ChannelFailure) -> WorkerError {
+    WorkerError::Unavailable("CONTROLLER_UNAVAILABLE: controller read channel unavailable".into())
+}
+
+// Recognize only the worker's structured SSH invocation. In particular, no
+// alternate executable, config, destination, forwarding or remote shell text.
+fn matches_route(request: &ProcessRequest, route: &ConfiguredRoute) -> bool {
+    if crate::transport::ssh_program().ok().as_ref() != Some(&request.program)
+        || !request.environment.is_empty()
+        || !request.environment_remove.is_empty()
+        || request.isolate_parent_environment
+        || route.remote_binary != "~/.local/bin/worker"
+    {
+        return false;
+    }
+    let Some(split) = request.args.len().checked_sub(3) else {
+        return false;
+    };
+    if request.args[split] != "--"
+        || request.args[split + 1] != OsStr::new(&route.ssh)
+        || request.args[split + 2] != "~/.local/bin/worker host controller-rpc"
+    {
+        return false;
+    }
+    let mut options = &request.args[..split];
+    if let Some(config) = &route.ssh_config_file {
+        if options.len() < 2 || options[0] != "-F" || options[1] != config.as_os_str() {
+            return false;
+        }
+        options = &options[2..];
+    }
+    let required = [
+        "BatchMode=yes",
+        "ConnectTimeout=5",
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+    ];
+    if options.len() < 8 || !options.len().is_multiple_of(2) {
+        return false;
+    }
+    for (index, pair) in options.chunks_exact(2).enumerate() {
+        if pair[0] != "-o" {
+            return false;
+        }
+        let Some(value) = pair[1].to_str() else {
+            return false;
+        };
+        if index < required.len() {
+            if value != required[index] {
+                return false;
+            }
+        } else if !matches!(
+            value,
+            "ControlMaster=auto"
+                | "ControlPersist=60"
+                | "ServerAliveInterval=10"
+                | "ServerAliveCountMax=3"
+                | "StreamLocalBindMask=0177"
+                | "StreamLocalBindUnlink=no"
+        ) && !value
+            .strip_prefix("ControlPath=")
+            .is_some_and(|path| !path.is_empty())
+        {
+            return false;
+        }
+    }
+    true
+}
+#[cfg(test)]
+mod tests;
