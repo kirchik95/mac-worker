@@ -342,7 +342,7 @@ impl ControllerJournal {
         deadline: Duration,
         mut read: impl FnMut(&fs::Manifest) -> io::Result<T>,
     ) -> io::Result<T> {
-        fs::retry_same_binding(&self.root, self.binding, deadline, &self.clock, || {
+        fs::retry_reader_same_binding(&self.root, self.binding, deadline, &self.clock, || {
             let shared = fs::acquire_lock(&self.root, self.lock, true, deadline, &self.clock)?;
             self.validate_epoch()?;
             self.hooks.at(JournalFaultPoint::ReadAttempt)?;
@@ -497,10 +497,6 @@ impl JournalReader for ControllerJournal {
                         return Ok(result);
                     }
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::TimedOut
-                        && !self.clock.0.cancelled()
-                        && self.clock.0.now() < wait_until => {}
                 Err(error) => return Err(runtime_io(&self.clock, error)),
             }
             // All SH/EX guards have dropped before the injected wait.

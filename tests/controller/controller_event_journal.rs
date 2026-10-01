@@ -655,6 +655,303 @@ fn long_poll_retries_exclusive_recovery_admission_timeout() {
     assert_eq!(h.runtime.now(), Duration::from_millis(250));
 }
 
+/// Hold a real EX lock only after the reader has dropped SH for recovery.
+struct RecoveryAdmissionHold {
+    lock_path: std::path::PathBuf,
+    entered: AtomicUsize,
+    release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    helper: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl RecoveryAdmissionHold {
+    fn new(h: &JournalHarness) -> Arc<Self> {
+        Arc::new(Self {
+            lock_path: h.root().join("journal.lock"),
+            entered: AtomicUsize::new(0),
+            release: Mutex::new(None),
+            helper: Mutex::new(None),
+        })
+    }
+
+    fn release(&self) {
+        if let Some(sender) = self.release.lock().unwrap().take() {
+            let _ = sender.send(());
+        }
+        if let Some(helper) = self.helper.lock().unwrap().take() {
+            helper.join().unwrap();
+        }
+    }
+
+    fn release_at(&self, runtime: &Arc<ManualEventRuntime>, elapsed: Duration) {
+        use mac_worker::controller::events::EventRuntime;
+        if runtime.now() >= elapsed {
+            self.release();
+        }
+    }
+}
+
+impl JournalFaultHook for RecoveryAdmissionHold {
+    fn at(&self, point: JournalFaultPoint) -> io::Result<()> {
+        use std::{os::fd::AsRawFd, sync::mpsc};
+
+        if point == JournalFaultPoint::RecoveryAttempt
+            && self.entered.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let lock_path = self.lock_path.clone();
+            *self.release.lock().unwrap() = Some(release_tx);
+            *self.helper.lock().unwrap() = Some(std::thread::spawn(move || {
+                let lock = fs::File::open(lock_path).unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(DEADLINE).unwrap();
+                drop(lock);
+            }));
+            entered_rx.recv_timeout(DEADLINE).unwrap();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RecoveryAdmissionHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+fn window_retries_exclusive_recovery_admission_timeout() {
+    use mac_worker::controller::events::EventRuntime;
+
+    let h = JournalHarness::new();
+    let epoch = h.head().journal_id;
+    let hold = RecoveryAdmissionHold::new(&h);
+    let reader = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hold.clone(),
+    )
+    .unwrap()
+    .unwrap();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let release = hold.clone();
+    let runtime = h.runtime.clone();
+    h.runtime
+        .on_sleep(move |_| release.release_at(&runtime, Duration::from_millis(200)));
+
+    let deadline = Duration::from_secs(1);
+    let result = reader.window(deadline);
+    h.runtime.clear_sleep_hook();
+    hold.release();
+    let window = result.expect("window must retry the 50 ms EX recovery admission timeout");
+    assert_eq!(window.journal_id, epoch);
+    assert_eq!(window.head_seq, Seq::new(1));
+    assert_eq!(h.runtime.now(), Duration::from_millis(250));
+    assert!(h.runtime.now() < deadline);
+    assert!(!h.root().join("pending.json").exists());
+}
+
+#[test]
+fn attachment_retries_exclusive_recovery_admission_timeout() {
+    use mac_worker::controller::events::EventRuntime;
+
+    let h = JournalHarness::new();
+    let epoch = h.head().journal_id;
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let hold = RecoveryAdmissionHold::new(&h);
+    let release = hold.clone();
+    let runtime = h.runtime.clone();
+    h.runtime
+        .on_sleep(move |_| release.release_at(&runtime, Duration::from_millis(200)));
+
+    let result = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hold.clone(),
+    );
+    h.runtime.clear_sleep_hook();
+    hold.release();
+    let reader = result
+        .expect("attachment must retry the 50 ms EX recovery admission timeout")
+        .unwrap();
+    assert_eq!(reader.window(DEADLINE).unwrap().journal_id, epoch);
+    assert_eq!(reader.window(DEADLINE).unwrap().head_seq, Seq::new(1));
+    assert_eq!(h.runtime.now(), Duration::from_millis(250));
+    assert!(!h.root().join("pending.json").exists());
+}
+
+#[test]
+fn nonwaiting_read_retries_exclusive_recovery_admission_timeout() {
+    let h = JournalHarness::new();
+    let before = h.head().cursor();
+    let hold = RecoveryAdmissionHold::new(&h);
+    let reader = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hold.clone(),
+    )
+    .unwrap()
+    .unwrap();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let release = hold.clone();
+    let runtime = h.runtime.clone();
+    h.runtime
+        .on_sleep(move |_| release.release_at(&runtime, Duration::from_millis(200)));
+
+    let result = reader.read(
+        ReadQuery {
+            after: Some(before),
+            limit: 1,
+            wait_ms: 0,
+        },
+        Duration::from_secs(1),
+    );
+    h.runtime.clear_sleep_hook();
+    hold.release();
+    let EventReadResult::Batch(batch) = result.expect("read admission uses the caller deadline")
+    else {
+        panic!("expected recovered batch");
+    };
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.next_after.seq, Seq::new(1));
+    batch.validate().unwrap();
+}
+
+#[test]
+fn recovery_admission_retry_expires_at_original_window_deadline() {
+    use mac_worker::controller::events::EventRuntime;
+
+    let h = JournalHarness::new();
+    let hold = RecoveryAdmissionHold::new(&h);
+    let reader = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hold.clone(),
+    )
+    .unwrap()
+    .unwrap();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let pending = fs::read(h.root().join("pending.json")).unwrap();
+    let deadline = Duration::from_millis(275);
+
+    let result = reader.window(deadline);
+    hold.release();
+    assert_eq!(
+        result.unwrap_err().public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(h.runtime.now(), deadline);
+    assert_eq!(fs::read(h.root().join("pending.json")).unwrap(), pending);
+    assert_eq!(
+        reader.window(deadline).unwrap_err().public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+}
+
+#[test]
+fn cancellation_stops_attachment_recovery_admission_retry() {
+    use mac_worker::controller::events::EventRuntime;
+
+    let h = JournalHarness::new();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let pending = fs::read(h.root().join("pending.json")).unwrap();
+    let hold = RecoveryAdmissionHold::new(&h);
+    let runtime = h.runtime.clone();
+    h.runtime.on_sleep(move |_| {
+        if runtime.now() >= Duration::from_millis(250) {
+            runtime.cancel();
+        }
+    });
+
+    let result = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        hold.clone(),
+    );
+    h.runtime.clear_sleep_hook();
+    hold.release();
+    assert_eq!(
+        result.err().unwrap().public_code(),
+        "CONTROLLER_EVENTS_CANCELLED"
+    );
+    assert_eq!(h.runtime.now(), Duration::from_millis(250));
+    assert_eq!(fs::read(h.root().join("pending.json")).unwrap(), pending);
+}
+
+#[test]
+fn recovery_io_timeout_fails_without_admission_retry() {
+    use mac_worker::controller::events::EventRuntime;
+
+    let h = JournalHarness::new();
+    let before = h.head().cursor();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let recovery_attempts = attempts.clone();
+    let reader = ControllerJournal::open_existing_with_hook(
+        &h.paths,
+        JournalOptions {
+            runtime: h.runtime.clone(),
+        },
+        Arc::new(move |point| {
+            if point == JournalFaultPoint::RecoveryAttempt {
+                recovery_attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Ok(())
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    h.inject(JournalFaultPoint::PendingDurable);
+    assert!(h.append_one().is_err());
+    let pending = fs::read(h.root().join("pending.json")).unwrap();
+
+    assert_eq!(
+        reader.window(DEADLINE).unwrap_err().public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runtime.now(), Duration::ZERO);
+    assert!(h.runtime.sleeps().is_empty());
+    assert_eq!(fs::read(h.root().join("pending.json")).unwrap(), pending);
+    assert_eq!(
+        reader
+            .read(
+                ReadQuery {
+                    after: Some(before),
+                    limit: 1,
+                    wait_ms: 1000,
+                },
+                DEADLINE,
+            )
+            .unwrap_err()
+            .public_code(),
+        "CONTROLLER_EVENTS_UNAVAILABLE"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(h.runtime.now(), Duration::ZERO);
+    assert!(h.runtime.sleeps().is_empty());
+    assert_eq!(fs::read(h.root().join("pending.json")).unwrap(), pending);
+}
+
 #[test]
 fn committed_batch_exposes_last_delivered_cursor() {
     let journal = MemoryJournal::new();

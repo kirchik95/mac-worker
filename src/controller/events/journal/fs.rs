@@ -10,12 +10,12 @@ use crate::rooted_fs::PrivateRolePoint;
 use crate::rooted_fs::{PrivateEntryIdentity, PrivateRegularRole, PrivateRoleHooks, RootedDir};
 
 use super::super::contracts::{
-    JOURNAL_ADMISSION_BUDGET, MAX_BATCH_BYTES as BATCH_BYTES, MAX_BATCH_EVENTS as BATCH_EVENTS,
-    MAX_EVENT_BYTES as EVENT_BYTES, MAX_JOURNAL_BYTES as TOTAL_BYTES,
-    MAX_JOURNAL_FILES as TOTAL_FILES, MAX_METADATA_BYTES as METADATA_BYTES,
-    MAX_RECOVERY_EVIDENCE_BYTES as EVIDENCE_BYTES, MAX_RECOVERY_EVIDENCE_FILES as EVIDENCE_FILES,
-    MAX_RETAINED_SEGMENTS as RETAINED_SEGMENTS, MAX_SEGMENT_BYTES as SEGMENT_BYTES,
-    MAX_STALE_RETRIES,
+    JOURNAL_ADMISSION_BUDGET, JOURNAL_CHECK_INTERVAL, MAX_BATCH_BYTES as BATCH_BYTES,
+    MAX_BATCH_EVENTS as BATCH_EVENTS, MAX_EVENT_BYTES as EVENT_BYTES,
+    MAX_JOURNAL_BYTES as TOTAL_BYTES, MAX_JOURNAL_FILES as TOTAL_FILES,
+    MAX_METADATA_BYTES as METADATA_BYTES, MAX_RECOVERY_EVIDENCE_BYTES as EVIDENCE_BYTES,
+    MAX_RECOVERY_EVIDENCE_FILES as EVIDENCE_FILES, MAX_RETAINED_SEGMENTS as RETAINED_SEGMENTS,
+    MAX_SEGMENT_BYTES as SEGMENT_BYTES, MAX_STALE_RETRIES,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1378,14 +1378,48 @@ fn recover_append_in(
 
 pub(super) use super::super::contracts::EventRuntime as FsClock;
 
+#[derive(Debug)]
+struct AdmissionTimeout;
+
+impl std::fmt::Display for AdmissionTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("journal lock admission timed out")
+    }
+}
+
+impl std::error::Error for AdmissionTimeout {}
+
 pub(super) fn retry_same_binding<T>(
     root: &RootedDir,
     binding: Binding,
     deadline: Duration,
     clock: &dyn FsClock,
+    operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry_same_binding_with_admission(root, binding, deadline, clock, false, operation)
+}
+
+/// Reader recovery may outwait an EX admission cap, within its original deadline.
+pub(super) fn retry_reader_same_binding<T>(
+    root: &RootedDir,
+    binding: Binding,
+    deadline: Duration,
+    clock: &dyn FsClock,
+    operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry_same_binding_with_admission(root, binding, deadline, clock, true, operation)
+}
+
+fn retry_same_binding_with_admission<T>(
+    root: &RootedDir,
+    binding: Binding,
+    deadline: Duration,
+    clock: &dyn FsClock,
+    retry_admission: bool,
     mut operation: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
-    for attempt in 0..=MAX_STALE_RETRIES {
+    let mut stale_retries = 0;
+    loop {
         root.verify_bound().map_err(|_| unavailable())?;
         if Binding::from(root.identity()?) != binding {
             return Err(unavailable());
@@ -1395,11 +1429,30 @@ pub(super) fn retry_same_binding<T>(
         }
         match operation() {
             Err(error)
-                if error.raw_os_error() == Some(libc::ESTALE) && attempt < MAX_STALE_RETRIES => {}
+                if error.raw_os_error() == Some(libc::ESTALE)
+                    && stale_retries < MAX_STALE_RETRIES =>
+            {
+                stale_retries += 1;
+            }
+            Err(error)
+                if retry_admission
+                    && error.kind() == io::ErrorKind::TimedOut
+                    && error
+                        .get_ref()
+                        .is_some_and(|error| error.is::<AdmissionTimeout>())
+                    && !clock.cancelled()
+                    && clock.now() < deadline =>
+            {
+                // The failed attempt has dropped all SH/EX guards before sleeping.
+                clock.sleep(
+                    deadline
+                        .saturating_sub(clock.now())
+                        .min(JOURNAL_CHECK_INTERVAL),
+                );
+            }
             result => return result,
         }
     }
-    unreachable!("the last retry returns its result")
 }
 
 pub(super) fn acquire_lock(
@@ -1429,7 +1482,7 @@ pub(super) fn acquire_lock(
             return Err(unavailable());
         }
         if clock.now() >= admission_end {
-            return Err(io::ErrorKind::TimedOut.into());
+            return Err(io::Error::new(io::ErrorKind::TimedOut, AdmissionTimeout));
         }
         let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
         if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
@@ -1442,7 +1495,7 @@ pub(super) fn acquire_lock(
         }
         let remaining = admission_end.saturating_sub(clock.now());
         if remaining.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
+            return Err(io::Error::new(io::ErrorKind::TimedOut, AdmissionTimeout));
         }
         clock.sleep(remaining.min(Duration::from_millis(1)));
     }
@@ -1960,6 +2013,38 @@ mod tests {
         fs::remove_file(root.path().join("journal.lock")).unwrap();
         assert!(acquire_lock(&root, binding, true, Duration::from_secs(1), &clock).is_err());
         assert!(!root.entry_exists("journal.lock").unwrap());
+    }
+
+    #[test]
+    fn reader_recovery_outwaits_multiple_exclusive_admission_caps() {
+        use std::sync::{Arc, Mutex};
+
+        let (_temp, root, _manifest) = fixture(&record(1), false);
+        root.open_private_lock("journal.lock").unwrap();
+        let lock_binding = root.private_entry_identity("journal.lock").unwrap().into();
+        let clock = ManualEventRuntime::new();
+        let shared =
+            acquire_lock(&root, lock_binding, true, Duration::from_secs(2), &clock).unwrap();
+        let held = Arc::new(Mutex::new(Some(shared)));
+        let release = held.clone();
+        let runtime = clock.clone();
+        clock.on_sleep(move |_| {
+            if runtime.now() >= Duration::from_secs(1) {
+                release.lock().unwrap().take();
+            }
+        });
+
+        let exclusive = retry_reader_same_binding(
+            &root,
+            root.identity().unwrap().into(),
+            Duration::from_secs(2),
+            &clock,
+            || acquire_lock(&root, lock_binding, false, Duration::from_secs(2), &clock),
+        );
+        clock.clear_sleep_hook();
+        held.lock().unwrap().take();
+        assert!(exclusive.is_ok());
+        assert_eq!(clock.now(), Duration::from_secs(1));
     }
 
     #[test]
