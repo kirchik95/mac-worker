@@ -20,6 +20,8 @@ use crate::{
 use serde::de::DeserializeOwned;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+pub use super::foreground::EventChannelRuntime;
+
 const LEGACY_SELECTOR_REJECTION: &str = "task.list body contained unexpected key controller_events";
 
 pub struct ControllerEventClient {
@@ -28,6 +30,39 @@ pub struct ControllerEventClient {
     runtime: Arc<dyn EventRuntime>,
 }
 impl ControllerEventClient {
+    /// Own a single foreground runner for event follow or notification reads.
+    pub fn for_read_loop(
+        raw: Arc<dyn ProcessRunner>,
+        scope: crate::controller::channel::ReadLoopScope,
+        paths: &crate::paths::PathLayout,
+        config: &crate::config::Config,
+        runtime: Arc<dyn EventRuntime>,
+        dependencies: crate::controller::channel::ClientDeps,
+    ) -> Self {
+        use crate::controller::channel::{
+            ConfiguredRoute, ReadLoopScope, client::ChannelProcessRunner,
+        };
+        let runner: Arc<dyn ProcessRunner> =
+            if matches!(scope, ReadLoopScope::EventsFollow | ReadLoopScope::Notify)
+                && let Ok(route) = ConfiguredRoute::new(&config.controller, &config.ssh)
+            {
+                let dependencies = crate::clone_controller_channel_dependencies(
+                    &dependencies,
+                    Arc::new(EventChannelRuntime(runtime.clone())),
+                );
+                Arc::new(ChannelProcessRunner::new(
+                    raw,
+                    scope,
+                    route,
+                    paths.clone(),
+                    dependencies,
+                ))
+            } else {
+                raw
+            };
+        Self::new(runner, config.controller.clone(), runtime)
+    }
+
     pub fn new(
         runner: Arc<dyn ProcessRunner>,
         controller: ControllerConfig,

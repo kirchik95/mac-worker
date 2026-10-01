@@ -155,12 +155,15 @@ pub(crate) fn run_command(
     stderr: &mut dyn Write,
 ) -> u8 {
     let result = (|| {
-        let (_, config) = super::foreground::configuration(cli, context)?;
+        let (paths, config) = super::foreground::configuration(cli, context)?;
         let runtime = super::foreground::ForegroundRuntime::install()?;
-        let source = super::client::ControllerEventClient::new(
+        let source = super::foreground::event_client(
             Arc::new(crate::process::SystemProcessRunner),
-            config.controller,
+            crate::controller::channel::ReadLoopScope::EventsFollow,
+            &paths,
+            &config,
             runtime.clone(),
+            context,
         );
         TailLoop {
             source: &source,

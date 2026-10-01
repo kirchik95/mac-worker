@@ -1213,3 +1213,1032 @@ mod t7a {
         assert!(!fixture.features().contains(&"controller.socket".into()));
     }
 }
+
+// T7b owns this loop/raw/route block; leader wiring is maintained by T7a.
+// Each mux-enabled fixture gets process-level HOME/XDG isolation as well as
+// RuntimeContext isolation. Raw SSH argv construction also reads process HOME.
+fn isolated_loop_fixture(name: &str) -> bool {
+    if std::env::var_os("MAC_WORKER_T7B_LOOP_FIXTURE").is_some() {
+        return false;
+    }
+    let root = tempfile::Builder::new()
+        .prefix("p3b")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let request = mac_worker::process::ProcessRequest {
+        program: std::env::current_exe().unwrap().into_os_string(),
+        args: vec![
+            "--exact".into(),
+            format!("controller_socket_wiring::{name}").into(),
+            "--nocapture".into(),
+        ],
+        environment: vec![
+            ("MAC_WORKER_T7B_LOOP_FIXTURE".into(), "1".into()),
+            ("HOME".into(), root.path().as_os_str().to_owned()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                root.path().join("config").into_os_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".into(),
+                root.path().join("cache").into_os_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                root.path().join("state").into_os_string(),
+            ),
+            (
+                "XDG_DATA_HOME".into(),
+                root.path().join("data").into_os_string(),
+            ),
+        ],
+        environment_remove: vec!["MAC_WORKER_TEST_SSH".into()],
+        stdin: None,
+        policy: mac_worker::process::ProcessPolicy {
+            stdout_limit: 4 * 1024 * 1024,
+            stderr_limit: 4 * 1024 * 1024,
+            deadline: std::time::Duration::from_secs(60),
+        },
+        isolate_parent_environment: false,
+    };
+    use mac_worker::process::ProcessRunner;
+    let result = mac_worker::process::SystemProcessRunner
+        .run(&request)
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    true
+}
+
+mod loop_fixtures {
+    use clap::Parser;
+    use mac_worker::{
+        RuntimeContext,
+        cli::Cli,
+        config::Config,
+        controller::{
+            ControllerRequest,
+            channel::{
+                ChannelFailure, ClientContext, ClientDeps, ConfiguredRoute, SocketConnector,
+                SocketIdentity, SocketSession,
+                testing::{
+                    FakeForwardControl, ManualRuntime, MemoryPinStore, ScriptedIdentitySource,
+                    identity_fixture, result_fixture,
+                },
+            },
+            decode_request,
+        },
+        error::WorkerError,
+        paths::PathLayout,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        task::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
+    };
+    use serde_json::{Value, json};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+    pub const TASK: &str = "018f0f4a6b5c7d8e9f00112233445566";
+    const TURN: &str = "018f0f4a6b5c7d8e9f00112233445577";
+    pub struct Fixture {
+        pub runtime: RuntimeContext,
+        pub paths: PathLayout,
+        pub config: Config,
+        pub endpoint: Arc<Endpoint>,
+        pub forwards: Arc<FakeForwardControl>,
+        pub clock: Arc<ManualRuntime>,
+        pub pins: Arc<MemoryPinStore>,
+        pub connector: Arc<Connector>,
+        pub order: Arc<Mutex<Vec<String>>>,
+        environment: BTreeMap<OsString, OsString>,
+        _temp: tempfile::TempDir,
+    }
+    impl Fixture {
+        pub fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let home = root.join("home");
+            let environment = BTreeMap::from([
+                (OsString::from("HOME"), home.clone().into_os_string()),
+                (
+                    OsString::from("XDG_CONFIG_HOME"),
+                    root.join("config").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    root.join("cache").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_DATA_HOME"),
+                    root.join("data").into_os_string(),
+                ),
+                (
+                    OsString::from("XDG_STATE_HOME"),
+                    root.join("state").into_os_string(),
+                ),
+            ]);
+            for path in environment.values() {
+                std::fs::create_dir_all(PathBuf::from(path)).unwrap();
+            }
+            let paths = PathLayout::discover(None, &environment, &home).unwrap();
+            std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            let text = "version = 1\n[controller]\nenabled = true\nssh = 'controller-host'\n[ssh]\nmultiplex = true\n";
+            std::fs::write(&paths.config, text).unwrap();
+            let config = Config::parse(text).unwrap();
+            let order = Arc::new(Mutex::new(vec![]));
+            Self {
+                runtime: RuntimeContext::isolated(environment.clone(), home, root),
+                paths,
+                config,
+                endpoint: Arc::new(Endpoint {
+                    order: order.clone(),
+                    ..Endpoint::default()
+                }),
+                forwards: Arc::new(FakeForwardControl::new("/private/fake-forward/s".into())),
+                clock: Arc::new(ManualRuntime::default()),
+                pins: Arc::new(MemoryPinStore::default()),
+                connector: Arc::new(Connector {
+                    order: order.clone(),
+                    ..Connector::default()
+                }),
+                order,
+                environment,
+                _temp: temp,
+            }
+        }
+        pub fn in_project(mut self, project: &std::path::Path) -> Self {
+            self.runtime = RuntimeContext::isolated(
+                self.environment.clone(),
+                PathBuf::from(self.environment.get(std::ffi::OsStr::new("HOME")).unwrap()),
+                project.to_owned(),
+            );
+            self
+        }
+        pub fn deps(&self) -> ClientDeps {
+            let mut identity = identity_fixture();
+            identity.route_sha256 = ConfiguredRoute::new(&self.config.controller, &self.config.ssh)
+                .unwrap()
+                .digest()
+                .unwrap();
+            ClientDeps {
+                identity: Arc::new(ScriptedIdentitySource::new(vec![
+                    Ok(identity.clone()),
+                    Ok(identity),
+                ])),
+                pins: self.pins.clone(),
+                forwards: self.forwards.clone(),
+                connector: self.connector.clone(),
+                runtime: self.clock.clone(),
+            }
+        }
+        pub fn run(&self, args: &[&str]) -> (u8, String, String) {
+            let context = self
+                .runtime
+                .clone()
+                .with_controller_channel_dependencies(self.deps());
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = mac_worker::run_with_io_in_context(
+                Cli::try_parse_from(args).unwrap(),
+                &*self.endpoint,
+                &context,
+                &mut stdout,
+                &mut stderr,
+            );
+            (
+                exit,
+                String::from_utf8(stdout).unwrap(),
+                String::from_utf8(stderr).unwrap(),
+            )
+        }
+    }
+    #[derive(Default)]
+    pub struct Endpoint {
+        pub calls: Mutex<Vec<ControllerRequest>>,
+        pub processes: Mutex<Vec<ProcessRequest>>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+    impl ProcessRunner for Endpoint {
+        fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if process.program == "/bin/ps" {
+                let mut output = result_fixture(
+                    &mac_worker::controller::channel::testing::request_fixture(
+                        "task.list",
+                        json!({}),
+                    ),
+                    json!({}),
+                    0,
+                );
+                output.stdout.clear();
+                return Ok(output);
+            }
+            if process.program == "/usr/bin/git" {
+                if process.args.iter().any(|arg| {
+                    arg.to_str()
+                        .is_some_and(|arg| arg.starts_with("--receive-pack="))
+                }) {
+                    self.order.lock().unwrap().push("git:source.push".into());
+                    return Ok(result_fixture(
+                        &mac_worker::controller::channel::testing::request_fixture(
+                            "task.list",
+                            json!({}),
+                        ),
+                        json!({}),
+                        0,
+                    ));
+                }
+                return mac_worker::process::SystemProcessRunner.run(process);
+            }
+            assert_eq!(process.program, "/usr/bin/ssh");
+            self.processes.lock().unwrap().push(process.clone());
+            if !process
+                .args
+                .last()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("host controller-rpc")
+            {
+                let mut output = result_fixture(
+                    &mac_worker::controller::channel::testing::request_fixture(
+                        "task.list",
+                        json!({}),
+                    ),
+                    json!({}),
+                    0,
+                );
+                output.stdout = b"{}".to_vec();
+                return Ok(output);
+            }
+            let request = decode_request(process.stdin.as_ref().unwrap()).unwrap();
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("stdio:{}", request.command()));
+            self.calls.lock().unwrap().push(request.clone());
+            Ok(reply(&request, &self.calls.lock().unwrap()))
+        }
+    }
+    fn status(task_id: &str, active: bool, cancelled: bool) -> Value {
+        let outcome = if cancelled {
+            TaskOutcome::Cancelled
+        } else {
+            TaskOutcome::Done
+        };
+        let terminal = if cancelled {
+            TurnTerminal::Cancelled
+        } else {
+            TurnTerminal::Succeeded
+        };
+        let status = TaskStatus::new(
+            if active {
+                TaskState::Active
+            } else {
+                TaskState::Open
+            },
+            (!active).then_some(outcome.clone()),
+            Some("mini-1".into()),
+            !active,
+            (!active).then(|| "a".repeat(40).parse().unwrap()),
+            None,
+            vec![],
+            vec![],
+            None,
+            vec![TurnSummary::new(
+                1,
+                TURN.parse().unwrap(),
+                (!active).then_some(terminal),
+                (!active).then_some(outcome),
+                Some(!active),
+                false,
+                Some(1),
+                (!active).then_some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        json!({"task_id":task_id,"run_id":null,"status":status,"warnings":[],"events":[],"runner":null,"exit_code":null})
+    }
+    pub fn reply(request: &ControllerRequest, calls: &[ControllerRequest]) -> ProcessResult {
+        let cancelled = calls.iter().any(|seen| seen.command() == "task.cancel");
+        let task_id = request
+            .body()
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or(TASK);
+        if matches!(request.command(), "task.submit" | "task.batch") {
+            let mut output = result_fixture(request, Value::Null, 0);
+            output.stdout = mac_worker::controller::encode_json_frame(&json!({
+                "protocol_version":7,"status":"acked","request_id":request.request_id(),"payload_sha256":request.payload_sha256(),"task_id":task_id,"turn_id":request.body().get("turn_id").cloned().unwrap_or(json!(TURN)),"created_at_millis":1,
+                "result": if request.command() == "task.batch" { json!({"run_id":request.body()["run_id"],"task_ids":[TASK]}) } else { status(task_id,false,false) }
+            })).unwrap();
+            return output;
+        }
+        if matches!(
+            request.command(),
+            "task.say" | "task.cancel" | "task.close" | "checkpoint.submit"
+        ) {
+            let mut output = result_fixture(request, Value::Null, 0);
+            output.stdout = mac_worker::controller::encode_json_frame(&json!({
+                "protocol_version":7,"status":"acked","request_id":request.request_id(),"payload_sha256":request.payload_sha256(),"task_id":TASK,"created_at_millis":1,"result":status(TASK,false,cancelled)
+            })).unwrap();
+            return output;
+        }
+        let result = match request.command() {
+            "task.wait.poll" => json!({"task_ids":[task_id],"quiescent":true,"exit_code":0}),
+            "task.status" => status(task_id, !cancelled, cancelled),
+            "controller.transfer.source.prepare" => {
+                let mut result = request.body().clone();
+                result["token"] = json!("0123456789ab4def8123456789abcdef");
+                result
+            }
+            "controller.transfer.source.finish" => {
+                json!({"token":request.body()["token"],"request_id":request.body()["request_id"],"oid":request.body()["expected_oid"],"request_ref":format!("refs/mac-worker/requests/{}",request.body()["request_id"].as_str().unwrap())})
+            }
+            "task.logs" => {
+                json!({"task_id":TASK,"turn_id":TURN,"turn_number":1,"agent":"codex","raw":true,"offset":request.body()["offset"],"next_offset":request.body()["offset"],"exhausted":true,"complete":true,"bytes_base64":""})
+            }
+            "task.list" if request.body().get("controller_health").is_some() => {
+                json!({"features":["controller.events","controller.task-logs-wait"],"state":"healthy","reason":"tick_succeeded","leader_running":true})
+            }
+            "task.list" if request.body().get("controller_events").is_some() => {
+                match request.body()["controller_events"]["op"].as_str().unwrap() {
+                    "read" if request.body()["controller_events"]["after"].is_null() => {
+                        json!({"type":"snapshot_required","reason":"bootstrap","window":{"journal_id":"01234567-89ab-4def-8123-456789abcdef","oldest_seq":"1","head_seq":"0"}})
+                    }
+                    "read" => {
+                        json!({"type":"batch","schema_version":1,"journal_id":"01234567-89ab-4def-8123-456789abcdef","oldest_seq":"1","head_seq":"0","next_after":request.body()["controller_events"]["after"],"events":[],"has_more":false})
+                    }
+                    "tasks" => {
+                        json!({"rows":[],"missing":[TASK],"proof_after":null,"baseline_after":null})
+                    }
+                    "repair" => {
+                        json!({"rows":[],"next":null,"complete":true,"restart":false,"baseline_after":request.body()["controller_events"]["baseline_after"]})
+                    }
+                    other => panic!("unexpected selector {other}"),
+                }
+            }
+            _ => json!({}),
+        };
+        result_fixture(request, result, 0)
+    }
+    #[derive(Default)]
+    pub struct Connector {
+        pub requests: Arc<Mutex<Vec<ControllerRequest>>>,
+        order: Arc<Mutex<Vec<String>>>,
+        pub fail_next: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl SocketConnector for Connector {
+        fn connect(
+            &self,
+            _: &std::path::Path,
+            _: &SocketIdentity,
+            ctx: &ClientContext<'_>,
+        ) -> Result<Box<dyn SocketSession>, ChannelFailure> {
+            ctx.check()?;
+            Ok(Box::new(Session(
+                self.requests.clone(),
+                self.order.clone(),
+                self.fail_next.clone(),
+            )))
+        }
+    }
+    struct Session(
+        Arc<Mutex<Vec<ControllerRequest>>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+    impl SocketSession for Session {
+        fn exchange(
+            &mut self,
+            _: &[u8],
+            request: &ControllerRequest,
+            ctx: &ClientContext<'_>,
+        ) -> Result<ProcessResult, ChannelFailure> {
+            ctx.check()?;
+            self.0.lock().unwrap().push(request.clone());
+            self.1
+                .lock()
+                .unwrap()
+                .push(format!("socket:{}", request.command()));
+            if self.2.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(ChannelFailure::Unavailable(
+                    mac_worker::controller::channel::ChannelReason::ForwardLost,
+                ));
+            }
+            Ok(reply(request, &[]))
+        }
+        fn close(&mut self) {}
+    }
+    pub fn commands(requests: &Mutex<Vec<ControllerRequest>>) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.command().to_owned())
+            .collect()
+    }
+}
+
+#[test]
+fn loop_wait_mutation_separation() {
+    if isolated_loop_fixture("loop_wait_mutation_separation") {
+        return;
+    }
+    use loop_fixtures::*;
+    for args in [
+        vec!["worker", "task", "wait", "--task-id", TASK],
+        vec![
+            "worker",
+            "task",
+            "wait",
+            "--run",
+            "018f0f4a6b5c7d8e9f00112233445599",
+        ],
+        vec![
+            "worker",
+            "task",
+            "say",
+            TASK,
+            "--message",
+            "steer",
+            "--wait",
+        ],
+        vec![
+            "worker",
+            "task",
+            "say",
+            TASK,
+            "--message",
+            "steer",
+            "--interrupt",
+        ],
+    ] {
+        let fixture = Fixture::new();
+        let (exit, _, stderr) = fixture.run(&args);
+        assert_eq!(exit, 0, "{args:?}: {stderr}");
+        assert_eq!(
+            commands(&fixture.connector.requests),
+            ["task.wait.poll"],
+            "{args:?}"
+        );
+        assert!(!commands(&fixture.endpoint.calls).contains(&"task.wait.poll".into()));
+        assert_eq!(fixture.forwards.opens(), 1);
+        assert_eq!(fixture.forwards.cancels(), 1);
+        if args.contains(&"--interrupt") {
+            assert_eq!(
+                *fixture.order.lock().unwrap(),
+                [
+                    "stdio:task.status",
+                    "stdio:task.cancel",
+                    "socket:task.wait.poll",
+                    "stdio:task.status",
+                    "stdio:task.say"
+                ]
+            );
+        } else if args.contains(&"say") {
+            assert_eq!(
+                *fixture.order.lock().unwrap(),
+                [
+                    "stdio:task.say",
+                    "socket:task.wait.poll",
+                    "stdio:task.status"
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn loop_submit_and_batch_transfer_finish_before_wait_setup() {
+    if isolated_loop_fixture("loop_submit_and_batch_transfer_finish_before_wait_setup") {
+        return;
+    }
+    use loop_fixtures::*;
+    let repo = crate::support::GitRepo::init();
+    repo.write("tracked", b"seed\n");
+    repo.commit_all("seed");
+    let batch = repo.root().join("batch.toml");
+    std::fs::write(
+        &batch,
+        "version = 1\nagent = 'codex'\n[[tasks]]\nprompt = 'fixture task'\n",
+    )
+    .unwrap();
+    for args in [
+        vec![
+            "worker",
+            "task",
+            "submit",
+            "--project",
+            repo.root().to_str().unwrap(),
+            "--agent",
+            "codex",
+            "--prompt",
+            "fixture",
+            "--wait",
+        ],
+        vec!["worker", "task", "batch", batch.to_str().unwrap(), "--wait"],
+    ] {
+        let fixture = Fixture::new().in_project(repo.root());
+        let (exit, _, stderr) = fixture.run(&args);
+        assert_eq!(exit, 0, "{args:?}: {stderr}");
+        let order = fixture.order.lock().unwrap();
+        assert_eq!(
+            &order[..4],
+            [
+                "stdio:controller.transfer.source.prepare",
+                "git:source.push",
+                "stdio:controller.transfer.source.finish",
+                if args[2] == "batch" {
+                    "stdio:task.batch"
+                } else {
+                    "stdio:task.submit"
+                }
+            ]
+        );
+        assert_eq!(order[4], "socket:task.wait.poll");
+        assert_eq!(commands(&fixture.connector.requests), ["task.wait.poll"]);
+        assert_eq!(fixture.forwards.opens(), 1);
+        assert_eq!(fixture.forwards.cancels(), 1);
+    }
+}
+
+#[test]
+fn raw_exclusions_stay_stdio() {
+    if isolated_loop_fixture("raw_exclusions_stay_stdio") {
+        return;
+    }
+    use loop_fixtures::*;
+    for args in [
+        vec!["worker", "task", "status", TASK],
+        vec!["worker", "task", "list"],
+        vec!["worker", "task", "logs", TASK, "--raw"],
+        vec!["worker", "task", "diff", TASK],
+        vec!["worker", "task", "result", TASK],
+        vec!["worker", "task", "reconcile"],
+        vec!["worker", "task", "publish-retry", TASK],
+        vec!["worker", "task", "cancel", TASK],
+        vec!["worker", "task", "close", TASK],
+        vec!["worker", "controller", "status"],
+        vec!["worker", "controller", "drain"],
+        vec!["worker", "controller", "drain", "--off"],
+    ] {
+        let fixture = Fixture::new();
+        fixture.run(&args);
+        assert!(
+            !fixture.endpoint.processes.lock().unwrap().is_empty(),
+            "did not reach raw transport: {args:?}"
+        );
+        assert_eq!(fixture.forwards.resolutions(), 0, "{args:?}");
+        assert_eq!(fixture.forwards.opens(), 0, "{args:?}");
+        assert!(fixture.connector.requests.lock().unwrap().is_empty());
+        assert!(fixture.pins.pin().is_none());
+    }
+}
+
+#[test]
+fn loop_interrupt_and_follow_wait_share_command_retirement() {
+    if isolated_loop_fixture("loop_interrupt_and_follow_wait_share_command_retirement") {
+        return;
+    }
+    use loop_fixtures::*;
+    let fixture = Fixture::new();
+    fixture
+        .forwards
+        .set_disposition(mac_worker::controller::channel::ForwardDisposition::Retained);
+    fixture
+        .connector
+        .fail_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (exit, _, stderr) = fixture.run(&[
+        "worker",
+        "task",
+        "say",
+        TASK,
+        "--message",
+        "steer",
+        "--interrupt",
+        "--wait",
+    ]);
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(
+        fixture.forwards.opens(),
+        1,
+        "uncertain cleanup must retire every later wait in this command"
+    );
+    assert_eq!(fixture.forwards.cancels(), 1);
+    assert_eq!(commands(&fixture.connector.requests), ["task.wait.poll"]);
+    assert_eq!(
+        commands(&fixture.endpoint.calls)
+            .iter()
+            .filter(|command| command.as_str() == "task.wait.poll")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn raw_controller_retry_preserves_saved_mutation_route() {
+    if isolated_loop_fixture("raw_controller_retry_preserves_saved_mutation_route") {
+        return;
+    }
+    use loop_fixtures::*;
+    // CP1 checkpoint envelopes have no separate CLI command. Their supported
+    // laptop entry point is the same saved-envelope retry path.
+    for (command, body) in [
+        (
+            "task.say",
+            json!({"task_id":TASK,"message":"saved message"}),
+        ),
+        ("checkpoint.submit", json!({"prompt":"saved checkpoint"})),
+    ] {
+        let fixture = Fixture::new();
+        let request = request_fixture(command, body);
+        mac_worker::controller::persist_operation_envelope(
+            &fixture.paths.controller_cache_root(),
+            &request,
+        )
+        .unwrap();
+        let (exit, _, stderr) =
+            fixture.run(&["worker", "controller", "retry", request.request_id()]);
+        assert_eq!(exit, 0, "{stderr}");
+        assert_eq!(commands(&fixture.endpoint.calls), [command]);
+        assert_eq!(fixture.endpoint.calls.lock().unwrap()[0], request);
+        assert_eq!(fixture.forwards.resolutions(), 0);
+        assert!(fixture.connector.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn raw_fetch_doctor_and_local_wait_allocate_no_channel() {
+    if isolated_loop_fixture("raw_fetch_doctor_and_local_wait_allocate_no_channel") {
+        return;
+    }
+    use loop_fixtures::*;
+    let repo = crate::support::GitRepo::init();
+    repo.write("tracked", b"seed\n");
+    repo.commit_all("seed");
+    let fixture = Fixture::new().in_project(repo.root());
+    fixture.run(&["worker", "task", "fetch", TASK]);
+    assert_eq!(
+        commands(&fixture.endpoint.calls),
+        ["controller.transfer.result.prepare"]
+    );
+    fixture.run(&[
+        "worker",
+        "doctor",
+        "--project",
+        repo.root().to_str().unwrap(),
+    ]);
+    assert_eq!(fixture.forwards.resolutions(), 0);
+    std::fs::write(
+        &fixture.paths.config,
+        "version=1\n[controller]\nenabled=false\n",
+    )
+    .unwrap();
+    let (exit, _, _) = fixture.run(&["worker", "task", "wait", "--task-id", TASK]);
+    assert_ne!(exit, 0);
+    assert_eq!(fixture.forwards.resolutions(), 0);
+    assert!(fixture.pins.pin().is_none());
+    assert!(fixture.connector.requests.lock().unwrap().is_empty());
+    assert!(
+        clap::Parser::try_parse_from(["worker", "events"])
+            .map(|_: mac_worker::cli::Cli| ())
+            .is_err()
+    );
+}
+
+#[test]
+fn route_loop_scopes_only() {
+    if isolated_loop_fixture("route_loop_scopes_only") {
+        return;
+    }
+    use loop_fixtures::*;
+    let fixture = Fixture::new();
+    let (exit, _, stderr) = fixture.run(&["worker", "task", "logs", TASK, "--follow", "--raw"]);
+    assert_eq!(exit, 0, "{stderr}");
+    let requests = fixture.connector.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body(), &json!({"controller_health":true}));
+    assert_eq!(requests[1].command(), "task.logs");
+    assert_eq!(requests[1].body()["wait_ms"], 15_000);
+    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.forwards.opens(), 1);
+    assert_eq!(fixture.forwards.cancels(), 1);
+}
+
+#[test]
+fn loop_short_wait_skips_cold_setup() {
+    if isolated_loop_fixture("loop_short_wait_skips_cold_setup") {
+        return;
+    }
+    use loop_fixtures::*;
+    let fixture = Fixture::new();
+    let (exit, _, stderr) = fixture.run(&[
+        "worker",
+        "task",
+        "wait",
+        "--task-id",
+        TASK,
+        "--timeout",
+        "1s",
+    ]);
+    assert_eq!(exit, 0, "{stderr}");
+    assert_eq!(commands(&fixture.endpoint.calls), ["task.wait.poll"]);
+    assert_eq!(fixture.forwards.resolutions(), 0);
+    assert!(
+        fixture.endpoint.processes.lock().unwrap()[0]
+            .policy
+            .deadline
+            <= std::time::Duration::from_secs(1)
+    );
+    assert!(fixture.pins.pin().is_none());
+}
+
+#[test]
+fn route_events_and_notify_own_one_scoped_runner() {
+    if isolated_loop_fixture("route_events_and_notify_own_one_scoped_runner") {
+        return;
+    }
+    use loop_fixtures::*;
+    use mac_worker::controller::{
+        channel::ReadLoopScope,
+        events::{
+            EventSource, ReadQuery, TaskAddressQuery, TaskRepairQuery,
+            client::ControllerEventClient, testing::ManualEventRuntime,
+        },
+    };
+    use std::{sync::Arc, time::Duration};
+    for scope in [ReadLoopScope::EventsFollow, ReadLoopScope::Notify] {
+        let fixture = Fixture::new();
+        let clock = Arc::new(ManualEventRuntime::new());
+        {
+            let source = ControllerEventClient::for_read_loop(
+                fixture.endpoint.clone(),
+                scope,
+                &fixture.paths,
+                &fixture.config,
+                clock.clone(),
+                fixture.deps(),
+            );
+            source.discover(Duration::from_secs(30)).unwrap();
+            source
+                .read(ReadQuery::default(), Duration::from_secs(30))
+                .unwrap();
+            if scope == ReadLoopScope::Notify {
+                source
+                    .tasks(
+                        TaskAddressQuery {
+                            task_ids: vec![TASK.parse().unwrap()],
+                            include_titles: false,
+                            proof_after: None,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .unwrap();
+                source
+                    .repair(
+                        TaskRepairQuery {
+                            after: None,
+                            limit: 128,
+                            baseline_after: None,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .unwrap();
+            }
+            assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+            assert_eq!(fixture.forwards.opens(), 1);
+        }
+        assert_eq!(fixture.forwards.cancels(), 1);
+        assert_eq!(
+            fixture.connector.requests.lock().unwrap().len(),
+            if scope == ReadLoopScope::Notify { 4 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn route_event_runtime_cancellation_is_shared_with_channel_setup() {
+    if isolated_loop_fixture("route_event_runtime_cancellation_is_shared_with_channel_setup") {
+        return;
+    }
+    use loop_fixtures::*;
+    use mac_worker::controller::{
+        channel::ReadLoopScope,
+        events::{EventSource, client::ControllerEventClient, testing::ManualEventRuntime},
+    };
+    use std::{sync::Arc, time::Duration};
+    let fixture = Fixture::new();
+    let clock = Arc::new(ManualEventRuntime::new());
+    struct CancellingIdentity {
+        clock: Arc<ManualEventRuntime>,
+        inner: Arc<dyn mac_worker::controller::channel::IdentitySource>,
+    }
+    impl mac_worker::controller::channel::IdentitySource for CancellingIdentity {
+        fn read(
+            &self,
+            raw: &dyn mac_worker::process::ProcessRunner,
+            route: &mac_worker::controller::channel::ConfiguredRoute,
+            master: Option<&mac_worker::controller::channel::MasterPlan>,
+            context: &mac_worker::controller::channel::ClientContext<'_>,
+        ) -> Result<
+            mac_worker::controller::channel::SocketIdentity,
+            mac_worker::controller::channel::ChannelFailure,
+        > {
+            let identity = self.inner.read(raw, route, master, context)?;
+            self.clock.cancel();
+            Ok(identity)
+        }
+    }
+    let mut deps = fixture.deps();
+    deps.identity = Arc::new(CancellingIdentity {
+        clock: clock.clone(),
+        inner: deps.identity,
+    });
+    let source = ControllerEventClient::for_read_loop(
+        fixture.endpoint.clone(),
+        ReadLoopScope::EventsFollow,
+        &fixture.paths,
+        &fixture.config,
+        clock.clone(),
+        deps,
+    );
+    assert!(source.discover(Duration::from_secs(30)).is_err());
+    assert_eq!(fixture.forwards.resolutions(), 1);
+    assert_eq!(fixture.forwards.opens(), 0);
+    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn loop_notify_short_budget_stays_with_original_deadline() {
+    if isolated_loop_fixture("loop_notify_short_budget_stays_with_original_deadline") {
+        return;
+    }
+    use loop_fixtures::*;
+    use mac_worker::controller::{
+        channel::ReadLoopScope,
+        events::{
+            EventSource, ReadQuery, TaskRepairQuery, client::ControllerEventClient,
+            testing::ManualEventRuntime,
+        },
+    };
+    use std::{sync::Arc, time::Duration};
+    let fixture = Fixture::new();
+    let clock = Arc::new(ManualEventRuntime::new());
+    let source = ControllerEventClient::for_read_loop(
+        fixture.endpoint.clone(),
+        ReadLoopScope::Notify,
+        &fixture.paths,
+        &fixture.config,
+        clock.clone(),
+        fixture.deps(),
+    );
+    clock.advance(Duration::from_secs(25));
+    source.discover(Duration::from_secs(30)).unwrap();
+    clock.advance(Duration::from_secs(4));
+    source
+        .repair(
+            TaskRepairQuery {
+                after: None,
+                limit: 128,
+                baseline_after: None,
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let requests = fixture.endpoint.processes.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].policy.deadline, Duration::from_secs(5));
+    assert_eq!(requests[1].policy.deadline, Duration::from_secs(1));
+    drop(requests);
+    clock.advance(Duration::from_secs(1));
+    assert!(
+        source
+            .read(ReadQuery::default(), Duration::from_secs(30))
+            .is_err()
+    );
+    assert_eq!(fixture.endpoint.processes.lock().unwrap().len(), 2);
+    assert_eq!(fixture.forwards.resolutions(), 0);
+}
+
+#[test]
+fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
+    if isolated_loop_fixture("loop_notify_preserves_fifteen_second_repair_with_shared_clock") {
+        return;
+    }
+    use loop_fixtures::*;
+    use mac_worker::controller::{
+        channel::*,
+        events::{
+            EventRuntime, PreviousProjection,
+            client::{ControllerEventClient, TaskReconciler},
+            notify::{NotifyCache, NotifyOptions, follow::NotifyLoop},
+            testing::ManualEventRuntime,
+        },
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    struct PollConnector {
+        clock: Arc<ManualEventRuntime>,
+        requests: Arc<Mutex<Vec<(Duration, mac_worker::controller::ControllerRequest)>>>,
+    }
+    impl SocketConnector for PollConnector {
+        fn connect(
+            &self,
+            _: &std::path::Path,
+            _: &SocketIdentity,
+            ctx: &ClientContext<'_>,
+        ) -> Result<Box<dyn SocketSession>, ChannelFailure> {
+            ctx.check()?;
+            Ok(Box::new(Self {
+                clock: self.clock.clone(),
+                requests: self.requests.clone(),
+            }))
+        }
+    }
+    impl SocketSession for PollConnector {
+        fn exchange(
+            &mut self,
+            _: &[u8],
+            request: &mac_worker::controller::ControllerRequest,
+            ctx: &ClientContext<'_>,
+        ) -> Result<mac_worker::process::ProcessResult, ChannelFailure> {
+            ctx.check()?;
+            self.requests
+                .lock()
+                .unwrap()
+                .push((self.clock.now(), request.clone()));
+            if let Some(wait) = request.body()["controller_events"]["wait_ms"].as_u64() {
+                self.clock.advance(Duration::from_millis(wait));
+            }
+            Ok(reply(request, &[]))
+        }
+        fn close(&mut self) {}
+    }
+    let fixture = Fixture::new();
+    let clock = Arc::new(ManualEventRuntime::new());
+    let requests = Arc::new(Mutex::new(vec![]));
+    let mut deps = fixture.deps();
+    deps.connector = Arc::new(PollConnector {
+        clock: clock.clone(),
+        requests: requests.clone(),
+    });
+    let source = ControllerEventClient::for_read_loop(
+        fixture.endpoint.clone(),
+        ReadLoopScope::Notify,
+        &fixture.paths,
+        &fixture.config,
+        clock.clone(),
+        deps,
+    );
+    let cache = NotifyCache::open(&fixture.paths, &fixture.config.controller).unwrap();
+    let mut reconciler =
+        TaskReconciler::new(PreviousProjection::Absent, None, vec![], clock.clone());
+    let options = NotifyOptions {
+        follow: true,
+        quiet: true,
+        no_titles: true,
+        ..Default::default()
+    };
+    NotifyLoop {
+        source: &source,
+        reconciler: &mut reconciler,
+        cache: &cache,
+        channels: &[],
+        options: &options,
+        runtime: clock,
+        stop_at: Some(Duration::from_secs(31)),
+    }
+    .run(&mut vec![])
+    .unwrap();
+    let requests = requests.lock().unwrap();
+    let repair_instants: Vec<_> = requests
+        .iter()
+        .filter(|(_, request)| request.body()["controller_events"]["op"] == "repair")
+        .map(|(instant, _)| *instant)
+        .collect();
+    assert_eq!(
+        repair_instants,
+        [
+            Duration::ZERO,
+            Duration::from_secs(15),
+            Duration::from_secs(30)
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .filter_map(|(_, request)| request.body()["controller_events"]["wait_ms"].as_u64())
+            .all(|wait| wait <= 15_000)
+    );
+    assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
+}

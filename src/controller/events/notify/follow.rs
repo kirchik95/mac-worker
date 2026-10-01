@@ -537,10 +537,13 @@ pub(crate) fn run_command(
         let runtime = super::super::foreground::ForegroundRuntime::install()?;
         let runner: Arc<dyn crate::process::ProcessRunner> =
             Arc::new(crate::process::SystemProcessRunner);
-        let source = super::super::client::ControllerEventClient::new(
+        let source = super::super::foreground::event_client(
             runner.clone(),
-            config.controller,
+            crate::controller::channel::ReadLoopScope::Notify,
+            &paths,
+            &config,
             runtime.clone(),
+            context,
         );
         let mut reconciler = super::super::client::TaskReconciler::new(
             super::super::PreviousProjection::Absent,

@@ -6,6 +6,24 @@ use predicates::prelude::*;
 use std::path::PathBuf;
 
 #[test]
+fn controller_channel_help_exposes_identity_and_expected_repin() {
+    let mut channel = Command::cargo_bin("worker").unwrap();
+    channel.args(["controller", "channel", "--help"]);
+    channel
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("identity"))
+        .stdout(predicate::str::contains("repin"));
+    let mut repin = Command::cargo_bin("worker").unwrap();
+    repin.args(["controller", "channel", "repin", "--help"]);
+    repin
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--expect-client-id"))
+        .stdout(predicate::str::contains("--force").not());
+}
+
+#[test]
 fn events_requires_follow_and_rejects_historical_or_notification_options() {
     for arguments in [
         vec!["worker", "events", "-f"],

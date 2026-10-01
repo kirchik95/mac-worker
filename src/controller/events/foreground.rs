@@ -19,6 +19,17 @@ use crate::{
     transfer::{ResolutionRuntime, SystemResolutionRuntime},
 };
 
+/// Channel setup and reads share the foreground event clock and cancellation.
+pub struct EventChannelRuntime(pub Arc<dyn EventRuntime>);
+impl crate::controller::channel::ChannelRuntime for EventChannelRuntime {
+    fn now(&self) -> Duration {
+        self.0.now()
+    }
+    fn cancelled(&self) -> bool {
+        self.0.cancelled()
+    }
+}
+
 pub(crate) struct ForegroundRuntime {
     cancelled: Arc<AtomicBool>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -74,6 +85,32 @@ impl Drop for ForegroundRuntime {
         }
         // No join: neither signal handling nor outstanding system I/O may
         // hold foreground cancellation open indefinitely.
+    }
+}
+
+pub(crate) fn event_client(
+    raw: Arc<dyn crate::process::ProcessRunner>,
+    scope: crate::controller::channel::ReadLoopScope,
+    paths: &PathLayout,
+    config: &Config,
+    runtime: Arc<dyn EventRuntime>,
+    context: &RuntimeContext,
+) -> super::client::ControllerEventClient {
+    match crate::controller_read_channel_dependencies(
+        paths,
+        config,
+        Arc::new(EventChannelRuntime(runtime.clone())),
+        context,
+    ) {
+        Some(dependencies) => super::client::ControllerEventClient::for_read_loop(
+            raw,
+            scope,
+            paths,
+            config,
+            runtime,
+            dependencies,
+        ),
+        None => super::client::ControllerEventClient::new(raw, config.controller.clone(), runtime),
     }
 }
 

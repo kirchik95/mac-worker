@@ -9,7 +9,10 @@ use std::{
 };
 
 use agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore};
-use cli::{Cli, Command, ControllerCommand, HiddenComponent, HostCommand, TaskCommand};
+use cli::{
+    Cli, Command, ControllerChannelCommand, ControllerCommand, HiddenComponent, HostCommand,
+    TaskCommand,
+};
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
 use dashboard::command::{
@@ -147,11 +150,24 @@ pub(crate) mod test_support;
 pub(crate) mod test_sync;
 
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeContext {
     environment: BTreeMap<OsString, OsString>,
     home: PathBuf,
     current_dir: RuntimeCurrentDir,
+    controller_channel: Option<std::sync::Arc<controller::channel::ClientDeps>>,
+}
+
+impl std::fmt::Debug for RuntimeContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeContext")
+            .field("environment", &self.environment)
+            .field("home", &self.home)
+            .field("current_dir", &self.current_dir)
+            .field("controller_channel", &self.controller_channel.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +187,7 @@ impl RuntimeContext {
             environment,
             home,
             current_dir: RuntimeCurrentDir::Process,
+            controller_channel: None,
         }
     }
 
@@ -184,7 +201,18 @@ impl RuntimeContext {
             environment,
             home,
             current_dir: RuntimeCurrentDir::Fixed(current_dir),
+            controller_channel: None,
         }
+    }
+
+    /// Supply the foreground read channel's dependencies without changing raw RPCs.
+    #[doc(hidden)]
+    pub fn with_controller_channel_dependencies(
+        mut self,
+        dependencies: controller::channel::ClientDeps,
+    ) -> Self {
+        self.controller_channel = Some(std::sync::Arc::new(dependencies));
+        self
     }
 
     fn current_dir(&self) -> Result<PathBuf, WorkerError> {
@@ -927,6 +955,9 @@ pub fn run_with_stdio_in_context(
             | Command::Controller {
                 command: ControllerCommand::Run { .. }
             }
+            | Command::Controller {
+                command: ControllerCommand::Channel { .. }
+            }
     ) && let Ok(paths) = discover_paths(cli.config.clone(), runtime)
         && let Ok(config) = Config::load(&paths.config)
         && config.controller.enabled
@@ -1052,6 +1083,10 @@ fn run_dashboard_command(
             error.exit_code()
         }
     }
+}
+
+fn controller_channel_error(failure: controller::channel::ChannelFailure) -> WorkerError {
+    WorkerError::Unavailable(format!("CONTROLLER_CHANNEL_UNAVAILABLE: {failure}"))
 }
 
 const VIEWER_HEARTBEAT_LOST: &str = "DASHBOARD_VIEWER_HEARTBEAT_LOST";
@@ -1347,6 +1382,72 @@ fn run_controller_command(
     let result = (|| -> Result<(), WorkerError> {
         let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
+        if let ControllerCommand::Channel { command } = command {
+            let config = Config::load(&paths.config)?;
+            if !config.controller.enabled {
+                return Err(WorkerError::task(
+                    "CONTROLLER_MODE_REQUIRED",
+                    "controller channel requires enabled controller mode",
+                ));
+            }
+            let route = controller::channel::ConfiguredRoute::new(&config.controller, &config.ssh)
+                .map_err(controller_channel_error)?;
+            let deps = runtime.controller_channel.as_deref().ok_or_else(|| {
+                controller_channel_error(controller::channel::ChannelFailure::Unavailable(
+                    controller::channel::ChannelReason::ServiceUnavailable,
+                ))
+            })?;
+            let context = controller::channel::ClientContext {
+                runtime: &*deps.runtime,
+                deadline: deps
+                    .runtime
+                    .now()
+                    .saturating_add(controller::channel::REQUEST_GUARD),
+                should_stop: &|| false,
+            };
+            // The operator path always bypasses the loop adapter and captured
+            // master: identity and repin each authenticate a fresh raw read.
+            let identity = deps
+                .identity
+                .read(runner, &route, None, &context)
+                .map_err(controller_channel_error)?;
+            match command {
+                ControllerChannelCommand::Identity => {
+                    if json {
+                        write_json_line(stdout, &identity)?;
+                    } else {
+                        writeln!(
+                            stdout,
+                            "controller client: {}\naccount: {} ({})\nsocket: {}",
+                            identity.service.controller_client_id,
+                            identity.service.account.username,
+                            identity.service.account.uid,
+                            identity.service.socket_path.display()
+                        )?;
+                    }
+                }
+                ControllerChannelCommand::Repin { expect_client_id } => {
+                    context.check().map_err(controller_channel_error)?;
+                    deps.pins
+                        .repin(&paths, &identity, expect_client_id)
+                        .map_err(controller_channel_error)?;
+                    if json {
+                        write_json_line(
+                            stdout,
+                            &controller::channel::Pin::from_identity(&identity),
+                        )?;
+                    } else {
+                        writeln!(
+                            stdout,
+                            "controller channel pinned to {}",
+                            identity.service.controller_client_id
+                        )?;
+                    }
+                }
+            }
+            stdout.flush()?;
+            return Ok(());
+        }
         if matches!(
             &command,
             ControllerCommand::Pending { .. } | ControllerCommand::Retry { .. }
@@ -2485,6 +2586,7 @@ fn interrupt_controller_turn(
     runner: &dyn ProcessRunner,
     paths: &PathLayout,
     config: &Config,
+    wait_loop: &ControllerWaitLoop<'_>,
     task_id: crate::task::TaskId,
     stderr: &mut dyn Write,
 ) -> Result<Option<InterruptedTurn>, WorkerError> {
@@ -2503,13 +2605,12 @@ fn interrupt_controller_turn(
     task_report_from_controller_ack(&ack)?;
     // Always wait: a terminal cancel ack does not mean the controller's runner
     // has retired the turn yet.
-    crate::controller::wait_via_controller(
-        runner,
-        &config.controller,
-        crate::controller::ControllerWaitSelector::Task(task_id),
-        Some(INTERRUPT_SETTLE_TIMEOUT),
-    )
-    .map_err(interrupt_settle_error)?;
+    wait_loop
+        .wait(
+            crate::controller::ControllerWaitSelector::Task(task_id),
+            Some(INTERRUPT_SETTLE_TIMEOUT),
+        )
+        .map_err(interrupt_settle_error)?;
     let report = controller_task_status(runner, config, task_id)?;
     interrupted_turn(report.status(), observed, turn_number).map(Some)
 }
@@ -5302,6 +5403,7 @@ fn run_enabled_controller_task(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, WorkerError> {
+    let wait_loop = ControllerWaitLoop::new(runner, paths, config, runtime);
     match command {
         Command::Task {
             command:
@@ -5381,9 +5483,7 @@ fn run_enabled_controller_task(
                                 .into(),
                         )
                     })?;
-                let waited = crate::controller::wait_via_controller(
-                    runner,
-                    &config.controller,
+                let waited = wait_loop.wait(
                     crate::controller::ControllerWaitSelector::Task(task_id),
                     None,
                 )?;
@@ -5441,7 +5541,21 @@ fn run_enabled_controller_task(
                     raw,
                 },
         } => {
-            controller_task_logs(runner, config, task_id, turn, follow, raw, stdout, stderr)?;
+            let channel = if follow {
+                controller_loop_runner(
+                    runner,
+                    controller::channel::ReadLoopScope::LogsFollow,
+                    paths,
+                    config,
+                    runtime,
+                )
+            } else {
+                None
+            };
+            let logs_runner = channel
+                .as_ref()
+                .map_or(runner, |channel| channel as &dyn ProcessRunner);
+            controller_task_logs(logs_runner, config, task_id, turn, follow, raw, stdout, stderr)?;
             Ok(0)
         }
         Command::Task {
@@ -5505,7 +5619,7 @@ fn run_enabled_controller_task(
         } => {
             let message = read_prompt(message, message_file)?;
             let interrupted = if interrupt {
-                interrupt_controller_turn(runner, paths, config, task_id, stderr)?
+                interrupt_controller_turn(runner, paths, config, &wait_loop, task_id, stderr)?
             } else {
                 None
             };
@@ -5521,9 +5635,7 @@ fn run_enabled_controller_task(
                 stderr,
             )?;
             if wait {
-                let waited = crate::controller::wait_via_controller(
-                    runner,
-                    &config.controller,
+                let waited = wait_loop.wait(
                     crate::controller::ControllerWaitSelector::Task(task_id),
                     None,
                 )?;
@@ -5596,8 +5708,7 @@ fn run_enabled_controller_task(
                     });
                 }
             };
-            let report =
-                crate::controller::wait_via_controller(runner, &config.controller, selector, timeout)?;
+            let report = wait_loop.wait(selector, timeout)?;
             write_wait_report(&report, json, stdout)?;
             Ok(report.exit_code())
         }
@@ -5689,9 +5800,7 @@ fn run_enabled_controller_task(
             let report = run_report_from_controller_ack(&ack)?;
             write_run_report(&report, json, stdout)?;
             if wait {
-                let waited = crate::controller::wait_via_controller(
-                    runner,
-                    &config.controller,
+                let waited = wait_loop.wait(
                     crate::controller::ControllerWaitSelector::Run(report.run_id().to_string()),
                     None,
                 )?;
@@ -6122,6 +6231,119 @@ fn controller_task_status(
         crate::controller::ControllerTaskStatusResult,
     >(runner, &config.controller, &request)?;
     Ok(reply.into_result().into_report())
+}
+
+fn controller_loop_runner<'a>(
+    raw: &'a dyn ProcessRunner,
+    scope: controller::channel::ReadLoopScope,
+    paths: &PathLayout,
+    config: &Config,
+    context: &RuntimeContext,
+) -> Option<controller::channel::client::ChannelProcessRunner<&'a dyn ProcessRunner>> {
+    let clock: std::sync::Arc<dyn controller::channel::ChannelRuntime> =
+        context.controller_channel.as_ref().map_or_else(
+            || std::sync::Arc::new(ControllerReadRuntime) as _,
+            |deps| deps.runtime.clone(),
+        );
+    let deps = controller_read_channel_dependencies(paths, config, clock, context)?;
+    let route = controller::channel::ConfiguredRoute::new(&config.controller, &config.ssh).ok()?;
+    Some(controller::channel::client::ChannelProcessRunner::new(
+        raw,
+        scope,
+        route,
+        paths.clone(),
+        deps,
+    ))
+}
+
+struct ControllerReadRuntime;
+impl controller::channel::ChannelRuntime for ControllerReadRuntime {
+    fn now(&self) -> std::time::Duration {
+        crate::transfer::ResolutionRuntime::monotonic_now(&crate::transfer::SystemResolutionRuntime)
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) fn controller_read_channel_dependencies(
+    _paths: &PathLayout,
+    config: &Config,
+    clock: std::sync::Arc<dyn controller::channel::ChannelRuntime>,
+    context: &RuntimeContext,
+) -> Option<controller::channel::ClientDeps> {
+    if !config.ssh.multiplex {
+        return None;
+    }
+    context
+        .controller_channel
+        .as_deref()
+        .map(|deps| clone_controller_channel_dependencies(deps, clock))
+}
+
+pub(crate) fn clone_controller_channel_dependencies(
+    deps: &controller::channel::ClientDeps,
+    runtime: std::sync::Arc<dyn controller::channel::ChannelRuntime>,
+) -> controller::channel::ClientDeps {
+    controller::channel::ClientDeps {
+        identity: deps.identity.clone(),
+        pins: deps.pins.clone(),
+        forwards: deps.forwards.clone(),
+        connector: deps.connector.clone(),
+        runtime,
+    }
+}
+
+struct ControllerWaitLoop<'a> {
+    raw: &'a dyn ProcessRunner,
+    paths: &'a PathLayout,
+    config: &'a Config,
+    context: &'a RuntimeContext,
+    channel: std::cell::OnceCell<
+        Option<controller::channel::client::ChannelProcessRunner<&'a dyn ProcessRunner>>,
+    >,
+}
+
+impl<'a> ControllerWaitLoop<'a> {
+    fn new(
+        raw: &'a dyn ProcessRunner,
+        paths: &'a PathLayout,
+        config: &'a Config,
+        context: &'a RuntimeContext,
+    ) -> Self {
+        Self {
+            raw,
+            paths,
+            config,
+            context,
+            channel: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn wait(
+        &self,
+        selector: controller::ControllerWaitSelector,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<task_client::WaitReport, WorkerError> {
+        // Admission is lazy, after each command's raw mutation/transfer phase.
+        // Multiple waits (interrupt settlement and --wait) retain one owner,
+        // including its permanent retirement after uncertain forward cleanup.
+        let channel = self.channel.get_or_init(|| {
+            controller_loop_runner(
+                self.raw,
+                controller::channel::ReadLoopScope::Wait,
+                self.paths,
+                self.config,
+                self.context,
+            )
+        });
+        let runner = channel
+            .as_ref()
+            .map_or(self.raw, |channel| channel as &dyn ProcessRunner);
+        // WaitDeadlineRunner remains outside the adapter: its borrowed live
+        // predicate and remaining budget cover setup, polling and fallback.
+        controller::wait_via_controller(runner, &self.config.controller, selector, timeout)
+    }
 }
 
 fn controller_task_list(

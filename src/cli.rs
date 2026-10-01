@@ -399,6 +399,11 @@ pub enum SkillsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ControllerCommand {
+    #[command(about = "Inspect or deliberately replace the controller read channel pin")]
+    Channel {
+        #[command(subcommand)]
+        command: ControllerChannelCommand,
+    },
     #[command(about = "List unsettled controller requests saved on this laptop")]
     Pending {
         /// Include requests older than seven days.
@@ -441,6 +446,18 @@ pub enum ControllerCommand {
     Run {
         #[arg(long, hide = true)]
         supervised: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ControllerChannelCommand {
+    #[command(about = "Read the controller channel identity through authenticated SSH")]
+    Identity,
+    #[command(about = "Replace a safe channel pin after reading a fresh controller identity")]
+    Repin {
+        /// Canonical controller client id verified by a fresh authenticated read
+        #[arg(long)]
+        expect_client_id: crate::job::ClientId,
     },
 }
 
