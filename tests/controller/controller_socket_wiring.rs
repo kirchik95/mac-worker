@@ -2288,3 +2288,554 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
     );
     assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
 }
+
+// T7b end-to-end checks. Only SSH control is fake: the leader, identity RPC,
+// private pin, hello/ready framing and each per-read RPC child are real.
+mod t7b_live {
+    use super::loop_fixtures;
+    use clap::Parser;
+    use mac_worker::{
+        RuntimeContext,
+        cli::Cli,
+        controller::{
+            ControllerRequest,
+            channel::{
+                ChannelFailure, ChannelRuntime, ClientContext, ClientDeps, ServiceRecord,
+                SocketConnector, SocketIdentity, SocketSession,
+                codec::{FramedSocketConnector, SessionCodec},
+                identity::StdioIdentitySource,
+                pin::PrivatePinStore,
+                testing::FakeForwardControl,
+            },
+            decode_request,
+            events::EventRuntime,
+        },
+        error::WorkerError,
+        paths::PathLayout,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        task::{TaskId, TurnId},
+    };
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        fs,
+        io::{BufRead, BufReader, Write},
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+        sync::{Arc, Mutex, mpsc},
+        time::{Duration, Instant},
+    };
+
+    const GUARD: Duration = Duration::from_secs(60);
+
+    pub struct Clock(Instant);
+    impl ChannelRuntime for Clock {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+    impl EventRuntime for Clock {
+        fn now(&self) -> Duration {
+            self.0.elapsed()
+        }
+        fn cancelled(&self) -> bool {
+            false
+        }
+        fn sleep(&self, _: Duration) {
+            panic!("direct source checks must not sleep")
+        }
+    }
+    impl Clock {
+        pub fn deadline(&self) -> Duration {
+            self.0.elapsed() + GUARD
+        }
+    }
+
+    pub struct Fixture {
+        leader: Leader,
+        pub laptop: loop_fixtures::Fixture,
+        pub raw: Arc<LocalRpc>,
+        pub connector: Arc<ObservedConnector>,
+        pub forwards: Arc<FakeForwardControl>,
+        pub clock: Arc<Clock>,
+        pub task: TaskId,
+        pub record: ServiceRecord,
+        _root: tempfile::TempDir,
+    }
+    impl Fixture {
+        pub fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("p3b")
+                .tempdir_in("/private/tmp")
+                .unwrap();
+            let home = root.path().join("h");
+            fs::create_dir(&home).unwrap();
+            let denied_ssh = root.path().join("deny-ssh");
+            fs::write(&denied_ssh, "#!/bin/sh\nexit 69\n").unwrap();
+            fs::set_permissions(&denied_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+            let environment = BTreeMap::<OsString, OsString>::from([
+                ("HOME".into(), home.clone().into_os_string()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    root.path().join("c").into_os_string(),
+                ),
+                (
+                    "XDG_STATE_HOME".into(),
+                    root.path().join("s").into_os_string(),
+                ),
+                (
+                    "XDG_CACHE_HOME".into(),
+                    root.path().join("k").into_os_string(),
+                ),
+                (
+                    "XDG_DATA_HOME".into(),
+                    root.path().join("d").into_os_string(),
+                ),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+                ("MAC_WORKER_TEST_SSH".into(), denied_ssh.into_os_string()),
+            ]);
+            let paths = PathLayout::discover(None, &environment, &home).unwrap();
+            fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+            fs::write(
+                &paths.config,
+                "version=1\n[[workers]]\nname='unused'\nssh='unused'\nslots=1\n",
+            )
+            .unwrap();
+            let installed = root.path().join("worker");
+            fs::copy(env!("CARGO_BIN_EXE_worker"), &installed).unwrap();
+            let task = seed_completed_task(&paths);
+            let mut command = Command::new(&installed);
+            let mut child = command
+                .env_clear()
+                .envs(&environment)
+                .arg("--config")
+                .arg(&paths.config)
+                .args(["controller", "run"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(stdout).read_line(&mut line).unwrap();
+                let _ = tx.send(line);
+            });
+            let leader = Leader(child);
+            assert_eq!(
+                rx.recv_timeout(GUARD).unwrap(),
+                "controller leader acquired\n"
+            );
+            reader.join().unwrap();
+            let start = Instant::now();
+            let record = loop {
+                if let Ok(bytes) = fs::read(paths.controller_state_root().join("rpc/service.json"))
+                {
+                    break serde_json::from_slice::<ServiceRecord>(&bytes).unwrap();
+                }
+                assert!(start.elapsed() < GUARD, "service readiness hang guard");
+                std::thread::yield_now();
+            };
+            let raw = Arc::new(LocalRpc {
+                installed,
+                paths,
+                environment,
+                calls: Mutex::new(vec![]),
+            });
+            Self {
+                leader,
+                laptop: loop_fixtures::Fixture::new(),
+                forwards: Arc::new(FakeForwardControl::new(record.service.socket_path.clone())),
+                clock: Arc::new(Clock(Instant::now())),
+                connector: Arc::new(ObservedConnector {
+                    inner: FramedSocketConnector::new(Arc::new(SessionCodec::new())),
+                    calls: Arc::new(Mutex::new(vec![])),
+                }),
+                raw,
+                task,
+                record,
+                _root: root,
+            }
+        }
+        pub fn deps(&self) -> ClientDeps {
+            ClientDeps {
+                identity: Arc::new(StdioIdentitySource::new()),
+                pins: Arc::new(PrivatePinStore::new()),
+                forwards: self.forwards.clone(),
+                connector: self.connector.clone(),
+                runtime: self.clock.clone(),
+            }
+        }
+        pub fn run(&self, args: &[&str]) -> (u8, String, String) {
+            let context: RuntimeContext = self
+                .laptop
+                .runtime
+                .clone()
+                .with_controller_channel_dependencies(self.deps());
+            let (mut stdout, mut stderr) = (vec![], vec![]);
+            let exit = mac_worker::run_with_io_in_context(
+                Cli::try_parse_from(args).unwrap(),
+                &*self.raw,
+                &context,
+                &mut stdout,
+                &mut stderr,
+            );
+            (
+                exit,
+                String::from_utf8(stdout).unwrap(),
+                String::from_utf8(stderr).unwrap(),
+            )
+        }
+        pub fn clear_calls(&self) {
+            self.raw.calls.lock().unwrap().clear();
+            self.connector.calls.lock().unwrap().clear();
+        }
+        pub fn assert_only_identity_was_stdio(&self) {
+            let calls = self.raw.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "unexpected raw fallback: {calls:?}");
+            assert_eq!(calls[0].command(), "task.list");
+            assert_eq!(calls[0].body()["controller_socket"]["op"], "identity");
+            assert_eq!(
+                self.laptop.pin().unwrap().controller_client_id,
+                self.record.service.controller_client_id
+            );
+        }
+        pub fn stop(&mut self) {
+            self.leader.stop();
+        }
+    }
+
+    struct Leader(Child);
+    impl Leader {
+        fn stop(&mut self) {
+            assert_eq!(unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) }, 0);
+            let start = Instant::now();
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                assert!(start.elapsed() < GUARD, "leader exit hang guard");
+                std::thread::yield_now();
+            }
+        }
+    }
+    impl Drop for Leader {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub struct LocalRpc {
+        installed: PathBuf,
+        paths: PathLayout,
+        environment: BTreeMap<OsString, OsString>,
+        pub calls: Mutex<Vec<ControllerRequest>>,
+    }
+    impl ProcessRunner for LocalRpc {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.run_interruptible(request, &|| false)
+        }
+        fn run_interruptible(
+            &self,
+            request: &ProcessRequest,
+            stop: &dyn Fn() -> bool,
+        ) -> Result<ProcessResult, WorkerError> {
+            assert!(request.program == "/usr/bin/ssh" || request.program == "fake-ssh");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(decode_request(request.stdin.as_ref().unwrap()).unwrap());
+            let mut local = request.clone();
+            local.program = self.installed.clone().into_os_string();
+            local.args = vec![
+                "--config".into(),
+                self.paths.config.clone().into_os_string(),
+                "host".into(),
+                "controller-rpc".into(),
+            ];
+            local.environment = self
+                .environment
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            local.isolate_parent_environment = true;
+            SystemProcessRunner.run_interruptible(&local, stop)
+        }
+    }
+    pub struct ObservedConnector {
+        inner: FramedSocketConnector,
+        pub calls: Arc<Mutex<Vec<ControllerRequest>>>,
+    }
+    impl SocketConnector for ObservedConnector {
+        fn connect(
+            &self,
+            path: &std::path::Path,
+            identity: &SocketIdentity,
+            ctx: &ClientContext<'_>,
+        ) -> Result<Box<dyn SocketSession>, ChannelFailure> {
+            Ok(Box::new(ObservedSession {
+                inner: self.inner.connect(path, identity, ctx)?,
+                calls: self.calls.clone(),
+            }))
+        }
+    }
+    struct ObservedSession {
+        inner: Box<dyn SocketSession>,
+        calls: Arc<Mutex<Vec<ControllerRequest>>>,
+    }
+    impl SocketSession for ObservedSession {
+        fn exchange(
+            &mut self,
+            frame: &[u8],
+            request: &ControllerRequest,
+            ctx: &ClientContext<'_>,
+        ) -> Result<ProcessResult, ChannelFailure> {
+            self.calls.lock().unwrap().push(request.clone());
+            self.inner.exchange(frame, request, ctx)
+        }
+        fn close(&mut self) {
+            self.inner.close();
+        }
+    }
+
+    fn seed_completed_task(paths: &PathLayout) -> TaskId {
+        use mac_worker::{
+            agent::{AgentKind, PermissionPolicy},
+            client_state::ClientStateStore,
+            task::{
+                ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskLimits, TaskMeta,
+                TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
+                TurnTerminal,
+            },
+        };
+        let (task, turn) = (TaskId::generate(), TurnId::generate());
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let meta = TaskMeta::new(TaskMetaInput {
+            task_id: task,
+            run_id: None,
+            project_id: "a".repeat(64),
+            worktree_id: "b".repeat(64),
+            agent: AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: PermissionPolicy::Workspace,
+            source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: "a".repeat(40).parse().unwrap(),
+            limits: TaskLimits::default(),
+            close_policy: ClosePolicy::Never,
+            env_profile: None,
+            git_identity: GitIdentity::new("Fixture", "fixture@example.test").unwrap(),
+            title: Some("live routing fixture".into()),
+            prompt: "fixture".into(),
+            created_at_millis: 1,
+        })
+        .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Done),
+            None,
+            false,
+            Some(meta.base_oid().clone()),
+            None,
+            vec![],
+            vec![],
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                None,
+                false,
+                None,
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap();
+        store
+            .create_task(
+                LocalTaskRecord::new(
+                    meta,
+                    status,
+                    None,
+                    None,
+                    None,
+                    "c".repeat(64),
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .open_runner_log(task, turn)
+            .unwrap()
+            .write_all(b"fixture log\n")
+            .unwrap();
+        let checkpoint = paths
+            .state
+            .join("runners")
+            .join(task.to_string())
+            .join(format!("{turn}.checkpoint.json"));
+        fs::write(&checkpoint, serde_json::to_vec(&serde_json::json!({"version":1,"task_id":task,"turn_id":turn,"committed":{
+            "offsets":[0,0],"len":12,"accepted":true,"completion":{"outcome":TaskOutcome::Done,"drained":true}
+        },"pending":null})).unwrap()).unwrap();
+        fs::set_permissions(checkpoint, fs::Permissions::from_mode(0o600)).unwrap();
+        task
+    }
+}
+
+#[test]
+fn route_real_server_wait_logs_and_raw_reads() {
+    if isolated_loop_fixture("route_real_server_wait_logs_and_raw_reads") {
+        return;
+    }
+    use loop_fixtures::commands;
+    let mut fixture = t7b_live::Fixture::new();
+    let task = fixture.task.to_string();
+    let (exit, _, errors) = fixture.run(&["worker", "task", "wait", "--task-id", &task]);
+    assert_eq!(exit, 0, "{errors}");
+    assert_eq!(commands(&fixture.connector.calls), ["task.wait.poll"]);
+    fixture.assert_only_identity_was_stdio();
+    assert_eq!(fixture.forwards.opens(), 1);
+    assert_eq!(fixture.forwards.cancels(), 1);
+    let expected = fixture.record.service.controller_client_id.to_string();
+    let cache = fixture
+        .laptop
+        .paths
+        .controller_cache_root()
+        .join("notify-sentinel");
+    std::fs::write(&cache, b"independent notification state").unwrap();
+    for args in [
+        vec!["worker", "controller", "channel", "identity", "--json"],
+        vec![
+            "worker",
+            "controller",
+            "channel",
+            "repin",
+            "--expect-client-id",
+            &expected,
+        ],
+    ] {
+        fixture.clear_calls();
+        let (exit, output, errors) = fixture.run(&args);
+        assert_eq!(exit, 0, "{errors}");
+        fixture.assert_only_identity_was_stdio();
+        assert!(fixture.connector.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.forwards.opens(), 1);
+        assert_eq!(fixture.forwards.cancels(), 1);
+        if args.contains(&"identity") {
+            let identity: mac_worker::controller::channel::SocketIdentity =
+                serde_json::from_str(&output).unwrap();
+            assert_eq!(identity.service, fixture.record.service);
+        }
+    }
+    assert_eq!(
+        std::fs::read(cache).unwrap(),
+        b"independent notification state"
+    );
+    assert!(!fixture.laptop.paths.state.join("client-id").exists());
+    fixture.clear_calls();
+    let (exit, logs, errors) = fixture.run(&["worker", "task", "logs", &task, "--follow", "--raw"]);
+    assert_eq!(exit, 0, "{errors}");
+    assert_eq!(logs, "fixture log\n");
+    let reads = fixture.connector.calls.lock().unwrap();
+    assert_eq!(reads[0].body(), &json!({"controller_health":true}));
+    assert!(
+        reads[1..]
+            .iter()
+            .all(|request| request.command() == "task.logs" && request.body()["wait_ms"] == 15_000)
+    );
+    drop(reads);
+    fixture.assert_only_identity_was_stdio();
+    assert_eq!(fixture.forwards.opens(), 2);
+    assert_eq!(fixture.forwards.cancels(), 2);
+    for args in [
+        vec!["worker", "task", "status", &task],
+        vec!["worker", "task", "list"],
+        vec!["worker", "task", "logs", &task, "--raw"],
+    ] {
+        fixture.clear_calls();
+        let (exit, _, errors) = fixture.run(&args);
+        assert_eq!(exit, 0, "{errors}");
+        assert_eq!(fixture.raw.calls.lock().unwrap().len(), 1);
+        assert!(fixture.connector.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.forwards.opens(), 2);
+    }
+    fixture.stop();
+}
+
+#[test]
+fn route_real_server_owned_events_and_notify_reads() {
+    if isolated_loop_fixture("route_real_server_owned_events_and_notify_reads") {
+        return;
+    }
+    use mac_worker::controller::{
+        channel::ReadLoopScope,
+        events::{
+            EventSource, ReadQuery, TaskAddressQuery, TaskRepairQuery,
+            client::ControllerEventClient,
+        },
+    };
+    let mut fixture = t7b_live::Fixture::new();
+    for (index, scope) in [ReadLoopScope::EventsFollow, ReadLoopScope::Notify]
+        .into_iter()
+        .enumerate()
+    {
+        fixture.clear_calls();
+        {
+            let source = ControllerEventClient::for_read_loop(
+                fixture.raw.clone(),
+                scope,
+                &fixture.laptop.paths,
+                &fixture.laptop.config,
+                fixture.clock.clone(),
+                fixture.deps(),
+            );
+            source.discover(fixture.clock.deadline()).unwrap();
+            source
+                .read(ReadQuery::default(), fixture.clock.deadline())
+                .unwrap();
+            if scope == ReadLoopScope::Notify {
+                let addressed = source
+                    .tasks(
+                        TaskAddressQuery {
+                            task_ids: vec![fixture.task],
+                            include_titles: false,
+                            proof_after: None,
+                        },
+                        fixture.clock.deadline(),
+                    )
+                    .unwrap();
+                assert_eq!(addressed.rows.len(), 1);
+                let page = source
+                    .repair(TaskRepairQuery::default(), fixture.clock.deadline())
+                    .unwrap();
+                assert!(page.complete);
+                assert_eq!(page.rows.len(), 1);
+            }
+            fixture.assert_only_identity_was_stdio();
+            assert_eq!(fixture.forwards.opens(), index + 1);
+        }
+        assert_eq!(fixture.forwards.cancels(), index + 1);
+        assert_eq!(
+            fixture.connector.calls.lock().unwrap().len(),
+            if scope == ReadLoopScope::Notify { 4 } else { 2 }
+        );
+    }
+    fixture.stop();
+}
