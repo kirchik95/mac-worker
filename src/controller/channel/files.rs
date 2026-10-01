@@ -1,7 +1,8 @@
 //! Blocking private channel files; call only on bounded native control jobs.
 //! Discovery withdrawal requires stopped admission and proven RPC exit. Images
 //! remain through shutdown, the next generation, and a ten-minute grace period.
-//! Unknown proof retains them. Detached task groups have no link dependency.
+//! Unknown same-boot proof retains them; older-boot residue can be reclaimed.
+//! Detached task groups have no link dependency.
 use super::contracts::{
     ChannelFailure, ChannelReason, CleanupContext, ForwardDisposition, IDENTITY_BYTES,
     PinnedExecutable, RunningImage, ServiceIdentity, UuidString,
@@ -100,9 +101,9 @@ pub struct LeaderSocketLease {
     controller_root: std::path::PathBuf,
 }
 
-/// Holds the leader lock. Recorded exit proof and age govern older-image
-/// cleanup; safely stale discovery recovers independently. Legacy/unknown
-/// generations never acquire exit proof merely because their leader died.
+/// Holds the leader lock. Recorded exit proof and age govern same-boot image
+/// cleanup; a reboot makes old RPC exits moot. Stale discovery recovers
+/// independently. A dead leader alone never proves unknown RPC exits.
 pub fn bind_leader(
     paths: &PathLayout,
     leader: &ControllerLeader,

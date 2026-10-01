@@ -1,5 +1,6 @@
-//! Native-only generation history. Exit proof is independent of age; neither a
-//! dead leader nor elapsed grace turns unknown cleanup into completion proof.
+//! Native-only generation history. Within a boot, exit proof is independent of
+//! age; neither a dead leader nor elapsed grace proves unknown cleanup complete.
+//! An earlier boot has no surviving RPC processes or executable-validation scans.
 use super::{core, private_entry, public_entry};
 use crate::controller::channel::contracts::{
     EntryIdentity, PinnedExecutable, ServiceRecord, UuidString,
@@ -18,7 +19,7 @@ fn invalid() -> io::Error {
 }
 
 /// Inject this clock stamp on native file operations. A boot-wide monotonic
-/// reading survives leader restarts; a changed boot identity never grants age.
+/// reading survives leader restarts; a changed boot identity ends prior scans.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionTime {
@@ -90,8 +91,8 @@ impl RetentionTime {
         Ok(())
     }
     fn expired(&self, last: &Self) -> bool {
-        self.epoch == last.epoch
-            && self
+        self.epoch != last.epoch
+            || self
                 .now
                 .checked_sub(last.now)
                 .is_some_and(|age| age > LINK_GRACE)
@@ -343,7 +344,7 @@ impl State {
         self.save(root)
     }
     /// The last two entries are current/previous even after their services stop.
-    /// A pending grace or unknown proof is never discarded to enforce a count.
+    /// Pending grace or unknown same-boot proof is never discarded for a count.
     pub(super) fn sweep(&mut self, root: &RootedDir, now: &RetentionTime) -> io::Result<()> {
         now.validate()?;
         let candidates: Vec<_> = self
@@ -351,7 +352,12 @@ impl State {
             .generations
             .iter()
             .take(self.history.generations.len().saturating_sub(2))
-            .filter(|entry| entry.rpc_exits_proven && now.expired(&entry.last_use))
+            .filter(|entry| {
+                // Both stamps are validated. A reboot makes prior RPC exits
+                // moot; elapsed grace alone still requires recorded exit proof.
+                (entry.rpc_exits_proven || now.epoch != entry.last_use.epoch)
+                    && now.expired(&entry.last_use)
+            })
             .cloned()
             .collect();
         let mut removed = BTreeSet::new();

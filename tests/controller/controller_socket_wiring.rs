@@ -267,17 +267,117 @@ mod t7a {
         }
 
         #[test]
-        fn image_link_retention_unknown_clock_epoch_keeps_old_links() {
-            let fixture = Fixture::new();
-            let first = fixture.stop(fixture.start(), true);
-            fixture.stop(fixture.start(), true);
+        fn image_link_retention_earlier_boot_withdraws_older_link_at_startup() {
+            let mut fixture = Fixture::new();
             fixture.clock.advance(Duration::from_secs(3600));
+            let first = fixture.stop(fixture.start(), true);
+            let second = fixture.stop(fixture.start(), true);
+            fixture.epoch.set(2);
+            fixture.clock = ManualRuntime::default();
+            let third = fixture.start();
+            assert!(
+                !first.path.exists(),
+                "an earlier boot has no executable-validation scan still in flight"
+            );
+            assert!(second.path.exists(), "the previous generation must remain");
+            assert!(third.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 2);
+            fixture.stop(third, true);
+            assert!(second.path.exists());
+            assert_eq!(fixture.links(), 2);
+        }
+
+        #[test]
+        fn image_link_retention_earlier_boot_makes_unknown_rpc_exit_moot() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), false);
+            // Model crashed discovery with no RPC-exit proof. The generation's
+            // recorded boot remains unchanged, and these image bytes are inert.
+            let path = fixture
+                .paths
+                .controller_state_root()
+                .join("rpc/service.json");
+            let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record["service"]["leader"] = serde_json::to_value(
+                mac_worker::job::ProcessIdentity::new(crate::fixture_pid(1), 1).unwrap(),
+            )
+            .unwrap();
+            fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let second = fixture.stop(fixture.start(), true);
+            assert!(
+                first.path.exists(),
+                "unknown exit must retain in the same boot"
+            );
             fixture.epoch.set(2);
             let third = fixture.start();
             assert!(
-                first.path.exists(),
-                "a different boot/clock epoch cannot authorize age cleanup"
+                !first.path.exists(),
+                "no RPC process from an earlier boot can still be alive"
             );
+            assert!(second.path.exists());
+            assert!(third.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 2);
+            fixture.stop(third, true);
+        }
+
+        #[test]
+        fn image_link_retention_current_and_previous_survive_boot_change() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), true);
+            fixture.epoch.set(2);
+            let second = fixture.start();
+            assert!(
+                first.path.exists(),
+                "boot change must keep the previous generation"
+            );
+            assert!(second.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 2);
+            let second = fixture.stop(second, true);
+            assert!(first.path.exists());
+            assert!(
+                second.path.exists(),
+                "shutdown must keep the current generation"
+            );
+            assert_eq!(fixture.links(), 2);
+        }
+
+        #[test]
+        fn image_link_retention_same_boot_backwards_clock_keeps_older_link() {
+            let mut fixture = Fixture::new();
+            fixture.clock.advance(Duration::from_secs(3600));
+            let first = fixture.stop(fixture.start(), true);
+            let second = fixture.stop(fixture.start(), true);
+            fixture.clock = ManualRuntime::default();
+            let third = fixture.start();
+            assert!(
+                first.path.exists(),
+                "backwards time in the same boot must extend retention"
+            );
+            assert!(second.path.exists());
+            assert!(third.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 3);
+            fixture.stop(third, true);
+        }
+
+        #[test]
+        fn image_link_retention_boot_change_binding_mismatch_preserves_replacement() {
+            let fixture = Fixture::new();
+            let first = fixture.stop(fixture.start(), true);
+            let original = fixture._temp.path().join("saved-original");
+            fs::rename(&first.path, &original).unwrap();
+            fs::write(&first.path, b"substituted executable").unwrap();
+            fs::set_permissions(&first.path, fs::Permissions::from_mode(0o755)).unwrap();
+            let replacement_inode = fs::metadata(&first.path).unwrap().ino();
+            assert_ne!(replacement_inode, first.binding.inode);
+            let second = fixture.stop(fixture.start(), true);
+            fixture.epoch.set(2);
+            let third = fixture.start();
+            assert_eq!(fs::read(&first.path).unwrap(), b"substituted executable");
+            assert_eq!(fs::metadata(&first.path).unwrap().ino(), replacement_inode);
+            assert_eq!(fs::metadata(original).unwrap().ino(), first.binding.inode);
+            assert!(second.path.exists());
+            assert!(third.lease.executable().path.exists());
+            assert_eq!(fixture.links(), 3);
             fixture.stop(third, true);
         }
     }
