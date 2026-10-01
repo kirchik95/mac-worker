@@ -9,6 +9,7 @@ mod admission_cache;
 mod client_state;
 mod client_state_active_tasks;
 mod fleet_reconciliation;
+mod legacy_fleet_protocol;
 mod run_command;
 mod scheduler_adapter;
 mod scheduler_concurrency;
