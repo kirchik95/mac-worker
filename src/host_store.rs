@@ -5795,7 +5795,9 @@ mod review_regression_tests {
             CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
         )
         .unwrap();
-        LeaseAcquireRequest::new(material)
+        LeaseAcquireRequest::new(material).with_execution_scope(crate::job::ExecutionScope::task(
+            crate::task::TaskId::new(uuid::Uuid::from_u128(seed)),
+        ))
     }
 
     fn staged_turn_receipt(staged: &StagedJob) -> crate::turn::TurnReceipt {
