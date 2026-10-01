@@ -60,6 +60,7 @@ struct Data {
     gate: Mutex<Option<Arc<Gate>>>,
     pin: Mutex<Option<SocketIdentity>>,
     cleanup_deadlines: Mutex<Vec<Duration>>,
+    return_cancel: Mutex<Option<(&'static str, Arc<AtomicBool>)>>,
 }
 #[derive(Clone)]
 struct Fixture(Arc<Data>);
@@ -99,6 +100,7 @@ impl Fixture {
             gate: Mutex::new(None),
             pin: Mutex::new(None),
             cleanup_deadlines: Mutex::new(Vec::new()),
+            return_cancel: Mutex::new(None),
         }))
     }
     fn runner(&self, scope: ReadLoopScope) -> ChannelProcessRunner<Arc<dyn ProcessRunner>> {
@@ -140,12 +142,20 @@ impl Fixture {
                 .expect("fixture hang guard");
         }
         ctx.check()?;
-        self.0
+        let outcome = self
+            .0
             .failures
             .lock()
             .unwrap()
             .remove(name)
-            .map_or(Ok(()), Err)
+            .map_or(Ok(()), Err);
+        if outcome.is_ok()
+            && let Some((stage, stopped)) = &*self.0.return_cancel.lock().unwrap()
+            && *stage == name
+        {
+            stopped.store(true, Ordering::SeqCst);
+        }
+        outcome
     }
     fn raw(
         &self,
@@ -197,7 +207,20 @@ impl ProcessRunner for Fixture {
         if should_stop() {
             return Err(crate::error::ProcessError::Cancelled.into());
         }
-        self.raw("interruptible", request)
+        let result = self.raw("interruptible", request);
+        let gate = self.0.gate.lock().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.stage == "raw") {
+            gate.entered.send(()).unwrap();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .expect("raw entry hang guard");
+        }
+        if should_stop() {
+            return Err(crate::error::ProcessError::Cancelled.into());
+        }
+        result
     }
 }
 impl IdentitySource for Fixture {
@@ -313,6 +336,10 @@ impl ForwardLease for Fixture {
     fn cancel(&mut self, _raw: &dyn ProcessRunner, ctx: &CleanupContext) -> ForwardDisposition {
         self.0.steps.lock().unwrap().push("cancel");
         self.0.cleanup_deadlines.lock().unwrap().push(ctx.deadline);
+        assert!(ctx.runtime.now() < ctx.deadline);
+        if let Some(elapsed) = self.0.advances.lock().unwrap().get("cancel") {
+            self.0.runtime.advance(*elapsed);
+        }
         *self.0.disposition.lock().unwrap()
     }
 }
@@ -1006,4 +1033,221 @@ fn changed_forward_binding_is_checked_before_application_bytes() {
     assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
     assert_eq!(fixture.count("close"), 1);
     assert_eq!(fixture.count("cancel"), 1);
+}
+
+#[test]
+fn independent_borrowed_cancellation_stays_live_inside_every_stage() {
+    for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        let (entered, release) = fixture.gate(stage);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let local = std::rc::Rc::new(std::cell::Cell::new(0));
+        let should_stop = || {
+            local.set(local.get() + 1);
+            stopped.load(Ordering::SeqCst)
+        };
+        std::thread::scope(|scope| {
+            let signal = stopped.clone();
+            scope.spawn(move || {
+                entered
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("operation entry");
+                signal.store(true, Ordering::SeqCst);
+                release.send(()).unwrap();
+            });
+            assert!(
+                matches!(
+                    runner.run_interruptible(&wait(1), &should_stop),
+                    Err(WorkerError::Process(ProcessError::Cancelled))
+                ),
+                "stage {stage}"
+            );
+        });
+        assert!(!fixture.0.runtime.cancelled());
+        assert!(
+            fixture.0.raw_calls.lock().unwrap().is_empty(),
+            "post-cancel fallback at {stage}"
+        );
+        if matches!(stage, "write" | "read") {
+            assert_eq!(fixture.count("close"), 1, "stage {stage}");
+        }
+        if matches!(stage, "connect" | "write" | "read") {
+            assert_eq!(fixture.count("cancel"), 1, "stage {stage}");
+        }
+    }
+}
+
+#[test]
+fn cancellation_after_a_dependency_returns_success_still_closes_and_stops() {
+    for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        let stopped = Arc::new(AtomicBool::new(false));
+        *fixture.0.return_cancel.lock().unwrap() = Some((stage, stopped.clone()));
+        let local = std::rc::Rc::new(());
+        let should_stop = || {
+            let _ = &local;
+            stopped.load(Ordering::SeqCst)
+        };
+        assert!(
+            matches!(
+                runner.run_interruptible(&wait(1), &should_stop),
+                Err(WorkerError::Process(ProcessError::Cancelled))
+            ),
+            "stage {stage}"
+        );
+        assert!(!fixture.0.runtime.cancelled());
+        assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+        if matches!(stage, "connect" | "write" | "read") {
+            assert_eq!(fixture.count("close"), 1, "stage {stage}");
+        }
+    }
+}
+
+#[test]
+fn original_deadline_expiry_at_each_stage_never_falls_back() {
+    for stage in ["resolve", "identity", "open", "connect", "write", "read"] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        fixture
+            .0
+            .advances
+            .lock()
+            .unwrap()
+            .insert(stage, Duration::from_secs(30));
+        assert!(
+            matches!(runner.run(&wait(1)), Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline == Duration::from_secs(30)),
+            "stage {stage}"
+        );
+        assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+        if matches!(stage, "write" | "read") {
+            assert_eq!(fixture.count("close"), 1);
+        }
+    }
+}
+
+#[test]
+fn cancellation_before_next_call_closes_an_existing_session() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    let token = std::rc::Rc::new(true);
+    assert!(matches!(
+        runner.run_interruptible(&wait(2), &|| *token),
+        Err(WorkerError::Process(ProcessError::Cancelled))
+    ));
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn command_cancellation_allows_only_clock_bounded_cleanup() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    fixture.0.runtime.advance(Duration::from_secs(10));
+    fixture.0.runtime.cancelled.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        runner.run(&wait(2)),
+        Err(WorkerError::Process(ProcessError::Cancelled))
+    ));
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    assert_eq!(
+        *fixture.0.cleanup_deadlines.lock().unwrap(),
+        [Duration::from_secs(15)]
+    );
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cleanup_time_consumes_original_budget_before_fallback() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    fixture.0.advances.lock().unwrap().extend([
+        ("read", Duration::from_secs(26)),
+        ("cancel", Duration::from_secs(4)),
+    ]);
+    assert!(
+        matches!(runner.run(&wait(1)), Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline == Duration::from_secs(30))
+    );
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(
+        *fixture.0.cleanup_deadlines.lock().unwrap(),
+        [Duration::from_secs(31)]
+    );
+}
+
+#[test]
+fn raw_fallback_preserves_the_live_borrowed_predicate() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    let (entered, release) = fixture.gate("raw");
+    let stopped = Arc::new(AtomicBool::new(false));
+    let token = std::rc::Rc::new(());
+    let should_stop = || {
+        let _ = &token;
+        stopped.load(Ordering::SeqCst)
+    };
+    std::thread::scope(|scope| {
+        let signal = stopped.clone();
+        scope.spawn(move || {
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("raw fallback entry");
+            signal.store(true, Ordering::SeqCst);
+            release.send(()).unwrap();
+        });
+        assert!(matches!(
+            runner.run_interruptible(&wait(1), &should_stop),
+            Err(WorkerError::Process(ProcessError::Cancelled))
+        ));
+    });
+    assert!(!fixture.0.runtime.cancelled());
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert_eq!(fixture.0.raw_calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn zero_call_budget_expires_without_application_or_setup() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    let mut request = wait(1);
+    request.policy.deadline = Duration::ZERO;
+    assert!(
+        matches!(runner.run(&request), Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline.is_zero())
+    );
+    assert!(fixture.steps().is_empty());
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn application_guard_caps_an_extended_process_policy() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    let mut request = wait(1);
+    request.policy.deadline = Duration::from_secs(60);
+    fixture
+        .0
+        .advances
+        .lock()
+        .unwrap()
+        .insert("read", Duration::from_secs(30));
+    assert!(
+        matches!(runner.run(&request), Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline == Duration::from_secs(30))
+    );
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.count("close"), 1);
 }

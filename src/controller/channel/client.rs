@@ -3,8 +3,8 @@ use std::{ffi::OsStr, sync::Mutex};
 
 pub use super::contracts::{
     CHANNEL_VERSION, ChannelFailure, ChannelReason, CleanupContext, ClientContext, ClientDeps,
-    ConfiguredRoute, ForwardDisposition, ForwardLease, ReadLoopScope, SETUP_GUARD, SocketSession,
-    eligible_read,
+    ConfiguredRoute, ForwardDisposition, ForwardLease, REQUEST_GUARD, ReadLoopScope, SETUP_GUARD,
+    SocketSession, eligible_read,
 };
 use crate::{
     controller::{ControllerRequest, decode_request},
@@ -152,13 +152,16 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 .deps
                 .runtime
                 .now()
-                .saturating_add(request.policy.deadline),
+                .saturating_add(request.policy.deadline.min(REQUEST_GUARD)),
             should_stop,
         };
-        ctx.check().map_err(unavailable)?;
         let Ok(mut state) = self.state.try_lock() else {
             return self.raw_read(request, &ctx);
         };
+        if let Err(error) = check_call(request, &ctx) {
+            self.close_session(&mut state);
+            return Err(error);
+        }
         // Existing retries of this same sequential read never re-enter the
         // channel, even if reconnect eligibility advances between attempts.
         if state.retired || state.last_read_id.as_deref() == Some(parsed.request_id()) {
@@ -190,23 +193,39 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
                 return self.raw_read(request, &ctx);
             }
         }
-        let session = state
+        let verified = state
             .session
-            .as_mut()
-            .expect("successful setup supplies a session");
-        if let Err(_failure) = session.forward.verify() {
+            .as_ref()
+            .expect("successful setup supplies a session")
+            .forward
+            .verify();
+        if let Err(_failure) = verified {
             self.close_session(&mut state);
             drop(state);
             return self.raw_read(request, &ctx);
         }
-        ctx.check().map_err(unavailable)?;
-        let result = session.socket.exchange(
-            request.stdin.as_deref().expect("eligible frame"),
-            parsed,
-            &ctx,
-        );
+        if let Err(error) = check_call(request, &ctx) {
+            self.close_session(&mut state);
+            return Err(error);
+        }
+        let result = state
+            .session
+            .as_mut()
+            .expect("verified session")
+            .socket
+            .exchange(
+                request.stdin.as_deref().expect("eligible frame"),
+                parsed,
+                &ctx,
+            );
         match result {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                if let Err(error) = check_call(request, &ctx) {
+                    self.close_session(&mut state);
+                    return Err(error);
+                }
+                Ok(result)
+            }
             Err(failure) => {
                 self.close_session(&mut state);
                 if matches!(failure, ChannelFailure::UnverifiedReply) {
@@ -230,11 +249,14 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
         request: &ProcessRequest,
         ctx: &ClientContext<'_>,
     ) -> Result<ProcessResult, WorkerError> {
-        ctx.check().map_err(unavailable)?;
+        check_call(request, ctx)?;
         let mut remaining = request.clone();
         remaining.policy.deadline = ctx.remaining();
-        self.raw
-            .run_interruptible(&remaining, &|| ctx.check().is_err())
+        let result = self
+            .raw
+            .run_interruptible(&remaining, &|| ctx.check().is_err());
+        check_call(request, ctx)?;
+        result
     }
 }
 impl<R: ProcessRunner> ProcessRunner for ChannelProcessRunner<R> {
@@ -267,14 +289,20 @@ impl<R: ProcessRunner> Drop for ChannelProcessRunner<R> {
 fn unavailable(failure: ChannelFailure) -> WorkerError {
     match failure {
         ChannelFailure::Unavailable(ChannelReason::Cancelled) => ProcessError::Cancelled.into(),
-        ChannelFailure::Unavailable(ChannelReason::Timeout) => ProcessError::DeadlineExceeded {
-            deadline: SETUP_GUARD,
-        }
-        .into(),
         _ => WorkerError::Unavailable(
             "CONTROLLER_UNAVAILABLE: controller read channel unavailable".into(),
         ),
     }
+}
+
+fn check_call(request: &ProcessRequest, ctx: &ClientContext<'_>) -> Result<(), WorkerError> {
+    ctx.check().map_err(|failure| match failure {
+        ChannelFailure::Unavailable(ChannelReason::Timeout) => ProcessError::DeadlineExceeded {
+            deadline: request.policy.deadline.min(REQUEST_GUARD),
+        }
+        .into(),
+        failure => unavailable(failure),
+    })
 }
 
 // Recognize only the worker's structured SSH invocation. In particular, no
