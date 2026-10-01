@@ -97,7 +97,7 @@ fn queue_record(store: &ClientStateStore, job_id: &str, at: u64) -> QueueEntry {
         CommandSummary::shell(),
         Vec::new(),
         WorkerPreference::Automatic,
-        QueueEntryKind::Batch,
+        QueueEntryKind::TaskTurn,
         None,
         ProcessIdentity::new(fixture_pid::fixture_pid(90_000), 90_000_001).unwrap(),
         at,

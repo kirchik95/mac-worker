@@ -61,7 +61,9 @@ fn request(seed: u128) -> LeaseAcquireRequest {
         CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
     )
     .unwrap();
-    LeaseAcquireRequest::new(material)
+    LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(
+        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(seed)),
+    ))
 }
 
 fn healthy() -> AdmissionFacts {
@@ -71,6 +73,145 @@ fn healthy() -> AdmissionFacts {
         memory_pressure: MemoryPressure::Normal,
         swap_used_bytes: Some(0),
     }
+}
+
+#[test]
+fn legacy_job_scope_admission_is_refused_before_any_store_write() {
+    // Break caught: a rejected batch request publishes a lease or lock state.
+    for explicit in [false, true] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let mut value = serde_json::to_value(request(90_001)).unwrap();
+        if explicit {
+            value["execution_scope"] = serde_json::json!({"kind": "job"});
+        } else {
+            value.as_object_mut().unwrap().remove("execution_scope");
+        }
+        let legacy: LeaseAcquireRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.execution_scope(), &ExecutionScope::Job);
+        let before = pin_tree(&root);
+        let error = LeaseService::new(&store)
+            .acquire(&legacy, &healthy(), 1)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "EXECUTION_SCOPE_CONFLICT");
+        assert!(
+            !error
+                .to_string()
+                .contains(&legacy.material().lease_token().to_string())
+        );
+        assert_eq!(pin_tree(&root), before);
+        assert_eq!(
+            LeaseService::new(&store).occupancy().unwrap().slot_state,
+            SlotState::Idle
+        );
+    }
+}
+
+#[test]
+fn hidden_legacy_job_scope_refusal_does_not_create_host_root() {
+    // Break caught: the wire handler creates HostStore before refusing batch.
+    for explicit in [false, true] {
+        let temp = tempdir().unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            temp.path().join("data").into_os_string(),
+        )]);
+        let home = temp.path().join("home");
+        let paths = PathLayout::discover(None, &environment, &home).unwrap();
+        let runtime = RuntimeContext::isolated(environment, home, temp.path().to_path_buf());
+        let mut value = serde_json::to_value(request(90_002)).unwrap();
+        if explicit {
+            value["execution_scope"] = serde_json::json!({"kind": "job"});
+        } else {
+            value.as_object_mut().unwrap().remove("execution_scope");
+        }
+        let mut stdin = Cursor::new(serde_json::to_vec(&value).unwrap());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_stdio_in_context(
+            Cli::try_parse_from(["worker", "host", "lease-acquire"]).unwrap(),
+            &NoProcess,
+            &runtime,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_ne!(exit, 0);
+        assert!(stderr.is_empty());
+        let error: HostControlError = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(error.protocol_version(), PROTOCOL_VERSION);
+        assert_eq!(error.error().code(), "EXECUTION_SCOPE_CONFLICT");
+        assert!(
+            !paths.data.exists(),
+            "batch refusal must not create host state"
+        );
+    }
+}
+
+#[test]
+fn existing_legacy_job_scope_remains_busy_in_inventory_probe_and_gc() {
+    // Break caught: retirement treats an existing batch lease as free capacity.
+    let temp = tempdir().unwrap();
+    let environment = BTreeMap::from([(
+        OsString::from("XDG_DATA_HOME"),
+        temp.path().join("data").into_os_string(),
+    )]);
+    let home = temp.path().join("home");
+    let paths = PathLayout::discover(None, &environment, &home).unwrap();
+    let root = paths.host_state_root();
+    let store = HostStore::open(&root).unwrap();
+    let req = request(90_003).with_execution_scope(ExecutionScope::task(
+        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(90_003)),
+    ));
+    let lease = match LeaseService::new(&store)
+        .acquire(&req, &healthy(), 1)
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        other => panic!("expected acquired task lease, got {other:?}"),
+    };
+    let lease_path = root.join("leases/slots/0/lease.json");
+    let lease_bytes = fs::read(&lease_path).unwrap();
+    let scope_path = root.join("leases/slots/0/scope.json");
+    let scope_bytes = br#"{"kind":"job"}"#;
+    fs::write(&scope_path, scope_bytes).unwrap();
+    let slots = LeaseService::new(&store).occupied_slots().unwrap();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].execution_scope, ExecutionScope::Job);
+    assert_eq!(slots[0].lease, lease);
+    let occupancy = LeaseService::load_if_present(&root).unwrap();
+    assert_eq!(occupancy.slot_state, SlotState::Busy);
+    assert_eq!(occupancy.busy_slots, 1);
+    assert_eq!(occupancy.active_lease.unwrap().job_id, lease.job_id());
+
+    let runtime = RuntimeContext::isolated(environment, home, temp.path().to_path_buf());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = run_with_stdio_in_context(
+        Cli::try_parse_from(["worker", "host", "probe"]).unwrap(),
+        &NoProcess,
+        &runtime,
+        &mut Cursor::new(Vec::<u8>::new()),
+        &mut stdout,
+        &mut stderr,
+    );
+    assert_eq!(exit, 0);
+    assert!(stderr.is_empty());
+    let probe: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(probe["slot_state"], "busy");
+    assert_eq!(probe["busy_slots"], 1);
+    let report = mac_worker::gc::HostGc::new(&store, &NoProcess)
+        .preview_at(60_001)
+        .unwrap();
+    assert!(report.candidates().is_empty());
+    assert!(report.applied().is_empty());
+    assert_eq!(fs::read(&lease_path).unwrap(), lease_bytes);
+    assert_eq!(fs::read(&scope_path).unwrap(), scope_bytes);
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Busy
+    );
 }
 
 #[test]
@@ -455,7 +596,8 @@ fn mismatched_same_job_abandonment_is_a_conflict_during_lease_acquisition() {
             material.command().clone(),
         )
         .unwrap(),
-    );
+    )
+    .with_execution_scope(abandoned.execution_scope().clone());
 
     let error = LeaseService::new(&store)
         .acquire(&mismatched, &healthy(), 200)

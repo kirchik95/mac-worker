@@ -558,11 +558,6 @@ impl<'a> TurnRunner<'a> {
         allow_reassignment: bool,
     ) -> Result<TurnOutcomeReport, WorkerError> {
         ignore_sigpipe();
-        // Legacy batch dispatch recovery deliberately skips task-turn rows,
-        // but keeping the call here preserves the runner's recovery stage
-        // and lets future mixed queues repair old rows without touching the
-        // task-turn ownership protocol.
-        let _ = self.client_state.recover_dead_dispatches()?;
         let result = (|| {
             let (claimed_task, claimed_turn, owner) =
                 self.claim(task_id, turn_id, allow_reassignment)?;

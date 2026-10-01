@@ -1806,7 +1806,7 @@ impl ClientStateStore {
                     .entries
                     .iter()
                     .filter(|entry| {
-                        matches!(
+                        entry.kind() == QueueEntryKind::TaskTurn && matches!(
                             entry.state(),
                             QueueState::Dispatching { selected_worker, .. }
                                 if selected_worker == worker
@@ -1823,7 +1823,8 @@ impl ClientStateStore {
                 .map(|observation| observation.capabilities().to_vec());
                 for index in 0..snapshot.entries.len() {
                     let candidate = &snapshot.entries[index];
-                    if turn_id.is_some_and(|turn| candidate.job_id() != turn || candidate.kind() != QueueEntryKind::TaskTurn) {
+                    if candidate.kind() != QueueEntryKind::TaskTurn
+                        || turn_id.is_some_and(|turn| candidate.job_id() != turn) {
                         continue;
                     }
                     if !matches!(candidate.state(), QueueState::Waiting { owner: row_owner } if *row_owner == owner)
@@ -2714,7 +2715,9 @@ impl ClientStateStore {
                 } else if candidate.job_id() != sibling.job_id() {
                     occupied_jobs.insert(sibling.job_id());
                 }
-            } else {
+            } else if candidate.kind() == QueueEntryKind::Batch {
+                // Preserve legacy projections while ignoring retired batch
+                // occupancy for task runs. Validate sibling records below.
                 occupied_jobs.insert(sibling.job_id());
             }
         };

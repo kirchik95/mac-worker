@@ -224,7 +224,8 @@ impl ClientStateStore {
         caller: ProcessIdentity,
         tasks: &HashMap<TurnId, LocalTaskRecord>,
     ) -> Result<bool, WorkerError> {
-        if older.is_cancel_requested()
+        if older.kind() != QueueEntryKind::TaskTurn
+            || older.is_cancel_requested()
             || !older.eligible_for(worker, capabilities)
             || !self.run_has_capacity(snapshot, older)?
         {
@@ -260,7 +261,7 @@ impl ClientStateStore {
                 .find(|observation| observation.worker_name() == worker)
                 .map(|observation| observation.capabilities());
             if !entry.eligible_for(worker, capabilities)
-                || snapshot.entries.iter().any(|other| matches!(other.state(), QueueState::Dispatching { selected_worker, .. } if selected_worker == worker))
+                || snapshot.entries.iter().any(|other| other.kind() == QueueEntryKind::TaskTurn && matches!(other.state(), QueueState::Dispatching { selected_worker, .. } if selected_worker == worker))
             { continue; }
             let mut blocked = false;
             for older in &snapshot.entries[..index] {

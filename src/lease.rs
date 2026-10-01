@@ -91,7 +91,7 @@ impl<'a> LeaseService<'a> {
         facts: &AdmissionFacts,
         now: u64,
     ) -> Result<LeaseAcquireResponse, WorkerError> {
-        request.validate()?;
+        validate_execution_scope(request)?;
         if request.material().resource_class() != "heavy" {
             return Err(WorkerError::Protocol(
                 "only the heavy resource class is supported".into(),
@@ -438,6 +438,18 @@ impl<'a> LeaseService<'a> {
     }
 }
 
+/// Refuse retired batch admission before opening or mutating host state.
+pub(crate) fn validate_execution_scope(request: &LeaseAcquireRequest) -> Result<(), WorkerError> {
+    request.validate()?;
+    if request.execution_scope().is_job() {
+        return Err(protocol_code(
+            "EXECUTION_SCOPE_CONFLICT",
+            "batch execution is no longer supported",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_admission(facts: &AdmissionFacts) -> Result<(), WorkerError> {
     let minimum = (facts.total_disk_bytes / 5).max(50 * GIB);
     if facts.free_disk_bytes < minimum {
@@ -776,7 +788,9 @@ mod lifecycle_tests {
             CommandSpec::argv(vec!["cargo".into(), "test".into()]).unwrap(),
         )
         .unwrap();
-        LeaseAcquireRequest::new(material)
+        LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(TaskId::new(
+            uuid::Uuid::from_u128(seed),
+        )))
     }
 
     fn healthy() -> AdmissionFacts {
@@ -1112,7 +1126,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn two_job_scopes_from_the_same_origin_overlap() {
+    fn two_distinct_task_scopes_from_the_same_origin_overlap() {
         let temp = tempdir().unwrap();
         let store = HostStore::open(&temp.path().join("host")).unwrap();
         let service = LeaseService::new(&store);

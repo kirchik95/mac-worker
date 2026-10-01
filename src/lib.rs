@@ -5304,6 +5304,7 @@ fn run_host_lease_acquire(
         deserializer.end().map_err(|_| {
             WorkerError::Protocol("lease-acquire request contained trailing data".into())
         })?;
+        lease::validate_execution_scope(&request)?;
         let paths = discover_paths(config_override, runtime)?;
         let host_state_root = paths.host_state_root();
         let probe = ProbeCollector::collect_at(&host_state_root)?;
