@@ -1758,9 +1758,42 @@ mod t7a {
             .unwrap();
             let mut process = controller_rpc_ssh_request(&config.controller).unwrap();
             process.stdin = Some(frame(&req));
+            let mut priming = process.clone();
+            priming.stdin = Some(
+                encode_json_frame(&json!({
+                    "protocol_version":req.protocol_version(),
+                    "request_id":"11111111111141118111111111111111",
+                    "command":req.command(),
+                    "body":req.body(),
+                }))
+                .unwrap(),
+            );
+            assert!(channel.run(&priming).unwrap().status.success());
+            assert_eq!(
+                raw.calls.lock().unwrap().as_slice(),
+                [priming.stdin.unwrap()]
+            );
+            assert_eq!(forwards.resolutions(), 0);
+            assert_eq!(forwards.opens(), 0);
+            assert_eq!(forwards.cancels(), 0);
+            assert_eq!(connector.connections(), 0);
+            assert!(connector.frames().is_empty());
+            assert!(
+                !fixture
+                    .paths
+                    .controller_cache_root()
+                    .join("channel")
+                    .exists()
+            );
+            assert!(!fixture.paths.state.exists());
+            assert!(!fixture.paths.controller_state_root().exists());
             assert!(channel.run(&process).unwrap().status.success());
-            assert_eq!(raw.calls.lock().unwrap().len(), 2);
-            assert_eq!(raw.calls.lock().unwrap()[1], frame(&req));
+            assert_eq!(raw.calls.lock().unwrap().len(), 3);
+            let identity =
+                mac_worker::controller::decode_request(&raw.calls.lock().unwrap()[1]).unwrap();
+            assert_eq!(identity.command(), "task.list");
+            assert_eq!(identity.body()["controller_socket"]["op"], "identity");
+            assert_eq!(raw.calls.lock().unwrap()[2], frame(&req));
             assert_eq!(forwards.opens(), 0);
             assert_eq!(connector.connections(), 0);
             assert!(!fixture.paths.state.exists());
