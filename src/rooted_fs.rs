@@ -1210,6 +1210,23 @@ impl RootedDir {
         self.channel_unlink_exact_with_hook(name, expected, || {})
     }
 
+    pub(crate) fn channel_remove_empty(&self) -> io::Result<()> {
+        self.channel_private_root()?;
+        if !directory_entries(self.root.as_raw_fd())?.is_empty() {
+            return Err(os_error(libc::ENOTEMPTY));
+        }
+        self.channel_private_root()?;
+        unlink_at(self.parent.as_raw_fd(), &self.root_name, libc::AT_REMOVEDIR)?;
+        for binding in &self.lineage {
+            binding.verify()?;
+        }
+        match stat_at(self.parent.as_raw_fd(), &self.root_name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(os_error(libc::ESTALE)),
+        }
+        cvt(unsafe { libc::fsync(self.parent.as_raw_fd()) })
+    }
+
     fn channel_unlink_exact_with_hook(
         &self,
         name: &str,
