@@ -9064,6 +9064,118 @@ mod task_turn_ports {
     }
 
     #[test]
+    // Supersedes v1 test: fleet_recovery_delegates_an_exact_nonindexed_crash_record_to_phase_three_reconciliation.
+    fn task_turn_repairs_an_exact_nonindexed_crash_record_and_launches_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let marker = temp.path().join("executions");
+        let (lease, request) = prepared_turn(&store, &marker);
+        drop(store);
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobPublish).unwrap();
+        assert!(
+            JobService::new(&faulted, &RejectLauncher)
+                .submit_turn(request.clone())
+                .is_err()
+        );
+        assert!(!faulted.job_index(lease.job_id()).unwrap().exists());
+        assert!(
+            faulted
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap()
+                .join("meta.json")
+                .is_file()
+        );
+        assert!(!marker.exists());
+        drop(faulted);
+        let store = HostStore::open(&root).unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = MatrixInlineLauncher {
+            store: store.clone(),
+            launches: Arc::clone(&launches),
+        };
+        let response = JobService::new(&store, &launcher)
+            .submit_turn(request.clone())
+            .unwrap_or_else(|error| {
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                let names: Vec<_> = fs::read_dir(job)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                panic!("unindexed task replay failed: {error}; final names: {names:?}");
+            });
+        let status = JobService::new(&store, &launcher)
+            .status(lease.job_id())
+            .unwrap();
+        assert_eq!(status.meta().job_id(), lease.job_id());
+        assert_eq!(
+            status.status().supervisor_identity(),
+            Some(
+                SystemProcessInspector
+                    .identity_for_pid(std::process::id())
+                    .unwrap()
+            )
+        );
+        assert_eq!(response.submit().status(), status.status());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(store.job_index(lease.job_id()).unwrap().is_file());
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        let retry = JobService::new(&store, &launcher)
+            .submit_turn(request)
+            .unwrap();
+        assert!(matches!(retry.submit(), SubmitResponse::Existing { .. }));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    // Supersedes the accepted prelaunch resolver branch of v1 test: acceptance_disconnect_matrix_100.
+    fn task_turn_resolution_recovers_an_indexed_prelaunch_turn_and_executes_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("host");
+        let marker = temp.path().join("executions");
+        let store = HostStore::open(&root).unwrap();
+        let (lease, request) = prepared_turn(&store, &marker);
+        drop(store);
+        let faulted =
+            HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterJobIndexParentSync)
+                .unwrap();
+        assert!(
+            JobService::new(&faulted, &RejectLauncher)
+                .submit_turn(request.clone())
+                .is_err()
+        );
+        let disposition: JobDisposition =
+            serde_json::from_slice(&fs::read(faulted.job_index(lease.job_id()).unwrap()).unwrap())
+                .unwrap();
+        assert!(matches!(disposition, JobDisposition::Accepted { .. }));
+        assert!(!marker.exists());
+        drop(faulted);
+        let store = HostStore::open(&root).unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = MatrixInlineLauncher {
+            store: store.clone(),
+            launches: Arc::clone(&launches),
+        };
+        let resolve = ResolveOrAbandonRequest::from_submit_request(request.submit()).unwrap();
+        let response = JobService::new(&store, &launcher)
+            .resolve_or_abandon(resolve)
+            .unwrap();
+        match response.outcome() {
+            ResolveOrAbandonOutcome::Accepted { response } => {
+                matrix_assert_meta_identity(response.meta(), request.submit());
+                assert_eq!(response.status().state(), JobState::Succeeded);
+            }
+            outcome => panic!("indexed turn was not accepted: {outcome:?}"),
+        }
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+    }
+
+    #[test]
     // Supersedes v1 test: host_reconcile_returns_per_job_errors_for_corrupt_status_or_lease.
     fn task_turn_status_preserves_corrupt_status_or_lease_and_reports_typed_errors() {
         for (label, target) in [("status", "status.json"), ("lease", "lease.json")] {
@@ -9151,5 +9263,88 @@ mod task_turn_ports {
                 request.submit(),
             );
         }
+    }
+
+    #[test]
+    // Supersedes the shared control-file/index frontiers of v1 test: fresh_reopen_repairs_every_durable_job_and_index_publication_boundary_once.
+    fn task_turn_publication_crash_frontiers_recover_and_execute_exactly_once() {
+        let points = [
+            HostStoreWritePoint::AfterJobMetaWrite,
+            HostStoreWritePoint::AfterJobMetaFileSync,
+            HostStoreWritePoint::AfterJobStatusWrite,
+            HostStoreWritePoint::AfterJobStatusFileSync,
+            HostStoreWritePoint::AfterJobExecutionWrite,
+            HostStoreWritePoint::AfterJobExecutionFileSync,
+            HostStoreWritePoint::AfterJobStagingDirectorySync,
+            HostStoreWritePoint::AfterJobRename,
+            HostStoreWritePoint::AfterJobPublish,
+            HostStoreWritePoint::AfterJobIndexFileSync,
+            HostStoreWritePoint::AfterJobIndexRename,
+            HostStoreWritePoint::AfterJobIndexParentSync,
+        ];
+        let mut recovery_errors = Vec::new();
+        for point in points {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("executions");
+            let store = HostStore::open(&root).unwrap();
+            let (lease, request) = prepared_turn(&store, &marker);
+            drop(store);
+            let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
+            let launches = Arc::new(AtomicUsize::new(0));
+            let first = MatrixInlineLauncher {
+                store: faulted.clone(),
+                launches: Arc::clone(&launches),
+            };
+            assert!(
+                JobService::new(&faulted, &first)
+                    .submit_turn(request.clone())
+                    .is_err(),
+                "{point:?}"
+            );
+            assert!(!marker.exists(), "{point:?} executed before recovery");
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            drop(first);
+            drop(faulted);
+            let reopened = HostStore::open(&root).unwrap();
+            let retry = MatrixInlineLauncher {
+                store: reopened.clone(),
+                launches: Arc::clone(&launches),
+            };
+            let response = match JobService::new(&reopened, &retry).submit_turn(request.clone()) {
+                Ok(response) => response,
+                Err(error) => {
+                    recovery_errors.push(format!("{point:?}: {error}"));
+                    continue;
+                }
+            };
+            assert_eq!(
+                response.submit().status().state(),
+                JobState::Succeeded,
+                "{point:?}"
+            );
+            assert_eq!(fs::read(&marker).unwrap(), b"x", "{point:?}");
+            assert!(reopened.job_index(lease.job_id()).unwrap().is_file());
+            assert_eq!(
+                LeaseService::new(&reopened).load().unwrap(),
+                None,
+                "{point:?}"
+            );
+            let repeated = JobService::new(&reopened, &retry)
+                .submit_turn(request)
+                .unwrap();
+            assert!(matches!(repeated.submit(), SubmitResponse::Existing { .. }));
+            assert_eq!(repeated.submit().status(), response.submit().status());
+            assert_eq!(launches.load(Ordering::SeqCst), 1, "{point:?}");
+            assert_eq!(
+                fs::read(&marker).unwrap(),
+                b"x",
+                "{point:?} duplicated execution"
+            );
+        }
+        assert!(
+            recovery_errors.is_empty(),
+            "task crash frontiers were not repairable: {recovery_errors:#?}"
+        );
     }
 }
