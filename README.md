@@ -79,13 +79,13 @@ Prefer to ask your laptop's coding agent? [Install the two pool skills](docs/get
 
 > Send this task to the pool: create SETUP_CHECK.md containing mac-worker works. Wait for the result and show me the branch.
 
-By default the laptop manages the queue. Enable a [remote controller](docs/usage.md#remote-controller) to keep the queue and runners on an always-on Mac.
+By default the laptop manages the queue. Enable a [remote controller](docs/usage.md#remote-controller) to keep the queue and runners on an always-on Mac. With a controller, `worker notify --follow` posts a laptop notification when a task finishes or needs input, and `worker events -f` tails the controller's lifecycle events.
 
 ## Documentation
 
 - [Detailed guide](docs/getting-started.md) — installation, laptop skills, workflow and architecture.
 - [Worker setup](docs/setup-macos-worker.md) — SSH, agent logins and project dependencies.
-- [Usage reference](docs/usage.md) — follow-ups, parallel tasks, dependencies, settings and known limitations.
+- [Usage reference](docs/usage.md) — follow-ups, parallel tasks, dependencies, settings, notifications and known limitations.
 - [Updating and removal](docs/getting-started.md#update-or-remove) — backups, helper updates and dashboard restart.
 - [Development and releases](docs/releasing.md) · [Dashboard development](ui/README.md).
 
