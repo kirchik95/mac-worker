@@ -1,5 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::git_transport::delivery_pin_ref;
+#[cfg(any(test, feature = "test-support"))]
+use std::{collections::HashMap, sync::Mutex};
+
 use std::{
-    collections::HashMap,
     ffi::OsString,
     fs::{self, File},
     io,
@@ -9,10 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,7 +25,7 @@ use crate::{
         BinaryIdentity, BinaryIdentitySource, SystemBinaryIdentitySource, binary_is_outdated,
     },
     error::WorkerError,
-    git_transport::{GitTransport, delivery_pin_ref},
+    git_transport::GitTransport,
     host_store::{HostStore, HostStoreWritePoint},
     job::ProcessIdentity,
     process::ProcessRunner,
@@ -53,16 +54,20 @@ const WATCH_STOP_WAIT_MILLIS: u64 = 100;
 const WATCH_STOP_POLL_MILLIS: u64 = 50;
 
 static WATCH_STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, feature = "test-support"))]
 static ROOT_COUNTERS: Mutex<Option<HashMap<PathBuf, (u64, u64)>>> = Mutex::new(None);
 
+#[cfg(any(test, feature = "test-support"))]
 fn bump_task_directory_scans(root: &Path) {
     bump_root_counter(root, true);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn bump_due_index_reads(root: &Path) {
     bump_root_counter(root, false);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn bump_root_counter(root: &Path, task_scans: bool) {
     let Ok(mut guard) = ROOT_COUNTERS.lock() else {
         return;
@@ -76,6 +81,7 @@ fn bump_root_counter(root: &Path, task_scans: bool) {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn task_directory_scans_for(root: &Path) -> u64 {
     ROOT_COUNTERS
         .lock()
@@ -88,6 +94,7 @@ pub fn task_directory_scans_for(root: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn due_index_reads_for(root: &Path) -> u64 {
     ROOT_COUNTERS
         .lock()
@@ -130,7 +137,7 @@ pub trait OutboxLauncher: Send + Sync {
     }
 }
 
-pub struct SystemOutboxLauncher;
+pub(crate) struct SystemOutboxLauncher;
 
 impl OutboxLauncher for SystemOutboxLauncher {
     fn ensure_watch(&self, host_root: &Path) -> Result<OutboxActivation, WorkerError> {
@@ -330,6 +337,7 @@ impl<'a> OriginOutbox<'a> {
         Ok(self.read_intent(project_id, task_id, turn_id)?.is_some())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn dto(
         &self,
         project_id: &str,
@@ -596,6 +604,7 @@ impl<'a> OriginOutbox<'a> {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn run_watch_with(
         &self,
         stop: &AtomicBool,
@@ -1014,6 +1023,7 @@ impl<'a> OriginOutbox<'a> {
     }
 
     fn list_due(&self, now_millis: u64) -> Result<Vec<DeliveryIntent>, WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         bump_due_index_reads(self.store.root());
         let mut due = Vec::new();
         for entry in self.load_due_entries()? {
@@ -1032,6 +1042,7 @@ impl<'a> OriginOutbox<'a> {
     }
 
     fn sleep_millis(&self, now_millis: u64, idle_millis: u64) -> Result<u64, WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         bump_due_index_reads(self.store.root());
         let mut next = None;
         for entry in self.load_due_entries()? {
@@ -1076,6 +1087,7 @@ impl<'a> OriginOutbox<'a> {
     }
 
     fn recover_due_index(&self) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         bump_task_directory_scans(self.store.root());
         let tasks = match self.store.open_directory("tasks", false) {
             Ok(tasks) => tasks,
@@ -1485,12 +1497,13 @@ impl DeliveryIntent {
 }
 
 impl OriginOutbox<'_> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delivery_refs(task_id: TaskId, turn_id: TurnId) -> String {
         delivery_pin_ref(task_id, turn_id)
     }
 }
 
-pub fn install_watch_stop_signals() -> Result<(), WorkerError> {
+pub(crate) fn install_watch_stop_signals() -> Result<(), WorkerError> {
     WATCH_STOP.store(false, Ordering::SeqCst);
     let handler = request_watch_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     for signal in [libc::SIGTERM, libc::SIGINT] {

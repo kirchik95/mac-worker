@@ -33,6 +33,7 @@ const DIRECTORY_OPEN_FLAGS: libc::c_int =
 const ROOTED_FS_NAMESPACE: &str = ".mac-worker-rooted-fs";
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub trait SnapshotHook: Send + Sync {
     fn after_materialization(&self, tree: &Path) -> io::Result<()>;
 
@@ -47,19 +48,23 @@ pub trait SnapshotHook: Send + Sync {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct NoopSnapshotHook;
 
+#[cfg(any(test, feature = "test-support"))]
 impl SnapshotHook for NoopSnapshotHook {
     fn after_materialization(&self, _tree: &Path) -> io::Result<()> {
         Ok(())
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static NOOP_SNAPSHOT_HOOK: NoopSnapshotHook = NoopSnapshotHook;
 
 pub struct SnapshotBuilder<'a> {
     selector: InputSelector<'a>,
     cache_root: &'a Path,
+    #[cfg(any(test, feature = "test-support"))]
     hook: &'a dyn SnapshotHook,
 }
 
@@ -73,6 +78,7 @@ pub struct Snapshot {
     pub total_bytes: u64,
     included_untracked_count: usize,
     warning_count: usize,
+    #[cfg(any(test, feature = "test-support"))]
     publication_root: PathBuf,
     owned_capture: RootedDir,
 }
@@ -103,6 +109,7 @@ pub struct SnapshotSummary {
 }
 
 impl Snapshot {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publication_root(&self) -> &Path {
         &self.publication_root
     }
@@ -119,10 +126,13 @@ impl Snapshot {
     }
 
     pub fn cleanup(&self) -> Result<(), WorkerError> {
-        self.cleanup_with_hook(&|| Ok(()))
+        self.owned_capture
+            .remove_owned_tree_with_cleanup_hook(&|| Ok(()))
+            .map_err(WorkerError::Io)
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cleanup_with_hook(
         &self,
         after_durable_delete: &dyn Fn() -> io::Result<()>,
@@ -135,10 +145,16 @@ impl Snapshot {
 
 impl<'a> SnapshotBuilder<'a> {
     pub fn new(runner: &'a dyn ProcessRunner, cache_root: &'a Path) -> Self {
-        Self::with_hook(runner, cache_root, &NOOP_SNAPSHOT_HOOK)
+        Self {
+            selector: InputSelector::new(runner),
+            cache_root,
+            #[cfg(any(test, feature = "test-support"))]
+            hook: &NOOP_SNAPSHOT_HOOK,
+        }
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_hook(
         runner: &'a dyn ProcessRunner,
         cache_root: &'a Path,
@@ -166,7 +182,10 @@ impl<'a> SnapshotBuilder<'a> {
         recover_pending_snapshot_parent(&staging, is_canonical_partial_name)?;
         recover_pending_snapshot_parent(&ready, is_canonical_ready_uuid)?;
 
+        #[cfg(any(test, feature = "test-support"))]
         let cleanup_hook = || self.hook.after_owned_cleanup_commit();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let cleanup_hook = || Ok(());
         let (capture_id, partial_path, mut partial, partial_identity) =
             create_unique_partial(&staging, &cleanup_hook)?;
         let tree_path = partial_path.join("tree");
@@ -225,6 +244,7 @@ impl<'a> SnapshotBuilder<'a> {
             };
             return fail_with_owned_cleanup(&partial, &cleanup_hook, primary);
         }
+        #[cfg(any(test, feature = "test-support"))]
         if let Err(error) = self.hook.after_publication(&ready_capture) {
             return fail_with_owned_cleanup(&partial, &cleanup_hook, WorkerError::Io(error));
         }
@@ -246,6 +266,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .filter(|entry| entry.origin != InputOrigin::Tracked)
                 .count(),
             warning_count: initial.warnings.len(),
+            #[cfg(any(test, feature = "test-support"))]
             publication_root: ready_capture,
             owned_capture: partial,
         })
@@ -282,6 +303,7 @@ impl<'a> SnapshotBuilder<'a> {
                 .expect("a staging tree always has its partial parent"),
         )?;
 
+        #[cfg(any(test, feature = "test-support"))]
         self.hook
             .after_materialization(tree_path)
             .map_err(WorkerError::Io)?;

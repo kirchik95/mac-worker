@@ -1,3 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    job::{SubmitRequest, SubmitResponse},
+    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+};
+
 use std::{
     collections::HashMap,
     fmt,
@@ -21,10 +27,8 @@ use crate::{
         LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
         LogStream, MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint,
         ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse, SubmitRequest,
-        SubmitResponse,
+        StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     process::{ProcessPolicy, ProcessRunner},
     task::TaskId,
     task_store::{
@@ -36,7 +40,8 @@ use crate::{
     turn::{TaskTurnRequest, TaskTurnResponse},
 };
 
-pub use crate::host_store::TransferGuard;
+#[cfg(test)]
+use crate::host_store::TransferGuard;
 
 const MAX_CONTROL_STDOUT_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_STDERR_BYTES: usize = 64 * 1024;
@@ -123,7 +128,7 @@ pub trait ResolutionRuntime: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemResolutionRuntime;
+pub(crate) struct SystemResolutionRuntime;
 
 static RESOLUTION_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static SYSTEM_RESOLUTION_RUNTIME: SystemResolutionRuntime = SystemResolutionRuntime;
@@ -244,10 +249,12 @@ impl PreacceptanceResolution {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn disposition(&self) -> &PreacceptanceDisposition {
         &self.disposition
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn abandonment_receipt(&self) -> Option<&PreacceptanceAbandonmentReceipt> {
         self.abandonment_receipt.as_ref()
     }
@@ -256,6 +263,7 @@ impl PreacceptanceResolution {
         self.disposition
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_abandonment_receipt(self) -> Option<PreacceptanceAbandonmentReceipt> {
         self.abandonment_receipt
     }
@@ -323,16 +331,20 @@ impl fmt::Debug for TransferIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum AbandonTransferResult {
     Abandoned,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub struct HostTransferService<'a> {
     store: &'a HostStore,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct TransferResolutionLauncher;
 
+#[cfg(any(test, feature = "test-support"))]
 impl SupervisorLauncher for TransferResolutionLauncher {
     fn launch(
         &self,
@@ -346,6 +358,7 @@ impl SupervisorLauncher for TransferResolutionLauncher {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<'a> HostTransferService<'a> {
     pub fn new(store: &'a HostStore) -> Self {
         Self { store }
@@ -775,6 +788,7 @@ impl<'a> RemoteJobClient<'a> {
         Ok(None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn status_and_logs(
         &self,
         worker: &WorkerEntry,
@@ -838,6 +852,7 @@ impl<'a> RemoteJobClient<'a> {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn status_and_logs_sequential(
         &self,
         worker: &WorkerEntry,
@@ -954,6 +969,7 @@ impl<'a> RemoteJobClient<'a> {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resolve_submission(
         &self,
         worker: &WorkerEntry,

@@ -106,6 +106,7 @@ impl<R: ProcessRunner> WorkersService<R> {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_clock(transport: SshTransport<R>, clock: Arc<dyn ProbeClock>) -> Self {
         Self { transport, clock }
     }
@@ -143,6 +144,7 @@ impl<R: ProcessRunner> WorkersService<R> {
         self.inspect_budgeted(config, &[], budget, false)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inspect_with_requirements_and_budget(
         &self,
         config: &Config,

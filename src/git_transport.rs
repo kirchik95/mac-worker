@@ -53,7 +53,7 @@ const ORIGIN_CONFIG_DEADLINE: Duration = Duration::from_secs(5);
 /// `PUBLISH_FAILED`. Stderr is classified, never stored.
 pub const ORIGIN_AUTH_FAILED: &str = "ORIGIN_AUTH_FAILED";
 
-pub const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
+pub(crate) const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushReceipt {
@@ -61,6 +61,7 @@ pub struct PushReceipt {
 }
 
 impl PushReceipt {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn objects_written(&self) -> u64 {
         self.objects_written
     }
@@ -575,7 +576,7 @@ impl<'a> GitTransport<'a> {
     }
 }
 
-pub fn delivery_pin_ref(task_id: TaskId, turn_id: crate::task::TurnId) -> String {
+pub(crate) fn delivery_pin_ref(task_id: TaskId, turn_id: crate::task::TurnId) -> String {
     format!("refs/mac-worker/delivery/{task_id}/{turn_id}")
 }
 
@@ -660,7 +661,7 @@ pub trait GitServerExecutor: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SystemGitServerExecutor;
+pub(crate) struct SystemGitServerExecutor;
 
 impl GitServerExecutor for SystemGitServerExecutor {
     fn exec(

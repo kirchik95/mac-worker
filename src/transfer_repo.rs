@@ -5,16 +5,15 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::OpenOptionsExt,
-        process::ExitStatusExt,
-    },
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
     time::Duration,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use std::os::unix::ffi::OsStringExt;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -91,6 +90,7 @@ impl BaseCommit {
         &self.oid
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn kind(&self) -> BaseKind {
         self.kind
     }
@@ -103,6 +103,7 @@ impl BaseCommit {
         self.branch.as_deref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn dirty(&self) -> &DirtyReport {
         &self.dirty
     }
@@ -859,6 +860,7 @@ impl TransferRepo {
     /// Object visibility through the transfer repository, including live
     /// alternates. This is not owned-graph proof; use [`Self::pin_object`]
     /// or [`Self::pin_frozen_source`] before treating a pin as durable.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_object(&self, oid: &BaseOid) -> bool {
         self.has_object_with_runner(&SystemProcessRunner, oid)
             .unwrap_or(false)
@@ -1625,6 +1627,7 @@ impl TransferRepo {
         self.update_ref(runner, &name, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn import_result(
         &self,
         runner: &dyn ProcessRunner,
@@ -1812,6 +1815,7 @@ impl TransferRepo {
         Ok(ImportReceipt { head, local_ref })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn tree_of(&self, oid: &BaseOid) -> CapturedTree {
         let listing = run_system_git(
             Some(&self.path),
@@ -1851,6 +1855,7 @@ impl TransferRepo {
         CapturedTree { entries }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn parent_of(&self, oid: &BaseOid) -> BaseOid {
         let output = run_system_git(
             Some(&self.path),
@@ -1865,6 +1870,7 @@ impl TransferRepo {
         parse_oid(&output).expect("parent oid")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_ref(&self, name: &str) -> bool {
         self.has_ref_with_runner(&SystemProcessRunner, name)
             .unwrap_or(false)
@@ -2243,16 +2249,19 @@ impl TransferRepo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct CapturedTree {
     entries: BTreeMap<String, CapturedEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 struct CapturedEntry {
     mode: String,
     bytes: Vec<u8>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CapturedTree {
     pub fn contains(&self, path: &str) -> bool {
         self.entries.contains_key(path)
@@ -2277,6 +2286,7 @@ impl CapturedTree {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct RepositoryFingerprint {
     head: Vec<u8>,
     index: Vec<u8>,
@@ -2288,6 +2298,7 @@ pub struct RepositoryFingerprint {
     objects: BTreeSet<String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl RepositoryFingerprint {
     pub fn capture(worktree: &Path) -> Result<Self, WorkerError> {
         let git_dir = PathBuf::from(OsString::from_vec(parse_scalar(
@@ -2759,6 +2770,7 @@ pub(crate) fn retry_result_ref_update(
     ))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn run_system_git(
     git_dir: Option<&Path>,
     args: &[OsString],
@@ -2880,6 +2892,7 @@ fn parse_tree_id(result: &ProcessResult) -> Result<String, WorkerError> {
     parse_hex_oid(result)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn parse_scalar(output: &[u8]) -> Result<Vec<u8>, WorkerError> {
     let scalar = output.strip_suffix(b"\n").unwrap_or(output);
     if scalar.contains(&b'\r') || scalar.contains(&b'\n') || scalar.contains(&b'\0') {
@@ -2894,6 +2907,7 @@ fn nul_records(output: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|record| !record.is_empty())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn list_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, WorkerError> {
     let mut files = BTreeMap::new();
     if !root.exists() {
@@ -2903,6 +2917,7 @@ fn list_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, WorkerError> {
     Ok(files)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn collect_files(
     root: &Path,
     current: &Path,
@@ -2925,6 +2940,7 @@ fn collect_files(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn list_names(root: &Path) -> Result<BTreeSet<String>, WorkerError> {
     let mut names = BTreeSet::new();
     if !root.exists() {
@@ -2934,6 +2950,7 @@ fn list_names(root: &Path) -> Result<BTreeSet<String>, WorkerError> {
     Ok(names)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn collect_names(
     root: &Path,
     current: &Path,

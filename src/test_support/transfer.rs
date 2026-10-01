@@ -1,13 +1,13 @@
 //! Explicit integration-test access for transfer contracts.
 
 pub use crate::transfer::{
-    HostOperation, HostTransferService, OptionalHostResponse, PreacceptanceAbandonmentReceipt,
-    RemoteJobClient, ResolutionRuntime, SshJsonTransport, TransferIdentity,
-    controller_host_request,
+    AbandonTransferResult, HostOperation, HostTransferService, OptionalHostResponse,
+    PreacceptanceAbandonmentReceipt, PreacceptanceResolution, RemoteJobClient, ResolutionRuntime,
+    SshJsonTransport, TransferIdentity, controller_host_request,
 };
 pub mod git {
     pub use crate::git_transport::{
-        GitServerExecutor, GitTransport, HostGitService, OBJECT_STORE_SYNC_RECEIPT,
+        FetchReceipt, GitServerExecutor, GitTransport, HostGitService, OBJECT_STORE_SYNC_RECEIPT,
         ORIGIN_AUTH_FAILED, PushReceipt, ReceivePackComponents, UploadPackComponents,
     };
 }
@@ -20,7 +20,8 @@ pub mod outbox {
 }
 pub mod repo {
     pub use crate::transfer_repo::{
-        BaseKind, RepositoryFingerprint, TransferGc, TransferRepo, repo_id_for,
+        BaseCommit, BaseKind, CapturedTree, DirtyReport, ImportReceipt, RepositoryFingerprint,
+        ResultImport, TransferGc, TransferRepo, repo_id_for,
     };
 }
 pub mod snapshot {
