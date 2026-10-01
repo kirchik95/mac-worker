@@ -58,7 +58,7 @@ fn probe_features_preserve_old_unknown_and_new_authoritative_lists() {
     for features in [
         None,
         Some(json!([])),
-        Some(json!(["host.status-logs", "future.feature"])),
+        Some(json!(["host.future-feature", "future.feature"])),
     ] {
         let mut value = probe_json();
         if let Some(features) = &features {

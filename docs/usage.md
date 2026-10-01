@@ -782,7 +782,7 @@ With an enabled controller, the leader keeps a small journal of lifecycle hints:
 
 Treat the journal as hints, not a log of record. Task, queue, run, DAG, admission, and drain records stay authoritative. A consumer reconciles a hint against saved state, so a missed or dropped hint cannot produce a wrong decision. It only delays confirmation until the next repair sweep re-reads that state. Sequence numbers order publication inside one journal. Timestamps are diagnostic. The journal is bounded and retires the oldest data (see [Controller events limits and failure states](#controller-events-limits-and-failure-states)); it is not an audit trail.
 
-Protocol stays 7. An integrated helper advertises `controller.events` beside `controller.task-logs-wait`. `worker controller status` prints `features: controller.events, controller.task-logs-wait`, or `features: unknown` when the peer sends no list. Host features stay `host.outbox-retry` and `host.status-logs`.
+Protocol stays 7. An integrated helper advertises `controller.events` beside `controller.task-logs-wait`. `worker controller status` prints `features: controller.events, controller.task-logs-wait`, or `features: unknown` when the peer sends no list. Optional-command probing replaces the former advertised host features for outbox retry and status/logs.
 
 `worker task wait` is unchanged. It still polls `task.wait.poll` about every 100 ms. A wait never sends a `controller_events` selector, and events never make it return earlier or later. Exit codes, including `WAIT_BLOCKED` (70), stay as in [Task lifecycle](#task-lifecycle).
 

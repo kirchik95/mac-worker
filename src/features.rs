@@ -4,7 +4,7 @@
 //! request field gets a feature string; clients must check for it before use.
 //! A missing feature list means an older peer whose features are unknown.
 
-pub const HOST_FEATURES: &[&str] = &["host.outbox-retry", "host.status-logs"];
+pub const HOST_FEATURES: &[&str] = &[];
 pub const CONTROLLER_FEATURES: &[&str] = &["controller.events", "controller.task-logs-wait"];
 /// Added only after an existing-only live generation/hello proof.
 pub const CONTROLLER_SOCKET: &str = "controller.socket";
@@ -15,7 +15,7 @@ mod tests {
 
     #[test]
     fn registries_are_sorted_unique_and_contain_the_supported_features() {
-        assert_eq!(HOST_FEATURES, ["host.outbox-retry", "host.status-logs"]);
+        assert!(HOST_FEATURES.is_empty());
         assert_eq!(
             CONTROLLER_FEATURES,
             ["controller.events", "controller.task-logs-wait"]

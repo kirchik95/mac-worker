@@ -1347,7 +1347,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(&response).unwrap()["features"],
-            serde_json::json!(["host.outbox-retry", "host.status-logs"])
+            serde_json::json!([])
         );
 
         assert_eq!(
