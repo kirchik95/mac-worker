@@ -279,17 +279,6 @@ pub struct ClientStateStore {
     admission_clock: Option<Arc<AdmissionClock>>,
 }
 
-pub(crate) enum ConditionalStatusUpdate {
-    Applied(LocalJobRecord),
-    Conflict(LocalJobRecord),
-}
-
-pub(crate) enum ObservationRelation {
-    RemoteAdvances,
-    CurrentAtLeastRemote,
-    Conflict,
-}
-
 /// Outcome of a spawn-slot reservation. Only [`Self::Acquired`] may spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerSlotDecision {
@@ -322,18 +311,6 @@ impl QueueRowWithBlockingReason {
     pub fn blocking_reason(&self) -> Option<&QueueBlockingReason> {
         self.blocking_reason.as_ref()
     }
-}
-
-/// Durable observation of the row that a public cancellation previously
-/// marked while it was dispatching. This is intentionally queue-lock scoped:
-/// callers must release the lock before resolving a host or waiting for an
-/// owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DispatchCancellationObservation {
-    NotRequested,
-    Requested,
-    WaitingCancelled,
-    Gone,
 }
 
 struct ClientStateInner {
@@ -1995,84 +1972,6 @@ impl ClientStateStore {
         })
     }
 
-    pub(crate) fn observe_dispatch_cancellation(
-        &self,
-        job_id: JobId,
-        dispatch_owner: ProcessIdentity,
-    ) -> Result<DispatchCancellationObservation, WorkerError> {
-        dispatch_owner.validate()?;
-        self.update_queue(|snapshot| {
-            let Some(entry) = snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.job_id() == job_id)
-            else {
-                return Ok((DispatchCancellationObservation::Gone, false));
-            };
-            let observation = match entry.state() {
-                QueueState::Dispatching {
-                    dispatch_owner: current,
-                    ..
-                } if *current == dispatch_owner && entry.is_cancel_requested() => {
-                    DispatchCancellationObservation::Requested
-                }
-                QueueState::Dispatching {
-                    dispatch_owner: current,
-                    ..
-                } if *current == dispatch_owner => DispatchCancellationObservation::NotRequested,
-                QueueState::Waiting { .. } if entry.is_cancel_requested() => {
-                    DispatchCancellationObservation::WaitingCancelled
-                }
-                QueueState::Dispatching { .. } => {
-                    return Err(queue_error(
-                        "QUEUE_OWNER_MISMATCH",
-                        "queue dispatch owner does not match",
-                    ));
-                }
-                QueueState::Waiting { .. } => DispatchCancellationObservation::NotRequested,
-                QueueState::Parked => DispatchCancellationObservation::NotRequested,
-            };
-            Ok((observation, false))
-        })
-    }
-
-    /// Retires a cancellation-requested dispatch before a local immutable job
-    /// record exists. At that point Task 3/4 ordering proves no remote
-    /// boundary has been reached, so this is the only safe no-SSH claim-race
-    /// retirement path.
-    pub(crate) fn remove_cancelled_dispatch_before_local_record(
-        &self,
-        job_id: JobId,
-        dispatch_owner: ProcessIdentity,
-    ) -> Result<Option<QueueEntry>, WorkerError> {
-        dispatch_owner.validate()?;
-        self.update_queue(|snapshot| {
-            let Some(index) = snapshot
-                .entries
-                .iter()
-                .position(|entry| entry.job_id() == job_id)
-            else {
-                return Ok((None, false));
-            };
-            let entry = &snapshot.entries[index];
-            if !matches!(
-                entry.state(),
-                QueueState::Dispatching { dispatch_owner: current, .. } if *current == dispatch_owner
-            ) || !entry.is_cancel_requested()
-            {
-                return Err(queue_error(
-                    "QUEUE_CANCEL_CONFLICT",
-                    "dispatch row is not the exact cancellation-requested owner",
-                ));
-            }
-            let name = job_file_name(job_id)?;
-            if read_job_optional(self.inner.jobs.as_raw_fd(), &name)?.is_some() {
-                return Ok((None, false));
-            }
-            Ok((Some(snapshot.entries.remove(index)), true))
-        })
-    }
-
     pub fn remove_after_terminal(
         &self,
         job_id: JobId,
@@ -2960,44 +2859,6 @@ impl ClientStateStore {
         })
     }
 
-    pub(crate) fn reconcile_authoritative_status(
-        &self,
-        expected: &LocalJobRecord,
-        status: JobStatus,
-    ) -> Result<ConditionalStatusUpdate, WorkerError> {
-        expected.validate()?;
-        self.require_local_client(expected)?;
-        status.validate()?;
-        let job_id = expected.meta().job_id();
-        let mut conflicted = false;
-        let current = self.update_locked(job_id, |existing| {
-            require_same_immutable(existing, expected)?;
-            let selected = match authoritative_observation_relation(existing, &status) {
-                ObservationRelation::CurrentAtLeastRemote => existing
-                    .last_status()
-                    .expect("a current-at-least-remote relation requires an observation")
-                    .clone(),
-                ObservationRelation::RemoteAdvances => status.clone(),
-                ObservationRelation::Conflict => {
-                    conflicted = true;
-                    return Ok(None);
-                }
-            };
-            LocalJobRecord::new(
-                existing.meta().clone(),
-                existing.lease_token(),
-                Some(selected),
-                RemoteUncertainty::None,
-            )
-            .map(Some)
-        })?;
-        Ok(if conflicted {
-            ConditionalStatusUpdate::Conflict(current)
-        } else {
-            ConditionalStatusUpdate::Applied(current)
-        })
-    }
-
     pub fn set_remote_uncertainty(
         &self,
         job_id: JobId,
@@ -3005,27 +2866,6 @@ impl ClientStateStore {
     ) -> Result<LocalJobRecord, WorkerError> {
         uncertainty.validate()?;
         self.update_locked(job_id, move |existing| {
-            LocalJobRecord::new(
-                existing.meta().clone(),
-                existing.lease_token(),
-                existing.last_status().cloned(),
-                uncertainty,
-            )
-            .map(Some)
-        })
-    }
-
-    pub(crate) fn set_remote_uncertainty_if_same_immutable(
-        &self,
-        expected: &LocalJobRecord,
-        uncertainty: RemoteUncertainty,
-    ) -> Result<LocalJobRecord, WorkerError> {
-        expected.validate()?;
-        self.require_local_client(expected)?;
-        uncertainty.validate()?;
-        let job_id = expected.meta().job_id();
-        self.update_locked(job_id, move |existing| {
-            require_same_immutable(existing, expected)?;
             LocalJobRecord::new(
                 existing.meta().clone(),
                 existing.lease_token(),
@@ -6029,41 +5869,6 @@ fn require_forward_observation(
             )
         }
     }
-}
-
-pub(crate) fn authoritative_observation_relation(
-    current: &LocalJobRecord,
-    remote: &JobStatus,
-) -> ObservationRelation {
-    let Some(current) = current.last_status() else {
-        return ObservationRelation::RemoteAdvances;
-    };
-    if current == remote || status_is_valid_forward(remote, current) {
-        ObservationRelation::CurrentAtLeastRemote
-    } else if status_is_valid_forward(current, remote) {
-        ObservationRelation::RemoteAdvances
-    } else {
-        ObservationRelation::Conflict
-    }
-}
-
-fn status_is_valid_forward(previous: &JobStatus, next: &JobStatus) -> bool {
-    require_forward_observation(Some(previous), Some(next)).is_ok()
-        || accepted_enrichment_is_transitively_forward(previous, next)
-}
-
-fn accepted_enrichment_is_transitively_forward(previous: &JobStatus, observed: &JobStatus) -> bool {
-    let Some(supervisor) = observed.supervisor_identity() else {
-        return false;
-    };
-    if observed.child_identity().is_none() {
-        return false;
-    }
-    let Ok(intermediate) = previous.with_supervisor(supervisor, observed.updated_at_millis())
-    else {
-        return false;
-    };
-    intermediate.transition(observed.clone()).is_ok()
 }
 
 fn require_sticky_observed_identity<T: Copy + PartialEq>(

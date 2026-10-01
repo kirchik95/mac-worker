@@ -120,7 +120,6 @@ pub mod redaction;
 pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
-pub mod run;
 pub(crate) mod runner_log;
 pub mod scheduler;
 pub mod scheduler_adapter;

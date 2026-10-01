@@ -798,10 +798,6 @@ impl<'a> RemoteJobClient<'a> {
         }
     }
 
-    pub(crate) fn process_runner(&self) -> &'a dyn ProcessRunner {
-        self.transport.runner
-    }
-
     pub fn lease_acquire(
         &self,
         worker: &WorkerEntry,
