@@ -1,3 +1,18 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::{
+    job::{
+        CachedAdmissionObservation, QueueAbandonmentProof, QueueCancel, ResolveOrAbandonRequest,
+    },
+    task::TaskOutcome,
+    transfer::PreacceptanceAbandonmentReceipt,
+};
+
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::{
+    Condvar, LazyLock, Weak,
+    atomic::{AtomicU8, Ordering},
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
@@ -10,10 +25,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     str::FromStr,
-    sync::{
-        Arc, Condvar, LazyLock, Mutex, Weak,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,12 +33,17 @@ use uuid::Uuid;
 
 mod active_tasks;
 mod deadline;
-pub mod events;
+pub(crate) mod events;
 pub(crate) use deadline::WaitDeadline;
 mod runner_dispatch;
 mod task_context;
 
-pub use active_tasks::{ActiveTaskConfig, ActiveTaskSelection, task_record_needs_active_index};
+pub use active_tasks::ActiveTaskConfig;
+#[cfg(any(test, feature = "test-support"))]
+pub use active_tasks::{
+    ActiveTaskBootstrapReport, ActiveTaskRefreshReport, ActiveTaskSelection,
+    task_record_needs_active_index,
+};
 
 #[cfg(test)]
 mod tests;
@@ -41,10 +58,9 @@ use crate::{
     },
     error::WorkerError,
     job::{
-        AdmissionObservation, CachedAdmissionObservation, ClientId, JobId, JobState, JobStatus,
-        LocalJobRecord, ProcessIdentity, QueueAbandonmentProof, QueueCancel, QueueClaim,
-        QueueEntry, QueueEntryKind, QueueSnapshot, QueueState, RemoteUncertainty,
-        ReplacementFailureBudget, ResolveOrAbandonRequest, RunnerSlotReservation,
+        AdmissionObservation, ClientId, JobId, JobState, JobStatus, LocalJobRecord,
+        ProcessIdentity, QueueClaim, QueueEntry, QueueEntryKind, QueueSnapshot, QueueState,
+        RemoteUncertainty, ReplacementFailureBudget, RunnerSlotReservation,
     },
     rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
@@ -54,9 +70,8 @@ use crate::{
     supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     task::{
         BaseOid, BranchName, LocalTaskRecord, RunId, RunRecord, RunnerIdentity, RunnerState,
-        TaskId, TaskOutcome, TurnId, TurnSummary,
+        TaskId, TurnId, TurnSummary,
     },
-    transfer::PreacceptanceAbandonmentReceipt,
 };
 
 const DIRECTORY_FLAGS: libc::c_int =
@@ -103,6 +118,7 @@ impl Default for ClientStateTimings {
 
 impl ClientStateTimings {
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fast() -> Self {
         Self {
             runner_absence_confirmation: Duration::from_millis(50),
@@ -110,6 +126,7 @@ impl ClientStateTimings {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 type AdmissionClock = dyn Fn() -> Result<u64, WorkerError> + Send + Sync;
 
 /// `task list` shows `RUNNER_UNVERIFIABLE` only after this long without proof.
@@ -164,11 +181,13 @@ struct RunnerLivenessTracking {
     absence_first_seen: HashMap<(u32, u64), Instant>,
     /// First time this identity was `Unverifiable` in this process.
     unverifiable_since: HashMap<(u32, u64), Instant>,
+    #[cfg(any(test, feature = "test-support"))]
     clock_offset: Duration,
 }
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum ClientStateWritePoint {
     BeforePublish = 1,
     AfterPublish = 2,
@@ -215,6 +234,7 @@ pub enum ClientStateWritePoint {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum ClientStateCreationRacePoint {
     RootComponent = 1,
     OwnedDirectory = 2,
@@ -256,12 +276,14 @@ enum IdenticalTaskWrite {
 /// A deterministic test hook for scheduler persistence races. Implementors
 /// must not grant capacity or alter durable state.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub trait ClientStateConcurrencyHook: Send + Sync {
     fn reach(&self, point: ClientStateConcurrencyPoint);
 }
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ClientStateSyncCounts {
     pub parent_directories: u64,
     pub root: u64,
@@ -275,7 +297,9 @@ pub struct ClientStateStore {
     event_sink: Option<Arc<dyn crate::controller::events::EventSink>>,
     wait_deadline: WaitDeadline,
     timings: ClientStateTimings,
+    #[cfg(any(test, feature = "test-support"))]
     liveness_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(any(test, feature = "test-support"))]
     admission_clock: Option<Arc<AdmissionClock>>,
 }
 
@@ -325,32 +349,44 @@ struct ClientStateInner {
     client_id: ClientId,
     owner_inspector: Arc<dyn ProcessInspector>,
     liveness: Mutex<RunnerLivenessTracking>,
+    #[cfg(any(test, feature = "test-support"))]
     concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
+    #[cfg(any(test, feature = "test-support"))]
     write_fault: Arc<AtomicU8>,
+    #[cfg(any(test, feature = "test-support"))]
     task_rollback_update_failures: AtomicU8,
+    #[cfg(any(test, feature = "test-support"))]
     submission_rollback_cleanup_fault: AtomicU8,
+    #[cfg(any(test, feature = "test-support"))]
     task_replacement_after_exchange_failure: AtomicU8,
+    #[cfg(any(test, feature = "test-support"))]
     sync_counts: Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))]
     cleanup_pause: Mutex<Option<Arc<CleanupPauseState>>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct CleanupPauseState {
     state: Mutex<CleanupPauseFlags>,
     changed: Condvar,
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "test-support"))]
 struct CleanupPauseFlags {
     paused: bool,
     resumed: bool,
 }
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ClientStateCleanupPause {
     inner: Arc<CleanupPauseState>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ClientStateCleanupPause {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn wait_until_paused(&self) {
         let mut state = self
             .inner
@@ -371,6 +407,7 @@ impl ClientStateCleanupPause {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resume(&self) {
         let mut state = self
             .inner
@@ -382,12 +419,14 @@ impl ClientStateCleanupPause {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for ClientStateCleanupPause {
     fn drop(&mut self) {
         self.resume();
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn pause_cleanup(pause: Arc<CleanupPauseState>) {
     let mut state = pause.state.lock().expect("cleanup pause mutex poisoned");
     state.paused = true;
@@ -405,21 +444,26 @@ fn pause_cleanup(pause: Arc<CleanupPauseState>) {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct LockContentionState {
     root: FileIdentity,
     confirmed: Mutex<bool>,
     changed: Condvar,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static LOCK_CONTENTION_PROBES: LazyLock<Mutex<Vec<Weak<LockContentionState>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ClientStateLockContentionProbe {
     inner: Arc<LockContentionState>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ClientStateLockContentionProbe {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn wait_until_confirmed(&self) {
         assert!(
             self.confirmed_within(Duration::from_secs(5)),
@@ -427,6 +471,7 @@ impl ClientStateLockContentionProbe {
         );
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn confirmed_within(&self, timeout: Duration) -> bool {
         let mut confirmed = self
             .inner
@@ -446,6 +491,7 @@ impl ClientStateLockContentionProbe {
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "test-support"))]
 struct SyncCounters {
     parent_directories: std::sync::atomic::AtomicU64,
     root: std::sync::atomic::AtomicU64,
@@ -483,9 +529,12 @@ impl ClientStateStore {
         }
         let mut reopened = Self::open_inner(
             &self.inner.state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             self.inner.owner_inspector.clone(),
+            #[cfg(any(test, feature = "test-support"))]
             self.inner.concurrency_hook.clone(),
             deadline,
         )?;
@@ -498,8 +547,11 @@ impl ClientStateStore {
         }
         reopened.event_sink = self.event_sink.clone();
         reopened.timings = self.timings;
-        reopened.liveness_clock = self.liveness_clock.clone();
-        reopened.admission_clock = self.admission_clock.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            reopened.liveness_clock = self.liveness_clock.clone();
+            reopened.admission_clock = self.admission_clock.clone();
+        }
         Ok(reopened)
     }
 
@@ -581,6 +633,7 @@ impl ClientStateStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_timings(mut self, timings: ClientStateTimings) -> Self {
         self.timings = timings;
         self
@@ -588,6 +641,7 @@ impl ClientStateStore {
 
     /// Use a monotonic clock shared by all clones of this handle.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_liveness_clock(mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
         self.liveness_clock = Some(clock);
         self
@@ -595,6 +649,7 @@ impl ClientStateStore {
 
     /// Use the same clock for admission cache age and fresh probe timestamps.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_admission_clock(mut self, clock: Arc<AdmissionClock>) -> Self {
         self.admission_clock = Some(clock);
         self
@@ -604,16 +659,19 @@ impl ClientStateStore {
         &self,
         system_now: impl FnOnce() -> Result<u64, WorkerError>,
     ) -> Result<u64, WorkerError> {
-        match &self.admission_clock {
-            Some(clock) => clock(),
-            None => system_now(),
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(clock) = &self.admission_clock {
+            return clock();
         }
+        system_now()
     }
 
     fn liveness_now(&self) -> Instant {
-        self.liveness_clock
-            .as_ref()
-            .map_or_else(Instant::now, |clock| clock())
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(clock) = &self.liveness_clock {
+            return clock();
+        }
+        Instant::now()
     }
 
     pub(crate) fn runner_absence_confirmation(&self) -> Duration {
@@ -627,7 +685,9 @@ impl ClientStateStore {
             event_sink: self.event_sink.clone(),
             wait_deadline,
             timings: self.timings,
+            #[cfg(any(test, feature = "test-support"))]
             liveness_clock: self.liveness_clock.clone(),
+            #[cfg(any(test, feature = "test-support"))]
             admission_clock: self.admission_clock.clone(),
         }
     }
@@ -640,6 +700,7 @@ impl ClientStateStore {
         let hints = self.event_scope();
         let lock = StateLock::acquire(
             self.inner.root.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
             self.wait_deadline,
         )?;
@@ -654,6 +715,7 @@ impl ClientStateStore {
         let lock = QueueLock::acquire(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
             self.wait_deadline,
         )?;
@@ -666,45 +728,57 @@ impl ClientStateStore {
     pub fn open(state_root: &Path) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(SystemProcessInspector),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             WaitDeadline::default(),
         )
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_write_fault(
         state_root: &Path,
         point: ClientStateWritePoint,
     ) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             Some(point),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(SystemProcessInspector),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             WaitDeadline::default(),
         )
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_creation_race(
         state_root: &Path,
         point: ClientStateCreationRacePoint,
     ) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             Some(point),
             Arc::new(SystemProcessInspector),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             WaitDeadline::default(),
         )
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_owner_inspector<I>(
         state_root: &Path,
         inspector: I,
@@ -714,30 +788,38 @@ impl ClientStateStore {
     {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(inspector),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             WaitDeadline::default(),
         )
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_concurrency_hook(
         state_root: &Path,
         hook: Arc<dyn ClientStateConcurrencyHook>,
     ) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(SystemProcessInspector),
+            #[cfg(any(test, feature = "test-support"))]
             Some(hook),
             WaitDeadline::default(),
         )
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_owner_inspector_and_concurrency_hook<I>(
         state_root: &Path,
         inspector: I,
@@ -748,9 +830,12 @@ impl ClientStateStore {
     {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(inspector),
+            #[cfg(any(test, feature = "test-support"))]
             Some(hook),
             WaitDeadline::default(),
         )
@@ -762,9 +847,12 @@ impl ClientStateStore {
     ) -> Result<Self, WorkerError> {
         Self::open_inner(
             state_root,
+            #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
             None,
             Arc::new(SystemProcessInspector),
+            #[cfg(any(test, feature = "test-support"))]
             None,
             WaitDeadline::until(expires),
         )
@@ -772,119 +860,176 @@ impl ClientStateStore {
 
     fn open_inner(
         state_root: &Path,
-        initial_fault: Option<ClientStateWritePoint>,
-        initial_creation_race: Option<ClientStateCreationRacePoint>,
+        #[cfg(any(test, feature = "test-support"))] initial_fault: Option<ClientStateWritePoint>,
+        #[cfg(any(test, feature = "test-support"))] initial_creation_race: Option<
+            ClientStateCreationRacePoint,
+        >,
         owner_inspector: Arc<dyn ProcessInspector>,
-        concurrency_hook: Option<Arc<dyn ClientStateConcurrencyHook>>,
+        #[cfg(any(test, feature = "test-support"))] concurrency_hook: Option<
+            Arc<dyn ClientStateConcurrencyHook>,
+        >,
         wait_deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
         wait_deadline.remaining()?;
+        #[cfg(any(test, feature = "test-support"))]
         let write_fault = Arc::new(AtomicU8::new(initial_fault.map_or(0, |point| point as u8)));
+        #[cfg(any(test, feature = "test-support"))]
         let sync_counts = Arc::new(SyncCounters::default());
+        #[cfg(any(test, feature = "test-support"))]
         let creation_race = AtomicU8::new(initial_creation_race.map_or(0, |point| point as u8));
-        let root = open_or_create_root(state_root, &sync_counts, &creation_race)?;
+        let root = open_or_create_root(
+            state_root,
+            #[cfg(any(test, feature = "test-support"))]
+            &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            &creation_race,
+        )?;
         require_owned_directory(root.as_raw_fd())?;
         let jobs = open_or_create_owned_directory(
             root.as_raw_fd(),
             JOBS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let operations = open_or_create_owned_directory(
             root.as_raw_fd(),
             OPERATIONS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let queue = open_or_create_owned_directory(
             root.as_raw_fd(),
             QUEUE_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let affinity = open_or_create_owned_directory(
             root.as_raw_fd(),
             AFFINITY_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let affinity_projects = open_or_create_owned_directory(
             affinity.as_raw_fd(),
             AFFINITY_PROJECTS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let affinity_worktrees = open_or_create_owned_directory(
             affinity.as_raw_fd(),
             AFFINITY_WORKTREES_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let observations = open_or_create_owned_directory(
             root.as_raw_fd(),
             OBSERVATIONS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let tasks = open_or_create_owned_directory(
             root.as_raw_fd(),
             TASKS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let runs = open_or_create_owned_directory(
             root.as_raw_fd(),
             RUNS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let dags = open_or_create_owned_directory(
             root.as_raw_fd(),
             DAGS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let dag_pending = open_or_create_owned_directory(
             root.as_raw_fd(),
             DAG_PENDING_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let active_tasks = open_or_create_owned_directory(
             root.as_raw_fd(),
             ACTIVE_TASKS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let turns = open_or_create_owned_directory(
             root.as_raw_fd(),
             TURNS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let runners = open_or_create_owned_directory(
             root.as_raw_fd(),
             RUNNERS_NAME,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Root,
+            #[cfg(any(test, feature = "test-support"))]
             &creation_race,
         )?;
         let _lock = StateLock::acquire_inner(
             root.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             Some(&creation_race),
             wait_deadline,
             libc::LOCK_EX,
@@ -913,14 +1058,18 @@ impl ClientStateStore {
         let client_id = load_or_create_client_id(
             root.as_raw_fd(),
             operations.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &write_fault,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
         )?;
         open_or_create_queue_lock(queue.as_raw_fd())?;
         let queue_snapshot = load_or_create_queue_snapshot(
             queue.as_raw_fd(),
             operations.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &write_fault,
+            #[cfg(any(test, feature = "test-support"))]
             &sync_counts,
         )?;
         require_queue_client(&queue_snapshot, client_id)?;
@@ -935,7 +1084,9 @@ impl ClientStateStore {
             wait_deadline,
             event_sink: None,
             timings: ClientStateTimings::default(),
+            #[cfg(any(test, feature = "test-support"))]
             liveness_clock: None,
+            #[cfg(any(test, feature = "test-support"))]
             admission_clock: None,
             inner: Arc::new(ClientStateInner {
                 state_root: state_root.to_path_buf(),
@@ -949,12 +1100,19 @@ impl ClientStateStore {
                 client_id,
                 owner_inspector,
                 liveness: Mutex::new(RunnerLivenessTracking::default()),
+                #[cfg(any(test, feature = "test-support"))]
                 concurrency_hook,
+                #[cfg(any(test, feature = "test-support"))]
                 write_fault,
+                #[cfg(any(test, feature = "test-support"))]
                 task_rollback_update_failures: AtomicU8::new(0),
+                #[cfg(any(test, feature = "test-support"))]
                 submission_rollback_cleanup_fault: AtomicU8::new(0),
+                #[cfg(any(test, feature = "test-support"))]
                 task_replacement_after_exchange_failure: AtomicU8::new(0),
+                #[cfg(any(test, feature = "test-support"))]
                 sync_counts,
+                #[cfg(any(test, feature = "test-support"))]
                 cleanup_pause: Mutex::new(None),
             }),
         })
@@ -1111,6 +1269,7 @@ impl ClientStateStore {
             let reservation = RunnerSlotReservation::new(reserver, token)?;
             let entry = find_queue_entry_mut(snapshot, job_id)?;
             entry.set_slot_reservation(Some(reservation))?;
+            #[cfg(any(test, feature = "test-support"))]
             self.reach_concurrency_point(ClientStateConcurrencyPoint::RunnerSlotReservation);
             Ok((RunnerSlotDecision::Acquired { token }, true))
         })
@@ -1138,6 +1297,7 @@ impl ClientStateStore {
         let _lock = QueueLock::acquire_inner(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
             WaitDeadline::default(),
             libc::LOCK_EX | libc::LOCK_NB,
@@ -1300,6 +1460,7 @@ impl ClientStateStore {
         }
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
         publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         let record = self.load_task_locked(task_id)?;
@@ -1335,6 +1496,7 @@ impl ClientStateStore {
             .expect("completed spawn row remains"))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn live_runner_slot_count(&self) -> Result<usize, WorkerError> {
         let _lock = self.acquire_queue_lock()?;
         let snapshot = read_queue_snapshot(self.inner.queue.as_raw_fd())?.0;
@@ -1638,6 +1800,7 @@ impl ClientStateStore {
         let _lock = QueueLock::acquire_inner(
             self.inner.root.as_raw_fd(),
             self.inner.queue.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
             WaitDeadline::default(),
             libc::LOCK_EX | libc::LOCK_NB,
@@ -1681,6 +1844,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn claim_next(
         &self,
         owner: ProcessIdentity,
@@ -1690,6 +1854,7 @@ impl ClientStateStore {
         self.claim_next_matching(owner, ranked_workers, claimed_at_millis, None, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn claim_next_with_slot_ceilings(
         &self,
         owner: ProcessIdentity,
@@ -1708,6 +1873,7 @@ impl ClientStateStore {
 
     /// Keeps an attached or resumed task runner bound to its requested turn,
     /// even when another row still contains the same process identity.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn claim_task_turn(
         &self,
         owner: ProcessIdentity,
@@ -1768,6 +1934,7 @@ impl ClientStateStore {
         }
 
         self.update_queue(|snapshot| {
+            #[cfg(any(test, feature = "test-support"))]
             self.reach_concurrency_point(ClientStateConcurrencyPoint::ClaimRunCapEvaluation);
             let tasks = if snapshot.entries.iter().any(|entry| matches!(entry.state(), QueueState::Parked)) {
                 self.queued_task_records_locked(snapshot)?
@@ -1855,6 +2022,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_preacceptance_abandoned(
         &self,
         receipt: &PreacceptanceAbandonmentReceipt,
@@ -1936,6 +2104,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request_queue_cancel(
         &self,
         job_id: JobId,
@@ -1972,6 +2141,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_after_terminal(
         &self,
         job_id: JobId,
@@ -2008,6 +2178,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn recover_dead_dispatches(&self) -> Result<Vec<JobId>, WorkerError> {
         self.update_queue(|snapshot| {
             let mut recovered = Vec::new();
@@ -2067,6 +2238,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_queued(&self, job_id: JobId) -> Result<Option<QueueEntry>, WorkerError> {
         self.update_queue(|snapshot| {
             let Some(index) = snapshot
@@ -2093,6 +2265,7 @@ impl ClientStateStore {
         &self,
         turn_id: TurnId,
     ) -> Result<Option<QueueEntry>, WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTaskReport) {
             return Err(injected_failure(ClientStateWritePoint::BeforeTaskReport));
         }
@@ -2151,6 +2324,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_affinity(
         &self,
         project_id: &str,
@@ -2246,6 +2420,7 @@ impl ClientStateStore {
     /// when they still name `worker`. A successful fresh probe may establish
     /// that a worker is reachable but no longer eligible; that advisory fact
     /// must not keep steering later scheduling attempts to the worker.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_affinity_if_matches(
         &self,
         project_id: &str,
@@ -2298,6 +2473,7 @@ impl ClientStateStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn admission_observation<F>(
         &self,
         worker: &str,
@@ -2327,6 +2503,7 @@ impl ClientStateStore {
             open_or_create_refresh_marker(
                 self.inner.observations.as_raw_fd(),
                 worker,
+                #[cfg(any(test, feature = "test-support"))]
                 &self.inner.sync_counts,
             )?
         };
@@ -2378,6 +2555,7 @@ impl ClientStateStore {
     /// refreshed worker facts. The worker probe is authoritative for this
     /// write; an observation that is older than the current record cannot
     /// overwrite a newer concurrent refresh.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_admission_observation(
         &self,
         observation: AdmissionObservation,
@@ -2399,6 +2577,7 @@ impl ClientStateStore {
     /// Drops the cached admission row for `worker` after this laptop releases
     /// a lease it holds. Occupancy snapshots stay reusable within TTL until
     /// this call; a local release does not age the row on its own.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn invalidate_admission_observation(&self, worker: &str) -> Result<(), WorkerError> {
         validate_state_worker_name(worker)?;
         let _lock = self.acquire_state_lock()?;
@@ -2450,6 +2629,7 @@ impl ClientStateStore {
         }
         let bytes = canonical_json_bytes(&incoming, "admission observation")?;
         let _lock = self.acquire_state_lock()?;
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::ObservationRefreshPublication);
         let existing = read_observation_optional(self.inner.observations.as_raw_fd(), worker)?;
         if existing.as_ref() != expected {
@@ -2475,6 +2655,7 @@ impl ClientStateStore {
             open_or_create_refresh_marker(
                 self.inner.observations.as_raw_fd(),
                 worker,
+                #[cfg(any(test, feature = "test-support"))]
                 &self.inner.sync_counts,
             )?
         };
@@ -2506,6 +2687,7 @@ impl ClientStateStore {
         snapshot.validate()?;
         require_queue_client(&snapshot, self.inner.client_id)?;
         if changed {
+            #[cfg(any(test, feature = "test-support"))]
             self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
             publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
         }
@@ -2513,19 +2695,24 @@ impl ClientStateStore {
     }
 
     pub(crate) fn reach_concurrency_point(&self, point: ClientStateConcurrencyPoint) {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.inner.concurrency_hook {
             hook.reach(point);
         }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = point;
     }
 
     #[doc(hidden)]
     pub fn clear_submission_intent(&self, replacement: LocalTaskRecord) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::SubmissionIntentClear);
         let result = self.mutate_task_before_final_sync(
             replacement.meta().task_id(),
             replacement.status().turns().last().map(TurnSummary::turn_id),
             LocalTaskRecord::without_submission_intent,
             || {
+                #[cfg(any(test, feature = "test-support"))]
                 if self.take_fault(
                     ClientStateWritePoint::AfterSubmissionIntentClearPublicationBeforeFinalSync,
                 ) {
@@ -2541,6 +2728,7 @@ impl ClientStateStore {
             IdenticalTaskWrite::Replace,
         );
         if result.is_err() {
+            #[cfg(any(test, feature = "test-support"))]
             self.reach_concurrency_point(
                 ClientStateConcurrencyPoint::SubmissionIntentClearResultUncertain,
             );
@@ -2550,6 +2738,7 @@ impl ClientStateStore {
 
     #[doc(hidden)]
     pub fn submission_intent_reconciliation_after_transfer_lock(&self) {
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(
             ClientStateConcurrencyPoint::SubmissionIntentReconciliationAfterTransferLock,
         );
@@ -2557,12 +2746,14 @@ impl ClientStateStore {
 
     #[doc(hidden)]
     pub fn submission_intent_reconciliation_before_transfer_lock(&self) {
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(
             ClientStateConcurrencyPoint::SubmissionIntentReconciliationBeforeTransferLock,
         );
     }
 
     pub(crate) fn runner_log_contention(&self) {
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::RunnerLogContention);
     }
 
@@ -2741,12 +2932,15 @@ impl ClientStateStore {
         unlink_at(self.inner.jobs.as_raw_fd(), &name, 0).map_err(WorkerError::Io)?;
         sync_counted(
             self.inner.jobs.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Jobs,
         )?;
         Ok(Some(record))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_job(&self, record: LocalJobRecord) -> Result<(), WorkerError> {
         record.validate()?;
         self.require_local_client(&record)?;
@@ -2757,7 +2951,9 @@ impl ClientStateStore {
             self.require_local_client(&existing)?;
             sync_counted(
                 self.inner.jobs.as_raw_fd(),
+                #[cfg(any(test, feature = "test-support"))]
                 &self.inner.sync_counts,
+                #[cfg(any(test, feature = "test-support"))]
                 SyncKind::Jobs,
             )?;
             return require_same_immutable(&existing, &record);
@@ -2767,8 +2963,10 @@ impl ClientStateStore {
         let operation = OperationFile::stage(
             self.inner.operations.as_raw_fd(),
             &bytes,
+            #[cfg(any(test, feature = "test-support"))]
             Arc::clone(&self.inner.sync_counts),
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforePublish) {
             return Err(injected_failure(ClientStateWritePoint::BeforePublish));
         }
@@ -2776,16 +2974,25 @@ impl ClientStateStore {
         match operation.publish_no_replace(
             self.inner.jobs.as_raw_fd(),
             &name,
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.write_fault,
         ) {
             Ok(()) => {}
             Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-                operation.cleanup(&self.inner.write_fault, &[], self.take_cleanup_pause())?;
+                operation.cleanup(
+                    #[cfg(any(test, feature = "test-support"))]
+                    &self.inner.write_fault,
+                    &[],
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.take_cleanup_pause(),
+                )?;
                 let existing = read_job(self.inner.jobs.as_raw_fd(), &name)?;
                 self.require_local_client(&existing)?;
                 sync_counted(
                     self.inner.jobs.as_raw_fd(),
+                    #[cfg(any(test, feature = "test-support"))]
                     &self.inner.sync_counts,
+                    #[cfg(any(test, feature = "test-support"))]
                     SyncKind::Jobs,
                 )?;
                 return require_same_immutable(&existing, &record);
@@ -2793,15 +3000,24 @@ impl ClientStateStore {
             Err(error) => return Err(error),
         }
 
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterPublish) {
             return Err(injected_failure(ClientStateWritePoint::AfterPublish));
         }
         sync_counted(
             self.inner.jobs.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Jobs,
         )?;
-        operation.cleanup(&self.inner.write_fault, &[], self.take_cleanup_pause())?;
+        operation.cleanup(
+            #[cfg(any(test, feature = "test-support"))]
+            &self.inner.write_fault,
+            &[],
+            #[cfg(any(test, feature = "test-support"))]
+            self.take_cleanup_pause(),
+        )?;
         Ok(())
     }
 
@@ -2823,6 +3039,7 @@ impl ClientStateStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn update_job(&self, replacement: LocalJobRecord) -> Result<(), WorkerError> {
         replacement.validate()?;
         self.require_local_client(&replacement)?;
@@ -2859,6 +3076,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_remote_uncertainty(
         &self,
         job_id: JobId,
@@ -2876,6 +3094,7 @@ impl ClientStateStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn list_jobs(&self) -> Result<Vec<LocalJobRecord>, WorkerError> {
         let _lock = self.acquire_state_lock()?;
         let mut entries = directory_entries(self.inner.jobs.as_raw_fd())?;
@@ -2923,6 +3142,7 @@ impl ClientStateStore {
         }
         if self.should_keep_active_index_locked(&record)? {
             self.ensure_active_task_index_locked(task_id)?;
+            #[cfg(any(test, feature = "test-support"))]
             if self.take_fault(ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish) {
                 return Err(injected_failure(
                     ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish,
@@ -3019,6 +3239,7 @@ impl ClientStateStore {
         F: FnOnce(&LocalTaskRecord) -> Result<LocalTaskRecord, WorkerError>,
         S: FnOnce() -> io::Result<()>,
     {
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::BeforeTaskMutation);
         let _lock = self.acquire_state_lock()?;
         let current = self.load_task_locked(task_id)?;
@@ -3141,6 +3362,7 @@ impl ClientStateStore {
     where
         F: FnOnce() -> io::Result<()>,
     {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_task_rollback_update_failure()
             || self.take_fault(ClientStateWritePoint::BeforeTaskRollbackUpdate)
         {
@@ -3174,6 +3396,7 @@ impl ClientStateStore {
         let keep = self.should_keep_active_index_locked(&replacement)?;
         if keep {
             self.ensure_active_task_index_locked(task_id)?;
+            #[cfg(any(test, feature = "test-support"))]
             if self.take_fault(ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish) {
                 return Err(injected_failure(
                     ClientStateWritePoint::AfterActiveTaskIndexBeforeTaskPublish,
@@ -3186,12 +3409,14 @@ impl ClientStateStore {
                 &old,
                 &bytes,
                 || {
+                    #[cfg(any(test, feature = "test-support"))]
                     self.reach_concurrency_point(
                         ClientStateConcurrencyPoint::TaskReplacementPreExchange,
                     );
                     Ok(())
                 },
                 || {
+                    #[cfg(any(test, feature = "test-support"))]
                     if self.take_task_replacement_after_exchange_failure() {
                         return Err(io::Error::other(
                             injected_failure(
@@ -3207,6 +3432,7 @@ impl ClientStateStore {
             .map_err(WorkerError::Io)?;
         self.capture_task_change(&existing, &replacement);
         if !keep {
+            #[cfg(any(test, feature = "test-support"))]
             if self.take_fault(ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire) {
                 return Err(injected_failure(
                     ClientStateWritePoint::AfterQuiescentTaskBeforeIndexRetire,
@@ -3298,6 +3524,7 @@ impl ClientStateStore {
         self.recover_task_replacement_residue(&tasks, &names)?;
         let task_name = task_file_name(task_id)?;
         let removed = self.load_task_locked(task_id).ok();
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
@@ -3315,6 +3542,7 @@ impl ClientStateStore {
         };
         match tasks.remove_owned_regular_with_cleanup_hook(&task_name, &after_durable_delete) {
             Ok(()) => {
+                #[cfg(any(test, feature = "test-support"))]
                 if self.take_fault(ClientStateWritePoint::AfterTaskSubmissionRecordRemoval) {
                     return Err(injected_failure(
                         ClientStateWritePoint::AfterTaskSubmissionRecordRemoval,
@@ -3331,6 +3559,7 @@ impl ClientStateStore {
     /// remains available for recovery. Callers restore the queue row if this
     /// fails.
     pub fn remove_task_submission_turns(&self, task_id: TaskId) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval,
@@ -3345,6 +3574,7 @@ impl ClientStateStore {
                     events::task_hint(record),
                 ));
             }
+            #[cfg(any(test, feature = "test-support"))]
             if self.take_submission_rollback_cleanup_fault(
                 ClientStateWritePoint::AfterTaskSubmissionTurnsRetirement,
             ) {
@@ -3398,6 +3628,7 @@ impl ClientStateStore {
     /// Observes a durable process identity without changing local state.
     /// Reconciliation uses the store's inspector so injected inspectors and
     /// normal runner views share one process authority.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn process_observation(&self, identity: ProcessIdentity) -> ProcessObservation {
         self.inner.owner_inspector.observe(identity)
     }
@@ -3416,7 +3647,9 @@ impl ClientStateStore {
             .liveness
             .lock()
             .expect("liveness tracking mutex poisoned");
-        let now = self.liveness_now() + tracking.clock_offset;
+        let now = self.liveness_now();
+        #[cfg(any(test, feature = "test-support"))]
+        let now = now + tracking.clock_offset;
         let key = identity_key(identity);
         match observation {
             ProcessObservation::Matching { .. } => {
@@ -3467,7 +3700,9 @@ impl ClientStateStore {
         else {
             return false;
         };
-        let now = self.liveness_now() + tracking.clock_offset;
+        let now = self.liveness_now();
+        #[cfg(any(test, feature = "test-support"))]
+        let now = now + tracking.clock_offset;
         now.saturating_duration_since(first) < self.runner_absence_confirmation()
     }
 
@@ -3484,7 +3719,10 @@ impl ClientStateStore {
         else {
             return Duration::ZERO;
         };
-        (self.liveness_now() + tracking.clock_offset).saturating_duration_since(since)
+        let now = self.liveness_now();
+        #[cfg(any(test, feature = "test-support"))]
+        let now = now + tracking.clock_offset;
+        now.saturating_duration_since(since)
     }
 
     /// Treat a prior `Absent` as already older than the confirmation window.
@@ -3492,13 +3730,16 @@ impl ClientStateStore {
     /// still prove adoption, replacement, and finalization once absence is
     /// confirmed.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn note_confirmed_runner_absence(&self, identity: ProcessIdentity) {
         let mut tracking = self
             .inner
             .liveness
             .lock()
             .expect("liveness tracking mutex poisoned");
-        let now = self.liveness_now() + tracking.clock_offset;
+        let now = self.liveness_now();
+        #[cfg(any(test, feature = "test-support"))]
+        let now = now + tracking.clock_offset;
         let first = now
             .checked_sub(self.runner_absence_confirmation())
             .unwrap_or(now);
@@ -3511,6 +3752,7 @@ impl ClientStateStore {
     /// [`RUNNER_ABSENCE_CONFIRMATION`] and [`RUNNER_UNVERIFIABLE_AFTER`]
     /// without sleeping in tests.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn advance_liveness_clock(&self, duration: Duration) {
         self.inner
             .liveness
@@ -3588,6 +3830,7 @@ impl ClientStateStore {
         if !dag_run_is_quiescent(&dag) {
             self.register_pending_dag_locked(run_id)?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterDagPendingBeforeDag) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterDagPendingBeforeDag,
@@ -3610,6 +3853,7 @@ impl ClientStateStore {
             }
             Err(error) => return Err(WorkerError::Io(error)),
         }
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterDagPublishBeforeRun) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterDagPublishBeforeRun,
@@ -3786,11 +4030,13 @@ impl ClientStateStore {
                                     .take_claim(caller, now_millis);
                                 let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
                                 self.persist_dag_locked(&dags, run_id, &dag)?;
+                                #[cfg(any(test, feature = "test-support"))]
                                 if self.take_fault(ClientStateWritePoint::AfterDagClaim) {
                                     return Err(injected_failure(
                                         ClientStateWritePoint::AfterDagClaim,
                                     ));
                                 }
+                                #[cfg(any(test, feature = "test-support"))]
                                 self.reach_concurrency_point(ClientStateConcurrencyPoint::DagClaim);
                                 return Ok(Some(DagClaim { batch_id, node }));
                             }
@@ -3806,9 +4052,11 @@ impl ClientStateStore {
                             .take_claim(caller, now_millis);
                         let node = dag.nodes.get(&batch_id).expect("id from keys").clone();
                         self.persist_dag_locked(&dags, run_id, &dag)?;
+                        #[cfg(any(test, feature = "test-support"))]
                         if self.take_fault(ClientStateWritePoint::AfterDagClaim) {
                             return Err(injected_failure(ClientStateWritePoint::AfterDagClaim));
                         }
+                        #[cfg(any(test, feature = "test-support"))]
                         self.reach_concurrency_point(ClientStateConcurrencyPoint::DagClaim);
                         return Ok(Some(DagClaim { batch_id, node }));
                     }
@@ -3840,6 +4088,7 @@ impl ClientStateStore {
             return Err(invalid_state("DAG node task ID does not match submit"));
         }
         self.append_run_task_id_locked(run_id, task_id)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterDagRunMembership) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterDagRunMembership,
@@ -3904,6 +4153,7 @@ impl ClientStateStore {
         }
         dag.validate()?;
         self.persist_dag_locked(&dags, run_id, &dag)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterDagBind) {
             return Err(injected_failure(ClientStateWritePoint::AfterDagBind));
         }
@@ -3911,6 +4161,7 @@ impl ClientStateStore {
     }
 
     pub fn load_run(&self, run_id: RunId) -> Result<RunRecord, WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeRunLoad) {
             return Err(injected_failure(ClientStateWritePoint::BeforeRunLoad));
         }
@@ -4208,6 +4459,7 @@ impl ClientStateStore {
             replacement,
             || Ok(()),
             || {
+                #[cfg(any(test, feature = "test-support"))]
                 if self.take_fault(
                     ClientStateWritePoint::AfterRunReplacementExchangeBeforeFirstDirectorySync,
                 ) {
@@ -4232,6 +4484,7 @@ impl ClientStateStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reserve_run_publish_branch(
         &self,
         run_id: RunId,
@@ -4285,6 +4538,7 @@ impl ClientStateStore {
         task_id: TaskId,
         branch: &BranchName,
     ) -> Result<RunRecord, WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeRunPublishBranchRelease) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeRunPublishBranchRelease,
@@ -4385,7 +4639,9 @@ impl ClientStateStore {
             entry.park()?;
             Ok((entry.clone(), true))
         })?;
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::ParkedTaskTurnPublication);
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterParkedTaskTurnPublication) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterParkedTaskTurnPublication,
@@ -4456,6 +4712,7 @@ impl ClientStateStore {
     /// Overwrites the restart budget. Tests plant an aged timestamp so a later
     /// reconcile can start after backoff without sleeping; operator reconcile
     /// passes `None` to clear it.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_replacement_failure(
         &self,
         job_id: JobId,
@@ -4549,6 +4806,7 @@ impl ClientStateStore {
         turn_id: TurnId,
         prompt: &str,
     ) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTurnPromptWrite) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTurnPromptWrite,
@@ -4600,6 +4858,7 @@ impl ClientStateStore {
         turn_id: TurnId,
         binding: &str,
     ) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTurnPromptWrite) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeTurnPromptWrite,
@@ -4646,6 +4905,7 @@ impl ClientStateStore {
 
     /// Removes the binding only while rolling back an unpublished turn whose
     /// task CAS-back succeeded. Completion and terminal paths never call this.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_turn_prepared_binding(
         &self,
         task_id: TaskId,
@@ -4709,6 +4969,7 @@ impl ClientStateStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_runner_log(&self, task_id: TaskId, turn_id: TurnId) -> Result<File, WorkerError> {
         let _lock = self.acquire_state_lock()?;
         let runners = self.runners_dir()?;
@@ -4917,6 +5178,7 @@ impl ClientStateStore {
             .map_err(WorkerError::Io)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn runners_dir(&self) -> Result<RootedDir, WorkerError> {
         let root = RootedDir::open(&self.inner.state_root).map_err(WorkerError::Io)?;
         root.open_child_directory(&relative_path(RUNNERS_NAME.to_str().unwrap())?, false)
@@ -4924,6 +5186,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn finish_local_runner_log(
         &self,
         task_id: TaskId,
@@ -4935,12 +5198,14 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inject_write_failure_once(&self, point: ClientStateWritePoint) {
         self.inner.write_fault.store(point as u8, Ordering::SeqCst);
     }
 
     #[doc(hidden)]
-    pub fn undrainable_record_fault(&self) -> Result<(), WorkerError> {
+    pub(crate) fn undrainable_record_fault(&self) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeUndrainableRecordUpdate) {
             return Err(injected_failure(
                 ClientStateWritePoint::BeforeUndrainableRecordUpdate,
@@ -4950,6 +5215,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inject_task_rollback_update_failures(&self, count: u8) {
         self.inner
             .task_rollback_update_failures
@@ -4957,6 +5223,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inject_task_replacement_after_exchange_failure_once(&self) {
         self.inner
             .task_replacement_after_exchange_failure
@@ -4964,6 +5231,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inject_submission_rollback_cleanup_failure_once(&self, point: ClientStateWritePoint) {
         assert!(matches!(
             point,
@@ -4975,43 +5243,52 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
-    pub fn submission_report_fault(&self) -> Result<(), WorkerError> {
-        if self.take_fault(ClientStateWritePoint::BeforeSubmissionReport) {
-            return Err(injected_failure(
-                ClientStateWritePoint::BeforeSubmissionReport,
-            ));
+    pub(crate) fn submission_report_fault(&self) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            #[cfg(any(test, feature = "test-support"))]
+            if self.take_fault(ClientStateWritePoint::BeforeSubmissionReport) {
+                return Err(injected_failure(
+                    ClientStateWritePoint::BeforeSubmissionReport,
+                ));
+            }
+            let point = match self.inner.write_fault.load(Ordering::SeqCst) {
+                value if value == ClientStateWritePoint::BeforeTaskReport as u8 => {
+                    ClientStateWritePoint::BeforeTaskReport
+                }
+                value if value == ClientStateWritePoint::BeforeTaskRollbackUpdate as u8 => {
+                    ClientStateWritePoint::BeforeTaskRollbackUpdate
+                }
+                value if value == ClientStateWritePoint::BeforeRunPublishBranchRelease as u8 => {
+                    ClientStateWritePoint::BeforeRunPublishBranchRelease
+                }
+                value
+                    if value == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval as u8 =>
+                {
+                    ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval
+                }
+                value if value == ClientStateWritePoint::BeforeTaskRollbackBaseRelease as u8 => {
+                    ClientStateWritePoint::BeforeTaskRollbackBaseRelease
+                }
+                value if value == ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval as u8 => {
+                    ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval
+                }
+                value if value == ClientStateWritePoint::AfterTaskSubmissionRecordRemoval as u8 => {
+                    ClientStateWritePoint::AfterTaskSubmissionRecordRemoval
+                }
+                _ => return Ok(()),
+            };
+            if self.inner.write_fault.load(Ordering::SeqCst) == point as u8 {
+                return Err(injected_failure(point));
+            }
+            unreachable!("the write-fault point was matched above")
         }
-        let point = match self.inner.write_fault.load(Ordering::SeqCst) {
-            value if value == ClientStateWritePoint::BeforeTaskReport as u8 => {
-                ClientStateWritePoint::BeforeTaskReport
-            }
-            value if value == ClientStateWritePoint::BeforeTaskRollbackUpdate as u8 => {
-                ClientStateWritePoint::BeforeTaskRollbackUpdate
-            }
-            value if value == ClientStateWritePoint::BeforeRunPublishBranchRelease as u8 => {
-                ClientStateWritePoint::BeforeRunPublishBranchRelease
-            }
-            value if value == ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval as u8 => {
-                ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval
-            }
-            value if value == ClientStateWritePoint::BeforeTaskRollbackBaseRelease as u8 => {
-                ClientStateWritePoint::BeforeTaskRollbackBaseRelease
-            }
-            value if value == ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval as u8 => {
-                ClientStateWritePoint::BeforeTaskSubmissionTurnsRemoval
-            }
-            value if value == ClientStateWritePoint::AfterTaskSubmissionRecordRemoval as u8 => {
-                ClientStateWritePoint::AfterTaskSubmissionRecordRemoval
-            }
-            _ => return Ok(()),
-        };
-        if self.inner.write_fault.load(Ordering::SeqCst) == point as u8 {
-            return Err(injected_failure(point));
-        }
-        unreachable!("the write-fault point was matched above")
+        #[cfg(not(any(test, feature = "test-support")))]
+        Ok(())
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pause_cleanup_after_move_once(&self) -> ClientStateCleanupPause {
         let state = Arc::new(CleanupPauseState {
             state: Mutex::new(CleanupPauseFlags::default()),
@@ -5026,6 +5303,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn observe_next_lock_contention(&self) -> ClientStateLockContentionProbe {
         let state = Arc::new(LockContentionState {
             root: FileIdentity::from_stat(
@@ -5042,6 +5320,7 @@ impl ClientStateStore {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn durability_sync_counts(&self) -> ClientStateSyncCounts {
         ClientStateSyncCounts {
             parent_directories: self
@@ -5068,6 +5347,7 @@ impl ClientStateStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_fault(&self, point: ClientStateWritePoint) -> bool {
         self.inner
             .write_fault
@@ -5075,6 +5355,7 @@ impl ClientStateStore {
             .is_ok()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_task_rollback_update_failure(&self) -> bool {
         self.inner
             .task_rollback_update_failures
@@ -5088,6 +5369,7 @@ impl ClientStateStore {
             .is_ok()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_task_replacement_after_exchange_failure(&self) -> bool {
         self.inner
             .task_replacement_after_exchange_failure
@@ -5095,6 +5377,7 @@ impl ClientStateStore {
             .is_ok()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_submission_rollback_cleanup_fault(&self, point: ClientStateWritePoint) -> bool {
         self.inner
             .submission_rollback_cleanup_fault
@@ -5102,6 +5385,7 @@ impl ClientStateStore {
             .is_ok()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_cleanup_pause(&self) -> Option<Arc<CleanupPauseState>> {
         self.inner
             .cleanup_pause
@@ -5133,8 +5417,10 @@ impl ClientStateStore {
         let operation = OperationFile::stage(
             self.inner.operations.as_raw_fd(),
             &bytes,
+            #[cfg(any(test, feature = "test-support"))]
             Arc::clone(&self.inner.sync_counts),
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforePublish) {
             return Err(injected_failure(ClientStateWritePoint::BeforePublish));
         }
@@ -5142,19 +5428,25 @@ impl ClientStateStore {
             self.inner.jobs.as_raw_fd(),
             &name,
             identity,
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.write_fault,
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterPublish) {
             return Err(injected_failure(ClientStateWritePoint::AfterPublish));
         }
         sync_counted(
             self.inner.jobs.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Jobs,
         )?;
         operation.cleanup(
+            #[cfg(any(test, feature = "test-support"))]
             &self.inner.write_fault,
             &[identity],
+            #[cfg(any(test, feature = "test-support"))]
             self.take_cleanup_pause(),
         )?;
         Ok(replacement)
@@ -5221,20 +5513,35 @@ impl QueueLock {
     fn acquire(
         root: RawFd,
         queue: RawFd,
-        sync_counts: &SyncCounters,
+        #[cfg(any(test, feature = "test-support"))] sync_counts: &SyncCounters,
         deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
-        Self::acquire_inner(root, queue, sync_counts, deadline, libc::LOCK_EX)
+        Self::acquire_inner(
+            root,
+            queue,
+            #[cfg(any(test, feature = "test-support"))]
+            sync_counts,
+            deadline,
+            libc::LOCK_EX,
+        )
     }
 
     fn acquire_inner(
         root: RawFd,
         queue: RawFd,
-        sync_counts: &SyncCounters,
+        #[cfg(any(test, feature = "test-support"))] sync_counts: &SyncCounters,
         deadline: WaitDeadline,
         operation: libc::c_int,
     ) -> Result<Self, WorkerError> {
-        let state = StateLock::acquire_inner(root, sync_counts, None, deadline, operation)?;
+        let state = StateLock::acquire_inner(
+            root,
+            #[cfg(any(test, feature = "test-support"))]
+            sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            None,
+            deadline,
+            operation,
+        )?;
         let marker = open_regular_at(queue, QUEUE_LOCK_NAME)?;
         require_owned_regular(marker.as_raw_fd(), 0)?;
         deadline.lock(marker.as_raw_fd(), operation)?;
@@ -5255,12 +5562,14 @@ struct RefreshLock {
     marker: OwnedFd,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 enum RefreshAcquire {
     Acquired(RefreshLock),
     Busy,
 }
 
 impl RefreshLock {
+    #[cfg(any(test, feature = "test-support"))]
     fn try_acquire(marker: OwnedFd) -> Result<RefreshAcquire, WorkerError> {
         match cvt(unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
             Ok(()) => Ok(RefreshAcquire::Acquired(Self { marker })),
@@ -5269,6 +5578,7 @@ impl RefreshLock {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn acquire(marker: OwnedFd, deadline: WaitDeadline) -> Result<Self, WorkerError> {
         deadline.lock(marker.as_raw_fd(), libc::LOCK_EX)?;
         Ok(Self { marker })
@@ -5327,18 +5637,34 @@ fn open_or_create_queue_lock(queue: RawFd) -> Result<(), WorkerError> {
 fn load_or_create_queue_snapshot(
     queue: RawFd,
     operations: RawFd,
-    fault: &AtomicU8,
-    sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
 ) -> Result<QueueSnapshot, WorkerError> {
     let snapshot = match read_regular_optional(queue, QUEUE_STATE_NAME)? {
         Some((bytes, _)) => parse_queue_snapshot(&bytes)?,
         None => {
             let snapshot = QueueSnapshot::empty();
             let bytes = canonical_queue_bytes(&snapshot)?;
-            let operation = OperationFile::stage(operations, &bytes, Arc::clone(sync_counts))?;
-            operation.publish_no_replace(queue, QUEUE_STATE_NAME, fault)?;
+            let operation = OperationFile::stage(
+                operations,
+                &bytes,
+                #[cfg(any(test, feature = "test-support"))]
+                Arc::clone(sync_counts),
+            )?;
+            operation.publish_no_replace(
+                queue,
+                QUEUE_STATE_NAME,
+                #[cfg(any(test, feature = "test-support"))]
+                fault,
+            )?;
             sync_directory(queue)?;
-            operation.cleanup(fault, &[], None)?;
+            operation.cleanup(
+                #[cfg(any(test, feature = "test-support"))]
+                fault,
+                &[],
+                #[cfg(any(test, feature = "test-support"))]
+                None,
+            )?;
             snapshot
         }
     };
@@ -5406,8 +5732,10 @@ fn publish_queue_snapshot(
     let operation = OperationFile::stage(
         store.inner.operations.as_raw_fd(),
         &bytes,
+        #[cfg(any(test, feature = "test-support"))]
         Arc::clone(&store.inner.sync_counts),
     )?;
+    #[cfg(any(test, feature = "test-support"))]
     if store.take_fault(ClientStateWritePoint::BeforePublish) {
         return Err(injected_failure(ClientStateWritePoint::BeforePublish));
     }
@@ -5415,8 +5743,10 @@ fn publish_queue_snapshot(
         store.inner.queue.as_raw_fd(),
         QUEUE_STATE_NAME,
         expected,
+        #[cfg(any(test, feature = "test-support"))]
         &store.inner.write_fault,
     )?;
+    #[cfg(any(test, feature = "test-support"))]
     if store.take_fault(ClientStateWritePoint::AfterPublish) {
         return Err(injected_failure(ClientStateWritePoint::AfterPublish));
     }
@@ -5429,8 +5759,10 @@ fn publish_queue_snapshot(
         }
     }
     operation.cleanup(
+        #[cfg(any(test, feature = "test-support"))]
         &store.inner.write_fault,
         &[expected],
+        #[cfg(any(test, feature = "test-support"))]
         store.take_cleanup_pause(),
     )
 }
@@ -5508,6 +5840,7 @@ fn read_worktree_affinity_optional(
         .transpose()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn publish_affinity_record(
     directory: RawFd,
     name: &CStr,
@@ -5532,17 +5865,29 @@ fn publish_optional_record(
     let operation = OperationFile::stage(
         store.inner.operations.as_raw_fd(),
         bytes,
+        #[cfg(any(test, feature = "test-support"))]
         Arc::clone(&store.inner.sync_counts),
     )?;
+    #[cfg(any(test, feature = "test-support"))]
     if store.take_fault(ClientStateWritePoint::BeforePublish) {
         return Err(injected_failure(ClientStateWritePoint::BeforePublish));
     }
     match existing {
-        Some(identity) => {
-            operation.replace_if_identity(directory, name, identity, &store.inner.write_fault)?
-        }
-        None => operation.publish_no_replace(directory, name, &store.inner.write_fault)?,
+        Some(identity) => operation.replace_if_identity(
+            directory,
+            name,
+            identity,
+            #[cfg(any(test, feature = "test-support"))]
+            &store.inner.write_fault,
+        )?,
+        None => operation.publish_no_replace(
+            directory,
+            name,
+            #[cfg(any(test, feature = "test-support"))]
+            &store.inner.write_fault,
+        )?,
     }
+    #[cfg(any(test, feature = "test-support"))]
     if store.take_fault(ClientStateWritePoint::AfterPublish) {
         return Err(injected_failure(ClientStateWritePoint::AfterPublish));
     }
@@ -5551,8 +5896,10 @@ fn publish_optional_record(
         after_durable();
     }
     operation.cleanup(
+        #[cfg(any(test, feature = "test-support"))]
         &store.inner.write_fault,
         &existing.into_iter().collect::<Vec<_>>(),
+        #[cfg(any(test, feature = "test-support"))]
         store.take_cleanup_pause(),
     )
 }
@@ -5669,7 +6016,7 @@ fn publish_observation(
 fn open_or_create_refresh_marker(
     directory: RawFd,
     worker: &str,
-    sync_counts: &SyncCounters,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &SyncCounters,
 ) -> Result<OwnedFd, WorkerError> {
     let name = observation_marker_name(worker)?;
     match open_regular_at(directory, &name) {
@@ -5681,7 +6028,13 @@ fn open_or_create_refresh_marker(
             match create_lock_at(directory, &name) {
                 Ok(marker) => {
                     require_owned_regular(marker.as_raw_fd(), 0)?;
-                    sync_counted(directory, sync_counts, SyncKind::Root)?;
+                    sync_counted(
+                        directory,
+                        #[cfg(any(test, feature = "test-support"))]
+                        sync_counts,
+                        #[cfg(any(test, feature = "test-support"))]
+                        SyncKind::Root,
+                    )?;
                     Ok(marker)
                 }
                 Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
@@ -5750,6 +6103,7 @@ fn validate_state_worker_name(value: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn cached_admission(
     observation: AdmissionObservation,
     now_millis: u64,
@@ -5765,6 +6119,7 @@ fn queue_error(code: &'static str, message: &'static str) -> WorkerError {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn terminal_unproven() -> WorkerError {
     queue_error(
         "QUEUE_TERMINAL_UNPROVEN",
@@ -5772,6 +6127,7 @@ fn terminal_unproven() -> WorkerError {
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn abandonment_conflict() -> WorkerError {
     queue_error(
         "QUEUE_ABANDONMENT_CONFLICT",
@@ -5779,10 +6135,12 @@ fn abandonment_conflict() -> WorkerError {
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn record_has_remote_evidence(record: &LocalJobRecord) -> bool {
     record.last_status().is_some() || record.remote_uncertainty() != &RemoteUncertainty::None
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn terminal_record_matches(entry: &QueueEntry, record: &LocalJobRecord) -> bool {
     matches!(entry.state(), QueueState::Dispatching { .. })
         && local_record_matches_queue_entry(entry, record)
@@ -5905,30 +6263,70 @@ fn observation_can_advance(previous: JobState, next: JobState) -> bool {
 fn load_or_create_client_id(
     root: RawFd,
     operations: RawFd,
-    fault: &AtomicU8,
-    sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
 ) -> Result<ClientId, WorkerError> {
     match read_regular_optional(root, CLIENT_ID_NAME)? {
         Some((bytes, _)) => {
             let client_id = parse_client_id(&bytes)?;
-            sync_counted(root, sync_counts, SyncKind::Root)?;
+            sync_counted(
+                root,
+                #[cfg(any(test, feature = "test-support"))]
+                sync_counts,
+                #[cfg(any(test, feature = "test-support"))]
+                SyncKind::Root,
+            )?;
             Ok(client_id)
         }
         None => {
             let candidate = ClientId::generate();
             let bytes = format!("{candidate}\n").into_bytes();
-            let operation = OperationFile::stage(operations, &bytes, Arc::clone(sync_counts))?;
-            match operation.publish_no_replace(root, CLIENT_ID_NAME, fault) {
+            let operation = OperationFile::stage(
+                operations,
+                &bytes,
+                #[cfg(any(test, feature = "test-support"))]
+                Arc::clone(sync_counts),
+            )?;
+            match operation.publish_no_replace(
+                root,
+                CLIENT_ID_NAME,
+                #[cfg(any(test, feature = "test-support"))]
+                fault,
+            ) {
                 Ok(()) => {
-                    sync_counted(root, sync_counts, SyncKind::Root)?;
-                    operation.cleanup(fault, &[], None)?;
+                    sync_counted(
+                        root,
+                        #[cfg(any(test, feature = "test-support"))]
+                        sync_counts,
+                        #[cfg(any(test, feature = "test-support"))]
+                        SyncKind::Root,
+                    )?;
+                    operation.cleanup(
+                        #[cfg(any(test, feature = "test-support"))]
+                        fault,
+                        &[],
+                        #[cfg(any(test, feature = "test-support"))]
+                        None,
+                    )?;
                     Ok(candidate)
                 }
                 Err(WorkerError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
-                    operation.cleanup(fault, &[], None)?;
+                    operation.cleanup(
+                        #[cfg(any(test, feature = "test-support"))]
+                        fault,
+                        &[],
+                        #[cfg(any(test, feature = "test-support"))]
+                        None,
+                    )?;
                     let (winner, _) = read_regular(root, CLIENT_ID_NAME)?;
                     let winner = parse_client_id(&winner)?;
-                    sync_counted(root, sync_counts, SyncKind::Root)?;
+                    sync_counted(
+                        root,
+                        #[cfg(any(test, feature = "test-support"))]
+                        sync_counts,
+                        #[cfg(any(test, feature = "test-support"))]
+                        SyncKind::Root,
+                    )?;
                     Ok(winner)
                 }
                 Err(error) => Err(error),
@@ -6192,6 +6590,7 @@ struct OperationFile {
     payload: OwnedFd,
     payload_identity: FileIdentity,
     expected_bytes: Vec<u8>,
+    #[cfg(any(test, feature = "test-support"))]
     sync_counts: Arc<SyncCounters>,
 }
 
@@ -6199,12 +6598,18 @@ impl OperationFile {
     fn stage(
         operations: RawFd,
         bytes: &[u8],
-        sync_counts: Arc<SyncCounters>,
+        #[cfg(any(test, feature = "test-support"))] sync_counts: Arc<SyncCounters>,
     ) -> Result<Self, WorkerError> {
         let name = CString::new(Uuid::new_v4().simple().to_string())
             .map_err(|_| invalid_state("operation identity is invalid"))?;
         mkdir_at(operations, &name, 0o700)?;
-        sync_counted(operations, &sync_counts, SyncKind::Operations)?;
+        sync_counted(
+            operations,
+            #[cfg(any(test, feature = "test-support"))]
+            &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )?;
         let directory = match open_directory_at(operations, &name) {
             Ok(directory) => directory,
             Err(error) => {
@@ -6223,7 +6628,13 @@ impl OperationFile {
             payload.as_raw_fd(),
             MAX_STATE_FILE_BYTES,
         )?);
-        sync_counted(directory.as_raw_fd(), &sync_counts, SyncKind::Operations)?;
+        sync_counted(
+            directory.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
+            &sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )?;
         Ok(Self {
             operations,
             name,
@@ -6232,6 +6643,7 @@ impl OperationFile {
             payload,
             payload_identity,
             expected_bytes: bytes.to_vec(),
+            #[cfg(any(test, feature = "test-support"))]
             sync_counts,
         })
     }
@@ -6240,12 +6652,13 @@ impl OperationFile {
         &self,
         destination_parent: RawFd,
         destination: &CStr,
-        fault: &AtomicU8,
+        #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
     ) -> Result<(), WorkerError> {
         let retained_identity = FileIdentity::from_stat(stat_fd(self.payload.as_raw_fd())?);
         if retained_identity != self.payload_identity {
             return Err(invalid_state("retained staged payload identity changed"));
         }
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::SwapOperationPayloadBeforePublish,
@@ -6260,16 +6673,22 @@ impl OperationFile {
         )?;
         let published = open_regular_at(destination_parent, destination)?;
         let (published_bytes, published_identity) = read_open_regular(published)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let rollback_fault_armed = rollback_fault_is_armed(fault);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let rollback_fault_armed = false;
         if published_identity != self.payload_identity
             || published_bytes != self.expected_bytes
-            || rollback_fault_is_armed(fault)
+            || rollback_fault_armed
         {
             if published_identity == self.payload_identity {
                 remove_entry_if_identity(
                     destination_parent,
                     destination,
                     self.payload_identity,
+                    #[cfg(any(test, feature = "test-support"))]
                     fault,
+                    #[cfg(any(test, feature = "test-support"))]
                     &self.sync_counts,
                     self.operations,
                 )?;
@@ -6286,8 +6705,9 @@ impl OperationFile {
         destination_parent: RawFd,
         destination: &CStr,
         expected: FileIdentity,
-        fault: &AtomicU8,
+        #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
     ) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(point) = take_live_job_swap_fault(fault) {
             inject_live_job_swap(destination_parent, destination, point)?;
         }
@@ -6364,11 +6784,19 @@ impl OperationFile {
             destination,
         )
         .map_err(|_| invalid_state("conditional replacement rollback failed"))?;
-        sync_counted(destination_parent, &self.sync_counts, SyncKind::Jobs)
-            .map_err(|_| invalid_state("conditional replacement rollback fsync failed"))?;
+        sync_counted(
+            destination_parent,
+            #[cfg(any(test, feature = "test-support"))]
+            &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Jobs,
+        )
+        .map_err(|_| invalid_state("conditional replacement rollback fsync failed"))?;
         sync_counted(
             self.directory.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )
         .map_err(|_| invalid_state("conditional replacement rollback fsync failed"))?;
@@ -6385,10 +6813,11 @@ impl OperationFile {
 
     fn cleanup(
         self,
-        fault: &AtomicU8,
+        #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
         extra_owned: &[FileIdentity],
-        pause: Option<Arc<CleanupPauseState>>,
+        #[cfg(any(test, feature = "test-support"))] pause: Option<Arc<CleanupPauseState>>,
     ) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::SwapOperationDirectoryBeforeCleanup,
@@ -6399,9 +6828,12 @@ impl OperationFile {
         let (namespace_name, namespace) = create_private_directory(
             self.operations,
             "cleanup",
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )?;
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::CrashCleanupAfterRetirementCreated,
@@ -6419,10 +6851,19 @@ impl OperationFile {
         )?;
         sync_counted(
             namespace.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )?;
-        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        sync_counted(
+            self.operations,
+            #[cfg(any(test, feature = "test-support"))]
+            &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::CrashCleanupAfterOperationMoved,
@@ -6431,6 +6872,7 @@ impl OperationFile {
                 ClientStateWritePoint::CrashCleanupAfterOperationMoved,
             ));
         }
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(pause) = pause {
             pause_cleanup(pause);
         }
@@ -6449,6 +6891,7 @@ impl OperationFile {
             ));
         }
 
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::SwapOperationDirectoryAfterValidationBeforeRemoval,
@@ -6464,11 +6907,14 @@ impl OperationFile {
         mkdir_at(namespace.as_raw_fd(), retired_name, 0o700)?;
         sync_counted(
             namespace.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )?;
         let retired = open_directory_at(namespace.as_raw_fd(), retired_name)?;
         require_owned_directory(retired.as_raw_fd())?;
+        #[cfg(any(test, feature = "test-support"))]
         if take_fault(
             fault,
             ClientStateWritePoint::CrashCleanupBeforeNestedCleanup,
@@ -6481,6 +6927,7 @@ impl OperationFile {
             acquired.as_raw_fd(),
             retired.as_raw_fd(),
             extra_owned,
+            #[cfg(any(test, feature = "test-support"))]
             fault,
         )?;
         if !directory_entries(acquired.as_raw_fd())?.is_empty() {
@@ -6507,10 +6954,22 @@ impl OperationFile {
             ));
         }
         unlink_at(retired.as_raw_fd(), acquired_name, libc::AT_REMOVEDIR)?;
-        sync_counted(retired.as_raw_fd(), &self.sync_counts, SyncKind::Operations)?;
+        sync_counted(
+            retired.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
+            &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )?;
         remove_empty_directory_if_identity(namespace.as_raw_fd(), retired_name, &retired)?;
         remove_empty_directory_if_identity(self.operations, &namespace_name, &namespace)?;
-        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)?;
+        sync_counted(
+            self.operations,
+            #[cfg(any(test, feature = "test-support"))]
+            &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )?;
         Ok(())
     }
 
@@ -6519,7 +6978,7 @@ impl OperationFile {
         directory: RawFd,
         retirement: RawFd,
         extra_owned: &[FileIdentity],
-        fault: &AtomicU8,
+        #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
     ) -> Result<(), WorkerError> {
         let mut removed = false;
         for entry in directory_entries(directory)? {
@@ -6533,6 +6992,7 @@ impl OperationFile {
                 MAX_STATE_FILE_BYTES,
             )?);
             if identity == self.payload_identity || extra_owned.contains(&identity) {
+                #[cfg(any(test, feature = "test-support"))]
                 if take_fault(
                     fault,
                     ClientStateWritePoint::SwapOperationChildAfterValidationBeforeRemoval,
@@ -6560,11 +7020,18 @@ impl OperationFile {
             }
         }
         if removed {
-            sync_counted(directory, &self.sync_counts, SyncKind::Operations)?;
+            sync_counted(
+                directory,
+                #[cfg(any(test, feature = "test-support"))]
+                &self.sync_counts,
+                #[cfg(any(test, feature = "test-support"))]
+                SyncKind::Operations,
+            )?;
         }
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn inject_payload_swap(&self) -> Result<(), WorkerError> {
         let original_name = c"payload-original";
         rename_no_replace(
@@ -6579,11 +7046,14 @@ impl OperationFile {
         replacement.sync_all()?;
         sync_counted(
             self.directory.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn inject_directory_swap(&self) -> Result<(), WorkerError> {
         let original_name = random_component();
         rename_no_replace(self.operations, &self.name, self.operations, &original_name)?;
@@ -6593,10 +7063,18 @@ impl OperationFile {
         File::from(sentinel).sync_all()?;
         sync_counted(
             replacement.as_raw_fd(),
+            #[cfg(any(test, feature = "test-support"))]
             &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
             SyncKind::Operations,
         )?;
-        sync_counted(self.operations, &self.sync_counts, SyncKind::Operations)
+        sync_counted(
+            self.operations,
+            #[cfg(any(test, feature = "test-support"))]
+            &self.sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            SyncKind::Operations,
+        )
     }
 }
 
@@ -6608,16 +7086,24 @@ struct StateLock {
 impl StateLock {
     fn acquire(
         root: RawFd,
-        sync_counts: &SyncCounters,
+        #[cfg(any(test, feature = "test-support"))] sync_counts: &SyncCounters,
         deadline: WaitDeadline,
     ) -> Result<Self, WorkerError> {
-        Self::acquire_inner(root, sync_counts, None, deadline, libc::LOCK_EX)
+        Self::acquire_inner(
+            root,
+            #[cfg(any(test, feature = "test-support"))]
+            sync_counts,
+            #[cfg(any(test, feature = "test-support"))]
+            None,
+            deadline,
+            libc::LOCK_EX,
+        )
     }
 
     fn acquire_inner(
         root: RawFd,
-        sync_counts: &SyncCounters,
-        creation_race: Option<&AtomicU8>,
+        #[cfg(any(test, feature = "test-support"))] sync_counts: &SyncCounters,
+        #[cfg(any(test, feature = "test-support"))] creation_race: Option<&AtomicU8>,
         deadline: WaitDeadline,
         operation: libc::c_int,
     ) -> Result<Self, WorkerError> {
@@ -6635,6 +7121,7 @@ impl StateLock {
         {
             Ok(()) => {}
             Err(error) if lock_would_block(&error) => {
+                #[cfg(any(test, feature = "test-support"))]
                 notify_lock_contention(root)?;
                 if operation & libc::LOCK_NB != 0 {
                     return Err(WorkerError::Io(error));
@@ -6645,10 +7132,21 @@ impl StateLock {
         }
         deadline.remaining()?;
 
-        let (marker, outcome) = open_lock_file_with_creation(root, creation_race)?;
+        let (marker, outcome) = open_lock_file_with_creation(
+            root,
+            #[cfg(any(test, feature = "test-support"))]
+            creation_race,
+        )?;
         if outcome != CreationOutcome::Existing {
-            sync_counted(root, sync_counts, SyncKind::Root)?;
+            sync_counted(
+                root,
+                #[cfg(any(test, feature = "test-support"))]
+                sync_counts,
+                #[cfg(any(test, feature = "test-support"))]
+                SyncKind::Root,
+            )?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         if outcome == CreationOutcome::ConcurrentExisting {
             sync_counts
                 .concurrent_loser_parents
@@ -6667,6 +7165,7 @@ fn lock_would_block(error: &io::Error) -> bool {
     code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn notify_lock_contention(root: RawFd) -> Result<(), WorkerError> {
     let root = FileIdentity::from_stat(stat_fd(root)?);
     let mut probes = LOCK_CONTENTION_PROBES
@@ -6730,6 +7229,7 @@ impl FileIdentity {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "test-support"))]
 enum SyncKind {
     ParentDirectory,
     Root,
@@ -6739,8 +7239,8 @@ enum SyncKind {
 
 fn open_or_create_root(
     path: &Path,
-    sync_counts: &Arc<SyncCounters>,
-    creation_race: &AtomicU8,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] creation_race: &AtomicU8,
 ) -> Result<OwnedFd, WorkerError> {
     if path.as_os_str().is_empty() {
         return Err(invalid_state("state root path is empty"));
@@ -6764,6 +7264,7 @@ fn open_or_create_root(
         let next = match open_directory_at(current.as_raw_fd(), &name) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                #[cfg(any(test, feature = "test-support"))]
                 if take_creation_race(creation_race, ClientStateCreationRacePoint::RootComponent) {
                     mkdir_at(current.as_raw_fd(), &name, 0o700)?;
                 }
@@ -6778,8 +7279,15 @@ fn open_or_create_root(
                 }
                 let directory = open_directory_at(current.as_raw_fd(), &name)?;
                 if created || concurrent_existing {
-                    sync_counted(current.as_raw_fd(), sync_counts, SyncKind::ParentDirectory)?;
+                    sync_counted(
+                        current.as_raw_fd(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        sync_counts,
+                        #[cfg(any(test, feature = "test-support"))]
+                        SyncKind::ParentDirectory,
+                    )?;
                 }
+                #[cfg(any(test, feature = "test-support"))]
                 if concurrent_existing {
                     sync_counts
                         .concurrent_loser_parents
@@ -6800,13 +7308,14 @@ fn open_or_create_root(
 fn open_or_create_owned_directory(
     parent: RawFd,
     name: &CStr,
-    sync_counts: &Arc<SyncCounters>,
-    sync_kind: SyncKind,
-    creation_race: &AtomicU8,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] sync_kind: SyncKind,
+    #[cfg(any(test, feature = "test-support"))] creation_race: &AtomicU8,
 ) -> Result<OwnedFd, WorkerError> {
     let directory = match open_directory_at(parent, name) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(any(test, feature = "test-support"))]
             if take_creation_race(creation_race, ClientStateCreationRacePoint::OwnedDirectory) {
                 mkdir_at(parent, name, 0o700)?;
             }
@@ -6821,8 +7330,15 @@ fn open_or_create_owned_directory(
             }
             let directory = open_directory_at(parent, name)?;
             if created || concurrent_existing {
-                sync_counted(parent, sync_counts, sync_kind)?;
+                sync_counted(
+                    parent,
+                    #[cfg(any(test, feature = "test-support"))]
+                    sync_counts,
+                    #[cfg(any(test, feature = "test-support"))]
+                    sync_kind,
+                )?;
             }
+            #[cfg(any(test, feature = "test-support"))]
             if concurrent_existing {
                 sync_counts
                     .concurrent_loser_parents
@@ -6845,7 +7361,7 @@ enum CreationOutcome {
 
 fn open_lock_file_with_creation(
     root: RawFd,
-    creation_race: Option<&AtomicU8>,
+    #[cfg(any(test, feature = "test-support"))] creation_race: Option<&AtomicU8>,
 ) -> Result<(OwnedFd, CreationOutcome), WorkerError> {
     let open_existing = || {
         cvt_fd(unsafe {
@@ -6859,6 +7375,7 @@ fn open_lock_file_with_creation(
     let (descriptor, outcome) = match open_existing() {
         Ok(descriptor) => (descriptor, CreationOutcome::Existing),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(any(test, feature = "test-support"))]
             if creation_race.is_some_and(|race| {
                 take_creation_race(race, ClientStateCreationRacePoint::LockFile)
             }) {
@@ -6890,6 +7407,7 @@ fn open_lock_file_with_creation(
     Ok((descriptor, outcome))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn create_lock_file(root: RawFd) -> io::Result<OwnedFd> {
     cvt_fd(unsafe {
         libc::openat(
@@ -7343,8 +7861,8 @@ fn remove_entry_if_identity(
     parent: RawFd,
     name: &CStr,
     expected: FileIdentity,
-    fault: &AtomicU8,
-    sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] fault: &AtomicU8,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
     operations: RawFd,
 ) -> Result<(), WorkerError> {
     if stat_fd(parent)?.st_dev != stat_fd(operations)?.st_dev {
@@ -7352,12 +7870,25 @@ fn remove_entry_if_identity(
             "rollback destination and operation state are on different filesystems",
         ));
     }
-    let (namespace_name, namespace) =
-        create_private_directory(operations, "rollback", sync_counts, SyncKind::Operations)?;
+    let (namespace_name, namespace) = create_private_directory(
+        operations,
+        "rollback",
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts,
+        #[cfg(any(test, feature = "test-support"))]
+        SyncKind::Operations,
+    )?;
     let acquired_name = c"published";
     rename_no_replace(parent, name, namespace.as_raw_fd(), acquired_name)?;
     sync_directory(parent)?;
-    sync_counted(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    sync_counted(
+        namespace.as_raw_fd(),
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts,
+        #[cfg(any(test, feature = "test-support"))]
+        SyncKind::Operations,
+    )?;
+    #[cfg(any(test, feature = "test-support"))]
     if take_fault(fault, ClientStateWritePoint::CrashRollbackAfterEntryMoved) {
         return Err(injected_failure(
             ClientStateWritePoint::CrashRollbackAfterEntryMoved,
@@ -7377,6 +7908,7 @@ fn remove_entry_if_identity(
         ));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     if take_fault(
         fault,
         ClientStateWritePoint::SwapPublishedRollbackAfterValidationBeforeRemoval,
@@ -7398,9 +7930,16 @@ fn remove_entry_if_identity(
 
     let retired_name = c"retired";
     mkdir_at(namespace.as_raw_fd(), retired_name, 0o700)?;
-    sync_counted(namespace.as_raw_fd(), sync_counts, SyncKind::Operations)?;
+    sync_counted(
+        namespace.as_raw_fd(),
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts,
+        #[cfg(any(test, feature = "test-support"))]
+        SyncKind::Operations,
+    )?;
     let retired = open_directory_at(namespace.as_raw_fd(), retired_name)?;
     require_owned_directory(retired.as_raw_fd())?;
+    #[cfg(any(test, feature = "test-support"))]
     if take_fault(
         fault,
         ClientStateWritePoint::CrashRollbackBeforeNestedCleanup,
@@ -7435,22 +7974,34 @@ fn remove_entry_if_identity(
     sync_directory(retired.as_raw_fd())?;
     remove_empty_directory_if_identity(namespace.as_raw_fd(), retired_name, &retired)?;
     remove_empty_directory_if_identity(operations, &namespace_name, &namespace)?;
-    sync_counted(operations, sync_counts, SyncKind::Operations)?;
+    sync_counted(
+        operations,
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts,
+        #[cfg(any(test, feature = "test-support"))]
+        SyncKind::Operations,
+    )?;
     sync_directory(parent)
 }
 
 fn create_private_directory(
     parent: RawFd,
     kind_name: &str,
-    sync_counts: &Arc<SyncCounters>,
-    kind: SyncKind,
+    #[cfg(any(test, feature = "test-support"))] sync_counts: &Arc<SyncCounters>,
+    #[cfg(any(test, feature = "test-support"))] kind: SyncKind,
 ) -> Result<(CString, OwnedFd), WorkerError> {
     for _ in 0..16 {
         let name = CString::new(format!("{kind_name}-{}", Uuid::new_v4().simple()))
             .expect("operation namespace name contains no NUL");
         match mkdir_at(parent, &name, 0o700) {
             Ok(()) => {
-                sync_counted(parent, sync_counts, kind)?;
+                sync_counted(
+                    parent,
+                    #[cfg(any(test, feature = "test-support"))]
+                    sync_counts,
+                    #[cfg(any(test, feature = "test-support"))]
+                    kind,
+                )?;
                 let directory = open_directory_at(parent, &name)?;
                 require_owned_directory(directory.as_raw_fd())?;
                 return Ok((name, directory));
@@ -7481,6 +8032,7 @@ fn remove_empty_directory_if_identity(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn inject_directory_swap_at(
     parent: RawFd,
     name: &CStr,
@@ -7505,6 +8057,7 @@ fn restore_quarantine(
         .map_err(WorkerError::Io)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn take_live_job_swap_fault(fault: &AtomicU8) -> Option<ClientStateWritePoint> {
     let point = match fault.load(Ordering::SeqCst) {
         value if value == ClientStateWritePoint::SwapLiveJobBeforeReplace as u8 => {
@@ -7529,6 +8082,7 @@ fn take_live_job_swap_fault(fault: &AtomicU8) -> Option<ClientStateWritePoint> {
     take_fault(fault, point).then_some(point)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn inject_live_job_swap(
     parent: RawFd,
     name: &CStr,
@@ -7564,6 +8118,7 @@ fn inject_live_job_swap(
     sync_directory(parent)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn write_new_file(parent: RawFd, name: &CStr, bytes: &[u8]) -> Result<(), WorkerError> {
     let descriptor = create_regular_at(parent, name)?;
     let mut file = File::from(descriptor);
@@ -7572,6 +8127,7 @@ fn write_new_file(parent: RawFd, name: &CStr, bytes: &[u8]) -> Result<(), Worker
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn random_component() -> CString {
     CString::new(Uuid::new_v4().simple().to_string()).expect("simple UUID contains no NUL")
 }
@@ -7601,26 +8157,31 @@ fn sync_directory(descriptor: RawFd) -> Result<(), WorkerError> {
 
 fn sync_counted(
     descriptor: RawFd,
-    counts: &SyncCounters,
-    kind: SyncKind,
+    #[cfg(any(test, feature = "test-support"))] counts: &SyncCounters,
+    #[cfg(any(test, feature = "test-support"))] kind: SyncKind,
 ) -> Result<(), WorkerError> {
     sync_directory(descriptor)?;
-    let counter = match kind {
-        SyncKind::ParentDirectory => &counts.parent_directories,
-        SyncKind::Root => &counts.root,
-        SyncKind::Jobs => &counts.jobs,
-        SyncKind::Operations => &counts.operations,
-    };
-    counter.fetch_add(1, Ordering::SeqCst);
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let counter = match kind {
+            SyncKind::ParentDirectory => &counts.parent_directories,
+            SyncKind::Root => &counts.root,
+            SyncKind::Jobs => &counts.jobs,
+            SyncKind::Operations => &counts.operations,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn take_fault(fault: &AtomicU8, point: ClientStateWritePoint) -> bool {
     fault
         .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn rollback_fault_is_armed(fault: &AtomicU8) -> bool {
     matches!(
         fault.load(Ordering::SeqCst),
@@ -7631,6 +8192,7 @@ fn rollback_fault_is_armed(fault: &AtomicU8) -> bool {
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn take_creation_race(fault: &AtomicU8, point: ClientStateCreationRacePoint) -> bool {
     fault
         .compare_exchange(point as u8, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -7687,6 +8249,7 @@ fn advisory_capabilities(observation: &AdmissionObservation, now_millis: u64) ->
     capabilities
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn injected_failure(point: ClientStateWritePoint) -> WorkerError {
     let label = match point {
         ClientStateWritePoint::BeforePublish => "before publication",

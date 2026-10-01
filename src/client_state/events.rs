@@ -112,6 +112,7 @@ impl DeferredHints {
         });
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn finish(self) {}
 }
 

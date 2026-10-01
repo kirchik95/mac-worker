@@ -187,10 +187,12 @@ impl PreacceptanceAbandonmentReceipt {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn job_id(&self) -> JobId {
         self.job_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn matches_request(&self, request: &ResolveOrAbandonRequest) -> bool {
         request.validate().is_ok()
             && self.job_id == request.job_id()

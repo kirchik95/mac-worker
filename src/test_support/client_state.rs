@@ -1,15 +1,17 @@
 //! Explicit integration-test access for client state contracts.
 
 pub use crate::client_state::{
-    ActiveTaskConfig, ActiveTaskSelection, ClientStateConcurrencyHook, ClientStateConcurrencyPoint,
-    ClientStateCreationRacePoint, ClientStateStore, ClientStateTimings, ClientStateWritePoint,
+    ActiveTaskBootstrapReport, ActiveTaskConfig, ActiveTaskRefreshReport, ActiveTaskSelection,
+    ClientStateCleanupPause, ClientStateConcurrencyHook, ClientStateConcurrencyPoint,
+    ClientStateCreationRacePoint, ClientStateLockContentionProbe, ClientStateStore,
+    ClientStateSyncCounts, ClientStateTimings, ClientStateWritePoint, QueueRowWithBlockingReason,
     RUNNER_ABSENCE_CONFIRMATION, RUNNER_UNVERIFIABLE_AFTER, ReservedSlotTakeover,
-    RunnerSlotDecision, task_record_needs_active_index,
+    RunnerLivenessVerdict, RunnerSlotDecision, task_record_needs_active_index,
 };
 pub mod dag {
     pub use crate::dag::{
-        DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeProjection, DagNodeState,
-        DagRecord, ParentGate, dag_pin_ref, parent_gate,
+        DAG_PARENT_FAILED, DagBase, DagClaim, DagFrozenSpec, DagNode, DagNodeProjection,
+        DagNodeState, DagRecord, ParentGate, dag_pin_ref, parent_gate,
     };
 }
 pub mod events {

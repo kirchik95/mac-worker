@@ -14,8 +14,8 @@ use crate::{
 };
 
 pub const DAG_PARENT_FAILED: &str = "DAG_PARENT_FAILED";
-pub const DAG_WAITING: &str = "DAG_WAITING";
-pub const DAG_CLAIMED: &str = "DAG_CLAIMED";
+pub(crate) const DAG_WAITING: &str = "DAG_WAITING";
+pub(crate) const DAG_CLAIMED: &str = "DAG_CLAIMED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,7 +34,7 @@ pub enum ParentGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimedNodeAction {
+pub(crate) enum ClaimedNodeAction {
     MarkSubmitted,
     Continue,
     Retake,
@@ -158,7 +158,7 @@ pub struct DagClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphIssue {
+pub(crate) struct GraphIssue {
     pub kind: &'static str,
     pub message: String,
 }
@@ -397,7 +397,7 @@ pub fn dag_pin_ref(run_id: RunId, batch_id: &str) -> String {
     format!("refs/mac-worker/dag/{run_id}/{batch_id}")
 }
 
-pub fn parse_from_base(base: &str) -> Option<&str> {
+pub(crate) fn parse_from_base(base: &str) -> Option<&str> {
     base.strip_prefix("from:")
         .filter(|parent| !parent.is_empty())
 }
@@ -407,7 +407,7 @@ pub fn parse_from_base(base: &str) -> Option<&str> {
 /// caller continues the same IDs. Continue does not persist caller ownership, so
 /// a dead claim must Retake. An existing task is Submitted only after the durable
 /// submission contract has cleared intent *and* a turn directory exists.
-pub fn claimed_node_action(
+pub(crate) fn claimed_node_action(
     claimed_by: Option<ProcessIdentity>,
     caller: ProcessIdentity,
     owner_live: bool,
@@ -424,7 +424,7 @@ pub fn claimed_node_action(
     }
 }
 
-pub fn dag_submission_complete(record: &LocalTaskRecord) -> bool {
+pub(crate) fn dag_submission_complete(record: &LocalTaskRecord) -> bool {
     record.submission_intent_turn_id().is_none()
         && record.submission_rollback_turn_id().is_none()
         && record.abandon_code() != Some("SUBMISSION_ROLLBACK_INCOMPLETE")
@@ -449,7 +449,7 @@ pub fn parent_gate(record: &LocalTaskRecord) -> ParentGate {
     }
 }
 
-pub fn parents_ready(
+pub(crate) fn parents_ready(
     _record: &DagRecord,
     node: &DagNode,
     parents: &BTreeMap<String, ParentGate>,
@@ -463,14 +463,14 @@ pub fn parents_ready(
         }
 }
 
-pub fn parents_failed(node: &DagNode, parents: &BTreeMap<String, ParentGate>) -> bool {
+pub(crate) fn parents_failed(node: &DagNode, parents: &BTreeMap<String, ParentGate>) -> bool {
     node.depends_on
         .iter()
         .any(|dep| parents.get(dep) == Some(&ParentGate::Failed))
 }
 
 /// Bind `from:` only to this accepted turn's imported object.
-pub fn accepted_import_oid(
+pub(crate) fn accepted_import_oid(
     record: &LocalTaskRecord,
     last_turn_id: TurnId,
     queue_busy: bool,
@@ -496,13 +496,13 @@ pub fn accepted_import_oid(
     Some(fetched.clone())
 }
 
-pub struct GraphNode<'a> {
+pub(crate) struct GraphNode<'a> {
     pub id: Option<&'a str>,
     pub depends_on: &'a [String],
     pub base: &'a str,
 }
 
-pub fn validate_batch_graph(tasks: &[GraphNode<'_>]) -> Vec<GraphIssue> {
+pub(crate) fn validate_batch_graph(tasks: &[GraphNode<'_>]) -> Vec<GraphIssue> {
     let mut issues = Vec::new();
     let mut ids = BTreeMap::new();
     for (index, task) in tasks.iter().enumerate() {
@@ -566,7 +566,7 @@ pub fn validate_batch_graph(tasks: &[GraphNode<'_>]) -> Vec<GraphIssue> {
     issues
 }
 
-pub fn validate_graph_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_graph_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 64
         || !id.bytes().all(|byte| {
@@ -630,7 +630,7 @@ fn detect_cycle(graph: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
     None
 }
 
-pub fn node_list_state(node: &DagNode) -> TaskState {
+pub(crate) fn node_list_state(node: &DagNode) -> TaskState {
     match node.state {
         DagNodeState::Waiting | DagNodeState::Claimed | DagNodeState::Submitted => {
             TaskState::Queued
@@ -639,7 +639,11 @@ pub fn node_list_state(node: &DagNode) -> TaskState {
     }
 }
 
-pub fn pending_list_row(run_id: RunId, node: &DagNode, created_at_millis: u64) -> TaskListRow {
+pub(crate) fn pending_list_row(
+    run_id: RunId,
+    node: &DagNode,
+    created_at_millis: u64,
+) -> TaskListRow {
     let blocking_code = match node.state {
         DagNodeState::Waiting => Some(DAG_WAITING.to_owned()),
         DagNodeState::Claimed => Some(DAG_CLAIMED.to_owned()),
@@ -681,7 +685,7 @@ pub fn pending_list_row(run_id: RunId, node: &DagNode, created_at_millis: u64) -
     }
 }
 
-pub fn merge_pending_into_projection(
+pub(crate) fn merge_pending_into_projection(
     projection: &mut TaskListProjection,
     run_id: RunId,
     dag: &DagRecord,
@@ -724,7 +728,7 @@ pub fn merge_pending_into_projection(
     projection.progress = RunProgress::from_states(projection.tasks.iter().map(|task| task.state));
 }
 
-pub fn dag_run_is_quiescent(dag: &DagRecord) -> bool {
+pub(crate) fn dag_run_is_quiescent(dag: &DagRecord) -> bool {
     dag.nodes
         .values()
         .all(|node| matches!(node.state, DagNodeState::Submitted | DagNodeState::Blocked))

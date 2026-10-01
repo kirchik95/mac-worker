@@ -99,8 +99,10 @@ impl ClientStateStore {
         snapshot.entries[target_index].unpark(owner)?;
         snapshot.entries[target_index].dispatch(owner, worker, now_millis)?;
         snapshot.validate()?;
+        #[cfg(any(test, feature = "test-support"))]
         self.reach_concurrency_point(ClientStateConcurrencyPoint::QueuePublication);
         publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
+        #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::AfterRunnerYieldQueuePublication) {
             return Err(injected_failure(
                 ClientStateWritePoint::AfterRunnerYieldQueuePublication,
