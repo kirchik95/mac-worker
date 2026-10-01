@@ -786,6 +786,7 @@ impl TransferRepo {
     /// `host upload-pack`, or controller-owned `controller-receive-pack` /
     /// `controller-upload-pack`). Do not raise this cap to fit a real repo, and
     /// do not put pack bytes in the 1 MiB RPC body on the final path.
+    #[cfg(test)]
     pub const FROZEN_BUNDLE_MAX_BYTES: usize = 1024 * 1024;
 
     /// Immutable request-scoped source ref. `git bundle create` with a raw
@@ -803,6 +804,7 @@ impl TransferRepo {
 
     /// Immutable DAG freeze / from-binding ref. Same owned-graph pin engine as
     /// [`Self::pin_frozen_source`]; the namespace is the only difference.
+    #[cfg(test)]
     pub fn frozen_dag_ref(run_id: &str, batch_id: &str) -> Result<String, WorkerError> {
         if !is_lower_hex(run_id, 32) {
             return Err(git_error(
@@ -882,6 +884,7 @@ impl TransferRepo {
     /// First-slice fixture transfer: a git bundle of one frozen commit that
     /// already fits in a 1 MiB controller RPC frame. This is not ordinary
     /// repository transfer.
+    #[cfg(test)]
     pub fn bundle_frozen_source(
         &self,
         runner: &dyn ProcessRunner,
@@ -918,6 +921,7 @@ impl TransferRepo {
         })
     }
 
+    #[cfg(test)]
     pub fn import_frozen_source(
         &self,
         runner: &dyn ProcessRunner,
@@ -980,6 +984,7 @@ impl TransferRepo {
         pinned
     }
 
+    #[cfg(test)]
     pub fn contains_commit(
         &self,
         runner: &dyn ProcessRunner,
@@ -1235,6 +1240,7 @@ impl TransferRepo {
         }
     }
 
+    #[cfg(test)]
     fn require_advertised_frozen_head(
         &self,
         runner: &dyn ProcessRunner,
@@ -1293,6 +1299,7 @@ impl TransferRepo {
         }
     }
 
+    #[cfg(test)]
     fn delete_ref_if_present(&self, runner: &dyn ProcessRunner, name: &str) {
         let _ = self.transfer_git(
             runner,
@@ -2214,6 +2221,7 @@ impl TransferRepo {
         }
     }
 
+    #[cfg(test)]
     fn with_scratch_regular<T>(
         &self,
         bytes: &[u8],
@@ -2962,6 +2970,7 @@ fn restore_and_remove_scratch_regular(scratch_dir: &RootedDir, name: &str) -> io
     scratch_dir.remove_owned_regular(name)
 }
 
+#[cfg(test)]
 fn read_scratch_regular(scratch_dir: &RootedDir, name: &str) -> Result<Vec<u8>, WorkerError> {
     let mut inspection = scratch_dir
         .inspect(&relative(name)?)

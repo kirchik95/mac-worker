@@ -1009,6 +1009,7 @@ impl HostStore {
     }
 
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn migrate_layout_with_write_fault(
         root: &Path,
         point: HostStoreWritePoint,

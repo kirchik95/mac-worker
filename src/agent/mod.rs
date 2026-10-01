@@ -4,7 +4,9 @@ mod cursor;
 pub(crate) mod identity;
 mod opencode;
 
-pub use identity::{AgentIdentity, VersionObservation};
+pub use identity::AgentIdentity;
+#[cfg(test)]
+pub use identity::VersionObservation;
 pub use opencode::{
     OPENCODE_DIALECT_MISMATCH, OPENCODE_VERSION_UNVERIFIED, OpencodeDialect,
     launch_dialect as opencode_launch_dialect, verify_launch as verify_opencode_launch,

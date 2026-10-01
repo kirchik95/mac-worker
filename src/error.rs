@@ -517,6 +517,7 @@ static CATALOG: &[PublicDiagnostic] = &[
     },
 ];
 
+#[cfg(test)]
 pub fn public_error_catalog() -> &'static [PublicDiagnostic] {
     CATALOG
 }

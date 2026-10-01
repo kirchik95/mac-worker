@@ -31,6 +31,7 @@ pub fn run() -> ExitCode {
 
 /// Libtest helper entry: the recorded child execs this test binary, then this
 /// reconstructs the production `[helper, ARG, --, agent...]` argv.
+#[cfg(test)]
 pub fn run_from_env_agent() -> u8 {
     let mut args = vec![
         std::env::args_os()
@@ -46,6 +47,7 @@ pub fn run_from_env_agent() -> u8 {
 
 /// JSON array of strings. Empty arguments are kept; NUL is not used because
 /// POSIX environment values cannot contain it.
+#[cfg(test)]
 fn decode_libtest_agent_argv(encoded: &str) -> Vec<OsString> {
     let parts: Vec<String> = serde_json::from_str(encoded).unwrap_or_default();
     parts.into_iter().map(OsString::from).collect()

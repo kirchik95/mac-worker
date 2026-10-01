@@ -343,6 +343,7 @@ impl DagRecord {
     }
 
     /// Pins that retain objects. Always computed; never trust serialized strings for release.
+    #[cfg(test)]
     pub fn retention_pin_refs(&self) -> Vec<String> {
         self.nodes
             .values()

@@ -735,6 +735,7 @@ fn current_time_millis() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub fn collect_json() -> Result<Vec<u8>, WorkerError> {
     let response = ProbeCollector::collect()?;
     serde_json::to_vec(&response)

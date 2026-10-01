@@ -690,6 +690,7 @@ pub fn serve_rpc_with_execution(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn send_controller_request(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,

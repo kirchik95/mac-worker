@@ -368,6 +368,7 @@ pub fn persist_setup_stage_result(turn_dir: &Path, error: &WorkerError) -> Resul
     )
 }
 
+#[cfg(test)]
 pub fn write_setup_stage_result(
     turn_dir: &RootedDir,
     error: &WorkerError,

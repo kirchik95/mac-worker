@@ -89,6 +89,7 @@ impl FailureReceipt {
     }
 
     /// Operator-facing parenthetical: `(stage=cleanup, residual=lease,cleanup-tree)`.
+    #[cfg(test)]
     pub fn render_parenthetical(&self) -> String {
         format!(
             "(stage={}, residual={})",
@@ -98,6 +99,7 @@ impl FailureReceipt {
     }
 
     /// `HOST_IO (stage=cleanup, residual=lease,cleanup-tree)`.
+    #[cfg(test)]
     pub fn render_with_code(&self, code: &str) -> String {
         format!("{code} {}", self.render_parenthetical())
     }
