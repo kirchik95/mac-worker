@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::from_parts;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsString,
@@ -13,24 +14,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent_facts::{
+use mac_worker::test_support::{
+    agents::agent_facts::{
         AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, HerdrFactState, HerdrFacts, ProfileProbe,
         turn_auth_failure_reason,
     },
-    cli::{Cli, Command},
-    config::{Config, WorkerEntry},
-    error::{ProcessError, ProcessStream, WorkerError},
-    lease::{LeaseSummary, MAX_HOST_SLOTS, SlotState},
-    output::CommandOutput,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{
-        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
-        WorkersReport,
+    cli::Command,
+    core::{
+        config::{Config, WorkerEntry},
+        error::{ProcessError, ProcessStream, WorkerError},
+        output::CommandOutput,
+        protocol::{
+            CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse,
+            WorkerHealth, WorkersReport,
+        },
     },
-    run_with_io_in_context,
-    transport::{ProbeClock, SshTransport, WorkersService},
+    host::{
+        lease::{LeaseSummary, MAX_HOST_SLOTS, SlotState},
+        process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    runtime::{RuntimeContext, run_with_io_in_context},
+    transfer::transport::{ProbeClock, SshTransport, WorkersService},
 };
 
 const TEST_COORDINATION_TIMEOUT: Duration = crate::support::HANDSHAKE_TIMEOUT;
@@ -258,7 +262,7 @@ fn request_destination(request: &ProcessRequest) -> String {
 fn config_with_workers(count: usize) -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: (1..=count)
@@ -338,7 +342,8 @@ fn structured_probe_json(
         "capabilities": capabilities,
     });
     if protocol_version == PROTOCOL_VERSION {
-        value["supervision_version"] = serde_json::json!(mac_worker::protocol::SUPERVISION_VERSION);
+        value["supervision_version"] =
+            serde_json::json!(mac_worker::test_support::core::protocol::SUPERVISION_VERSION);
         value["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
         value["slot_state"] = serde_json::json!("idle");
         value["active_lease"] = serde_json::Value::Null;
@@ -643,7 +648,7 @@ fn budgeted_requirement_inspection_keeps_inventory_first_stable_union() {
     ));
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![worker(
@@ -777,7 +782,7 @@ fn two_slot_probe_with_one_busy_lease_is_ready_and_has_a_free_slot() {
     let runner = RecordingRunner::returning_json(occupancy_probe_json(2, 1, "idle", true));
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![worker("mini-1", "mac1", &[])],
@@ -957,7 +962,10 @@ fn any_advertised_version_other_than_the_current_pair_is_a_protocol_mismatch() {
     // (no supervision_version reads as 0). The N-1 helper is covered in
     // detail by protocol_six_helper_is_an_explicit_mismatch_before_jobs.
     assert_eq!(PROTOCOL_VERSION, 7);
-    assert_eq!(mac_worker::protocol::SUPERVISION_VERSION, 3);
+    assert_eq!(
+        mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
+        3
+    );
     let with_versions = |protocol: Option<u32>, supervision: Option<u32>| {
         let mut response: serde_json::Value = serde_json::from_slice(&valid_probe_json()).unwrap();
         if let Some(protocol) = protocol {
@@ -1125,7 +1133,7 @@ fn inventory_keeps_ready_and_failed_workers_in_config_order() {
     ]);
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![
@@ -1205,7 +1213,7 @@ fn inspect_with_requirements_adds_project_capabilities_without_changing_inventor
     ]);
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![worker("mini-1", "mac1", &["darwin-arm64"])],
@@ -1250,7 +1258,7 @@ fn inspect_with_requirements_uses_inventory_first_stable_union_for_multiple_miss
     ));
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![worker(
@@ -1298,7 +1306,7 @@ fn human_workers_output_includes_all_parsed_health_facts() {
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -1364,7 +1372,7 @@ fn human_unavailable_worker_keeps_error_missing_capabilities_and_unknown_swap_vi
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -1419,7 +1427,7 @@ fn workers_output_includes_profile_keyed_facts_without_values() {
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -1495,7 +1503,7 @@ fn workers_render_a_turn_auth_failure_reason() {
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -1558,14 +1566,14 @@ fn workers_refresh_clear_auth_incidents_uses_the_clearing_host_command() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(
-        Cli {
-            config: Some(config_path),
-            json: false,
-            command: Command::Workers {
+        from_parts(
+            Some(config_path),
+            false,
+            Command::Workers {
                 refresh: true,
                 clear_auth_incidents: true,
             },
-        },
+        ),
         &runner,
         &runtime,
         &mut stdout,
@@ -1632,14 +1640,14 @@ fn run_workers_refresh(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(
-        Cli {
-            config: Some(config_path),
+        from_parts(
+            Some(config_path),
             json,
-            command: Command::Workers {
+            Command::Workers {
                 refresh: true,
                 clear_auth_incidents: false,
             },
-        },
+        ),
         runner,
         &runtime,
         &mut stdout,
@@ -1847,7 +1855,7 @@ fn herdr_health(facts: Option<AgentFacts>, facts_age_millis: Option<u64>) -> Wor
         probe: Some(ProbeResponse {
             features: None,
             protocol_version: PROTOCOL_VERSION,
-            supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+            supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),
             arch: "arm64".into(),
             os_version: "26.2".into(),

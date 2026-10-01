@@ -1,11 +1,10 @@
 use base64::Engine;
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    run_with_stdio_in_context,
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
 };
 use serde_json::json;
 use std::{

@@ -2,18 +2,18 @@ use crate::support;
 
 use std::os::unix::process::ExitStatusExt;
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::ClientStateStore,
-    git_transport::GitTransport,
-    process::ProcessResult,
-    project::ProjectInspector,
-    rooted_fs::RootedDir,
+    host::{process::ProcessResult, rooted_fs::RootedDir},
     task::{
-        BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, RunId, RunRecord, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+        model::{
+            BaseOid, BranchName, ClosePolicy, GitIdentity, PublishMode, RunId, RunRecord, TaskId,
+            TaskLimits, TaskMeta, TaskMetaInput, TaskSource,
+        },
+        project::ProjectInspector,
     },
-    transfer_repo::TransferRepo,
+    transfer::{git::GitTransport, repo::TransferRepo},
 };
 use support::GitRepo;
 use uuid::Uuid;
@@ -194,7 +194,7 @@ fn origin_preflight_requires_the_exact_advertised_object_and_redacts_the_url() {
         stdout: b"0123456789012345678901234567890123456788 refs/heads/main\n".to_vec(),
         stderr: b"remote diagnostic with secret\n".to_vec(),
     });
-    let base: mac_worker::task::BaseOid =
+    let base: mac_worker::test_support::task::model::BaseOid =
         "0123456789012345678901234567890123456789".parse().unwrap();
     let error = GitTransport::new(&runner)
         .preflight_origin(
@@ -222,14 +222,22 @@ fn origin_base_reference_resolution_is_read_only() {
     let repo = GitRepo::init();
     repo.write("base.txt", b"base\n");
     repo.commit_all("base");
-    let before = mac_worker::transfer_repo::RepositoryFingerprint::capture(repo.root()).unwrap();
-    let context = ProjectInspector::new(&mac_worker::process::SystemProcessRunner)
-        .inspect(repo.root())
-        .unwrap();
-    let base =
-        TransferRepo::resolve_base_oid(&mac_worker::process::SystemProcessRunner, &context, "HEAD")
+    let before =
+        mac_worker::test_support::transfer::repo::RepositoryFingerprint::capture(repo.root())
             .unwrap();
-    let after = mac_worker::transfer_repo::RepositoryFingerprint::capture(repo.root()).unwrap();
+    let context =
+        ProjectInspector::new(&mac_worker::test_support::host::process::SystemProcessRunner)
+            .inspect(repo.root())
+            .unwrap();
+    let base = TransferRepo::resolve_base_oid(
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+        &context,
+        "HEAD",
+    )
+    .unwrap();
+    let after =
+        mac_worker::test_support::transfer::repo::RepositoryFingerprint::capture(repo.root())
+            .unwrap();
     assert_eq!(base.as_str().len(), 40);
     assert_eq!(
         before, after,
@@ -242,9 +250,9 @@ fn origin_fetch_uses_only_the_normalized_url_and_exact_base_oid() {
     let mirror_root = tempfile::tempdir().unwrap();
     let mirror = RootedDir::create(&mirror_root.path().join("mirror")).unwrap();
     let runner = support::recording_runner::RecordingRunner::returning_success();
-    let base: mac_worker::task::BaseOid =
+    let base: mac_worker::test_support::task::model::BaseOid =
         "0123456789012345678901234567890123456789".parse().unwrap();
-    mac_worker::git_transport::GitTransport::new(&runner)
+    mac_worker::test_support::transfer::git::GitTransport::new(&runner)
         .fetch_origin(
             "https://user:secret@EXAMPLE.test/repo.git?token=secret",
             &base,
@@ -350,7 +358,7 @@ fn origin_push_failure_has_a_stable_code_without_remote_output() {
     assert_eq!(error.public_code(), "PUBLISH_FAILED");
     assert_eq!(
         error.exit_kind(),
-        mac_worker::error::ExitKind::Infrastructure
+        mac_worker::test_support::core::error::ExitKind::Infrastructure
     );
     assert!(!format!("{error:?}").contains("secret"));
 }

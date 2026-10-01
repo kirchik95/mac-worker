@@ -6,38 +6,38 @@
 //! machinery; binds use the real registry API. No worker binary is spawned.
 
 use crate::support;
+use mac_worker::test_support::cli::from_parts;
 
 use std::{
     collections::BTreeMap, ffi::OsString, io::Cursor, os::unix::fs::PermissionsExt, path::PathBuf,
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command as WorkerCommand, HostCommand},
-    client_state::ClientStateStore,
-    controller::batch::{BatchKind, FrozenBatchBody},
+    client_state::{
+        ClientStateStore,
+        dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState},
+    },
     controller::{
         ControllerCommandHandler, ControllerFault, ControllerStore, OperationMeta,
+        batch::{BatchKind, FrozenBatchBody},
         canonical_request_sha256,
         protocol::{ControllerRequest, decode_frame, encode_frame},
         registry::ProjectRegistry,
     },
-    dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState},
-    error::WorkerError,
-    git_transport::GitTransport,
-    job::RequestFingerprint,
-    paths::PathLayout,
-    prepared_submit::FrozenSubmitBody,
-    process::SystemProcessRunner,
-    protocol::PROTOCOL_VERSION,
-    run_with_stdio_in_context,
+    core::{error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{job::RequestFingerprint, process::SystemProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, TaskId,
+            TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
+            TurnId, TurnSummary, TurnTerminal,
+        },
+        prepared_submit::FrozenSubmitBody,
     },
-    transfer_repo::TransferRepo,
+    transfer::{git::GitTransport, repo::TransferRepo},
 };
 use serde_json::{Value, json};
 use support::GitRepo;
@@ -147,7 +147,7 @@ impl ControllerCommandHandler for PassthroughDurable {
 
     fn execute(
         &self,
-        _record: &mac_worker::controller::DurableRequest,
+        _record: &mac_worker::test_support::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
         Ok(Value::Null)
     }
@@ -166,8 +166,8 @@ fn persist_durable(
         "body": body,
     }))
     .unwrap();
-    let request =
-        mac_worker::controller::parse_request(&payload).expect("valid controller request");
+    let request = mac_worker::test_support::controller::parse_request(&payload)
+        .expect("valid controller request");
     let fingerprint = canonical_request_sha256(PROTOCOL_VERSION, command, &body).unwrap();
     let store = ControllerStore::open(&isolated.paths.controller_state_root()).unwrap();
     store
@@ -443,13 +443,13 @@ fn seed_result(isolated: &Isolated, label: &[u8]) -> BaseOid {
 }
 
 fn host_controller_rpc_cli() -> Cli {
-    Cli {
-        config: None,
-        json: false,
-        command: WorkerCommand::Host {
+    from_parts(
+        None,
+        false,
+        WorkerCommand::Host {
             command: HostCommand::ControllerRpc,
         },
-    }
+    )
 }
 
 fn prepare_frame(task_id: TaskId, request_id: &str) -> Vec<u8> {
@@ -831,12 +831,12 @@ fn completed_followup_imported_prepares_and_fetches_normally() {
             laptop_transfer.path(),
         )
         .expect("real result fetch");
-    let imported = mac_worker::controller::import_controller_result(
+    let imported = mac_worker::test_support::controller::import_controller_result(
         &laptop_transfer,
         &RUNNER,
         &laptop.root().join(".git"),
         &request_hex(0x33),
-        &mac_worker::controller::VerifiedResultMeta {
+        &mac_worker::test_support::controller::VerifiedResultMeta {
             task_id: task_n(0x7001),
             turn_id: turn_n(0x7003),
             imported_oid: second.clone(),

@@ -13,15 +13,17 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    error::{ProcessError, ProcessStream, WorkerError},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project::{ProjectContext, ProjectInspector},
-    project_config::{
-        ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings, TaskSettings,
+use mac_worker::test_support::{
+    core::error::{ProcessError, ProcessStream, WorkerError},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    task::{
+        model::{BaseOid, GitIdentity, TaskId},
+        project::{ProjectContext, ProjectInspector},
+        project_config::{
+            ArtifactSettings, ProjectSettings, ResourceClass, SnapshotSettings, TaskSettings,
+        },
     },
-    task::{BaseOid, GitIdentity, TaskId},
-    transfer_repo::{BaseKind, RepositoryFingerprint, TransferRepo, repo_id_for},
+    transfer::repo::{BaseKind, RepositoryFingerprint, TransferRepo, repo_id_for},
 };
 use support::{GitRepo, create_directory, recording_runner::RecordingRunner};
 use uuid::Uuid;

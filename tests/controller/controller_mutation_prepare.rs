@@ -26,36 +26,37 @@ use std::{
     },
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         ClientStateWritePoint,
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    config::Config,
     controller::{
         ActiveResumeConfig, ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler,
         drain::set_drained,
     },
-    error::WorkerError,
-    job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    protocol::PROTOCOL_VERSION,
-    scheduler::{CandidateSlot, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnId, TurnSummary, TurnTerminal,
+        client::TaskClient,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{TaskCloseRequest, TaskCloseResponse},
+        turn_runner::InlineRunnerExecutor,
     },
-    task_client::TaskClient,
-    task_store::{TaskCloseRequest, TaskCloseResponse},
     transfer::HostOperation,
-    turn_runner::InlineRunnerExecutor,
 };
 use serde_json::{Value, json};
 use support::GitRepo;
@@ -171,7 +172,7 @@ impl ProcessInspector for DeadOwnerReusedInspector {
     fn identity_for_pid(
         &self,
         pid: u32,
-    ) -> Result<ProcessIdentity, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessIdentity, mac_worker::test_support::core::error::WorkerError> {
         ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
     }
 
@@ -377,7 +378,7 @@ impl Fixture {
         assert!(
             matches!(
                 claimed.entry().state(),
-                mac_worker::job::QueueState::Dispatching { .. }
+                mac_worker::test_support::host::job::QueueState::Dispatching { .. }
             ),
             "fixture row must be dispatching"
         );
@@ -557,13 +558,13 @@ impl Fixture {
     }
 }
 
-fn questions_request(command: &str) -> mac_worker::controller::ControllerRequest {
+fn questions_request(command: &str) -> mac_worker::test_support::controller::ControllerRequest {
     let extra = if command == "task.say" {
         json!({"message": "human choice"})
     } else {
         json!({})
     };
-    mac_worker::controller::parse_request(&mutation_request(
+    mac_worker::test_support::controller::parse_request(&mutation_request(
         command,
         &request_hex(0x51),
         task_body(0x5001, extra),
@@ -800,7 +801,7 @@ fn questions_controller_say_retries_dead_finalizer_within_one_tick() {
         &state,
         &InlineRunnerExecutor,
     );
-    let tick = mac_worker::controller::health::ControllerTickReport::collect(
+    let tick = mac_worker::test_support::controller::health::ControllerTickReport::collect(
         &journal,
         &handler,
         || client.tick_selected_recovery(),
@@ -963,11 +964,14 @@ fn prepare_via_adapter(
     command: &str,
     request_id: &str,
     body: serde_json::Value,
-) -> Result<mac_worker::controller::OperationMeta, mac_worker::error::WorkerError> {
+) -> Result<
+    mac_worker::test_support::controller::OperationMeta,
+    mac_worker::test_support::core::error::WorkerError,
+> {
     let payload = mutation_request(command, request_id, body);
-    let request = mac_worker::controller::parse_request(&payload).unwrap();
+    let request = mac_worker::test_support::controller::parse_request(&payload).unwrap();
     let handler = TaskSubmitHandler::new(&RUNNER, &fixture.config, &fixture.paths, store);
-    mac_worker::controller::ControllerCommandHandler::prepare(&handler, &request)
+    mac_worker::test_support::controller::ControllerCommandHandler::prepare(&handler, &request)
 }
 
 fn task_body(task: u128, extra: serde_json::Value) -> serde_json::Value {
@@ -981,11 +985,17 @@ fn task_body(task: u128, extra: serde_json::Value) -> serde_json::Value {
     Value::Object(body)
 }
 
-fn row_entry(store: &ClientStateStore, turn: u128) -> Option<mac_worker::job::QueueEntry> {
+fn row_entry(
+    store: &ClientStateStore,
+    turn: u128,
+) -> Option<mac_worker::test_support::host::job::QueueEntry> {
     store.queue_entry(turn_n(turn)).unwrap()
 }
 
-fn frozen_expected(command: &str, meta: &mac_worker::controller::OperationMeta) -> Value {
+fn frozen_expected(
+    command: &str,
+    meta: &mac_worker::test_support::controller::OperationMeta,
+) -> Value {
     match command {
         "task.say" => meta.prepared["prepared"]["expected"].clone(),
         _ => meta.prepared["expected"].clone(),

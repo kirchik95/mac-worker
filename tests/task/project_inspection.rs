@@ -5,10 +5,10 @@ use std::{
     sync::Mutex,
 };
 
-use mac_worker::{
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project::ProjectInspector,
+use mac_worker::test_support::{
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    task::project::ProjectInspector,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;

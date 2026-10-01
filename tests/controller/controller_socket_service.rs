@@ -1,4 +1,4 @@
-use mac_worker::controller::channel::{
+use mac_worker::test_support::channel::{
     contracts::*,
     server::{ChildRpcExecutor, NativeControl, ServerDeps, ShutdownEvidence, SocketService},
     testing::{
@@ -6,11 +6,11 @@ use mac_worker::controller::channel::{
         identity_fixture, request_fixture, result_fixture,
     },
 };
-use mac_worker::error::{ProcessError, WorkerError};
-use mac_worker::{
-    controller::channel::contracts::{ChannelFailure, ChannelReason, FrameDecoder, SocketIdentity},
+use mac_worker::test_support::core::error::{ProcessError, WorkerError};
+use mac_worker::test_support::{
+    channel::contracts::{ChannelFailure, ChannelReason, FrameDecoder, SocketIdentity},
     controller::{MAX_FRAME_BYTES, decode_frame, decode_request, encode_frame, encode_json_frame},
-    process::{CleanupState, ProcessCompletion, ProcessResult, TrackedProcessRunner},
+    host::process::{CleanupState, ProcessCompletion, ProcessResult, TrackedProcessRunner},
 };
 use std::os::unix::net::UnixListener;
 use std::{
@@ -61,11 +61,11 @@ impl ChannelCodec for Codec {
     }
     fn encode_reply(
         &self,
-        request: &mac_worker::controller::ControllerRequest,
+        request: &mac_worker::test_support::controller::ControllerRequest,
         result: &ProcessResult,
     ) -> Result<Vec<u8>, ChannelFailure> {
         let payload = decode_frame(&result.stdout).map_err(|_| invalid())?;
-        let reply: mac_worker::controller::ControllerReadReply<serde_json::Value> =
+        let reply: mac_worker::test_support::controller::ControllerReadReply<serde_json::Value> =
             serde_json::from_slice(payload).map_err(|_| invalid())?;
         reply.verify_envelope(request).map_err(|_| invalid())?;
         StubCodec.encode_reply(request, result)
@@ -73,7 +73,7 @@ impl ChannelCodec for Codec {
     fn decode_reply(
         &self,
         payload: &[u8],
-        request: &mac_worker::controller::ControllerRequest,
+        request: &mac_worker::test_support::controller::ControllerRequest,
     ) -> Result<ProcessResult, ChannelFailure> {
         StubCodec.decode_reply(payload, request)
     }
@@ -627,7 +627,7 @@ struct RealProcessExecutor {
 impl ChannelExecutor for RealProcessExecutor {
     fn run(&self, frame: &[u8], ctx: &ServerContext) -> ProcessCompletion {
         self.calls.fetch_add(1, Ordering::AcqRel);
-        use mac_worker::process::{
+        use mac_worker::test_support::host::process::{
             ProcessPolicy, ProcessRequest, SystemProcessRunner, TrackedProcessRunner,
         };
         let request = ProcessRequest {
@@ -651,7 +651,7 @@ impl ChannelExecutor for RealProcessExecutor {
         let cancelled = matches!(
             &completion.outcome,
             Err(WorkerError::Process(
-                mac_worker::error::ProcessError::Cancelled
+                mac_worker::test_support::core::error::ProcessError::Cancelled
             ))
         );
         let _ = self.completed.send((cancelled, completion.cleanup));
@@ -1022,13 +1022,13 @@ s.close()
 mod child_cases {
 
     use super::*;
-    use mac_worker::{
-        controller::channel::contracts::{
+    use mac_worker::test_support::{
+        channel::contracts::{
             ChannelRuntime, DETACHED_RUNNER_EXECUTABLE_ENV, EntryIdentity, PinnedExecutable,
         },
         controller::{MAX_FRAME_BYTES, encode_json_frame},
-        error::ProcessError,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        core::error::ProcessError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
     };
     use std::{
         ffi::OsString,

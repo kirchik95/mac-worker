@@ -8,8 +8,9 @@ use std::{
     thread,
 };
 
-use mac_worker::{
-    client_state::ClientStateStore, job::AdmissionObservation, scheduler::CandidateSlot,
+use mac_worker::test_support::{
+    client_state::{ClientStateStore, scheduler::CandidateSlot},
+    host::job::AdmissionObservation,
 };
 
 fn temp_state() -> (tempfile::TempDir, ClientStateStore) {

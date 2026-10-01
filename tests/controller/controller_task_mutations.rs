@@ -18,32 +18,32 @@ use std::{
     },
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
-    config::Config,
     controller::{
         ActiveResumeConfig, ControllerFault, ControllerStore, PreparedTaskMutation, RequestPhase,
         TaskSubmitHandler, execute_task_mutation, parse_request, prepare_task_mutation,
     },
-    error::WorkerError,
-    job::ProcessIdentity,
-    paths::PathLayout,
-    prepared_followup::PreparedFollowup,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    protocol::PROTOCOL_VERSION,
-    supervisor::{ProcessInspector, ProcessObservation},
-    task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::ProcessIdentity,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{ProcessInspector, ProcessObservation},
     },
-    task_client::TaskClient,
-    task_store::{TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse},
-    transfer::HostOperation,
-    transfer_repo::repo_id_for,
-    turn_runner::RunnerExecutor,
+    task::{
+        client::TaskClient,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
+            TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        prepared_followup::PreparedFollowup,
+        project_state::ProjectState,
+        store::{TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse},
+        turn_runner::RunnerExecutor,
+    },
+    transfer::{HostOperation, repo::repo_id_for},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -68,15 +68,15 @@ impl ProcessInspector for LiveOwners {
     fn observe_group(
         &self,
         _process_group: u32,
-    ) -> mac_worker::supervisor::ProcessGroupObservation {
-        mac_worker::supervisor::ProcessGroupObservation::Ambiguous
+    ) -> mac_worker::test_support::host::supervisor::ProcessGroupObservation {
+        mac_worker::test_support::host::supervisor::ProcessGroupObservation::Ambiguous
     }
 
     fn observe_group_members(
         &self,
         _leader: u32,
-    ) -> mac_worker::supervisor::ProcessGroupMembership {
-        mac_worker::supervisor::ProcessGroupMembership::Ambiguous
+    ) -> mac_worker::test_support::host::supervisor::ProcessGroupMembership {
+        mac_worker::test_support::host::supervisor::ProcessGroupMembership::Ambiguous
     }
 }
 
@@ -102,12 +102,11 @@ impl RunnerExecutor for CountingExecutor {
         _paths: &PathLayout,
         _task_id: TaskId,
         _turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        Ok(mac_worker::task::RunnerIdentity::new(ProcessIdentity::new(
-            support::fixture_pid(2_000_000_011),
-            9_999_999,
-        )?))
+        Ok(mac_worker::test_support::task::model::RunnerIdentity::new(
+            ProcessIdentity::new(support::fixture_pid(2_000_000_011), 9_999_999)?,
+        ))
     }
 }
 
@@ -278,7 +277,7 @@ fn request(
     request_id: &str,
     command: &str,
     body: Value,
-) -> mac_worker::controller::ControllerRequest {
+) -> mac_worker::test_support::controller::ControllerRequest {
     let payload = serde_json::to_vec(&json!({
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
@@ -1233,8 +1232,11 @@ fn questions_controller_say_cas_loser_resumes_published_evidence() {
     let preparation =
         TaskSubmitHandler::new(&host, &harness.config, &harness.paths, &harness.store);
     let journal = ControllerStore::open(&harness.paths.controller_state_root()).unwrap();
-    mac_worker::controller::drain::set_drained(&harness.paths.controller_state_root(), true)
-        .unwrap();
+    mac_worker::test_support::controller::drain::set_drained(
+        &harness.paths.controller_state_root(),
+        true,
+    )
+    .unwrap();
     journal
         .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
         .unwrap();
@@ -1309,7 +1311,7 @@ fn questions_close_conflict_after_retained_cancel_stays_retryable() {
     journal
         .handle_with(&envelope, &preparation, ControllerFault::StopAfterPublish)
         .unwrap();
-    let owner = mac_worker::supervisor::SystemProcessInspector
+    let owner = mac_worker::test_support::host::supervisor::SystemProcessInspector
         .identity_for_pid(std::process::id())
         .unwrap();
     harness
@@ -1319,17 +1321,17 @@ fn questions_close_conflict_after_retained_cancel_stays_retryable() {
     harness
         .store
         .enqueue(
-            mac_worker::job::QueueEntry::new(
+            mac_worker::test_support::host::job::QueueEntry::new(
                 turn_id,
                 harness.store.client_id(),
                 harness.project_id.clone(),
                 harness.worktree_id.clone(),
-                mac_worker::job::CommandSummary::argv(2).unwrap(),
+                mac_worker::test_support::host::job::CommandSummary::argv(2).unwrap(),
                 Vec::new(),
-                mac_worker::scheduler::WorkerPreference::Pinned {
+                mac_worker::test_support::client_state::scheduler::WorkerPreference::Pinned {
                     worker: "mini-1".into(),
                 },
-                mac_worker::job::QueueEntryKind::TaskTurn,
+                mac_worker::test_support::host::job::QueueEntryKind::TaskTurn,
                 None,
                 owner,
                 3,

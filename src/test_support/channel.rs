@@ -1,5 +1,6 @@
 //! Explicit integration-test access for channel contracts.
 
+pub use crate::controller::channel::contracts::{ControllerAccount, Pin, ServiceIdentity};
 pub use crate::controller::channel::{
     CHANNEL_VERSION, ChannelCodec, ChannelExecutor, ChannelFailure, ChannelReason, ChannelRuntime,
     ChildRpcSpec, CleanupContext, ClientContext, ClientDeps, ConfiguredRoute,
@@ -35,6 +36,9 @@ pub mod contracts {
         SERVICE_SCHEMA_VERSION, SETUP_GUARD, SOCKET_PATH_BYTES, ServerContext, SocketBinding,
         SocketConnector, SocketIdentity, SocketIdentityResult, SocketSession, UuidString,
         eligible_read, server_eligible_read, verify_expected_service,
+    };
+    pub use crate::controller::channel::contracts::{
+        ControllerAccount, Pin, ServiceIdentity, ServiceRecord,
     };
 }
 pub mod files {

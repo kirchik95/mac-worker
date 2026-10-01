@@ -10,36 +10,45 @@ use std::{
     sync::Mutex,
 };
 
-use mac_worker::{
-    agent::{
-        AgentKind, PermissionPolicy, adapter_for, parse_prebind_session_ref, prebind_login_request,
-        render_prebind_shell,
+use mac_worker::test_support::{
+    agents::{
+        agent::{
+            AgentKind, PermissionPolicy, adapter_for, parse_prebind_session_ref,
+            prebind_login_request, render_prebind_shell,
+        },
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
     },
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
-    client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    host_store::HostStore,
-    job::{
-        CommandSpec, HostControlError, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, SubmitResponse,
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
+    core::{
+        config::Config,
+        error::WorkerError,
+        protocol::{
+            CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        },
     },
-    lease::SlotState,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    scheduler::WorkerPreference,
+    host::{
+        job::{
+            CommandSpec, HostControlError, JobMeta, JobStatus, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, SubmitResponse,
+        },
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::HostStore,
+    },
     task::{
-        ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
-    },
-    task_client::{TaskClient, TaskSubmitRequest},
-    task_store::{
-        SessionBinding, TaskPrebindRequest, TaskPrepareRequest, TaskPrepareResponse,
-        TaskSessionRequest, TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
+        client::{TaskClient, TaskSubmitRequest},
+        model::{
+            ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        store::{
+            SessionBinding, TaskPrebindRequest, TaskPrepareRequest, TaskPrepareResponse,
+            TaskSessionRequest, TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
+        },
+        turn::{TaskTurnRequest, TaskTurnResponse, prebind_session},
+        turn_runner::InlineRunnerExecutor,
     },
     transfer::HostOperation,
-    turn::{TaskTurnRequest, TaskTurnResponse, prebind_session},
-    turn_runner::InlineRunnerExecutor,
 };
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
@@ -390,7 +399,8 @@ impl ProcessRunner for RecordingHost {
                 canonical_process(&TaskTurnResponse::new(submit, active))
             }
             value if value == HostOperation::Status.command() => {
-                let query: mac_worker::job::StatusRequest = decode_request(request)?;
+                let query: mac_worker::test_support::host::job::StatusRequest =
+                    decode_request(request)?;
                 let state = self.state.lock().unwrap();
                 let meta = state
                     .native_job
@@ -402,15 +412,15 @@ impl ProcessRunner for RecordingHost {
                 } else {
                     JobStatus::succeeded(meta.created_at_millis() + 2, 0, 0)?
                 };
-                canonical_process(&mac_worker::job::StatusResponse::new(meta, status)?)
+                canonical_process(&mac_worker::test_support::host::job::StatusResponse::new(
+                    meta, status,
+                )?)
             }
             value if value == HostOperation::LogChunk.command() => {
                 let chunk_request: LogChunkRequest = decode_request(request)?;
-                let response = mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                    chunk_request.stream(),
-                    chunk_request.offset(),
-                    Vec::new(),
-                )?)?;
+                let response = mac_worker::test_support::host::job::LogChunkResponse::new(
+                    LogChunk::new(chunk_request.stream(), chunk_request.offset(), Vec::new())?,
+                )?;
                 canonical_process(&response)
             }
             value if value == HostOperation::StatusLogs.command() => {
@@ -429,7 +439,7 @@ struct TaskHarness {
     _current_dir: CurrentDirGuard,
     _state_root: tempfile::TempDir,
     _profile_root: Option<tempfile::TempDir>,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     state: ClientStateStore,
     config: Config,
     runner: RecordingHost,
@@ -835,12 +845,17 @@ fn cursor_and_opencode_prompts_require_an_exact_json_final_message() {
 fn cursor_workspace_policy_records_permission_fallback() {
     let launch = adapter_for(AgentKind::Cursor)
         .resume_turn(
-            &mac_worker::agent::TurnParams {
+            &mac_worker::test_support::agents::agent::TurnParams {
                 kind: AgentKind::Cursor,
                 model: None,
                 effort: None,
                 policy: PermissionPolicy::Workspace,
-                limits: mac_worker::agent::TurnLimits::new(45 * 60 * 1000, None, None).unwrap(),
+                limits: mac_worker::test_support::agents::agent::TurnLimits::new(
+                    45 * 60 * 1000,
+                    None,
+                    None,
+                )
+                .unwrap(),
                 session_seed: uuid::Uuid::from_u128(1),
                 allow_permission_fallback: true,
             },
@@ -867,11 +882,17 @@ fn malformed_and_truncated_trailer_results_remain_unknown() {
     let truncated = adapter
         .extract_result("```mac-worker-result\n{\"status\":\"done\"", None)
         .unwrap();
-    assert_eq!(truncated.status(), mac_worker::agent::ResultStatus::Unknown);
+    assert_eq!(
+        truncated.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::Unknown
+    );
     let malformed = adapter_for(AgentKind::Opencode)
         .extract_result("```mac-worker-result\nnot-json\n```", None)
         .unwrap();
-    assert_eq!(malformed.status(), mac_worker::agent::ResultStatus::Unknown);
+    assert_eq!(
+        malformed.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::Unknown
+    );
 }
 
 #[test]
@@ -1003,7 +1024,7 @@ fn prebind_login_request_runs_the_command_through_a_login_shell() {
             std::ffi::OsString::from("exec '/bin/echo' 'prebind-ok'"),
         ]
     );
-    let result = mac_worker::process::SystemProcessRunner
+    let result = mac_worker::test_support::host::process::SystemProcessRunner
         .run(&request)
         .unwrap();
     assert!(
@@ -1026,7 +1047,10 @@ fn cursor_live_markdown_final_message_stays_unknown() {
     let result = adapter_for(AgentKind::Cursor)
         .extract_result(&cursor_fixture("stream-json.jsonl"), None)
         .unwrap();
-    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Unknown);
+    assert_eq!(
+        result.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::Unknown
+    );
 }
 
 #[test]
@@ -1034,7 +1058,10 @@ fn cursor_extracts_the_json_object_ending_the_final_message() {
     let result = adapter_for(AgentKind::Cursor)
         .extract_result(&cursor_fixture("final-json.jsonl"), None)
         .unwrap();
-    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Done);
+    assert_eq!(
+        result.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::Done
+    );
     assert_eq!(result.summary(), "smoke file created");
     assert_eq!(result.files_changed(), &["scratch/cursor-smoke.txt"]);
 }
@@ -1044,7 +1071,10 @@ fn cursor_extracts_a_fenced_json_object_from_the_final_message() {
     let result = adapter_for(AgentKind::Cursor)
         .extract_result(&cursor_fixture("final-fenced.jsonl"), None)
         .unwrap();
-    assert_eq!(result.status(), mac_worker::agent::ResultStatus::Done);
+    assert_eq!(
+        result.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::Done
+    );
     assert_eq!(result.summary(), "smoke file created");
 }
 
@@ -1053,23 +1083,29 @@ fn cursor_extracts_needs_input_from_the_final_message() {
     let result = adapter_for(AgentKind::Cursor)
         .extract_result(&cursor_fixture("final-needs-input.jsonl"), None)
         .unwrap();
-    assert_eq!(result.status(), mac_worker::agent::ResultStatus::NeedsInput);
+    assert_eq!(
+        result.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::NeedsInput
+    );
     assert_eq!(
         result.questions(),
-        &[mac_worker::agent::Question::open("alpha or beta?")]
+        &[mac_worker::test_support::agents::agent::Question::open(
+            "alpha or beta?"
+        )]
     );
 }
 
 #[test]
 fn cursor_live_fixture_captures_the_session_id() {
     let adapter = adapter_for(AgentKind::Cursor);
-    let events: Vec<mac_worker::agent::AgentEvent> = cursor_fixture("stream-json.jsonl")
-        .lines()
-        .filter_map(|line| adapter.parse_event(line))
-        .collect();
+    let events: Vec<mac_worker::test_support::agents::agent::AgentEvent> =
+        cursor_fixture("stream-json.jsonl")
+            .lines()
+            .filter_map(|line| adapter.parse_event(line))
+            .collect();
     assert!(matches!(
         events.first(),
-        Some(mac_worker::agent::AgentEvent::SessionStarted { session_ref }) if session_ref == "2df4613a-3015-46d8-9f06-b595b06988f4"
+        Some(mac_worker::test_support::agents::agent::AgentEvent::SessionStarted { session_ref }) if session_ref == "2df4613a-3015-46d8-9f06-b595b06988f4"
     ));
 }
 

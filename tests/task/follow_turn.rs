@@ -18,18 +18,22 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, Question, TurnLimits},
-    error::WorkerError,
-    failure_receipt::STAGE_FOLLOW,
-    follow_turn::{follow_turn, follow_turn_with_poll_interval},
-    host_store::HostStore,
-    job::{ClientId, CommandSpec, JobId, JobStatus, LeaseToken, RequestFingerprintMaterial},
-    task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, Question, TurnLimits},
+    core::{error::WorkerError, failure_receipt::STAGE_FOLLOW},
+    host::{
+        job::{ClientId, CommandSpec, JobId, JobStatus, LeaseToken, RequestFingerprintMaterial},
+        store::HostStore,
     },
-    turn::{TurnMaterial, TurnSection},
+    task::{
+        follow_turn::{follow_turn, follow_turn_with_poll_interval},
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
+            TurnTerminal,
+        },
+        turn::{TurnMaterial, TurnSection},
+    },
 };
 use tempfile::{TempDir, tempdir};
 use uuid::Uuid;

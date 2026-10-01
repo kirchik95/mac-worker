@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::transfer_repo::TransferRepo;
+use mac_worker::test_support::transfer::repo::TransferRepo;
 
 pub const FAKE_CONTROLLER_DEST: &str = "fakecontroller";
 pub const FAKE_EXEC_DEST: &str = "fakeexec";

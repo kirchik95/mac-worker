@@ -3,23 +3,25 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    job::JobId,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    task::{
-        BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
-        TaskState, TaskStatus, TurnSummary, TurnTerminal,
+    core::{config::Config, error::WorkerError, paths::PathLayout},
+    host::{
+        job::JobId,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     },
-    task_client::{TaskClient, WaitSelector},
-    task_store::TaskStatusResponse,
+    task::{
+        client::{TaskClient, WaitSelector},
+        model::{
+            BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
+            PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
+            TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        },
+        store::TaskStatusResponse,
+        turn_runner::InlineRunnerExecutor,
+    },
     transfer::HostOperation,
-    turn_runner::InlineRunnerExecutor,
 };
 use uuid::Uuid;
 
@@ -204,7 +206,7 @@ fn wait_once(
     paths: &PathLayout,
     store: &ClientStateStore,
     task: TaskId,
-) -> mac_worker::task_client::WaitReport {
+) -> mac_worker::test_support::task::client::WaitReport {
     let config = task_config();
     let client = TaskClient::new(remote, &config, paths, store, &InlineRunnerExecutor);
     client
@@ -215,7 +217,10 @@ fn wait_once(
 fn wait_planted(
     record: LocalTaskRecord,
     remote: &TaskRemoteRunner,
-) -> (mac_worker::task_client::WaitReport, LocalTaskRecord) {
+) -> (
+    mac_worker::test_support::task::client::WaitReport,
+    LocalTaskRecord,
+) {
     let state_root = tempfile::tempdir().unwrap();
     let paths = isolated_paths(state_root.path().canonicalize().unwrap());
     let store = ClientStateStore::open(&paths.state).unwrap();

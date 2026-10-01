@@ -13,7 +13,7 @@ use harness::{
     laptop_task_authority, oversize_length_prefix, run_worker, ssh_log_entries,
     ssh_logged_commands, ssh_saw_controller_rpc,
 };
-use mac_worker::{controller::encode_frame, protocol::PROTOCOL_VERSION};
+use mac_worker::test_support::{controller::encode_frame, core::protocol::PROTOCOL_VERSION};
 use serde_json::json;
 
 fn assert_no_laptop_task_authority(homes: &IsolatedHomes) {
@@ -26,7 +26,7 @@ fn assert_no_laptop_task_authority(homes: &IsolatedHomes) {
     );
 }
 
-fn authority_files(paths: &mac_worker::paths::PathLayout) -> Vec<String> {
+fn authority_files(paths: &mac_worker::test_support::core::paths::PathLayout) -> Vec<String> {
     let mut found = Vec::new();
     for name in ["tasks", "queue", "runners", "turns", "runs", "dags"] {
         let root = paths.state.join(name);
@@ -165,7 +165,7 @@ fn rpc_child_rejects_frozen_submit_without_source_receipt() {
         error.error().message()
     );
     assert_ne!(code, "CONTROLLER_UNAVAILABLE");
-    let payload = mac_worker::controller::decode_frame(&output.stdout).unwrap();
+    let payload = mac_worker::test_support::controller::decode_frame(&output.stdout).unwrap();
     let value: serde_json::Value = serde_json::from_slice(payload).unwrap();
     assert_ne!(
         value.get("status").and_then(|status| status.as_str()),

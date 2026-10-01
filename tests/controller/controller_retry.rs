@@ -1,18 +1,16 @@
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::Config,
     controller::{
         ControllerRequest, canonical_request_sha256, decode_frame, encode_json_frame,
         load_operation_envelope, parse_request, persist_operation_envelope,
     },
-    error::WorkerError,
-    job::HostControlError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    run_with_io_in_context,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::HostControlError,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    runtime::{RuntimeContext, run_with_io_in_context},
 };
 use serde_json::{Value, json};
 use std::{
@@ -344,7 +342,7 @@ fn retry_settles_normally_with_an_invalid_adoption_marker() {
             .unwrap()
             .unwrap()
             .outcome(),
-        Some(&mac_worker::controller::OperationOutcome::Acknowledged)
+        Some(&mac_worker::test_support::controller::OperationOutcome::Acknowledged)
     );
 }
 

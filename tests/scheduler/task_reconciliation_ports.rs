@@ -3,19 +3,20 @@ use crate::{
     task_diagnostics_ports::{PublicRuntime, runtime, seed_task},
     task_ports_fixture::{canonical, config},
 };
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
-    config::Config,
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    core::{config::Config, error::WorkerError},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
     task::{
-        LocalTaskRecord, TaskId, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        client::{TaskClient, TaskListFilter},
+        model::{
+            LocalTaskRecord, TaskId, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal,
+        },
+        store::{TaskStatusRequest, TaskStatusResponse},
+        turn_runner::InlineRunnerExecutor,
+        view::TaskFreshness,
     },
-    task_client::{TaskClient, TaskListFilter},
-    task_store::{TaskStatusRequest, TaskStatusResponse},
-    task_view::TaskFreshness,
     transfer::HostOperation,
-    turn_runner::InlineRunnerExecutor,
 };
 use std::{
     collections::BTreeMap,
@@ -63,10 +64,12 @@ impl ProcessRunner for StatusReader {
                     code: "SSH_UNAVAILABLE",
                     message: "fixture host unreachable".into(),
                 },
-                Failure::Timeout => mac_worker::error::ProcessError::DeadlineExceeded {
-                    deadline: request.policy.deadline,
+                Failure::Timeout => {
+                    mac_worker::test_support::core::error::ProcessError::DeadlineExceeded {
+                        deadline: request.policy.deadline,
+                    }
+                    .into()
                 }
-                .into(),
             });
         }
         if let Some((entered, release)) = &self.gate

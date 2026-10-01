@@ -1,6 +1,10 @@
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
-use mac_worker::{
+use mac_worker::test_support::{
+    core::protocol::{
+        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse,
+        SUPERVISION_VERSION, WorkerHealth,
+    },
     dashboard::{
         model::{DashboardError, DashboardQueueEntry, DashboardSnapshot},
         service::{
@@ -8,16 +12,12 @@ use mac_worker::{
         },
         source::project_worker,
     },
-    lease::SlotState,
-    protocol::{
-        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse,
-        SUPERVISION_VERSION, WorkerHealth,
-    },
+    host::lease::SlotState,
 };
 
 #[test]
 fn cache_counters_sums_coordinated_probe_ticks_without_overflow() {
-    let counters = mac_worker::dashboard::source::cache_counters(CpuCounters {
+    let counters = mac_worker::test_support::dashboard::source::cache_counters(CpuCounters {
         user_ticks: 100,
         system_ticks: 200,
         idle_ticks: 300,
@@ -28,7 +28,7 @@ fn cache_counters_sums_coordinated_probe_ticks_without_overflow() {
     assert_eq!(counters.total_ticks(), 1_000);
     assert_eq!(counters.idle_ticks(), 300);
     assert!(
-        mac_worker::dashboard::source::cache_counters(CpuCounters {
+        mac_worker::test_support::dashboard::source::cache_counters(CpuCounters {
             user_ticks: u64::MAX,
             system_ticks: 1,
             idle_ticks: 0,
@@ -76,7 +76,7 @@ fn reset_or_missing_probe_counters_emit_null_and_keep_other_probe_facts() {
     assert_eq!(missing.workers[0].system.total_disk_bytes, Some(1_000));
     assert_eq!(
         missing.workers[0].system.memory_pressure,
-        Some(mac_worker::dashboard::model::DashboardMemoryPressure::Warn)
+        Some(mac_worker::test_support::dashboard::model::DashboardMemoryPressure::Warn)
     );
     assert_eq!(missing.workers[0].system.swap_used_bytes, Some(42));
     let wire = serde_json::to_string(&missing).unwrap();
@@ -98,7 +98,7 @@ fn invalid_probe_counter_pair_does_not_make_the_worker_unavailable() {
     assert_eq!(observation.worker.system.free_disk_bytes, Some(400));
     assert_eq!(
         observation.worker.health,
-        mac_worker::dashboard::model::WorkerHealth::Ready
+        mac_worker::test_support::dashboard::model::WorkerHealth::Ready
     );
 }
 

@@ -15,23 +15,26 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    error::WorkerError,
-    host_store::HostStore,
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    core::{error::WorkerError, protocol::MemoryPressure},
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::HostStore,
     },
-    lease::{AdmissionFacts, LeaseService},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::MemoryPressure,
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskSource, TaskState, TaskStatus,
-    },
-    task_store::{
-        SessionBinding, TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest, TaskStore,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskSource, TaskState, TaskStatus,
+        },
+        store::{
+            SessionBinding, TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest, TaskStore,
+        },
     },
 };
 use support::GitRepo;

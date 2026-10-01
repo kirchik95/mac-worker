@@ -1,13 +1,15 @@
-use mac_worker::{
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
-    config::{Config, WorkerEntry},
-    error::WorkerError,
-    lease::SlotState,
-    protocol::{
-        CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+use mac_worker::test_support::{
+    agents::agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+    client_state::{scheduler::CandidateSlot, scheduler_adapter::SchedulerProbeAdapter},
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        protocol::{
+            CpuCounters, HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse,
+            WorkerHealth,
+        },
     },
-    scheduler::CandidateSlot,
-    scheduler_adapter::SchedulerProbeAdapter,
+    host::lease::SlotState,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -15,7 +17,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 fn config() -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![WorkerEntry {
@@ -82,7 +84,8 @@ fn previous_protocol_probe_is_ineligible_for_scheduling() {
     // Accepting the N-1 wire version would silently omit the scheduler and
     // dashboard facts the current probe carries.
     let mut health = ready_health();
-    health.probe.as_mut().unwrap().protocol_version = mac_worker::protocol::PROTOCOL_VERSION - 1;
+    health.probe.as_mut().unwrap().protocol_version =
+        mac_worker::test_support::core::protocol::PROTOCOL_VERSION - 1;
 
     assert!(matches!(
         SchedulerProbeAdapter::observations(&config(), &[health]),
@@ -98,10 +101,10 @@ fn unavailable_or_missing_probe_projects_to_busy_unready_policy_fact() {
     health.probe = None;
 
     let facts = SchedulerProbeAdapter::observations(&config(), &[health]).unwrap();
-    let ranked = mac_worker::scheduler::SchedulerPolicy::rank(
+    let ranked = mac_worker::test_support::client_state::scheduler::SchedulerPolicy::rank(
         &facts,
         &["node".into()],
-        &mac_worker::scheduler::AffinityHints::none(),
+        &mac_worker::test_support::client_state::scheduler::AffinityHints::none(),
     );
 
     assert!(ranked.is_empty());
@@ -144,7 +147,7 @@ fn ready_probe_without_memory_fact_preserves_unavailable_memory() {
 
 #[test]
 fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
-    use mac_worker::agent_facts::{AgentFacts, HerdrFactState, HerdrFacts};
+    use mac_worker::test_support::agents::agent_facts::{AgentFacts, HerdrFactState, HerdrFacts};
 
     let mut health = ready_health();
     let probe = health.probe.as_mut().unwrap();
@@ -179,14 +182,16 @@ fn adapter_threads_interactive_agents_from_a_fresh_herdr_fact() {
         }),
         origin_https_helpers: Default::default(),
     });
-    probe.facts_age_millis = Some(mac_worker::agent_facts::FACTS_TTL + 1);
+    probe.facts_age_millis = Some(mac_worker::test_support::agents::agent_facts::FACTS_TTL + 1);
     let stale_facts = SchedulerProbeAdapter::observations(&config(), &[stale]).unwrap();
     assert_eq!(stale_facts[0].interactive_agents(), None);
 }
 
 #[test]
 fn a_turn_auth_failure_reason_is_not_an_agent_capability() {
-    let reason = mac_worker::agent_facts::turn_auth_failure_reason(1_704_067_200_000).unwrap();
+    let reason =
+        mac_worker::test_support::agents::agent_facts::turn_auth_failure_reason(1_704_067_200_000)
+            .unwrap();
     let mut health = ready_health();
     let probe = health.probe.as_mut().unwrap();
     probe.agent_facts = Some(AgentFacts {

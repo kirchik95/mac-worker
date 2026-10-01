@@ -1,9 +1,9 @@
-use mac_worker::{
+use mac_worker::test_support::{
     dashboard::{
         model::{DashboardCommandMode, DashboardCommandSummary, DashboardQueueEntryKind},
         queue::{PhaseFourQueueEntry, PhaseFourQueueReader, SchedulerQueueAdapter},
     },
-    job::JobId,
+    host::job::JobId,
 };
 
 const SSH_SECRET: &str = "operator@mini-1.internal";
@@ -60,7 +60,8 @@ struct FakeQueue {
 impl PhaseFourQueueReader for FakeQueue {
     fn ordered_pending(
         &self,
-    ) -> Result<Vec<PhaseFourQueueEntry>, mac_worker::dashboard::model::DashboardError> {
+    ) -> Result<Vec<PhaseFourQueueEntry>, mac_worker::test_support::dashboard::model::DashboardError>
+    {
         Ok(self.rows.clone())
     }
 }

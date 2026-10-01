@@ -1,12 +1,14 @@
 //! Real T2 wire and Unix session acceptance on the frozen T1 contracts.
 
-use mac_worker::controller::channel::{
+use mac_worker::test_support::channel::{
     codec::{FramedSocketConnector, SessionCodec},
     contracts::*,
     testing::{ManualRuntime, identity_fixture, request_fixture, result_fixture},
 };
-use mac_worker::controller::protocol::{MAX_FRAME_BYTES, decode_frame, encode_frame};
-use mac_worker::{controller::protocol::ControllerRequest, process::ProcessResult};
+use mac_worker::test_support::controller::protocol::{MAX_FRAME_BYTES, decode_frame, encode_frame};
+use mac_worker::test_support::{
+    controller::protocol::ControllerRequest, host::process::ProcessResult,
+};
 use serde_json::{Value, json};
 
 fn identity_json() -> Value {
@@ -469,10 +471,10 @@ fn reply_wrap_accepts_the_exact_whole_frame_cap() {
 
 mod io {
     use super::*;
-    use mac_worker::controller::channel::contracts::{
+    use mac_worker::test_support::channel::contracts::{
         ChannelRuntime, DecodeProgress, FrameDecoder,
     };
-    use mac_worker::controller::protocol::{
+    use mac_worker::test_support::controller::protocol::{
         decode_frame, encode_frame, encode_json_frame, parse_request,
     };
     use serde_json::{Value, json};
@@ -523,7 +525,9 @@ mod io {
         let mut prefix = [0; 4];
         stream.read_exact(&mut prefix).unwrap();
         let len = u32::from_be_bytes(prefix) as usize;
-        assert!((1..=mac_worker::controller::protocol::MAX_FRAME_BYTES).contains(&len));
+        assert!(
+            (1..=mac_worker::test_support::controller::protocol::MAX_FRAME_BYTES).contains(&len)
+        );
         let mut payload = vec![0; len];
         stream.read_exact(&mut payload).unwrap();
         payload

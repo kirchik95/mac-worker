@@ -22,31 +22,37 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::WorkerEntry,
-    error::WorkerError,
-    failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP, STAGE_DRAIN},
-    host_store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
-    job::{
-        CancelRequest, CancelResponse, ClientId, CommandSpec, HostControlError, JobId, JobMeta,
-        JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
-        LogChunk, LogChunkRequest, LogChunkResponse, LogCursor, LogStream, ProcessIdentity,
-        RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusRequest,
-        StatusResponse, SubmitRequest, SubmitResponse, TerminalLogDrain,
+    core::{
+        config::WorkerEntry,
+        error::WorkerError,
+        failure_receipt::{RESIDUAL_LEASE, RESIDUAL_WORKSPACE, STAGE_CLEANUP, STAGE_DRAIN},
+        paths::PathLayout,
+        protocol::MemoryPressure,
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    lease::{AdmissionFacts, LeaseService},
-    paths::PathLayout,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::MemoryPressure,
-    run_with_stdio_in_context,
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
-        ReconciliationRuntime, Supervisor, SystemProcessInspector,
+    host::{
+        job::{
+            CancelRequest, CancelResponse, ClientId, CommandSpec, HostControlError, JobId, JobMeta,
+            JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
+            LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogCursor, LogStream,
+            ProcessIdentity, RequestFingerprintMaterial, ResolveOrAbandonOutcome,
+            ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusLogsRequest,
+            StatusLogsResponse, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+            TerminalLogDrain,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+        lease::{AdmissionFacts, LeaseService},
+        process::{
+            ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner,
+        },
+        store::{HostStore, HostStoreWritePoint, JobDisposition, SupervisorGuard},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+            ReconciliationRuntime, Supervisor, SystemProcessInspector,
+        },
     },
+    runtime::{RuntimeContext, run_with_stdio_in_context},
     transfer::{
         HostOperation, HostTransferService, RemoteJobClient, ResolutionRuntime, SshJsonTransport,
     },
@@ -169,7 +175,7 @@ impl ProcessInspector for ScriptedReconciliation {
     fn identity_for_pid(
         &self,
         _pid: u32,
-    ) -> Result<ProcessIdentity, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessIdentity, mac_worker::test_support::core::error::WorkerError> {
         panic!("orphan reconciliation must never derive a new process identity")
     }
 
@@ -208,7 +214,7 @@ impl ReconciliationRuntime for ScriptedReconciliation {
         &self,
         process_group: u32,
         signal: i32,
-    ) -> Result<(), mac_worker::error::WorkerError> {
+    ) -> Result<(), mac_worker::test_support::core::error::WorkerError> {
         self.inner
             .signals
             .lock()
@@ -220,9 +226,11 @@ impl ReconciliationRuntime for ScriptedReconciliation {
             .is_some_and(|expected| *expected == signal)
         {
             *fail_signal = None;
-            return Err(mac_worker::error::WorkerError::Protocol(format!(
-                "injected signal failure {signal}"
-            )));
+            return Err(
+                mac_worker::test_support::core::error::WorkerError::Protocol(format!(
+                    "injected signal failure {signal}"
+                )),
+            );
         }
         Ok(())
     }
@@ -321,7 +329,7 @@ impl SupervisorLauncher for RejectLauncher {
         &self,
         _job_id: JobId,
         _guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         panic!("a missing job must not launch a supervisor")
     }
 }
@@ -331,11 +339,14 @@ impl SupervisorLauncher for HoldingRecordingLauncher {
         &self,
         _job_id: JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
-        let current: JobStatus =
-            serde_json::from_slice(&fs::read(self.job_path.join("status.json"))?)
-                .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let current: JobStatus = serde_json::from_slice(&fs::read(
+            self.job_path.join("status.json"),
+        )?)
+        .map_err(|error| {
+            mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+        })?;
         let enriched = current.with_supervisor(self.identity, current.updated_at_millis() + 1)?;
         replace_json(&self.job_path.join("status.json"), &enriched)?;
         *self.guard.lock().unwrap() = Some(guard);
@@ -348,7 +359,7 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
         &self,
         job_id: JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         Supervisor::new(&self.store, &inspector)
@@ -363,13 +374,16 @@ impl SupervisorLauncher for BlockingLauncher {
         &self,
         _job_id: JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         self.entered.send(()).unwrap();
         self.release.lock().unwrap().recv().unwrap();
-        let current: JobStatus =
-            serde_json::from_slice(&fs::read(self.job_path.join("status.json"))?)
-                .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let current: JobStatus = serde_json::from_slice(&fs::read(
+            self.job_path.join("status.json"),
+        )?)
+        .map_err(|error| {
+            mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+        })?;
         let enriched = current.with_supervisor(self.identity, current.updated_at_millis() + 1)?;
         replace_json(&self.job_path.join("status.json"), &enriched)?;
         drop(guard);
@@ -382,11 +396,13 @@ impl SupervisorLauncher for CountingRejectLauncher {
         &self,
         _job_id: JobId,
         _guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
-        Err(mac_worker::error::WorkerError::Protocol(
-            "unexpected second launch".into(),
-        ))
+        Err(
+            mac_worker::test_support::core::error::WorkerError::Protocol(
+                "unexpected second launch".into(),
+            ),
+        )
     }
 }
 
@@ -395,11 +411,14 @@ impl SupervisorLauncher for PrelaunchLostLauncher {
         &self,
         _job_id: JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
-        let current: JobStatus =
-            serde_json::from_slice(&fs::read(self.job_path.join("status.json"))?)
-                .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let current: JobStatus = serde_json::from_slice(&fs::read(
+            self.job_path.join("status.json"),
+        )?)
+        .map_err(|error| {
+            mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+        })?;
         let lost = current
             .with_supervisor(self.identity, current.updated_at_millis() + 1)?
             .into_infrastructure_terminal(
@@ -421,14 +440,14 @@ impl SupervisorLauncher for SpoofedPrelaunchFailureLauncher {
         &self,
         _job_id: JobId,
         _guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let attempt = self.launches.fetch_add(1, Ordering::SeqCst);
         let message = if attempt == 0 {
             "SUPERVISOR_PRELAUNCH_FAILED: synthetic launcher failure"
         } else {
             "SECOND_LAUNCH: status retried an uncommitted launch"
         };
-        Err(mac_worker::error::WorkerError::Protocol(message.into()))
+        Err(mac_worker::test_support::core::error::WorkerError::Protocol(message.into()))
     }
 }
 
@@ -1276,14 +1295,15 @@ fn resolve_without_a_live_lease_fences_delayed_acquire_and_executes_nothing() {
         let admission = verify_store.admission_lock(prepare_submit.material().job_id())?;
         let transfer =
             verify_store.transfer_lock_after(&admission, prepare_submit.material().job_id())?;
-        mac_worker::task_store::TaskStore::new(&verify_store, &SystemProcessRunner).prepare(
-            &mac_worker::task_store::TaskPrepareRequest::new(
-                meta,
-                prepare_submit.material().job_id(),
-                "mini-1",
-            ),
-            &transfer,
-        )
+        mac_worker::test_support::task::store::TaskStore::new(&verify_store, &SystemProcessRunner)
+            .prepare(
+                &mac_worker::test_support::task::store::TaskPrepareRequest::new(
+                    meta,
+                    prepare_submit.material().job_id(),
+                    "mini-1",
+                ),
+                &transfer,
+            )
     });
     let submit_store = store.clone();
     let submit_attempting = attempting_tx.clone();
@@ -4874,7 +4894,7 @@ fn submit_requires_a_matching_live_lease_without_a_disposition() {
     );
 
     let error = JobService::new(&same_job_store, &RejectLauncher)
-        .submit_turn(mac_worker::turn::TaskTurnRequest::new(
+        .submit_turn(mac_worker::test_support::task::turn::TaskTurnRequest::new(
             changed.with_execution_scope(request.execution_scope().clone()),
             turn.turn().clone(),
             super::supervisor::HOST_SAFETY_TURN_PROMPT,
@@ -6101,8 +6121,10 @@ fn endpoint_runtime_and_completed_job(
         .unwrap();
     let response = StatusResponse::new(
         match &completed {
-            mac_worker::job::SubmitResponse::Accepted { meta, .. } => (**meta).clone(),
-            mac_worker::job::SubmitResponse::Existing { .. } => unreachable!(),
+            mac_worker::test_support::host::job::SubmitResponse::Accepted { meta, .. } => {
+                (**meta).clone()
+            }
+            mac_worker::test_support::host::job::SubmitResponse::Existing { .. } => unreachable!(),
         },
         completed.status().clone(),
     )
@@ -6173,8 +6195,10 @@ fn hidden_query_endpoints_are_argument_free_and_return_one_canonical_typed_line(
         LogChunk::new(LogStream::Stderr, 0, Vec::new()).unwrap(),
     )
     .unwrap();
-    let expected_resolve =
-        mac_worker::job::ResolveOrAbandonResponse::accepted(expected_status.clone()).unwrap();
+    let expected_resolve = mac_worker::test_support::host::job::ResolveOrAbandonResponse::accepted(
+        expected_status.clone(),
+    )
+    .unwrap();
     let cases = [
         (
             "status",
@@ -6445,7 +6469,7 @@ fn matrix_runtime(temp: &tempfile::TempDir) -> (RuntimeContext, PathBuf) {
 fn matrix_remote_resolve(
     runner: &MatrixEndpointRunner,
     request: &ResolveOrAbandonRequest,
-) -> mac_worker::job::ResolveOrAbandonResponse {
+) -> mac_worker::test_support::host::job::ResolveOrAbandonResponse {
     SshJsonTransport::new(runner)
         .request(
             &matrix_worker(),
@@ -6467,12 +6491,12 @@ fn matrix_resolver_before_mutator<M, R>(
     ready_event: &'static str,
     complete_event: &'static str,
 ) -> (
-    mac_worker::job::ResolveOrAbandonResponse,
+    mac_worker::test_support::host::job::ResolveOrAbandonResponse,
     Result<(LeaseRecord, SubmitResponse), WorkerError>,
 )
 where
     M: FnOnce() -> Result<(LeaseRecord, SubmitResponse), WorkerError> + Send,
-    R: FnOnce() -> mac_worker::job::ResolveOrAbandonResponse,
+    R: FnOnce() -> mac_worker::test_support::host::job::ResolveOrAbandonResponse,
 {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -6504,11 +6528,11 @@ fn matrix_mutator_before_resolver<M, R>(
     complete_event: &'static str,
 ) -> (
     Result<(LeaseRecord, SubmitResponse), WorkerError>,
-    mac_worker::job::ResolveOrAbandonResponse,
+    mac_worker::test_support::host::job::ResolveOrAbandonResponse,
 )
 where
     M: FnOnce() -> Result<(LeaseRecord, SubmitResponse), WorkerError>,
-    R: FnOnce() -> mac_worker::job::ResolveOrAbandonResponse + Send,
+    R: FnOnce() -> mac_worker::test_support::host::job::ResolveOrAbandonResponse + Send,
 {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -6908,8 +6932,8 @@ fn lease_request() -> LeaseAcquireRequest {
         )
         .unwrap(),
     )
-    .with_execution_scope(mac_worker::job::ExecutionScope::task(
-        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(17)),
+    .with_execution_scope(mac_worker::test_support::host::job::ExecutionScope::task(
+        mac_worker::test_support::task::model::TaskId::new(uuid::Uuid::from_u128(17)),
     ))
 }
 
@@ -6937,8 +6961,10 @@ fn lease_request_with_identity(
         )
         .unwrap(),
     )
-    .with_execution_scope(mac_worker::job::ExecutionScope::task(
-        mac_worker::task::TaskId::new(uuid::Uuid::parse_str(&job_id.to_string()).unwrap()),
+    .with_execution_scope(mac_worker::test_support::host::job::ExecutionScope::task(
+        mac_worker::test_support::task::model::TaskId::new(
+            uuid::Uuid::parse_str(&job_id.to_string()).unwrap(),
+        ),
     ))
 }
 
@@ -7012,11 +7038,13 @@ impl TaskQueryProducer<'_> {
     fn submit_frozen(
         &self,
         request: SubmitRequest,
-        turn: &mac_worker::turn::TurnMaterial,
+        turn: &mac_worker::test_support::task::turn::TurnMaterial,
     ) -> Result<SubmitResponse, WorkerError> {
         self.service
-            .submit_turn(mac_worker::turn::TaskTurnRequest::new(
-                request.with_execution_scope(mac_worker::job::ExecutionScope::task(turn.task_id())),
+            .submit_turn(mac_worker::test_support::task::turn::TaskTurnRequest::new(
+                request.with_execution_scope(
+                    mac_worker::test_support::host::job::ExecutionScope::task(turn.task_id()),
+                ),
                 turn.clone(),
                 super::supervisor::HOST_SAFETY_TURN_PROMPT,
             ))
@@ -7645,14 +7673,21 @@ fn remove_and_sync(path: &Path) {
         .unwrap();
 }
 
-fn assert_error_code(error: mac_worker::error::WorkerError, expected: &str, context: &str) {
+fn assert_error_code(
+    error: mac_worker::test_support::core::error::WorkerError,
+    expected: &str,
+    context: &str,
+) {
     assert!(
         error.to_string().contains(expected),
         "{context}: expected {expected}, got {error}"
     );
 }
 
-fn assert_after_term_kill_grace(error: &mac_worker::error::WorkerError, context: &str) {
+fn assert_after_term_kill_grace(
+    error: &mac_worker::test_support::core::error::WorkerError,
+    context: &str,
+) {
     let message = error.to_string();
     assert!(
         message.contains("RECONCILIATION_AMBIGUOUS"),
@@ -7666,7 +7701,10 @@ fn assert_after_term_kill_grace(error: &mac_worker::error::WorkerError, context:
     );
 }
 
-fn assert_after_ambiguous_grace(error: &mac_worker::error::WorkerError, context: &str) {
+fn assert_after_ambiguous_grace(
+    error: &mac_worker::test_support::core::error::WorkerError,
+    context: &str,
+) {
     let message = error.to_string();
     assert!(
         message.contains("RECONCILIATION_AMBIGUOUS"),
@@ -7693,11 +7731,13 @@ fn identity(seed: u32) -> ProcessIdentity {
 mod task_turn_ports {
     use super::super::supervisor::HOST_SAFETY_TURN_PROMPT;
     use super::*;
-    use mac_worker::{
-        job::ExecutionScope,
-        task::{TaskId, TaskMeta},
-        task_store::{TaskPrepareRequest, TaskStore},
-        turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
+    use mac_worker::test_support::{
+        host::job::ExecutionScope,
+        task::{
+            model::{TaskId, TaskMeta},
+            store::{TaskPrepareRequest, TaskStore},
+            turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
+        },
     };
 
     pub(super) fn matrix_task_request(
@@ -8183,7 +8223,7 @@ mod task_turn_ports {
         submit: &SubmitRequest,
         launches: &Arc<AtomicUsize>,
         runner: &MatrixEndpointRunner,
-    ) -> mac_worker::job::ResolveOrAbandonResponse {
+    ) -> mac_worker::test_support::host::job::ResolveOrAbandonResponse {
         let request = ResolveOrAbandonRequest::from_submit_request(submit).unwrap();
         if boundary == 3 {
             let launcher = MatrixInlineLauncher {
@@ -8289,7 +8329,7 @@ mod task_turn_ports {
                             .load_status(manifest.project_id(), manifest.task_id())
                             .unwrap()
                             .state(),
-                        mac_worker::task::TaskState::Active
+                        mac_worker::test_support::task::model::TaskState::Active
                     );
                     assert!(
                         !store
@@ -8625,7 +8665,7 @@ mod task_turn_ports {
                     }
                     runner.lose_success_responses.store(1, Ordering::SeqCst);
                     let lost = SshJsonTransport::new(&runner)
-                        .request::<_, mac_worker::job::ResolveOrAbandonResponse>(
+                        .request::<_, mac_worker::test_support::host::job::ResolveOrAbandonResponse>(
                         &matrix_worker(),
                         HostOperation::ResolveOrAbandon,
                         &resolve,

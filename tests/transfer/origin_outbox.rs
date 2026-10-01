@@ -17,33 +17,41 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
-    error::WorkerError,
-    git_transport::{GitTransport, OBJECT_STORE_SYNC_RECEIPT, ORIGIN_AUTH_FAILED},
-    host_store::{HostGc, HostStore, HostStoreWritePoint},
-    job::{
-        CancelRequest, ClientId, CommandSpec, ExecutionScope, JobId, JobState, LeaseAcquireRequest,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial, StatusLogsRequest, SubmitRequest,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
+        laptop::{BinaryIdentity, FixedBinaryIdentitySource},
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    laptop::{BinaryIdentity, FixedBinaryIdentitySource},
-    lease::{AdmissionFacts, LeaseService, SlotState},
-    outbox::{
-        DELIVERY_ALREADY_DELIVERED, DELIVERY_NOT_FOUND, DELIVERY_UNREADABLE, DeliveryCommit,
-        OUTBOX_BUSY, OUTBOX_WORKER_REQUIRED, OriginOutbox, OutboxActivation, OutboxLauncher,
-        due_index_reads_for, task_directory_scans_for,
+    core::{error::WorkerError, protocol::MemoryPressure},
+    host::{
+        job::{
+            CancelRequest, ClientId, CommandSpec, ExecutionScope, JobId, JobState,
+            LeaseAcquireRequest, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+            StatusLogsRequest, SubmitRequest,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+        lease::{AdmissionFacts, LeaseService, SlotState},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::{HostGc, HostStore, HostStoreWritePoint},
+        supervisor::{Supervisor, SystemProcessInspector},
     },
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::MemoryPressure,
-    supervisor::{Supervisor, SystemProcessInspector},
     task::{
-        BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-        TurnTerminal,
+        model::{
+            BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TurnTerminal,
+        },
+        store::{TaskCloseRequest, TaskPrepareRequest, TaskStore},
+        turn::{TaskTurnRequest, TurnMaterial},
     },
-    task_store::{TaskCloseRequest, TaskPrepareRequest, TaskStore},
-    turn::{TaskTurnRequest, TurnMaterial},
+    transfer::{
+        git::{GitTransport, OBJECT_STORE_SYNC_RECEIPT, ORIGIN_AUTH_FAILED},
+        outbox::{
+            DELIVERY_ALREADY_DELIVERED, DELIVERY_NOT_FOUND, DELIVERY_UNREADABLE, DeliveryCommit,
+            OUTBOX_BUSY, OUTBOX_WORKER_REQUIRED, OriginOutbox, OutboxActivation, OutboxLauncher,
+            due_index_reads_for, task_directory_scans_for,
+        },
+    },
 };
 use serde::{Deserialize, Serialize};
 use support::GitRepo;
@@ -92,7 +100,7 @@ impl OutboxLauncher for CountingLauncher {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublishedOutboxWorker {
-    identity: mac_worker::job::ProcessIdentity,
+    identity: mac_worker::test_support::host::job::ProcessIdentity,
     watch: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     binary: Option<BinaryIdentity>,
@@ -115,7 +123,7 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
     fn launch(
         &self,
         job_id: JobId,
-        guard: mac_worker::host_store::SupervisorGuard,
+        guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
@@ -503,7 +511,7 @@ fn commit_for(
     oid: &BaseOid,
     turn: JobId,
     now: u64,
-) -> mac_worker::task::OriginDelivery {
+) -> mac_worker::test_support::task::model::OriginDelivery {
     let branch: BranchName = "release-candidate".parse().unwrap();
     OriginOutbox::new(store, &SystemProcessRunner)
         .commit_intent(DeliveryCommit {
@@ -524,7 +532,7 @@ fn commit(
     oid: &BaseOid,
     turn: JobId,
     now: u64,
-) -> mac_worker::task::OriginDelivery {
+) -> mac_worker::test_support::task::model::OriginDelivery {
     commit_for(store, PROJECT_ID, task_id(1), origin, oid, turn, now)
 }
 
@@ -1162,7 +1170,7 @@ fn https_origin_username_prompt_records_origin_auth_failed_with_a_publish_receip
     assert_eq!(error.public_code(), ORIGIN_AUTH_FAILED);
     assert_eq!(
         error.failure_receipt().unwrap().stage(),
-        mac_worker::failure_receipt::STAGE_PUBLISH
+        mac_worker::test_support::core::failure_receipt::STAGE_PUBLISH
     );
     release_lease(&store, &request);
 }
@@ -2905,7 +2913,10 @@ fn packed_baseline_receipt_is_retained_when_pin_publication_fails() {
     assert_eq!(delivery_pack_stats(&mirror_path), (0, 0));
 }
 
-fn exhaust_until_failed(store: &HostStore, mut now: u64) -> mac_worker::task::OriginDelivery {
+fn exhaust_until_failed(
+    store: &HostStore,
+    mut now: u64,
+) -> mac_worker::test_support::task::model::OriginDelivery {
     let mut last = None;
     for _ in 0..20 {
         let results = outbox(store).pump_due(now).unwrap();

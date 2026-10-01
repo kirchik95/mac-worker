@@ -1,5 +1,5 @@
 //! Controller channel integration: isolated leaders, scoped loops and recovery.
-use mac_worker::controller::channel::{server_eligible_read, testing::request_fixture};
+use mac_worker::test_support::channel::{server_eligible_read, testing::request_fixture};
 use serde_json::json;
 
 #[test]
@@ -11,12 +11,10 @@ fn gate_raw_operator_setters_are_ineligible() {
 
 // Share T7a's isolated leader fixtures; T7b's loop/route cases follow this block.
 mod t7a {
-    use mac_worker::{
-        controller::{
-            ControllerRequest, channel::contracts::*, channel::testing::request_fixture,
-            decode_frame, encode_json_frame,
-        },
-        paths::PathLayout,
+    use mac_worker::test_support::{
+        channel::{contracts::*, testing::request_fixture},
+        controller::{ControllerRequest, decode_frame, encode_json_frame},
+        core::paths::PathLayout,
     };
     use serde_json::{Value, json};
     use std::{
@@ -37,12 +35,12 @@ mod t7a {
     // the injected clock must never accelerate unlinking a real worker image.
     mod link_retention {
         use super::*;
-        use mac_worker::controller::{
-            ControllerLeader,
+        use mac_worker::test_support::{
             channel::{
                 files::{LeaderSocketLease, RetentionTime, bind_leader_at},
                 testing::{ManualRuntime, identity_fixture},
             },
+            controller::ControllerLeader,
         };
         use std::cell::Cell;
 
@@ -232,9 +230,10 @@ mod t7a {
                 .controller_state_root()
                 .join("rpc/service.json");
             let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            record["service"]["leader"] =
-                serde_json::to_value(mac_worker::job::ProcessIdentity::new(999999, 1).unwrap())
-                    .unwrap();
+            record["service"]["leader"] = serde_json::to_value(
+                mac_worker::test_support::host::job::ProcessIdentity::new(999999, 1).unwrap(),
+            )
+            .unwrap();
             fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
             fixture.clock.advance(Duration::from_secs(3600));
             fixture.stop(fixture.start(), true);
@@ -299,7 +298,8 @@ mod t7a {
                 .join("rpc/service.json");
             let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             record["service"]["leader"] = serde_json::to_value(
-                mac_worker::job::ProcessIdentity::new(crate::fixture_pid(1), 1).unwrap(),
+                mac_worker::test_support::host::job::ProcessIdentity::new(crate::fixture_pid(1), 1)
+                    .unwrap(),
             )
             .unwrap();
             fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
@@ -720,7 +720,7 @@ mod t7a {
     }
 
     async fn receive(stream: &tokio::net::UnixStream) -> Option<Vec<u8>> {
-        use mac_worker::controller::channel::codec::SessionCodec;
+        use mac_worker::test_support::channel::codec::SessionCodec;
         let mut decoder = SessionCodec::new().decoder();
         loop {
             stream.readable().await.unwrap();
@@ -742,8 +742,12 @@ mod t7a {
         courier: PathBuf,
     }
     impl ChannelExecutor for LiveRpc {
-        fn run(&self, frame: &[u8], ctx: &ServerContext) -> mac_worker::process::ProcessCompletion {
-            use mac_worker::process::{
+        fn run(
+            &self,
+            frame: &[u8],
+            ctx: &ServerContext,
+        ) -> mac_worker::test_support::host::process::ProcessCompletion {
+            use mac_worker::test_support::host::process::{
                 ProcessPolicy, ProcessRequest, SystemProcessRunner, TrackedProcessRunner,
             };
             let script = format!(
@@ -782,13 +786,13 @@ mod t7a {
     }
 
     fn shutdown_exit(mode: &str) {
-        use mac_worker::controller::{
+        use mac_worker::test_support::{
             channel::{
                 codec::SessionCodec,
                 server::{NativeControl, ServerDeps, SocketService},
                 testing::{ManualRuntime, identity_fixture},
             },
-            runtime::run_tick_loop_with_shutdown,
+            controller::runtime::run_tick_loop_with_shutdown,
         };
         use std::{
             os::unix::net::{UnixDatagram, UnixListener},
@@ -857,9 +861,11 @@ mod t7a {
                     joined.store(true, Ordering::Release);
                     Ok(None)
                 } else if mode == "tick" {
-                    Err(mac_worker::error::WorkerError::Unavailable(
-                        "TICK_FIXTURE: tick failed".into(),
-                    ))
+                    Err(
+                        mac_worker::test_support::core::error::WorkerError::Unavailable(
+                            "TICK_FIXTURE: tick failed".into(),
+                        ),
+                    )
                 } else if mode == "emit" {
                     Ok(Some("diagnostic".into()))
                 } else {
@@ -915,7 +921,7 @@ mod t7a {
             }
             "tick" => assert_eq!(result.unwrap_err().public_code(), "TICK_FIXTURE"),
             "emit" => assert!(
-                matches!(result, Err(mac_worker::error::WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                matches!(result, Err(mac_worker::test_support::core::error::WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
             ),
             _ => assert_eq!(result.unwrap_err().public_code(), "CONTROLLER_TRANSPORT"),
         }
@@ -941,14 +947,18 @@ mod t7a {
     fn seed_task(
         fixture: &Fixture,
         parked: bool,
-    ) -> (mac_worker::task::TaskId, mac_worker::task::TurnId) {
-        use mac_worker::{
-            agent::{AgentKind, PermissionPolicy},
-            client_state::ClientStateStore,
-            job::{CommandSummary, QueueEntry, QueueEntryKind},
-            scheduler::WorkerPreference,
-            supervisor::SystemProcessInspector,
-            task::{
+    ) -> (
+        mac_worker::test_support::task::model::TaskId,
+        mac_worker::test_support::task::model::TurnId,
+    ) {
+        use mac_worker::test_support::{
+            agents::agent::{AgentKind, PermissionPolicy},
+            client_state::{ClientStateStore, scheduler::WorkerPreference},
+            host::{
+                job::{CommandSummary, QueueEntry, QueueEntryKind},
+                supervisor::SystemProcessInspector,
+            },
+            task::model::{
                 ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
                 TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
                 TurnSummary, TurnTerminal,
@@ -1166,7 +1176,7 @@ mod t7a {
 
     #[test]
     fn journal_missing_or_failed_still_serves_wait_and_logs_with_event_errors_unchanged() {
-        use mac_worker::controller::channel::{
+        use mac_worker::test_support::channel::{
             codec::{FramedSocketConnector, SessionCodec},
             testing::ManualRuntime,
         };
@@ -1263,22 +1273,20 @@ mod t7a {
     fn native_inputs(
         fixture: &Fixture,
     ) -> (
-        std::sync::Arc<mac_worker::controller::ControllerLeader>,
-        mac_worker::controller::runtime::LeaderChannelConfig,
-        mac_worker::controller::runtime::LeaderChannelDeps,
+        std::sync::Arc<mac_worker::test_support::controller::ControllerLeader>,
+        mac_worker::test_support::controller::runtime::LeaderChannelConfig,
+        mac_worker::test_support::controller::runtime::LeaderChannelDeps,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
-        use mac_worker::{
+        use mac_worker::test_support::{
+            channel::{server::NativeControl, testing::ScriptedImageSource},
             client_state::ClientStateStore,
-            controller::{
-                channel::{server::NativeControl, testing::ScriptedImageSource},
-                runtime::{LeaderChannelConfig, LeaderChannelDeps, SystemChannelRuntime},
-            },
-            process::SystemProcessRunner,
+            controller::runtime::{LeaderChannelConfig, LeaderChannelDeps, SystemChannelRuntime},
+            host::process::SystemProcessRunner,
         };
         use std::sync::{Arc, atomic::AtomicBool};
         let leader = Arc::new(
-            mac_worker::controller::ControllerLeader::acquire(
+            mac_worker::test_support::controller::ControllerLeader::acquire(
                 &fixture.paths.controller_state_root(),
             )
             .unwrap(),
@@ -1311,7 +1319,7 @@ mod t7a {
         )
     }
 
-    async fn channel_ready(channel: &mac_worker::controller::runtime::LeaderChannel) {
+    async fn channel_ready(channel: &mac_worker::test_support::controller::runtime::LeaderChannel) {
         tokio::time::timeout(GUARD, async {
             while !channel.ready() {
                 assert!(!channel.retired(), "optional channel unexpectedly retired");
@@ -1324,12 +1332,12 @@ mod t7a {
 
     #[test]
     fn journal_initialization_hint_never_queries_window_as_a_startup_precondition() {
-        use mac_worker::controller::{
+        use mac_worker::test_support::{
+            controller::runtime::LeaderChannel,
             events::{
                 JournalReader,
                 journal::{ControllerJournal, JournalFaultPoint, JournalOptions},
             },
-            runtime::LeaderChannel,
         };
         use std::sync::{
             Arc,
@@ -1344,7 +1352,7 @@ mod t7a {
             &fixture.paths,
             &leader,
             JournalOptions {
-                runtime: mac_worker::ControllerEventRuntime::system(),
+                runtime: mac_worker::test_support::runtime::ControllerEventRuntime::system(),
             },
             Arc::new(move |point| {
                 if matches!(point, JournalFaultPoint::ReadAttempt)
@@ -1357,10 +1365,10 @@ mod t7a {
             }),
         )
         .unwrap();
-        let event_runtime = mac_worker::ControllerEventRuntime::system();
+        let event_runtime = mac_worker::test_support::runtime::ControllerEventRuntime::system();
         let epoch = journal
             .window(
-                mac_worker::controller::events::EventRuntime::now(event_runtime.as_ref()) + GUARD,
+                mac_worker::test_support::events::EventRuntime::now(event_runtime.as_ref()) + GUARD,
             )
             .unwrap()
             .journal_id;
@@ -1391,7 +1399,9 @@ mod t7a {
 
     #[test]
     fn shutdown_gated_image_native_startup_keeps_signal_pollable_with_lock_held() {
-        use mac_worker::controller::runtime::{LeaderChannel, run_tick_loop_with_shutdown};
+        use mac_worker::test_support::controller::runtime::{
+            LeaderChannel, run_tick_loop_with_shutdown,
+        };
         use std::sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -1407,7 +1417,7 @@ mod t7a {
             fn capture(&self) -> Result<RunningImage, ChannelFailure> {
                 assert_ne!(std::thread::current().id(), self.caller);
                 assert_eq!(
-                    mac_worker::controller::ControllerLeader::acquire(&self.root)
+                    mac_worker::test_support::controller::ControllerLeader::acquire(&self.root)
                         .err()
                         .unwrap()
                         .public_code(),
@@ -1482,7 +1492,9 @@ mod t7a {
 
     #[test]
     fn shutdown_gated_withdrawal_control_retains_image_and_original_tick_error() {
-        use mac_worker::controller::runtime::{LeaderChannel, run_tick_loop_with_shutdown};
+        use mac_worker::test_support::controller::runtime::{
+            LeaderChannel, run_tick_loop_with_shutdown,
+        };
         let fixture = Fixture::new();
         let (leader, config, deps, stop) = native_inputs(&fixture);
         let control = deps.control.clone();
@@ -1509,9 +1521,11 @@ mod t7a {
             &runtime,
             &stop,
             || {
-                Err(mac_worker::error::WorkerError::Unavailable(
-                    "TICK_FIXTURE: retained control".into(),
-                ))
+                Err(
+                    mac_worker::test_support::core::error::WorkerError::Unavailable(
+                        "TICK_FIXTURE: retained control".into(),
+                    ),
+                )
             },
             std::future::pending(),
             |_| Ok(()),
@@ -1537,9 +1551,10 @@ mod t7a {
 
     #[test]
     fn feature_unknown_rpc_cleanup_retires_only_channel_and_preserves_image() {
-        use mac_worker::{
-            controller::{channel::testing::RecordingTrackedRunner, runtime::LeaderChannel},
-            process::{CleanupState, ProcessCompletion},
+        use mac_worker::test_support::{
+            channel::testing::RecordingTrackedRunner,
+            controller::runtime::LeaderChannel,
+            host::process::{CleanupState, ProcessCompletion},
         };
         use std::sync::{Arc, atomic::Ordering};
         let fixture = Fixture::new();
@@ -1547,9 +1562,11 @@ mod t7a {
         deps.runner = Arc::new(RecordingTrackedRunner::new(
             (0..8)
                 .map(|_| ProcessCompletion {
-                    outcome: Err(mac_worker::error::WorkerError::Unavailable(
-                        "RPC_FIXTURE: unknown exit".into(),
-                    )),
+                    outcome: Err(
+                        mac_worker::test_support::core::error::WorkerError::Unavailable(
+                            "RPC_FIXTURE: unknown exit".into(),
+                        ),
+                    ),
                     cleanup: CleanupState::Unknown,
                 })
                 .collect(),
@@ -1563,17 +1580,17 @@ mod t7a {
             channel_ready(&channel).await;
             let record = fixture.record();
             let identity = SocketIdentity { route_sha256: RouteDigest::parse(&"a".repeat(64)).unwrap(), service: record.service.clone() };
-            let codec = mac_worker::controller::channel::codec::SessionCodec::new();
+            let codec = mac_worker::test_support::channel::codec::SessionCodec::new();
             for _ in 0..8 {
                 let stream = tokio::net::UnixStream::connect(&identity.service.socket_path).await.unwrap();
                 send(&stream, &codec.encode_hello(&identity).unwrap()).await;
                 codec.decode_ready(&receive(&stream).await.unwrap(), &identity).unwrap();
-                send(&stream, &encode_json_frame(&json!({"protocol_version":7,"request_id":mac_worker::job::ClientId::generate(),"command":"task.wait.poll","body":{"task_id":"018f0f4a6b5c7d8e9f00112233445566"}})).unwrap()).await;
+                send(&stream, &encode_json_frame(&json!({"protocol_version":7,"request_id":mac_worker::test_support::host::job::ClientId::generate(),"command":"task.wait.poll","body":{"task_id":"018f0f4a6b5c7d8e9f00112233445566"}})).unwrap()).await;
                 assert!(receive(&stream).await.is_none());
             }
             tokio::time::timeout(GUARD, async { while !channel.retired() { tokio::task::yield_now().await; } }).await.unwrap();
             assert!(!stop.load(Ordering::Acquire), "channel retirement cannot stop the controller leader");
-            assert_eq!(mac_worker::controller::ControllerLeader::acquire(&fixture.paths.controller_state_root()).err().unwrap().public_code(), "CONTROLLER_LOCK_HELD");
+            assert_eq!(mac_worker::test_support::controller::ControllerLeader::acquire(&fixture.paths.controller_state_root()).err().unwrap().public_code(), "CONTROLLER_LOCK_HELD");
             (record, channel.shutdown().await)
         });
         assert_eq!(result.1.rpc.unknown, 8);
@@ -1587,15 +1604,13 @@ mod t7a {
     mod t7c {
         use super::*;
         use crate::task_state_fixture::TaskStateFixture;
-        use mac_worker::{
+        use mac_worker::test_support::{
+            channel::{codec::SessionCodec, pin::PrivatePinStore},
             client_state::ClientStateStore,
-            controller::{
-                channel::{codec::SessionCodec, pin::PrivatePinStore},
-                runtime::LeaderChannel,
-            },
-            process::ProcessRunner,
-            task::{TaskId, TurnId},
-            transfer_repo::TransferRepo,
+            controller::runtime::LeaderChannel,
+            host::process::ProcessRunner,
+            task::model::{TaskId, TurnId},
+            transfer::repo::TransferRepo,
         };
         use std::{os::fd::AsRawFd, path::Path, sync::Arc};
 
@@ -1660,7 +1675,7 @@ mod t7a {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             pub struct Wait {
-                pub task_ids: Vec<mac_worker::task::TaskId>,
+                pub task_ids: Vec<mac_worker::test_support::task::model::TaskId>,
                 pub quiescent: bool,
                 pub exit_code: u8,
             }
@@ -1672,8 +1687,8 @@ mod t7a {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             pub struct Logs {
-                pub task_id: mac_worker::task::TaskId,
-                pub turn_id: mac_worker::task::TurnId,
+                pub task_id: mac_worker::test_support::task::model::TaskId,
+                pub turn_id: mac_worker::test_support::task::model::TurnId,
                 pub turn_number: u32,
                 pub agent: String,
                 pub offset: u64,
@@ -1702,16 +1717,18 @@ mod t7a {
             }
             // bad365b read.rs: task.list rejects keys before calling list().
             pub fn task_list(
-                request: &mac_worker::controller::ControllerRequest,
-            ) -> Result<(), mac_worker::error::WorkerError> {
+                request: &mac_worker::test_support::controller::ControllerRequest,
+            ) -> Result<(), mac_worker::test_support::core::error::WorkerError> {
                 if request
                     .body()
                     .as_object()
                     .is_none_or(|body| !body.is_empty())
                 {
-                    return Err(mac_worker::error::WorkerError::Protocol(
-                        "CONTROLLER_TRANSPORT: task.list has unknown fields".into(),
-                    ));
+                    return Err(
+                        mac_worker::test_support::core::error::WorkerError::Protocol(
+                            "CONTROLLER_TRANSPORT: task.list has unknown fields".into(),
+                        ),
+                    );
                 }
                 Ok(())
             }
@@ -1795,8 +1812,8 @@ mod t7a {
 
         #[test]
         fn compatibility_old_selector_rejects_without_receipts_and_new_read_falls_back() {
-            use mac_worker::{
-                controller::channel::{
+            use mac_worker::test_support::{
+                channel::{
                     client::ChannelProcessRunner,
                     testing::{FakeForwardControl, ManualRuntime, ScriptedConnector},
                 },
@@ -1809,17 +1826,19 @@ mod t7a {
             impl ProcessRunner for Old {
                 fn run(
                     &self,
-                    request: &mac_worker::process::ProcessRequest,
-                ) -> Result<mac_worker::process::ProcessResult, mac_worker::error::WorkerError>
-                {
+                    request: &mac_worker::test_support::host::process::ProcessRequest,
+                ) -> Result<
+                    mac_worker::test_support::host::process::ProcessResult,
+                    mac_worker::test_support::core::error::WorkerError,
+                > {
                     let bytes = request.stdin.as_ref().unwrap();
                     self.calls.lock().unwrap().push(bytes.clone());
-                    let req = mac_worker::controller::decode_request(bytes).unwrap();
+                    let req = mac_worker::test_support::controller::decode_request(bytes).unwrap();
                     if req.body().get("controller_socket").is_some() {
                         baseline::task_list(&req)?;
                         panic!("old server admitted socket selector");
                     }
-                    Ok(mac_worker::process::ProcessResult { status: ExitStatus::from_raw(0), stdout: encode_json_frame(&json!({"protocol_version":7,"command":req.command(),"request_id":req.request_id(),"payload_sha256":req.payload_sha256(),"result":{"task_ids":[],"quiescent":true,"exit_code":0}})).unwrap(), stderr:vec![] })
+                    Ok(mac_worker::test_support::host::process::ProcessResult { status: ExitStatus::from_raw(0), stdout: encode_json_frame(&json!({"protocol_version":7,"command":req.command(),"request_id":req.request_id(),"payload_sha256":req.payload_sha256(),"result":{"task_ids":[],"quiescent":true,"exit_code":0}})).unwrap(), stderr:vec![] })
                 }
             }
             let fixture = Fixture::new();
@@ -1840,7 +1859,7 @@ mod t7a {
                 fixture.paths.clone(),
                 ClientDeps {
                     identity: Arc::new(
-                        mac_worker::controller::channel::identity::StdioIdentitySource::new(),
+                        mac_worker::test_support::channel::identity::StdioIdentitySource::new(),
                     ),
                     pins: Arc::new(PrivatePinStore::new()),
                     forwards: forwards.clone(),
@@ -1852,7 +1871,7 @@ mod t7a {
                 "task.wait.poll",
                 json!({"task_id":"018f0f4a6b5c7d8e9f00112233445566"}),
             );
-            let config = mac_worker::config::Config::parse(
+            let config = mac_worker::test_support::core::config::Config::parse(
                 "version=1\n[controller]\nenabled=true\nssh='old-controller'\n",
             )
             .unwrap();
@@ -1890,7 +1909,8 @@ mod t7a {
             assert!(channel.run(&process).unwrap().status.success());
             assert_eq!(raw.calls.lock().unwrap().len(), 3);
             let identity =
-                mac_worker::controller::decode_request(&raw.calls.lock().unwrap()[1]).unwrap();
+                mac_worker::test_support::controller::decode_request(&raw.calls.lock().unwrap()[1])
+                    .unwrap();
             assert_eq!(identity.command(), "task.list");
             assert_eq!(identity.body()["controller_socket"]["op"], "identity");
             assert_eq!(raw.calls.lock().unwrap()[2], frame(&req));
@@ -1978,7 +1998,7 @@ mod t7a {
 
         #[test]
         fn compatibility_account_and_reinstall_mismatch_emit_no_socket_reads() {
-            use mac_worker::controller::{
+            use mac_worker::test_support::{
                 channel::{
                     client::ChannelProcessRunner,
                     testing::{
@@ -1986,10 +2006,10 @@ mod t7a {
                         ScriptedIdentitySource, identity_fixture, result_fixture,
                     },
                 },
-                controller_rpc_ssh_request,
+                controller::controller_rpc_ssh_request,
             };
             let fixture = Fixture::new();
-            let config = mac_worker::config::Config::parse(
+            let config = mac_worker::test_support::core::config::Config::parse(
                 "version=1\n[controller]\nenabled=true\nssh='mismatch'\n",
             )
             .unwrap();
@@ -2010,7 +2030,8 @@ mod t7a {
                 let mut changed = original.clone();
                 match variant {
                     0 => {
-                        changed.service.controller_client_id = mac_worker::job::ClientId::generate()
+                        changed.service.controller_client_id =
+                            mac_worker::test_support::host::job::ClientId::generate()
                     }
                     1 => changed.service.account.uid += 1,
                     2 => changed.service.account.username = "reinstalled-account".into(),
@@ -2056,13 +2077,13 @@ mod t7a {
 
         #[test]
         fn compatibility_notify_cache_and_lock_remain_independent_when_config_route_changes() {
-            use mac_worker::controller::{
+            use mac_worker::test_support::{
                 channel::testing::identity_fixture,
                 events::{NotifyState, notify::NotifyCache},
             };
             use sha2::{Digest, Sha256};
             let fixture = Fixture::new();
-            let mut config = mac_worker::config::Config::parse(
+            let mut config = mac_worker::test_support::core::config::Config::parse(
                 "version=1\n[controller]\nenabled=true\nssh='cache-controller'\n",
             )
             .unwrap();
@@ -2124,24 +2145,24 @@ mod t7a {
         #[test]
         fn raw_opposing_drain_and_intervening_publish_retry_reconcile_preserve_actual_effects() {
             use crate::fixture::{ControllerBridge, IsolatedHost};
-            use mac_worker::{
-                controller::{
-                    channel::{
-                        client::ChannelProcessRunner,
-                        testing::{
-                            FakeForwardControl, ManualRuntime, ScriptedConnector,
-                            ScriptedIdentitySource,
-                        },
+            use mac_worker::test_support::{
+                channel::{
+                    client::ChannelProcessRunner,
+                    testing::{
+                        FakeForwardControl, ManualRuntime, ScriptedConnector,
+                        ScriptedIdentitySource,
                     },
-                    controller_rpc_ssh_request,
                 },
-                error::WorkerError,
-                job::{CommandSummary, QueueEntry, QueueEntryKind},
-                outbox::OutboxRetryResponse,
-                process::{ProcessRequest, ProcessResult},
-                scheduler::WorkerPreference,
-                supervisor::SystemProcessInspector,
-                task::{DeliveryState, OriginDelivery},
+                client_state::scheduler::WorkerPreference,
+                controller::controller_rpc_ssh_request,
+                core::error::WorkerError,
+                host::{
+                    job::{CommandSummary, QueueEntry, QueueEntryKind},
+                    process::{ProcessRequest, ProcessResult},
+                    supervisor::SystemProcessInspector,
+                },
+                task::model::{DeliveryState, OriginDelivery},
+                transfer::outbox::OutboxRetryResponse,
             };
             use std::{
                 os::unix::process::ExitStatusExt,
@@ -2154,7 +2175,7 @@ mod t7a {
             struct Worker {
                 task: TaskId,
                 turn: TurnId,
-                base: mac_worker::task::BaseOid,
+                base: mac_worker::test_support::task::model::BaseOid,
                 calls: AtomicU32,
             }
             impl ProcessRunner for Worker {
@@ -2220,7 +2241,8 @@ mod t7a {
                 },
                 calls: Mutex::default(),
             };
-            let config = mac_worker::config::Config::load(&laptop.paths.config).unwrap();
+            let config =
+                mac_worker::test_support::core::config::Config::load(&laptop.paths.config).unwrap();
             let forwards = Arc::new(FakeForwardControl::new("/private/unused-forward".into()));
             let connector = Arc::new(ScriptedConnector::new(vec![]));
             let client = ChannelProcessRunner::new(
@@ -2275,7 +2297,7 @@ mod t7a {
                 let request = request_fixture("controller.drain", json!({"drained":drained}));
                 assert_eq!(send(&request)["result"]["drained"], drained);
                 assert_eq!(
-                    mac_worker::controller::drain::is_drained(
+                    mac_worker::test_support::controller::drain::is_drained(
                         &controller.paths.controller_state_root()
                     )
                     .unwrap(),
@@ -2336,7 +2358,8 @@ mod t7a {
             config: PathBuf,
             environment: BTreeMap<OsString, OsString>,
             calls: std::sync::Mutex<Vec<ControllerRequest>>,
-            processes: std::sync::Mutex<Vec<mac_worker::process::ProcessRequest>>,
+            processes:
+                std::sync::Mutex<Vec<mac_worker::test_support::host::process::ProcessRequest>>,
         }
         impl LocalStdio {
             fn new(fixture: &Fixture) -> Self {
@@ -2352,20 +2375,26 @@ mod t7a {
         impl ProcessRunner for LocalStdio {
             fn run(
                 &self,
-                process: &mac_worker::process::ProcessRequest,
-            ) -> Result<mac_worker::process::ProcessResult, mac_worker::error::WorkerError>
-            {
+                process: &mac_worker::test_support::host::process::ProcessRequest,
+            ) -> Result<
+                mac_worker::test_support::host::process::ProcessResult,
+                mac_worker::test_support::core::error::WorkerError,
+            > {
                 self.run_interruptible(process, &|| false)
             }
             fn run_interruptible(
                 &self,
-                process: &mac_worker::process::ProcessRequest,
+                process: &mac_worker::test_support::host::process::ProcessRequest,
                 stop: &dyn Fn() -> bool,
-            ) -> Result<mac_worker::process::ProcessResult, mac_worker::error::WorkerError>
-            {
+            ) -> Result<
+                mac_worker::test_support::host::process::ProcessResult,
+                mac_worker::test_support::core::error::WorkerError,
+            > {
                 self.calls.lock().unwrap().push(
-                    mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())
-                        .unwrap(),
+                    mac_worker::test_support::controller::decode_request(
+                        process.stdin.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 );
                 self.processes.lock().unwrap().push(process.clone());
                 let mut local = process.clone();
@@ -2382,12 +2411,13 @@ mod t7a {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 local.isolate_parent_environment = true;
-                mac_worker::process::SystemProcessRunner.run_interruptible(&local, stop)
+                mac_worker::test_support::host::process::SystemProcessRunner
+                    .run_interruptible(&local, stop)
             }
         }
         #[test]
         fn journal_actual_epoch_reset_uses_event_reply_while_wait_logs_and_pin_stay_valid() {
-            use mac_worker::controller::{
+            use mac_worker::test_support::{
                 channel::{
                     codec::FramedSocketConnector, identity::StdioIdentitySource,
                     testing::FakeForwardControl,
@@ -2406,7 +2436,7 @@ mod t7a {
             let replacement_record = replacement.record();
             replacement_leader.stop();
             let laptop = Fixture::new();
-            let config=mac_worker::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='journal-fixture'\n[ssh]\nmultiplex=true\n").unwrap();
+            let config=mac_worker::test_support::core::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='journal-fixture'\n[ssh]\nmultiplex=true\n").unwrap();
             let raw = Arc::new(LocalStdio::new(&fixture));
             let forwards = Arc::new(FakeForwardControl::new(record.service.socket_path.clone()));
             let clock = Arc::new(ManualEventRuntime::new());
@@ -2422,7 +2452,7 @@ mod t7a {
                     forwards: forwards.clone(),
                     connector: Arc::new(FramedSocketConnector::new(Arc::new(SessionCodec::new()))),
                     runtime: Arc::new(
-                        mac_worker::controller::channel::testing::ManualRuntime::default(),
+                        mac_worker::test_support::channel::testing::ManualRuntime::default(),
                     ),
                 },
             );
@@ -2562,7 +2592,7 @@ mod t7a {
             store
                 .write_task_project_path(&store.load_task(task).unwrap(), project)
                 .unwrap();
-            mac_worker::controller::registry::ProjectRegistry::open(
+            mac_worker::test_support::controller::registry::ProjectRegistry::open(
                 &fixture.paths.controller_state_root(),
             )
             .unwrap()
@@ -2576,7 +2606,8 @@ mod t7a {
                     entry["worktree_id"] = json!(worktree);
                 }
             }
-            let queue: mac_worker::job::QueueSnapshot = serde_json::from_value(queue).unwrap();
+            let queue: mac_worker::test_support::host::job::QueueSnapshot =
+                serde_json::from_value(queue).unwrap();
             let mut bytes = serde_json::to_vec(&queue).unwrap();
             bytes.push(b'\n');
             fs::write(&queue_path, bytes).unwrap();
@@ -2614,7 +2645,10 @@ mod t7a {
             );
             (task, turn, lock)
         }
-        async fn runner(fixture: &Fixture, task: TaskId) -> mac_worker::job::ProcessIdentity {
+        async fn runner(
+            fixture: &Fixture,
+            task: TaskId,
+        ) -> mac_worker::test_support::host::job::ProcessIdentity {
             tokio::time::timeout(GUARD, async {
                 loop {
                     if let Some(runner) = ClientStateStore::open(&fixture.paths.state)
@@ -2662,7 +2696,7 @@ mod t7a {
             let (leader, config, mut deps, stop) = native_inputs(&fixture);
             let (reporter, courier) = children::reporter(&fixture);
             deps.runner = reporter.clone();
-            use mac_worker::controller::events::{
+            use mac_worker::test_support::events::{
                 JournalReader, NewEvent,
                 journal::{ControllerJournal, JournalOptions},
                 testing::{ManualEventRuntime, RecordingSink},
@@ -2676,7 +2710,8 @@ mod t7a {
             )
             .unwrap();
             let sink = Arc::new(RecordingSink::new());
-            let hints = mac_worker::client_state::events::DeferredHints::begin(sink.clone());
+            let hints =
+                mac_worker::test_support::client_state::events::DeferredHints::begin(sink.clone());
             hints.capture(NewEvent::ControllerDrainChanged { drained: true });
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2851,10 +2886,10 @@ mod t7a {
 
         mod children {
             use super::*;
-            use mac_worker::{
-                controller::channel::server::ShutdownEvidence,
-                error::WorkerError,
-                process::{
+            use mac_worker::test_support::{
+                channel::server::ShutdownEvidence,
+                core::error::WorkerError,
+                host::process::{
                     CleanupState, ProcessCompletion, ProcessRequest, ProcessResult,
                     SystemProcessRunner, TrackedProcessRunner,
                 },
@@ -3062,7 +3097,7 @@ mod t7a {
                         .decode_reply(&receive(&stream).await.unwrap(), &request)
                         .unwrap();
                     assert!(!error.status.success());
-                    let error: mac_worker::job::HostControlError =
+                    let error: mac_worker::test_support::host::job::HostControlError =
                         serde_json::from_slice(decode_frame(&error.stdout).unwrap()).unwrap();
                     assert_eq!(error.error().code(), "CONFIG");
                     finished(&reporter, 5).await;
@@ -3172,7 +3207,7 @@ mod t7a {
                             .is_err()
                     );
                     assert_eq!(
-                        mac_worker::controller::ControllerLeader::acquire(
+                        mac_worker::test_support::controller::ControllerLeader::acquire(
                             &fixture.paths.controller_state_root()
                         )
                         .err()
@@ -3262,20 +3297,18 @@ mod t7a {
 
         mod recovery {
             use super::*;
-            use mac_worker::{
-                controller::{
-                    channel::{
-                        client::ChannelProcessRunner,
-                        codec::FramedSocketConnector,
-                        identity::StdioIdentitySource,
-                        testing::{
-                            FakeForwardControl, ManualRuntime, identity_fixture, result_fixture,
-                        },
+            use mac_worker::test_support::{
+                channel::{
+                    client::ChannelProcessRunner,
+                    codec::FramedSocketConnector,
+                    identity::StdioIdentitySource,
+                    testing::{
+                        FakeForwardControl, ManualRuntime, identity_fixture, result_fixture,
                     },
-                    controller_rpc_ssh_request, decode_request, encode_frame,
                 },
-                error::WorkerError,
-                process::{ProcessRequest, ProcessResult},
+                controller::{controller_rpc_ssh_request, decode_request, encode_frame},
+                core::error::WorkerError,
+                host::process::{ProcessRequest, ProcessResult},
             };
             use std::{
                 cell::Cell,
@@ -3344,7 +3377,7 @@ mod t7a {
                 Some(bytes)
             }
             fn process(request: &ControllerRequest) -> ProcessRequest {
-                let config = mac_worker::config::Config::parse(
+                let config = mac_worker::test_support::core::config::Config::parse(
                     "version=1\n[controller]\nenabled=true\nssh='fault-peer'\n",
                 )
                 .unwrap();
@@ -3398,7 +3431,7 @@ mod t7a {
                         status: ExitStatus::from_raw(75 << 8),
                         stdout: encode_json_frame(
                             &serde_json::to_value(
-                                mac_worker::job::HostControlError::new(
+                                mac_worker::test_support::host::job::HostControlError::new(
                                     "CAPACITY_BUSY",
                                     "fixture capacity",
                                 )
@@ -3593,11 +3626,11 @@ mod t7a {
                     stopped.load(Ordering::Acquire)
                 };
                 if matches!(fault, Fault::BadCursor) {
-                    use mac_worker::controller::events::{
+                    use mac_worker::test_support::events::{
                         EventCursor, EventSource, ReadQuery, Seq, client::ControllerEventClient,
                         testing::ManualEventRuntime,
                     };
-                    let config = mac_worker::config::Config::parse(
+                    let config = mac_worker::test_support::core::config::Config::parse(
                         "version=1\n[controller]\nenabled=true\nssh='fault-peer'\n",
                     )
                     .unwrap();
@@ -3664,10 +3697,10 @@ mod t7a {
                     );
                     assert_eq!(raw.calls.lock().unwrap().len(), 1);
                     if matches!(fault, Fault::WrongTurn) {
-                        let reply: mac_worker::controller::ControllerReadReply<
-                            mac_worker::controller::read::ControllerTaskLogsResult,
+                        let reply: mac_worker::test_support::controller::ControllerReadReply<
+                            mac_worker::test_support::controller::read::ControllerTaskLogsResult,
                         > = serde_json::from_slice(decode_frame(&answer.stdout).unwrap()).unwrap();
-                        use mac_worker::controller::ControllerReadIdentity;
+                        use mac_worker::test_support::controller::ControllerReadIdentity;
                         assert!(reply.result().verify_payload(&request).is_err());
                     }
                 } else {
@@ -3734,14 +3767,14 @@ mod t7a {
                     .unwrap();
                 rt.block_on(async {
                     let channel=LeaderChannel::start(config,leader,deps,stop);channel_ready(&channel).await;let record=fixture.record();
-                    let config=mac_worker::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='handler-fixture'\n[ssh]\nmultiplex=true\n").unwrap();
+                    let config=mac_worker::test_support::core::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='handler-fixture'\n[ssh]\nmultiplex=true\n").unwrap();
                     let laptop=Fixture::new();let raw=Arc::new(LocalStdio::new(&fixture));let forwards=Arc::new(FakeForwardControl::new(record.service.socket_path.clone()));let clock=Arc::new(ManualRuntime::default());
                     let route=ConfiguredRoute::new(&config.controller,&config.ssh).unwrap();let identity=SocketIdentity {route_sha256:route.digest().unwrap(),service:record.service.clone()};
                     // This native leader is the test process, whose argv is
                     // deliberately not the installed `controller run` role.
                     // Real stdio bootstrap is covered by the CLI-leader cases.
                     let client=Arc::new(ChannelProcessRunner::new(raw.clone(),ReadLoopScope::LogsFollow,route,laptop.paths.clone(),ClientDeps {
-                        identity:Arc::new(mac_worker::controller::channel::testing::ScriptedIdentitySource::new(vec![Ok(identity)])),pins:Arc::new(PrivatePinStore::new()),forwards:forwards.clone(),connector:Arc::new(FramedSocketConnector::new(Arc::new(SessionCodec::new()))),runtime:clock.clone()}));
+                        identity:Arc::new(mac_worker::test_support::channel::testing::ScriptedIdentitySource::new(vec![Ok(identity)])),pins:Arc::new(PrivatePinStore::new()),forwards:forwards.clone(),connector:Arc::new(FramedSocketConnector::new(Arc::new(SessionCodec::new()))),runtime:clock.clone()}));
                     let request=request_fixture("task.logs",json!({"task_id":task,"raw":true,"offset":0,"wait_ms":0}));
                     let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));
                     let mut priming = original.clone();
@@ -3793,8 +3826,8 @@ mod t7a {
                     let processes=raw.processes.lock().unwrap();assert_eq!(processes.len(),2);let mut expected=processes[1].clone();expected.policy.deadline=Duration::from_secs(30);
                     let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));assert_eq!(expected,original);assert_eq!(processes[1].policy.deadline,Duration::from_secs(25));drop(processes);
                     assert_eq!(forwards.opens(),1);assert_eq!(forwards.cancels(),1);assert_eq!(client.close(),ForwardDisposition::Cleaned);
-                    let reply:mac_worker::controller::ControllerReadReply<mac_worker::controller::read::ControllerTaskLogsResult>=serde_json::from_slice(decode_frame(&result.stdout).unwrap()).unwrap();
-                    use mac_worker::controller::ControllerReadIdentity;
+                    let reply:mac_worker::test_support::controller::ControllerReadReply<mac_worker::test_support::controller::read::ControllerTaskLogsResult>=serde_json::from_slice(decode_frame(&result.stdout).unwrap()).unwrap();
+                    use mac_worker::test_support::controller::ControllerReadIdentity;
                     reply.verify_envelope(&request).unwrap();reply.result().verify_payload(&request).unwrap();
                 });
             }
@@ -3840,7 +3873,7 @@ fn isolated_loop_fixture(name: &str) -> bool {
         .prefix("p3b")
         .tempdir_in("/private/tmp")
         .unwrap();
-    let request = mac_worker::process::ProcessRequest {
+    let request = mac_worker::test_support::host::process::ProcessRequest {
         program: std::env::current_exe().unwrap().into_os_string(),
         args: vec![
             "--exact".into(),
@@ -3869,15 +3902,15 @@ fn isolated_loop_fixture(name: &str) -> bool {
         ],
         environment_remove: vec!["MAC_WORKER_TEST_SSH".into()],
         stdin: None,
-        policy: mac_worker::process::ProcessPolicy {
+        policy: mac_worker::test_support::host::process::ProcessPolicy {
             stdout_limit: 4 * 1024 * 1024,
             stderr_limit: 4 * 1024 * 1024,
             deadline: std::time::Duration::from_secs(60),
         },
         isolate_parent_environment: false,
     };
-    use mac_worker::process::ProcessRunner;
-    let result = mac_worker::process::SystemProcessRunner
+    use mac_worker::test_support::host::process::ProcessRunner;
+    let result = mac_worker::test_support::host::process::SystemProcessRunner
         .run(&request)
         .unwrap();
     assert!(
@@ -3891,25 +3924,20 @@ fn isolated_loop_fixture(name: &str) -> bool {
 
 mod loop_fixtures {
     use clap::Parser;
-    use mac_worker::{
-        RuntimeContext,
-        cli::Cli,
-        config::Config,
-        controller::{
-            ControllerRequest,
-            channel::{
-                ChannelFailure, ClientContext, ClientDeps, ConfiguredRoute, SocketConnector,
-                SocketIdentity, SocketSession,
-                identity::StdioIdentitySource,
-                pin::{Pin, PrivatePinStore},
-                testing::{FakeForwardControl, ManualRuntime, identity_fixture, result_fixture},
-            },
-            decode_request,
+    use mac_worker::test_support::{
+        channel::{
+            ChannelFailure, ClientContext, ClientDeps, ConfiguredRoute, SocketConnector,
+            SocketIdentity, SocketSession,
+            identity::StdioIdentitySource,
+            pin::{Pin, PrivatePinStore},
+            testing::{FakeForwardControl, ManualRuntime, identity_fixture, result_fixture},
         },
-        error::WorkerError,
-        paths::PathLayout,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
-        task::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
+        cli::Cli,
+        controller::{ControllerRequest, decode_request},
+        core::{config::Config, error::WorkerError, paths::PathLayout},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        runtime::RuntimeContext,
+        task::model::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
     };
     use serde_json::{Value, json};
     use std::{
@@ -4039,7 +4067,7 @@ mod loop_fixtures {
                 .with_controller_channel_dependencies(self.deps());
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let exit = mac_worker::run_with_io_in_context(
+            let exit = mac_worker::test_support::runtime::run_with_io_in_context(
                 Cli::try_parse_from(args).unwrap(),
                 &*self.endpoint,
                 &context,
@@ -4065,7 +4093,7 @@ mod loop_fixtures {
         fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
             if process.program == "/bin/ps" {
                 let mut output = result_fixture(
-                    &mac_worker::controller::channel::testing::request_fixture(
+                    &mac_worker::test_support::channel::testing::request_fixture(
                         "task.list",
                         json!({}),
                     ),
@@ -4082,7 +4110,7 @@ mod loop_fixtures {
                 }) {
                     self.order.lock().unwrap().push("git:source.push".into());
                     return Ok(result_fixture(
-                        &mac_worker::controller::channel::testing::request_fixture(
+                        &mac_worker::test_support::channel::testing::request_fixture(
                             "task.list",
                             json!({}),
                         ),
@@ -4090,7 +4118,7 @@ mod loop_fixtures {
                         0,
                     ));
                 }
-                return mac_worker::process::SystemProcessRunner.run(process);
+                return mac_worker::test_support::host::process::SystemProcessRunner.run(process);
             }
             assert!(process.program == "/usr/bin/ssh" || process.program == "fake-ssh");
             self.processes.lock().unwrap().push(process.clone());
@@ -4120,7 +4148,7 @@ mod loop_fixtures {
                 .ends_with("host controller-rpc")
             {
                 let mut output = result_fixture(
-                    &mac_worker::controller::channel::testing::request_fixture(
+                    &mac_worker::test_support::channel::testing::request_fixture(
                         "task.list",
                         json!({}),
                     ),
@@ -4188,7 +4216,7 @@ mod loop_fixtures {
             .unwrap_or(TASK);
         if matches!(request.command(), "task.submit" | "task.batch") {
             let mut output = result_fixture(request, Value::Null, 0);
-            output.stdout = mac_worker::controller::encode_json_frame(&json!({
+            output.stdout = mac_worker::test_support::controller::encode_json_frame(&json!({
                 "protocol_version":7,"status":"acked","request_id":request.request_id(),"payload_sha256":request.payload_sha256(),"task_id":task_id,"turn_id":request.body().get("turn_id").cloned().unwrap_or(json!(TURN)),"created_at_millis":1,
                 "result": if request.command() == "task.batch" { json!({"run_id":request.body()["run_id"],"task_ids":[TASK]}) } else { status(task_id,false,false) }
             })).unwrap();
@@ -4199,7 +4227,7 @@ mod loop_fixtures {
             "task.say" | "task.cancel" | "task.close" | "checkpoint.submit"
         ) {
             let mut output = result_fixture(request, Value::Null, 0);
-            output.stdout = mac_worker::controller::encode_json_frame(&json!({
+            output.stdout = mac_worker::test_support::controller::encode_json_frame(&json!({
                 "protocol_version":7,"status":"acked","request_id":request.request_id(),"payload_sha256":request.payload_sha256(),"task_id":TASK,"created_at_millis":1,"result":status(TASK,false,cancelled)
             })).unwrap();
             return output;
@@ -4283,7 +4311,7 @@ mod loop_fixtures {
                 .push(format!("socket:{}", request.command()));
             if self.2.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Err(ChannelFailure::Unavailable(
-                    mac_worker::controller::channel::ChannelReason::ForwardLost,
+                    mac_worker::test_support::channel::ChannelReason::ForwardLost,
                 ));
             }
             Ok(reply(request, &[]))
@@ -4474,7 +4502,7 @@ fn loop_interrupt_and_follow_wait_share_command_retirement() {
     let fixture = Fixture::new();
     fixture
         .forwards
-        .set_disposition(mac_worker::controller::channel::ForwardDisposition::Retained);
+        .set_disposition(mac_worker::test_support::channel::ForwardDisposition::Retained);
     fixture
         .connector
         .fail_next
@@ -4523,7 +4551,7 @@ fn raw_controller_retry_preserves_saved_mutation_route() {
     ] {
         let fixture = Fixture::new();
         let request = request_fixture(command, body);
-        mac_worker::controller::persist_operation_envelope(
+        mac_worker::test_support::controller::persist_operation_envelope(
             &fixture.paths.controller_cache_root(),
             &request,
         )
@@ -4572,7 +4600,7 @@ fn raw_fetch_doctor_and_local_wait_allocate_no_channel() {
     assert!(fixture.connector.requests.lock().unwrap().is_empty());
     assert!(
         clap::Parser::try_parse_from(["worker", "events"])
-            .map(|_: mac_worker::cli::Cli| ())
+            .map(|_: mac_worker::test_support::cli::Cli| ())
             .is_err()
     );
 }
@@ -4633,7 +4661,7 @@ fn route_events_and_notify_own_one_scoped_runner() {
         return;
     }
     use loop_fixtures::*;
-    use mac_worker::controller::{
+    use mac_worker::test_support::{
         channel::ReadLoopScope,
         events::{
             EventSource, ReadQuery, TaskAddressQuery, TaskRepairQuery,
@@ -4700,7 +4728,7 @@ fn route_event_runtime_cancellation_is_shared_with_channel_setup() {
         return;
     }
     use loop_fixtures::*;
-    use mac_worker::controller::{
+    use mac_worker::test_support::{
         channel::ReadLoopScope,
         events::{EventSource, client::ControllerEventClient, testing::ManualEventRuntime},
     };
@@ -4709,18 +4737,18 @@ fn route_event_runtime_cancellation_is_shared_with_channel_setup() {
     let clock = Arc::new(ManualEventRuntime::new());
     struct CancellingIdentity {
         clock: Arc<ManualEventRuntime>,
-        inner: Arc<dyn mac_worker::controller::channel::IdentitySource>,
+        inner: Arc<dyn mac_worker::test_support::channel::IdentitySource>,
     }
-    impl mac_worker::controller::channel::IdentitySource for CancellingIdentity {
+    impl mac_worker::test_support::channel::IdentitySource for CancellingIdentity {
         fn read(
             &self,
-            raw: &dyn mac_worker::process::ProcessRunner,
-            route: &mac_worker::controller::channel::ConfiguredRoute,
-            master: Option<&mac_worker::controller::channel::MasterPlan>,
-            context: &mac_worker::controller::channel::ClientContext<'_>,
+            raw: &dyn mac_worker::test_support::host::process::ProcessRunner,
+            route: &mac_worker::test_support::channel::ConfiguredRoute,
+            master: Option<&mac_worker::test_support::channel::MasterPlan>,
+            context: &mac_worker::test_support::channel::ClientContext<'_>,
         ) -> Result<
-            mac_worker::controller::channel::SocketIdentity,
-            mac_worker::controller::channel::ChannelFailure,
+            mac_worker::test_support::channel::SocketIdentity,
+            mac_worker::test_support::channel::ChannelFailure,
         > {
             let identity = self.inner.read(raw, route, master, context)?;
             self.clock.cancel();
@@ -4760,7 +4788,7 @@ fn loop_notify_short_budget_stays_with_original_deadline() {
         return;
     }
     use loop_fixtures::*;
-    use mac_worker::controller::{
+    use mac_worker::test_support::{
         channel::ReadLoopScope,
         events::{
             EventSource, ReadQuery, TaskRepairQuery, client::ControllerEventClient,
@@ -4812,7 +4840,7 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
         return;
     }
     use loop_fixtures::*;
-    use mac_worker::controller::{
+    use mac_worker::test_support::{
         channel::*,
         events::{
             EventRuntime, PreviousProjection,
@@ -4827,7 +4855,14 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
     };
     struct PollConnector {
         clock: Arc<ManualEventRuntime>,
-        requests: Arc<Mutex<Vec<(Duration, mac_worker::controller::ControllerRequest)>>>,
+        requests: Arc<
+            Mutex<
+                Vec<(
+                    Duration,
+                    mac_worker::test_support::controller::ControllerRequest,
+                )>,
+            >,
+        >,
     }
     impl SocketConnector for PollConnector {
         fn connect(
@@ -4847,9 +4882,10 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
         fn exchange(
             &mut self,
             _: &[u8],
-            request: &mac_worker::controller::ControllerRequest,
+            request: &mac_worker::test_support::controller::ControllerRequest,
             ctx: &ClientContext<'_>,
-        ) -> Result<mac_worker::process::ProcessResult, ChannelFailure> {
+        ) -> Result<mac_worker::test_support::host::process::ProcessResult, ChannelFailure>
+        {
             ctx.check()?;
             self.requests
                 .lock()
@@ -4929,26 +4965,22 @@ fn loop_notify_preserves_fifteen_second_repair_with_shared_clock() {
 mod t7b_live {
     use super::loop_fixtures;
     use clap::Parser;
-    use mac_worker::{
-        RuntimeContext,
-        cli::Cli,
-        controller::{
-            ControllerRequest,
-            channel::{
-                ChannelFailure, ChannelRuntime, ClientContext, ClientDeps, ServiceRecord,
-                SocketConnector, SocketIdentity, SocketSession,
-                codec::{FramedSocketConnector, SessionCodec},
-                identity::StdioIdentitySource,
-                pin::PrivatePinStore,
-                testing::FakeForwardControl,
-            },
-            decode_request,
-            events::EventRuntime,
+    use mac_worker::test_support::{
+        channel::{
+            ChannelFailure, ChannelRuntime, ClientContext, ClientDeps, ServiceRecord,
+            SocketConnector, SocketIdentity, SocketSession,
+            codec::{FramedSocketConnector, SessionCodec},
+            identity::StdioIdentitySource,
+            pin::PrivatePinStore,
+            testing::FakeForwardControl,
         },
-        error::WorkerError,
-        paths::PathLayout,
-        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-        task::{TaskId, TurnId},
+        cli::Cli,
+        controller::{ControllerRequest, decode_request},
+        core::{error::WorkerError, paths::PathLayout},
+        events::EventRuntime,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        runtime::RuntimeContext,
+        task::model::{TaskId, TurnId},
     };
     use std::{
         collections::BTreeMap,
@@ -5113,7 +5145,7 @@ mod t7b_live {
                 .clone()
                 .with_controller_channel_dependencies(self.deps());
             let (mut stdout, mut stderr) = (vec![], vec![]);
-            let exit = mac_worker::run_with_io_in_context(
+            let exit = mac_worker::test_support::runtime::run_with_io_in_context(
                 Cli::try_parse_from(args).unwrap(),
                 &*self.raw,
                 &context,
@@ -5241,10 +5273,10 @@ mod t7b_live {
     }
 
     fn seed_completed_task(paths: &PathLayout) -> TaskId {
-        use mac_worker::{
-            agent::{AgentKind, PermissionPolicy},
+        use mac_worker::test_support::{
+            agents::agent::{AgentKind, PermissionPolicy},
             client_state::ClientStateStore,
-            task::{
+            task::model::{
                 ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskLimits, TaskMeta,
                 TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
                 TurnTerminal,
@@ -5380,7 +5412,7 @@ fn route_real_server_wait_logs_and_raw_reads() {
             assert_eq!(raw[0].command(), "task.list");
             assert_eq!(raw[0].body()["controller_socket"]["op"], "identity");
             assert!(fixture.laptop.pin().is_none());
-            let identity: mac_worker::controller::channel::SocketIdentity =
+            let identity: mac_worker::test_support::channel::SocketIdentity =
                 serde_json::from_str(&output).unwrap();
             assert_eq!(identity.service, fixture.record.service);
         } else {
@@ -5437,7 +5469,7 @@ fn route_real_server_owned_events_and_notify_reads() {
     if isolated_loop_fixture("route_real_server_owned_events_and_notify_reads") {
         return;
     }
-    use mac_worker::controller::{
+    use mac_worker::test_support::{
         channel::ReadLoopScope,
         events::{
             EventSource, ReadQuery, TaskAddressQuery, TaskRepairQuery,

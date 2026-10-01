@@ -22,36 +22,45 @@ use std::{
     },
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy},
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+    },
     client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    job::{
-        JobMeta, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        LogChunk, LogChunkRequest, LogStream, StatusRequest, StatusResponse, SubmitResponse,
+    core::{
+        config::Config,
+        error::WorkerError,
+        paths::PathLayout,
+        protocol::{
+            CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        },
     },
-    lease::SlotState,
-    paths::PathLayout,
-    prepared_followup::PreparedFollowup,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    host::{
+        job::{
+            JobMeta, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
+            LogChunk, LogChunkRequest, LogStream, StatusRequest, StatusResponse, SubmitResponse,
+        },
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnId, TurnSummary, TurnTerminal,
+        client::TaskClient,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        prepared_followup::PreparedFollowup,
+        project_state::ProjectState,
+        store::{
+            SessionBinding, TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest,
+            TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
+        },
+        turn::{TaskTurnRequest, TaskTurnResponse},
+        turn_runner::{InlineRunnerExecutor, RunnerExecutor},
     },
-    task_client::TaskClient,
-    task_store::{
-        SessionBinding, TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest,
-        TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
-    },
-    transfer::HostOperation,
-    transfer_repo::repo_id_for,
-    turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{InlineRunnerExecutor, RunnerExecutor},
+    transfer::{HostOperation, repo::repo_id_for},
 };
 use uuid::Uuid;
 
@@ -195,7 +204,7 @@ impl CompletingHost {
                 "GIT_COMMON_DIR".into(),
             ],
             stdin: None,
-            policy: mac_worker::process::ProcessPolicy {
+            policy: mac_worker::test_support::host::process::ProcessPolicy {
                 stdout_limit: 64 * 1024,
                 stderr_limit: 64 * 1024,
                 deadline: std::time::Duration::from_secs(15),
@@ -423,11 +432,9 @@ impl ProcessRunner for CompletingHost {
                 } else {
                     Vec::new()
                 };
-                canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                    chunk_request.stream(),
-                    chunk_request.offset(),
-                    bytes,
-                )?)?)
+                canonical_process(&mac_worker::test_support::host::job::LogChunkResponse::new(
+                    LogChunk::new(chunk_request.stream(), chunk_request.offset(), bytes)?,
+                )?)
             }
             value if value == HostOperation::StatusLogs.command() => Ok(ProcessResult {
                 status: ExitStatus::from_raw(2 << 8),

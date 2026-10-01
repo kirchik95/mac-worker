@@ -4,14 +4,12 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::WorkerEntry,
     controller::{init::ConfiguredHost, service::ServiceStatus},
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    run_with_stdio_in_context,
+    core::{config::WorkerEntry, error::WorkerError},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
     transfer::{HostOperation, controller_host_request},
 };
 use serde_json::json;
@@ -56,7 +54,7 @@ mod legacy {
     #[serde(deny_unknown_fields)]
     pub struct ControllerConfigureRequest {
         pub config_toml: String,
-        pub workers: Vec<mac_worker::controller::provision::PlannedWorker>,
+        pub workers: Vec<mac_worker::test_support::controller::provision::PlannedWorker>,
         pub known_hosts: String,
         #[serde(default)]
         pub force: bool,
@@ -143,7 +141,7 @@ fn worker() -> WorkerEntry {
 }
 
 fn configure_request(host: &NewHost) -> legacy::ControllerConfigureRequest {
-    use mac_worker::controller::provision::{PlannedWorker, ResolvedSsh};
+    use mac_worker::test_support::controller::provision::{PlannedWorker, ResolvedSsh};
     let config_toml =
         "version=1\n[[workers]]\nname='mini-1'\nssh='mac-worker-controller-mini-1'\nslots=1\n";
     let path = host.home.join(".config/mac-worker/config.toml");
@@ -255,7 +253,7 @@ impl ProcessRunner for OldHost {
         let request: legacy::ControllerServiceRequest = match serde_json::from_slice(bytes) {
             Ok(request) => request,
             Err(_) => {
-                let error = mac_worker::job::HostControlError::new(
+                let error = mac_worker::test_support::host::job::HostControlError::new(
                     "INVALID_REQUEST",
                     "invalid controller host request",
                 )
@@ -337,7 +335,7 @@ fn new_laptop_status_falls_back_when_legacy_helper_rejects_details() {
 fn new_laptop_disable_accepts_legacy_helper_and_disables_local_mode() {
     let (host, _, config) = old_host_cli("disable");
     assert!(
-        !mac_worker::config::Config::parse(&config)
+        !mac_worker::test_support::core::config::Config::parse(&config)
             .unwrap()
             .controller
             .enabled

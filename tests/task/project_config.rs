@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::command;
 
 use std::{
     ffi::CString,
@@ -12,20 +13,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::AgentKind,
-    client_state::ClientStateStore,
-    config::Config,
-    dag::DagNodeState,
-    error::{ExitKind, WorkerError},
-    job::AdmissionObservation,
-    paths::PathLayout,
-    process::SystemProcessRunner,
-    project_config::{ProjectSettings, ResourceClass},
-    requirements::RequirementDetector,
-    scheduler::CandidateSlot,
-    task_client::TaskClient,
-    turn_runner::InlineRunnerExecutor,
+use mac_worker::test_support::{
+    agents::agent::AgentKind,
+    client_state::{ClientStateStore, dag::DagNodeState, scheduler::CandidateSlot},
+    core::{
+        config::Config,
+        error::{ExitKind, WorkerError},
+        paths::PathLayout,
+        requirements::RequirementDetector,
+    },
+    host::{job::AdmissionObservation, process::SystemProcessRunner},
+    task::{
+        client::TaskClient,
+        project_config::{ProjectSettings, ResourceClass},
+        turn_runner::InlineRunnerExecutor,
+    },
 };
 use tempfile::tempdir;
 
@@ -456,7 +458,7 @@ fn requirement_detector_ignores_a_symlinked_indicator_file() {
 
 #[test]
 fn herdr_keys_parse_with_their_defaults_and_reject_unknown_neighbours() {
-    use mac_worker::config::Config;
+    use mac_worker::test_support::core::config::Config;
 
     let minimal =
         Config::parse("version = 1\n\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n")
@@ -520,7 +522,7 @@ files = ["src/lib.rs"]
 acceptance = ["cargo test"]
 "#,
     );
-    let report = mac_worker::task_client::preview_batch_plan(
+    let report = mac_worker::test_support::task::client::preview_batch_plan(
         &SystemProcessRunner,
         &preview_config(),
         &repo.root().join("tasks.toml"),
@@ -564,7 +566,7 @@ prompt = "ok"
 files = ["src/lib.rs/"]
 "#,
     );
-    let report = mac_worker::task_client::preview_batch_plan(
+    let report = mac_worker::test_support::task::client::preview_batch_plan(
         &SystemProcessRunner,
         &preview_config(),
         &repo.root().join("tasks.toml"),
@@ -582,9 +584,9 @@ fn batch_preview_cli_does_not_open_client_state() {
     use std::collections::BTreeMap;
 
     use clap::Parser;
-    use mac_worker::{
-        RuntimeContext,
+    use mac_worker::test_support::{
         cli::{Cli, Command, TaskCommand},
+        runtime::RuntimeContext,
     };
 
     let repo = GitRepo::init();
@@ -624,14 +626,14 @@ depends_on = ["missing"]
     ])
     .unwrap();
     assert!(matches!(
-        cli.command,
+        command(&cli),
         Command::Task {
             command: TaskCommand::Batch { preview: true, .. }
         }
     ));
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
         cli,
         &SystemProcessRunner,
         &runtime,
@@ -819,7 +821,7 @@ fn batch_preview_under_enabled_controller_keeps_pinned_workers() {
     repo.write("src/lib.rs", b"fn main() {}\n");
     repo.commit_all("base");
     pinned_dag_batch(&repo);
-    let report = mac_worker::task_client::preview_batch_plan(
+    let report = mac_worker::test_support::task::client::preview_batch_plan(
         &SystemProcessRunner,
         &controller_only_config(),
         &repo.root().join("tasks.toml"),
@@ -846,7 +848,7 @@ fn batch_preview_without_controller_still_rejects_unknown_worker() {
     repo.write("src/lib.rs", b"fn main() {}\n");
     repo.commit_all("base");
     pinned_dag_batch(&repo);
-    let report = mac_worker::task_client::preview_batch_plan(
+    let report = mac_worker::test_support::task::client::preview_batch_plan(
         &SystemProcessRunner,
         &preview_config(),
         &repo.root().join("tasks.toml"),
@@ -865,7 +867,7 @@ fn batch_preview_cli_under_enabled_controller_exits_zero_and_stays_local() {
     use std::collections::BTreeMap;
 
     use clap::Parser;
-    use mac_worker::{RuntimeContext, cli::Cli};
+    use mac_worker::test_support::{cli::Cli, runtime::RuntimeContext};
 
     let repo = GitRepo::init();
     repo.write("src/lib.rs", b"fn main() {}\n");
@@ -896,7 +898,7 @@ fn batch_preview_cli_under_enabled_controller_exits_zero_and_stays_local() {
     .unwrap();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
         cli,
         &SystemProcessRunner,
         &runtime,
@@ -923,7 +925,7 @@ fn batch_preview_human_output_matches_enforced_dag() {
     use std::collections::BTreeMap;
 
     use clap::Parser;
-    use mac_worker::{RuntimeContext, cli::Cli};
+    use mac_worker::test_support::{cli::Cli, runtime::RuntimeContext};
 
     let repo = GitRepo::init();
     repo.write("src/lib.rs", b"fn main() {}\n");
@@ -962,7 +964,7 @@ prompt = "fix login"
     .unwrap();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
         cli,
         &SystemProcessRunner,
         &runtime,

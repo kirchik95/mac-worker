@@ -3,15 +3,13 @@ use crate::fixture;
 use std::{ffi::OsString, os::unix::process::ExitStatusExt, process::ExitStatus};
 
 use fixture::{ControllerBridge, IsolatedHost, NoProcesses};
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::ClientStateStore,
     controller::{decode_frame, encode_json_frame},
-    error::WorkerError,
-    outbox::OutboxRetryResponse,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    task::{DeliveryState, LocalTaskRecord, OriginDelivery, TaskId, TaskState},
-    transfer::HostOperation,
+    core::{error::WorkerError, protocol::PROTOCOL_VERSION},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    task::model::{DeliveryState, LocalTaskRecord, OriginDelivery, TaskId, TaskState},
+    transfer::{HostOperation, outbox::OutboxRetryResponse},
 };
 use serde_json::{Value, json};
 

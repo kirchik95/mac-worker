@@ -3,15 +3,14 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    config::WorkerEntry,
-    error::WorkerError,
-    job::JobId,
-    outbox::OutboxRetryResponse,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    task::{BaseOid, DeliveryState, OriginDelivery, TaskId},
-    transfer::{HostOperation, RemoteJobClient},
+use mac_worker::test_support::{
+    core::{config::WorkerEntry, error::WorkerError, protocol::PROTOCOL_VERSION},
+    host::{
+        job::JobId,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    task::model::{BaseOid, DeliveryState, OriginDelivery, TaskId},
+    transfer::{HostOperation, RemoteJobClient, outbox::OutboxRetryResponse},
 };
 use uuid::Uuid;
 

@@ -1,10 +1,13 @@
 use clap::Parser;
-use mac_worker::{
+use mac_worker::test_support::cli::into_command;
+use mac_worker::test_support::{
     cli::{Cli, Command, ControllerCommand, HostCommand, TaskCommand},
-    protocol::PROTOCOL_VERSION,
-    task::RunProgress,
-    task_client::BatchFile,
-    task_view::{TaskListJson, TaskListProjection},
+    core::protocol::PROTOCOL_VERSION,
+    task::{
+        client::BatchFile,
+        model::RunProgress,
+        view::{TaskListJson, TaskListProjection},
+    },
 };
 
 #[test]
@@ -188,7 +191,7 @@ fn task_submit_allows_attached_no_wait_to_fail_after_the_probe() {
                 wait: true,
                 ..
             },
-    } = parsed.command
+    } = into_command(parsed)
     else {
         panic!("expected task submit command");
     };
@@ -321,7 +324,7 @@ fn batch_preview_conflicts_with_wait() {
     let parsed =
         Cli::try_parse_from(["worker", "task", "batch", "tasks.toml", "--preview"]).unwrap();
     assert!(matches!(
-        parsed.command,
+        into_command(parsed),
         Command::Task {
             command: TaskCommand::Batch {
                 preview: true,
@@ -419,7 +422,7 @@ fn task_say_interrupt_records_the_flag_with_message_and_wait() {
         "--wait",
     ])
     .unwrap();
-    match parsed.command {
+    match into_command(parsed) {
         Command::Task {
             command:
                 TaskCommand::Say {
@@ -479,7 +482,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
         "never",
     ])
     .unwrap();
-    match submit.command {
+    match into_command(submit) {
         Command::Task {
             command:
                 TaskCommand::Submit {
@@ -502,7 +505,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
         "--wait",
     ])
     .unwrap();
-    match say.command {
+    match into_command(say) {
         Command::Task {
             command:
                 TaskCommand::Say {
@@ -516,7 +519,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
 
     let list = Cli::try_parse_from(["worker", "task", "list"]).unwrap();
     assert!(matches!(
-        list.command,
+        into_command(list),
         Command::Task {
             command: TaskCommand::List {
                 run: None,
@@ -540,7 +543,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
     ])
     .unwrap();
     assert!(matches!(
-        filtered.command,
+        into_command(filtered),
         Command::Task {
             command: TaskCommand::List {
                 run: Some(_),
@@ -553,7 +556,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
 
     let reconcile = Cli::try_parse_from(["worker", "task", "reconcile"]).unwrap();
     assert!(matches!(
-        reconcile.command,
+        into_command(reconcile),
         Command::Task {
             command: TaskCommand::Reconcile,
         }
@@ -561,7 +564,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
 
     let wait_run = Cli::try_parse_from(["worker", "task", "wait", "--run", RUN_ID]).unwrap();
     assert!(matches!(
-        wait_run.command,
+        into_command(wait_run),
         Command::Task {
             command: TaskCommand::Wait {
                 task_id: None,
@@ -581,7 +584,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
     ])
     .unwrap();
     assert!(matches!(
-        wait_task.command,
+        into_command(wait_task),
         Command::Task {
             command: TaskCommand::Wait {
                 task_id: Some(_),
@@ -593,7 +596,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
 
     let batch = Cli::try_parse_from(["worker", "task", "batch", "tasks.toml"]).unwrap();
     assert!(matches!(
-        batch.command,
+        into_command(batch),
         Command::Task {
             command: TaskCommand::Batch {
                 max_parallel: None,
@@ -605,7 +608,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
     ));
     let omitted = Cli::try_parse_from(["worker", "--json", "task", "batch", "tasks.toml"]).unwrap();
     assert!(matches!(
-        omitted.command,
+        into_command(omitted),
         Command::Task {
             command: TaskCommand::Batch {
                 max_parallel: None,
@@ -638,14 +641,14 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
 
     let run = Cli::try_parse_from(["worker", "controller", "run"]).unwrap();
     assert!(matches!(
-        run.command,
+        into_command(run),
         Command::Controller {
             command: ControllerCommand::Run { supervised: false }
         }
     ));
     let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
     assert!(matches!(
-        rpc.command,
+        into_command(rpc),
         Command::Host {
             command: HostCommand::ControllerRpc
         }
@@ -663,7 +666,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
     ])
     .unwrap();
     assert!(matches!(
-        receive.command,
+        into_command(receive),
         Command::Host {
             command: HostCommand::ControllerReceivePack { .. }
         }
@@ -681,7 +684,7 @@ fn controller_era_task_forms_parse_with_their_documented_fields() {
     ])
     .unwrap();
     assert!(matches!(
-        upload.command,
+        into_command(upload),
         Command::Host {
             command: HostCommand::ControllerUploadPack { .. }
         }

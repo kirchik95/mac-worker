@@ -3,10 +3,10 @@
 
 use std::{fs, os::unix::fs::PermissionsExt};
 
-use mac_worker::{
-    host_store::{HostStore, JobDisposition},
+use mac_worker::test_support::host::{
     job::{ExecutionScope, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord, SubmitRequest},
     legacy_snapshot_receipt::VerifiedReceipt,
+    store::{HostStore, JobDisposition},
 };
 use serde::Serialize;
 use std::{
@@ -63,7 +63,7 @@ pub(super) fn lease(store: &HostStore, request: &LeaseAcquireRequest, now: u64) 
         now + request.material().timeout_millis(),
     )
     .unwrap();
-    let slots = mac_worker::lease::LeaseService::new(store)
+    let slots = mac_worker::test_support::host::lease::LeaseService::new(store)
         .occupied_slots()
         .unwrap();
     let slot = (0..=u8::MAX)
@@ -73,7 +73,7 @@ pub(super) fn lease(store: &HostStore, request: &LeaseAcquireRequest, now: u64) 
     private_json(store, &directory, "lease.json", &lease);
     private_json(store, &directory, "scope.json", &ExecutionScope::Job);
     assert_eq!(
-        mac_worker::lease::LeaseService::new(store)
+        mac_worker::test_support::host::lease::LeaseService::new(store)
             .load_for_job(lease.job_id())
             .unwrap(),
         Some(lease.clone())
@@ -139,11 +139,11 @@ pub(super) fn accepted(store: &HostStore, request: &SubmitRequest, now: u64, ind
     #[derive(Serialize)]
     struct LegacyExecution<'a> {
         version: u32,
-        job_id: mac_worker::job::JobId,
-        client_id: mac_worker::job::ClientId,
-        request_fingerprint: &'a mac_worker::job::RequestFingerprint,
-        lease_token: mac_worker::job::LeaseToken,
-        command: &'a mac_worker::job::CommandSpec,
+        job_id: mac_worker::test_support::host::job::JobId,
+        client_id: mac_worker::test_support::host::job::ClientId,
+        request_fingerprint: &'a mac_worker::test_support::host::job::RequestFingerprint,
+        lease_token: mac_worker::test_support::host::job::LeaseToken,
+        command: &'a mac_worker::test_support::host::job::CommandSpec,
         turn: Option<()>,
     }
     let material = request.material();

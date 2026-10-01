@@ -2,15 +2,20 @@ use crate::support;
 
 use std::fs;
 
-use mac_worker::{
-    agent::AgentKind,
-    agent::render_prebind_shell,
-    agent_facts::AgentAuth,
-    job::{ClientId, CommandSpec, JobId, LeaseRecord, LeaseToken, RequestFingerprintMaterial},
-    process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
-    supervisor::LaunchPlan,
-    task::{BaseOid, GitIdentity, TaskId},
-    turn::{EnvProfile, TurnMaterial, TurnSection},
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, render_prebind_shell},
+        agent_facts::AgentAuth,
+    },
+    host::{
+        job::{ClientId, CommandSpec, JobId, LeaseRecord, LeaseToken, RequestFingerprintMaterial},
+        process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
+        supervisor::LaunchPlan,
+    },
+    task::{
+        model::{BaseOid, GitIdentity, TaskId},
+        turn::{EnvProfile, TurnMaterial, TurnSection},
+    },
 };
 use support::agent_launch_fixture::{
     FixtureLayout, LOGIN_BAD, LOGIN_GOOD, PARENT_ONLY, PROFILE_GOOD, PROFILE_NAME,
@@ -31,8 +36,8 @@ fn cursor_status_launch_plan(fixture: &FixtureLayout, profile_name: &str) -> Lau
         AgentKind::Cursor,
         None,
         None,
-        mac_worker::agent::PermissionPolicy::Unattended,
-        mac_worker::agent::TurnLimits::new(60_000, None, None).unwrap(),
+        mac_worker::test_support::agents::agent::PermissionPolicy::Unattended,
+        mac_worker::test_support::agents::agent::TurnLimits::new(60_000, None, None).unwrap(),
         "a".repeat(40).parse::<BaseOid>().unwrap(),
         b"prompt",
         Some(profile_name.into()),
@@ -319,7 +324,10 @@ fn launch_plan_and_prebind_share_login_shell_boundary() {
         plan.program(),
         std::env::current_exe().unwrap().to_str().unwrap()
     );
-    assert_eq!(plan.args()[1], mac_worker::prepare_turn::ARG);
+    assert_eq!(
+        plan.args()[1],
+        mac_worker::test_support::task::prepare_turn::ARG
+    );
     assert_eq!(plan.args()[2], "--");
     assert_eq!(
         plan.prepare_turn_agent_args().map(ToOwned::to_owned),

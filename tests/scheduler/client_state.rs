@@ -15,18 +15,24 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    client_state::{ClientStateCreationRacePoint, ClientStateStore, ClientStateWritePoint},
-    config::WorkerEntry,
-    error::{ProcessError, WorkerError},
-    job::{
-        AdmissionObservation, ClientId, CommandSpec, CommandSummary, JobId, JobMeta, JobState,
-        JobStatus, LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity,
-        QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
-        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
+use mac_worker::test_support::{
+    client_state::{
+        ClientStateCreationRacePoint, ClientStateStore, ClientStateWritePoint,
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    scheduler::{CandidateSlot, WorkerPreference},
+    core::{
+        config::WorkerEntry,
+        error::{ProcessError, WorkerError},
+    },
+    host::{
+        job::{
+            AdmissionObservation, ClientId, CommandSpec, CommandSummary, JobId, JobMeta, JobState,
+            JobStatus, LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity,
+            QueueEntry, QueueEntryKind, RemoteUncertainty, RequestFingerprintMaterial,
+            ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusResponse, SubmitRequest,
+        },
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
     transfer::{RemoteJobClient, ResolutionRuntime},
 };
 
@@ -1790,7 +1796,7 @@ fn queue_update_crash_after_publication_is_a_complete_canonical_replacement() {
     assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
     assert!(matches!(
         reopened.queue_snapshot().unwrap().entries()[0].state(),
-        mac_worker::job::QueueState::Dispatching { selected_worker, .. }
+        mac_worker::test_support::host::job::QueueState::Dispatching { selected_worker, .. }
             if selected_worker == "mini-1"
     ));
 }

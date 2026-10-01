@@ -1,12 +1,11 @@
 use crate::fixture_pid;
 
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{
         ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
         FakeControllerExecutor, parse_request, tick_controller_leader,
     },
-    error::WorkerError,
-    protocol::PROTOCOL_VERSION,
+    core::{error::WorkerError, protocol::PROTOCOL_VERSION},
 };
 use serde_json::{Value, json};
 
@@ -66,10 +65,10 @@ fn leader_tick_exposes_per_request_failure_and_neighbor_progress() {
 
 #[test]
 fn repeated_failures_are_counted_without_hiding_neighbor_progress() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::health::{ControllerHealth, ControllerTickReport},
-        job::ProcessIdentity,
-        task_client::ReconcileReport,
+        host::job::ProcessIdentity,
+        task::client::ReconcileReport,
     };
     let temp = tempfile::tempdir().unwrap();
     let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
@@ -105,9 +104,9 @@ fn repeated_failures_are_counted_without_hiding_neighbor_progress() {
 
 #[test]
 fn health_persistence_is_atomic_private_and_bounded() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::health::{ControllerHealth, HealthStore},
-        job::ProcessIdentity,
+        host::job::ProcessIdentity,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let temp = tempfile::tempdir().unwrap();
@@ -163,9 +162,9 @@ fn pending_age_counts_only_active_receipts_and_marks_unknown_ages() {
 
 #[test]
 fn failure_logging_is_rate_limited_but_counts_every_tick() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::health::{ControllerHealth, HealthLogger},
-        job::ProcessIdentity,
+        host::job::ProcessIdentity,
     };
     let mut health = ControllerHealth::new(
         ProcessIdentity::new(fixture_pid::fixture_pid(42), 1).unwrap(),

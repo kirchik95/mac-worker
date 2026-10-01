@@ -10,14 +10,20 @@ use std::{
     time::Instant,
 };
 
-use mac_worker::{
-    agent::prebind_login_request,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
-    error::WorkerError,
-    host_store::HostStore,
-    probe::ProbeCollector,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    supervisor::LaunchPlan,
+use mac_worker::test_support::{
+    agents::{
+        agent::prebind_login_request,
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+        probe::ProbeCollector,
+    },
+    core::error::WorkerError,
+    host::{
+        process::{
+            ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner,
+        },
+        store::HostStore,
+        supervisor::LaunchPlan,
+    },
 };
 
 pub const PROFILE_GOOD: &str = "profile-good";
@@ -332,7 +338,7 @@ pub fn run_launch_plan_cursor_auth(plan: &LaunchPlan) -> AgentAuth {
 }
 
 pub fn classify_cursor_process_result(result: &ProcessResult) -> AgentAuth {
-    use mac_worker::agent::{AgentKind, AuthProbeResult, adapter_for};
+    use mac_worker::test_support::agents::agent::{AgentKind, AuthProbeResult, adapter_for};
     let probe = adapter_for(AgentKind::Cursor).auth_probe();
     if !result.status.success() {
         panic!(

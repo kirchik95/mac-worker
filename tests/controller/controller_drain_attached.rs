@@ -19,36 +19,45 @@ use std::{
     },
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy},
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
+    },
     client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    job::{
-        JobMeta, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        LogChunk, LogChunkRequest, LogStream, StatusRequest, StatusResponse, SubmitResponse,
+    core::{
+        config::Config,
+        error::WorkerError,
+        paths::PathLayout,
+        protocol::{
+            CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        },
     },
-    lease::SlotState,
-    paths::PathLayout,
-    prepared_followup::PreparedFollowup,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    host::{
+        job::{
+            JobMeta, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
+            LogChunk, LogChunkRequest, LogStream, StatusRequest, StatusResponse, SubmitResponse,
+        },
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnId, TurnSummary, TurnTerminal,
+        client::TaskClient,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        prepared_followup::PreparedFollowup,
+        project_state::ProjectState,
+        store::{
+            SessionBinding, TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest,
+            TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
+        },
+        turn::{TaskTurnRequest, TaskTurnResponse},
+        turn_runner::{InlineRunnerExecutor, RunnerExecutor},
     },
-    task_client::TaskClient,
-    task_store::{
-        SessionBinding, TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest,
-        TaskSessionResponse, TaskStatusRequest, TaskStatusResponse,
-    },
-    transfer::HostOperation,
-    transfer_repo::repo_id_for,
-    turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{InlineRunnerExecutor, RunnerExecutor},
+    transfer::{HostOperation, repo::repo_id_for},
 };
 use uuid::Uuid;
 
@@ -203,7 +212,7 @@ impl CompletingHost {
                 "GIT_COMMON_DIR".into(),
             ],
             stdin: None,
-            policy: mac_worker::process::ProcessPolicy {
+            policy: mac_worker::test_support::host::process::ProcessPolicy {
                 stdout_limit: 64 * 1024,
                 stderr_limit: 64 * 1024,
                 deadline: std::time::Duration::from_secs(15),
@@ -352,7 +361,8 @@ impl ProcessRunner for CompletingHost {
             value if value == HostOperation::TaskTurn.command() => {
                 let turn: TaskTurnRequest = decode_request(request)?;
                 assert!(
-                    !mac_worker::controller::drain::is_drained(&self.drain_root).unwrap(),
+                    !mac_worker::test_support::controller::drain::is_drained(&self.drain_root)
+                        .unwrap(),
                     "attached command dispatched a worker task-turn while drained"
                 );
                 self.submissions.fetch_add(1, Ordering::SeqCst);
@@ -435,11 +445,9 @@ impl ProcessRunner for CompletingHost {
                 } else {
                     Vec::new()
                 };
-                canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                    chunk_request.stream(),
-                    chunk_request.offset(),
-                    bytes,
-                )?)?)
+                canonical_process(&mac_worker::test_support::host::job::LogChunkResponse::new(
+                    LogChunk::new(chunk_request.stream(), chunk_request.offset(), bytes)?,
+                )?)
             }
             value if value == HostOperation::StatusLogs.command() => Ok(ProcessResult {
                 status: ExitStatus::from_raw(2 << 8),
@@ -616,7 +624,8 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
     let executor = CountingInlineExecutor::new();
     let config = task_config();
     assert!(!config.controller.enabled);
-    mac_worker::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+    mac_worker::test_support::controller::drain::set_drained(&paths.controller_state_root(), true)
+        .unwrap();
     let polls = AtomicUsize::new(0);
     let poll = |delay: std::time::Duration| {
         assert!(
@@ -633,7 +642,7 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
         let row = &rows.entries()[0];
         assert_eq!(
             *row.owner_opt().unwrap(),
-            mac_worker::supervisor::SystemProcessInspector
+            mac_worker::test_support::host::supervisor::SystemProcessInspector
                 .identity_for_pid(std::process::id())
                 .unwrap()
         );
@@ -646,8 +655,11 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
                     "injected deadline expiry",
                 ));
             }
-            mac_worker::controller::drain::set_drained(&paths.controller_state_root(), false)
-                .unwrap();
+            mac_worker::test_support::controller::drain::set_drained(
+                &paths.controller_state_root(),
+                false,
+            )
+            .unwrap();
             probe_recovery(&paths);
             assert_eq!(store.queue_entry(row.job_id()).unwrap().as_ref(), Some(row));
         }
@@ -670,7 +682,8 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
         store
             .adopt_row(
                 prepared.turn_id(),
-                mac_worker::job::ProcessIdentity::new(std::process::id(), 1).unwrap(),
+                mac_worker::test_support::host::job::ProcessIdentity::new(std::process::id(), 1)
+                    .unwrap(),
             )
             .unwrap();
         if matches!(path, AttachedPath::ResumeParked) {
@@ -700,7 +713,7 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
     let mut stderr = Vec::new();
     let report = match path {
         AttachedPath::Submit => client.submit(
-            mac_worker::task_client::TaskSubmitRequest {
+            mac_worker::test_support::task::client::TaskSubmitRequest {
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -716,7 +729,8 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
                 limits: TaskLimits::default(),
                 close_policy: ClosePolicy::Never,
                 env_profile: None,
-                preference: mac_worker::scheduler::WorkerPreference::Automatic,
+                preference:
+                    mac_worker::test_support::client_state::scheduler::WorkerPreference::Automatic,
                 wait_for_capacity: true,
                 attached: true,
                 run_id: None,
@@ -770,7 +784,10 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
         assert_eq!(host.submissions(), 0);
         assert_eq!(executor.starts(), 0);
         let row = store.queue_snapshot().unwrap().entries()[0].clone();
-        assert!(matches!(row.state(), mac_worker::job::QueueState::Parked));
+        assert!(matches!(
+            row.state(),
+            mac_worker::test_support::host::job::QueueState::Parked
+        ));
         let task_id = store.task_id_for_turn(row.job_id()).unwrap().unwrap();
         assert!(
             !store
@@ -779,7 +796,11 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
                 .is_empty()
         );
         assert!(store.load_task(task_id).unwrap().runner().is_none());
-        mac_worker::controller::drain::set_drained(&paths.controller_state_root(), false).unwrap();
+        mac_worker::test_support::controller::drain::set_drained(
+            &paths.controller_state_root(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             client
                 .reconcile_selected(&[task_id])
@@ -794,10 +815,11 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
                 .started_runners(),
             0
         );
-        let outcome =
-            mac_worker::turn_runner::TurnRunner::new(&host, &config, &paths, &store, &executor)
-                .run(task_id, row.job_id(), None)
-                .unwrap();
+        let outcome = mac_worker::test_support::task::turn_runner::TurnRunner::new(
+            &host, &config, &paths, &store, &executor,
+        )
+        .run(task_id, row.job_id(), None)
+        .unwrap();
         assert_eq!(outcome.exit_code(), 0);
         assert_eq!(host.submissions(), 1);
         assert_eq!(executor.starts(), 1);
@@ -917,7 +939,8 @@ fn attached_waiter_exit_is_recovered_once_after_drain_off() {
     let store = ClientStateStore::open(&paths.state).unwrap();
     let expected = plant_open_first_turn(&store, &project, base_oid.clone(), 11, 12);
     let task_id = expected.meta().task_id();
-    mac_worker::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+    mac_worker::test_support::controller::drain::set_drained(&paths.controller_state_root(), true)
+        .unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -968,7 +991,9 @@ fn attached_waiter_exit_is_recovered_once_after_drain_off() {
             .owner_opt(),
         row.owner_opt()
     );
-    store.advance_liveness_clock(mac_worker::client_state::RUNNER_ABSENCE_CONFIRMATION);
+    store.advance_liveness_clock(
+        mac_worker::test_support::client_state::RUNNER_ABSENCE_CONFIRMATION,
+    );
     assert_eq!(
         client
             .reconcile_selected(&[task_id])
@@ -978,7 +1003,8 @@ fn attached_waiter_exit_is_recovered_once_after_drain_off() {
     );
     assert_eq!(host.submissions(), 0);
     assert_eq!(executor.starts(), 0);
-    mac_worker::controller::drain::set_drained(&paths.controller_state_root(), false).unwrap();
+    mac_worker::test_support::controller::drain::set_drained(&paths.controller_state_root(), false)
+        .unwrap();
     assert_eq!(
         client
             .reconcile_selected(&[task_id])
@@ -993,10 +1019,11 @@ fn attached_waiter_exit_is_recovered_once_after_drain_off() {
             .started_runners(),
         0
     );
-    let outcome =
-        mac_worker::turn_runner::TurnRunner::new(&host, &config, &paths, &store, &executor)
-            .run(task_id, row.job_id(), None)
-            .unwrap();
+    let outcome = mac_worker::test_support::task::turn_runner::TurnRunner::new(
+        &host, &config, &paths, &store, &executor,
+    )
+    .run(task_id, row.job_id(), None)
+    .unwrap();
     assert_eq!(outcome.exit_code(), 0);
     assert_eq!(host.submissions(), 1);
     assert_eq!(executor.starts(), 1);
@@ -1044,9 +1071,11 @@ fn drain_exiting_waiter() {
 
 struct ReleaseJournalOnContention(Mutex<Option<std::fs::File>>);
 
-impl mac_worker::client_state::ClientStateConcurrencyHook for ReleaseJournalOnContention {
-    fn reach(&self, point: mac_worker::client_state::ClientStateConcurrencyPoint) {
-        if point == mac_worker::client_state::ClientStateConcurrencyPoint::RunnerLogContention {
+impl mac_worker::test_support::client_state::ClientStateConcurrencyHook
+    for ReleaseJournalOnContention
+{
+    fn reach(&self, point: mac_worker::test_support::client_state::ClientStateConcurrencyPoint) {
+        if point == mac_worker::test_support::client_state::ClientStateConcurrencyPoint::RunnerLogContention {
             self.0.lock().unwrap().take();
         }
     }

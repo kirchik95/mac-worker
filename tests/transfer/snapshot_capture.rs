@@ -15,16 +15,21 @@ use std::{
     time::Instant,
 };
 
-use mac_worker::{
-    error::WorkerError,
-    inputs::{
-        InputOrigin, InputSelection, InputSelector, RelativePath, SelectedInput, SelectedInputKind,
+use mac_worker::test_support::{
+    core::{
+        error::WorkerError,
+        inputs::{
+            InputOrigin, InputSelection, InputSelector, RelativePath, SelectedInput,
+            SelectedInputKind,
+        },
+        manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
     },
-    manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project::{ProjectContext, ProjectInspector},
-    project_config::SnapshotSettings,
-    snapshot::{Snapshot, SnapshotBuilder, SnapshotHook},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    task::{
+        project::{ProjectContext, ProjectInspector},
+        project_config::SnapshotSettings,
+    },
+    transfer::snapshot::{Snapshot, SnapshotBuilder, SnapshotHook},
 };
 use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 

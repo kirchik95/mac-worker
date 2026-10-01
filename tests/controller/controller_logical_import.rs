@@ -10,10 +10,10 @@ use crate::support;
 
 use std::process::Command;
 
-use mac_worker::{
-    process::SystemProcessRunner,
-    task::{BaseOid, TaskId},
-    transfer_repo::{TransferRepo, repo_id_for},
+use mac_worker::test_support::{
+    host::process::SystemProcessRunner,
+    task::model::{BaseOid, TaskId},
+    transfer::repo::{TransferRepo, repo_id_for},
 };
 use support::GitRepo;
 use uuid::Uuid;

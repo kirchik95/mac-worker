@@ -1,42 +1,43 @@
 //! Paired local fixture observations; elapsed times are never speed assertions.
-use mac_worker::controller::channel::{server_eligible_read, testing::request_fixture};
+use mac_worker::test_support::channel::{server_eligible_read, testing::request_fixture};
 use serde_json::json;
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    channel::{
+        client::ChannelProcessRunner,
+        codec::{SessionCodec, io::FramedSocketConnector},
+        contracts::*,
+        files::PrivateChannelFiles,
+        forward::MasterForwardControl,
+        identity::StdioIdentitySource,
+        pin::PrivatePinStore,
+        server::NativeControl,
+        testing::ScriptedImageSource,
+    },
     client_state::ClientStateStore,
-    config::{ControllerConfig, SshConfig},
     controller::{
-        ControllerLeader, ControllerRequest,
-        channel::{
-            client::ChannelProcessRunner,
-            codec::{SessionCodec, io::FramedSocketConnector},
-            contracts::*,
-            files::PrivateChannelFiles,
-            forward::MasterForwardControl,
-            identity::StdioIdentitySource,
-            pin::PrivatePinStore,
-            server::NativeControl,
-            testing::ScriptedImageSource,
-        },
-        controller_rpc_ssh_request, decode_frame, decode_request, encode_json_frame,
-        events::{
-            EventBatch, EventCursor, JournalReader, NewEvent, Seq,
-            journal::{ControllerJournal, JournalOptions},
-        },
-        parse_request,
+        ControllerLeader, ControllerRequest, controller_rpc_ssh_request, decode_frame,
+        decode_request, encode_json_frame, parse_request,
         runtime::{
             LeaderChannel, LeaderChannelConfig, LeaderChannelDeps, LeaderChannelShutdown,
             SystemChannelRuntime,
         },
     },
-    error::WorkerError,
-    paths::PathLayout,
-    process::{
+    core::{
+        config::{ControllerConfig, SshConfig},
+        error::WorkerError,
+        paths::PathLayout,
+    },
+    events::{
+        EventBatch, EventCursor, JournalReader, NewEvent, Seq,
+        journal::{ControllerJournal, JournalOptions},
+    },
+    host::process::{
         CleanupState, ProcessCompletion, ProcessPolicy, ProcessRequest, ProcessResult,
         ProcessRunner, SystemProcessRunner, TrackedProcessRunner,
     },
-    task::{
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
         TurnTerminal,
@@ -337,7 +338,7 @@ impl Fixture {
             inode: metadata.ino(),
         };
         let leader = Arc::new(ControllerLeader::acquire(&paths.controller_state_root()).unwrap());
-        let event_runtime = mac_worker::ControllerEventRuntime::system();
+        let event_runtime = mac_worker::test_support::runtime::ControllerEventRuntime::system();
         let journal = ControllerJournal::initialize_for_leader(
             &paths,
             &leader,
@@ -356,13 +357,13 @@ impl Fixture {
                         .collect(),
                 )
                 .unwrap(),
-                mac_worker::controller::events::EventRuntime::now(event_runtime.as_ref()) + GUARD,
+                mac_worker::test_support::events::EventRuntime::now(event_runtime.as_ref()) + GUARD,
             )
             .unwrap();
         assert_eq!(
             journal
                 .window(
-                    mac_worker::controller::events::EventRuntime::now(event_runtime.as_ref())
+                    mac_worker::test_support::events::EventRuntime::now(event_runtime.as_ref())
                         + GUARD
                 )
                 .unwrap()
@@ -1094,7 +1095,7 @@ impl PinStore for PinProbe {
         &self,
         _: &PathLayout,
         _: &SocketIdentity,
-        _: mac_worker::job::ClientId,
+        _: mac_worker::test_support::host::job::ClientId,
     ) -> Result<(), ChannelFailure> {
         panic!("observation must not repin")
     }

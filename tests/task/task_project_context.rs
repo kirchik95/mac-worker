@@ -12,26 +12,31 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    client_state::{ClientStateStore, ClientStateWritePoint},
-    config::Config,
-    error::WorkerError,
-    job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
-    process::SystemProcessRunner,
-    project_state::ProjectState,
-    scheduler::{CandidateSlot, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
-        SystemProcessInspector,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    client_state::{
+        ClientStateStore, ClientStateWritePoint,
+        scheduler::{CandidateSlot, WorkerPreference},
+    },
+    core::{config::Config, error::WorkerError},
+    host::{
+        job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
+        process::SystemProcessRunner,
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+            SystemProcessInspector,
+        },
     },
     task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
+        client::{TaskClient, TaskSubmitRequest},
+        model::{
+            ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
+            TaskLimits, TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
+        },
+        project_state::ProjectState,
+        turn_runner::InlineRunnerExecutor,
     },
-    task_client::{TaskClient, TaskSubmitRequest},
-    transfer_repo::repo_id_for,
-    turn_runner::InlineRunnerExecutor,
+    transfer::repo::repo_id_for,
 };
 use uuid::Uuid;
 

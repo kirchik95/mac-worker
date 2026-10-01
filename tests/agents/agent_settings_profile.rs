@@ -10,13 +10,14 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore},
+use mac_worker::test_support::{
+    agents::agent_settings::{
+        AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore,
+    },
     cli::Cli,
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    run_with_stdio_in_context,
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};

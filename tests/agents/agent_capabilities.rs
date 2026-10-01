@@ -4,19 +4,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mac_worker::{
-    agent::{AgentKind, AuthProbeResult, adapter_for},
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
-    config::{Config, WorkerEntry},
-    error::WorkerError,
-    lease::SlotState,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, AuthProbeResult, adapter_for},
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, ProfileProbe},
     },
-    scheduler_adapter::SchedulerProbeAdapter,
-    transport::SshTransport,
+    client_state::scheduler_adapter::SchedulerProbeAdapter,
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth,
+        },
+    },
+    host::{
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    transfer::transport::SshTransport,
 };
 
 fn result(stdout: &[u8]) -> ProcessResult {
@@ -223,7 +229,7 @@ fn origin_worker() -> WorkerEntry {
 fn origin_config() -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![origin_worker()],
@@ -356,7 +362,7 @@ fn unverified_cursor_login_is_not_advertised_as_an_agent_capability() {
 
 #[test]
 fn adapters_own_turn_auth_failure_signatures() {
-    use mac_worker::agent::AuthFailureSignature;
+    use mac_worker::test_support::agents::agent::AuthFailureSignature;
 
     assert_eq!(
         adapter_for(AgentKind::Codex).auth_failure_signatures(),
@@ -386,7 +392,9 @@ fn adapters_own_turn_auth_failure_signatures() {
 
 #[test]
 fn auth_failure_scan_matches_phrases_split_across_chunks_and_bounded_tails() {
-    use mac_worker::agent::{AUTH_SCAN_TAIL_BYTES, AuthFailureScan, AuthFailureSignature};
+    use mac_worker::test_support::agents::agent::{
+        AUTH_SCAN_TAIL_BYTES, AuthFailureScan, AuthFailureSignature,
+    };
 
     let signatures = [AuthFailureSignature::Contains(
         "refresh token was already used",
@@ -428,14 +436,17 @@ fn cursor_extracts_needs_input_when_prose_abuts_a_result_with_questions() {
     let result = adapter_for(AgentKind::Cursor)
         .extract_result("", Some(text))
         .unwrap();
-    assert_eq!(result.status(), mac_worker::agent::ResultStatus::NeedsInput);
+    assert_eq!(
+        result.status(),
+        mac_worker::test_support::agents::agent::ResultStatus::NeedsInput
+    );
     assert_eq!(
         result.summary(),
         "Need the maintainer to choose the docs file before any writing."
     );
     assert_eq!(
         result.questions(),
-        &[mac_worker::agent::Question::new(
+        &[mac_worker::test_support::agents::agent::Question::new(
             "Should the new 'When a turn fails' section go into README.md (under the operator section) or into docs/usage.md next to task lifecycle?",
             vec![
                 "README.md (under the operator section)".into(),

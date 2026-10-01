@@ -1,6 +1,6 @@
 use crate::v7;
 
-use mac_worker::{prepared_submit::FrozenSubmitBody, task::QuestionsPolicy};
+use mac_worker::test_support::task::{model::QuestionsPolicy, prepared_submit::FrozenSubmitBody};
 use serde_json::json;
 
 fn legacy_submit() -> serde_json::Value {
@@ -47,7 +47,7 @@ fn questions_dag_wire_works_with_f59e56a_in_both_directions_by_default() {
     }
     object.insert("project_path".into(), json!("/fixture"));
     let old: v7::DagFrozenSpec = serde_json::from_value(wire).unwrap();
-    let new: mac_worker::dag::DagFrozenSpec =
+    let new: mac_worker::test_support::client_state::dag::DagFrozenSpec =
         serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
     assert_eq!(new.questions, None);
     let _: v7::DagFrozenSpec = serde_json::from_value(serde_json::to_value(new).unwrap()).unwrap();
@@ -55,7 +55,7 @@ fn questions_dag_wire_works_with_f59e56a_in_both_directions_by_default() {
 
 #[test]
 fn questions_status_roundtrips_through_strict_f59e56a_dto() {
-    use mac_worker::controller::ControllerTaskStatusResult;
+    use mac_worker::test_support::controller::ControllerTaskStatusResult;
     let wire = json!({
         "task_id":"00000000000000000000000000000001", "run_id":null,
         "status": {"state":"queued", "last_outcome":null, "worker":null,
@@ -86,7 +86,7 @@ fn questions_status_roundtrips_through_strict_f59e56a_dto() {
 
 #[test]
 fn questions_auto_history_is_carried_in_events_compatible_with_f59e56a() {
-    use mac_worker::controller::ControllerTaskStatusResult;
+    use mac_worker::test_support::controller::ControllerTaskStatusResult;
     let turn = "00000000000000000000000000000002";
     let wire = json!({
         "task_id":"00000000000000000000000000000001", "run_id":null,

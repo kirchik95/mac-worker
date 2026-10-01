@@ -6,15 +6,12 @@ use std::{
     process::Command,
 };
 
-use mac_worker::{
-    config::Config,
+use mac_worker::test_support::{
+    client_state::dag::DagBase,
     controller::{BatchKind, freeze_laptop_batch},
-    dag::DagBase,
-    error::WorkerError,
-    paths::PathLayout,
-    process::SystemProcessRunner,
-    project_state::ProjectState,
-    task::BaseOid,
+    core::{config::Config, error::WorkerError, paths::PathLayout},
+    host::process::SystemProcessRunner,
+    task::{model::BaseOid, project_state::ProjectState},
 };
 use support::GitRepo;
 
@@ -70,7 +67,7 @@ impl Harness {
         batch: &Path,
         run_name: Option<String>,
         max_parallel: Option<u32>,
-    ) -> Result<mac_worker::controller::LaptopFrozenBatch, WorkerError> {
+    ) -> Result<mac_worker::test_support::controller::LaptopFrozenBatch, WorkerError> {
         freeze_laptop_batch(
             &RUNNER,
             &self.config,
@@ -323,7 +320,10 @@ prompt = "child work"
     let child = &frozen.body().nodes["child"];
     assert!(matches!(child.base, DagBase::From { ref parent } if parent == "parent"));
     assert_eq!(child.depends_on, vec!["parent".to_string()]);
-    assert_eq!(child.state, mac_worker::dag::DagNodeState::Waiting);
+    assert_eq!(
+        child.state,
+        mac_worker::test_support::client_state::dag::DagNodeState::Waiting
+    );
     assert!(child.bound_oid.is_none());
     assert!(child.claimed_by.is_none());
     let parent = &frozen.body().nodes["parent"];

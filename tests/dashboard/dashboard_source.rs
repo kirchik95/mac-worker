@@ -5,10 +5,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
-    client_state::ClientStateStore,
-    config::{Config, WorkerEntry},
+use mac_worker::test_support::{
+    agents::agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
+    client_state::{
+        ClientStateStore,
+        scheduler::{CandidateSlot, WorkerPreference},
+    },
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth as ProbeWorkerHealth, WorkersReport,
+        },
+    },
     dashboard::{
         cache::Observation,
         model::{DashboardMemoryPressure, DashboardSlotState, WorkerHealth},
@@ -18,17 +28,13 @@ use mac_worker::{
         },
         source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
     },
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, JobId, LogChunk, LogStream, ProcessIdentity,
-        QueueEntry, QueueEntryKind,
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, JobId, LogChunk, LogStream, ProcessIdentity,
+            QueueEntry, QueueEntryKind,
+        },
+        lease::{LeaseSummary, SlotState},
     },
-    lease::{LeaseSummary, SlotState},
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth as ProbeWorkerHealth, WorkersReport,
-    },
-    scheduler::{CandidateSlot, WorkerPreference},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -305,7 +311,7 @@ impl Fixture {
         let state = Arc::new(ClientStateStore::open(&state_root).unwrap());
         let config = Arc::new(Config {
             version: 1,
-            notifications: mac_worker::config::NotificationsConfig::default(),
+            notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
             controller: Default::default(),
             ssh: Default::default(),
             workers: vec![WorkerEntry {
@@ -437,8 +443,8 @@ impl DashboardRemoteReader for RecordingRemote {
     fn task_status(
         &self,
         _worker: &WorkerEntry,
-        _request: &mac_worker::task_store::TaskStatusRequest,
-    ) -> Result<mac_worker::task_store::TaskStatusResponse, WorkerError> {
+        _request: &mac_worker::test_support::task::store::TaskStatusRequest,
+    ) -> Result<mac_worker::test_support::task::store::TaskStatusResponse, WorkerError> {
         self.task_status_calls.lock().unwrap().push(job_id(0));
         Err(WorkerError::Protocol("TASK_NOT_FOUND".into()))
     }
@@ -564,7 +570,7 @@ fn current_observation(fixture: &Fixture) -> Observation {
 fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it() {
     // The dashboard sees the same fact doctor and workers see, unchanged; a
     // record that predates the fact projects `null` rather than inventing one.
-    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+    use mac_worker::test_support::agents::agent_facts::{HerdrFactState, HerdrFacts};
 
     let mut report = ready_report(job_id(91));
     let probe = report.workers[0].probe.as_mut().unwrap();
@@ -615,7 +621,7 @@ fn source_passes_the_herdr_fact_through_agent_facts_and_projects_null_without_it
 
 #[test]
 fn source_projects_a_fresh_herdr_chip_and_passes_a_stale_fact_through_with_its_age() {
-    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+    use mac_worker::test_support::agents::agent_facts::{HerdrFactState, HerdrFacts};
 
     let mut report = ready_report(job_id(93));
     let probe = report.workers[0].probe.as_mut().unwrap();
@@ -682,7 +688,7 @@ fn source_projects_a_fresh_herdr_chip_and_passes_a_stale_fact_through_with_its_a
 }
 
 fn stale_herdr_report() -> WorkersReport {
-    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+    use mac_worker::test_support::agents::agent_facts::{HerdrFactState, HerdrFacts};
 
     let mut report = ready_report(job_id(95));
     let probe = report.workers[0].probe.as_mut().unwrap();

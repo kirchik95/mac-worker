@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use mac_worker::agent_settings::{ModelOption, NativeAgentSettingsStore};
+use mac_worker::test_support::agents::agent_settings::{ModelOption, NativeAgentSettingsStore};
 use serde_json::json;
 use tempfile::tempdir;
 

@@ -11,24 +11,27 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    error::WorkerError,
-    host_store::{AdmissionGuard, HostStore, TransferGuard},
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    core::{error::WorkerError, protocol::MemoryPressure},
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::{AdmissionGuard, HostStore, TransferGuard},
     },
-    lease::{AdmissionFacts, LeaseService},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::MemoryPressure,
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskState, TaskStatus,
-    },
-    task_store::{
-        MAX_DIFF_BYTES, SessionBinding, TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest,
-        TaskStatusRequest, TaskStore,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskState, TaskStatus,
+        },
+        store::{
+            MAX_DIFF_BYTES, SessionBinding, TaskCloseRequest, TaskDiffRequest, TaskPrepareRequest,
+            TaskStatusRequest, TaskStore,
+        },
     },
 };
 use support::GitRepo;
@@ -76,7 +79,7 @@ fn task_meta_for(task_id: TaskId, base_oid: BaseOid) -> TaskMeta {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local {
+        source: mac_worker::test_support::task::model::TaskSource::Local {
             wip: false,
             push_target: None,
         },
@@ -121,7 +124,10 @@ fn git_status(path: &Path, args: &[&str]) -> std::process::Output {
         .expect("run git status fixture command")
 }
 
-fn git_ref_exists(mirror: &mac_worker::rooted_fs::RootedDir, reference: &str) -> bool {
+fn git_ref_exists(
+    mirror: &mac_worker::test_support::host::rooted_fs::RootedDir,
+    reference: &str,
+) -> bool {
     Command::new("/usr/bin/git")
         .args(["--git-dir"])
         .arg(mirror.path())
@@ -419,7 +425,7 @@ fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Origin {
+        source: mac_worker::test_support::task::model::TaskSource::Origin {
             url: "https://example.test/repo.git".into(),
         },
         publish: vec![PublishMode::Fetch],
@@ -434,12 +440,13 @@ fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
         created_at_millis: 100,
     })
     .unwrap();
-    let runner =
-        support::recording_runner::RecordingRunner::returning(mac_worker::process::ProcessResult {
+    let runner = support::recording_runner::RecordingRunner::returning(
+        mac_worker::test_support::host::process::ProcessResult {
             status: std::process::ExitStatus::from_raw(1),
             stdout: Vec::new(),
             stderr: b"origin unavailable".to_vec(),
-        });
+        },
+    );
     let request = TaskPrepareRequest::new(meta, job_id(), "mini-1");
     let error = {
         let (_admission, transfer) = transfer_guard(&store);
@@ -499,7 +506,7 @@ fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Origin {
+        source: mac_worker::test_support::task::model::TaskSource::Origin {
             url: "https://example.test/repo.git".into(),
         },
         publish: vec![PublishMode::Fetch],
@@ -543,7 +550,7 @@ fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Origin {
+        source: mac_worker::test_support::task::model::TaskSource::Origin {
             url: "https://example.test/repo.git".into(),
         },
         publish: vec![PublishMode::Fetch],
@@ -1176,7 +1183,7 @@ fn discard_skips_native_deletion_when_another_task_references_the_session() {
         .unwrap();
     let shared = SessionBinding::new(AgentKind::Codex, "shared-session", 200).unwrap();
     assert!(
-        mac_worker::agent::adapter_for(AgentKind::Codex)
+        mac_worker::test_support::agents::agent::adapter_for(AgentKind::Codex)
             .delete_session(shared.session_ref())
             .is_some()
     );
@@ -1333,7 +1340,7 @@ fn session_binding_is_owner_only_idempotent_and_strict() {
     let error = SessionBinding::new(AgentKind::Codex, "--help", 202).unwrap_err();
     assert_eq!(error.public_code(), "TASK_SESSION_INVALID");
     assert!(
-        mac_worker::agent::adapter_for(AgentKind::Codex)
+        mac_worker::test_support::agents::agent::adapter_for(AgentKind::Codex)
             .delete_session("--help")
             .is_none()
     );
@@ -1345,7 +1352,7 @@ fn task_dtos_carry_protocol_version_and_reject_unknown_fields() {
     let value = serde_json::to_value(&request).unwrap();
     assert_eq!(
         value["protocol_version"],
-        mac_worker::protocol::PROTOCOL_VERSION
+        mac_worker::test_support::core::protocol::PROTOCOL_VERSION
     );
     let mut object = value.as_object().unwrap().clone();
     object.insert("extra".into(), serde_json::json!(true));
@@ -1469,7 +1476,7 @@ fn prepare_rejects_wrong_project_before_creating_a_task() {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local {
+        source: mac_worker::test_support::task::model::TaskSource::Local {
             wip: false,
             push_target: None,
         },

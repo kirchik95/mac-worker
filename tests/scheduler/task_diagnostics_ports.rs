@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::from_parts;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -11,20 +12,20 @@ use std::{
 };
 
 use crate::{support::recording_runner::RecordingRunner, task_ports_fixture::canonical};
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command, TaskCommand},
     client_state::ClientStateStore,
-    job::{
-        CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
-        RequestFingerprintMaterial,
+    core::{paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::{
+            CommandSpec, JobId, JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
+            RequestFingerprintMaterial,
+        },
+        process::ProcessResult,
     },
-    paths::PathLayout,
-    process::ProcessResult,
-    protocol::PROTOCOL_VERSION,
-    run_with_io_in_context,
-    task::{
+    runtime::{RuntimeContext, run_with_io_in_context},
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnSummary,
     },
@@ -156,11 +157,7 @@ fn seed_legacy_job(store: &ClientStateStore) -> JobId {
     job
 }
 fn cli(config: PathBuf, json: bool, command: TaskCommand) -> Cli {
-    Cli {
-        config: Some(config),
-        json,
-        command: Command::Task { command },
-    }
+    from_parts(Some(config), json, Command::Task { command })
 }
 fn events(bytes: &[u8]) -> Vec<serde_json::Value> {
     bytes
@@ -190,7 +187,10 @@ fn failing_envelope(code: &str, message: &str, oversized: bool) -> ProcessResult
     let mut result = if oversized {
         ProcessResult { status: ExitStatus::from_raw(0), stdout: format!(r#"{{"protocol_version":{PROTOCOL_VERSION},"error":{{"code":"{code}","message":"{message}"}}}}"#).into_bytes(), stderr: Vec::new() }
     } else {
-        canonical(&mac_worker::job::HostControlError::new(code, message).unwrap()).unwrap()
+        canonical(
+            &mac_worker::test_support::host::job::HostControlError::new(code, message).unwrap(),
+        )
+        .unwrap()
     };
     result.status = ExitStatus::from_raw(23 << 8);
     result
@@ -300,7 +300,7 @@ fn task_diag_missing_config_is_sanitized_for_human_and_json() {
                     String::from_utf8(stderr).unwrap(),
                     format!(
                         "CONFIG_MISSING: configuration error\n{}\n",
-                        mac_worker::error::hint_for("CONFIG_MISSING").unwrap()
+                        mac_worker::test_support::core::error::hint_for("CONFIG_MISSING").unwrap()
                     )
                 );
             }
@@ -416,7 +416,7 @@ fn task_diag_non_utf8_config_path_is_sanitized_and_preserves_persisted_state() {
                 String::from_utf8(stderr).unwrap(),
                 format!(
                     "CONFIG_MISSING: configuration error\n{}\n",
-                    mac_worker::error::hint_for("CONFIG_MISSING").unwrap()
+                    mac_worker::test_support::core::error::hint_for("CONFIG_MISSING").unwrap()
                 )
             );
         }

@@ -1,5 +1,7 @@
-use mac_worker::{
-    controller::events::{
+use mac_worker::test_support::{
+    core::error::WorkerError,
+    dashboard::events::LocalViewerEventSource,
+    events::{
         EventBatch, EventCursor, EventReadResult, EventRuntime, JournalReader, JournalWindow,
         JournalWriter, LocalProjectionRefresh, NewEvent, ReadQuery, SSE_CAPACITY, SSE_MAX_STREAMS,
         Seq, SnapshotRequired, ViewerEventSource, ViewerMessage,
@@ -7,8 +9,6 @@ use mac_worker::{
             FakeLocalProjectionRefresh, ManualEventRuntime, MemoryJournal, MemoryViewerEventSource,
         },
     },
-    dashboard::events::LocalViewerEventSource,
-    error::WorkerError,
 };
 use std::{
     sync::{
@@ -369,7 +369,7 @@ async fn cancellation_closes_stream_before_a_held_replay_reader_returns() {
     release_tx.send(()).unwrap();
 }
 
-use mac_worker::{
+use mac_worker::test_support::{
     dashboard::{
         cache::Observation,
         model::{
@@ -383,10 +383,10 @@ use mac_worker::{
         task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState},
     },
-    job::LogStream,
-    task::{BranchName, ClosePolicy, TaskId, TaskState, TurnId},
-    task_view::{
-        ReviewState, TaskDetailProjection, TaskFreshness, TaskListProjection, TaskListRow,
+    host::job::LogStream,
+    task::{
+        model::{BranchName, ClosePolicy, TaskId, TaskState, TurnId},
+        view::{ReviewState, TaskDetailProjection, TaskFreshness, TaskListProjection, TaskListRow},
     },
 };
 use std::{
@@ -959,16 +959,16 @@ struct SseConnection {
 /// a local fake SSH executable, so no host or browser can be reached.
 struct ProcessViewerHarness {
     _temporary: tempfile::TempDir,
-    paths: mac_worker::paths::PathLayout,
-    journal: Option<Arc<mac_worker::controller::events::journal::ControllerJournal>>,
+    paths: mac_worker::test_support::core::paths::PathLayout,
+    journal: Option<Arc<mac_worker::test_support::events::journal::ControllerJournal>>,
     child: std::process::Child,
     address: SocketAddr,
 }
 
 impl ProcessViewerHarness {
     fn start(initialized: bool, controller_viewer: bool) -> Self {
-        use mac_worker::controller::{
-            ControllerLeader,
+        use mac_worker::test_support::{
+            controller::ControllerLeader,
             events::journal::{ControllerJournal, JournalOptions},
         };
         use std::{
@@ -1001,7 +1001,9 @@ impl ProcessViewerHarness {
         for value in environment.values() {
             crate::support::create_directory(std::path::PathBuf::from(value));
         }
-        let paths = mac_worker::paths::PathLayout::discover(None, &environment, &home).unwrap();
+        let paths =
+            mac_worker::test_support::core::paths::PathLayout::discover(None, &environment, &home)
+                .unwrap();
         crate::support::create_directory(paths.config.parent().unwrap());
         std::fs::write(&paths.config, "version = 1\n[controller]\nenabled = false\n[notifications]\nherdr = false\n[[workers]]\nname = \"fixture\"\nssh = \"fake-viewer-worker\"\nslots = 1\n").unwrap();
         let fake_ssh = root.join("fake-ssh");
@@ -1012,7 +1014,7 @@ impl ProcessViewerHarness {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
-        mac_worker::client_state::ClientStateStore::open(&paths.state).unwrap();
+        mac_worker::test_support::client_state::ClientStateStore::open(&paths.state).unwrap();
         let journal = initialized.then(|| {
             let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
             ControllerJournal::initialize_for_leader(
@@ -1337,7 +1339,7 @@ impl ViewerInput {
     fn expired(&self) -> bool {
         self.eof
             || self.now.saturating_sub(self.last_input)
-                >= mac_worker::controller::events::TUNNEL_TIMEOUT
+                >= mac_worker::test_support::events::TUNNEL_TIMEOUT
     }
 }
 
@@ -1349,7 +1351,8 @@ struct SseHarness {
     events: Arc<LocalViewerEventSource>,
     server: Option<DashboardHttpServer>,
     connection: Option<SseConnection>,
-    collector: Option<thread::JoinHandle<mac_worker::dashboard::model::DashboardSnapshot>>,
+    collector:
+        Option<thread::JoinHandle<mac_worker::test_support::dashboard::model::DashboardSnapshot>>,
     release: Option<mpsc::Sender<()>>,
     viewer: ViewerInput,
 }
@@ -1466,7 +1469,7 @@ impl SseHarness {
         self.ticks.cancel();
     }
     async fn fire_viewer_timeout(&mut self) {
-        self.viewer.now = mac_worker::controller::events::TUNNEL_TIMEOUT;
+        self.viewer.now = mac_worker::test_support::events::TUNNEL_TIMEOUT;
         assert!(self.viewer.expired());
         self.shutdown().await;
     }

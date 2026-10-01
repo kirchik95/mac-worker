@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use mac_worker::paths::PathLayout;
+use mac_worker::test_support::core::paths::PathLayout;
 
 /// Returns the isolated client-state roots used by task/runner integration
 /// fixtures. Keeping this in one helper makes it harder for a test to

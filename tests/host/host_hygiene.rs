@@ -10,19 +10,20 @@ use std::{
 };
 
 use fake_herdr::{FakeHerdr, Hold, Reply};
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
-    gc::HostGc,
-    herdr_reporter::{WORKSPACE_LABEL, task_label_prefix},
-    host_store::HostStore,
-    job::JobId,
-    process::SystemProcessRunner,
-    task::{
-        ClosePolicy, GitIdentity, HerdrTurnReport, HerdrTurnState, PublishMode, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
-        TurnTerminal,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy, TurnLimits},
+        herdr_reporter::{WORKSPACE_LABEL, task_label_prefix},
     },
-    task_store::{TaskCloseRequest, TaskStore},
+    host::{gc::HostGc, job::JobId, process::SystemProcessRunner, store::HostStore},
+    task::{
+        model::{
+            ClosePolicy, GitIdentity, HerdrTurnReport, HerdrTurnState, PublishMode, TaskId,
+            TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
+            TurnSummary, TurnTerminal,
+        },
+        store::{TaskCloseRequest, TaskStore},
+    },
 };
 use serde_json::json;
 use uuid::Uuid;

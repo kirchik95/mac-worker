@@ -18,26 +18,30 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::{
         ClientStateStore, ClientStateWritePoint, ReservedSlotTakeover, RunnerSlotDecision,
+        scheduler::{CandidateObservation, CandidateSlot, QueueBlockingReason, WorkerPreference},
     },
-    config::{Config, WorkerEntry},
-    error::{ProcessError, WorkerError},
-    job::{
-        AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
-        LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity, QueueCancel,
-        QueueEntry, QueueEntryKind, QueueId, QueueRunReference, QueueSnapshot, QueueState,
-        RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, RunId,
+    core::{
+        config::{Config, WorkerEntry},
+        error::{ProcessError, WorkerError},
     },
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    scheduler::{CandidateObservation, CandidateSlot, QueueBlockingReason, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    host::{
+        job::{
+            AdmissionObservation, CommandSpec, CommandSummary, JobId, JobMeta, JobState, JobStatus,
+            LeaseToken, LocalJobRecord, PreacceptanceDisposition, ProcessIdentity, QueueCancel,
+            QueueEntry, QueueEntryKind, QueueId, QueueRunReference, QueueSnapshot, QueueState,
+            RemoteUncertainty, RequestFingerprintMaterial, ResolveOrAbandonRequest,
+            ResolveOrAbandonResponse, RunId,
+        },
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
-    task::{
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
@@ -776,9 +780,12 @@ fn task_runner_preserves_legacy_batch_row_on_task_error() {
         .unwrap();
     fixture.store.note_confirmed_runner_absence(dispatcher);
     let before = fixture.store.queue_snapshot().unwrap();
-    let paths =
-        mac_worker::paths::PathLayout::discover(None, &BTreeMap::new(), fixture._directory.path())
-            .unwrap();
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+        None,
+        &BTreeMap::new(),
+        fixture._directory.path(),
+    )
+    .unwrap();
     let config = Config {
         version: 1,
         notifications: Default::default(),
@@ -792,12 +799,12 @@ fn task_runner_preserves_legacy_batch_row_on_task_error() {
             panic!("a missing task must not invoke a subprocess");
         }
     }
-    let result = mac_worker::turn_runner::TurnRunner::new(
+    let result = mac_worker::test_support::task::turn_runner::TurnRunner::new(
         &NoProcesses,
         &config,
         &paths,
         &fixture.store,
-        &mac_worker::turn_runner::DetachedRunnerExecutor,
+        &mac_worker::test_support::task::turn_runner::DetachedRunnerExecutor,
     )
     .run(
         TaskId::new(Uuid::from_u128(90_011)),
@@ -1060,7 +1067,7 @@ fn queue_rows_expose_advisory_blocking_reasons_from_cached_observations_only() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![
@@ -1187,7 +1194,7 @@ fn queue_blocking_reason_without_cached_observations_is_no_eligible_worker() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![queue_worker("mini-a")],
@@ -1227,7 +1234,7 @@ fn queue_blocking_reason_uses_pinned_policy_rejections_for_capabilities() {
     let fixture = open_queue();
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![queue_worker("mini-a"), queue_worker("mini-b")],

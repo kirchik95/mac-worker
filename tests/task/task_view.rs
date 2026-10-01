@@ -5,21 +5,27 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
-    client_state::ClientStateStore,
-    config::Config,
-    job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
-    protocol::PROTOCOL_VERSION,
-    scheduler::{CandidateSlot, WorkerPreference},
-    task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunProgress, RunRecord,
-        RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, TurnLimits},
+    client_state::{
+        ClientStateStore,
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    task_view::{
-        TaskDetailProjection, TaskFreshness, TaskListJson, TaskListProjection, filter_task_list,
-        project_task_detail, project_task_list, project_task_list_with_blocking_codes,
+    core::{config::Config, protocol::PROTOCOL_VERSION},
+    host::job::{
+        AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind,
+    },
+    task::{
+        model::{
+            ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunProgress, RunRecord,
+            RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
+            TaskSource, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        view::{
+            TaskDetailProjection, TaskFreshness, TaskListJson, TaskListProjection,
+            filter_task_list, project_task_detail, project_task_list,
+            project_task_list_with_blocking_codes,
+        },
     },
 };
 use serde::Serialize;

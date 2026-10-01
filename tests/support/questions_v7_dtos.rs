@@ -1,8 +1,8 @@
 //! Strict DTO definitions copied from f59e56a for mixed-version regressions.
 #![allow(dead_code)]
-use mac_worker::agent;
-use mac_worker::agent::{Question, ReportedCheck};
-use mac_worker::task::{
+use mac_worker::test_support::agents::agent;
+use mac_worker::test_support::agents::agent::{Question, ReportedCheck};
+use mac_worker::test_support::task::model::{
     BaseOid, ClosePolicy, HerdrTurnReport, OriginDelivery, RunId, RunnerState, TaskId, TaskOutcome,
     TaskState, TurnId, TurnTerminal,
 };

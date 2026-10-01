@@ -1,12 +1,12 @@
-use mac_worker::{
+use mac_worker::test_support::{
     dashboard::model::{
         ApiError, CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
         DashboardCommandSummary, DashboardError, DashboardLogChunk, DashboardMemoryPressure,
         DashboardQueueEntry, DashboardQueueEntryKind, DashboardSlotState, DashboardSnapshot,
         DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
     },
-    job::{JobId, LogStream},
-    task_view::TaskListProjection,
+    host::job::{JobId, LogStream},
+    task::view::TaskListProjection,
 };
 
 const JOB_ID: &str = "0123456789abcdef0123456789abcdef";

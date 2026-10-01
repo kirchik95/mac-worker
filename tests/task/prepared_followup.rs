@@ -20,26 +20,28 @@ use std::{
     },
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, ReportedCheck, ReportedCheckStatus},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, ReportedCheck, ReportedCheckStatus},
     client_state::{ClientStateStore, ClientStateWritePoint},
-    config::Config,
-    error::WorkerError,
-    job::ProcessIdentity,
-    paths::PathLayout,
-    prepared_followup::PreparedFollowup,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    supervisor::{ProcessInspector, ProcessObservation},
-    task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+    core::{config::Config, error::WorkerError, paths::PathLayout},
+    host::{
+        job::ProcessIdentity,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{ProcessInspector, ProcessObservation},
     },
-    task_client::TaskClient,
-    task_store::{TaskCancelRequest, TaskCancelResponse},
+    task::{
+        client::TaskClient,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
+            TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        prepared_followup::PreparedFollowup,
+        project_state::ProjectState,
+        store::{TaskCancelRequest, TaskCancelResponse},
+        turn_runner::RunnerExecutor,
+    },
     transfer::HostOperation,
-    turn_runner::RunnerExecutor,
 };
 use uuid::Uuid;
 
@@ -62,15 +64,15 @@ impl ProcessInspector for LiveOwners {
     fn observe_group(
         &self,
         _process_group: u32,
-    ) -> mac_worker::supervisor::ProcessGroupObservation {
-        mac_worker::supervisor::ProcessGroupObservation::Ambiguous
+    ) -> mac_worker::test_support::host::supervisor::ProcessGroupObservation {
+        mac_worker::test_support::host::supervisor::ProcessGroupObservation::Ambiguous
     }
 
     fn observe_group_members(
         &self,
         _leader: u32,
-    ) -> mac_worker::supervisor::ProcessGroupMembership {
-        mac_worker::supervisor::ProcessGroupMembership::Ambiguous
+    ) -> mac_worker::test_support::host::supervisor::ProcessGroupMembership {
+        mac_worker::test_support::host::supervisor::ProcessGroupMembership::Ambiguous
     }
 }
 
@@ -96,12 +98,11 @@ impl RunnerExecutor for CountingExecutor {
         _paths: &PathLayout,
         _task_id: TaskId,
         _turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        Ok(mac_worker::task::RunnerIdentity::new(ProcessIdentity::new(
-            support::fixture_pid(2_000_000_011),
-            9_999_999,
-        )?))
+        Ok(mac_worker::test_support::task::model::RunnerIdentity::new(
+            ProcessIdentity::new(support::fixture_pid(2_000_000_011), 9_999_999)?,
+        ))
     }
 }
 
@@ -243,7 +244,10 @@ impl Harness {
         }
     }
 
-    fn client<'a>(&'a self, runner: &'a dyn mac_worker::process::ProcessRunner) -> TaskClient<'a> {
+    fn client<'a>(
+        &'a self,
+        runner: &'a dyn mac_worker::test_support::host::process::ProcessRunner,
+    ) -> TaskClient<'a> {
         TaskClient::new(
             runner,
             &self.config,
@@ -742,7 +746,7 @@ fn capacity_is_summed_slots_and_park_replay_is_stable() {
     assert_eq!(parked.job_id(), second.turn_id());
     assert!(matches!(
         parked.state(),
-        mac_worker::job::QueueState::Parked
+        mac_worker::test_support::host::job::QueueState::Parked
     ));
     assert_eq!(harness.executor.starts(), 1);
 
@@ -759,7 +763,7 @@ fn capacity_is_summed_slots_and_park_replay_is_stable() {
     assert_eq!(parked.job_id(), second.turn_id());
     assert!(matches!(
         parked.state(),
-        mac_worker::job::QueueState::Parked
+        mac_worker::test_support::host::job::QueueState::Parked
     ));
     assert_eq!(harness.executor.starts(), 1);
     let live = harness.store.load_task(second.task_id()).unwrap();
@@ -1444,7 +1448,10 @@ fn post_park_fault_preserves_published_turn_and_peer_replay_converges() {
         .unwrap()
         .unwrap();
     assert_eq!(row.job_id(), prepared.turn_id());
-    assert!(matches!(row.state(), mac_worker::job::QueueState::Parked));
+    assert!(matches!(
+        row.state(),
+        mac_worker::test_support::host::job::QueueState::Parked
+    ));
     assert_eq!(
         harness
             .store

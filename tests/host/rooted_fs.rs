@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mac_worker::{
-    inputs::RelativePath,
-    rooted_fs::{EntryKind, RootedDir},
+use mac_worker::test_support::{
+    core::inputs::RelativePath,
+    host::rooted_fs::{EntryKind, RootedDir},
 };
 
 struct RootFixture {

@@ -4,6 +4,7 @@
 //! legitimate `LocalTaskRecord` (and optional runner log) in an isolated
 //! controller store, then query it through `host controller-rpc`.
 
+use mac_worker::test_support::cli::from_parts;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -16,31 +17,31 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::{Cli, Command as WorkerCommand, HostCommand},
     client_state::ClientStateStore,
-    config::Config,
     controller::{
         ControllerFault, ControllerReadReply, ControllerStore, ControllerTaskLogsResult,
         ControllerTaskStatusResult, canonical_request_sha256, decode_frame, encode_frame,
         encode_json_frame, protocol::MAX_FRAME_BYTES, serve_rpc_with_runtime,
     },
-    error::WorkerError,
-    job::{JobId, MAX_LOG_CHUNK_BYTES},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    run_with_stdio_in_context,
-    task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
-        TurnTerminal,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::{JobId, MAX_LOG_CHUNK_BYTES},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     },
-    task_store::{TaskDiffRequest, TaskDiffResponse},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    task::{
+        model::{
+            ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+            TurnTerminal,
+        },
+        store::{TaskDiffRequest, TaskDiffResponse},
+        turn_log,
+    },
     transfer::HostOperation,
-    turn_log,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -343,7 +344,7 @@ impl<'a> LogWaitClock<'a> {
     }
 }
 
-impl mac_worker::transfer::ResolutionRuntime for LogWaitClock<'_> {
+impl mac_worker::test_support::transfer::ResolutionRuntime for LogWaitClock<'_> {
     fn monotonic_now(&self) -> Duration {
         self.elapsed()
     }
@@ -380,25 +381,30 @@ fn log_wait_reply(
             panic!("log long-poll must use only local read-only state");
         }
     }
-    let client = mac_worker::task_client::TaskClient::new(
+    let client = mac_worker::test_support::task::client::TaskClient::new(
         &NoProcess,
         &config,
         &fixture.paths,
         &state,
-        &mac_worker::turn_runner::DetachedRunnerExecutor,
+        &mac_worker::test_support::task::turn_runner::DetachedRunnerExecutor,
     );
     let mut body =
         json!({"task_id": seeded_ids().0, "offset": 0, "follow": true, "raw": true, "limit": 64});
     body.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
-    let request = mac_worker::controller::parse_request(&serde_json::to_vec(&json!({
+    let request = mac_worker::test_support::controller::parse_request(&serde_json::to_vec(&json!({
         "protocol_version": PROTOCOL_VERSION, "request_id": STATUS_REQUEST, "command": "task.logs", "body": body,
     })).unwrap()).unwrap();
-    let reply = mac_worker::controller::read::logs_reply_with_runtime(&request, &client, clock)?;
+    let reply = mac_worker::test_support::controller::read::logs_reply_with_runtime(
+        &request, &client, clock,
+    )?;
     reply.verify_envelope(&request).unwrap();
-    mac_worker::controller::ControllerReadIdentity::verify_payload(reply.result(), &request)
-        .unwrap();
+    mac_worker::test_support::controller::ControllerReadIdentity::verify_payload(
+        reply.result(),
+        &request,
+    )
+    .unwrap();
     Ok(reply.into_result())
 }
 
@@ -509,48 +515,52 @@ fn logs_wait_terminal_follow_remains_bounded_until_checkpoint_completion() {
     }
     impl ProcessRunner for ClockedRpc<'_> {
         fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-            let request = mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())?;
-            let stdout = if mac_worker::controller::health_read::is_health_read(&request) {
-                mac_worker::controller::health_read::serve_health_read(
-                    &request,
-                    &self.controller.paths.controller_state_root(),
-                )?
-            } else {
-                let call = {
-                    let mut count = self.calls.lock().unwrap();
-                    *count += 1;
-                    *count
-                };
-                assert!(call <= 3, "terminal logs must eventually finish");
-                assert_eq!(request.body()["wait_ms"], 15_000);
-                if call == 3 {
-                    seed_runner_log_checkpoint(
+            let request = mac_worker::test_support::controller::decode_request(
+                process.stdin.as_ref().unwrap(),
+            )?;
+            let stdout =
+                if mac_worker::test_support::controller::health_read::is_health_read(&request) {
+                    mac_worker::test_support::controller::health_read::serve_health_read(
+                        &request,
+                        &self.controller.paths.controller_state_root(),
+                    )?
+                } else {
+                    let call = {
+                        let mut count = self.calls.lock().unwrap();
+                        *count += 1;
+                        *count
+                    };
+                    assert!(call <= 3, "terminal logs must eventually finish");
+                    assert_eq!(request.body()["wait_ms"], 15_000);
+                    if call == 3 {
+                        seed_runner_log_checkpoint(
+                            &self.controller.paths,
+                            b"drained tail\n",
+                            Some(TaskOutcome::Lost),
+                        );
+                    }
+                    let state = ClientStateStore::open(&self.controller.paths.state)?;
+                    let config =
+                        Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n")?;
+                    let client = mac_worker::test_support::task::client::TaskClient::new(
+                        &FailingSsh,
+                        &config,
                         &self.controller.paths,
-                        b"drained tail\n",
-                        Some(TaskOutcome::Lost),
+                        &state,
+                        &mac_worker::test_support::task::turn_runner::DetachedRunnerExecutor,
                     );
-                }
-                let state = ClientStateStore::open(&self.controller.paths.state)?;
-                let config =
-                    Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n")?;
-                let client = mac_worker::task_client::TaskClient::new(
-                    &FailingSsh,
-                    &config,
-                    &self.controller.paths,
-                    &state,
-                    &mac_worker::turn_runner::DetachedRunnerExecutor,
-                );
-                let reply = mac_worker::controller::read::logs_reply_with_runtime(
-                    &request, &client, self.clock,
-                )?;
-                assert_eq!(
-                    self.clock.elapsed(),
-                    Duration::from_secs((call.min(2) * 15) as u64),
-                    "a terminal incomplete checkpoint must not cause immediate SSH repolling"
-                );
-                assert_eq!(reply.result().complete(), call == 3);
-                encode_json_frame(&reply)?
-            };
+                    let reply =
+                        mac_worker::test_support::controller::read::logs_reply_with_runtime(
+                            &request, &client, self.clock,
+                        )?;
+                    assert_eq!(
+                        self.clock.elapsed(),
+                        Duration::from_secs((call.min(2) * 15) as u64),
+                        "a terminal incomplete checkpoint must not cause immediate SSH repolling"
+                    );
+                    assert_eq!(reply.result().complete(), call == 3);
+                    encode_json_frame(&reply)?
+                };
             Ok(ProcessResult {
                 status: ExitStatus::from_raw(0),
                 stdout,
@@ -711,13 +721,13 @@ fn status_request(task_id: TaskId) -> Value {
 }
 
 fn host_controller_rpc_cli() -> Cli {
-    Cli {
-        config: None,
-        json: false,
-        command: WorkerCommand::Host {
+    from_parts(
+        None,
+        false,
+        WorkerCommand::Host {
             command: HostCommand::ControllerRpc,
         },
-    }
+    )
 }
 
 fn request_row_count(paths: &PathLayout) -> usize {

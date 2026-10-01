@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::from_parts;
 
 use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
@@ -9,24 +10,27 @@ use std::{
     io::{self, Write},
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
-    cli::{Cli, Command, TaskCommand},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    cli::{Command, TaskCommand},
     client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    failure_receipt::{FailureReceipt, RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    run_with_io_in_context,
-    task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
-        TurnTerminal,
+    core::{
+        config::Config,
+        error::WorkerError,
+        failure_receipt::{FailureReceipt, RESIDUAL_CLEANUP_TREE, RESIDUAL_LEASE, STAGE_CLEANUP},
+        paths::PathLayout,
     },
-    task_client::TaskClient,
-    turn_runner::InlineRunnerExecutor,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_io_in_context},
+    task::{
+        client::TaskClient,
+        model::{
+            ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+            TurnTerminal,
+        },
+        turn_runner::InlineRunnerExecutor,
+    },
 };
 
 struct NoProcesses;
@@ -866,16 +870,16 @@ fn task_status_json_includes_stage_and_residual() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(
-        Cli {
-            config: Some(paths.config),
-            json: true,
-            command: Command::Task {
+        from_parts(
+            Some(paths.config),
+            true,
+            Command::Task {
                 command: TaskCommand::Status {
                     task_id,
                     full: false,
                 },
             },
-        },
+        ),
         &NoProcesses,
         &runtime,
         &mut stdout,

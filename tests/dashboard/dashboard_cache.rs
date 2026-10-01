@@ -1,4 +1,4 @@
-use mac_worker::dashboard::{
+use mac_worker::test_support::dashboard::{
     cache::{
         CpuBusyPercent, CpuCounters, MAX_SAMPLES_PER_WORKER, OBSERVATION_TTL_MILLIS, Observation,
         ObservationCache,

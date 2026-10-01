@@ -3,15 +3,18 @@ use crate::{
     task_diagnostics_ports::runtime,
     task_ports_fixture::{self as fixture, TaskRemote},
 };
-use mac_worker::{
-    client_state::ClientStateStore,
-    error::WorkerError,
-    host_store::HostStore,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
-    scheduler::WorkerPreference,
-    task_client::TaskClient,
-    turn_runner::InlineRunnerExecutor,
+use mac_worker::test_support::{
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
+    core::error::WorkerError,
+    host::{
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::HostStore,
+    },
+    task::{
+        client::TaskClient,
+        project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
+        turn_runner::InlineRunnerExecutor,
+    },
 };
 use std::{
     ffi::OsStr,

@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::into_command;
 use std::{
     future::Future,
     io::{Read, Write},
@@ -8,8 +9,9 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
+use mac_worker::test_support::{
     cli::{Cli, Command as WorkerCommand},
+    core::error::WorkerError,
     dashboard::{
         command::{BrowserOpener, DashboardCommandRequest, DashboardLauncher, run_dashboard},
         model::{ApiError, DashboardError, DashboardLogChunk, DashboardQueueEntry},
@@ -19,10 +21,11 @@ use mac_worker::{
         task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState},
     },
-    error::WorkerError,
-    job::LogStream,
-    task::{TaskId, TurnId},
-    task_view::TaskDetailProjection,
+    host::job::LogStream,
+    task::{
+        model::{TaskId, TurnId},
+        view::TaskDetailProjection,
+    },
 };
 use tokio::sync::oneshot;
 
@@ -62,7 +65,7 @@ fn dashboard_parses_only_the_documented_public_forms() {
             no_open,
             no_facts_refresh,
             controller_viewer,
-        } = cli.command
+        } = into_command(cli)
         else {
             panic!("dashboard arguments must select the dashboard command");
         };
@@ -87,7 +90,7 @@ fn dashboard_parses_only_the_documented_public_forms() {
         .expect("hidden viewer flag is presence-only");
     let WorkerCommand::Dashboard {
         controller_viewer, ..
-    } = hidden.command
+    } = into_command(hidden)
     else {
         panic!("hidden viewer flag must select the dashboard command");
     };

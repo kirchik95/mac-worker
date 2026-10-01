@@ -5,19 +5,23 @@ use task_state_fixture::TaskStateFixture;
 
 use std::sync::{Arc, Barrier};
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    client_state::{ClientStateStore, ClientStateWritePoint},
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind,
-        QueueRunReference, QueueState,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    client_state::{
+        ClientStateStore, ClientStateWritePoint,
+        scheduler::{CandidateObservation, CandidateSlot, WorkerPreference},
     },
-    scheduler::{CandidateObservation, CandidateSlot, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    core::error::WorkerError,
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind,
+            QueueRunReference, QueueState,
+        },
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
-    task::{
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
     },
@@ -227,7 +231,8 @@ impl Fixture {
         number: u128,
         owner: ProcessIdentity,
         observations: &[CandidateObservation],
-    ) -> Result<Option<(TaskId, mac_worker::job::QueueClaim)>, WorkerError> {
+    ) -> Result<Option<(TaskId, mac_worker::test_support::host::job::QueueClaim)>, WorkerError>
+    {
         self.store.claim_parked_for_waiting_runner(
             task(number),
             turn(number),
@@ -354,7 +359,7 @@ fn reserved_worker_and_run_limit_cannot_be_bypassed() {
     for limited_run in [true, false] {
         let fixture = Fixture::new();
         let run = QueueRunReference::new(
-            mac_worker::job::RunId::new(task(99).to_string()).unwrap(),
+            mac_worker::test_support::host::job::RunId::new(task(99).to_string()).unwrap(),
             1,
         )
         .unwrap();

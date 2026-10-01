@@ -1,7 +1,10 @@
 use assert_cmd::Command;
 use clap::{CommandFactory, Parser};
-use mac_worker::cli::{Cli, Command as WorkerCommand, ControllerCommand, HostCommand};
-use mac_worker::protocol::PROTOCOL_VERSION;
+use mac_worker::test_support::cli::{
+    Cli, Command as WorkerCommand, ControllerCommand, HostCommand,
+};
+use mac_worker::test_support::cli::{into_command, json};
+use mac_worker::test_support::core::protocol::PROTOCOL_VERSION;
 use predicates::prelude::*;
 use std::path::PathBuf;
 
@@ -249,16 +252,19 @@ fn collect_missing_help(command: &clap::Command, path: &str, missing: &mut Vec<S
 fn gc_supports_preview_by_default_and_explicit_apply() {
     let preview = Cli::try_parse_from(["worker", "gc"]).unwrap();
     assert!(matches!(
-        preview.command,
+        into_command(preview),
         WorkerCommand::Gc { apply: false }
     ));
 
     let apply = Cli::try_parse_from(["worker", "gc", "--apply"]).unwrap();
-    assert!(matches!(apply.command, WorkerCommand::Gc { apply: true }));
+    assert!(matches!(
+        into_command(apply),
+        WorkerCommand::Gc { apply: true }
+    ));
 
     let host = Cli::try_parse_from(["worker", "host", "gc"]).unwrap();
     assert!(matches!(
-        host.command,
+        into_command(host),
         WorkerCommand::Host {
             command: HostCommand::Gc
         }
@@ -283,7 +289,7 @@ fn host_follow_turn_parses_three_identifiers_and_stays_hidden() {
     ])
     .unwrap();
     assert!(matches!(
-        cli.command,
+        into_command(cli),
         WorkerCommand::Host {
             command: HostCommand::FollowTurn { .. }
         }
@@ -321,7 +327,7 @@ fn host_outbox_retry_parses_a_task_id() {
     let task_id = "018f0f4a6b5c7d8e9f00112233445566";
     let cli = Cli::try_parse_from(["worker", "host", "outbox-retry", task_id]).unwrap();
     assert!(matches!(
-        cli.command,
+        into_command(cli),
         WorkerCommand::Host {
             command: HostCommand::OutboxRetry { .. }
         }
@@ -332,14 +338,14 @@ fn host_outbox_retry_parses_a_task_id() {
 fn controller_run_is_public_and_controller_rpc_stays_hidden() {
     let run = Cli::try_parse_from(["worker", "controller", "run"]).unwrap();
     assert!(matches!(
-        run.command,
+        into_command(run),
         WorkerCommand::Controller {
             command: ControllerCommand::Run { supervised: false }
         }
     ));
     let rpc = Cli::try_parse_from(["worker", "host", "controller-rpc"]).unwrap();
     assert!(matches!(
-        rpc.command,
+        into_command(rpc),
         WorkerCommand::Host {
             command: HostCommand::ControllerRpc
         }
@@ -441,8 +447,8 @@ fn task_list_and_wait_parse_a_run_name_or_a_run_id() {
     let name = "polish-2026-09-10";
     let list = Cli::try_parse_from(["worker", "task", "list", "--run", name]).unwrap();
     let WorkerCommand::Task {
-        command: mac_worker::cli::TaskCommand::List { run, .. },
-    } = list.command
+        command: mac_worker::test_support::cli::TaskCommand::List { run, .. },
+    } = into_command(list)
     else {
         panic!("expected a task list command");
     };
@@ -450,8 +456,8 @@ fn task_list_and_wait_parse_a_run_name_or_a_run_id() {
 
     let wait = Cli::try_parse_from(["worker", "task", "wait", "--run", name]).unwrap();
     let WorkerCommand::Task {
-        command: mac_worker::cli::TaskCommand::Wait { run, .. },
-    } = wait.command
+        command: mac_worker::test_support::cli::TaskCommand::Wait { run, .. },
+    } = into_command(wait)
     else {
         panic!("expected a task wait command");
     };
@@ -497,8 +503,8 @@ fn task_submit_parses_model_and_effort() {
     ])
     .unwrap();
     let WorkerCommand::Task {
-        command: mac_worker::cli::TaskCommand::Submit { model, effort, .. },
-    } = cli.command
+        command: mac_worker::test_support::cli::TaskCommand::Submit { model, effort, .. },
+    } = into_command(cli)
     else {
         panic!("expected a task submit command");
     };
@@ -510,8 +516,8 @@ fn task_submit_parses_model_and_effort() {
 fn task_list_parses_the_outcome_filter() {
     let cli = Cli::try_parse_from(["worker", "task", "list", "--outcome", "needs-input"]).unwrap();
     let WorkerCommand::Task {
-        command: mac_worker::cli::TaskCommand::List { outcome, .. },
-    } = cli.command
+        command: mac_worker::test_support::cli::TaskCommand::List { outcome, .. },
+    } = into_command(cli)
     else {
         panic!("expected a task list command");
     };
@@ -546,7 +552,7 @@ fn host_cancel_parses_without_a_positional_job_id() {
     let job_id = "018f0f4a6b5c7d8e9f00112233445566";
     let host = Cli::try_parse_from(["worker", "host", "cancel"]).unwrap();
     assert!(matches!(
-        host.command,
+        into_command(host),
         WorkerCommand::Host {
             command: HostCommand::Cancel
         }
@@ -608,8 +614,8 @@ fn doctor_parses_the_public_command_forms_without_resolving_the_project() {
 
     for (arguments, expected_json, expected_project, expected_includes) in cases {
         let cli = Cli::try_parse_from(arguments).expect("public doctor form must parse");
-        assert_eq!(cli.json, expected_json);
-        let WorkerCommand::Doctor { project, includes } = cli.command else {
+        assert_eq!(json(&cli), expected_json);
+        let WorkerCommand::Doctor { project, includes } = into_command(cli) else {
             panic!("doctor arguments must select the doctor command");
         };
         assert_eq!(project, expected_project);
@@ -877,9 +883,10 @@ fn event_commands_require_controller_mode_before_any_rpc() {
             "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture-only'\nslots = 1\n",
         )
         .unwrap();
-        let valid =
-            mac_worker::config::Config::parse(&std::fs::read_to_string(&fixture.config).unwrap())
-                .unwrap();
+        let valid = mac_worker::test_support::core::config::Config::parse(
+            &std::fs::read_to_string(&fixture.config).unwrap(),
+        )
+        .unwrap();
         assert!(!valid.controller.enabled);
         let mut command = fixture.command();
         command.args(arguments);

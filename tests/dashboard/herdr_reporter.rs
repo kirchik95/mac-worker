@@ -6,15 +6,17 @@ use std::{
 };
 
 use fake_herdr::{FakeHerdr, Reply};
-use mac_worker::{
-    agent::{AgentKind, Question},
-    herdr::{HerdrClient, HerdrError, HerdrSocket},
-    herdr_reporter::{
-        CLOSE_BUDGET, DISPLAY_AGENT, FOLLOW_TURN_COMMAND, HerdrClock, HerdrReporter,
-        MAX_TABS_PER_PASS, SHELL_SETTLE, START_BUDGET, TurnIdentity, WORKSPACE_LABEL,
-        short_task_id, task_label_prefix, terminal_report, title_line, turn_label,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, Question},
+        herdr::{HerdrClient, HerdrError, HerdrSocket},
+        herdr_reporter::{
+            CLOSE_BUDGET, DISPLAY_AGENT, FOLLOW_TURN_COMMAND, HerdrClock, HerdrReporter,
+            MAX_TABS_PER_PASS, SHELL_SETTLE, START_BUDGET, TurnIdentity, WORKSPACE_LABEL,
+            short_task_id, task_label_prefix, terminal_report, title_line, turn_label,
+        },
     },
-    task::{HerdrTurnState, TaskId, TaskOutcome},
+    task::model::{HerdrTurnState, TaskId, TaskOutcome},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;

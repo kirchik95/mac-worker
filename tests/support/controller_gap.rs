@@ -4,18 +4,15 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::Cli,
     client_state::ClientStateStore,
     controller::encode_json_frame,
-    error::WorkerError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    run_with_stdio_in_context,
-    task::{
+    core::{error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
         TurnTerminal,

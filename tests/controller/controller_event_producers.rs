@@ -1,4 +1,4 @@
-use mac_worker::controller::events::{
+use mac_worker::test_support::events::{
     EventBatch, EventSink, NewEvent, PublishAttempt, SafeOutcome, testing::RecordingSink,
 };
 
@@ -15,10 +15,10 @@ fn producer_sink_drops_a_whole_batch() {
     assert_eq!(sink.batches()[0].len(), 2);
 }
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     client_state::{ClientStateStore, ClientStateWritePoint},
-    task::{
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
         TurnTerminal,
@@ -66,7 +66,9 @@ fn task_record() -> LocalTaskRecord {
     task_record_with_base("0123456789abcdef0123456789abcdef01234567".parse().unwrap())
 }
 
-fn task_record_with_base(base_oid: mac_worker::task::BaseOid) -> LocalTaskRecord {
+fn task_record_with_base(
+    base_oid: mac_worker::test_support::task::model::BaseOid,
+) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
         task_id: TaskId::generate(),
         run_id: None,
@@ -174,22 +176,25 @@ fn locks_are_free(paths: &[std::path::PathBuf]) -> bool {
     })
 }
 
-fn owner() -> mac_worker::job::ProcessIdentity {
-    mac_worker::supervisor::SystemProcessInspector
+fn owner() -> mac_worker::test_support::host::job::ProcessIdentity {
+    mac_worker::test_support::host::supervisor::SystemProcessInspector
         .identity_for_pid(std::process::id())
         .unwrap()
 }
 
-fn queue_row(store: &ClientStateStore, turn: TurnId) -> mac_worker::job::QueueEntry {
-    mac_worker::job::QueueEntry::new(
+fn queue_row(
+    store: &ClientStateStore,
+    turn: TurnId,
+) -> mac_worker::test_support::host::job::QueueEntry {
+    mac_worker::test_support::host::job::QueueEntry::new(
         turn,
         store.client_id(),
         "a".repeat(64),
         "b".repeat(64),
-        mac_worker::job::CommandSummary::argv(1).unwrap(),
+        mac_worker::test_support::host::job::CommandSummary::argv(1).unwrap(),
         vec![],
-        mac_worker::scheduler::WorkerPreference::Automatic,
-        mac_worker::job::QueueEntryKind::TaskTurn,
+        mac_worker::test_support::client_state::scheduler::WorkerPreference::Automatic,
+        mac_worker::test_support::host::job::QueueEntryKind::TaskTurn,
         None,
         owner(),
         100,
@@ -199,9 +204,14 @@ fn queue_row(store: &ClientStateStore, turn: TurnId) -> mac_worker::job::QueueEn
 
 fn run_and_dag(
     record: &LocalTaskRecord,
-) -> (mac_worker::task::RunRecord, mac_worker::dag::DagRecord) {
-    use mac_worker::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref};
-    let id = mac_worker::task::RunId::generate();
+) -> (
+    mac_worker::test_support::task::model::RunRecord,
+    mac_worker::test_support::client_state::dag::DagRecord,
+) {
+    use mac_worker::test_support::client_state::dag::{
+        DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref,
+    };
+    let id = mac_worker::test_support::task::model::RunId::generate();
     let node = DagNode {
         batch_id: "private-node".into(),
         task_id: record.meta().task_id(),
@@ -251,7 +261,7 @@ fn run_and_dag(
         claimed_at_millis: None,
     };
     (
-        mac_worker::task::RunRecord::new(id, None, vec![], 1, 100).unwrap(),
+        mac_worker::test_support::task::model::RunRecord::new(id, None, vec![], 1, 100).unwrap(),
         DagRecord::new(
             id,
             std::collections::BTreeMap::from([("private-node".into(), node)]),
@@ -575,7 +585,7 @@ fn dag_recovery_admission_requires_two_records() {
 
 #[test]
 fn accepted_status_proof_required() {
-    use mac_worker::controller::events::{AcceptedHint, WorkerName};
+    use mac_worker::test_support::events::{AcceptedHint, WorkerName};
     let (_dir, store, sink) = store_with_sink();
     let record = task_record();
     store.create_task(record.clone()).unwrap();
@@ -620,22 +630,34 @@ fn accepted_status_proof_required() {
 fn drain_hint_after_lock_release() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap().join("controller");
-    mac_worker::controller::drain::set_drained(&root, false).unwrap();
+    mac_worker::test_support::controller::drain::set_drained(&root, false).unwrap();
     let locked = vec![root.join("drain.lock")];
     let sink = Arc::new(CheckingSink::checking(move || locks_are_free(&locked)));
-    mac_worker::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
-        .unwrap();
+    mac_worker::test_support::controller::drain::set_drained_with_event_sink(
+        &root,
+        true,
+        Some(sink.clone()),
+    )
+    .unwrap();
     assert_eq!(
         sink.events(),
         vec![NewEvent::ControllerDrainChanged { drained: true }]
     );
     assert_eq!(sink.unsafe_releases.load(Ordering::Relaxed), 0);
     sink.clear();
-    mac_worker::controller::drain::set_drained_with_event_sink(&root, true, Some(sink.clone()))
-        .unwrap();
+    mac_worker::test_support::controller::drain::set_drained_with_event_sink(
+        &root,
+        true,
+        Some(sink.clone()),
+    )
+    .unwrap();
     assert!(sink.events().is_empty());
-    mac_worker::controller::drain::set_drained_with_event_sink(&root, false, Some(sink.clone()))
-        .unwrap();
+    mac_worker::test_support::controller::drain::set_drained_with_event_sink(
+        &root,
+        false,
+        Some(sink.clone()),
+    )
+    .unwrap();
     assert_eq!(
         sink.events(),
         vec![NewEvent::ControllerDrainChanged { drained: false }]
@@ -700,7 +722,7 @@ fn all_terminal_outcomes_are_safe_and_prose_free() {
 
 #[test]
 fn metadata_rewrites_and_runner_log_sidecars_are_silent() {
-    use mac_worker::task::{HerdrTurnReport, HerdrTurnState};
+    use mac_worker::test_support::task::model::{HerdrTurnReport, HerdrTurnState};
     let (_dir, store, sink) = store_with_sink();
     let record = terminal_record(&task_record(), TaskOutcome::Done);
     let task = record.meta().task_id();
@@ -736,7 +758,7 @@ fn metadata_rewrites_and_runner_log_sidecars_are_silent() {
 
 #[test]
 fn legacy_job_running_and_health_bookkeeping_are_silent() {
-    use mac_worker::job::{
+    use mac_worker::test_support::host::job::{
         JobMeta, JobStatus, LeaseToken, LocalJobRecord, RemoteUncertainty,
         RequestFingerprintMaterial,
     };
@@ -754,7 +776,8 @@ fn legacy_job_running_and_health_bookkeeping_are_silent() {
         "packages/app".into(),
         1000,
         "heavy".into(),
-        mac_worker::job::CommandSpec::argv(vec!["PRIVATE_COMMAND".into()]).unwrap(),
+        mac_worker::test_support::host::job::CommandSpec::argv(vec!["PRIVATE_COMMAND".into()])
+            .unwrap(),
     )
     .unwrap();
     let meta = JobMeta::new(&material, material.fingerprint()).unwrap();
@@ -773,15 +796,12 @@ fn legacy_job_running_and_health_bookkeeping_are_silent() {
             LocalJobRecord::new(meta, token, Some(status), RemoteUncertainty::None).unwrap(),
         )
         .unwrap();
-    let health = mac_worker::controller::health::HealthStore::open(
+    let health = mac_worker::test_support::controller::health::HealthStore::open(
         &dir.path().canonicalize().unwrap().join("controller"),
     )
     .unwrap();
     health
-        .write(&mac_worker::controller::health::ControllerHealth::new(
-            owner(),
-            100,
-        ))
+        .write(&mac_worker::test_support::controller::health::ControllerHealth::new(owner(), 100))
         .unwrap();
     assert!(sink.events().is_empty());
 }
@@ -862,12 +882,12 @@ fn serialize_hints(events: &[NewEvent]) -> String {
             let wire = event
                 .to_wire(
                     uuid::Uuid::from_u128(1),
-                    mac_worker::controller::events::Seq::new(index as u64 + 1),
+                    mac_worker::test_support::events::Seq::new(index as u64 + 1),
                     120,
                 )
                 .unwrap();
             let encoded = serde_json::to_string(&wire).unwrap();
-            assert!(encoded.len() < mac_worker::controller::events::contracts::MAX_EVENT_BYTES);
+            assert!(encoded.len() < mac_worker::test_support::events::contracts::MAX_EVENT_BYTES);
             encoded
         })
         .collect::<Vec<_>>()
@@ -876,20 +896,19 @@ fn serialize_hints(events: &[NewEvent]) -> String {
 
 #[test]
 fn finalizer_changes_terminal_outcome() {
-    use mac_worker::{
-        config::Config,
+    use mac_worker::test_support::{
+        client_state::scheduler::WorkerPreference,
         controller::registry::ProjectRegistry,
-        error::WorkerError,
-        job::{CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
-        paths::PathLayout,
-        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-        scheduler::WorkerPreference,
-        supervisor::{
-            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        core::{config::Config, error::WorkerError, paths::PathLayout},
+        host::{
+            job::{CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
+            process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+            supervisor::{
+                ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
+                ProcessObservation,
+            },
         },
-        task::RunnerIdentity,
-        task_client::TaskClient,
-        turn_runner::InlineRunnerExecutor,
+        task::{client::TaskClient, model::RunnerIdentity, turn_runner::InlineRunnerExecutor},
     };
     struct LocalGitOnly;
     impl ProcessRunner for LocalGitOnly {
@@ -901,7 +920,7 @@ fn finalizer_changes_terminal_outcome() {
     struct ReusedOwner(ProcessIdentity);
     impl ProcessInspector for ReusedOwner {
         fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
-            mac_worker::supervisor::SystemProcessInspector.identity_for_pid(pid)
+            mac_worker::test_support::host::supervisor::SystemProcessInspector.identity_for_pid(pid)
         }
         fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
             if expected == self.0 {
@@ -1030,22 +1049,24 @@ fn finalizer_changes_terminal_outcome() {
 
 mod runner_events {
     use super::*;
-    use mac_worker::{
-        config::Config,
+    use mac_worker::test_support::{
+        agents::herdr::HerdrSocket,
+        client_state::scheduler::WorkerPreference,
         controller::registry::ProjectRegistry,
-        error::WorkerError,
-        herdr::HerdrSocket,
-        job::{
-            CommandSpec, CommandSummary, JobMeta, JobState, JobStatus, LeaseToken, LogChunk,
-            LogStream, QueueEntry, QueueEntryKind, QueueState, RequestFingerprintMaterial,
-            StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
+        core::{config::Config, error::WorkerError, paths::PathLayout},
+        host::{
+            job::{
+                CommandSpec, CommandSummary, JobMeta, JobState, JobStatus, LeaseToken, LogChunk,
+                LogStream, QueueEntry, QueueEntryKind, QueueState, RequestFingerprintMaterial,
+                StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
+            },
+            process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
         },
-        paths::PathLayout,
-        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-        scheduler::WorkerPreference,
-        task_store::{TaskStatusRequest, TaskStatusResponse},
+        task::{
+            store::{TaskStatusRequest, TaskStatusResponse},
+            turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
+        },
         transfer::HostOperation,
-        turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
     };
     use std::{ffi::OsStr, os::unix::process::ExitStatusExt, sync::Mutex};
 

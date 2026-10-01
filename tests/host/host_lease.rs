@@ -14,21 +14,24 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    error::WorkerError,
-    host_store::{HostStore, HostStoreWritePoint},
-    job::{
-        ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobStatus,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
-        RequestFingerprintMaterial,
+    core::{
+        error::WorkerError,
+        paths::PathLayout,
+        protocol::{MemoryPressure, PROTOCOL_VERSION},
     },
-    lease::{AdmissionFacts, LeaseService, SlotState},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION},
-    run_with_stdio_in_context,
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobStatus,
+            LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken,
+            RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService, SlotState},
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        store::{HostStore, HostStoreWritePoint},
+    },
+    runtime::{RuntimeContext, run_with_stdio_in_context},
 };
 use tempfile::tempdir;
 
@@ -62,7 +65,7 @@ fn request(seed: u128) -> LeaseAcquireRequest {
     )
     .unwrap();
     LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(
-        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(seed)),
+        mac_worker::test_support::task::model::TaskId::new(uuid::Uuid::from_u128(seed)),
     ))
 }
 
@@ -162,7 +165,7 @@ fn existing_legacy_job_scope_remains_busy_in_inventory_probe_and_gc() {
     let root = paths.host_state_root();
     let store = HostStore::open(&root).unwrap();
     let req = request(90_003).with_execution_scope(ExecutionScope::task(
-        mac_worker::task::TaskId::new(uuid::Uuid::from_u128(90_003)),
+        mac_worker::test_support::task::model::TaskId::new(uuid::Uuid::from_u128(90_003)),
     ));
     let lease = match LeaseService::new(&store)
         .acquire(&req, &healthy(), 1)
@@ -201,7 +204,7 @@ fn existing_legacy_job_scope_remains_busy_in_inventory_probe_and_gc() {
     let probe: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(probe["slot_state"], "busy");
     assert_eq!(probe["busy_slots"], 1);
-    let report = mac_worker::gc::HostGc::new(&store, &NoProcess)
+    let report = mac_worker::test_support::host::gc::HostGc::new(&store, &NoProcess)
         .preview_at(60_001)
         .unwrap();
     assert!(report.candidates().is_empty());
@@ -958,7 +961,10 @@ fn assert_canonical_tree_delete_journal(namespace: &Path) {
 fn abandoned_lease_with_receipt(
     store: &HostStore,
     seed: u128,
-) -> (LeaseRecord, mac_worker::host_store::CleanupReceipt) {
+) -> (
+    LeaseRecord,
+    mac_worker::test_support::host::store::CleanupReceipt,
+) {
     let req = request(seed);
     let lease = match LeaseService::new(store)
         .acquire(&req, &healthy(), 1)
@@ -1564,7 +1570,7 @@ fn same_task_id_second_acquire_is_workspace_busy() {
     let temp = tempdir().unwrap();
     let store = HostStore::open(&temp.path().join("host")).unwrap();
     LeaseService::new(&store).set_slot_count(2).unwrap();
-    let task = mac_worker::task::TaskId::new(uuid::Uuid::from_u128(7));
+    let task = mac_worker::test_support::task::model::TaskId::new(uuid::Uuid::from_u128(7));
     let first = request(41).with_execution_scope(ExecutionScope::task(task));
     let second = request(42).with_execution_scope(ExecutionScope::task(task));
     LeaseService::new(&store)

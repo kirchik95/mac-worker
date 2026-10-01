@@ -10,13 +10,13 @@ use std::{
     sync::Mutex,
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     controller::service::{
         ServiceAction, ServicePaths, ServiceStatus, launchdaemon_commands as daemon_with_paths,
         manage as manage_with_paths, truncate_log,
     },
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
 };
 
 fn manage(
@@ -25,11 +25,19 @@ fn manage(
     runner: &dyn ProcessRunner,
     action: ServiceAction,
 ) -> Result<ServiceStatus, WorkerError> {
-    let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+        None,
+        &Default::default(),
+        home,
+    )?;
     manage_with_paths(home, &paths, &home.join(".config"), uid, runner, action)
 }
 fn launchdaemon_commands(home: &Path, username: &str, uid: u32) -> Result<String, WorkerError> {
-    let paths = mac_worker::paths::PathLayout::discover(None, &Default::default(), home)?;
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+        None,
+        &Default::default(),
+        home,
+    )?;
     daemon_with_paths(home, &ServicePaths::from_layout(&paths)?, username, uid)
 }
 
@@ -462,7 +470,10 @@ fn host_service_install_with_config(
     config: Option<&Path>,
 ) -> String {
     use clap::Parser;
-    use mac_worker::{RuntimeContext, cli::Cli, run_with_stdio_in_context};
+    use mac_worker::test_support::{
+        cli::Cli,
+        runtime::{RuntimeContext, run_with_stdio_in_context},
+    };
     use std::{collections::BTreeMap, io::Cursor};
     struct HostLaunchctl(Mutex<bool>);
     impl ProcessRunner for HostLaunchctl {
@@ -565,7 +576,7 @@ fn service_paths_pin_helper_xdg_config_in_supervised_argv() {
     let config_environment =
         format!("<key>XDG_CONFIG_HOME</key>\n    <string>{escaped_root}</string>");
     assert!(plist.contains(&config_environment), "{plist}");
-    let paths = mac_worker::paths::PathLayout::discover(
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
         None,
         &std::collections::BTreeMap::from([("XDG_CONFIG_HOME".into(), root.into())]),
         &home,
@@ -603,9 +614,11 @@ fn service_paths_pin_helper_xdg_state_and_other_child_roots() {
 #[test]
 fn service_paths_missing_config_fails_before_leader_acquisition() {
     use clap::Parser;
-    use mac_worker::{
-        RuntimeContext, cli::Cli, controller::ControllerLeader, paths::PathLayout,
-        run_with_stdio_in_context,
+    use mac_worker::test_support::{
+        cli::Cli,
+        controller::ControllerLeader,
+        core::paths::PathLayout,
+        runtime::{RuntimeContext, run_with_stdio_in_context},
     };
     use std::{collections::BTreeMap, io::Cursor};
     for explicit in [false, true] {
@@ -657,7 +670,7 @@ fn service_paths_runner_child_uses_plist_config_and_inherited_state() {
         "version=1\n[[workers]]\nname='fixture'\nssh='never-contact'\nslots=1\n",
     )
     .unwrap();
-    mac_worker::config::Config::load(&config).unwrap();
+    mac_worker::test_support::core::config::Config::load(&config).unwrap();
     fn value_after(plist: &str, marker: &str) -> String {
         plist
             .split_once(marker)

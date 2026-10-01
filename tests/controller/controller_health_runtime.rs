@@ -1,6 +1,6 @@
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{ControllerFault, ControllerStore, RequestPhase, parse_request},
-    protocol::PROTOCOL_VERSION,
+    core::protocol::PROTOCOL_VERSION,
 };
 use serde_json::{Value, json};
 use std::{
@@ -109,7 +109,7 @@ fn controller_run_persists_failed_tick_and_shuts_down_cleanly() {
     let health: Value =
         serde_json::from_slice(&std::fs::read(state.join("health.json")).unwrap()).unwrap();
     assert!(health["stopped_at_millis"].is_number());
-    let _next = mac_worker::controller::ControllerLeader::acquire(&state).unwrap();
+    let _next = mac_worker::test_support::controller::ControllerLeader::acquire(&state).unwrap();
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn blocked_tick_leaves_shutdown_pollable_and_is_joined() {
     let mut entered_tx = Some(entered_tx);
     let (release_tx, release_rx) = mpsc::channel();
     let release_rx = std::sync::Mutex::new(release_rx);
-    mac_worker::controller::runtime::run_tick_loop(
+    mac_worker::test_support::controller::runtime::run_tick_loop(
         &runtime,
         &stop,
         || {
@@ -158,9 +158,9 @@ fn blocked_tick_leaves_shutdown_pollable_and_is_joined() {
 
 #[test]
 fn shutdown_is_forwarded_to_inflight_process_io() {
-    use mac_worker::{
-        error::{ProcessError, WorkerError},
-        process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    use mac_worker::test_support::{
+        core::error::{ProcessError, WorkerError},
+        host::process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     };
     use std::sync::{
         Mutex,
@@ -205,7 +205,8 @@ fn shutdown_is_forwarded_to_inflight_process_io() {
     let inner = BlockingIo {
         entered: Mutex::new(Some(entered_tx)),
     };
-    let runner = mac_worker::controller::runtime::ControllerProcessRunner::new(&inner, &stop);
+    let runner =
+        mac_worker::test_support::controller::runtime::ControllerProcessRunner::new(&inner, &stop);
     let request = ProcessRequest {
         program: "unused".into(),
         args: Vec::new(),
@@ -219,7 +220,7 @@ fn shutdown_is_forwarded_to_inflight_process_io() {
             deadline: Duration::from_secs(60),
         },
     };
-    mac_worker::controller::runtime::run_tick_loop(
+    mac_worker::test_support::controller::runtime::run_tick_loop(
         &runtime,
         &stop,
         || {

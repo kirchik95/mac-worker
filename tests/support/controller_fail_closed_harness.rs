@@ -10,11 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{MAX_FRAME_BYTES, decode_frame, encode_frame},
-    job::HostControlError,
-    paths::PathLayout,
-    protocol::PROTOCOL_VERSION,
+    core::{paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::job::HostControlError,
 };
 use serde_json::{Value, json};
 

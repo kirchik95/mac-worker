@@ -12,27 +12,29 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::WorkerEntry,
-    error::WorkerError,
-    git_transport::{
-        GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents,
-        UploadPackComponents,
+    core::{config::WorkerEntry, error::WorkerError},
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+            RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessRequest, ProcessResult},
+        store::{HOST_LAYOUT_VERSION, HostStore, PREVIOUS_HOST_LAYOUT_VERSION},
     },
-    host_store::{HOST_LAYOUT_VERSION, HostStore, PREVIOUS_HOST_LAYOUT_VERSION},
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
-        RequestFingerprintMaterial,
+    runtime::{RuntimeContext, run_with_io_in_context},
+    task::model::{BaseOid, TaskId, TurnId},
+    transfer::{
+        TransferIdentity,
+        git::{
+            GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents,
+            UploadPackComponents,
+        },
+        repo::TransferRepo,
+        transport::SshTransport,
     },
-    lease::{AdmissionFacts, LeaseService},
-    process::{ProcessRequest, ProcessResult},
-    run_with_io_in_context,
-    task::{BaseOid, TaskId, TurnId},
-    transfer::TransferIdentity,
-    transfer_repo::TransferRepo,
-    transport::SshTransport,
 };
 use support::{GitRepo, recording_runner::RecordingRunner};
 use tempfile::TempDir;
@@ -71,7 +73,7 @@ fn lease_token() -> LeaseToken {
     LeaseToken::new(Uuid::from_u128(30))
 }
 
-fn fingerprint() -> mac_worker::job::RequestFingerprint {
+fn fingerprint() -> mac_worker::test_support::host::job::RequestFingerprint {
     RequestFingerprintMaterial::new(
         job_id(),
         client_id(),
@@ -319,7 +321,7 @@ impl GitServerExecutor for RecordingExecutor {
     fn exec(
         &self,
         program: &str,
-        mirror: &mac_worker::rooted_fs::RootedDir,
+        mirror: &mac_worker::test_support::host::rooted_fs::RootedDir,
         environment: &[(OsString, OsString)],
     ) -> Result<std::convert::Infallible, WorkerError> {
         self.calls.lock().unwrap().push((
@@ -357,7 +359,7 @@ fn store_with_lease() -> (TempDir, HostStore) {
     let facts = AdmissionFacts {
         free_disk_bytes: 100 * 1024 * 1024 * 1024,
         total_disk_bytes: 200 * 1024 * 1024 * 1024,
-        memory_pressure: mac_worker::protocol::MemoryPressure::Normal,
+        memory_pressure: mac_worker::test_support::core::protocol::MemoryPressure::Normal,
         swap_used_bytes: Some(0),
     };
     LeaseService::new(&store)
@@ -562,7 +564,7 @@ fn outdated_layout_fails_closed_until_hidden_setup_migrates_it() {
         "unexpected error: {error:?}"
     );
     assert_eq!(
-        mac_worker::probe::ProbeCollector::collect_at(&root)
+        mac_worker::test_support::agents::probe::ProbeCollector::collect_at(&root)
             .unwrap_err()
             .public_code(),
         "HOST_LAYOUT_OUTDATED"
@@ -720,7 +722,7 @@ fn shared_recording_runner_can_execute_real_transfer_commands_and_keep_request_h
     transfer
         .resolve_base(
             &runner,
-            &mac_worker::project::ProjectInspector::new(&runner)
+            &mac_worker::test_support::task::project::ProjectInspector::new(&runner)
                 .inspect(repo.root())
                 .unwrap(),
             "HEAD",

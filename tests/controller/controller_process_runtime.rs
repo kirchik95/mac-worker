@@ -11,23 +11,24 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use controller_process::ProcessFixture;
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, TurnLimits},
     controller::{OperationEnvelope, decode_frame, encode_json_frame, load_operation_envelope},
-    job::{
+    core::protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    host::job::{
         ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseAcquireResponse,
         LeaseToken, RequestFingerprintMaterial, StatusLogsRequest, StatusLogsResponse,
         SubmitResponse,
     },
-    protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput,
+        },
+        store::{TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse},
+        turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
     },
-    task_store::{
-        TaskPrepareRequest, TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse,
-    },
-    transfer_repo::TransferRepo,
-    turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
+    transfer::repo::TransferRepo,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -143,7 +144,7 @@ fn plumbing_task_meta(base_oid: BaseOid) -> TaskMeta {
         model: None,
         effort: None,
         policy: PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local {
+        source: mac_worker::test_support::task::model::TaskSource::Local {
             wip: false,
             push_target: None,
         },
@@ -289,7 +290,7 @@ fn harness_task_protocol_and_descendant_git() {
     assert_eq!(session.binding().agent(), AgentKind::Codex);
     assert!(!session.binding().session_ref().is_empty());
 
-    let submit = mac_worker::job::SubmitRequest::new(material.clone())
+    let submit = mac_worker::test_support::host::job::SubmitRequest::new(material.clone())
         .with_execution_scope(ExecutionScope::task(plumbing_task_id()));
     let turn_req = TaskTurnRequest::new(submit, turn, prompt);
     let turn_resp: TaskTurnResponse = fakeexec_ok(
@@ -300,7 +301,10 @@ fn harness_task_protocol_and_descendant_git() {
     match turn_resp.submit() {
         SubmitResponse::Accepted { meta, status } => {
             assert_eq!(meta.job_id(), plumbing_job_id());
-            assert_eq!(status.state(), mac_worker::job::JobState::Accepted);
+            assert_eq!(
+                status.state(),
+                mac_worker::test_support::host::job::JobState::Accepted
+            );
         }
         other => panic!("expected accepted submit, got {other:?}"),
     }
@@ -324,7 +328,7 @@ fn harness_task_protocol_and_descendant_git() {
     assert_eq!(logs.status().meta().job_id(), plumbing_job_id());
     assert_eq!(
         logs.status().status().state(),
-        mac_worker::job::JobState::Succeeded
+        mac_worker::test_support::host::job::JobState::Succeeded
     );
 
     fixture.git_fetch_result(

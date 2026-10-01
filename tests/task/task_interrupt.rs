@@ -14,28 +14,32 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::Cli,
-    client_state::ClientStateStore,
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, HostControlError, ProcessIdentity, QueueEntry,
-        QueueEntryKind, QueueState,
+    client_state::{
+        ClientStateStore,
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    run_with_stdio_in_context,
-    scheduler::{CandidateSlot, WorkerPreference},
-    supervisor::SystemProcessInspector,
+    core::{error::WorkerError, paths::PathLayout},
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, HostControlError, ProcessIdentity, QueueEntry,
+            QueueEntryKind, QueueState,
+        },
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::SystemProcessInspector,
+    },
+    runtime::{RuntimeContext, run_with_stdio_in_context},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
+            TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{TaskCancelResponse, TaskStatusResponse},
     },
-    task_store::{TaskCancelResponse, TaskStatusResponse},
     transfer::HostOperation,
 };
 use support::GitRepo;
@@ -363,7 +367,8 @@ fn plant(script: Script) -> Fixture {
     } else {
         dispatching_turn(&store, turn_id, &project)
     };
-    mac_worker::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+    mac_worker::test_support::controller::drain::set_drained(&paths.controller_state_root(), true)
+        .unwrap();
     let runtime = RuntimeContext::isolated(environment, home_dir, project.context.root.clone());
     Fixture {
         home: Home {

@@ -1,8 +1,8 @@
-use mac_worker::{
-    controller::events::{
+use mac_worker::test_support::{
+    events::{
         BaselineKind, ChangeCause, DerivedTaskChange, Reconciliation, SafeOutcome, TaskFacts,
     },
-    task::{TaskId, TurnId},
+    task::model::{TaskId, TurnId},
 };
 #[test]
 fn cold_repair_cannot_make_historical_notification_changes() {
@@ -41,7 +41,9 @@ mod policy {
         }
     }
 
-    fn target_digest(controller: &mac_worker::config::ControllerConfig) -> String {
+    fn target_digest(
+        controller: &mac_worker::test_support::core::config::ControllerConfig,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(controller.ssh.as_bytes());
         hasher.update([0xff]);
@@ -50,8 +52,8 @@ mod policy {
     }
 
     fn cache_directory(
-        paths: &mac_worker::paths::PathLayout,
-        controller: &mac_worker::config::ControllerConfig,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
+        controller: &mac_worker::test_support::core::config::ControllerConfig,
     ) -> std::path::PathBuf {
         paths
             .controller_cache_root()
@@ -68,24 +70,22 @@ mod policy {
 
     use uuid::Uuid;
 
-    use mac_worker::controller::events::notify::{
+    use mac_worker::test_support::events::notify::{
         NotifyCache, NotifyPlan, commit_then_deliver, plan_notifications,
     };
-    use mac_worker::controller::events::testing::{
+    use mac_worker::test_support::events::testing::{
         FakeEventReconciler, ManualEventRuntime, RecordingNoticeChannel, ScriptedEventSource,
     };
-    use mac_worker::{
-        config::ControllerConfig,
-        controller::events::contracts::{
+    use mac_worker::test_support::{
+        core::{config::ControllerConfig, error::WorkerError, paths::PathLayout},
+        events::contracts::{
             AttentionSummary, BaselineKind, ChangeCause, DerivedTaskChange, EventCursor,
             EventReconciler, MAX_NOTIFY_STATE_BYTES, MAX_RECONCILIATION_ROWS,
             NOTIFY_DECISION_CAPACITY, Notice, NoticeChannel, NoticeSound, NotifyOptions,
             NotifyState, ReconcileInput, Reconciliation, RepairProgress, SafeCode, SafeOutcome,
             Seq, TaskFacts,
         },
-        error::WorkerError,
-        paths::PathLayout,
-        task::{TaskId, TurnId},
+        task::model::{TaskId, TurnId},
     };
 
     struct NotifierHarness {
@@ -1467,21 +1467,20 @@ mod channels {
 
     use serde_json::Value;
 
-    use mac_worker::controller::events::notify::{
+    use mac_worker::test_support::events::notify::{
         ChannelOptions, HerdrChannel, MacosChannel, OSASCRIPT_HANDLER, SelectedChannel,
         UnconfirmedTask, channels_for, eligibility_unknown_diagnostic, herdr_socket_reachable,
         herdr_sound, laptop_notification_socket, notices_for_support, select_channels,
     };
-    use mac_worker::{
-        config::NotificationsConfig,
-        controller::events::contracts::{
+    use mac_worker::test_support::{
+        agents::herdr::HerdrSocket,
+        core::{config::NotificationsConfig, error::WorkerError},
+        events::contracts::{
             EventSupport, Notice, NoticeChannel, NoticeSound, NotifyChannel, NotifyOptions,
             SafeOutcome,
         },
-        error::WorkerError,
-        herdr::HerdrSocket,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
-        task::TaskId,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        task::model::TaskId,
     };
     use uuid::Uuid;
 

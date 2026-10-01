@@ -1,4 +1,5 @@
 use crate::fixture_pid;
+use mac_worker::test_support::cli::from_parts;
 
 use std::{
     collections::VecDeque,
@@ -15,19 +16,20 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    cli::{Cli, Command, HostCommand},
-    config::WorkerEntry,
-    error::{ProcessError, WorkerError},
-    execute_with,
-    install::{Installer, prepare_candidate},
-    output::CommandOutput,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{
-        PROTOCOL_VERSION, SetupFailureKind, SetupHostResult, SetupReport, SetupWarning,
-        SetupWarningCode,
+use mac_worker::test_support::{
+    agents::install::{Installer, prepare_candidate},
+    cli::{Command, HostCommand},
+    core::{
+        config::WorkerEntry,
+        error::{ProcessError, WorkerError},
+        output::CommandOutput,
+        protocol::{
+            PROTOCOL_VERSION, SetupFailureKind, SetupHostResult, SetupReport, SetupWarning,
+            SetupWarningCode,
+        },
     },
-    run_with_io,
+    host::process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{execute_with, run_with_io},
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -147,7 +149,7 @@ fn result(code: i32, stdout: impl AsRef<[u8]>, stderr: impl AsRef<[u8]>) -> Proc
 fn valid_probe_json() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
-        "supervision_version": mac_worker::protocol::SUPERVISION_VERSION,
+        "supervision_version": mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
         "hostname": "mini-1.local",
         "arch": "arm64",
         "os_version": "26.2",
@@ -332,7 +334,7 @@ fn setup_warms_the_promoted_helper_with_version_before_the_verification_probe() 
 }
 
 fn expected_setup_json(expected: &[u8]) -> Vec<u8> {
-    let digest = mac_worker::binary_identity::sha256_hex(
+    let digest = mac_worker::test_support::host::binary_identity::sha256_hex(
         &fs::read(std::env::current_exe().unwrap()).unwrap(),
     );
     String::from_utf8(expected.to_vec())
@@ -634,14 +636,14 @@ fn run_executable_setup(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -1884,14 +1886,14 @@ fn setup_dispatch_keeps_processing_inventory_names_after_a_host_failure() {
     ];
     results.extend(second_host);
     let runner = RecordingRunner::returning_results(results);
-    let cli = Cli {
-        config: Some(config_path),
-        json: true,
-        command: Command::Setup {
+    let cli = from_parts(
+        Some(config_path),
+        true,
+        Command::Setup {
             hosts: vec!["first".into(), "second".into()],
             allow_debug: false,
         },
-    };
+    );
 
     let output = execute_with(cli, &runner).unwrap();
 
@@ -1917,14 +1919,14 @@ fn setup_selection_uses_inventory_names_and_empty_means_all() {
         result(0, b"invalid local probe", b""),
     ]);
     let output = execute_with(
-        Cli {
-            config: Some(config_path.clone()),
-            json: false,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path.clone()),
+            false,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
     )
     .unwrap();
@@ -1942,14 +1944,14 @@ fn setup_selection_uses_inventory_names_and_empty_means_all() {
 
     let empty_runner = RecordingRunner::returning(Vec::new());
     let error = execute_with(
-        Cli {
-            config: Some(config_path),
-            json: false,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            false,
+            Command::Setup {
                 hosts: vec!["mac1".into()],
                 allow_debug: false,
             },
-        },
+        ),
         &empty_runner,
     )
     .unwrap_err();
@@ -1961,13 +1963,13 @@ fn setup_selection_uses_inventory_names_and_empty_means_all() {
 fn hidden_host_probe_does_not_load_client_inventory() {
     let runner = RecordingRunner::returning(Vec::new());
     let output = execute_with(
-        Cli {
-            config: Some("/definitely/missing/mac-worker.toml".into()),
-            json: false,
-            command: Command::Host {
+        from_parts(
+            Some("/definitely/missing/mac-worker.toml".into()),
+            false,
+            Command::Host {
                 command: HostCommand::Probe,
             },
-        },
+        ),
         &runner,
     )
     .unwrap();
@@ -2199,14 +2201,14 @@ fn executable_setup_all_success_renders_complete_report_and_exits_zero() {
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2239,14 +2241,14 @@ fn executable_setup_all_failed_renders_every_host_and_exits_unavailable() {
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2284,14 +2286,14 @@ fn executable_setup_integrity_failure_renders_report_then_exits_infrastructure()
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2326,14 +2328,14 @@ fn executable_setup_local_io_failure_renders_report_then_exits_io() {
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2513,14 +2515,14 @@ fn executable_setup_upload_io_renders_transfer_report_cleans_up_and_exits_io() {
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2560,14 +2562,14 @@ fn executable_setup_upload_nonzero_renders_transfer_report_cleans_up_and_exits_u
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2613,14 +2615,14 @@ fn executable_setup_mixed_failures_render_all_hosts_and_use_strongest_category()
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2664,14 +2666,14 @@ fn executable_setup_partial_failure_renders_success_and_failure_then_exits_unava
     let mut stderr = Vec::new();
 
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut stdout,
         &mut stderr,
@@ -2708,14 +2710,14 @@ fn successful_output_broken_pipe_is_typed_io_and_maps_to_exit_74() {
     let runner = RecordingRunner::returning_results(success_results());
     let mut stderr = Vec::new();
     let exit = run_with_io(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &runner,
         &mut BrokenWriter,
         &mut stderr,
@@ -2749,14 +2751,14 @@ fn error_report_fallback_ignores_a_broken_stderr_writer() {
     // is itself impossible.
     let runner = RecordingRunner::returning(Vec::new());
     let exit = run_with_io(
-        Cli {
-            config: Some("/definitely/missing/mac-worker.toml".into()),
-            json: false,
-            command: Command::Workers {
+        from_parts(
+            Some("/definitely/missing/mac-worker.toml".into()),
+            false,
+            Command::Workers {
                 refresh: false,
                 clear_auth_incidents: false,
             },
-        },
+        ),
         &runner,
         &mut Vec::new(),
         &mut BrokenWriter,
@@ -2803,7 +2805,7 @@ fn install_with_verification_probe(probe: Vec<u8>, worker: &WorkerEntry) -> Setu
 fn herdr_unavailable_warning() -> SetupWarning {
     SetupWarning {
         code: SetupWarningCode::HerdrUnavailable,
-        message: mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE.into(),
+        message: mac_worker::test_support::core::protocol::HERDR_UNAVAILABLE_MESSAGE.into(),
     }
 }
 
@@ -2811,7 +2813,7 @@ fn herdr_unavailable_warning() -> SetupWarning {
 fn verified_install_with_herdr_requested_but_unavailable_stays_installed_with_typed_warning() {
     // Spec 5.3: `herdr = true` with any fact but `available` is a setup
     // warning; the host still reports installed with its protocol version.
-    use mac_worker::agent_facts::FACTS_TTL;
+    use mac_worker::test_support::agents::agent_facts::FACTS_TTL;
 
     for (label, probe) in [
         (
@@ -2882,7 +2884,7 @@ fn verified_install_carries_no_herdr_warning_when_available_or_not_requested() {
 
 #[test]
 fn setup_output_surfaces_the_herdr_warning_after_installed_in_text_and_json() {
-    let message = mac_worker::protocol::HERDR_UNAVAILABLE_MESSAGE;
+    let message = mac_worker::test_support::core::protocol::HERDR_UNAVAILABLE_MESSAGE;
     let output = CommandOutput::Setup(SetupReport {
         protocol_version: PROTOCOL_VERSION,
         workers: vec![SetupHostResult {
@@ -3063,14 +3065,14 @@ fn setup_with_controller(
     .unwrap();
     let runner = RecordingRunner::returning_results(results);
     let output = execute_with(
-        Cli {
-            config: Some(config_path),
-            json: true,
-            command: Command::Setup {
+        from_parts(
+            Some(config_path),
+            true,
+            Command::Setup {
                 hosts: Vec::new(),
                 allow_debug: false,
             },
-        },
+        ),
         &SetupControllerHealth(&runner),
     )
     .unwrap();
@@ -3086,24 +3088,30 @@ impl ProcessRunner for SetupControllerHealth<'_> {
             .is_some_and(|arg| arg == "~/.local/bin/worker host controller-rpc")
         {
             self.0.requests.lock().unwrap().push(request.clone());
-            let parsed = mac_worker::controller::parse_request(
-                mac_worker::controller::decode_frame(request.stdin.as_ref().unwrap()).unwrap(),
+            let parsed = mac_worker::test_support::controller::parse_request(
+                mac_worker::test_support::controller::decode_frame(request.stdin.as_ref().unwrap())
+                    .unwrap(),
             )
             .unwrap();
-            let mut health =
-                serde_json::to_value(mac_worker::controller::health::ControllerHealth::new(
-                    mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(42), 1001000)
-                        .unwrap(),
+            let mut health = serde_json::to_value(
+                mac_worker::test_support::controller::health::ControllerHealth::new(
+                    mac_worker::test_support::host::job::ProcessIdentity::new(
+                        fixture_pid::fixture_pid(42),
+                        1001000,
+                    )
+                    .unwrap(),
                     1001,
-                ))
-                .unwrap();
+                ),
+            )
+            .unwrap();
             health["supervised"] = serde_json::json!(true);
-            health["binary_sha256"] =
-                serde_json::json!(mac_worker::binary_identity::current_binary_sha256().unwrap());
+            health["binary_sha256"] = serde_json::json!(
+                mac_worker::test_support::host::binary_identity::current_binary_sha256().unwrap()
+            );
             health["config_path"] =
                 serde_json::json!("/Users/controller/.config/mac-worker/config.toml");
             health["paths"] = setup_service_paths();
-            return Ok(result(0, mac_worker::controller::encode_json_frame(&serde_json::json!({"protocol_version":PROTOCOL_VERSION,"command":parsed.command(),"request_id":parsed.request_id(),"payload_sha256":parsed.payload_sha256(),"result":{"state":"healthy","reason":"tick_succeeded","leader_running":true,"health":health}})).unwrap(), b""));
+            return Ok(result(0, mac_worker::test_support::controller::encode_json_frame(&serde_json::json!({"protocol_version":PROTOCOL_VERSION,"command":parsed.command(),"request_id":parsed.request_id(),"payload_sha256":parsed.payload_sha256(),"result":{"state":"healthy","reason":"tick_succeeded","leader_running":true,"health":health}})).unwrap(), b""));
         }
         self.0.run(request)
     }
@@ -3114,7 +3122,7 @@ fn setup_service_paths() -> serde_json::Value {
 }
 
 fn restarted_controller_service() -> ProcessResult {
-    let status: mac_worker::controller::service::ServiceStatus = serde_json::from_value(serde_json::json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":fixture_pid::fixture_pid(42),"running":true,"restart_started_at_millis":1000,"paths":setup_service_paths()})).unwrap();
+    let status: mac_worker::test_support::controller::service::ServiceStatus = serde_json::from_value(serde_json::json!({"label":"com.mac-worker.controller","domain":"gui/501","installed":true,"loaded":true,"pid":fixture_pid::fixture_pid(42),"running":true,"restart_started_at_millis":1000,"paths":setup_service_paths()})).unwrap();
     result(0, serde_json::to_vec(&status).unwrap(), b"")
 }
 

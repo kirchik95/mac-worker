@@ -15,15 +15,17 @@ use std::{
     thread,
 };
 
-use mac_worker::{
-    agent::{AdapterError, AgentKind, AgentOutcome, PermissionPolicy, Question, TurnLimits},
+use mac_worker::test_support::{
+    agents::agent::{
+        AdapterError, AgentKind, AgentOutcome, PermissionPolicy, Question, TurnLimits,
+    },
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         ClientStateWritePoint,
     },
-    error::{ExitKind, WorkerError},
-    job::{JobId, ProcessIdentity},
-    task::{
+    core::error::{ExitKind, WorkerError},
+    host::job::{JobId, ProcessIdentity},
+    task::model::{
         BaseOid, BranchName, ClosePolicy, GitIdentity, LocalTaskRecord, MAX_FOLLOWUPS,
         MAX_PROMPT_BYTES, PublishMode, PushTarget, RunId, RunProgress, RunRecord, RunnerIdentity,
         RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
@@ -53,14 +55,14 @@ fn questions_policy_record_roundtrips_without_changing_host_meta() {
         serde_json::from_value(value.clone()).expect("new questions policy");
     assert_eq!(
         record.questions_policy(),
-        mac_worker::task::QuestionsPolicy::Decide
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide
     );
     assert_eq!(
         record
             .with_status(record.status().clone())
             .unwrap()
             .questions_policy(),
-        mac_worker::task::QuestionsPolicy::Decide
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide
     );
     assert_eq!(serde_json::to_value(&record).unwrap(), value);
     assert!(
@@ -76,7 +78,7 @@ fn questions_legacy_record_stays_ask_and_byte_identical() {
     let record: LocalTaskRecord = serde_json::from_str(LEGACY_FETCH_ONLY_LOCAL_RECORD).unwrap();
     assert_eq!(
         record.questions_policy(),
-        mac_worker::task::QuestionsPolicy::Ask
+        mac_worker::test_support::task::model::QuestionsPolicy::Ask
     );
     assert_eq!(
         serde_json::to_string(&record).unwrap(),
@@ -1285,7 +1287,7 @@ fn hex_id_helper_matches_task_id_display() {
 
 #[test]
 fn turn_summary_carries_an_optional_herdr_report() {
-    use mac_worker::task::{HerdrTurnReport, HerdrTurnState};
+    use mac_worker::test_support::task::model::{HerdrTurnReport, HerdrTurnState};
 
     let plain = TurnSummary::new(1, turn_id(), None, None, None, false, None, None);
     let plain_json = serde_json::to_string(&plain).unwrap();

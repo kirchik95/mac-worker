@@ -1,10 +1,12 @@
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
-use mac_worker::{
-    config::{ControllerConfig, SshConfig},
-    controller::channel::{contracts::*, testing::*},
-    job::ProcessIdentity,
-    process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+use mac_worker::test_support::{
+    channel::{contracts::*, testing::*},
+    core::config::{ControllerConfig, SshConfig},
+    host::{
+        job::ProcessIdentity,
+        process::{ProcessPolicy, ProcessRequest, ProcessRunner},
+    },
 };
 use serde_json::json;
 

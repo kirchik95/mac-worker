@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::from_parts;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -15,27 +16,31 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
-    cli::{Cli, Command},
-    config::{Config, WorkerEntry},
-    doctor::{DoctorRequest, DoctorService},
-    error::{ExitKind, WorkerError},
-    inputs::InputSelector,
-    laptop::{FixedLaptopProcessTable, LaptopProcess},
-    lease::SlotState,
-    output::CommandOutput,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project::ProjectInspector,
-    project_config::SnapshotSettings,
-    protocol::{
-        DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, MemoryPressure,
-        PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+use mac_worker::test_support::{
+    agents::{
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
+        doctor::{DoctorRequest, DoctorService},
+        laptop::{FixedLaptopProcessTable, LaptopProcess},
     },
-    run_with_io_in_context,
-    snapshot::SnapshotSummary,
+    cli::{Cli, Command},
+    core::{
+        config::{Config, WorkerEntry},
+        error::{ExitKind, WorkerError},
+        inputs::InputSelector,
+        output::CommandOutput,
+        paths::PathLayout,
+        protocol::{
+            DoctorIssue, DoctorProject, DoctorReport, HealthStatus, IssueSeverity, MemoryPressure,
+            PROTOCOL_VERSION, ProbeResponse, WorkerHealth,
+        },
+    },
+    host::{
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    },
+    runtime::{RuntimeContext, run_with_io_in_context},
+    task::{project::ProjectInspector, project_config::SnapshotSettings},
+    transfer::snapshot::SnapshotSummary,
 };
 
 use support::GitRepo;
@@ -261,7 +266,7 @@ fn exit_status(code: i32) -> ExitStatus {
 fn ready_probe(capabilities: &[&str]) -> Result<ProcessResult, WorkerError> {
     let response = serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
-        "supervision_version": mac_worker::protocol::SUPERVISION_VERSION,
+        "supervision_version": mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
         "hostname": "mini.local",
         "arch": "arm64",
         "os_version": "26.2",
@@ -313,7 +318,7 @@ fn structured_probe(
     });
     if protocol_version == PROTOCOL_VERSION {
         response["supervision_version"] =
-            serde_json::json!(mac_worker::protocol::SUPERVISION_VERSION);
+            serde_json::json!(mac_worker::test_support::core::protocol::SUPERVISION_VERSION);
         response["total_disk_bytes"] = serde_json::json!(1_073_741_824_u64);
         response["slot_state"] = serde_json::json!("idle");
         response["active_lease"] = serde_json::Value::Null;
@@ -359,7 +364,7 @@ fn worker(name: &str, ssh: &str, capabilities: &[&str]) -> WorkerEntry {
 fn config(workers: Vec<WorkerEntry>) -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers,
@@ -380,13 +385,13 @@ fn inspect(
     state_root: &Path,
     config: &Config,
     runner: &DoctorRunner,
-) -> Result<mac_worker::protocol::DoctorReport, WorkerError> {
+) -> Result<mac_worker::test_support::core::protocol::DoctorReport, WorkerError> {
     let paths = paths(state_root);
     DoctorService {
         runner,
         config,
         paths: &paths,
-        laptop_processes: &mac_worker::laptop::EmptyLaptopProcessTable,
+        laptop_processes: &mac_worker::test_support::agents::laptop::EmptyLaptopProcessTable,
         installed_binary_mtime: None,
     }
     .inspect(DoctorRequest {
@@ -446,7 +451,7 @@ fn ready_output_report() -> DoctorReport {
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-1.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -455,7 +460,7 @@ fn ready_output_report() -> DoctorReport {
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(134_217_728),
                 available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
-                cpu_counters: Some(mac_worker::protocol::CpuCounters {
+                cpu_counters: Some(mac_worker::test_support::core::protocol::CpuCounters {
                     user_ticks: 10,
                     system_ticks: 20,
                     idle_ticks: 30,
@@ -507,7 +512,7 @@ fn blocked_output_report(code: &str) -> DoctorReport {
             probe: Some(ProbeResponse {
                 features: None,
                 protocol_version: PROTOCOL_VERSION,
-                supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+                supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
                 hostname: "mini-2.local".into(),
                 arch: "arm64".into(),
                 os_version: "26.2".into(),
@@ -559,14 +564,14 @@ fn write_inventory(root: &Path) -> PathBuf {
 }
 
 fn doctor_cli(config: PathBuf, project: Option<&Path>, includes: Vec<String>, json: bool) -> Cli {
-    Cli {
-        config: Some(config),
+    from_parts(
+        Some(config),
         json,
-        command: Command::Doctor {
+        Command::Doctor {
             project: project.map(Path::to_path_buf),
             includes,
         },
-    }
+    )
 }
 
 fn isolated_runtime(root: &Path, current_dir: &Path) -> IsolatedRuntime {
@@ -982,7 +987,7 @@ fn executable_doctor_rejects_external_project_policy_without_leaking_diagnostics
 
     assert_eq!(exit, ExitKind::Usage as u8);
     assert!(stdout.is_empty());
-    let hint = mac_worker::error::hint_for("CONFIG").unwrap();
+    let hint = mac_worker::test_support::core::error::hint_for("CONFIG").unwrap();
     assert_eq!(
         String::from_utf8_lossy(&stderr),
         format!("CONFIG: configuration error\n{hint}\n")
@@ -2009,7 +2014,9 @@ fn unavailable_herdr_probes() -> Vec<(Result<ProcessResult, WorkerError>, &'stat
 fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays_ready() {
     // Spec 5.3 and 12: HERDR_UNAVAILABLE is a warning, never a blocker, and
     // it never touches readiness or eligibility.
-    use mac_worker::protocol::{HERDR_FACTS_STALE_MESSAGE, HERDR_UNAVAILABLE_MESSAGE};
+    use mac_worker::test_support::core::protocol::{
+        HERDR_FACTS_STALE_MESSAGE, HERDR_UNAVAILABLE_MESSAGE,
+    };
 
     let repo = herdr_repo();
     let config = config(vec![herdr_worker("mini-1", "mac1", true)]);
@@ -2068,7 +2075,7 @@ fn herdr_true_worker_gets_a_warning_for_every_fact_state_but_available_and_stays
 
 #[test]
 fn herdr_true_worker_with_an_available_fact_gets_no_herdr_warning() {
-    use mac_worker::agent_facts::FACTS_TTL;
+    use mac_worker::test_support::agents::agent_facts::FACTS_TTL;
 
     let repo = herdr_repo();
     let state = tempfile::tempdir().unwrap();
@@ -2116,7 +2123,7 @@ fn herdr_warning_for_an_unreachable_herdr_worker_sorts_with_the_other_warnings()
     // An unreachable worker has no fresh fact; asking for herdr on it adds
     // the facts warning beside SSH_UNAVAILABLE and leaves the ready pool
     // ready.
-    use mac_worker::protocol::HERDR_FACTS_STALE_MESSAGE;
+    use mac_worker::test_support::core::protocol::HERDR_FACTS_STALE_MESSAGE;
 
     let repo = herdr_repo();
     let state = tempfile::tempdir().unwrap();

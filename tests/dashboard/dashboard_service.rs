@@ -8,8 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
-    agent_facts::{AgentFacts, FACTS_TTL, HerdrFactState, HerdrFacts},
+use mac_worker::test_support::{
+    agents::agent_facts::{AgentFacts, FACTS_TTL, HerdrFactState, HerdrFacts},
+    core::{
+        error::WorkerError,
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth as ProbeWorkerHealth,
+        },
+    },
     dashboard::{
         cache::{CpuCounters, IDLE_PROBE_INTERVAL_MILLIS, OBSERVATION_TTL_MILLIS, Observation},
         model::{
@@ -26,15 +33,11 @@ use mac_worker::{
         },
         source::project_worker,
     },
-    error::WorkerError,
-    job::JobId,
-    lease::SlotState,
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth as ProbeWorkerHealth,
+    host::{job::JobId, lease::SlotState},
+    task::{
+        model::{BranchName, ClosePolicy, RunId, TaskId, TaskState},
+        view::{ReviewState, TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection},
     },
-    task::{BranchName, ClosePolicy, RunId, TaskId, TaskState},
-    task_view::{ReviewState, TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection},
 };
 
 #[test]
@@ -354,7 +357,7 @@ fn current_and_cached_workers_recheck_their_own_agent_facts_freshness() {
     assert_eq!(snapshot.workers[0].freshness, Freshness::Current);
     assert_eq!(
         snapshot.workers[0].agent_facts.as_ref().unwrap().freshness,
-        mac_worker::dashboard::model::AgentFactsFreshness::Current
+        mac_worker::test_support::dashboard::model::AgentFactsFreshness::Current
     );
 
     wall.set(10_000 + IDLE_PROBE_INTERVAL_MILLIS);
@@ -367,7 +370,7 @@ fn current_and_cached_workers_recheck_their_own_agent_facts_freshness() {
     assert_eq!(cached.workers[0].freshness, Freshness::Stale);
     assert_eq!(
         cached.workers[0].agent_facts.as_ref().unwrap().freshness,
-        mac_worker::dashboard::model::AgentFactsFreshness::Stale
+        mac_worker::test_support::dashboard::model::AgentFactsFreshness::Stale
     );
 }
 
@@ -590,7 +593,7 @@ fn fact_age_changes_publish_only_when_freshness_changes() {
     assert_eq!(stale.workers[0].freshness, Freshness::Current);
     assert_eq!(
         stale.workers[0].agent_facts.as_ref().unwrap().freshness,
-        mac_worker::dashboard::model::AgentFactsFreshness::Stale
+        mac_worker::test_support::dashboard::model::AgentFactsFreshness::Stale
     );
     assert!(stale.workers[0].herdr.as_ref().unwrap().stale);
 }
@@ -885,7 +888,7 @@ fn waiter_timeout_with_prior_snapshot_preserves_data_revision_and_generation_tim
     assert_eq!(stale.workers[0].freshness, Freshness::Stale);
     assert_eq!(
         stale.workers[0].agent_facts.as_ref().unwrap().freshness,
-        mac_worker::dashboard::model::AgentFactsFreshness::Current,
+        mac_worker::test_support::dashboard::model::AgentFactsFreshness::Current,
         "worker connectivity and agent-facts age remain independent"
     );
     assert_eq!(stale.queue, completed.queue);
@@ -1327,7 +1330,7 @@ fn unreachable_workers_are_not_refreshed() {
 #[test]
 fn snapshot_sets_laptop_binary_outdated_when_the_installed_file_changed() {
     let source = FakeSource::new();
-    let started = mac_worker::laptop::BinaryIdentity {
+    let started = mac_worker::test_support::agents::laptop::BinaryIdentity {
         path: "/tmp/worker".into(),
         inode: 1,
         size: 10,
@@ -1337,7 +1340,7 @@ fn snapshot_sets_laptop_binary_outdated_when_the_installed_file_changed() {
     installed.inode = 2;
     let service = DashboardService::new(source, ManualClock::new(10_000), ManualMonotonic::new(0))
         .with_binary_source(std::sync::Arc::new(
-            mac_worker::laptop::FixedBinaryIdentitySource {
+            mac_worker::test_support::agents::laptop::FixedBinaryIdentitySource {
                 started: Some(started),
                 installed: Some(installed),
             },
@@ -1345,9 +1348,11 @@ fn snapshot_sets_laptop_binary_outdated_when_the_installed_file_changed() {
     let snapshot = service.snapshot(Default::default()).unwrap();
     assert_eq!(
         snapshot.laptop,
-        Some(mac_worker::dashboard::model::DashboardLaptop {
-            binary_outdated: true
-        })
+        Some(
+            mac_worker::test_support::dashboard::model::DashboardLaptop {
+                binary_outdated: true
+            }
+        )
     );
     let json = serde_json::to_value(&snapshot).unwrap();
     assert_eq!(json["laptop"]["binary_outdated"], true);
@@ -1355,7 +1360,7 @@ fn snapshot_sets_laptop_binary_outdated_when_the_installed_file_changed() {
 
 #[test]
 fn matching_laptop_binary_omits_the_additive_laptop_object() {
-    let identity = mac_worker::laptop::BinaryIdentity {
+    let identity = mac_worker::test_support::agents::laptop::BinaryIdentity {
         path: "/tmp/worker".into(),
         inode: 1,
         size: 10,
@@ -1367,7 +1372,7 @@ fn matching_laptop_binary_omits_the_additive_laptop_object() {
         ManualMonotonic::new(0),
     )
     .with_binary_source(std::sync::Arc::new(
-        mac_worker::laptop::FixedBinaryIdentitySource {
+        mac_worker::test_support::agents::laptop::FixedBinaryIdentitySource {
             started: Some(identity.clone()),
             installed: Some(identity),
         },

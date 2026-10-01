@@ -8,16 +8,13 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
     controller::{canonical_request_sha256, decode_frame, encode_json_frame},
-    error::WorkerError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    run_with_stdio_in_context,
-    task::{BaseOid, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal},
+    core::{error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    task::model::{BaseOid, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;

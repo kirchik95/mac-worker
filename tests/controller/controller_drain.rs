@@ -7,28 +7,28 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    client_state::ClientStateStore,
-    config::Config,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
     controller::{
         ControllerFault, ControllerLeader, ControllerStore, RequestPhase,
         drain::{is_drained, set_drained},
         parse_request,
     },
-    error::WorkerError,
-    job::{CommandSummary, QueueEntry, QueueEntryKind},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    scheduler::WorkerPreference,
-    supervisor::SystemProcessInspector,
-    task::{
-        ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId, TaskLimits,
-        TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{
+        job::{CommandSummary, QueueEntry, QueueEntryKind},
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        supervisor::SystemProcessInspector,
     },
-    task_client::TaskClient,
-    turn_runner::{RunnerExecutor, RunnerStart, start_runner_with_reservation},
+    task::{
+        client::TaskClient,
+        model::{
+            ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity, TaskId,
+            TaskLimits, TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
+        },
+        turn_runner::{RunnerExecutor, RunnerStart, start_runner_with_reservation},
+    },
 };
 
 struct CountingExecutor(AtomicUsize);

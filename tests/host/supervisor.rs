@@ -20,27 +20,33 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
-    error::WorkerError,
-    host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
-    job::{
-        CommandSpec, ExecutionScope, JobState, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LogChunkRequest, LogChunkResponse, LogStream,
-        ProcessIdentity, RequestFingerprintMaterial, StatusRequest, StatusResponse, SubmitRequest,
-        SubmitResponse,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
+    core::{
+        error::WorkerError,
+        protocol::{MemoryPressure, PROTOCOL_VERSION},
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    lease::{AdmissionFacts, LeaseService},
-    process::SystemProcessRunner,
-    protocol::{MemoryPressure, PROTOCOL_VERSION},
-    supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+    host::{
+        job::{
+            CommandSpec, ExecutionScope, JobState, JobStatus, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseRecord, LogChunkRequest, LogChunkResponse, LogStream,
+            ProcessIdentity, RequestFingerprintMaterial, StatusRequest, StatusResponse,
+            SubmitRequest, SubmitResponse,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+        lease::{AdmissionFacts, LeaseService},
+        process::SystemProcessRunner,
+        store::{HostStore, HostStoreWritePoint, SupervisorGuard},
+        supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+    },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskSource,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskSource,
+        },
+        store::{SessionBinding, TaskPrepareRequest, TaskStore},
+        turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
     },
-    task_store::{SessionBinding, TaskPrepareRequest, TaskStore},
-    turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
 };
 use sha2::{Digest, Sha256};
 
@@ -330,7 +336,7 @@ impl TurnRequestFields for TaskTurnRequest {
 // The agent fixture writes its structured result separately, preserving exact raw stdout/stderr probes.
 pub(super) fn task_probe_command(
     store: &HostStore,
-    job: mac_worker::job::JobId,
+    job: mac_worker::test_support::host::job::JobId,
     command: CommandSpec,
 ) -> CommandSpec {
     let last = store
@@ -512,7 +518,7 @@ fn assert_turnless_prelaunch_refusal(indexed: bool, resolve: bool) {
         let error = if resolve {
             service
                 .resolve_or_abandon(
-                    mac_worker::job::ResolveOrAbandonRequest::from_submit_request(&request)
+                    mac_worker::test_support::host::job::ResolveOrAbandonRequest::from_submit_request(&request)
                         .unwrap(),
                 )
                 .unwrap_err()
@@ -678,7 +684,7 @@ impl Drop for DetachedJobCleanup {
         {
             if matches!(
                 inspector.observe(identity),
-                mac_worker::supervisor::ProcessObservation::Matching { .. }
+                mac_worker::test_support::host::supervisor::ProcessObservation::Matching { .. }
             ) {
                 let _ = unsafe { libc::kill(identity.pid() as libc::pid_t, libc::SIGKILL) };
             }
@@ -741,9 +747,9 @@ struct TimedSupervisorLauncher {
 impl SupervisorLauncher for TimedSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         let mut supervisor = Supervisor::new(&self.store, &inspector)
@@ -769,9 +775,9 @@ struct TamperingInlineSupervisorLauncher {
 impl SupervisorLauncher for RejectLauncher {
     fn launch(
         &self,
-        _job_id: mac_worker::job::JobId,
+        _job_id: mac_worker::test_support::host::job::JobId,
         _guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         panic!("peer fixture publication must not launch a supervisor")
     }
 }
@@ -779,9 +785,9 @@ impl SupervisorLauncher for RejectLauncher {
 impl SupervisorLauncher for InlineSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         Supervisor::new(&self.store, &inspector)
@@ -794,9 +800,9 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
 impl SupervisorLauncher for FaultingInlineSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
         Supervisor::new_with_fault(&self.store, &inspector, self.point)
@@ -809,9 +815,9 @@ impl SupervisorLauncher for FaultingInlineSupervisorLauncher {
 impl SupervisorLauncher for TamperingInlineSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         let payload_path = self.job_path.join("execution.json");
         let mut bytes = fs::read(&payload_path)?;
         let original = b"/bin/true";
@@ -820,7 +826,7 @@ impl SupervisorLauncher for TamperingInlineSupervisorLauncher {
             .windows(original.len())
             .position(|window| window == original)
             .ok_or_else(|| {
-                mac_worker::error::WorkerError::Protocol(
+                mac_worker::test_support::core::error::WorkerError::Protocol(
                     "test execution payload did not contain its command".into(),
                 )
             })?;
@@ -874,22 +880,24 @@ struct MarkingInlineSupervisorLauncher {
 impl SupervisorLauncher for FailingLauncher {
     fn launch(
         &self,
-        _job_id: mac_worker::job::JobId,
+        _job_id: mac_worker::test_support::host::job::JobId,
         _guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
-        Err(mac_worker::error::WorkerError::Protocol(
-            "injected launcher failure".into(),
-        ))
+        Err(
+            mac_worker::test_support::core::error::WorkerError::Protocol(
+                "injected launcher failure".into(),
+            ),
+        )
     }
 }
 
 impl SupervisorLauncher for CapturedPreidentityLauncher {
     fn launch(
         &self,
-        _job_id: mac_worker::job::JobId,
+        _job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         *self.held.lock().unwrap() = Some(guard);
         self.entered.send(()).unwrap();
         Ok(LaunchCandidate::new(
@@ -901,9 +909,9 @@ impl SupervisorLauncher for CapturedPreidentityLauncher {
 impl SupervisorLauncher for CountingInlineSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(std::process::id())?;
@@ -917,7 +925,7 @@ impl SupervisorLauncher for CountingInlineSupervisorLauncher {
 impl SupervisorLauncher for MarkingInlineSupervisorLauncher {
     fn launch(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
@@ -934,13 +942,14 @@ impl SupervisorLauncher for MarkingInlineSupervisorLauncher {
 impl SupervisorLauncher for RecordingLauncher {
     fn launch(
         &self,
-        _job_id: mac_worker::job::JobId,
+        _job_id: mac_worker::test_support::host::job::JobId,
         guard: SupervisorGuard,
-    ) -> Result<LaunchCandidate, mac_worker::error::WorkerError> {
+    ) -> Result<LaunchCandidate, mac_worker::test_support::core::error::WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         let bytes = fs::read(self.job_path.join("status.json"))?;
-        let status: JobStatus = serde_json::from_slice(&bytes)
-            .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+        let status: JobStatus = serde_json::from_slice(&bytes).map_err(|error| {
+            mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+        })?;
         let status = status.with_supervisor(self.identity, 4)?;
         let replacement = self.job_path.join(".test-launcher-status");
         let mut replacement_file = OpenOptions::new()
@@ -1883,7 +1892,8 @@ fn production_term_grace_stress() {
 }
 
 fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
-    let grace = term_grace.unwrap_or(mac_worker::supervisor::SUPERVISOR_TERM_GRACE);
+    let grace =
+        term_grace.unwrap_or(mac_worker::test_support::host::supervisor::SUPERVISOR_TERM_GRACE);
     let temp = tempfile::tempdir().unwrap();
     let command = CommandSpec::argv(vec![
         "/bin/sh".into(),
@@ -1929,7 +1939,7 @@ fn assert_timeout_group_cleanup(term_grace: Option<Duration>) {
     );
     assert_eq!(
         SystemProcessInspector.observe_group(process_group as u32),
-        mac_worker::supervisor::ProcessGroupObservation::Absent,
+        mac_worker::test_support::host::supervisor::ProcessGroupObservation::Absent,
         "targeted timeout cleanup must prove the group absent"
     );
     assert!(LeaseService::new(&store).load().unwrap().is_none());
@@ -1982,7 +1992,7 @@ fn successful_leader_cannot_leave_a_background_process_group_after_cleanup() {
     );
     assert_eq!(
         SystemProcessInspector.observe_group(process_group as u32),
-        mac_worker::supervisor::ProcessGroupObservation::Absent,
+        mac_worker::test_support::host::supervisor::ProcessGroupObservation::Absent,
         "background group cleanup must prove the group absent"
     );
     assert!(LeaseService::new(&store).load().unwrap().is_none());

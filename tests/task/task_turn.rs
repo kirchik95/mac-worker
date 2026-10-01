@@ -13,37 +13,45 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::{
-        AgentKind, PermissionPolicy, PromptDelivery, Question, TurnLaunch, TurnLimits, TurnParams,
-        adapter_for,
+use mac_worker::test_support::{
+    agents::{
+        agent::{
+            AgentKind, PermissionPolicy, PromptDelivery, Question, TurnLaunch, TurnLimits,
+            TurnParams, adapter_for,
+        },
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
+        probe::ProbeCollector,
     },
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, turn_auth_failure_reason},
-    error::WorkerError,
-    host_store::HostStore,
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, JobState, JobStatus, LeaseAcquireRequest,
-        LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+    core::{
+        error::WorkerError,
+        protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    lease::{AdmissionFacts, LeaseService},
-    outbox::OriginOutbox,
-    probe::ProbeCollector,
-    process::SystemProcessRunner,
-    protocol::{MemoryPressure, PROTOCOL_VERSION, SUPERVISION_VERSION},
-    supervisor::{
-        LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
-        ProcessObservation, ReconciliationRuntime, StdinSource, StdoutSink, Supervisor,
-        SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, JobState, JobStatus, LeaseAcquireRequest,
+            LeaseRecord, LeaseToken, RequestFingerprintMaterial,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+        lease::{AdmissionFacts, LeaseService},
+        process::SystemProcessRunner,
+        store::HostStore,
+        supervisor::{
+            LaunchPlan, ProcessGroupMembership, ProcessGroupObservation, ProcessInspector,
+            ProcessObservation, ReconciliationRuntime, StdinSource, StdoutSink, Supervisor,
+            SupervisorFaultPoint, SystemProcessInspector, SystemSupervisorLauncher,
+        },
     },
     task::{
-        BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        model::{
+            BaseOid, BranchName, ClosePolicy, DeliveryState, GitIdentity, PublishMode, PushTarget,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+        },
+        store::{
+            SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore,
+        },
+        turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
     },
-    task_store::{
-        SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore,
-    },
-    turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
+    transfer::outbox::OriginOutbox,
 };
 use support::GitRepo;
 use tempfile::tempdir;
@@ -106,7 +114,7 @@ impl SupervisorLauncher for InlineTurnLauncher {
     fn launch(
         &self,
         job_id: JobId,
-        guard: mac_worker::host_store::SupervisorGuard,
+        guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(process::id())?;
@@ -132,7 +140,7 @@ impl SupervisorLauncher for CappedTurnLauncher {
     fn launch(
         &self,
         job_id: JobId,
-        guard: mac_worker::host_store::SupervisorGuard,
+        guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(process::id())?;
@@ -153,7 +161,7 @@ impl SupervisorLauncher for CountingFailingLauncher {
     fn launch(
         &self,
         _job_id: JobId,
-        _guard: mac_worker::host_store::SupervisorGuard,
+        _guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         Err(WorkerError::Protocol("test launcher was invoked".into()))
@@ -165,11 +173,17 @@ struct FastReconciliationRuntime {
 }
 
 impl ProcessInspector for FastReconciliationRuntime {
-    fn identity_for_pid(&self, pid: u32) -> Result<mac_worker::job::ProcessIdentity, WorkerError> {
+    fn identity_for_pid(
+        &self,
+        pid: u32,
+    ) -> Result<mac_worker::test_support::host::job::ProcessIdentity, WorkerError> {
         SystemProcessInspector.identity_for_pid(pid)
     }
 
-    fn observe(&self, expected: mac_worker::job::ProcessIdentity) -> ProcessObservation {
+    fn observe(
+        &self,
+        expected: mac_worker::test_support::host::job::ProcessIdentity,
+    ) -> ProcessObservation {
         SystemProcessInspector.observe(expected)
     }
 
@@ -220,7 +234,7 @@ fn prepared_task_turn(
 ) -> (
     tempfile::TempDir,
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    mac_worker::test_support::task::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
     prepared_task_turn_with_close(script, ClosePolicy::Never)
@@ -271,12 +285,15 @@ fn acquire_scoped_task_lease(store: &HostStore, task: TaskId, job: JobId, token:
         )
         .unwrap()
     {
-        mac_worker::job::LeaseAcquireResponse::Acquired { .. } => {}
+        mac_worker::test_support::host::job::LeaseAcquireResponse::Acquired { .. } => {}
         other => panic!("expected acquired task lease, got {other:?}"),
     }
 }
 
-fn submit_inline(store: &HostStore, request: TaskTurnRequest) -> mac_worker::task::TaskStatus {
+fn submit_inline(
+    store: &HostStore,
+    request: TaskTurnRequest,
+) -> mac_worker::test_support::task::model::TaskStatus {
     let launcher = InlineTurnLauncher {
         store: store.clone(),
         fault: None,
@@ -294,7 +311,7 @@ fn prepared_task_turn_with_close(
 ) -> (
     tempfile::TempDir,
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    mac_worker::test_support::task::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
     let temp = tempdir().unwrap();
@@ -353,7 +370,7 @@ fn prepared_push_task_turn(
 ) -> (
     tempfile::TempDir,
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    mac_worker::test_support::task::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
     let temp = tempdir().unwrap();
@@ -377,9 +394,9 @@ fn prepared_push_task_turn(
 }
 
 fn request_with_mismatched_origin(
-    request: &mac_worker::turn::TaskTurnRequest,
-) -> mac_worker::turn::TaskTurnRequest {
-    mac_worker::turn::TaskTurnRequest::new_with_origin(
+    request: &mac_worker::test_support::task::turn::TaskTurnRequest,
+) -> mac_worker::test_support::task::turn::TaskTurnRequest {
+    mac_worker::test_support::task::turn::TaskTurnRequest::new_with_origin(
         request.submit().clone(),
         request.turn().clone(),
         request.prompt(),
@@ -404,7 +421,7 @@ fn prepared_task_turn_at(
     spec: PreparedTaskTurnSpec,
 ) -> (
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    mac_worker::test_support::task::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
     prepared_task_turn_at_with_lease_clock(host, script, spec, wall_clock_millis)
@@ -417,7 +434,7 @@ fn prepared_task_turn_at_with_lease_clock(
     lease_clock: impl FnOnce() -> u64,
 ) -> (
     HostStore,
-    mac_worker::turn::TaskTurnRequest,
+    mac_worker::test_support::task::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
     let PreparedTaskTurnSpec {
@@ -469,7 +486,7 @@ fn prepared_task_turn_at_with_lease_clock(
     )
     .unwrap()
     .with_frozen_setup(
-        mac_worker::project_readiness::FrozenSetup::from_snapshot(
+        mac_worker::test_support::task::project_readiness::FrozenSetup::from_snapshot(
             &SystemProcessRunner,
             source.root(),
             &base_oid,
@@ -548,17 +565,20 @@ fn prepared_task_turn_at_with_lease_clock(
     .unwrap();
     let admission = store.admission_lock(job_id).unwrap();
     let transfer = store.transfer_lock_after(&admission, job_id).unwrap();
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .prepare(
-            &TaskPrepareRequest::new(meta, job_id, "test-worker"),
-            &transfer,
-        )
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .prepare(
+        &TaskPrepareRequest::new(meta, job_id, "test-worker"),
+        &transfer,
+    )
+    .unwrap();
     drop(transfer);
     drop(admission);
 
-    let request = mac_worker::turn::TaskTurnRequest::new_with_origin(
-        mac_worker::job::SubmitRequest::new(projected)
+    let request = mac_worker::test_support::task::turn::TaskTurnRequest::new_with_origin(
+        mac_worker::test_support::host::job::SubmitRequest::new(projected)
             .with_execution_scope(ExecutionScope::task(task_id())),
         turn,
         prompt,
@@ -755,7 +775,7 @@ impl SupervisorLauncher for CrashAfterSnapshotLauncher {
     fn launch(
         &self,
         job_id: JobId,
-        guard: mac_worker::host_store::SupervisorGuard,
+        guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             let job_path = self.store.job(PROJECT_ID, WORKTREE_ID, job_id)?;
@@ -825,13 +845,16 @@ fn existing_session_and_parsed_last_md_still_record_raw_stdout_auth_failure() {
     let host = temp.path().join("host");
     let collected_at = wall_clock_millis().saturating_sub(1_000);
     let planted = plant_authenticated_codex_facts(&host, collected_at);
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .bind_session(
-            PROJECT_ID,
-            task_id(),
-            SessionBinding::new(AgentKind::Codex, "sess-auth-stdout", wall_clock_millis()).unwrap(),
-        )
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .bind_session(
+        PROJECT_ID,
+        task_id(),
+        SessionBinding::new(AgentKind::Codex, "sess-auth-stdout", wall_clock_millis()).unwrap(),
+    )
+    .unwrap();
     let before = wall_clock_millis();
     let launcher = InlineTurnLauncher {
         store: store.clone(),
@@ -1221,7 +1244,10 @@ fn turn_launch_plans_use_the_account_environment() {
         plan.program(),
         std::env::current_exe().unwrap().to_str().unwrap()
     );
-    assert_eq!(plan.args()[1], mac_worker::prepare_turn::ARG);
+    assert_eq!(
+        plan.args()[1],
+        mac_worker::test_support::task::prepare_turn::ARG
+    );
     assert_eq!(plan.args()[2], "--");
     assert_eq!(
         plan.prepare_turn_agent_args().map(ToOwned::to_owned),
@@ -1420,17 +1446,20 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     let transfer = store
         .transfer_lock_after(&admission, JobId::new(Uuid::from_u128(3)))
         .unwrap();
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .prepare(
-            &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
-            &transfer,
-        )
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .prepare(
+        &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
+        &transfer,
+    )
+    .unwrap();
     drop(transfer);
     drop(admission);
 
     let request = TaskTurnRequest::new(
-        mac_worker::job::SubmitRequest::new(projected)
+        mac_worker::test_support::host::job::SubmitRequest::new(projected)
             .with_execution_scope(ExecutionScope::task(task_id())),
         turn,
         prompt,
@@ -1447,7 +1476,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
     let job_path = store
         .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
         .unwrap();
-    let job_status: mac_worker::job::JobStatus =
+    let job_status: mac_worker::test_support::host::job::JobStatus =
         serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
     assert!(job_status.state().is_terminal());
     assert!(job_path.join("execution.json").is_file());
@@ -1612,21 +1641,24 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{
         )
         .unwrap();
 
-    let (meta, prepared) = TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .prepare_resume(
-            PROJECT_ID,
-            task_id(),
-            resume_job_id,
-            2,
-            "test-worker",
-            &base_oid,
-        )
-        .unwrap();
+    let (meta, prepared) = TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .prepare_resume(
+        PROJECT_ID,
+        task_id(),
+        resume_job_id,
+        2,
+        "test-worker",
+        &base_oid,
+    )
+    .unwrap();
     assert_eq!(meta.agent(), AgentKind::Codex);
     assert_eq!(prepared.state(), TaskState::Active);
 
     let resume_request = TaskTurnRequest::new(
-        mac_worker::job::SubmitRequest::new(projected)
+        mac_worker::test_support::host::job::SubmitRequest::new(projected)
             .with_execution_scope(ExecutionScope::task(task_id())),
         resume_turn,
         resume_prompt,
@@ -1756,17 +1788,20 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
     let transfer = store
         .transfer_lock_after(&admission, JobId::new(Uuid::from_u128(3)))
         .unwrap();
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .prepare(
-            &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
-            &transfer,
-        )
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .prepare(
+        &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
+        &transfer,
+    )
+    .unwrap();
     drop(transfer);
     drop(admission);
 
     let request = TaskTurnRequest::new(
-        mac_worker::job::SubmitRequest::new(projected)
+        mac_worker::test_support::host::job::SubmitRequest::new(projected)
             .with_execution_scope(ExecutionScope::task(task_id())),
         turn,
         prompt,
@@ -1905,17 +1940,20 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
     let transfer = store
         .transfer_lock_after(&admission, JobId::new(Uuid::from_u128(3)))
         .unwrap();
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .prepare(
-            &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
-            &transfer,
-        )
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .prepare(
+        &TaskPrepareRequest::new(meta, JobId::new(Uuid::from_u128(3)), "test-worker"),
+        &transfer,
+    )
+    .unwrap();
     drop(transfer);
     drop(admission);
 
     let request = TaskTurnRequest::new(
-        mac_worker::job::SubmitRequest::new(projected)
+        mac_worker::test_support::host::job::SubmitRequest::new(projected)
             .with_execution_scope(ExecutionScope::task(task_id())),
         turn,
         prompt,
@@ -1932,7 +1970,7 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
     let job_path = store
         .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
         .unwrap();
-    let job_status: mac_worker::job::JobStatus =
+    let job_status: mac_worker::test_support::host::job::JobStatus =
         serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
     assert!(job_status.state().is_terminal());
     assert!(job_path.join("execution.json").is_file());
@@ -2377,9 +2415,12 @@ fn public_close_stays_busy_while_a_foreign_task_scope_is_live() {
     let status = submit_inline(&store, request);
     assert_eq!(status.state(), TaskState::Open);
     acquire_scoped_task_lease(&store, task_id(), JobId::new(Uuid::from_u128(77)), 51);
-    let error = TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
-        .unwrap_err();
+    let error = TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+    .unwrap_err();
     assert_eq!(error.public_code(), "TASK_BUSY");
     assert_eq!(
         store.task_status(PROJECT_ID, task_id()).unwrap().state(),
@@ -2407,7 +2448,10 @@ fn herdr_turn_job_id() -> JobId {
     JobId::new(Uuid::from_u128(3))
 }
 
-fn run_flagged_turn(store: &HostStore, request: TaskTurnRequest) -> mac_worker::task::TaskStatus {
+fn run_flagged_turn(
+    store: &HostStore,
+    request: TaskTurnRequest,
+) -> mac_worker::test_support::task::model::TaskStatus {
     let launcher = InlineTurnLauncher {
         store: store.clone(),
         fault: None,
@@ -2447,7 +2491,7 @@ fn herdr_reporter_marks_the_turn_unavailable_without_a_socket() {
     let turn = &status.turns()[0];
     assert_eq!(
         turn.herdr().map(|report| report.state),
-        Some(mac_worker::task::HerdrTurnState::Unavailable)
+        Some(mac_worker::test_support::task::model::HerdrTurnState::Unavailable)
     );
     assert_eq!(turn.herdr().and_then(|report| report.pane_id.clone()), None);
     let log = fs::read_to_string(
@@ -2496,9 +2540,12 @@ fn a_turn_without_the_flag_never_touches_herdr() {
         .submit_turn(request)
         .unwrap();
     assert_eq!(response.task().turns()[0].herdr(), None);
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+    .unwrap();
 }
 
 #[test]
@@ -2669,7 +2716,7 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab() {
     let turn = &status.turns()[0];
     assert_eq!(
         turn.herdr().map(|report| report.state),
-        Some(mac_worker::task::HerdrTurnState::Attached)
+        Some(mac_worker::test_support::task::model::HerdrTurnState::Attached)
     );
     assert_eq!(
         turn.herdr().and_then(|report| report.pane_id.as_deref()),
@@ -2686,9 +2733,12 @@ fn herdr_reporter_attaches_the_turn_and_close_removes_its_tab() {
         !log.contains("herdr reporter"),
         "an attached turn leaves no reporter diagnostic: {log}"
     );
-    TaskStore::new(&store, &mac_worker::process::SystemProcessRunner)
-        .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
-        .unwrap();
+    TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .close(&TaskCloseRequest::new(PROJECT_ID, task_id(), false))
+    .unwrap();
 }
 
 fn queue_herdr_turn_and_close_replies(server: &support::fake_herdr::FakeHerdr) {
@@ -2881,7 +2931,7 @@ fn auto_close_done_turn_closes_herdr_tabs_from_the_account_home() {
     let turn = &status.turns()[0];
     assert_eq!(
         turn.herdr().map(|report| report.state),
-        Some(mac_worker::task::HerdrTurnState::Attached)
+        Some(mac_worker::test_support::task::model::HerdrTurnState::Attached)
     );
     assert_eq!(
         turn.herdr().and_then(|report| report.pane_id.as_deref()),
@@ -3065,7 +3115,10 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
     let setup = fs::read(job_path.join("setup-result.json"))
         .ok()
         .and_then(|bytes| {
-            serde_json::from_slice::<mac_worker::project_readiness::SetupStageResult>(&bytes).ok()
+            serde_json::from_slice::<
+                mac_worker::test_support::task::project_readiness::SetupStageResult,
+            >(&bytes)
+            .ok()
         });
     if let Some(setup) = setup {
         assert_eq!(setup.code, "SETUP_CANCELLED");
@@ -3239,7 +3292,7 @@ impl SupervisorLauncher for BudgetTurnLauncher {
     fn launch(
         &self,
         job_id: JobId,
-        guard: mac_worker::host_store::SupervisorGuard,
+        guard: mac_worker::test_support::host::store::SupervisorGuard,
     ) -> Result<LaunchCandidate, WorkerError> {
         let inspector = SystemProcessInspector;
         let identity = inspector.identity_for_pid(process::id())?;

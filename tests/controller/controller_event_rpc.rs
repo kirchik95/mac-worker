@@ -1,6 +1,6 @@
-use mac_worker::{
-    controller::events::{EventSelector, ReadQuery, TaskAddressQuery, TaskRepairQuery},
-    task::TaskId,
+use mac_worker::test_support::{
+    events::{EventSelector, ReadQuery, TaskAddressQuery, TaskRepairQuery},
+    task::model::TaskId,
 };
 
 #[test]
@@ -21,31 +21,28 @@ fn all_reads_use_only_the_safe_task_list_selector() {
     }
 }
 
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::ClientStateStore,
-    config::Config,
     controller::{
         ControllerFault, ControllerStore, FakeControllerExecutor, decode_frame, decode_request,
         encode_json_frame,
-        events::{
-            EventCursor, EventReadResult, EventRuntime, EventSource, EventSupport, JournalProvider,
-            SafeOutcome, Seq, TaskFacts, TaskProjectionProvider,
-            client::ControllerEventClient,
-            rpc::{is_event_selector, serve_selector_with},
-            testing::{
-                FakeJournalProvider, FakeTaskProjectionProvider, ManualEventRuntime, MemoryJournal,
-                MemoryTaskReader,
-            },
+    },
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    events::{
+        EventCursor, EventReadResult, EventRuntime, EventSource, EventSupport, JournalProvider,
+        SafeOutcome, Seq, TaskFacts, TaskProjectionProvider,
+        client::ControllerEventClient,
+        rpc::{is_event_selector, serve_selector_with},
+        testing::{
+            FakeJournalProvider, FakeTaskProjectionProvider, ManualEventRuntime, MemoryJournal,
+            MemoryTaskReader,
         },
     },
-    error::WorkerError,
-    job::HostControlError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    task::TurnId,
-    task_client::TaskClient,
-    turn_runner::DetachedRunnerExecutor,
+    host::{
+        job::HostControlError,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    task::{client::TaskClient, model::TurnId, turn_runner::DetachedRunnerExecutor},
 };
 use serde_json::{Value, json};
 use std::{
@@ -72,11 +69,14 @@ fn terminal(n: u128, outcome: SafeOutcome, quiescent: bool) -> TaskFacts {
         quiescent,
     )
 }
-fn request(selector: &EventSelector) -> mac_worker::controller::ControllerRequest {
+fn request(selector: &EventSelector) -> mac_worker::test_support::controller::ControllerRequest {
     rpc_request("task.list", selector.request_body().unwrap())
 }
-fn rpc_request(command: &str, body: Value) -> mac_worker::controller::ControllerRequest {
-    mac_worker::controller::parse_request(
+fn rpc_request(
+    command: &str,
+    body: Value,
+) -> mac_worker::test_support::controller::ControllerRequest {
+    mac_worker::test_support::controller::parse_request(
         &serde_json::to_vec(&json!({
             "protocol_version": PROTOCOL_VERSION,
             "command": command, "request_id": uuid::Uuid::new_v4().simple().to_string(),
@@ -88,7 +88,7 @@ fn rpc_request(command: &str, body: Value) -> mac_worker::controller::Controller
 }
 fn routed_rpc(
     paths: &PathLayout,
-    request: &mac_worker::controller::ControllerRequest,
+    request: &mac_worker::test_support::controller::ControllerRequest,
 ) -> Result<Vec<u8>, WorkerError> {
     let config = Config::parse("version=1\n[controller]\nenabled=true\nssh='controller'\n")?;
     let input = encode_json_frame(&json!({
@@ -98,7 +98,7 @@ fn routed_rpc(
         "body": request.body(),
     }))?;
     let mut output = Vec::new();
-    mac_worker::controller::serve_rpc_with_runtime(
+    mac_worker::test_support::controller::serve_rpc_with_runtime(
         paths,
         &config,
         &NoRemote,
@@ -108,7 +108,10 @@ fn routed_rpc(
     )?;
     Ok(output)
 }
-fn envelope(request: &mac_worker::controller::ControllerRequest, result: Value) -> Value {
+fn envelope(
+    request: &mac_worker::test_support::controller::ControllerRequest,
+    result: Value,
+) -> Value {
     json!({"protocol_version": PROTOCOL_VERSION, "command":request.command(),
         "request_id":request.request_id(),"payload_sha256":request.payload_sha256(),"result":result})
 }
@@ -132,13 +135,14 @@ impl ProcessRunner for Dispatch {
         let reply = if !self.old.load(Ordering::SeqCst)
             && request.body() == &json!({"controller_health":true})
         {
-            let mut status =
-                serde_json::to_value(mac_worker::controller::health_read::assess_health(
+            let mut status = serde_json::to_value(
+                mac_worker::test_support::controller::health_read::assess_health(
                     None,
-                    mac_worker::supervisor::ProcessObservation::Absent,
+                    mac_worker::test_support::host::supervisor::ProcessObservation::Absent,
                     100,
-                ))
-                .unwrap();
+                ),
+            )
+            .unwrap();
             status["features"] = json!(["controller.events"]);
             encode_json_frame(&envelope(&request, status))
         } else if !self.old.load(Ordering::SeqCst) && is_event_selector(&request) {
@@ -159,8 +163,8 @@ impl ProcessRunner for Dispatch {
                 &state,
                 &DetachedRunnerExecutor,
             );
-            if mac_worker::controller::is_read_command(request.command()) {
-                mac_worker::controller::read::serve_read_command(&request, &client)
+            if mac_worker::test_support::controller::is_read_command(request.command()) {
+                mac_worker::test_support::controller::read::serve_read_command(&request, &client)
             } else {
                 ControllerStore::open(&self.paths.controller_state_root())?
                     .handle_with(&request, &FakeControllerExecutor, ControllerFault::None)
@@ -293,10 +297,10 @@ fn selector_dispatch_is_lazy_and_preserves_read_envelope() {
         let request = request(&selector);
         let frame = serve_selector_with(&request, h.journal.as_ref(), h.tasks.as_ref(), deadline())
             .unwrap();
-        let reply: mac_worker::controller::read::ControllerReadReply<Value> =
+        let reply: mac_worker::test_support::controller::read::ControllerReadReply<Value> =
             serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
         reply.verify_envelope(&request).unwrap();
-        assert!(frame.len() < mac_worker::controller::MAX_FRAME_BYTES);
+        assert!(frame.len() < mac_worker::test_support::controller::MAX_FRAME_BYTES);
     }
     assert_eq!(h.journal.open_count(), 1);
     assert_eq!(h.tasks.open_count(), 2);
@@ -310,7 +314,7 @@ fn invalid_selectors_are_rejected_before_opening_any_provider() {
         json!({"controller_events":{"op":"tasks","task_ids":[]}}),
         json!({"controller_events":{"op":"read","path":"secret"}}),
     ] {
-        let req = mac_worker::controller::parse_request(
+        let req = mac_worker::test_support::controller::parse_request(
             &serde_json::to_vec(&json!({
             "protocol_version":PROTOCOL_VERSION,"command":"task.list",
             "request_id":uuid::Uuid::new_v4().simple().to_string(),"body":body}))
@@ -326,7 +330,7 @@ fn invalid_selectors_are_rejected_before_opening_any_provider() {
         "{{\"protocol_version\":7,\"command\":\"task.list\",\"request_id\":\"{}\",\"body\":{{\"controller_events\":{{\"op\":\"read\",\"op\":\"tasks\"}}}}}}",
         uuid::Uuid::new_v4().simple()
     );
-    assert!(mac_worker::controller::parse_request(raw.as_bytes()).is_err());
+    assert!(mac_worker::test_support::controller::parse_request(raw.as_bytes()).is_err());
     assert_eq!(h.journal.open_count(), 0);
     assert_eq!(h.tasks.open_count(), 0);
 }
@@ -343,27 +347,27 @@ mod state_reads {
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
-    use mac_worker::{
-        agent::{AgentKind, PermissionPolicy},
+    use mac_worker::test_support::{
+        agents::agent::{AgentKind, PermissionPolicy},
         client_state::ClientStateStore,
-        job::ProcessIdentity,
-        task::{
+        host::job::ProcessIdentity,
+        task::model::{
             ClosePolicy, GitIdentity, PublishMode, RunnerIdentity, TaskLimits, TaskMeta,
             TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
             TurnTerminal,
         },
     };
 
-    use mac_worker::{
-        controller::events::{OpaqueCursor, rpc::task_reads::*},
-        paths::PathLayout,
-        task::{LocalTaskRecord, TaskId},
+    use mac_worker::test_support::{
+        core::paths::PathLayout,
+        events::{OpaqueCursor, rpc::task_reads::*},
+        task::model::{LocalTaskRecord, TaskId},
     };
     use std::{sync::Arc, time::Duration};
 
     #[derive(Default)]
     struct ManualRuntime {
-        inner: mac_worker::controller::events::testing::ManualEventRuntime,
+        inner: mac_worker::test_support::events::testing::ManualEventRuntime,
         step: AtomicU64,
         cancelled: AtomicBool,
     }
@@ -617,7 +621,7 @@ mod state_reads {
 
     struct WaitRpc<'a> {
         paths: &'a PathLayout,
-        requests: std::sync::Mutex<Vec<mac_worker::controller::ControllerRequest>>,
+        requests: std::sync::Mutex<Vec<mac_worker::test_support::controller::ControllerRequest>>,
     }
 
     impl<'a> WaitRpc<'a> {
@@ -642,7 +646,9 @@ mod state_reads {
             &self,
             process: &super::ProcessRequest,
         ) -> Result<super::ProcessResult, WorkerError> {
-            let request = mac_worker::controller::decode_request(process.stdin.as_ref().unwrap())?;
+            let request = mac_worker::test_support::controller::decode_request(
+                process.stdin.as_ref().unwrap(),
+            )?;
             assert_eq!(
                 request.command(),
                 "task.wait.poll",
@@ -654,8 +660,8 @@ mod state_reads {
                 Ok(frame) => (0, frame),
                 Err(error) => (
                     1 << 8,
-                    mac_worker::controller::encode_json_frame(
-                        &mac_worker::job::HostControlError::new(
+                    mac_worker::test_support::controller::encode_json_frame(
+                        &mac_worker::test_support::host::job::HostControlError::new(
                             error.public_code(),
                             error.public_message(),
                         )
@@ -671,8 +677,8 @@ mod state_reads {
         }
     }
 
-    fn wait_config() -> mac_worker::config::ControllerConfig {
-        mac_worker::config::ControllerConfig {
+    fn wait_config() -> mac_worker::test_support::core::config::ControllerConfig {
+        mac_worker::test_support::core::config::ControllerConfig {
             enabled: true,
             ssh: "controller".into(),
             ..Default::default()
@@ -681,7 +687,7 @@ mod state_reads {
 
     #[test]
     fn wait_wiring_only_polls_with_hang_guard_and_eventless_quiescence() {
-        use mac_worker::controller::{ControllerWaitSelector, wait_via_controller};
+        use mac_worker::test_support::controller::{ControllerWaitSelector, wait_via_controller};
 
         for (outcome, expected_exit) in [
             (TaskOutcome::Done, 0),
@@ -716,13 +722,13 @@ mod state_reads {
 
     #[test]
     fn wait_wiring_advances_eventless_dag_and_preserves_ids_and_aggregate_exit() {
-        use mac_worker::{
-            controller::{ControllerWaitSelector, wait_via_controller},
-            dag::{
+        use mac_worker::test_support::{
+            client_state::dag::{
                 DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord,
                 dag_pin_ref,
             },
-            task::{RunId, RunRecord},
+            controller::{ControllerWaitSelector, wait_via_controller},
+            task::model::{RunId, RunRecord},
         };
         use std::collections::BTreeMap;
 
@@ -812,13 +818,13 @@ mod state_reads {
 
     #[test]
     fn wait_wiring_preserves_wait_blocked_without_events_or_discovery() {
-        use mac_worker::{
+        use mac_worker::test_support::{
+            client_state::scheduler::WorkerPreference,
             controller::{ControllerWaitSelector, wait_via_controller},
-            job::{
+            host::job::{
                 CommandSpec, QueueEntry, QueueEntryKind, REPLACEMENT_FAILURE_PARK_AFTER,
                 ReplacementFailureBudget,
             },
-            scheduler::WorkerPreference,
         };
 
         let (_root, paths, _) = fixture();
@@ -899,13 +905,12 @@ mod state_reads {
 
     #[test]
     fn rpc_routing_serves_all_selectors_with_the_existing_read_envelope() {
-        use mac_worker::controller::{
-            ControllerLeader,
+        use mac_worker::test_support::{
+            controller::{ControllerLeader, read::ControllerReadReply},
             events::{
                 EventBatch, JournalReader, NewEvent,
                 journal::{ControllerJournal, JournalOptions},
             },
-            read::ControllerReadReply,
         };
 
         let (_root, paths, runtime) = fixture();
@@ -1108,32 +1113,37 @@ mod state_reads {
         fs::remove_dir_all(&events).unwrap();
         fs::write(events, b"not a directory").unwrap();
         let reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
-        let provider = mac_worker::controller::events::rpc::ExistingTaskProjectionProvider::new(
+        let provider = mac_worker::test_support::events::rpc::ExistingTaskProjectionProvider::new(
             paths.clone(),
             runtime,
         );
-        let journal = mac_worker::controller::events::testing::FakeJournalProvider::error(
+        let journal = mac_worker::test_support::events::testing::FakeJournalProvider::error(
             "unsafe event namespace",
         );
         for selector in [
-            mac_worker::controller::events::EventSelector::Tasks(
-                mac_worker::controller::events::TaskAddressQuery::try_new(vec![id(1)], false, None)
-                    .unwrap(),
+            mac_worker::test_support::events::EventSelector::Tasks(
+                mac_worker::test_support::events::TaskAddressQuery::try_new(
+                    vec![id(1)],
+                    false,
+                    None,
+                )
+                .unwrap(),
             ),
-            mac_worker::controller::events::EventSelector::Repair(
-                mac_worker::controller::events::TaskRepairQuery::default(),
+            mac_worker::test_support::events::EventSelector::Repair(
+                mac_worker::test_support::events::TaskRepairQuery::default(),
             ),
         ] {
-            let frame = mac_worker::controller::events::rpc::serve_selector_with(
+            let frame = mac_worker::test_support::events::rpc::serve_selector_with(
                 &super::request(&selector),
                 &journal,
                 &provider,
                 Duration::from_secs(30),
             )
             .unwrap();
-            let value: serde_json::Value =
-                serde_json::from_slice(mac_worker::controller::decode_frame(&frame).unwrap())
-                    .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(
+                mac_worker::test_support::controller::decode_frame(&frame).unwrap(),
+            )
+            .unwrap();
             assert_eq!(value["result"]["rows"][0]["quiescent"], true);
         }
         assert_eq!(journal.open_count(), 0);
@@ -1472,7 +1482,7 @@ mod state_reads {
         assert!(page.stats.record_reads > 0 && page.stats.record_reads < 12);
         assert!(page.stats.input_bytes <= 8 * 1024 * 1024);
         assert!(!page.value.complete);
-        let request = mac_worker::controller::parse_request(
+        let request = mac_worker::test_support::controller::parse_request(
             &serde_json::to_vec(&serde_json::json!({
                 "protocol_version": 7, "request_id": "00000000000000000000000000000001",
                 "command": "task.list", "body": {"controller_events": {"op": "repair"}},
@@ -1480,7 +1490,7 @@ mod state_reads {
             .unwrap(),
         )
         .unwrap();
-        let frame = mac_worker::controller::encode_json_frame(&super::envelope(
+        let frame = mac_worker::test_support::controller::encode_json_frame(&super::envelope(
             &request,
             serde_json::to_value(page.value).unwrap(),
         ))
@@ -1619,7 +1629,7 @@ mod state_reads {
 
 mod reconciliation {
     use super::*;
-    use mac_worker::controller::events::{
+    use mac_worker::test_support::events::{
         ChangeCause, EventBatch, EventReconciler, JournalReader, JournalWriter, NewEvent,
         PreviousProjection, ReconcileInput, Reconciliation, RepairProgress, TaskFactsBatch,
         TaskHint, TaskProjectionReader, TaskRepairPage, TurnHint, WireEvent,
@@ -1736,7 +1746,7 @@ mod reconciliation {
             result.validate().unwrap();
             result
         }
-        fn sweep(&mut self) -> Vec<mac_worker::controller::events::DerivedTaskChange> {
+        fn sweep(&mut self) -> Vec<mac_worker::test_support::events::DerivedTaskChange> {
             let mut changes = Vec::new();
             for index in 0..200 {
                 let result = self.tick(None, index == 0);
@@ -1875,7 +1885,7 @@ mod reconciliation {
         let warm = h.tick(None, false);
         assert_eq!(
             warm.baseline,
-            mac_worker::controller::events::BaselineKind::Warm
+            mac_worker::test_support::events::BaselineKind::Warm
         );
         assert_eq!(warm.changes.len(), 1);
         assert_eq!(warm.changes[0].task_id, task_id(2));
@@ -1892,7 +1902,7 @@ mod reconciliation {
         let cold = h.tick(None, false);
         assert_eq!(
             cold.baseline,
-            mac_worker::controller::events::BaselineKind::Cold
+            mac_worker::test_support::events::BaselineKind::Cold
         );
         assert!(cold.changes.is_empty());
         assert_eq!(cold.attention.as_ref().unwrap().count, 1);
@@ -2413,7 +2423,7 @@ mod reconciliation {
     fn unknown_kind_requests_global_repair_without_trusting_raw_task_id() {
         let mut h = Harness::new(PreviousProjection::Absent, None, vec![]);
         let id = h.source.journal.window(deadline()).unwrap().journal_id;
-        let read = EventReadResult::Batch(mac_worker::controller::events::ReadBatch {
+        let read = EventReadResult::Batch(mac_worker::test_support::events::ReadBatch {
             schema_version: 1,
             journal_id: id,
             oldest_seq: Seq::new(1),
@@ -2462,9 +2472,9 @@ mod reconciliation {
         for _ in 0..3 {
             source
                 .queue_read(Ok(EventReadResult::SnapshotRequired(
-                    mac_worker::controller::events::SnapshotRequired {
+                    mac_worker::test_support::events::SnapshotRequired {
                         reason: "bootstrap".into(),
-                        window: mac_worker::controller::events::JournalWindow {
+                        window: mac_worker::test_support::events::JournalWindow {
                             journal_id: baseline.journal_id,
                             oldest_seq: Seq::new(1),
                             head_seq: Seq::ZERO,
@@ -2698,7 +2708,7 @@ mod reconciliation {
         };
         source
             .queue_read(Ok(EventReadResult::Batch(
-                mac_worker::controller::events::ReadBatch {
+                mac_worker::test_support::events::ReadBatch {
                     schema_version: 1,
                     journal_id: id,
                     oldest_seq: Seq::new(10),
@@ -3411,12 +3421,13 @@ mod reconciliation {
 
 mod transport_bounds {
     use super::*;
-    use mac_worker::controller::events::{
+    use mac_worker::test_support::events::{
         EventBatch, JournalReader, JournalWriter, NewEvent, TaskProjectionReader,
         rpc::TaskEventReadStore, testing::ManualEventRuntime,
     };
     use std::sync::Mutex;
-    type ReplyFactory = dyn Fn(&mac_worker::controller::ControllerRequest) -> Value + Send + Sync;
+    type ReplyFactory =
+        dyn Fn(&mac_worker::test_support::controller::ControllerRequest) -> Value + Send + Sync;
     struct ReplyRunner {
         reply: Box<ReplyFactory>,
         calls: Mutex<Vec<ProcessRequest>>,
@@ -3434,7 +3445,10 @@ mod transport_bounds {
         }
     }
     fn client(
-        reply: impl Fn(&mac_worker::controller::ControllerRequest) -> Value + Send + Sync + 'static,
+        reply: impl Fn(&mac_worker::test_support::controller::ControllerRequest) -> Value
+        + Send
+        + Sync
+        + 'static,
         runtime: Arc<ManualEventRuntime>,
     ) -> (ControllerEventClient, Arc<ReplyRunner>) {
         let runner = Arc::new(ReplyRunner {
@@ -3722,13 +3736,15 @@ mod transport_bounds {
 // task schema types are reused; no production DTO or module root is changed.
 #[allow(dead_code)]
 mod legacy_v7 {
-    use mac_worker::{
-        dag::DagNodeProjection,
+    use mac_worker::test_support::{
+        client_state::dag::DagNodeProjection,
         task::{
-            BranchName, ClosePolicy, OriginDelivery, RunId, RunnerState, TaskId, TaskOutcome,
-            TaskState, TaskStatus, TurnId,
+            model::{
+                BranchName, ClosePolicy, OriginDelivery, RunId, RunnerState, TaskId, TaskOutcome,
+                TaskState, TaskStatus, TurnId,
+            },
+            view::{ReviewState, TaskFreshness},
         },
-        task_view::{ReviewState, TaskFreshness},
     };
     use serde_json::Value;
     #[derive(Debug, serde::Deserialize)]

@@ -5,22 +5,26 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::Config,
     controller::{
         decode_frame, decode_request, encode_json_frame,
         health_read::{
             ControllerHealthStatus, HealthState, fetch_controller_health, serve_health_read,
         },
     },
-    error::WorkerError,
-    job::HostControlError,
-    output::CommandOutput,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION, WorkersReport},
-    transport::SshTransport,
+    core::{
+        config::Config,
+        error::WorkerError,
+        output::CommandOutput,
+        protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION, WorkersReport},
+    },
+    host::{
+        job::HostControlError,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    runtime::RuntimeContext,
+    transfer::transport::SshTransport,
 };
 use serde_json::{Value, json};
 
@@ -220,7 +224,7 @@ fn controller_status_prints_features_in_plain_and_json_output() {
             }
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let exit = mac_worker::run_with_stdio_in_context(
+            let exit = mac_worker::test_support::runtime::run_with_stdio_in_context(
                 Cli::try_parse_from(args).unwrap(),
                 &runner,
                 &runtime,
@@ -253,7 +257,7 @@ fn controller_status_prints_features_in_plain_and_json_output() {
 
 #[test]
 fn health_frames_keep_the_existing_envelope_shape() {
-    let request = mac_worker::controller::parse_request(
+    let request = mac_worker::test_support::controller::parse_request(
         &serde_json::to_vec(&json!({
             "protocol_version": PROTOCOL_VERSION, "request_id": "018f0f4a6b5c7d8e9f00112233445560",
             "command": "task.list", "body": {"controller_health": true},

@@ -9,16 +9,13 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
     controller::{decode_frame, encode_json_frame, parse_request},
-    error::WorkerError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
-    run_with_io_in_context,
-    task::{BaseOid, TaskId, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
+    core::{error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_io_in_context},
+    task::model::{BaseOid, TaskId, TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -171,7 +168,10 @@ impl ProcessRunner for SayWaitController {
     }
 }
 
-fn failed_or_done_status(outcome: &TaskOutcome, turn_id: mac_worker::task::TurnId) -> TaskStatus {
+fn failed_or_done_status(
+    outcome: &TaskOutcome,
+    turn_id: mac_worker::test_support::task::model::TurnId,
+) -> TaskStatus {
     let turn = TurnSummary::new(
         1,
         turn_id,

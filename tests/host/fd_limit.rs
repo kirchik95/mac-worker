@@ -6,16 +6,18 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    host_store::HostStore,
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
-        RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, SubmitRequest,
+use mac_worker::test_support::{
+    core::protocol::MemoryPressure,
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+            RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
+            ResolveOrAbandonResponse, SubmitRequest,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        store::HostStore,
     },
-    lease::{AdmissionFacts, LeaseService},
-    protocol::MemoryPressure,
-    task::TaskId,
+    task::model::TaskId,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;

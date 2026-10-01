@@ -24,12 +24,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use controller_process::{OwnedChild, ProcessFixture, TEST_SSH_ENV};
-use mac_worker::{
+use mac_worker::test_support::{
+    client_state::dag::DagBase,
     controller::{
         BatchKind, FrozenBatchBody, OperationEnvelope, decode_frame, load_operation_envelope,
     },
-    dag::DagBase,
-    protocol::PROTOCOL_VERSION,
+    core::protocol::PROTOCOL_VERSION,
 };
 use serde_json::Value;
 

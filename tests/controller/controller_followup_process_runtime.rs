@@ -13,10 +13,10 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use controller_process::ProcessFixture;
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{OperationEnvelope, decode_frame, encode_json_frame, load_operation_envelope},
-    protocol::PROTOCOL_VERSION,
-    transfer_repo::TransferRepo,
+    core::protocol::PROTOCOL_VERSION,
+    transfer::repo::TransferRepo,
 };
 use serde_json::{Value, json};
 

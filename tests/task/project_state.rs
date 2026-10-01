@@ -8,11 +8,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use mac_worker::{
-    error::WorkerError,
-    manifest::ManifestEntryKind,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
+use mac_worker::test_support::{
+    core::{error::WorkerError, manifest::ManifestEntryKind},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    task::project_state::{ProjectPreparationError, ProjectPreparationRequest, ProjectState},
 };
 
 use support::{GitRepo, create_directory};

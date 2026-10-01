@@ -113,7 +113,9 @@ fn legacy_turn_without_frozen_recipe_never_executes_workspace_setup() {
 
 #[test]
 fn frozen_setup_reads_original_commit_even_after_workspace_and_head_change() {
-    use mac_worker::{process::SystemProcessRunner, project_readiness::FrozenSetup};
+    use mac_worker::test_support::{
+        host::process::SystemProcessRunner, task::project_readiness::FrozenSetup,
+    };
     let repo = support::GitRepo::init();
     repo.write(
         ".worker.toml",

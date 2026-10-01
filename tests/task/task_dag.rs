@@ -20,50 +20,59 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy, TurnLimits},
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe},
+    },
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         ClientStateWritePoint,
+        dag::{
+            DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord,
+            dag_pin_ref,
+        },
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    config::Config,
     controller::ProjectRegistry,
-    dag::{
-        DAG_PARENT_FAILED, DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref,
+    core::{
+        config::Config,
+        error::WorkerError,
+        protocol::{
+            CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+        },
     },
-    error::WorkerError,
-    git_transport::GitTransport,
-    job::{
-        AdmissionObservation, JobMeta, JobState, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogChunkResponse, LogStream,
-        ProcessIdentity, QueueState, StatusLogsRequest, StatusLogsResponse, StatusRequest,
-        StatusResponse, SubmitResponse,
-    },
-    lease::SlotState,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_config::ProjectSettings,
-    project_state::ProjectState,
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    scheduler::{CandidateSlot, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    host::{
+        job::{
+            AdmissionObservation, JobMeta, JobState, JobStatus, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseRecord, LogChunk, LogChunkRequest, LogChunkResponse,
+            LogStream, ProcessIdentity, QueueState, StatusLogsRequest, StatusLogsResponse,
+            StatusRequest, StatusResponse, SubmitResponse,
+        },
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord,
-        RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
-        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector},
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord,
+            RunnerIdentity, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
+            TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        project_config::ProjectSettings,
+        project_state::ProjectState,
+        store::{
+            SessionBinding, TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest,
+            TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
+            TaskStatusResponse,
+        },
+        turn::{TaskTurnRequest, TaskTurnResponse},
+        turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
     },
-    task_client::{TaskClient, TaskListFilter, TaskSubmitRequest, WaitSelector},
-    task_store::{
-        SessionBinding, TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest,
-        TaskPrepareResponse, TaskSessionRequest, TaskSessionResponse, TaskStatusRequest,
-        TaskStatusResponse,
-    },
-    transfer::HostOperation,
-    transfer_repo::TransferRepo,
-    turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{InlineRunnerExecutor, RunnerExecutor, TurnRunner},
+    transfer::{HostOperation, git::GitTransport, repo::TransferRepo},
 };
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -978,7 +987,7 @@ impl ProcessRunner for IsolatedDagRunner {
 struct FrozenDagFixture {
     _repo: support::GitRepo,
     _root: tempfile::TempDir,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     store: Arc<ClientStateStore>,
     runner: IsolatedDagRunner,
     run_id: RunId,
@@ -1610,7 +1619,7 @@ struct FailingStartExecutor;
 impl RunnerExecutor for FailingStartExecutor {
     fn start(
         &self,
-        _paths: &mac_worker::paths::PathLayout,
+        _paths: &mac_worker::test_support::core::paths::PathLayout,
         _task_id: TaskId,
         _turn_id: TurnId,
     ) -> Result<RunnerIdentity, WorkerError> {
@@ -1868,7 +1877,7 @@ fn plant_closed_done_import(
     store: &ClientStateStore,
     task_id: TaskId,
     turn_id: TurnId,
-    result_oid: mac_worker::task::BaseOid,
+    result_oid: mac_worker::test_support::task::model::BaseOid,
 ) {
     if let Some(entry) = store.queue_entry_for_task_turn(task_id).unwrap() {
         let owner = entry.owner_opt().copied().unwrap_or_else(|| {
@@ -1922,7 +1931,7 @@ fn plant_parent_status(
     store: &ClientStateStore,
     task_id: TaskId,
     turn_id: TurnId,
-    result_oid: mac_worker::task::BaseOid,
+    result_oid: mac_worker::test_support::task::model::BaseOid,
     state: TaskState,
     outcome: TaskOutcome,
     terminal: TurnTerminal,
@@ -2137,7 +2146,7 @@ impl FollowupWorker {
 
     fn terminal_status(
         &self,
-        job_id: mac_worker::job::JobId,
+        job_id: mac_worker::test_support::host::job::JobId,
     ) -> Result<StatusResponse, WorkerError> {
         let requests = self.requests();
         let material = if let Some(request) = requests.iter().rev().find(|request| {
@@ -2418,7 +2427,7 @@ fn canonical_host_process<T: serde::Serialize>(value: &T) -> Result<ProcessResul
 
 struct BatchHarness {
     _root: tempfile::TempDir,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     store: ClientStateStore,
     config: Config,
     runner: IsolatedDagRunner,
@@ -2492,7 +2501,7 @@ impl BatchHarness {
         self.store.record_runner(task_id, None).unwrap();
     }
 
-    fn batch(&self) -> mac_worker::task_client::RunReport {
+    fn batch(&self) -> mac_worker::test_support::task::client::RunReport {
         self.client()
             .batch(
                 &self.repo().root().join("tasks.toml"),
@@ -2510,7 +2519,7 @@ impl BatchHarness {
             .to_owned()
     }
 
-    fn commit_result(&self, contents: &[u8]) -> mac_worker::task::BaseOid {
+    fn commit_result(&self, contents: &[u8]) -> mac_worker::test_support::task::model::BaseOid {
         self.repo().write("result.txt", contents);
         self.repo().commit_all("imported turn");
         self.head().parse().unwrap()
@@ -2585,7 +2594,7 @@ base = "from:root"
 
     repo.write("result.txt", b"imported parent result\n");
     repo.commit_all("imported turn");
-    let result_oid: mac_worker::task::BaseOid =
+    let result_oid: mac_worker::test_support::task::model::BaseOid =
         String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
             .unwrap()
             .trim()
@@ -2877,7 +2886,7 @@ publish = ["fetch", "push"]
 
     repo.write("result.txt", b"imported parent result\n");
     repo.commit_all("imported turn");
-    let result_oid: mac_worker::task::BaseOid =
+    let result_oid: mac_worker::test_support::task::model::BaseOid =
         String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
             .unwrap()
             .trim()
@@ -3058,7 +3067,8 @@ prompt = "join work"
 depends_on = ["left", "right"]
 "#,
     );
-    let frozen_head: mac_worker::task::BaseOid = harness.head().parse().unwrap();
+    let frozen_head: mac_worker::test_support::task::model::BaseOid =
+        harness.head().parse().unwrap();
     let report = harness.batch();
     let dag = harness
         .store
@@ -3347,7 +3357,7 @@ fn assert_prepared_resume_conflict(mutate: impl FnOnce(&mut DagNode)) {
 
 #[test]
 fn questions_legacy_frozen_dag_resolves_project_policy_and_retains_it_on_replay() {
-    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    use mac_worker::test_support::task::model::QuestionsPolicy::{Ask, Decide};
     for (frozen_policy, project_policy, expected) in [
         (None, Some(Ask), Ask),
         (None, None, Decide),
@@ -4011,7 +4021,7 @@ fn run_auto_closed_turn(
     worker: &FollowupWorker,
     task_id: TaskId,
     turn_id: TurnId,
-) -> mac_worker::turn_runner::TurnOutcomeReport {
+) -> mac_worker::test_support::task::turn_runner::TurnOutcomeReport {
     finish_before_watchdog(Duration::from_secs(20), || {
         TurnRunner::new(
             worker,

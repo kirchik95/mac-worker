@@ -1,4 +1,4 @@
-use mac_worker::agent::{AgentKind, ResultStatus, adapter_for};
+use mac_worker::test_support::agents::agent::{AgentKind, ResultStatus, adapter_for};
 
 #[test]
 fn malformed_result_fixtures_have_typed_safe_reasons() {

@@ -1,7 +1,7 @@
 use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus};
 
-use mac_worker::{
-    agent::{
+use mac_worker::test_support::{
+    agents::agent::{
         AgentAdapter, AgentEvent, AgentKind, AgentOutcome, AuthProbeResult,
         MAX_DECLARED_ACCEPTANCE, OPENCODE_DIALECT_MISMATCH, OPENCODE_VERSION_UNVERIFIED,
         OpencodeDialect, PROMPT_POINTER, PermissionPolicy, PromptDelivery, Question,
@@ -9,7 +9,7 @@ use mac_worker::{
         adapter_for_host, adapter_for_launch, declared_acceptance_instructions, has_dialects,
         render_shell, verify_opencode_launch,
     },
-    process::ProcessResult,
+    host::process::ProcessResult,
 };
 use uuid::Uuid;
 

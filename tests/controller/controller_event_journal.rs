@@ -1,22 +1,20 @@
-use mac_worker::controller::events::{
+use mac_worker::test_support::events::{
     EventBatch, EventReadResult, JournalReader, JournalWriter, NewEvent, ReadQuery, Seq,
     testing::MemoryJournal,
 };
 use std::time::Duration;
 
-use mac_worker::{
-    controller::{
-        ControllerLeader,
-        events::{
-            JournalProvider, WorkerName,
-            journal::{
-                BoundedPublisher, ControllerJournal, ExistingJournalProvider, JournalFaultHook,
-                JournalFaultPoint, JournalOptions, JournalRole, JournalRoleBoundary,
-            },
-            testing::ManualEventRuntime,
+use mac_worker::test_support::{
+    controller::ControllerLeader,
+    core::paths::PathLayout,
+    events::{
+        JournalProvider, WorkerName,
+        journal::{
+            BoundedPublisher, ControllerJournal, ExistingJournalProvider, JournalFaultHook,
+            JournalFaultPoint, JournalOptions, JournalRole, JournalRoleBoundary,
         },
+        testing::ManualEventRuntime,
     },
-    paths::PathLayout,
 };
 use std::{
     fs, io,
@@ -48,7 +46,7 @@ fn private_paths(root: &std::path::Path) -> PathLayout {
     }
 }
 
-fn store_single_event(h: &JournalHarness, event: &mac_worker::controller::events::WireEvent) {
+fn store_single_event(h: &JournalHarness, event: &mac_worker::test_support::events::WireEvent) {
     let path = h.root().join("segment-1.jsonl");
     let mut bytes = serde_json::to_vec(event).unwrap();
     bytes.push(b'\n');
@@ -154,18 +152,23 @@ impl JournalHarness {
 
     fn append_one(
         &self,
-    ) -> Result<mac_worker::controller::events::EventCursor, mac_worker::error::WorkerError> {
+    ) -> Result<
+        mac_worker::test_support::events::EventCursor,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
         self.journal.append(
             EventBatch::try_new(vec![NewEvent::ControllerDrainChanged { drained: true }]).unwrap(),
             Duration::from_secs(60),
         )
     }
 
-    fn head(&self) -> mac_worker::controller::events::JournalWindow {
+    fn head(&self) -> mac_worker::test_support::events::JournalWindow {
         self.journal.window(Duration::from_secs(60)).unwrap()
     }
 
-    fn reopen(&self) -> Result<Arc<ControllerJournal>, mac_worker::error::WorkerError> {
+    fn reopen(
+        &self,
+    ) -> Result<Arc<ControllerJournal>, mac_worker::test_support::core::error::WorkerError> {
         ControllerJournal::open_existing(
             &self.paths,
             JournalOptions {
@@ -248,7 +251,7 @@ impl JournalHarness {
     }
 
     fn assert_budget(&self) {
-        use mac_worker::controller::events::*;
+        use mac_worker::test_support::events::*;
         let (bytes, files, evidence_bytes, evidence_files) = self.usage();
         assert!(bytes <= MAX_JOURNAL_BYTES);
         assert!(files <= MAX_JOURNAL_FILES);
@@ -272,7 +275,7 @@ impl JournalHarness {
             for seq in first..first + 256 {
                 let sequence = seq.to_string();
                 let (record, range) = records.entry(sequence.len()).or_insert_with(|| {
-                    let mut event = mac_worker::controller::events::WireEvent {
+                    let mut event = mac_worker::test_support::events::WireEvent {
                         schema_version: 1,
                         journal_id: epoch,
                         seq: Seq::new(seq),
@@ -319,7 +322,7 @@ impl JournalHarness {
         );
     }
 
-    fn read_from(&self, seq: u64, limit: usize) -> mac_worker::controller::events::ReadBatch {
+    fn read_from(&self, seq: u64, limit: usize) -> mac_worker::test_support::events::ReadBatch {
         read_from_journal(&self.recover(), self.head().journal_id, seq, limit)
     }
 }
@@ -329,11 +332,11 @@ fn read_from_journal(
     journal_id: uuid::Uuid,
     seq: u64,
     limit: usize,
-) -> mac_worker::controller::events::ReadBatch {
+) -> mac_worker::test_support::events::ReadBatch {
     let EventReadResult::Batch(batch) = journal
         .read(
             ReadQuery {
-                after: Some(mac_worker::controller::events::EventCursor {
+                after: Some(mac_worker::test_support::events::EventCursor {
                     journal_id,
                     seq: Seq::new(seq),
                 }),
@@ -524,7 +527,7 @@ fn real_committed_cursor_matches_memory_contract_and_wakes_outside_lock() {
 
 #[test]
 fn long_poll_waits_for_writer_beyond_exclusive_admission_budget() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
     use std::sync::mpsc;
 
     let h = JournalHarness::new();
@@ -593,7 +596,7 @@ fn long_poll_waits_for_writer_beyond_exclusive_admission_budget() {
 
 #[test]
 fn long_poll_retries_exclusive_recovery_admission_timeout() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
     use std::os::fd::AsRawFd;
 
     let h = JournalHarness::new();
@@ -683,7 +686,7 @@ impl RecoveryAdmissionHold {
     }
 
     fn release_at(&self, runtime: &Arc<ManualEventRuntime>, elapsed: Duration) {
-        use mac_worker::controller::events::EventRuntime;
+        use mac_worker::test_support::events::EventRuntime;
         if runtime.now() >= elapsed {
             self.release();
         }
@@ -725,7 +728,7 @@ impl Drop for RecoveryAdmissionHold {
 
 #[test]
 fn window_retries_exclusive_recovery_admission_timeout() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
 
     let h = JournalHarness::new();
     let epoch = h.head().journal_id;
@@ -760,7 +763,7 @@ fn window_retries_exclusive_recovery_admission_timeout() {
 
 #[test]
 fn attachment_retries_exclusive_recovery_admission_timeout() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
 
     let h = JournalHarness::new();
     let epoch = h.head().journal_id;
@@ -832,7 +835,7 @@ fn nonwaiting_read_retries_exclusive_recovery_admission_timeout() {
 
 #[test]
 fn recovery_admission_retry_expires_at_original_window_deadline() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
 
     let h = JournalHarness::new();
     let hold = RecoveryAdmissionHold::new(&h);
@@ -866,7 +869,7 @@ fn recovery_admission_retry_expires_at_original_window_deadline() {
 
 #[test]
 fn cancellation_stops_attachment_recovery_admission_retry() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
 
     let h = JournalHarness::new();
     h.inject(JournalFaultPoint::PendingDurable);
@@ -899,7 +902,7 @@ fn cancellation_stops_attachment_recovery_admission_retry() {
 
 #[test]
 fn recovery_io_timeout_fails_without_admission_retry() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
 
     let h = JournalHarness::new();
     let before = h.head().cursor();
@@ -985,7 +988,7 @@ fn committed_batch_exposes_last_delivered_cursor() {
 
 #[test]
 fn successful_initialization_and_attachment_allow_work_beyond_lock_admission_budget() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
     let temporary = tempfile::tempdir().unwrap();
     let paths = private_paths(temporary.path());
     let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
@@ -1299,7 +1302,7 @@ fn plain_reader_recovers_manifest_stage_created_before_evidence() {
     let EventReadResult::Batch(batch) = reader
         .read(
             ReadQuery {
-                after: Some(mac_worker::controller::events::EventCursor {
+                after: Some(mac_worker::test_support::events::EventCursor {
                     journal_id,
                     seq: Seq::new(4),
                 }),
@@ -1507,14 +1510,17 @@ impl JournalReader for CompletionWriter {
     fn window(
         &self,
         deadline: Duration,
-    ) -> Result<mac_worker::controller::events::JournalWindow, mac_worker::error::WorkerError> {
+    ) -> Result<
+        mac_worker::test_support::events::JournalWindow,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
         self.journal.window(deadline)
     }
     fn read(
         &self,
         query: ReadQuery,
         deadline: Duration,
-    ) -> Result<EventReadResult, mac_worker::error::WorkerError> {
+    ) -> Result<EventReadResult, mac_worker::test_support::core::error::WorkerError> {
         self.journal.read(query, deadline)
     }
 }
@@ -1523,7 +1529,10 @@ impl JournalWriter for CompletionWriter {
         &self,
         batch: EventBatch,
         deadline: Duration,
-    ) -> Result<mac_worker::controller::events::EventCursor, mac_worker::error::WorkerError> {
+    ) -> Result<
+        mac_worker::test_support::events::EventCursor,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
         let result = self.journal.append(batch, deadline);
         self.complete.send(()).unwrap();
         result
@@ -1532,7 +1541,7 @@ impl JournalWriter for CompletionWriter {
 
 #[test]
 fn publisher_retry_allows_successful_work_beyond_lock_admission_budget() {
-    use mac_worker::controller::events::PublishAttempt;
+    use mac_worker::test_support::events::PublishAttempt;
     use std::sync::mpsc;
     let h = JournalHarness::new();
     let once = std::sync::atomic::AtomicBool::new(true);
@@ -1733,7 +1742,7 @@ fn public_rotation_retention_expiry_oldest_minus_one_ahead_and_reset() {
             .journal
             .read(
                 ReadQuery {
-                    after: Some(mac_worker::controller::events::EventCursor {
+                    after: Some(mac_worker::test_support::events::EventCursor {
                         journal_id,
                         seq: Seq::new(seq),
                     }),
@@ -1875,7 +1884,7 @@ fn public_estale_retries_once_prepared_range_and_exhausts_after_three_retries() 
 
 #[test]
 fn public_empty_timeout_cancellation_and_provider_keep_original_deadline() {
-    use mac_worker::controller::events::{EventCursor, EventRuntime};
+    use mac_worker::test_support::events::{EventCursor, EventRuntime};
     let h = JournalHarness::new();
     let cursor = h.head().cursor();
     let EventReadResult::Batch(batch) = h
@@ -1987,7 +1996,7 @@ fn public_batch_bounds_and_sequence_exhaustion_do_not_mutate_head() {
 
 #[test]
 fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
-    use mac_worker::controller::events::{EventSink, PublishAttempt, testing::RecordingSink};
+    use mac_worker::test_support::events::{EventSink, PublishAttempt, testing::RecordingSink};
     use std::sync::mpsc;
     let h = JournalHarness::new();
     let (reached, wait) = mpsc::channel();
@@ -2021,10 +2030,18 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
         assert_eq!(sink.try_publish(drain_batch(32)), PublishAttempt::Queued);
     }
     assert_eq!(sink.try_publish(drain_batch(1)), PublishAttempt::Dropped);
-    let state = mac_worker::client_state::ClientStateStore::open(&h.paths.state).unwrap();
+    let state =
+        mac_worker::test_support::client_state::ClientStateStore::open(&h.paths.state).unwrap();
     assert!(state.list_tasks().unwrap().is_empty());
-    mac_worker::controller::drain::set_drained(&h.paths.controller_state_root(), true).unwrap();
-    assert!(mac_worker::controller::drain::is_drained(&h.paths.controller_state_root()).unwrap());
+    mac_worker::test_support::controller::drain::set_drained(
+        &h.paths.controller_state_root(),
+        true,
+    )
+    .unwrap();
+    assert!(
+        mac_worker::test_support::controller::drain::is_drained(&h.paths.controller_state_root())
+            .unwrap()
+    );
     let recording = RecordingSink::new();
     assert_eq!(
         recording.try_publish(drain_batch(1)),
@@ -2042,14 +2059,14 @@ fn blocked_journal_fsync_gate_leaves_publisher_state_and_drain_independent() {
 }
 
 struct FsyncGatedPublisher {
-    sink: Arc<dyn mac_worker::controller::events::EventSink>,
-    handle: mac_worker::controller::events::journal::PublisherHandle,
+    sink: Arc<dyn mac_worker::test_support::events::EventSink>,
+    handle: mac_worker::test_support::events::journal::PublisherHandle,
     release: std::sync::mpsc::Sender<()>,
     finished: std::sync::mpsc::Receiver<()>,
 }
 
 fn fsync_gated_publisher(h: &JournalHarness) -> FsyncGatedPublisher {
-    use mac_worker::controller::events::PublishAttempt;
+    use mac_worker::test_support::events::PublishAttempt;
     use std::sync::mpsc;
     let (reached, wait) = mpsc::channel();
     let (release, gate) = mpsc::channel();
@@ -2088,7 +2105,7 @@ fn fsync_gated_publisher(h: &JournalHarness) -> FsyncGatedPublisher {
 
 #[test]
 fn publisher_exit_grace_commits_in_flight_and_queued_batches_within_bound() {
-    use mac_worker::controller::events::{EventRuntime, PublishAttempt};
+    use mac_worker::test_support::events::{EventRuntime, PublishAttempt};
     let h = JournalHarness::new();
     let publisher = fsync_gated_publisher(&h);
     assert_eq!(
@@ -2145,7 +2162,7 @@ fn publisher_exit_grace_commits_in_flight_and_queued_batches_within_bound() {
 
 #[test]
 fn publisher_exit_grace_returns_at_bound_without_joining_held_fsync() {
-    use mac_worker::controller::events::{EventRuntime, PublishAttempt};
+    use mac_worker::test_support::events::{EventRuntime, PublishAttempt};
     let h = JournalHarness::new();
     let publisher = fsync_gated_publisher(&h);
     assert_eq!(
@@ -2206,7 +2223,7 @@ fn committed_envelopes_use_frozen_validation_and_allow_unknown_versions() {
 fn committed_event_limit_counts_newline_and_rejects_one_extra_byte() {
     let h = JournalHarness::new();
     let cursor = h.head().cursor();
-    let mut event = mac_worker::controller::events::WireEvent {
+    let mut event = mac_worker::test_support::events::WireEvent {
         schema_version: 1,
         journal_id: cursor.journal_id,
         seq: Seq::new(1),
@@ -2243,7 +2260,7 @@ fn committed_event_limit_counts_newline_and_rejects_one_extra_byte() {
 
 #[test]
 fn original_provider_deadline_and_retained_root_are_not_reset_or_adopted() {
-    use mac_worker::controller::events::EventRuntime;
+    use mac_worker::test_support::events::EventRuntime;
     use std::os::fd::AsRawFd;
     let h = JournalHarness::new();
     let lock = fs::File::open(h.root().join("journal.lock")).unwrap();
@@ -2401,7 +2418,7 @@ fn journal_process_child() {
         loop {
             match journal.read(
                 ReadQuery {
-                    after: Some(mac_worker::controller::events::EventCursor {
+                    after: Some(mac_worker::test_support::events::EventCursor {
                         journal_id: epoch,
                         seq: Seq::ZERO,
                     }),
@@ -2475,20 +2492,20 @@ fn cancellation_during_lock_admission_is_reported_as_cancelled() {
 
 #[test]
 fn publisher_panic_is_contained_and_only_drops_optional_hints() {
-    use mac_worker::controller::events::{EventCursor, JournalWindow, PublishAttempt};
+    use mac_worker::test_support::events::{EventCursor, JournalWindow, PublishAttempt};
     struct PanickingWriter(MemoryJournal);
     impl JournalReader for PanickingWriter {
         fn window(
             &self,
             deadline: Duration,
-        ) -> Result<JournalWindow, mac_worker::error::WorkerError> {
+        ) -> Result<JournalWindow, mac_worker::test_support::core::error::WorkerError> {
             self.0.window(deadline)
         }
         fn read(
             &self,
             query: ReadQuery,
             deadline: Duration,
-        ) -> Result<EventReadResult, mac_worker::error::WorkerError> {
+        ) -> Result<EventReadResult, mac_worker::test_support::core::error::WorkerError> {
             self.0.read(query, deadline)
         }
     }
@@ -2497,7 +2514,7 @@ fn publisher_panic_is_contained_and_only_drops_optional_hints() {
             &self,
             _: EventBatch,
             _: Duration,
-        ) -> Result<EventCursor, mac_worker::error::WorkerError> {
+        ) -> Result<EventCursor, mac_worker::test_support::core::error::WorkerError> {
             panic!("injected optional journal panic");
         }
     }

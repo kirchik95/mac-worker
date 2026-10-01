@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::from_parts;
 
 use std::{
     collections::BTreeMap,
@@ -11,26 +12,31 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
-    cli::{Cli, Command as WorkerCommand},
-    error::{ProcessError, WorkerError},
-    host_store::{HostGc, HostStore},
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseToken, RequestFingerprintMaterial,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    cli::Command as WorkerCommand,
+    core::{
+        error::{ProcessError, WorkerError},
+        protocol::{MemoryPressure, PROTOCOL_VERSION},
     },
-    lease::{AdmissionFacts, LeaseService},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION},
-    run_with_io_in_context,
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+            LeaseToken, RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::{HostGc, HostStore},
+    },
+    runtime::{RuntimeContext, run_with_io_in_context},
     task::{
-        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
-        TaskMetaInput, TaskOutcome, TaskSource, TaskState, TurnSummary, TurnTerminal,
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+            TaskMetaInput, TaskOutcome, TaskSource, TaskState, TurnSummary, TurnTerminal,
+        },
+        store::{SessionBinding, TaskStore},
     },
-    task_store::{SessionBinding, TaskStore},
-    transfer_repo::{TransferGc, TransferRepo},
+    transfer::repo::{TransferGc, TransferRepo},
 };
 use support::{GitRepo, recording_runner::RecordingRunner};
 use tempfile::TempDir;
@@ -295,7 +301,7 @@ fn prepare_task(store: &HostStore, task: TaskId, job: JobId, base_oid: &BaseOid)
     let transfer = store.transfer_lock_after(&admission, job).unwrap();
     TaskStore::new(store, &SystemProcessRunner)
         .prepare(
-            &mac_worker::task_store::TaskPrepareRequest::new(
+            &mac_worker::test_support::task::store::TaskPrepareRequest::new(
                 task_meta(task, base_oid.clone(), 1),
                 job,
                 "mini-1",
@@ -336,7 +342,7 @@ fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_
     } else {
         status.turns().to_vec()
     };
-    let replacement = mac_worker::task::TaskStatus::new(
+    let replacement = mac_worker::test_support::task::model::TaskStatus::new(
         state,
         status.last_outcome().cloned(),
         status.worker().map(str::to_owned),
@@ -369,7 +375,7 @@ fn gc_closes_idle_open_task_but_preserves_result_branch_and_metadata() {
     release_lease(&store, job);
     rewrite_status(&store, task, TaskState::Open, 1);
 
-    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -414,7 +420,7 @@ fn gc_does_not_close_an_open_task_while_its_task_scope_lease_is_live() {
     let job = job_id(1);
     prepare_task(&store, task, job, &base_oid);
     rewrite_status(&store, task, TaskState::Open, 1);
-    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -453,7 +459,7 @@ fn gc_does_not_close_two_open_tasks_while_both_slot_leases_are_live() {
     rewrite_status(&store, task_id(1), TaskState::Open, 1);
     rewrite_status(&store, task_id(2), TaskState::Open, 1);
     assert_eq!(LeaseService::new(&store).occupied_slots().unwrap().len(), 2);
-    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -482,7 +488,7 @@ fn gc_keeps_all_slot_records_when_a_slot_lease_is_unreadable() {
         b"not-a-canonical-lease",
     )
     .unwrap();
-    let now = 1 + mac_worker::host_store::TASK_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -543,7 +549,7 @@ fn gc_prunes_expired_task_branch_without_removing_foreign_mirror_refs() {
         String::from_utf8_lossy(&keep.stderr)
     );
 
-    let now = 1 + mac_worker::host_store::BRANCH_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::BRANCH_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -584,7 +590,7 @@ fn gc_runs_one_maintenance_pass_without_immediate_prune() {
     );
 
     HostGc::new(&store, &SystemProcessRunner)
-        .apply_at(1 + mac_worker::host_store::JOB_RETENTION_MILLIS)
+        .apply_at(1 + mac_worker::test_support::host::store::JOB_RETENTION_MILLIS)
         .unwrap();
     let now = u64::MAX / 2;
     let preview = HostGc::new(&store, &SystemProcessRunner)
@@ -730,7 +736,7 @@ fn gc_expires_task_metadata_before_a_newer_result_branch() {
     rewrite_status(&store, task, TaskState::Closed, 1);
     let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
 
-    let now = 1 + mac_worker::host_store::JOB_RETENTION_MILLIS;
+    let now = 1 + mac_worker::test_support::host::store::JOB_RETENTION_MILLIS;
     let preview = HostGc::new(&store, &SystemProcessRunner)
         .preview_at(now)
         .unwrap();
@@ -766,7 +772,7 @@ fn gc_prunes_orphaned_task_refs_after_task_metadata_retention() {
     let mirror_path = store.mirror(PROJECT_ID).unwrap().path().to_path_buf();
 
     HostGc::new(&store, &SystemProcessRunner)
-        .apply_at(1 + mac_worker::host_store::JOB_RETENTION_MILLIS)
+        .apply_at(1 + mac_worker::test_support::host::store::JOB_RETENTION_MILLIS)
         .unwrap();
     let now = u64::MAX / 2;
     let preview = HostGc::new(&store, &SystemProcessRunner)
@@ -1022,7 +1028,7 @@ fn gc_never_requests_native_agent_session_deletion() {
     rewrite_status(&store, task, TaskState::Open, 1);
 
     let report = HostGc::new(&store, &SystemProcessRunner)
-        .apply_at(1 + mac_worker::host_store::TASK_RETENTION_MILLIS)
+        .apply_at(1 + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS)
         .unwrap();
     assert!(
         report
@@ -1346,11 +1352,7 @@ slots = 1
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(
-        Cli {
-            config: Some(config_path),
-            json,
-            command: WorkerCommand::Gc { apply: true },
-        },
+        from_parts(Some(config_path), json, WorkerCommand::Gc { apply: true }),
         &runner,
         &runtime,
         &mut stdout,

@@ -5,13 +5,11 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::Config,
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    run_with_io_in_context,
+    core::{config::Config, error::WorkerError},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_io_in_context},
 };
 use std::{
     collections::VecDeque, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex,
@@ -53,8 +51,8 @@ fn reply(code: i32, text: &str) -> ProcessResult {
 
 fn probe(agents: serde_json::Value, profiles: serde_json::Value) -> String {
     serde_json::json!({
-        "protocol_version": mac_worker::protocol::PROTOCOL_VERSION,
-        "supervision_version": mac_worker::protocol::SUPERVISION_VERSION,
+        "protocol_version": mac_worker::test_support::core::protocol::PROTOCOL_VERSION,
+        "supervision_version": mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
         "hostname": "mini.local", "arch": "arm64", "os_version": "26.2",
         "free_disk_bytes": 100_000_000_000_u64, "total_disk_bytes": 200_000_000_000_u64,
         "memory_pressure": "normal", "swap_used_bytes": 0,

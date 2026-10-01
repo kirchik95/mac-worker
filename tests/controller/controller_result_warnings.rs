@@ -1,7 +1,7 @@
 use crate::fixture;
 
 use fixture::{ControllerBridge, IsolatedHost, NoProcesses};
-use mac_worker::{controller::decode_frame, protocol::PROTOCOL_VERSION};
+use mac_worker::test_support::{controller::decode_frame, core::protocol::PROTOCOL_VERSION};
 use serde_json::{Value, json};
 
 const WARNING: &str = "requested workspace permission for claude has no workspace sandbox; effective permission is unattended";
@@ -118,12 +118,11 @@ fn result_warning_status_read_checks_task_identity() {
 }
 
 mod legacy {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::{decode_frame, encode_json_frame, parse_request},
-        error::WorkerError,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
-        protocol::PROTOCOL_VERSION,
-        task::{OriginDelivery, RunId, RunnerState, TaskId, TaskStatus},
+        core::{error::WorkerError, protocol::PROTOCOL_VERSION},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        task::model::{OriginDelivery, RunId, RunnerState, TaskId, TaskStatus},
     };
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};

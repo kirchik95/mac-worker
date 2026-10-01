@@ -8,9 +8,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mac_worker::{
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+use mac_worker::test_support::{
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
 };
 
 #[derive(Clone)]

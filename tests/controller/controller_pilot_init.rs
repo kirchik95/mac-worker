@@ -1,11 +1,10 @@
 use crate::fixture_pid;
 
 use base64::Engine;
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{decode_frame, encode_json_frame, init::InitRequest},
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
+    core::{error::WorkerError, protocol::PROTOCOL_VERSION},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
 };
 use serde_json::{Value, json};
 use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
@@ -18,8 +17,8 @@ fn initialize(
     home: &std::path::Path,
     digest: &str,
     request: InitRequest,
-) -> Result<mac_worker::controller::init::InitReport, WorkerError> {
-    mac_worker::controller::init::initialize(
+) -> Result<mac_worker::test_support::controller::init::InitReport, WorkerError> {
+    mac_worker::test_support::controller::init::initialize(
         runner,
         config,
         &pending_root(home),
@@ -35,8 +34,8 @@ fn initialize_with_wait(
     digest: &str,
     request: InitRequest,
     wait: &dyn Fn(std::time::Duration),
-) -> Result<mac_worker::controller::init::InitReport, WorkerError> {
-    mac_worker::controller::init::initialize_with_wait(
+) -> Result<mac_worker::test_support::controller::init::InitReport, WorkerError> {
+    mac_worker::test_support::controller::init::initialize_with_wait(
         runner,
         config,
         &pending_root(home),
@@ -49,8 +48,8 @@ fn initialize_with_wait(
 fn disable(
     runner: &dyn ProcessRunner,
     config: &std::path::Path,
-) -> Result<mac_worker::controller::service::ServiceStatus, WorkerError> {
-    mac_worker::controller::init::disable(
+) -> Result<mac_worker::test_support::controller::service::ServiceStatus, WorkerError> {
+    mac_worker::test_support::controller::init::disable(
         runner,
         config,
         &pending_root(config.parent().unwrap()),
@@ -72,17 +71,23 @@ fn key() -> String {
 fn result(value: Value) -> ProcessResult {
     let stdout = if value.get("workers").is_some() {
         serde_json::to_vec(
-            &serde_json::from_value::<mac_worker::protocol::WorkersReport>(value).unwrap(),
+            &serde_json::from_value::<mac_worker::test_support::core::protocol::WorkersReport>(
+                value,
+            )
+            .unwrap(),
         )
         .unwrap()
     } else if value.get("conflict").is_some() {
         serde_json::to_vec(
-            &serde_json::from_value::<mac_worker::controller::init::ConfiguredHost>(value).unwrap(),
+            &serde_json::from_value::<mac_worker::test_support::controller::init::ConfiguredHost>(
+                value,
+            )
+            .unwrap(),
         )
         .unwrap()
     } else if value.get("label").is_some() {
         serde_json::to_vec(
-            &serde_json::from_value::<mac_worker::controller::service::ServiceStatus>(value)
+            &serde_json::from_value::<mac_worker::test_support::controller::service::ServiceStatus>(value)
                 .unwrap(),
         )
         .unwrap()
@@ -261,9 +266,10 @@ impl ProcessRunner for Fake {
                 let request: Value =
                     serde_json::from_slice(decode_frame(req.stdin.as_ref().unwrap()).unwrap())
                         .unwrap();
-                let parsed =
-                    mac_worker::controller::parse_request(&serde_json::to_vec(&request).unwrap())
-                        .unwrap();
+                let parsed = mac_worker::test_support::controller::parse_request(
+                    &serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap();
                 let mut pending = self.pending_health.lock().unwrap();
                 let health = if *pending > 0 {
                     *pending -= 1;
@@ -271,8 +277,8 @@ impl ProcessRunner for Fake {
                 } else {
                     {
                         let mut record = serde_json::to_value(
-                            mac_worker::controller::health::ControllerHealth::new(
-                                mac_worker::job::ProcessIdentity::new(
+                            mac_worker::test_support::controller::health::ControllerHealth::new(
+                                mac_worker::test_support::host::job::ProcessIdentity::new(
                                     fixture_pid::fixture_pid(42),
                                     1001000,
                                 )
@@ -320,7 +326,7 @@ fn init_is_rerunnable_preserves_laptop_workers_and_verifies_before_enabling() {
         assert_eq!(report.workers.len(), 2);
         assert!(report.workers.iter().all(|w| w.reachable));
     }
-    let cfg = mac_worker::config::Config::load(&path).unwrap();
+    let cfg = mac_worker::test_support::core::config::Config::load(&path).unwrap();
     assert!(cfg.controller.enabled);
     assert_eq!(cfg.controller.ssh, "mac1");
     assert_eq!(cfg.workers[0].ssh, "mac1");
@@ -355,7 +361,7 @@ fn init_missing_trust_fails_worker_without_changing_mode() {
     assert!(!report.ready);
     assert!(report.workers.iter().any(|w| w.error_code.is_some()));
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -489,7 +495,7 @@ fn controller_commands_and_hidden_operations_are_available_without_confirmation_
         vec!["worker", "host", "controller-probe"],
     ] {
         assert!(
-            mac_worker::cli::Cli::try_parse_from(args.clone()).is_ok(),
+            mac_worker::test_support::cli::Cli::try_parse_from(args.clone()).is_ok(),
             "{args:?}"
         );
     }
@@ -501,7 +507,7 @@ fn disable_unloads_service_before_disabling_laptop_and_keeps_inventory() {
     let fake = Fake::new();
     initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
     disable(&fake, &path).unwrap();
-    let cfg = mac_worker::config::Config::load(&path).unwrap();
+    let cfg = mac_worker::test_support::core::config::Config::load(&path).unwrap();
     assert!(!cfg.controller.enabled);
     assert_eq!(cfg.controller.ssh, "mac1");
     assert_eq!(cfg.workers.len(), 2);
@@ -623,7 +629,7 @@ fn init_keeps_a_first_jump_to_the_same_host_on_a_different_port() {
             .any(|call| call.ends_with("host controller-configure"))
     );
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -656,7 +662,7 @@ fn init_refuses_a_first_jump_to_the_controller_address_behind_another_route() {
             .any(|call| call.ends_with("host controller-configure"))
     );
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -694,7 +700,7 @@ fn init_rejects_leader_using_a_different_config_path() {
     assert!(!report.ready, "accepted a different config: {report:?}");
     assert!(report.message.contains("config"), "{report:?}");
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -722,7 +728,7 @@ fn init_supervision_rejects_a_foreign_manual_leader() {
         "must identify the foreign pid: {report:?}"
     );
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -747,7 +753,7 @@ fn init_supervision_rejects_loaded_but_exited_service() {
         Some("CONTROLLER_FOREIGN_LEADER")
     );
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -785,7 +791,7 @@ fn init_supervision_missing_launchd_pid_is_unverified_without_stop_advice() {
         assert!(!report.message.contains("FOREIGN_LEADER"));
         assert!(!report.message.contains("stop that process"));
         assert!(
-            !mac_worker::config::Config::load(&path)
+            !mac_worker::test_support::core::config::Config::load(&path)
                 .unwrap()
                 .controller
                 .enabled
@@ -836,7 +842,7 @@ fn init_supervision_rejects_old_build_old_start_and_wrong_roots_with_bounded_wai
         assert_eq!(waits.get(), 20);
         assert!(report.message.contains("timed out"), "{report:?}");
         assert!(
-            !mac_worker::config::Config::load(&path)
+            !mac_worker::test_support::core::config::Config::load(&path)
                 .unwrap()
                 .controller
                 .enabled
@@ -847,13 +853,13 @@ fn init_supervision_rejects_old_build_old_start_and_wrong_roots_with_bounded_wai
 #[test]
 fn setup_restart_verification_requires_the_installed_digest_with_injected_wait() {
     let fake = Fake::new();
-    let controller = mac_worker::config::ControllerConfig {
+    let controller = mac_worker::test_support::core::config::ControllerConfig {
         enabled: true,
         ssh: "controller-route".into(),
         ..Default::default()
     };
     let waits = std::cell::Cell::new(0);
-    let error = mac_worker::controller::service::restart_and_verify(
+    let error = mac_worker::test_support::controller::service::restart_and_verify(
         &fake,
         &controller,
         "different-installed-build",
@@ -895,7 +901,7 @@ fn init_preflight_rejects_a_stale_non_controller_helper_before_remote_writes() {
             || call.ends_with("host controller-service")
     }));
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -911,7 +917,7 @@ fn recovery_failed_first_init_can_be_disabled_without_a_destination() {
     let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
     assert!(!report.ready);
     assert!(
-        !mac_worker::config::Config::load(&path)
+        !mac_worker::test_support::core::config::Config::load(&path)
             .unwrap()
             .controller
             .enabled
@@ -941,8 +947,14 @@ fn recovery_failed_first_init_can_be_disabled_without_a_destination() {
 fn recovery_disable_accepts_an_explicit_destination() {
     use clap::Parser;
     assert!(
-        mac_worker::cli::Cli::try_parse_from(["worker", "controller", "disable", "--ssh", "mac1"])
-            .is_ok()
+        mac_worker::test_support::cli::Cli::try_parse_from([
+            "worker",
+            "controller",
+            "disable",
+            "--ssh",
+            "mac1"
+        ])
+        .is_ok()
     );
 }
 
@@ -968,15 +980,15 @@ fn recovery_failed_first_init_can_be_disabled_with_explicit_ssh() {
     fake.pending_path = Some(pending_file.clone());
     let report = initialize(&fake, &path, temp.path(), &fake.digest, request()).unwrap();
     assert!(!report.ready);
-    let runtime = mac_worker::RuntimeContext::isolated(
+    let runtime = mac_worker::test_support::runtime::RuntimeContext::isolated(
         Default::default(),
         temp.path().into(),
         temp.path().into(),
     );
     let mut out = vec![];
     let mut err = vec![];
-    let exit = mac_worker::run_with_stdio_in_context(
-        mac_worker::cli::Cli::try_parse_from([
+    let exit = mac_worker::test_support::runtime::run_with_stdio_in_context(
+        mac_worker::test_support::cli::Cli::try_parse_from([
             "worker",
             "--config",
             path.to_str().unwrap(),
@@ -1035,7 +1047,7 @@ fn recovery_every_remote_failure_retains_private_pending_record_and_safe_hint() 
             0o600
         );
         assert!(
-            !mac_worker::config::Config::load(&path)
+            !mac_worker::test_support::core::config::Config::load(&path)
                 .unwrap()
                 .controller
                 .enabled
@@ -1079,7 +1091,7 @@ fn recovery_pending_uses_resolved_xdg_state_for_cli_disable() {
     let root = custom_state.join("mac-worker-controller");
     let mut fake = Fake::new();
     fake.unreachable_worker = true;
-    let report = mac_worker::controller::init::initialize_with_wait(
+    let report = mac_worker::test_support::controller::init::initialize_with_wait(
         &fake,
         &path,
         &root,
@@ -1091,7 +1103,7 @@ fn recovery_pending_uses_resolved_xdg_state_for_cli_disable() {
     .unwrap();
     assert!(!report.ready);
     assert!(root.join("pending-init.json").exists());
-    let runtime = mac_worker::RuntimeContext::isolated(
+    let runtime = mac_worker::test_support::runtime::RuntimeContext::isolated(
         std::collections::BTreeMap::from([(
             "XDG_STATE_HOME".into(),
             custom_state.into_os_string(),
@@ -1101,8 +1113,8 @@ fn recovery_pending_uses_resolved_xdg_state_for_cli_disable() {
     );
     let mut out = vec![];
     let mut err = vec![];
-    let exit = mac_worker::run_with_stdio_in_context(
-        mac_worker::cli::Cli::try_parse_from([
+    let exit = mac_worker::test_support::runtime::run_with_stdio_in_context(
+        mac_worker::test_support::cli::Cli::try_parse_from([
             "worker",
             "--config",
             path.to_str().unwrap(),
@@ -1193,8 +1205,13 @@ fn recovery_explicit_pending_cleanup_preserves_a_different_enabled_controller() 
             .unwrap()
             .ready
     );
-    mac_worker::controller::init::disable(&fake, &path, &pending_root(temp.path()), Some("mac1"))
-        .unwrap();
+    mac_worker::test_support::controller::init::disable(
+        &fake,
+        &path,
+        &pending_root(temp.path()),
+        Some("mac1"),
+    )
+    .unwrap();
     assert!(fake.calls.lock().unwrap().last().unwrap().contains("mac1"));
     assert!(!pending_root(temp.path()).join("pending-init.json").exists());
     assert_eq!(fs::read_to_string(&path).unwrap(), original);

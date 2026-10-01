@@ -5,12 +5,13 @@
 
 use std::{sync::Mutex, time::Duration};
 
-use mac_worker::{
-    client_state::ClientStateStore,
-    config::{Config, WorkerEntry},
-    error::WorkerError,
-    job::{JobId, ProcessIdentity, QueueEntry, QueueEntryKind, QueueState},
-    scheduler::WorkerPreference,
+use mac_worker::test_support::{
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+    },
+    host::job::{JobId, ProcessIdentity, QueueEntry, QueueEntryKind, QueueState},
 };
 
 use crate::support;
@@ -18,7 +19,7 @@ use crate::support;
 fn config() -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![WorkerEntry {
@@ -41,19 +42,23 @@ fn assert_no_host_lease(temp: &tempfile::TempDir) {
 
 mod task_ports {
     use super::*;
-    use mac_worker::{
-        agent::{AgentKind, PermissionPolicy},
-        job::CommandSummary,
-        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-        project_state::ProjectState,
-        supervisor::SystemProcessInspector,
-        task::{
-            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity,
-            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-            TaskStatus, TurnSummary,
+    use mac_worker::test_support::{
+        agents::agent::{AgentKind, PermissionPolicy},
+        host::{
+            job::CommandSummary,
+            process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+            supervisor::SystemProcessInspector,
         },
-        task_client::TaskClient,
-        turn_runner::InlineRunnerExecutor,
+        task::{
+            client::TaskClient,
+            model::{
+                BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunnerIdentity,
+                TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+                TaskStatus, TurnSummary,
+            },
+            project_state::ProjectState,
+            turn_runner::InlineRunnerExecutor,
+        },
     };
     use std::path::PathBuf;
 

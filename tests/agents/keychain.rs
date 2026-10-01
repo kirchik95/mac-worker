@@ -2,11 +2,12 @@ use std::{
     ffi::OsString, os::unix::process::ExitStatusExt, path::Path, sync::Mutex, time::Duration,
 };
 
-use mac_worker::{
-    error::WorkerError,
-    keychain::{KeychainUnlockConfig, unlock_keychain},
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    redaction::RedactionBoundary,
+use mac_worker::test_support::{
+    agents::keychain::{KeychainUnlockConfig, unlock_keychain},
+    core::{error::WorkerError, redaction::RedactionBoundary},
+    host::process::{
+        ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner,
+    },
 };
 
 struct RecordingRunner {

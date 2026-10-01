@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::into_command;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -13,15 +14,13 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
+use mac_worker::test_support::{
     cli::{Cli, Command as WorkerCommand},
     client_state::ClientStateStore,
-    config::ControllerConfig,
     controller::{ControllerLeader, controller_dashboard_ssh_request},
-    job::JobId,
-    paths::PathLayout,
-    supervisor::SystemProcessInspector,
-    task::{
+    core::{config::ControllerConfig, paths::PathLayout},
+    host::{job::JobId, supervisor::SystemProcessInspector},
+    task::model::{
         BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits,
         TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus, TurnSummary,
         TurnTerminal,
@@ -582,10 +581,10 @@ fn task_record(id: u128, state: TaskState) -> LocalTaskRecord {
         run_id: None,
         project_id: "b".repeat(64),
         worktree_id: "c".repeat(64),
-        agent: mac_worker::agent::AgentKind::Codex,
+        agent: mac_worker::test_support::agents::agent::AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: None,
@@ -893,7 +892,7 @@ fn hidden_viewer_flag_is_presence_only() {
     assert!(Cli::try_parse_from(["worker", "dashboard", "--controller-viewer", "PATH"]).is_err());
     let parsed = Cli::try_parse_from(["worker", "dashboard", "--controller-viewer"]).unwrap();
     assert!(matches!(
-        parsed.command,
+        into_command(parsed),
         WorkerCommand::Dashboard {
             controller_viewer: true,
             ..
@@ -1110,18 +1109,21 @@ fn readiness_timeout_fixture() {
         return;
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-    let config = mac_worker::config::Config::parse(
+    let config = mac_worker::test_support::core::config::Config::parse(
         &fs::read_to_string(home.join(".config/mac-worker/config.toml")).unwrap(),
     )
     .unwrap();
-    let runtime =
-        mac_worker::RuntimeContext::isolated(std::env::vars_os().collect(), home.clone(), home);
+    let runtime = mac_worker::test_support::runtime::RuntimeContext::isolated(
+        std::env::vars_os().collect(),
+        home.clone(),
+        home,
+    );
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(
-            mac_worker::dashboard::run_controller_dashboard_tunnel_with_readiness_timeout(
+            mac_worker::test_support::dashboard::run_controller_dashboard_tunnel_with_readiness_timeout(
                 &config,
                 &runtime,
                 None,

@@ -8,7 +8,7 @@ use std::{
 };
 
 use fake_herdr::{FakeHerdr, Reply};
-use mac_worker::herdr::{
+use mac_worker::test_support::agents::herdr::{
     AgentState, DEFAULT_SOCKET_RELATIVE, HerdrClient, HerdrError, HerdrSocket, NotificationSound,
     PaneMetadata, SOCKET_ENV_NAME, SOURCE,
 };

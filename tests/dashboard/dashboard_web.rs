@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     dashboard::{
         cache::Observation,
         model::{
@@ -24,10 +24,12 @@ use mac_worker::{
         task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
         web::{DashboardHttpServer, DashboardHttpState},
     },
-    job::{JobId, LogStream},
-    task::{BaseOid, BranchName, RunId, RunnerState, TaskId, TaskState, TurnId, TurnTerminal},
-    task_view::{
-        TaskDetailProjection, TaskFreshness, TaskListRow, TaskTimelineEvent, TaskTurnProjection,
+    host::job::{JobId, LogStream},
+    task::{
+        model::{BaseOid, BranchName, RunId, RunnerState, TaskId, TaskState, TurnId, TurnTerminal},
+        view::{
+            TaskDetailProjection, TaskFreshness, TaskListRow, TaskTimelineEvent, TaskTurnProjection,
+        },
     },
 };
 
@@ -556,7 +558,8 @@ impl DashboardDataSource for FakeSource {
 
     fn queue_entries(
         &self,
-    ) -> Result<Vec<mac_worker::dashboard::model::DashboardQueueEntry>, DashboardError> {
+    ) -> Result<Vec<mac_worker::test_support::dashboard::model::DashboardQueueEntry>, DashboardError>
+    {
         Ok(Vec::new())
     }
 }
@@ -647,7 +650,7 @@ impl DashboardDataSource for FixtureSource {
         Ok(vec![DashboardQueueEntry {
             position: 1,
             job_id: job_id(4),
-            entry_kind: mac_worker::dashboard::model::DashboardQueueEntryKind::Batch,
+            entry_kind: mac_worker::test_support::dashboard::model::DashboardQueueEntryKind::Batch,
             task_id: None,
             turn_id: None,
             run_id: None,
@@ -952,7 +955,7 @@ fn fixture_detail() -> TaskDetailProjection {
         ended_at_millis: Some(2_000),
     };
     TaskDetailProjection {
-        questions_policy: mac_worker::task::QuestionsPolicy::Ask,
+        questions_policy: mac_worker::test_support::task::model::QuestionsPolicy::Ask,
         task: TaskListRow {
             task_id,
             run_id: Some(run_id),
@@ -976,8 +979,8 @@ fn fixture_detail() -> TaskDetailProjection {
             created_at_millis: 900,
             updated_at_millis: 1_500,
             active_turn_id: Some(turn_id),
-            close_policy: mac_worker::task::ClosePolicy::Done,
-            review_state: mac_worker::task_view::ReviewState::NotReviewable,
+            close_policy: mac_worker::test_support::task::model::ClosePolicy::Done,
+            review_state: mac_worker::test_support::task::view::ReviewState::NotReviewable,
             delivery: None,
             deliveries: Vec::new(),
             publish_push: false,
@@ -996,8 +999,8 @@ fn fixture_detail() -> TaskDetailProjection {
         files_changed: vec!["src/login.rs".into()],
         diff_stat: Some("1 file changed".into()),
         fetch_command: format!("worker task fetch {task_id}"),
-        review_state: mac_worker::task_view::ReviewState::NotReviewable,
-        close_policy: mac_worker::task::ClosePolicy::Done,
+        review_state: mac_worker::test_support::task::view::ReviewState::NotReviewable,
+        close_policy: mac_worker::test_support::task::model::ClosePolicy::Done,
         reported_checks: Vec::new(),
         fetched_head: None,
         fetched_ref: None,

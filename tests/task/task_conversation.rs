@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::from_parts;
 
 use crate::task_state_fixture;
 use task_state_fixture::TaskStateFixture;
@@ -19,49 +20,51 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, Question},
-    cli::{Cli, Command, TaskCommand},
-    client_state::{ClientStateStore, ClientStateTimings, RUNNER_UNVERIFIABLE_AFTER},
-    config::Config,
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, JobId, ProcessIdentity, QueueEntry, QueueEntryKind,
-        QueueRunReference, QueueState, REPLACEMENT_FAILURE_PARK_AFTER, RUNNER_REPEATED_FAILURE,
-        RUNNER_UNVERIFIABLE, ReplacementFailureBudget, RunId,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, Question},
+    cli::{Command, TaskCommand},
+    client_state::{
+        ClientStateStore, ClientStateTimings, RUNNER_UNVERIFIABLE_AFTER,
+        scheduler::{
+            AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot,
+            QueueBlockingReason, SchedulerPolicy, Selection, WorkerPreference,
+        },
     },
-    outbox::OutboxRetryResponse,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    run_with_io_in_context,
-    scheduler::{
-        AffinityHints, CandidateObservation, CandidateRejection, CandidateSlot,
-        QueueBlockingReason, SchedulerPolicy, Selection, WorkerPreference,
+    core::{config::Config, error::WorkerError, paths::PathLayout},
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, JobId, ProcessIdentity, QueueEntry,
+            QueueEntryKind, QueueRunReference, QueueState, REPLACEMENT_FAILURE_PARK_AFTER,
+            RUNNER_REPEATED_FAILURE, RUNNER_UNVERIFIABLE, ReplacementFailureBudget, RunId,
+        },
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
-    },
+    runtime::{RuntimeContext, run_with_io_in_context},
     task::{
-        BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
-        PublishMode, PushTarget, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState,
-        TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
-        TaskStatus, TurnSummary, TurnTerminal,
+        client::{TaskClient, TaskListFilter, WaitSelector},
+        model::{
+            BaseOid, ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery,
+            PublishMode, PushTarget, RunId as TaskRunId, RunRecord, RunnerIdentity, RunnerState,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TaskStatus, TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{
+            TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
+            TaskStatusResponse,
+        },
+        turn_runner::InlineRunnerExecutor,
+        view::TaskFreshness,
     },
-    task_client::{TaskClient, TaskListFilter, WaitSelector},
-    task_store::{
-        TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
-        TaskStatusResponse,
-    },
-    task_view::TaskFreshness,
-    transfer::HostOperation,
-    turn_runner::InlineRunnerExecutor,
+    transfer::{HostOperation, outbox::OutboxRetryResponse},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use mac_worker::job::RunId as QueueRunId;
+use mac_worker::test_support::host::job::RunId as QueueRunId;
 
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -75,7 +78,7 @@ impl ProcessInspector for LiveOwners {
     fn identity_for_pid(
         &self,
         pid: u32,
-    ) -> Result<ProcessIdentity, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessIdentity, mac_worker::test_support::core::error::WorkerError> {
         ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
     }
 
@@ -195,7 +198,7 @@ impl Drop for CurrentDirGuard {
 
 struct TaskRemoteRunner {
     status: Mutex<TaskStatus>,
-    deliveries: Mutex<Vec<mac_worker::task::OriginDelivery>>,
+    deliveries: Mutex<Vec<mac_worker::test_support::task::model::OriginDelivery>>,
     status_failures: AtomicUsize,
     on_outbox_retry: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -214,7 +217,10 @@ impl TaskRemoteRunner {
         *self.status.lock().unwrap() = status;
     }
 
-    fn set_deliveries(&self, deliveries: Vec<mac_worker::task::OriginDelivery>) {
+    fn set_deliveries(
+        &self,
+        deliveries: Vec<mac_worker::test_support::task::model::OriginDelivery>,
+    ) {
         *self.deliveries.lock().unwrap() = deliveries;
     }
 
@@ -385,7 +391,7 @@ fn task_record_in_run(
         agent: AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: None,
@@ -457,7 +463,7 @@ fn closed_push_task_record(
         agent: AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: Some(PushTarget::new("https://example.test/repo.git".into()).unwrap()),
@@ -785,7 +791,7 @@ fn active_record_with_pending_turn(
         agent: AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: None,
@@ -857,7 +863,7 @@ fn origin_queued_task_record(
         agent: AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Origin {
             url: "https://origin.example.test/repo.git".into(),
         },
@@ -921,7 +927,7 @@ fn job(number: u128) -> JobId {
 }
 
 fn plant_incomplete_accepted_journal(
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     store: &ClientStateStore,
     task_id: TaskId,
     turn_id: JobId,
@@ -961,7 +967,7 @@ fn plant_incomplete_accepted_journal(
 }
 
 fn plant_post_acceptance_diagnostic(
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     store: &ClientStateStore,
     task_id: TaskId,
     turn_id: JobId,
@@ -1003,7 +1009,7 @@ fn plant_post_acceptance_diagnostic(
 }
 
 fn runner_checkpoint(
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     task_id: TaskId,
     turn_id: JobId,
 ) -> serde_json::Value {
@@ -1079,10 +1085,10 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
         run_id: Some(TaskRunId::new(Uuid::from_u128(99))),
         project_id: PROJECT_ID.into(),
         worktree_id: WORKTREE_ID.into(),
-        agent: mac_worker::agent::AgentKind::Codex,
+        agent: mac_worker::test_support::agents::agent::AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: None,
@@ -2527,7 +2533,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
     }
     let config = task_config();
     let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
-    let transfer = mac_worker::transfer_repo::TransferRepo::open_or_create(
+    let transfer = mac_worker::test_support::transfer::repo::TransferRepo::open_or_create(
         &paths.cache,
         &project.context.common_dir,
     )
@@ -2564,7 +2570,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
             None
         };
         if mode == "retry" {
-            let owner = mac_worker::turn_runner::RunnerExecutor::start(
+            let owner = mac_worker::test_support::task::turn_runner::RunnerExecutor::start(
                 &InlineRunnerExecutor,
                 &paths,
                 task,
@@ -2579,7 +2585,7 @@ fn finalizer_cannot_damage_a_new_turn(mode: &str) {
             .spawn_scoped(scope, || match mode {
                 "cancel" => client.cancel(task).map(|_| ()),
                 "reconcile" => client.reconcile_runners().map(|_| ()),
-                "retry" => mac_worker::turn_runner::TurnRunner::new(
+                "retry" => mac_worker::test_support::task::turn_runner::TurnRunner::new(
                     &remote,
                     &config,
                     &paths,
@@ -2659,7 +2665,7 @@ fn completed_runner_retry_fences_a_stale_reconciler() {
 
 fn enqueue_dead_dispatching_turn(
     store: &ClientStateStore,
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     project: &ProjectState,
     dead_owner: ProcessIdentity,
     task_number: u128,
@@ -3565,13 +3571,13 @@ fn publish_retry_then_status_shows_delivery_for_a_closed_task() {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let retry_exit = run_with_io_in_context(
-        Cli {
-            config: Some(paths.config.clone()),
-            json: false,
-            command: Command::Task {
+        from_parts(
+            Some(paths.config.clone()),
+            false,
+            Command::Task {
                 command: TaskCommand::PublishRetry { task_id },
             },
-        },
+        ),
         &remote,
         &runtime,
         &mut stdout,
@@ -3582,16 +3588,16 @@ fn publish_retry_then_status_shows_delivery_for_a_closed_task() {
     stdout.clear();
     stderr.clear();
     let status_exit = run_with_io_in_context(
-        Cli {
-            config: Some(paths.config.clone()),
-            json: false,
-            command: Command::Task {
+        from_parts(
+            Some(paths.config.clone()),
+            false,
+            Command::Task {
                 command: TaskCommand::Status {
                     task_id,
                     full: false,
                 },
             },
-        },
+        ),
         &remote,
         &runtime,
         &mut stdout,
@@ -3607,16 +3613,16 @@ fn publish_retry_then_status_shows_delivery_for_a_closed_task() {
     stdout.clear();
     stderr.clear();
     let json_exit = run_with_io_in_context(
-        Cli {
-            config: Some(paths.config.clone()),
-            json: true,
-            command: Command::Task {
+        from_parts(
+            Some(paths.config.clone()),
+            true,
+            Command::Task {
                 command: TaskCommand::Status {
                     task_id,
                     full: false,
                 },
             },
-        },
+        ),
         &remote,
         &runtime,
         &mut stdout,

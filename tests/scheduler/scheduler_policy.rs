@@ -1,4 +1,4 @@
-use mac_worker::scheduler::{
+use mac_worker::test_support::client_state::scheduler::{
     AffinityHints, CandidateObservation, CandidateObservationError, CandidateRejection,
     CandidateSlot, SchedulerPolicy, Selection, WorkerPreference,
 };
@@ -39,7 +39,9 @@ fn observation_with_agents(
         .with_interactive_agents(interactive_agents)
 }
 
-fn names(ranked: &[mac_worker::scheduler::RankedCandidate]) -> Vec<&str> {
+fn names(
+    ranked: &[mac_worker::test_support::client_state::scheduler::RankedCandidate],
+) -> Vec<&str> {
     ranked
         .iter()
         .map(|candidate| candidate.worker_name())

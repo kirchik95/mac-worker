@@ -1,8 +1,7 @@
-use mac_worker::{
-    agent::prebind_login_request,
-    agent_facts::AgentAuth,
-    error::{ProcessError, ProcessStream, WorkerError},
-    process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
+use mac_worker::test_support::{
+    agents::{agent::prebind_login_request, agent_facts::AgentAuth},
+    core::error::{ProcessError, ProcessStream, WorkerError},
+    host::process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner},
 };
 use std::{
     sync::{
@@ -396,7 +395,7 @@ fn successful_exit_does_not_hide_stdin_broken_pipe() {
 #[cfg(target_os = "macos")]
 mod termination {
     use super::*;
-    use mac_worker::{
+    use mac_worker::test_support::host::{
         job::ProcessIdentity,
         supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector},
     };

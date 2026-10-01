@@ -12,25 +12,26 @@ use std::{
 };
 
 use crate::task_ports_fixture as task_fixture;
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         RunnerSlotDecision,
+        scheduler::{CandidateSlot, WorkerPreference},
     },
-    error::WorkerError,
-    host_store::HostStore,
-    job::{
-        AdmissionObservation, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseToken, ProcessIdentity, QueueEntry, QueueEntryKind,
-        QueueRunReference, QueueState, RequestFingerprintMaterial, RunId,
+    core::{error::WorkerError, protocol::MemoryPressure},
+    host::{
+        job::{
+            AdmissionObservation, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest,
+            LeaseAcquireResponse, LeaseToken, ProcessIdentity, QueueEntry, QueueEntryKind,
+            QueueRunReference, QueueState, RequestFingerprintMaterial, RunId,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        store::HostStore,
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
-    lease::{AdmissionFacts, LeaseService},
-    protocol::MemoryPressure,
-    scheduler::{CandidateSlot, WorkerPreference},
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
-    },
-    task::{TaskId, TaskOutcome},
+    task::model::{TaskId, TaskOutcome},
 };
 use support::GitRepo;
 
@@ -254,7 +255,7 @@ fn simultaneous_clients_preserve_fifo(client_count: u32) {
                 .lock()
                 .unwrap()
                 .push((value, entry.job_id(), entry.queue_id().value()));
-            Ok::<_, mac_worker::error::WorkerError>(entry)
+            Ok::<_, mac_worker::test_support::core::error::WorkerError>(entry)
         }));
     }
     barrier.wait();
@@ -728,12 +729,12 @@ fn task_claim_lease_handoff_matrix_uses_turn_runner_dispatch() {
         let run = thread::spawn(move || {
             let mut request = task_fixture::request_from_path(&project, false);
             request.attached = false;
-            let report = mac_worker::task_client::TaskClient::new(
+            let report = mac_worker::test_support::task::client::TaskClient::new(
                 &*run_remote,
                 &run_config,
                 &run_paths,
                 &run_store,
-                &mac_worker::turn_runner::InlineRunnerExecutor,
+                &mac_worker::test_support::task::turn_runner::InlineRunnerExecutor,
             )
             .submit(request, &mut Vec::new(), &mut Vec::new())?;
             let turn = run_store
@@ -830,8 +831,8 @@ fn task_claim_lease_handoff_matrix_uses_turn_runner_dispatch() {
 
 fn dispatch_task(
     remote: &task_fixture::TaskRemote,
-    config: &mac_worker::config::Config,
-    paths: &mac_worker::paths::PathLayout,
+    config: &mac_worker::test_support::core::config::Config,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     store: &ClientStateStore,
     repo: &GitRepo,
     wait: bool,
@@ -975,12 +976,12 @@ fn task_two_slot_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
     let project = repo.root().to_path_buf();
     let (done_tx, done_rx) = mpsc::channel();
     let waiter = thread::spawn(move || {
-        let report = mac_worker::task_client::TaskClient::new(
+        let report = mac_worker::test_support::task::client::TaskClient::new(
             &*wait_remote,
             &wait_config,
             &wait_paths,
             &wait_store,
-            &mac_worker::turn_runner::InlineRunnerExecutor,
+            &mac_worker::test_support::task::turn_runner::InlineRunnerExecutor,
         )
         .submit(
             task_fixture::request_from_path(&project, true),
@@ -1105,7 +1106,10 @@ fn task_cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
         match (claim, cancellation) {
             (
                 Some(claim),
-                Some(mac_worker::job::QueueCancel::RequestedDispatch { job_id: id, .. }),
+                Some(mac_worker::test_support::host::job::QueueCancel::RequestedDispatch {
+                    job_id: id,
+                    ..
+                }),
             ) => {
                 assert_eq!(id, job_id, "case {case}");
                 assert!(matches!(
@@ -1113,7 +1117,12 @@ fn task_cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
                     QueueState::Dispatching { .. }
                 ));
             }
-            (None, Some(mac_worker::job::QueueCancel::RemovedWaiting { job_id: id })) => {
+            (
+                None,
+                Some(mac_worker::test_support::host::job::QueueCancel::RemovedWaiting {
+                    job_id: id,
+                }),
+            ) => {
                 assert_eq!(id, job_id, "case {case}");
             }
             (claim, cancellation) => panic!(

@@ -1,30 +1,37 @@
 //! Real task client/runner and lease storage, with only the remote process boundary faked.
-use mac_worker::{
-    agent::AgentKind,
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe},
-    client_state::ClientStateStore,
-    config::{Config, WorkerEntry},
-    error::WorkerError,
-    host_store::HostStore,
-    job::{
-        ExecutionScope, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LogChunk, LogChunkRequest, LogChunkResponse, StatusRequest,
-        StatusResponse, SubmitResponse,
+use mac_worker::test_support::{
+    agents::{
+        agent::AgentKind,
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe},
     },
-    lease::{AdmissionFacts, LeaseService},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    scheduler::WorkerPreference,
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        paths::PathLayout,
+        protocol::{MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
+    },
+    host::{
+        job::{
+            ExecutionScope, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
+            LeaseAcquireResponse, LogChunk, LogChunkRequest, LogChunkResponse, StatusRequest,
+            StatusResponse, SubmitResponse,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        store::HostStore,
+    },
     task::{
-        ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+        client::{TaskClient, TaskSubmitRequest},
+        model::{
+            ClosePolicy, TaskId, TaskLimits, TaskMeta, TaskOutcome, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        store::{TaskPrepareRequest, TaskPrepareResponse, TaskStatusRequest, TaskStatusResponse},
+        turn::{TaskTurnRequest, TaskTurnResponse},
+        turn_runner::{InlineRunnerExecutor, TurnOutcomeReport, TurnRunner},
     },
-    task_client::{TaskClient, TaskSubmitRequest},
-    task_store::{TaskPrepareRequest, TaskPrepareResponse, TaskStatusRequest, TaskStatusResponse},
     transfer::HostOperation,
-    turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{InlineRunnerExecutor, TurnOutcomeReport, TurnRunner},
 };
 use std::{
     collections::{HashMap, HashSet},

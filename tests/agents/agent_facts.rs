@@ -16,27 +16,33 @@ use std::{
 };
 
 use fake_herdr::{FakeHerdr, Reply};
-use mac_worker::{
-    agent::{AgentKind, adapter_for},
-    agent_facts::{
-        AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_REFRESH_BUDGET_REASON, FACTS_TTL,
-        FactsClock, HerdrFactState, HerdrFacts, PROBE_DEADLINE, ProfileProbe,
-        collect_agent_facts_at, collect_agent_facts_at_host_with_timing,
-        collect_agent_facts_at_with_budget, collect_agent_facts_at_with_timing,
-        turn_auth_failure_reason,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, adapter_for},
+        agent_facts::{
+            AgentAuth, AgentFacts, AgentProbe, EnvProfile, FACTS_REFRESH_BUDGET_REASON, FACTS_TTL,
+            FactsClock, HerdrFactState, HerdrFacts, PROBE_DEADLINE, ProfileProbe,
+            collect_agent_facts_at, collect_agent_facts_at_host_with_timing,
+            collect_agent_facts_at_with_budget, collect_agent_facts_at_with_timing,
+            turn_auth_failure_reason,
+        },
+        auth_incidents::{self, AUTH_INCIDENT_TTL_MILLIS, AUTH_INCIDENTS_UNREADABLE_REASON},
+        probe::ProbeCollector,
     },
-    auth_incidents::{self, AUTH_INCIDENT_TTL_MILLIS, AUTH_INCIDENTS_UNREADABLE_REASON},
-    config::{Config, WorkerEntry},
-    error::{ProcessError, WorkerError},
-    host_store::HostStore,
-    lease::SlotState,
-    probe::ProbeCollector,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth,
+    client_state::scheduler_adapter::SchedulerProbeAdapter,
+    core::{
+        config::{Config, WorkerEntry},
+        error::{ProcessError, WorkerError},
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth,
+        },
     },
-    scheduler_adapter::SchedulerProbeAdapter,
+    host::{
+        lease::SlotState,
+        process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+        store::HostStore,
+    },
 };
 
 const COLLECTED_AT: u64 = 100_000;
@@ -509,7 +515,9 @@ fn collects_all_adapters_with_profile_keyed_auth_and_git_identity() {
                 auth_by_profile: vec![("agents".into(), AgentAuth::Authenticated)],
             },
             AgentProbe {
-                autoupdate: Some(mac_worker::agent_facts::AgentAutoUpdate::NotConfigured),
+                autoupdate: Some(
+                    mac_worker::test_support::agents::agent_facts::AgentAutoUpdate::NotConfigured
+                ),
                 name: "opencode".into(),
                 version: Some("1.0.0".into()),
                 auth: AgentAuth::Unauthenticated,
@@ -660,7 +668,7 @@ fn unverified_cursor_login_reaches_facts_and_is_not_an_agent_capability() {
     let observations = SchedulerProbeAdapter::observations(
         &Config {
             version: 1,
-            notifications: mac_worker::config::NotificationsConfig::default(),
+            notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
             controller: Default::default(),
             ssh: Default::default(),
             workers: vec![WorkerEntry {
@@ -1575,7 +1583,7 @@ fn advertised_agent_capabilities(facts: AgentFacts) -> Vec<String> {
     let observations = SchedulerProbeAdapter::observations(
         &Config {
             version: 1,
-            notifications: mac_worker::config::NotificationsConfig::default(),
+            notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
             controller: Default::default(),
             ssh: Default::default(),
             workers: vec![WorkerEntry {

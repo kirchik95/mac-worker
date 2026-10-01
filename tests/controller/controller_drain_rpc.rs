@@ -3,16 +3,18 @@
 
 use std::{io::Cursor, os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
 
-use mac_worker::{
-    config::{Config, ControllerConfig},
+use mac_worker::test_support::{
     controller::{
         ControllerFault, ControllerReadReply, control::drain_via_controller, decode_frame,
         drain::is_drained, encode_json_frame, parse_request, serve_rpc_with_runtime,
     },
-    error::WorkerError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
+    core::{
+        config::{Config, ControllerConfig},
+        error::WorkerError,
+        paths::PathLayout,
+        protocol::PROTOCOL_VERSION,
+    },
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
 };
 use serde_json::{Value, json};
 

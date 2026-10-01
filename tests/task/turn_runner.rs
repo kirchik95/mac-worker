@@ -26,56 +26,62 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::herdr::HerdrSocket;
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
+use mac_worker::test_support::agents::herdr::HerdrSocket;
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, PermissionPolicy},
+        agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe},
+    },
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
-        ClientStateWritePoint,
+        ClientStateWritePoint, scheduler::WorkerPreference,
     },
-    config::{Config, WorkerEntry},
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        protocol::{
+            CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkersReport,
+        },
+    },
     dashboard::{
         service::{DashboardService, SystemClock, SystemMonotonicClock},
         source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
         task::{DashboardTaskSource, MacWorkerTaskSource},
     },
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, HostControlError, JobId, JobMeta, JobState,
-        JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LogChunk,
-        LogChunkRequest, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind,
-        ReplacementFailureBudget, StatusLogsRequest, StatusLogsResponse, StatusRequest,
-        StatusResponse, SubmitResponse,
-    },
-    lease::SlotState,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    protocol::{
-        CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkersReport,
-    },
-    scheduler::WorkerPreference,
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, HostControlError, JobId, JobMeta, JobState,
+            JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LogChunk,
+            LogChunkRequest, LogStream, ProcessIdentity, QueueEntry, QueueEntryKind,
+            ReplacementFailureBudget, StatusLogsRequest, StatusLogsResponse, StatusRequest,
+            StatusResponse, SubmitResponse,
+        },
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
     task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord,
-        RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
-        TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        client::{TaskClient, TaskSubmitRequest, WaitSelector},
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord,
+            RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource,
+            TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{
+            TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest, TaskPrepareResponse,
+            TaskStatusRequest, TaskStatusResponse,
+        },
+        turn::{TaskTurnRequest, TaskTurnResponse},
+        turn_runner::{
+            DetachedRunnerExecutor, InlineRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
+            start_runner_with_reservation,
+        },
     },
-    task_client::{TaskClient, TaskSubmitRequest, WaitSelector},
-    task_store::{
-        TaskCloseRequest, TaskCloseResponse, TaskPrepareRequest, TaskPrepareResponse,
-        TaskStatusRequest, TaskStatusResponse,
-    },
-    transfer::HostOperation,
-    transfer_repo::TransferRepo,
-    turn::{TaskTurnRequest, TaskTurnResponse},
-    turn_runner::{
-        DetachedRunnerExecutor, InlineRunnerExecutor, RunnerExecutor, RunnerStart, TurnRunner,
-        start_runner_with_reservation,
-    },
+    transfer::{HostOperation, repo::TransferRepo},
 };
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
@@ -361,11 +367,9 @@ impl ProcessRunner for ReplayableLogsRunner<'_> {
             let bytes = &self.logs[index];
             let offset = query.offset() as usize;
             let end = bytes.len().min(offset + query.limit() as usize);
-            return canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                query.stream(),
-                query.offset(),
-                bytes[offset..end].to_vec(),
-            )?)?);
+            return canonical_process(&mac_worker::test_support::host::job::LogChunkResponse::new(
+                LogChunk::new(query.stream(), query.offset(), bytes[offset..end].to_vec())?,
+            )?);
         }
         self.inner.run(request)
     }
@@ -745,7 +749,9 @@ fn assert_wait_and_dashboard_keep_undrainable_failure<R: ProcessRunner>(
         std::sync::Arc::clone(&config),
         std::sync::Arc::clone(&store),
         std::sync::Arc::clone(&dashboard_remote)
-            as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+            as std::sync::Arc<
+                dyn mac_worker::test_support::dashboard::source::DashboardRemoteReader,
+            >,
     );
     let detail = tasks.task_detail(fixture.task_id).unwrap();
     assert_eq!(detail.task.state, TaskState::Open);
@@ -764,7 +770,9 @@ fn assert_wait_and_dashboard_keep_undrainable_failure<R: ProcessRunner>(
             std::sync::Arc::new(IdleDashboardWorkers),
             std::sync::Arc::clone(&store),
             dashboard_remote
-                as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+                as std::sync::Arc<
+                    dyn mac_worker::test_support::dashboard::source::DashboardRemoteReader,
+                >,
         ),
         SystemClock,
         SystemMonotonicClock::new(),
@@ -809,7 +817,10 @@ fn adopt_dead_owner_and_reconcile<R: ProcessRunner>(
     fixture: &AcceptedThenTerminalFixture,
     remote: &R,
     dead_owner: ProcessIdentity,
-) -> (ClientStateStore, mac_worker::task_client::ReconcileReport) {
+) -> (
+    ClientStateStore,
+    mac_worker::test_support::task::client::ReconcileReport,
+) {
     fixture
         .state
         .adopt_row(fixture.turn_id, dead_owner)
@@ -948,10 +959,10 @@ impl ClientStateConcurrencyHook for SubmissionIntentClearFailureGate {
 impl RunnerExecutor for ChildAdoptsThenFails {
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         let identity = InlineRunnerExecutor.start(paths, task_id, turn_id)?;
         self.state.adopt_row(turn_id, identity.process_identity())?;
         Err(WorkerError::Protocol(
@@ -996,10 +1007,10 @@ impl AcceptedThenTerminalRunner {
         &self,
         task_id: TaskId,
         terminal: bool,
-    ) -> Result<TaskStatus, mac_worker::error::WorkerError> {
+    ) -> Result<TaskStatus, mac_worker::test_support::core::error::WorkerError> {
         let task = self.task.lock().unwrap();
         let (meta, turn_id) = task.as_ref().ok_or_else(|| {
-            mac_worker::error::WorkerError::Protocol(
+            mac_worker::test_support::core::error::WorkerError::Protocol(
                 "task status requested before task preparation".into(),
             )
         })?;
@@ -1018,7 +1029,7 @@ impl AcceptedThenTerminalRunner {
         );
         turns.push(turn);
         let questions = if outcome == Some(TaskOutcome::NeedsInput) {
-            vec![mac_worker::agent::Question::new(
+            vec![mac_worker::test_support::agents::agent::Question::new(
                 "Which approach?",
                 vec!["Recommended: small change".into(), "Rewrite".into()],
             )]
@@ -1092,7 +1103,7 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         self.requests.lock().unwrap().push(request.clone());
 
         if request.program == OsStr::new("/usr/bin/git") {
@@ -1120,7 +1131,7 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                     environment: Vec::new(),
                     environment_remove: Vec::new(),
                     stdin: None,
-                    policy: mac_worker::process::ProcessPolicy {
+                    policy: mac_worker::test_support::host::process::ProcessPolicy {
                         stdout_limit: 64 * 1024,
                         stderr_limit: 64 * 1024,
                         deadline: Duration::from_secs(5),
@@ -1309,15 +1320,15 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 };
                 canonical_process(&TaskTurnResponse::new(submit, active))
             }
-            value if value == HostOperation::TaskSession.command() => {
-                canonical_process(&mac_worker::task_store::TaskSessionResponse::new(
-                    mac_worker::task_store::SessionBinding::new(
+            value if value == HostOperation::TaskSession.command() => canonical_process(
+                &mac_worker::test_support::task::store::TaskSessionResponse::new(
+                    mac_worker::test_support::task::store::SessionBinding::new(
                         AgentKind::Codex,
                         "018f0f4a-6b5c-7d8e-9f00-112233445566",
                         1,
                     )?,
-                ))
-            }
+                ),
+            ),
             value if value == HostOperation::Status.command() => {
                 fixture_terminal_job(&self.requests(), request, 13, 0)
             }
@@ -1332,11 +1343,9 @@ impl ProcessRunner for AcceptedThenTerminalRunner {
                 } else {
                     Vec::new()
                 };
-                let response = mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                    chunk_request.stream(),
-                    chunk_request.offset(),
-                    bytes,
-                )?)?;
+                let response = mac_worker::test_support::host::job::LogChunkResponse::new(
+                    LogChunk::new(chunk_request.stream(), chunk_request.offset(), bytes)?,
+                )?;
                 canonical_process(&response)
             }
             value if value == HostOperation::StatusLogs.command() => {
@@ -1388,7 +1397,7 @@ struct AcceptedThenTerminalFixture {
     _repo: support::GitRepo,
     _current_dir: CurrentDirGuard,
     state_root: tempfile::TempDir,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     state: ClientStateStore,
     config: Config,
     runner: AcceptedThenTerminalRunner,
@@ -1568,7 +1577,10 @@ impl AcceptedThenTerminalFixture {
     fn run(
         &self,
         follower: &mut dyn Write,
-    ) -> Result<mac_worker::turn_runner::TurnOutcomeReport, mac_worker::error::WorkerError> {
+    ) -> Result<
+        mac_worker::test_support::task::turn_runner::TurnOutcomeReport,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
         TurnRunner::new(
             &self.runner,
             &self.config,
@@ -1603,7 +1615,7 @@ fn successful_submission_reports_the_handed_off_runner() {
 
 #[test]
 fn questions_submit_resolves_flag_over_project_over_default() {
-    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    use mac_worker::test_support::task::model::QuestionsPolicy::{Ask, Decide};
     let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for (project_policy, flag, expected) in [
         (None, None, Decide),
@@ -1652,7 +1664,7 @@ fn questions_submit_resolves_flag_over_project_over_default() {
 }
 
 fn questions_fixture(
-    policy: mac_worker::task::QuestionsPolicy,
+    policy: mac_worker::test_support::task::model::QuestionsPolicy,
     outcome: TaskOutcome,
     budget: u32,
 ) -> AcceptedThenTerminalFixture {
@@ -1683,10 +1695,10 @@ struct QuestionsAttachedExecutor<'a> {
 impl RunnerExecutor for QuestionsAttachedExecutor<'_> {
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task: TaskId,
         turn: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         let record = self.state.load_task(task)?;
         if record
             .status()
@@ -1748,9 +1760,9 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
         let client = TaskClient::new(&runner, &config, &paths, &state, &executor);
         let mut request = submit_request(repo.root(), None, WorkerPreference::Automatic, true);
         request.questions = Some(if mode == "submit" {
-            mac_worker::task::QuestionsPolicy::Decide
+            mac_worker::test_support::task::model::QuestionsPolicy::Decide
         } else {
-            mac_worker::task::QuestionsPolicy::Ask
+            mac_worker::test_support::task::model::QuestionsPolicy::Ask
         });
         request.attached = mode == "submit";
         let report = thread::scope(|scope| {
@@ -1812,10 +1824,9 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
                 TurnRunner::new(&runner, &config, &paths, &state, &executor)
                     .run(task, first, None)
                     .unwrap();
-                let expected = state
-                    .load_task(task)
-                    .unwrap()
-                    .with_questions_policy(mac_worker::task::QuestionsPolicy::Decide);
+                let expected = state.load_task(task).unwrap().with_questions_policy(
+                    mac_worker::test_support::task::model::QuestionsPolicy::Decide,
+                );
                 state.replace_task_fixture(expected.clone()).unwrap();
                 if mode == "say" {
                     client.say(
@@ -1826,7 +1837,7 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
                         &mut Vec::new(),
                     )
                 } else {
-                    let prepared = mac_worker::prepared_followup::PreparedFollowup::prepare(
+                    let prepared = mac_worker::test_support::task::prepared_followup::PreparedFollowup::prepare(
                         &expected,
                         "human follow-up".into(),
                         TurnId::generate(),
@@ -1900,7 +1911,7 @@ fn questions_assert_attached_wait(modes: &[&str], automatic_outcome: TaskOutcome
 fn questions_auto_continues_once_detached_with_questions_and_same_session() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2002,7 +2013,7 @@ fn questions_auto_continues_once_detached_with_questions_and_same_session() {
 
 #[test]
 fn questions_auto_skips_ask_other_outcomes_and_exhausted_budget() {
-    use mac_worker::task::QuestionsPolicy::{Ask, Decide};
+    use mac_worker::test_support::task::model::QuestionsPolicy::{Ask, Decide};
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for (policy, outcome, budget) in [
         (Ask, TaskOutcome::NeedsInput, 10),
@@ -2033,7 +2044,7 @@ fn questions_auto_skips_ask_other_outcomes_and_exhausted_budget() {
 fn questions_auto_retries_terminal_cleanup_without_duplicate_continuation() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2071,7 +2082,7 @@ fn questions_auto_retries_terminal_cleanup_without_duplicate_continuation() {
 fn questions_auto_prompt_failure_keeps_finished_turn_open_and_logs_only_code() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2154,7 +2165,7 @@ impl ClientStateConcurrencyHook for QuestionsStagingFailure {
 fn questions_auto_staging_failure_does_not_create_unprepared_journal() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2210,10 +2221,10 @@ fn questions_auto_staging_failure_does_not_create_unprepared_journal() {
 impl RunnerExecutor for QuestionsSpawnFailure {
     fn start(
         &self,
-        _: &mac_worker::paths::PathLayout,
+        _: &mac_worker::test_support::core::paths::PathLayout,
         _: TaskId,
         _: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         Err(WorkerError::Protocol(
             "private spawn error must not escape".into(),
         ))
@@ -2227,20 +2238,20 @@ struct QuestionsBoundChildFailure {
 impl RunnerExecutor for QuestionsBoundChildFailure {
     fn start(
         &self,
-        _: &mac_worker::paths::PathLayout,
+        _: &mac_worker::test_support::core::paths::PathLayout,
         _: TaskId,
         _: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         unreachable!("automatic continuation must reserve a slot")
     }
 
     fn start_with_slot(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
         token: Option<uuid::Uuid>,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         // Simulate the post-bind failure before complete_runner_spawn has
         // published child ownership or runner metadata. No real child runs.
         self.state.bind_runner_slot_child(
@@ -2258,7 +2269,7 @@ impl RunnerExecutor for QuestionsBoundChildFailure {
 fn questions_auto_post_bind_failure_preserves_child_reservation() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2309,7 +2320,7 @@ fn questions_auto_post_bind_failure_preserves_child_reservation() {
 fn questions_auto_spawn_failure_restores_open_finished_turn() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2348,7 +2359,7 @@ fn questions_auto_spawn_failure_restores_open_finished_turn() {
 fn questions_auto_reconcile_completed_dead_runner_starts_one_continuation() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2391,7 +2402,7 @@ impl ClientStateConcurrencyHook for QuestionsRetirementFault {
 
 fn questions_pending_intent_fixture() -> AcceptedThenTerminalFixture {
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         10,
     );
@@ -2441,7 +2452,7 @@ fn questions_auto_recovers_after_finished_row_retirement_crash() {
     assert_eq!(finished.status().state(), TaskState::Open);
     assert_eq!(finished.status().turns().len(), 1);
     let wire = serde_json::to_value(&finished).unwrap();
-    let prepared: mac_worker::prepared_followup::PreparedFollowup =
+    let prepared: mac_worker::test_support::task::prepared_followup::PreparedFollowup =
         serde_json::from_value(wire["auto_continue_intent"].clone()).unwrap();
     // Recreate a later crash boundary too: evidence durable, Active CAS absent.
     reopened
@@ -2504,10 +2515,11 @@ fn questions_human_say_overrides_pending_intent_before_reconciliation() {
     for prepared_path in [false, true] {
         let fixture = questions_pending_intent_fixture();
         let before = fixture.state.load_task(fixture.task_id).unwrap();
-        let automatic: mac_worker::prepared_followup::PreparedFollowup = serde_json::from_value(
-            serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
-        )
-        .unwrap();
+        let automatic: mac_worker::test_support::task::prepared_followup::PreparedFollowup =
+            serde_json::from_value(
+                serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
+            )
+            .unwrap();
         let client = TaskClient::new(
             &fixture.runner,
             &fixture.config,
@@ -2544,13 +2556,14 @@ fn questions_human_say_overrides_pending_intent_before_reconciliation() {
         assert_eq!(fixture.state.load_task(fixture.task_id).unwrap(), before);
         drop(held);
         let report = if prepared_path {
-            let prepared = mac_worker::prepared_followup::PreparedFollowup::prepare(
-                &before,
-                "Use the human's answer".into(),
-                TurnId::generate(),
-                before.status().updated_at_millis() + 1,
-            )
-            .unwrap();
+            let prepared =
+                mac_worker::test_support::task::prepared_followup::PreparedFollowup::prepare(
+                    &before,
+                    "Use the human's answer".into(),
+                    TurnId::generate(),
+                    before.status().updated_at_millis() + 1,
+                )
+                .unwrap();
             client.say_prepared(&prepared, false, &mut Vec::new(), &mut Vec::new())
         } else {
             client.say(
@@ -2600,10 +2613,11 @@ fn questions_human_cancel_clears_pending_intent_and_fences_stale_automatic_say()
     for expected_path in [false, true] {
         let fixture = questions_pending_intent_fixture();
         let before = fixture.state.load_task(fixture.task_id).unwrap();
-        let automatic: mac_worker::prepared_followup::PreparedFollowup = serde_json::from_value(
-            serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
-        )
-        .unwrap();
+        let automatic: mac_worker::test_support::task::prepared_followup::PreparedFollowup =
+            serde_json::from_value(
+                serde_json::to_value(&before).unwrap()["auto_continue_intent"].clone(),
+            )
+            .unwrap();
         let client = TaskClient::new(
             &fixture.runner,
             &fixture.config,
@@ -2686,7 +2700,7 @@ fn questions_human_say_racing_after_materialization_is_busy_without_duplicate() 
 fn questions_auto_done_closes_only_after_continuation_and_keeps_dag_waiting_until_then() {
     let _lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = questions_fixture(
-        mac_worker::task::QuestionsPolicy::Decide,
+        mac_worker::test_support::task::model::QuestionsPolicy::Decide,
         TaskOutcome::NeedsInput,
         1,
     );
@@ -2694,8 +2708,8 @@ fn questions_auto_done_closes_only_after_continuation_and_keeps_dag_waiting_unti
     let pending = fixture.state.load_task(fixture.task_id).unwrap();
     assert_eq!(pending.status().state(), TaskState::Active);
     assert_eq!(
-        mac_worker::dag::parent_gate(&pending),
-        mac_worker::dag::ParentGate::Waiting
+        mac_worker::test_support::client_state::dag::parent_gate(&pending),
+        mac_worker::test_support::client_state::dag::ParentGate::Waiting
     );
     *fixture.runner.next_outcome.lock().unwrap() = Some(TaskOutcome::Done);
     TurnRunner::new(
@@ -2716,8 +2730,8 @@ fn questions_auto_done_closes_only_after_continuation_and_keeps_dag_waiting_unti
     );
     assert_eq!(finished.status().turns().len(), 2);
     assert_eq!(
-        mac_worker::dag::parent_gate(&finished),
-        mac_worker::dag::ParentGate::Ready
+        mac_worker::test_support::client_state::dag::parent_gate(&finished),
+        mac_worker::test_support::client_state::dag::ParentGate::Ready
     );
 }
 
@@ -2981,10 +2995,13 @@ impl ProcessRunner for ParkedRecoveryRemote<'_> {
             .last()
             .is_some_and(|arg| arg == HostOperation::TaskCancel.command())
         {
-            let cancel: mac_worker::task_store::TaskCancelRequest = decode_request(request)?;
-            return canonical_process(&mac_worker::task_store::TaskCancelResponse::new(
-                self.inner.inner.task_status(cancel.task_id(), false)?,
-            ));
+            let cancel: mac_worker::test_support::task::store::TaskCancelRequest =
+                decode_request(request)?;
+            return canonical_process(
+                &mac_worker::test_support::task::store::TaskCancelResponse::new(
+                    self.inner.inner.task_status(cancel.task_id(), false)?,
+                ),
+            );
         }
         let recovering = self.recovering.load(Ordering::SeqCst);
         let on_b = request.args.iter().any(|arg| arg == "mac2");
@@ -3035,10 +3052,10 @@ struct RefuseRecoverySpawn;
 impl RunnerExecutor for RefuseRecoverySpawn {
     fn start(
         &self,
-        _: &mac_worker::paths::PathLayout,
+        _: &mac_worker::test_support::core::paths::PathLayout,
         _: TaskId,
         _: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         Err(WorkerError::Io(io::Error::other(
             "simulated replacement spawn failure",
         )))
@@ -3099,7 +3116,7 @@ fn assert_accepted_turn_recovers_from_park(
                 ReplacementFailureBudget::new(
                     1,
                     "SSH_LAUNCH_FAILED".into(),
-                    mac_worker::job::REPLACEMENT_FAILURE_PARK_AFTER,
+                    mac_worker::test_support::host::job::REPLACEMENT_FAILURE_PARK_AFTER,
                 )
                 .unwrap(),
             ),
@@ -3131,7 +3148,7 @@ fn assert_accepted_turn_recovers_from_park(
             .unwrap()
             .unwrap()
             .state(),
-        mac_worker::job::QueueState::Parked
+        mac_worker::test_support::host::job::QueueState::Parked
     ));
     match action {
         ParkedRecoveryAction::Resume => {}
@@ -3678,7 +3695,9 @@ fn recovery_records_log_drain_unavailable_when_the_worker_job_is_gone() {
         std::sync::Arc::clone(&config),
         std::sync::Arc::clone(&store),
         std::sync::Arc::clone(&dashboard_remote)
-            as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+            as std::sync::Arc<
+                dyn mac_worker::test_support::dashboard::source::DashboardRemoteReader,
+            >,
     );
     let detail = tasks.task_detail(fixture.task_id).unwrap();
     assert_eq!(detail.task.state, TaskState::Open);
@@ -3697,7 +3716,9 @@ fn recovery_records_log_drain_unavailable_when_the_worker_job_is_gone() {
             std::sync::Arc::new(IdleDashboardWorkers),
             std::sync::Arc::clone(&store),
             dashboard_remote
-                as std::sync::Arc<dyn mac_worker::dashboard::source::DashboardRemoteReader>,
+                as std::sync::Arc<
+                    dyn mac_worker::test_support::dashboard::source::DashboardRemoteReader,
+                >,
         ),
         SystemClock,
         SystemMonotonicClock::new(),
@@ -3915,7 +3936,7 @@ fn origin_source_skips_push_base_receive_pack() {
 
 fn assert_remote_turn_completed(
     fixture: &AcceptedThenTerminalFixture,
-    outcome: &mac_worker::turn_runner::TurnOutcomeReport,
+    outcome: &mac_worker::test_support::task::turn_runner::TurnOutcomeReport,
 ) {
     assert_eq!(outcome.status().state(), TaskState::Closed);
     assert_eq!(outcome.status().last_outcome(), Some(&TaskOutcome::Done));
@@ -3995,7 +4016,7 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
             AdmissionObservation::new(
                 worker.name.clone(),
                 true,
-                mac_worker::scheduler::CandidateSlot::Idle,
+                mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
                 vec!["darwin-arm64".into()],
                 Some(12 * 1024 * 1024 * 1024),
                 100 * 1024 * 1024 * 1024,
@@ -4025,9 +4046,11 @@ fn runner_refreshes_stale_agent_facts_before_claiming() {
     let cached = fixture
         .state
         .admission_observation("mini-1", query_now, || {
-            Err(mac_worker::error::WorkerError::Protocol(
-                "refreshed facts were not cached".into(),
-            ))
+            Err(
+                mac_worker::test_support::core::error::WorkerError::Protocol(
+                    "refreshed facts were not cached".into(),
+                ),
+            )
         })
         .unwrap();
     assert!(
@@ -4104,7 +4127,7 @@ fn plant_bound_mini1_ready(state: &ClientStateStore, capabilities: Vec<String>) 
             AdmissionObservation::new(
                 "mini-1".into(),
                 true,
-                mac_worker::scheduler::CandidateSlot::Idle,
+                mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
                 capabilities,
                 Some(8 * 1024 * 1024 * 1024),
                 64 * 1024 * 1024 * 1024,
@@ -4155,11 +4178,13 @@ struct FixedTaskExecutor(ProcessIdentity);
 impl RunnerExecutor for FixedTaskExecutor {
     fn start(
         &self,
-        _: &mac_worker::paths::PathLayout,
+        _: &mac_worker::test_support::core::paths::PathLayout,
         _: TaskId,
         _: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
-        Ok(mac_worker::task::RunnerIdentity::new(self.0))
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
+        Ok(mac_worker::test_support::task::model::RunnerIdentity::new(
+            self.0,
+        ))
     }
 }
 
@@ -4168,10 +4193,10 @@ struct CountedInlineExecutor(Mutex<Vec<(TaskId, TurnId)>>);
 impl RunnerExecutor for CountedInlineExecutor {
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task: TaskId,
         turn: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         self.0.lock().unwrap().push((task, turn));
         InlineRunnerExecutor.start(paths, task, turn)
     }
@@ -4290,7 +4315,9 @@ fn saturated_pool(
         .state
         .record_runner(
             fixture.task_id,
-            Some(mac_worker::task::RunnerIdentity::new(active_owner)),
+            Some(mac_worker::test_support::task::model::RunnerIdentity::new(
+                active_owner,
+            )),
         )
         .unwrap();
     fixture
@@ -4318,7 +4345,7 @@ fn saturated_pool(
             .unwrap()
             .unwrap()
             .state(),
-        mac_worker::job::QueueState::Parked
+        mac_worker::test_support::host::job::QueueState::Parked
     ));
     *fixture.runner.facts_fresh.lock().unwrap() = true;
     (donor, recipient)
@@ -4477,7 +4504,7 @@ fn attached_waiter_keeps_following_the_requested_turn() {
             .unwrap()
             .unwrap()
             .state(),
-        mac_worker::job::QueueState::Parked
+        mac_worker::test_support::host::job::QueueState::Parked
     ));
     assert!(!fixture.runner.requests().iter().any(|request| {
         request
@@ -4509,16 +4536,18 @@ fn interrupted_legacy_reassignment_recovers_from_an_unrelated_working_directory(
         .state
         .record_runner(
             donor.0,
-            Some(mac_worker::task::RunnerIdentity::new(crashed_owner)),
+            Some(mac_worker::test_support::task::model::RunnerIdentity::new(
+                crashed_owner,
+            )),
         )
         .unwrap();
     let unrelated = tempfile::tempdir().unwrap();
     let _cwd = CurrentDirGuard::enter(unrelated.path());
     let observations = vec![
-        mac_worker::scheduler::CandidateObservation::new(
+        mac_worker::test_support::client_state::scheduler::CandidateObservation::new(
             "mini-2".into(),
             true,
-            mac_worker::scheduler::CandidateSlot::Idle,
+            mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
             vec!["agent:codex".into(), "darwin-arm64".into()],
             Some(16 << 30),
             64 << 30,
@@ -4614,7 +4643,7 @@ fn assert_automatic_admission_survives(failure: AdmissionFailure) {
                 AdmissionObservation::new(
                     "mini-2".into(),
                     true,
-                    mac_worker::scheduler::CandidateSlot::Idle,
+                    mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
                     vec!["agent:codex".into(), "darwin-arm64".into()],
                     Some(12 * 1024 * 1024 * 1024),
                     100 * 1024 * 1024 * 1024,
@@ -4889,10 +4918,13 @@ impl FetchFailingRunner {
         self.requests.lock().unwrap().clone()
     }
 
-    fn task_status(&self, task_id: TaskId) -> Result<TaskStatus, mac_worker::error::WorkerError> {
+    fn task_status(
+        &self,
+        task_id: TaskId,
+    ) -> Result<TaskStatus, mac_worker::test_support::core::error::WorkerError> {
         let task = self.task.lock().unwrap();
         let (meta, turn_id) = task.as_ref().ok_or_else(|| {
-            mac_worker::error::WorkerError::Protocol(
+            mac_worker::test_support::core::error::WorkerError::Protocol(
                 "task status requested before task preparation".into(),
             )
         })?;
@@ -4926,7 +4958,7 @@ impl ProcessRunner for FetchFailingRunner {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         self.requests.lock().unwrap().push(request.clone());
 
         if request.program == OsStr::new("/usr/bin/git") {
@@ -5048,11 +5080,9 @@ impl ProcessRunner for FetchFailingRunner {
             }
             value if value == HostOperation::LogChunk.command() => {
                 let query: LogChunkRequest = decode_request(request)?;
-                canonical_process(&mac_worker::job::LogChunkResponse::new(LogChunk::new(
-                    query.stream(),
-                    query.offset(),
-                    vec![],
-                )?)?)
+                canonical_process(&mac_worker::test_support::host::job::LogChunkResponse::new(
+                    LogChunk::new(query.stream(), query.offset(), vec![])?,
+                )?)
             }
             value if value == HostOperation::StatusLogs.command() => {
                 Ok(clap_unrecognized_subcommand("status-logs"))
@@ -5086,18 +5116,23 @@ impl ProcessRunner for FetchFailingRunner {
 
 fn decode_request<T: serde::de::DeserializeOwned>(
     request: &ProcessRequest,
-) -> Result<T, mac_worker::error::WorkerError> {
+) -> Result<T, mac_worker::test_support::core::error::WorkerError> {
     serde_json::from_slice(request.stdin.as_deref().ok_or_else(|| {
-        mac_worker::error::WorkerError::Protocol("worker request had no stdin".into())
+        mac_worker::test_support::core::error::WorkerError::Protocol(
+            "worker request had no stdin".into(),
+        )
     })?)
-    .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))
+    .map_err(|error| {
+        mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+    })
 }
 
 fn canonical_process<T: serde::Serialize>(
     value: &T,
-) -> Result<ProcessResult, mac_worker::error::WorkerError> {
-    let mut stdout = serde_json::to_vec(value)
-        .map_err(|error| mac_worker::error::WorkerError::Protocol(error.to_string()))?;
+) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
+    let mut stdout = serde_json::to_vec(value).map_err(|error| {
+        mac_worker::test_support::core::error::WorkerError::Protocol(error.to_string())
+    })?;
     stdout.push(b'\n');
     Ok(ProcessResult {
         status: ExitStatus::from_raw(0),
@@ -5193,7 +5228,12 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
                 .any(|arg| arg.to_string_lossy().starts_with("--upload-pack="))
     }));
 
-    let project = mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+    let project = mac_worker::test_support::task::project_state::ProjectState::load(
+        &runner,
+        repo.root(),
+        &[],
+    )
+    .unwrap();
     {
         let transfer =
             TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
@@ -5770,8 +5810,12 @@ fn assert_submit_rolls_back_post_create_state(
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
-        let project =
-            mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+        let project = mac_worker::test_support::task::project_state::ProjectState::load(
+            &runner,
+            repo.root(),
+            &[],
+        )
+        .unwrap();
         let transfer =
             TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
         let base_refs = process::Command::new("/usr/bin/git")
@@ -5803,8 +5847,12 @@ fn assert_submit_rolls_back_post_create_state(
                     .publish_branches()
                     .is_empty()
             );
-            let project =
-                mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+            let project = mac_worker::test_support::task::project_state::ProjectState::load(
+                &runner,
+                repo.root(),
+                &[],
+            )
+            .unwrap();
             {
                 let transfer =
                     TransferRepo::open_or_create(&paths.cache, &project.context.common_dir)
@@ -5866,8 +5914,12 @@ fn assert_submit_rolls_back_post_create_state(
                     .publish_branches()
                     .is_empty()
             );
-            let project =
-                mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+            let project = mac_worker::test_support::task::project_state::ProjectState::load(
+                &runner,
+                repo.root(),
+                &[],
+            )
+            .unwrap();
             let transfer =
                 TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
             assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{}", task.meta().task_id())));
@@ -6401,8 +6453,12 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
         assert!(retained.runner().is_some());
         let entry = state.queue_entry_for_task_turn(task_id).unwrap().unwrap();
         assert!(state.read_turn_prompt(task_id, entry.job_id()).is_ok());
-        let project =
-            mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+        let project = mac_worker::test_support::task::project_state::ProjectState::load(
+            &runner,
+            repo.root(),
+            &[],
+        )
+        .unwrap();
         let transfer =
             TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
         assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
@@ -6712,7 +6768,12 @@ fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     assert_eq!(turn_entries, vec![".mac-worker-rooted-fs"]);
-    let project = mac_worker::project_state::ProjectState::load(&runner, repo.root(), &[]).unwrap();
+    let project = mac_worker::test_support::task::project_state::ProjectState::load(
+        &runner,
+        repo.root(),
+        &[],
+    )
+    .unwrap();
     let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
     assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
 }
@@ -6777,9 +6838,12 @@ fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
     let entry = state.queue_entry_for_task_turn(task_id).unwrap().unwrap();
     assert!(entry.owner_opt().is_some());
     assert!(state.read_turn_prompt(task_id, entry.job_id()).is_ok());
-    let project =
-        mac_worker::project_state::ProjectState::load(&SystemProcessRunner, repo.root(), &[])
-            .unwrap();
+    let project = mac_worker::test_support::task::project_state::ProjectState::load(
+        &SystemProcessRunner,
+        repo.root(),
+        &[],
+    )
+    .unwrap();
     let transfer = TransferRepo::open_or_create(&paths.cache, &project.context.common_dir).unwrap();
     assert!(transfer.has_ref(&format!("refs/mac-worker/bases/{task_id}")));
 }
@@ -7231,7 +7295,7 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
             .expect("runner encountered refresh fence before admission");
         assert!(matches!(
             state.queue_entry(fixture.turn_id).unwrap().unwrap().state(),
-            mac_worker::job::QueueState::Waiting { .. }
+            mac_worker::test_support::host::job::QueueState::Waiting { .. }
         ));
         release_refresh.release();
         refresh.join().unwrap().unwrap();
@@ -7272,7 +7336,9 @@ fn runner_refresh_contention(ownership_change: Option<bool>) {
             state
                 .record_runner(
                     fixture.task_id,
-                    Some(mac_worker::task::RunnerIdentity::new(replacement_owner)),
+                    Some(mac_worker::test_support::task::model::RunnerIdentity::new(
+                        replacement_owner,
+                    )),
                 )
                 .unwrap();
         }
@@ -7351,7 +7417,7 @@ fn runner_parent_publication_contention(revoke_token: bool) {
         .owner_opt()
         .unwrap();
     state.record_runner(fixture.task_id, None).unwrap();
-    let mac_worker::client_state::RunnerSlotDecision::Acquired { token } = state
+    let mac_worker::test_support::client_state::RunnerSlotDecision::Acquired { token } = state
         .reserve_runner_slot(fixture.turn_id, owner, 8, false)
         .unwrap()
     else {
@@ -7405,7 +7471,7 @@ fn runner_parent_publication_contention(revoke_token: bool) {
                 .reserve_runner_slot(fixture.turn_id, owner, 8, false)
                 .unwrap();
             assert!(matches!(replacement,
-                mac_worker::client_state::RunnerSlotDecision::Acquired { token: replacement }
+                mac_worker::test_support::client_state::RunnerSlotDecision::Acquired { token: replacement }
                 if replacement != token));
         }
         drop(held);
@@ -7486,12 +7552,12 @@ struct HoldJournalAfterSpawn {
 impl RunnerExecutor for HoldJournalAfterSpawn {
     fn start_with_slot_until(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
         _slot_token: Option<uuid::Uuid>,
         deadline: Option<Instant>,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         assert!(
             deadline.is_some_and(|deadline| deadline > Instant::now()),
             "fixture must reach the executor before its wait budget expires"
@@ -7502,10 +7568,10 @@ impl RunnerExecutor for HoldJournalAfterSpawn {
 
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         let file = fs::OpenOptions::new().append(true).open(
             paths
                 .state
@@ -7813,7 +7879,8 @@ impl ProcessRunner for DelayedProjectionRemote<'_> {
         let operation = request.args.last().and_then(|arg| arg.to_str());
         if operation == Some(HostOperation::TaskCancel.command()) {
             self.cancelled.store(true, Ordering::SeqCst);
-            let response = mac_worker::task_store::TaskCancelResponse::new(self.terminal());
+            let response =
+                mac_worker::test_support::task::store::TaskCancelResponse::new(self.terminal());
             self.delay_response();
             return canonical_process(&response);
         }
@@ -8104,7 +8171,7 @@ fn delayed_idle_refresh_propagates_current_record_corruption() {
 
 fn runner_with_notifier<'a>(
     fixture: &'a AcceptedThenTerminalFixture,
-    config: &'a mac_worker::config::Config,
+    config: &'a mac_worker::test_support::core::config::Config,
     socket: Option<HerdrSocket>,
 ) -> TurnRunner<'a> {
     TurnRunner::new(
@@ -8330,7 +8397,9 @@ fn reconcile_does_not_restart_a_fixture_turn_while_its_post_acceptance_backoff_i
         .state
         .record_runner(
             fixture.task_id,
-            Some(mac_worker::task::RunnerIdentity::new(dead_owner)),
+            Some(mac_worker::test_support::task::model::RunnerIdentity::new(
+                dead_owner,
+            )),
         )
         .unwrap();
     let (store, first) = adopt_dead_owner_and_reconcile(&fixture, &fixture.runner, dead_owner);
@@ -8532,7 +8601,7 @@ fn a_runner_for_a_row_held_by_another_identity_stops_after_the_adoption_wait() {
     assert_eq!(entry.owner_opt(), Some(&foreign));
     assert!(matches!(
         entry.state(),
-        mac_worker::job::QueueState::Waiting { .. }
+        mac_worker::test_support::host::job::QueueState::Waiting { .. }
     ));
     let log = String::from_utf8(fixture.runner_log()).unwrap();
     let line = log.lines().next().unwrap_or_default();
@@ -8842,7 +8911,7 @@ fn submit_does_not_reuse_a_future_bound_probe_timestamp() {
             AdmissionObservation::new(
                 worker.name.clone(),
                 true,
-                mac_worker::scheduler::CandidateSlot::Idle,
+                mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
                 vec!["darwin-arm64".into(), "agent:codex".into()],
                 Some(10),
                 20,
@@ -8912,7 +8981,7 @@ fn submit_reuses_a_bound_negative_without_facts() {
             AdmissionObservation::new(
                 worker.name.clone(),
                 false,
-                mac_worker::scheduler::CandidateSlot::Busy,
+                mac_worker::test_support::client_state::scheduler::CandidateSlot::Busy,
                 Vec::new(),
                 None,
                 0,
@@ -9052,7 +9121,7 @@ fn slow_offline_peer_does_not_erase_healthy_warm_eligibility() {
             AdmissionObservation::new(
                 worker.name.clone(),
                 true,
-                mac_worker::scheduler::CandidateSlot::Idle,
+                mac_worker::test_support::client_state::scheduler::CandidateSlot::Idle,
                 vec![
                     "darwin-arm64".into(),
                     "origin:example.test".into(),
@@ -9274,20 +9343,20 @@ impl PausingSlotExecutor {
 impl RunnerExecutor for PausingSlotExecutor {
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         InlineRunnerExecutor.start(paths, task_id, turn_id)
     }
 
     fn start_with_slot(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
         slot_token: Option<uuid::Uuid>,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         // Only the first call pauses: it is the submitter reaching handoff.
         // Any later call (e.g. an unexpected background start) delegates
         // straight through so it is counted, never gated.
@@ -9440,7 +9509,7 @@ fn hold_published_journal_flock(state_root: &Path, task_id: TaskId, turn_id: Tur
 
 fn journal_paths(
     state_root: &Path,
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     task_id: TaskId,
     turn_id: TurnId,
 ) -> (PathBuf, PathBuf) {
@@ -9478,20 +9547,20 @@ impl PreSpawnJournalExecutor {
 impl RunnerExecutor for PreSpawnJournalExecutor {
     fn start(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         self.start_with_slot(paths, task_id, turn_id, None)
     }
 
     fn start_with_slot(
         &self,
-        paths: &mac_worker::paths::PathLayout,
+        paths: &mac_worker::test_support::core::paths::PathLayout,
         task_id: TaskId,
         turn_id: TurnId,
         slot_token: Option<uuid::Uuid>,
-    ) -> Result<mac_worker::task::RunnerIdentity, WorkerError> {
+    ) -> Result<mac_worker::test_support::task::model::RunnerIdentity, WorkerError> {
         if self.starts.load(Ordering::SeqCst) == 0 {
             self.gate.arrive_and_wait();
         }
@@ -9506,7 +9575,7 @@ struct HandoffSubmitSetup {
     _current_dir: CurrentDirGuard,
     _repo: support::GitRepo,
     state_root: tempfile::TempDir,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     state: ClientStateStore,
     config: Config,
     remote: AcceptedThenTerminalRunner,
@@ -9565,7 +9634,7 @@ fn assert_completed_handoff(
     state: &ClientStateStore,
     executor_starts: usize,
     state_root: &Path,
-    paths: &mac_worker::paths::PathLayout,
+    paths: &mac_worker::test_support::core::paths::PathLayout,
     task_id: TaskId,
     turn_id: TurnId,
 ) {

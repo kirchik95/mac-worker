@@ -16,9 +16,9 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::ClientStateStore,
-    config::Config,
+    core::{config::Config, error::WorkerError, paths::PathLayout},
     dashboard::{
         model::{ApiError, DashboardError, DashboardLogChunk},
         service::{
@@ -30,19 +30,21 @@ use mac_worker::{
         },
         web::{DashboardHttpServer, DashboardHttpState},
     },
-    error::WorkerError,
-    job::{JobId, LogStream, ProcessIdentity},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    task::{
-        LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
-        TurnSummary, TurnTerminal,
+    host::{
+        job::{JobId, LogStream, ProcessIdentity},
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     },
-    task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
-    task_view::{ReviewState, TaskDetailProjection},
+    task::{
+        model::{
+            LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus, TurnId,
+            TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
+        turn_runner::RunnerExecutor,
+        view::{ReviewState, TaskDetailProjection},
+    },
     transfer::HostOperation,
-    turn_runner::RunnerExecutor,
 };
 use uuid::Uuid;
 
@@ -252,32 +254,37 @@ fn open_done_record_for_project(
 ) -> LocalTaskRecord {
     // Keep this fixture aligned with tests/task/task_review.rs so dashboard
     // mutations exercise the same Open+done review record.
-    let base_oid: mac_worker::task::BaseOid = "a".repeat(40).parse().unwrap();
-    let meta = mac_worker::task::TaskMeta::new(mac_worker::task::TaskMetaInput {
-        task_id,
-        run_id: None,
-        project_id,
-        worktree_id,
-        agent: mac_worker::agent::AgentKind::Codex,
-        model: None,
-        effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
-        source: mac_worker::task::TaskSource::Local {
-            wip: false,
-            push_target: None,
-        },
-        publish: vec![mac_worker::task::PublishMode::Fetch],
-        publish_branch: None,
-        base_oid: base_oid.clone(),
-        limits: mac_worker::task::TaskLimits::default(),
-        close_policy: mac_worker::task::ClosePolicy::Never,
-        env_profile: None,
-        git_identity: mac_worker::task::GitIdentity::new("mac-worker", "mac-worker@example.test")
+    let base_oid: mac_worker::test_support::task::model::BaseOid = "a".repeat(40).parse().unwrap();
+    let meta = mac_worker::test_support::task::model::TaskMeta::new(
+        mac_worker::test_support::task::model::TaskMetaInput {
+            task_id,
+            run_id: None,
+            project_id,
+            worktree_id,
+            agent: mac_worker::test_support::agents::agent::AgentKind::Codex,
+            model: None,
+            effort: None,
+            policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
+            source: mac_worker::test_support::task::model::TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![mac_worker::test_support::task::model::PublishMode::Fetch],
+            publish_branch: None,
+            base_oid: base_oid.clone(),
+            limits: mac_worker::test_support::task::model::TaskLimits::default(),
+            close_policy: mac_worker::test_support::task::model::ClosePolicy::Never,
+            env_profile: None,
+            git_identity: mac_worker::test_support::task::model::GitIdentity::new(
+                "mac-worker",
+                "mac-worker@example.test",
+            )
             .unwrap(),
-        title: None,
-        prompt: "fixture task".into(),
-        created_at_millis: 1,
-    })
+            title: None,
+            prompt: "fixture task".into(),
+            created_at_millis: 1,
+        },
+    )
     .unwrap();
     let turn = TurnSummary::new(
         1,
@@ -503,7 +510,8 @@ impl DashboardDataSource for EmptyDashboardSource {
 
     fn queue_entries(
         &self,
-    ) -> Result<Vec<mac_worker::dashboard::model::DashboardQueueEntry>, DashboardError> {
+    ) -> Result<Vec<mac_worker::test_support::dashboard::model::DashboardQueueEntry>, DashboardError>
+    {
         Ok(Vec::new())
     }
 }

@@ -11,18 +11,21 @@ use std::{
     thread,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, TurnLimits},
     client_state::{
         ActiveTaskConfig, ClientStateStore, ClientStateWritePoint, RunnerSlotDecision,
-        task_record_needs_active_index,
+        scheduler::WorkerPreference, task_record_needs_active_index,
     },
-    job::{CommandSummary, JobId, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference},
-    scheduler::WorkerPreference,
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+    host::{
+        job::{
+            CommandSummary, JobId, ProcessIdentity, QueueEntry, QueueEntryKind, QueueRunReference,
+        },
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
     },
-    task::{
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId as TaskRunId, RunnerIdentity,
         TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
         TaskStatus, TurnSummary,
@@ -49,7 +52,7 @@ impl ProcessInspector for MatchingInspector {
     fn identity_for_pid(
         &self,
         pid: u32,
-    ) -> Result<ProcessIdentity, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessIdentity, mac_worker::test_support::core::error::WorkerError> {
         ProcessIdentity::new(pid, u64::from(pid) * 10_000 + 7)
     }
 
@@ -151,7 +154,9 @@ fn record_with_id(n: u128, state: TaskState, runner: bool) -> LocalTaskRecord {
     .expect("fixture record")
 }
 
-fn select_all(store: &ClientStateStore) -> mac_worker::client_state::ActiveTaskSelection {
+fn select_all(
+    store: &ClientStateStore,
+) -> mac_worker::test_support::client_state::ActiveTaskSelection {
     store
         .select_active_task_ids(&ActiveTaskConfig::default())
         .unwrap()
@@ -194,7 +199,7 @@ fn task_run(n: u128) -> TaskRunId {
 
 fn queue_run(n: u128, max_parallel: u32) -> QueueRunReference {
     QueueRunReference::new(
-        mac_worker::job::RunId::new(task_run(n).to_string()).unwrap(),
+        mac_worker::test_support::host::job::RunId::new(task_run(n).to_string()).unwrap(),
         max_parallel,
     )
     .unwrap()

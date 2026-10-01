@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::from_parts;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -9,11 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::{Cli, Command as WorkerCommand, HostCommand},
     client_state::ClientStateStore,
-    config::Config,
     controller::{
         ControllerFault, ControllerLeader, ControllerStore, RequestPhase,
         controller_rpc_ssh_request, load_operation_envelope, persist_operation_envelope,
@@ -23,12 +22,9 @@ use mac_worker::{
         },
         serve_rpc,
     },
-    error::WorkerError,
-    job::HostControlError,
-    paths::PathLayout,
-    process::SystemProcessRunner,
-    protocol::PROTOCOL_VERSION,
-    run_with_stdio_in_context,
+    core::{config::Config, error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{job::HostControlError, process::SystemProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
 };
 use serde_json::{Value, json};
 
@@ -425,16 +421,16 @@ fn enabled_controller_without_ssh_is_rejected_without_a_dummy_worker() {
 }
 
 fn host_controller_rpc_cli() -> Cli {
-    Cli {
-        config: None,
-        json: false,
-        command: WorkerCommand::Host {
+    from_parts(
+        None,
+        false,
+        WorkerCommand::Host {
             command: HostCommand::ControllerRpc,
         },
-    }
+    )
 }
 
-fn parsed_request() -> mac_worker::controller::ControllerRequest {
+fn parsed_request() -> mac_worker::test_support::controller::ControllerRequest {
     parse_request(&serde_json::to_vec(&valid_request_value()).unwrap()).unwrap()
 }
 

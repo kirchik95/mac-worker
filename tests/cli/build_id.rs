@@ -2,14 +2,16 @@
 
 use std::process::Command;
 
-use mac_worker::{
-    binary_identity::current_binary_sha256,
-    build_id::BUILD_ID,
-    output::CommandOutput,
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth, WorkersReport,
+use mac_worker::test_support::{
+    core::{
+        build_id::BUILD_ID,
+        output::CommandOutput,
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth, WorkersReport,
+        },
     },
+    host::binary_identity::current_binary_sha256,
 };
 
 #[test]
@@ -89,7 +91,7 @@ fn host(name: &str, build_id: Option<&str>, binary_sha256: Option<String>) -> Wo
             swap_used_bytes: None,
             available_memory_bytes: None,
             cpu_counters: None,
-            slot_state: mac_worker::lease::SlotState::Idle,
+            slot_state: mac_worker::test_support::host::lease::SlotState::Idle,
             active_lease: None,
             capabilities: vec!["darwin-arm64".into()],
             agent_facts: None,

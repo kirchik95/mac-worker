@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::agent::{
+use mac_worker::test_support::agents::agent::{
     AgentKind, PermissionPolicy, TurnLimits, TurnParams, adapter_for_launch, render_shell,
 };
 

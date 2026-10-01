@@ -11,13 +11,13 @@ use std::{
     ffi::OsString, os::unix::process::ExitStatusExt, path::Path, process::ExitStatus, sync::Mutex,
 };
 
-use mac_worker::{
-    agent_facts::{
+use mac_worker::test_support::{
+    agents::agent_facts::{
         AgentAuth, AgentProbe, EnvProfile, collect_agent_facts_at,
         collect_agent_facts_at_with_timing,
     },
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
+    core::error::WorkerError,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
 };
 
 const COLLECTED_AT: u64 = 100_000;
@@ -403,7 +403,7 @@ fn the_fixture_would_catch_a_plain_auth_probe_on_v2() {
         environment: Vec::new(),
         environment_remove: Vec::new(),
         stdin: None,
-        policy: mac_worker::process::ProcessPolicy {
+        policy: mac_worker::test_support::host::process::ProcessPolicy {
             stdout_limit: 4096,
             stderr_limit: 4096,
             // Only the recorded command matters here; a loaded login shell and

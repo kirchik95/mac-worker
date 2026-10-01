@@ -9,24 +9,28 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mac_worker::{
-    client_state::{ClientStateStore, ClientStateWritePoint},
-    config::Config,
+use mac_worker::test_support::{
+    client_state::{
+        ClientStateStore, ClientStateWritePoint,
+        dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, dag_pin_ref},
+        scheduler::CandidateSlot,
+    },
     controller::{
         BatchExecuteContext, BatchKind, ControllerCheckoutMap, ControllerTransfer, FrozenBatchBody,
         FrozenBatchSource, canonical_request_sha256, controller_transfer_git_path,
         execute_task_batch, parse_request, prepare_task_batch,
     },
-    dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, dag_pin_ref},
-    error::WorkerError,
-    job::{AdmissionObservation, ProcessIdentity, RequestFingerprint},
-    process::SystemProcessRunner,
-    project_state::ProjectState,
-    protocol::PROTOCOL_VERSION,
-    scheduler::CandidateSlot,
-    task::{BaseOid, ClosePolicy, RunId, TaskId, TurnId},
-    task_client::TaskClient,
-    turn_runner::InlineRunnerExecutor,
+    core::{config::Config, error::WorkerError, protocol::PROTOCOL_VERSION},
+    host::{
+        job::{AdmissionObservation, ProcessIdentity, RequestFingerprint},
+        process::SystemProcessRunner,
+    },
+    task::{
+        client::TaskClient,
+        model::{BaseOid, ClosePolicy, RunId, TaskId, TurnId},
+        project_state::ProjectState,
+        turn_runner::InlineRunnerExecutor,
+    },
 };
 use support::GitRepo;
 use uuid::Uuid;
@@ -37,7 +41,7 @@ const LAPTOP_PATH: &str = "/tmp/mac-worker-batch-laptop-provenance";
 struct Harness {
     _root: tempfile::TempDir,
     _repos: Vec<GitRepo>,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     store: ClientStateStore,
     transfer: ControllerTransfer,
     config: Config,
@@ -329,7 +333,9 @@ fn frozen_base(run_id: RunId, batch_id: &str, oid: BaseOid) -> DagBase {
     }
 }
 
-fn request_from_body(body: &FrozenBatchBody) -> mac_worker::controller::ControllerRequest {
+fn request_from_body(
+    body: &FrozenBatchBody,
+) -> mac_worker::test_support::controller::ControllerRequest {
     let value = serde_json::to_value(body).unwrap();
     let payload = serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
@@ -351,7 +357,7 @@ fn fingerprint_for(body: &FrozenBatchBody) -> RequestFingerprint {
 fn prepare_ok(
     harness: &Harness,
     body: &FrozenBatchBody,
-) -> mac_worker::controller::PreparedTaskBatch {
+) -> mac_worker::test_support::controller::PreparedTaskBatch {
     let request = request_from_body(body);
     prepare_task_batch(
         &request,
@@ -422,7 +428,7 @@ fn prepared_roundtrip_preserves_resolved_max_parallel_and_source_digest() {
     assert_eq!(prepared.requested_max_parallel(), None);
     assert_eq!(prepared.sources()[0].fingerprint(), fp.as_str());
     let encoded = serde_json::to_value(&prepared).unwrap();
-    let decoded: mac_worker::controller::PreparedTaskBatch =
+    let decoded: mac_worker::test_support::controller::PreparedTaskBatch =
         serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded, prepared);
     assert_eq!(empty_laptop_config().configured_runner_slots(), 0);

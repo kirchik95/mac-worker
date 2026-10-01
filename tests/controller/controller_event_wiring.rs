@@ -1,28 +1,25 @@
-use mac_worker::controller::events::{JournalProvider, testing::FakeJournalProvider};
+use mac_worker::test_support::events::{JournalProvider, testing::FakeJournalProvider};
 use std::time::Duration;
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, PermissionPolicy},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
     cli::Cli,
-    client_state::ClientStateStore,
-    controller::{
-        encode_json_frame,
-        events::{
-            EventCursor, EventReadResult, JournalReader, ReadQuery, Seq, WireEvent,
-            journal::{ControllerJournal, JournalOptions},
-            testing::ManualEventRuntime,
-        },
+    client_state::{ClientStateStore, scheduler::WorkerPreference},
+    controller::encode_json_frame,
+    core::{error::WorkerError, paths::PathLayout},
+    events::{
+        EventCursor, EventReadResult, JournalReader, ReadQuery, Seq, WireEvent,
+        journal::{ControllerJournal, JournalOptions},
+        testing::ManualEventRuntime,
     },
-    error::WorkerError,
-    job::{CommandSummary, QueueEntry, QueueEntryKind},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    run_with_stdio_in_context,
-    scheduler::WorkerPreference,
-    supervisor::SystemProcessInspector,
-    task::{
+    host::{
+        job::{CommandSummary, QueueEntry, QueueEntryKind},
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        supervisor::SystemProcessInspector,
+    },
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
         TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
     },
@@ -250,7 +247,8 @@ impl ProcessWiringHarness {
         let mut wire: serde_json::Value =
             serde_json::from_slice(&fs::read(&queue_path).unwrap()).unwrap();
         wire["entries"][0]["cancel_requested_at_millis"] = serde_json::json!(101);
-        let snapshot: mac_worker::job::QueueSnapshot = serde_json::from_value(wire).unwrap();
+        let snapshot: mac_worker::test_support::host::job::QueueSnapshot =
+            serde_json::from_value(wire).unwrap();
         let mut encoded = serde_json::to_vec(&snapshot).unwrap();
         encoded.push(b'\n');
         fs::write(queue_path, encoded).unwrap();
@@ -259,7 +257,7 @@ impl ProcessWiringHarness {
         assert_eq!(saved.status().state(), TaskState::Open);
         assert_eq!(
             saved.status().turns()[0].outcome(),
-            Some(&mac_worker::task::TaskOutcome::Cancelled)
+            Some(&mac_worker::test_support::task::model::TaskOutcome::Cancelled)
         );
         (task, turn)
     }
@@ -303,7 +301,9 @@ impl ProcessWiringHarness {
     }
 
     fn rpc<T: serde::de::DeserializeOwned>(&self, body: serde_json::Value) -> T {
-        use mac_worker::controller::{decode_frame, parse_request, read::ControllerReadReply};
+        use mac_worker::test_support::controller::{
+            decode_frame, parse_request, read::ControllerReadReply,
+        };
         use std::io::Write;
 
         let wire = serde_json::json!({
@@ -596,8 +596,8 @@ fn rpc_drain_attaches_to_initialized_host_journal() {
 
 #[test]
 fn process_end_to_end_reads_detached_producer_and_rpc_drain_on_one_root() {
-    use mac_worker::controller::{
-        ControllerStore,
+    use mac_worker::test_support::{
+        controller::ControllerStore,
         events::{
             EventSelector, SafeOutcome, TaskAddressQuery, TaskFactsBatch, TaskRepairPage,
             TaskRepairQuery,
@@ -686,11 +686,13 @@ fn process_end_to_end_reads_detached_producer_and_rpc_drain_on_one_root() {
     assert_eq!(saved.status().state(), TaskState::Open);
     assert_eq!(
         saved.status().turns()[0].outcome(),
-        Some(&mac_worker::task::TaskOutcome::Cancelled)
+        Some(&mac_worker::test_support::task::model::TaskOutcome::Cancelled)
     );
     assert!(
-        mac_worker::controller::drain::is_drained(&controller.paths.controller_state_root())
-            .unwrap()
+        mac_worker::test_support::controller::drain::is_drained(
+            &controller.paths.controller_state_root()
+        )
+        .unwrap()
     );
     assert_eq!(
         ControllerStore::open(&controller.paths.controller_state_root())
@@ -770,22 +772,19 @@ impl Drop for FsyncRelease {
 }
 
 fn prove_fsync_gate(paths: PathLayout) {
-    use mac_worker::{
-        ControllerEventPublisher, ControllerEventRuntime,
-        config::Config,
-        controller::{
-            decode_frame,
-            drain::set_drained_with_event_sink,
-            events::{
-                EventBatch, EventRuntime, NewEvent, PublishAttempt,
-                journal::ExistingJournalProvider,
-                journal::JournalFaultPoint,
-                rpc::{ExistingTaskProjectionProvider, serve_selector_with},
-            },
-            parse_request,
+    use mac_worker::test_support::{
+        controller::{decode_frame, drain::set_drained_with_event_sink, parse_request},
+        core::config::Config,
+        events::{
+            EventBatch, EventRuntime, NewEvent, PublishAttempt,
+            journal::{ExistingJournalProvider, JournalFaultPoint},
+            rpc::{ExistingTaskProjectionProvider, serve_selector_with},
         },
-        task_client::TaskClient,
-        turn_runner::{InlineRunnerExecutor, TurnRunner},
+        runtime::{ControllerEventPublisher, ControllerEventRuntime},
+        task::{
+            client::TaskClient,
+            turn_runner::{InlineRunnerExecutor, TurnRunner},
+        },
     };
     use std::sync::{
         Mutex,
@@ -825,7 +824,8 @@ fn prove_fsync_gate(paths: PathLayout) {
     let mut wire: serde_json::Value =
         serde_json::from_slice(&fs::read(&queue_path).unwrap()).unwrap();
     wire["entries"][0]["cancel_requested_at_millis"] = serde_json::json!(101);
-    let snapshot: mac_worker::job::QueueSnapshot = serde_json::from_value(wire).unwrap();
+    let snapshot: mac_worker::test_support::host::job::QueueSnapshot =
+        serde_json::from_value(wire).unwrap();
     let mut encoded = serde_json::to_vec(&snapshot).unwrap();
     encoded.push(b'\n');
     fs::write(queue_path, encoded).unwrap();
@@ -928,7 +928,10 @@ fn prove_fsync_gate(paths: PathLayout) {
     drain_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
-    assert!(!mac_worker::controller::drain::is_drained(&paths.controller_state_root()).unwrap());
+    assert!(
+        !mac_worker::test_support::controller::drain::is_drained(&paths.controller_state_root())
+            .unwrap()
+    );
 
     let (read_tx, read_rx) = mpsc::channel();
     let read_store = store.clone();
@@ -962,7 +965,9 @@ fn prove_fsync_gate(paths: PathLayout) {
             &InlineRunnerExecutor,
         );
         let request = parse_request(&serde_json::to_vec(&serde_json::json!({"protocol_version":7,"request_id":uuid::Uuid::new_v4().simple().to_string(),"command":"task.status","body":{"task_id":task}})).unwrap()).unwrap();
-        let frame = mac_worker::controller::read::serve_read_command(&request, &client).unwrap();
+        let frame =
+            mac_worker::test_support::controller::read::serve_read_command(&request, &client)
+                .unwrap();
         let reply: serde_json::Value =
             serde_json::from_slice(decode_frame(&frame).unwrap()).unwrap();
         assert_eq!(reply["result"]["task_id"], task.to_string());
@@ -978,7 +983,10 @@ fn prove_fsync_gate(paths: PathLayout) {
         store.create_task(task_record()).unwrap();
     }
     assert!(publisher.diagnostics().is_empty());
-    assert_eq!(mac_worker::client_state::events::dropped_hint_count(), 0);
+    assert_eq!(
+        mac_worker::test_support::client_state::events::dropped_hint_count(),
+        0
+    );
     let overflow = task_record();
     store.create_task(overflow.clone()).unwrap();
     assert!(store.load_task(overflow.meta().task_id()).is_ok());
@@ -988,7 +996,10 @@ fn prove_fsync_gate(paths: PathLayout) {
             .iter()
             .any(|item| item.code == "CONTROLLER_EVENTS_DROPPED_FULL" && item.count == 1)
     );
-    assert_eq!(mac_worker::client_state::events::dropped_hint_count(), 1);
+    assert_eq!(
+        mac_worker::test_support::client_state::events::dropped_hint_count(),
+        1
+    );
     let sink = publisher.sink();
     let (exit_tx, exit_rx) = mpsc::channel();
     std::thread::spawn(move || {

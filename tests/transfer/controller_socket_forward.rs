@@ -15,16 +15,14 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    config::SshConfig,
-    controller::channel::{
+use mac_worker::test_support::{
+    channel::{
         contracts::*,
         forward::MasterForwardControl,
         testing::{FakeForwardPaths, ManualRuntime, identity_fixture},
     },
-    error::WorkerError,
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    core::{config::SshConfig, error::WorkerError, paths::PathLayout},
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
 };
 use sha2::{Digest, Sha256};
 
@@ -914,7 +912,7 @@ impl ProcessRunner for UnacknowledgedRunner {
                 socket
             }));
             bound_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            return Err(mac_worker::error::ProcessError::Cancelled.into());
+            return Err(mac_worker::test_support::core::error::ProcessError::Cancelled.into());
         }
         if has_pair(&args, "-O", "cancel") {
             self.base.calls.lock().unwrap().push(request.clone());
@@ -991,7 +989,7 @@ fn interrupted_open_bind_before_listen_never_uses_refusal_cleanup() {
 // through T5's bind/listen barrier and the accepted T6 command owner.
 #[derive(Default)]
 struct ObservedPrivateFiles {
-    inner: mac_worker::controller::channel::files::PrivateChannelFiles,
+    inner: mac_worker::test_support::channel::files::PrivateChannelFiles,
     allocations: Mutex<Vec<ForwardPath>>,
     cleanups: AtomicUsize,
 }
@@ -1023,14 +1021,14 @@ struct ScopedRaw<R> {
 impl<R: ProcessRunner> ProcessRunner for ScopedRaw<R> {
     fn run(&self, process: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         if let Some(frame) = &process.stdin {
-            let request = mac_worker::controller::decode_request(frame).unwrap();
+            let request = mac_worker::test_support::controller::decode_request(frame).unwrap();
             if request.body().get("controller_socket").is_some() {
                 self.bootstraps.lock().unwrap().push(process.clone());
                 assert_eq!(
                     request.body()["controller_socket"]["route_sha256"],
                     self.identity.route_sha256.as_str()
                 );
-                return Ok(mac_worker::controller::channel::testing::result_fixture(
+                return Ok(mac_worker::test_support::channel::testing::result_fixture(
                     &request,
                     serde_json::to_value(SocketIdentityResult::Available(self.identity.clone()))
                         .unwrap(),
@@ -1038,7 +1036,7 @@ impl<R: ProcessRunner> ProcessRunner for ScopedRaw<R> {
                 ));
             }
             self.reads.lock().unwrap().push(process.clone());
-            return Ok(mac_worker::controller::channel::testing::result_fixture(
+            return Ok(mac_worker::test_support::channel::testing::result_fixture(
                 &request,
                 serde_json::json!({"task_ids":[request.body()["task_id"]],"quiescent":true,"exit_code":0}),
                 0,
@@ -1048,16 +1046,18 @@ impl<R: ProcessRunner> ProcessRunner for ScopedRaw<R> {
     }
 }
 fn scoped_request(route: &ConfiguredRoute) -> ProcessRequest {
-    let frame = mac_worker::controller::encode_json_frame(&serde_json::json!({
-        "protocol_version":7,"request_id":mac_worker::job::ClientId::generate(),
+    let frame = mac_worker::test_support::controller::encode_json_frame(&serde_json::json!({
+        "protocol_version":7,"request_id":mac_worker::test_support::host::job::ClientId::generate(),
         "command":"task.wait.poll","body":{"task_id":"018f0f4a6b5c7d8e9f00112233445566"}
     }))
     .unwrap();
-    let config =
-        mac_worker::config::Config::parse("version=1\n[controller]\nenabled=true\nssh='fixture'\n")
-            .unwrap();
+    let config = mac_worker::test_support::core::config::Config::parse(
+        "version=1\n[controller]\nenabled=true\nssh='fixture'\n",
+    )
+    .unwrap();
     let mut process =
-        mac_worker::controller::controller_rpc_ssh_request(&config.controller).unwrap();
+        mac_worker::test_support::controller::controller_rpc_ssh_request(&config.controller)
+            .unwrap();
     if let Some(config) = &route.ssh_config_file {
         process
             .args
@@ -1073,7 +1073,7 @@ fn scoped_client_unacknowledged_bind_before_listen_retires_across_all_eligibilit
     ) {
         return;
     }
-    use mac_worker::controller::channel::{
+    use mac_worker::test_support::channel::{
         client::ChannelProcessRunner, identity::StdioIdentitySource, pin::PrivatePinStore,
         testing::ScriptedConnector,
     };
@@ -1188,7 +1188,7 @@ fn scoped_client_exit_zero_cancel_error_preserves_one_real_allocation_after_conf
     ) {
         return;
     }
-    use mac_worker::controller::channel::{
+    use mac_worker::test_support::channel::{
         client::ChannelProcessRunner, identity::StdioIdentitySource, pin::PrivatePinStore,
         testing::ScriptedConnector,
     };
@@ -1269,7 +1269,7 @@ fn scoped_client_exit_zero_cancel_error_preserves_one_real_allocation_after_conf
 }
 
 fn scoped_offline_mux(master_lost: bool) {
-    use mac_worker::controller::channel::{
+    use mac_worker::test_support::channel::{
         client::ChannelProcessRunner,
         identity::StdioIdentitySource,
         pin::PrivatePinStore,
@@ -1286,7 +1286,9 @@ fn scoped_offline_mux(master_lost: bool) {
         bootstraps: Mutex::default(),
     };
     let first = scoped_request(&route);
-    let request = mac_worker::controller::decode_request(first.stdin.as_ref().unwrap()).unwrap();
+    let request =
+        mac_worker::test_support::controller::decode_request(first.stdin.as_ref().unwrap())
+            .unwrap();
     let connector = Arc::new(ScriptedConnector::new(vec![
         Ok(result_fixture(
             &request,
@@ -1446,7 +1448,7 @@ impl ProcessRunner for GateRunner {
             );
             thread::yield_now();
         }
-        Err(mac_worker::error::ProcessError::Cancelled.into())
+        Err(mac_worker::test_support::core::error::ProcessError::Cancelled.into())
     }
 }
 

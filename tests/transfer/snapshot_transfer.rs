@@ -19,32 +19,35 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::WorkerEntry,
-    error::{ProcessError, ProcessStream, WorkerError},
-    git_transport::{GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents},
-    host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
-    job::{
-        ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobMeta, JobStatus,
-        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
-        LogChunkResponse, LogStream, PreacceptanceDisposition, RequestFingerprint,
-        RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
-        ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusResponse,
-        SubmitRequest, SubmitResponse,
+    core::{
+        config::WorkerEntry,
+        error::{ProcessError, ProcessStream, WorkerError},
+        protocol::{MemoryPressure, PROTOCOL_VERSION},
     },
-    job_service::{JobService, LaunchCandidate, SupervisorLauncher},
-    lease::{AdmissionFacts, LeaseService},
-    legacy_snapshot_receipt::VerifiedReceipt,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION},
-    rooted_fs::RootedDir,
-    run_with_stdio_in_context,
-    task::{BaseOid, TaskId},
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobMeta, JobStatus,
+            LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
+            LogChunkResponse, LogStream, PreacceptanceDisposition, RequestFingerprint,
+            RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
+            ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusResponse,
+            SubmitRequest, SubmitResponse,
+        },
+        job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+        lease::{AdmissionFacts, LeaseService},
+        legacy_snapshot_receipt::VerifiedReceipt,
+        process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+        rooted_fs::RootedDir,
+        store::{HostStore, HostStoreWritePoint, SupervisorGuard},
+    },
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    task::model::{BaseOid, TaskId},
     transfer::{
         HostOperation, OptionalHostResponse, RemoteJobClient, ResolutionRuntime, SshJsonTransport,
         TransferIdentity,
+        git::{GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents},
     },
 };
 use sha2::Digest;
@@ -1557,13 +1560,16 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
     let cases = [
         (
             HostOperation::Status,
-            serde_json::to_vec(&mac_worker::job::StatusRequest::new(resolve.job_id())).unwrap(),
+            serde_json::to_vec(&mac_worker::test_support::host::job::StatusRequest::new(
+                resolve.job_id(),
+            ))
+            .unwrap(),
             canonical_line(&status_response),
             "~/.local/bin/worker host status",
         ),
         (
             HostOperation::LogChunk,
-            serde_json::to_vec(&mac_worker::job::LogChunkRequest::new(
+            serde_json::to_vec(&mac_worker::test_support::host::job::LogChunkRequest::new(
                 resolve.job_id(),
                 LogStream::Stdout,
                 7,
@@ -1600,7 +1606,7 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
                     .request::<_, StatusResponse>(
                         &worker(),
                         operation,
-                        &mac_worker::job::StatusRequest::new(resolve.job_id()),
+                        &mac_worker::test_support::host::job::StatusRequest::new(resolve.job_id()),
                         request_policy,
                     )
                     .unwrap();
@@ -1610,7 +1616,7 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
                     .request::<_, LogChunkResponse>(
                         &worker(),
                         operation,
-                        &mac_worker::job::LogChunkRequest::new(
+                        &mac_worker::test_support::host::job::LogChunkRequest::new(
                             resolve.job_id(),
                             LogStream::Stdout,
                             7,
@@ -2012,7 +2018,7 @@ fn remote_log_chunk_enforces_the_callers_effective_requested_limit() {
         assert_eq!(
             runner.requests()[0].stdin,
             Some(
-                serde_json::to_vec(&mac_worker::job::LogChunkRequest::new(
+                serde_json::to_vec(&mac_worker::test_support::host::job::LogChunkRequest::new(
                     job_id,
                     LogStream::Stdout,
                     7,

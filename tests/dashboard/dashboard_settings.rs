@@ -10,11 +10,11 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent_settings::{
+use mac_worker::test_support::{
+    agents::agent_settings::{
         AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
     },
-    config::Config,
+    core::config::Config,
     dashboard::{
         model::{ApiError, DashboardLogChunk, DashboardQueueEntry},
         service::{
@@ -25,10 +25,14 @@ use mac_worker::{
         task::DashboardTaskSource,
         web::{DashboardHttpServer, DashboardHttpState},
     },
-    job::LogStream,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    task::{TaskId, TurnId},
-    task_view::TaskListProjection,
+    host::{
+        job::LogStream,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+    },
+    task::{
+        model::{TaskId, TurnId},
+        view::TaskListProjection,
+    },
     transfer::HostOperation,
 };
 
@@ -119,7 +123,7 @@ struct EmptyDashboard;
 impl DashboardDataSource for EmptyDashboard {
     fn configured_workers(
         &self,
-    ) -> Result<Vec<String>, mac_worker::dashboard::model::DashboardError> {
+    ) -> Result<Vec<String>, mac_worker::test_support::dashboard::model::DashboardError> {
         Ok(Vec::new())
     }
     fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
@@ -127,13 +131,15 @@ impl DashboardDataSource for EmptyDashboard {
     }
     fn queue_entries(
         &self,
-    ) -> Result<Vec<DashboardQueueEntry>, mac_worker::dashboard::model::DashboardError> {
+    ) -> Result<Vec<DashboardQueueEntry>, mac_worker::test_support::dashboard::model::DashboardError>
+    {
         Ok(Vec::new())
     }
     fn task_projection(
         &self,
         _deadline: Duration,
-    ) -> Result<DashboardTaskCollection, mac_worker::dashboard::model::DashboardError> {
+    ) -> Result<DashboardTaskCollection, mac_worker::test_support::dashboard::model::DashboardError>
+    {
         Ok(DashboardTaskCollection {
             projection: TaskListProjection::empty(),
             errors: Vec::new(),
@@ -147,7 +153,7 @@ impl DashboardTaskSource for EmptyTasks {
     fn task_detail(
         &self,
         _task_id: TaskId,
-    ) -> Result<mac_worker::task_view::TaskDetailProjection, ApiError> {
+    ) -> Result<mac_worker::test_support::task::view::TaskDetailProjection, ApiError> {
         Err(ApiError::new("TASK_NOT_FOUND", "task is not available"))
     }
     fn read_task_log(
@@ -189,7 +195,7 @@ impl ProcessRunner for SettingsTransportFixture {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         self.requests.lock().unwrap().push(request.clone());
         let mut response = entry();
         response.agent = "cursor".into();
@@ -606,7 +612,7 @@ impl ProcessRunner for LargeCatalogTransportFixture {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         assert_eq!(request.program, "/usr/bin/ssh");
         assert_eq!(
             request.args.last().unwrap(),
@@ -636,19 +642,21 @@ async fn full_128_model_catalogs_and_additive_sources_cross_ssh_and_http() {
                 settings.agent = agent.into();
                 settings.model_catalog_source = (agent != "claude").then(|| "live".into());
                 settings.model_options = (0..128)
-                    .map(|index| mac_worker::agent_settings::ModelOption {
-                        id: format!("{agent}/{}-{index:03}", "m".repeat(251 - agent.len())),
-                        label: "L".repeat(256),
-                        effort_options: if matches!(agent, "codex" | "cursor") {
-                            (0..32)
-                                .map(|effort| format!("{}-{effort:02}", "e".repeat(29)))
-                                .collect()
-                        } else {
-                            Vec::new()
+                    .map(
+                        |index| mac_worker::test_support::agents::agent_settings::ModelOption {
+                            id: format!("{agent}/{}-{index:03}", "m".repeat(251 - agent.len())),
+                            label: "L".repeat(256),
+                            effort_options: if matches!(agent, "codex" | "cursor") {
+                                (0..32)
+                                    .map(|effort| format!("{}-{effort:02}", "e".repeat(29)))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            },
+                            fast_supported: false,
+                            capabilities_known: agent == "cursor",
                         },
-                        fast_supported: false,
-                        capabilities_known: agent == "cursor",
-                    })
+                    )
                     .collect();
                 settings
             })

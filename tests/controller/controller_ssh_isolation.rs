@@ -1,14 +1,15 @@
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
+use mac_worker::test_support::{
     cli::Cli,
-    config::Config,
     controller::provision::{ResolvedSsh, plan_inventory},
-    error::WorkerError,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{ControllerConfigureRequest, PROTOCOL_VERSION},
-    run_with_stdio_in_context,
-    transport::SshTransport,
+    core::{
+        config::Config,
+        error::WorkerError,
+        protocol::{ControllerConfigureRequest, PROTOCOL_VERSION},
+    },
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    runtime::{RuntimeContext, run_with_stdio_in_context},
+    transfer::transport::SshTransport,
 };
 use std::{
     collections::BTreeMap, fs, io::Cursor, os::unix::process::ExitStatusExt, process::ExitStatus,
@@ -163,7 +164,7 @@ fn controller_configure_records_host_config_file_and_probe_installs_it_process_w
             })
         }
     }
-    mac_worker::git_transport::GitTransport::new(&OriginRunner)
+    mac_worker::test_support::transfer::git::GitTransport::new(&OriginRunner)
         .preflight_origin(
             "git@example.test:owner/project.git",
             &"1111111111111111111111111111111111111111".parse().unwrap(),

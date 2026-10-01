@@ -1,13 +1,13 @@
 use std::os::unix::process::ExitStatusExt;
 use std::{fs, path::Path, process::ExitStatus, sync::Mutex};
 
-use mac_worker::agent_settings::{
+use mac_worker::test_support::agents::agent_settings::{
     AgentDefaultSettings, AgentSettingsGetRequest, AgentSettingsList, AgentSettingsSaveRequest,
     ModelOption, NativeAgentSettingsStore, SETTINGS_AGENT_IDS,
 };
-use mac_worker::{
-    config::WorkerEntry,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
+use mac_worker::test_support::{
+    core::config::WorkerEntry,
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner},
     transfer::{HostOperation, SshJsonTransport},
 };
 use tempfile::tempdir;
@@ -1112,7 +1112,7 @@ impl ProcessRunner for RecordingRunner {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         *self.request.lock().unwrap() = Some(request.clone());
         Ok(ProcessResult {
             status: ExitStatus::from_raw(0),

@@ -1,9 +1,9 @@
-use mac_worker::{
-    config::Config,
+use mac_worker::test_support::{
     controller::provision::{
         ResolvedSsh, authorize_controller_key, plan_inventory, trusted_host_keys,
         write_controller_config,
     },
+    core::config::Config,
 };
 use std::{
     collections::BTreeMap,
@@ -118,7 +118,7 @@ fn managed_alias_hash_collision_is_refused_before_provisioning() {
     ];
     for name in names {
         assert_eq!(
-            mac_worker::controller::provision::worker_ssh_alias(name),
+            mac_worker::test_support::controller::provision::worker_ssh_alias(name),
             "mac-worker-controller-worker-name-with-a-shared-prefix-0766d888"
         );
     }
@@ -143,11 +143,11 @@ fn managed_alias_hash_collision_is_refused_before_provisioning() {
 
 #[test]
 fn managed_alias_at_name_is_one_transport_destination_and_resolves_offline() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::provision::write_ssh_settings,
-        error::WorkerError,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
-        transport::SshTransport,
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        transfer::transport::SshTransport,
     };
     let mut config = inventory();
     config.workers.truncate(1);
@@ -267,7 +267,7 @@ fn controller_config_is_idempotent_and_conflicts_need_force_with_diff() {
 
 #[test]
 fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
-    use mac_worker::controller::provision::write_ssh_settings;
+    use mac_worker::test_support::controller::provision::write_ssh_settings;
     let temp = tempfile::tempdir().unwrap();
     let ssh = temp.path().join(".ssh");
     fs::create_dir(&ssh).unwrap();
@@ -311,7 +311,7 @@ fn generated_ssh_settings_use_only_dedicated_key_and_strict_pinned_hosts() {
 
 #[test]
 fn generated_ssh_settings_effective_config_is_isolated_offline() {
-    use mac_worker::controller::provision::write_ssh_settings;
+    use mac_worker::test_support::controller::provision::write_ssh_settings;
     if !std::path::Path::new("/usr/bin/ssh").exists() {
         eprintln!("skipping effective SSH config: /usr/bin/ssh is missing");
         return;
@@ -371,10 +371,10 @@ fn generated_ssh_settings_effective_config_is_isolated_offline() {
 
 #[test]
 fn controller_key_generation_never_overwrites_an_existing_private_key() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::provision::ensure_controller_key,
-        error::WorkerError,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
     };
     struct NoProcess;
     impl ProcessRunner for NoProcess {
@@ -407,10 +407,10 @@ fn controller_key_generation_never_overwrites_an_existing_private_key() {
 
 #[test]
 fn controller_key_generation_publishes_once_and_recovers_missing_public_half() {
-    use mac_worker::{
+    use mac_worker::test_support::{
         controller::provision::ensure_controller_key,
-        error::WorkerError,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
     };
     use std::{os::unix::process::ExitStatusExt, process::ExitStatus, sync::Mutex};
     struct Keygen {

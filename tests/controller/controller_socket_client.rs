@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    controller::channel::{
+use mac_worker::test_support::{
+    channel::{
         client::ChannelProcessRunner,
         contracts::*,
         testing::{
@@ -22,11 +22,15 @@ use mac_worker::{
         },
     },
     controller::{ControllerRequest, decode_request, encode_json_frame},
-    error::{ProcessError, WorkerError},
-    job::ClientId,
-    paths::PathLayout,
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::PROTOCOL_VERSION,
+    core::{
+        error::{ProcessError, WorkerError},
+        paths::PathLayout,
+        protocol::PROTOCOL_VERSION,
+    },
+    host::{
+        job::ClientId,
+        process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    },
 };
 
 // T1 doubles cover sibling contracts. Local gated stages below exercise live
@@ -281,7 +285,7 @@ impl ProcessRunner for Fixture {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<ProcessResult, WorkerError> {
         if should_stop() {
-            return Err(mac_worker::error::ProcessError::Cancelled.into());
+            return Err(mac_worker::test_support::core::error::ProcessError::Cancelled.into());
         }
         let result = self.raw("interruptible", request);
         let gate = self.0.gate.lock().unwrap().clone();
@@ -294,7 +298,7 @@ impl ProcessRunner for Fixture {
                 .expect("raw entry hang guard");
         }
         if should_stop() {
-            return Err(mac_worker::error::ProcessError::Cancelled.into());
+            return Err(mac_worker::test_support::core::error::ProcessError::Cancelled.into());
         }
         result
     }
@@ -1148,12 +1152,14 @@ fn partial_write_or_lost_reply_has_one_identical_raw_fallback() {
         // Preserve noncanonical whitespace and the caller's complete original
         // frame, rather than rebuilding JSON after an ambiguous transmission.
         request.stdin = Some(
-            mac_worker::controller::encode_frame(
+            mac_worker::test_support::controller::encode_frame(
                 format!(
                     "  {}\n",
                     std::str::from_utf8(
-                        mac_worker::controller::decode_frame(request.stdin.as_ref().unwrap())
-                            .unwrap()
+                        mac_worker::test_support::controller::decode_frame(
+                            request.stdin.as_ref().unwrap()
+                        )
+                        .unwrap()
                     )
                     .unwrap()
                 )
@@ -1358,8 +1364,11 @@ fn verified_application_error_preserves_stdout_status_and_stderr() {
             read_result(&request).stdout
         } else {
             encode_json_frame(
-                &mac_worker::job::HostControlError::new(code, "fixture application outcome")
-                    .unwrap(),
+                &mac_worker::test_support::host::job::HostControlError::new(
+                    code,
+                    "fixture application outcome",
+                )
+                .unwrap(),
             )
             .unwrap()
         };

@@ -15,24 +15,27 @@ use std::{
     thread,
 };
 
-use mac_worker::{
-    agent::{AgentKind, ReportedCheck, ReportedCheckStatus},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, ReportedCheck, ReportedCheckStatus},
     client_state::ClientStateStore,
-    config::Config,
-    error::WorkerError,
-    job::JobId,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project_state::ProjectState,
-    task::{
-        BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskCloseIntent, TaskId,
-        TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState, TaskStatus,
-        TurnSummary, TurnTerminal,
+    core::{config::Config, error::WorkerError},
+    host::{
+        job::JobId,
+        process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     },
-    task_client::{TaskClient, TaskListFilter},
-    task_store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
-    task_view::{ReviewState, remote_status_refresh_allowed, review_state},
+    task::{
+        client::{TaskClient, TaskListFilter},
+        model::{
+            BaseOid, ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskCloseIntent,
+            TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
+            TaskStatus, TurnSummary, TurnTerminal,
+        },
+        project_state::ProjectState,
+        store::{TaskCloseRequest, TaskCloseResponse, TaskStatusResponse},
+        turn_runner::InlineRunnerExecutor,
+        view::{ReviewState, remote_status_refresh_allowed, review_state},
+    },
     transfer::HostOperation,
-    turn_runner::InlineRunnerExecutor,
 };
 use uuid::Uuid;
 
@@ -207,7 +210,7 @@ fn open_done_record(
         agent: AgentKind::Codex,
         model: None,
         effort: None,
-        policy: mac_worker::agent::PermissionPolicy::Workspace,
+        policy: mac_worker::test_support::agents::agent::PermissionPolicy::Workspace,
         source: TaskSource::Local {
             wip: false,
             push_target: None,
@@ -275,7 +278,7 @@ struct CloseHarness {
     _current_dir: CurrentDirGuard,
     _state_root: tempfile::TempDir,
     store: ClientStateStore,
-    paths: mac_worker::paths::PathLayout,
+    paths: mac_worker::test_support::core::paths::PathLayout,
     config: Config,
     task_id: TaskId,
 }

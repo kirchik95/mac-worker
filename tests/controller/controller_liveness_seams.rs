@@ -9,17 +9,21 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy},
-    client_state::{ClientStateStore, ClientStateTimings, RunnerSlotDecision},
-    dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref},
-    error::WorkerError,
-    job::{CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
-    scheduler::WorkerPreference,
-    supervisor::{
-        ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy},
+    client_state::{
+        ClientStateStore, ClientStateTimings, RunnerSlotDecision,
+        dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, dag_pin_ref},
+        scheduler::WorkerPreference,
     },
-    task::{
+    core::error::WorkerError,
+    host::{
+        job::{CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
+        supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        },
+    },
+    task::model::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, RunId, RunRecord, RunnerIdentity,
         TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskSource, TaskState, TaskStatus, TurnId,
         TurnSummary,

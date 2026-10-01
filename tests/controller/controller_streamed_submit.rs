@@ -11,28 +11,33 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     client_state::ClientStateStore,
-    config::Config,
     controller::{
         ActiveResumeConfig, ControllerFault, ControllerStore, ControllerTransfer, OwnedCheckoutMap,
         TaskSubmitHandler, VerifiedResultMeta, canonical_request_sha256,
         controller_transfer_git_path, decode_frame, encode_frame, import_controller_result,
         load_operation_envelope, parse_request, registry::ProjectRegistry,
     },
-    git_transport::GitTransport,
-    host_store::HostStore,
-    job::{
-        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
-        RequestFingerprint, RequestFingerprintMaterial,
+    core::{
+        config::Config,
+        paths::PathLayout,
+        protocol::{MemoryPressure, PROTOCOL_VERSION},
     },
-    lease::{AdmissionFacts, LeaseService},
-    paths::PathLayout,
-    prepared_submit::FrozenSubmitBody,
-    process::{ProcessPolicy, ProcessRequest, SystemProcessRunner},
-    protocol::{MemoryPressure, PROTOCOL_VERSION},
-    task::{BaseOid, ClosePolicy, TaskId, TurnId},
-    transfer_repo::TransferRepo,
+    host::{
+        job::{
+            ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+            RequestFingerprint, RequestFingerprintMaterial,
+        },
+        lease::{AdmissionFacts, LeaseService},
+        process::{ProcessPolicy, ProcessRequest, SystemProcessRunner},
+        store::HostStore,
+    },
+    task::{
+        model::{BaseOid, ClosePolicy, TaskId, TurnId},
+        prepared_submit::FrozenSubmitBody,
+    },
+    transfer::{git::GitTransport, repo::TransferRepo},
 };
 use support::GitRepo;
 use tempfile::TempDir;
@@ -147,7 +152,7 @@ fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
 fn submit_request(
     request_id: &str,
     body: &FrozenSubmitBody,
-) -> mac_worker::controller::ControllerRequest {
+) -> mac_worker::test_support::controller::ControllerRequest {
     let payload = serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
@@ -739,7 +744,7 @@ fn controller_rpc_child(isolated: &Isolated, frame: &[u8]) -> std::process::Outp
 /// Collect real isolated host readiness before entering the SSH probe budget.
 /// The fake hop serves this snapshot until capacity changes and we refresh it.
 fn refresh_slot_probe(isolated: &Isolated) {
-    use mac_worker::process::ProcessRunner;
+    use mac_worker::test_support::host::process::ProcessRunner;
 
     let mut environment: Vec<_> = isolated
         .environment
@@ -977,7 +982,7 @@ fn controller_retry_ack_replays_after_rpc_restart_and_receipt_retirement() {
         load_operation_envelope(&isolated.paths.controller_cache_root(), &bind.request_id)
             .unwrap()
             .unwrap();
-    let frame = mac_worker::controller::encode_json_frame(&serde_json::json!({
+    let frame = mac_worker::test_support::controller::encode_json_frame(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION, "request_id": bind.request_id,
         "command": envelope.command(), "body": envelope.body()
     }))

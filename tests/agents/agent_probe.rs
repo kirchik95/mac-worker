@@ -1,3 +1,4 @@
+use mac_worker::test_support::cli::{from_parts, into_command};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -9,22 +10,28 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
-    RuntimeContext,
-    agent::{AgentKind, adapter_for},
-    agent_facts::{
-        AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe, turn_auth_failure_reason,
+use mac_worker::test_support::{
+    agents::{
+        agent::{AgentKind, adapter_for},
+        agent_facts::{
+            AgentAuth, AgentFacts, AgentProbe, FACTS_TTL, ProfileProbe, turn_auth_failure_reason,
+        },
+        auth_incidents,
+        probe::ProbeCollector,
     },
-    auth_incidents,
     cli::{Cli, Command, HostCommand},
-    config::{Config, WorkerEntry},
-    host_store::HostStore,
-    lease::SlotState,
-    output::CommandOutput,
-    probe::ProbeCollector,
-    process::{ProcessRequest, ProcessResult, ProcessRunner},
-    protocol::{HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth},
-    scheduler_adapter::SchedulerProbeAdapter,
+    client_state::scheduler_adapter::SchedulerProbeAdapter,
+    core::{
+        config::{Config, WorkerEntry},
+        output::CommandOutput,
+        protocol::{HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth},
+    },
+    host::{
+        lease::SlotState,
+        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        store::HostStore,
+    },
+    runtime::RuntimeContext,
     transfer::HostOperation,
 };
 
@@ -46,7 +53,7 @@ impl ProcessRunner for RecordingRunner {
     fn run(
         &self,
         request: &ProcessRequest,
-    ) -> Result<ProcessResult, mac_worker::error::WorkerError> {
+    ) -> Result<ProcessResult, mac_worker::test_support::core::error::WorkerError> {
         self.requests.lock().unwrap().push(request.clone());
         let program = request.program.to_string_lossy();
         let args = request
@@ -193,7 +200,7 @@ fn worker() -> WorkerEntry {
 fn config() -> Config {
     Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: vec![worker()],
@@ -249,7 +256,7 @@ fn health_with_facts(facts: AgentFacts) -> WorkerHealth {
         probe: Some(ProbeResponse {
             features: None,
             protocol_version: PROTOCOL_VERSION,
-            supervision_version: mac_worker::protocol::SUPERVISION_VERSION,
+            supervision_version: mac_worker::test_support::core::protocol::SUPERVISION_VERSION,
             hostname: "mini-1.local".into(),
             arch: "arm64".into(),
             os_version: "26.2".into(),
@@ -434,7 +441,7 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     // refresh, or probing before the refresh operation completes.
     let workers = Cli::try_parse_from(["worker", "workers", "--refresh"]).unwrap();
     assert!(matches!(
-        workers.command,
+        into_command(workers),
         Command::Workers {
             refresh: true,
             clear_auth_incidents: false
@@ -442,7 +449,7 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     ));
     let host = Cli::try_parse_from(["worker", "host", "refresh-facts"]).unwrap();
     assert!(matches!(
-        host.command,
+        into_command(host),
         Command::Host {
             command: HostCommand::RefreshFacts {
                 timing: false,
@@ -452,7 +459,7 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     ));
     let timed = Cli::try_parse_from(["worker", "host", "refresh-facts", "--timing"]).unwrap();
     assert!(matches!(
-        timed.command,
+        into_command(timed),
         Command::Host {
             command: HostCommand::RefreshFacts {
                 timing: true,
@@ -476,15 +483,15 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
     let runner = RecordingRunner::default();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
-        Cli {
-            config: Some(config_path),
-            json: false,
-            command: Command::Workers {
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
+        from_parts(
+            Some(config_path),
+            false,
+            Command::Workers {
                 refresh: true,
                 clear_auth_incidents: false,
             },
-        },
+        ),
         &runner,
         &runtime,
         &mut stdout,
@@ -511,7 +518,7 @@ fn refresh_command_is_hidden_and_workers_refreshes_before_its_probe() {
 fn workers_output_reports_facts_and_age_without_profile_values() {
     // Break caught: displaying raw profile contents or silently omitting the
     // operator-visible state needed to diagnose agent eligibility.
-    let report = mac_worker::protocol::WorkersReport {
+    let report = mac_worker::test_support::core::protocol::WorkersReport {
         protocol_version: PROTOCOL_VERSION,
         workers: vec![health_with_facts(facts(1))],
     };
@@ -533,7 +540,7 @@ fn workers_output_includes_agent_auth_reasons() {
         "agents".into(),
         AgentAuth::UnknownWithReason("keychain unlock failed"),
     )];
-    let report = mac_worker::protocol::WorkersReport {
+    let report = mac_worker::test_support::core::protocol::WorkersReport {
         protocol_version: PROTOCOL_VERSION,
         workers: vec![health_with_facts(facts)],
     };
@@ -561,17 +568,17 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
     let runner = RecordingRunner::default();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
-        Cli {
-            config: Some("/missing/client-inventory.toml".into()),
-            json: false,
-            command: Command::Host {
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
+        from_parts(
+            Some("/missing/client-inventory.toml".into()),
+            false,
+            Command::Host {
                 command: HostCommand::RefreshFacts {
                     timing: false,
                     clear_auth_incidents: false,
                 },
             },
-        },
+        ),
         &runner,
         &runtime,
         &mut stdout,
@@ -596,7 +603,7 @@ fn refresh_uses_the_runtime_home_without_loading_inventory() {
 fn refresh_collects_the_herdr_fact_and_cached_reads_never_probe_it() {
     // Break caught: the herdr fact leaving refresh-facts for the probe hot
     // path, or the lookup bypassing the account login shell.
-    use mac_worker::agent_facts::{HerdrFactState, HerdrFacts};
+    use mac_worker::test_support::agents::agent_facts::{HerdrFactState, HerdrFacts};
 
     let temporary = tempfile::tempdir().unwrap();
     let host_root = host_root(temporary.path());
@@ -737,17 +744,17 @@ fn run_host_refresh_facts(timing: bool) -> (u8, Vec<u8>, Vec<u8>) {
     let runner = RecordingRunner::default();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit = mac_worker::run_with_io_in_context(
-        Cli {
-            config: Some("/missing/client-inventory.toml".into()),
-            json: false,
-            command: Command::Host {
+    let exit = mac_worker::test_support::runtime::run_with_io_in_context(
+        from_parts(
+            Some("/missing/client-inventory.toml".into()),
+            false,
+            Command::Host {
                 command: HostCommand::RefreshFacts {
                     timing,
                     clear_auth_incidents: false,
                 },
             },
-        },
+        ),
         &runner,
         &runtime,
         &mut stdout,
@@ -914,7 +921,7 @@ fn workers_and_host_parse_clear_auth_incidents() {
     let workers =
         Cli::try_parse_from(["worker", "workers", "--refresh", "--clear-auth-incidents"]).unwrap();
     assert!(matches!(
-        workers.command,
+        into_command(workers),
         Command::Workers {
             refresh: true,
             clear_auth_incidents: true
@@ -924,7 +931,7 @@ fn workers_and_host_parse_clear_auth_incidents() {
     let host =
         Cli::try_parse_from(["worker", "host", "refresh-facts", "--clear-auth-incidents"]).unwrap();
     assert!(matches!(
-        host.command,
+        into_command(host),
         Command::Host {
             command: HostCommand::RefreshFacts {
                 timing: false,
@@ -939,7 +946,7 @@ fn workers_output_includes_turn_auth_failure_reason() {
     let mut facts = facts(1);
     let reason = turn_auth_failure_reason(TURN_AUTH_AT).unwrap();
     facts.agents[0].auth = AgentAuth::UnknownWithReason(reason);
-    let report = mac_worker::protocol::WorkersReport {
+    let report = mac_worker::test_support::core::protocol::WorkersReport {
         protocol_version: PROTOCOL_VERSION,
         workers: vec![health_with_facts(facts)],
     };

@@ -1,7 +1,8 @@
 use crate::fixture_pid;
 
-use mac_worker::{
-    job::{
+use mac_worker::test_support::{
+    core::protocol::PROTOCOL_VERSION,
+    host::job::{
         CommandSpec, CommandSummary, HostControlError, JobId, JobMeta, JobState, JobStatus,
         JsonEvent, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LocalJobRecord,
         LogChunk, LogChunkRequest, LogChunkResponse, LogStream, PreacceptanceDisposition,
@@ -9,7 +10,6 @@ use mac_worker::{
         ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusRequest,
         StatusResponse, SubmitRequest, SubmitResponse,
     },
-    protocol::PROTOCOL_VERSION,
 };
 
 const JOB_ID: &str = "018f0f4a6b5c7d8e9f00112233445566";

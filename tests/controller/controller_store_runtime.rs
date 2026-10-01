@@ -10,14 +10,13 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
-use mac_worker::{
+use mac_worker::test_support::{
     controller::{
         ActiveResumeConfig, ControllerCommandHandler, ControllerFault, ControllerRequest,
         ControllerStore, DurableRequest, OperationMeta, RequestPhase, default_prepare_operation,
         parse_request,
     },
-    error::WorkerError,
-    protocol::PROTOCOL_VERSION,
+    core::{error::WorkerError, protocol::PROTOCOL_VERSION},
 };
 use serde_json::{Value, json};
 

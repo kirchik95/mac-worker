@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mac_worker::{agent::AgentKind, turn_log::render_agent_log};
+use mac_worker::test_support::{agents::agent::AgentKind, task::turn_log::render_agent_log};
 
 const FIXTURE_ROOT: &str = "tests/fixtures";
 const REFERENCE_ROOT: &str = "tests/fixtures/turn_log";

@@ -1,5 +1,5 @@
 //! T1 contract gate; operator CLI wiring and help are implemented by T7b.
-use mac_worker::controller::channel::{pin::Pin, testing::identity_fixture};
+use mac_worker::test_support::channel::{pin::Pin, testing::identity_fixture};
 
 #[test]
 fn gate_repin_input_has_a_strict_schema() {
@@ -16,7 +16,7 @@ fn isolated_operator_fixture(name: &str) -> bool {
         .prefix("p3b")
         .tempdir_in("/private/tmp")
         .unwrap();
-    let request = mac_worker::process::ProcessRequest {
+    let request = mac_worker::test_support::host::process::ProcessRequest {
         program: std::env::current_exe().unwrap().into_os_string(),
         args: vec![
             "--exact".into(),
@@ -45,15 +45,15 @@ fn isolated_operator_fixture(name: &str) -> bool {
         ],
         environment_remove: vec!["MAC_WORKER_TEST_SSH".into()],
         stdin: None,
-        policy: mac_worker::process::ProcessPolicy {
+        policy: mac_worker::test_support::host::process::ProcessPolicy {
             stdout_limit: 4 * 1024 * 1024,
             stderr_limit: 4 * 1024 * 1024,
             deadline: std::time::Duration::from_secs(60),
         },
         isolate_parent_environment: false,
     };
-    use mac_worker::process::ProcessRunner;
-    let result = mac_worker::process::SystemProcessRunner
+    use mac_worker::test_support::host::process::ProcessRunner;
+    let result = mac_worker::test_support::host::process::SystemProcessRunner
         .run(&request)
         .unwrap();
     assert!(
@@ -67,20 +67,16 @@ fn isolated_operator_fixture(name: &str) -> bool {
 
 mod fixtures {
     use clap::Parser;
-    use mac_worker::{
-        RuntimeContext,
-        cli::Cli,
-        config::Config,
-        controller::{
-            channel::{
-                ConfiguredRoute, SocketIdentity,
-                testing::{identity_fixture, result_fixture},
-            },
-            decode_request,
+    use mac_worker::test_support::{
+        channel::{
+            ConfiguredRoute, SocketIdentity,
+            testing::{identity_fixture, result_fixture},
         },
-        error::WorkerError,
-        paths::PathLayout,
-        process::{ProcessRequest, ProcessResult, ProcessRunner},
+        cli::Cli,
+        controller::decode_request,
+        core::{config::Config, error::WorkerError, paths::PathLayout},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        runtime::RuntimeContext,
     };
     use std::{
         collections::{BTreeMap, VecDeque},
@@ -167,7 +163,7 @@ mod fixtures {
             let cli = Cli::try_parse_from(args).unwrap();
             let mut output = vec![];
             let mut errors = vec![];
-            let exit = mac_worker::run_with_io_in_context(
+            let exit = mac_worker::test_support::runtime::run_with_io_in_context(
                 cli,
                 runner,
                 &self.runtime,
@@ -248,7 +244,7 @@ fn identity_json_reads_raw_stdio_without_pinning() {
         &runner,
     );
     assert_eq!(exit, 0, "{errors}");
-    let actual: mac_worker::controller::channel::SocketIdentity =
+    let actual: mac_worker::test_support::channel::SocketIdentity =
         serde_json::from_str(&output).unwrap();
     assert_eq!(actual, fixture.identity(FIRST));
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
@@ -401,7 +397,7 @@ fn repin_expected_mismatch_and_unsafe_pin_preserve_existing_state() {
 #[test]
 fn repin_requires_canonical_expected_client_id_without_force_or_prompt() {
     use clap::Parser;
-    use mac_worker::cli::Cli;
+    use mac_worker::test_support::cli::Cli;
     assert!(
         Cli::try_parse_from([
             "worker",

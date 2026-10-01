@@ -13,10 +13,20 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    agent::{AgentKind, PermissionPolicy, TurnLimits},
-    client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore},
-    config::{Config, WorkerEntry},
+use mac_worker::test_support::{
+    agents::agent::{AgentKind, PermissionPolicy, TurnLimits},
+    client_state::{
+        ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
+        scheduler::{CandidateSlot, WorkerPreference},
+    },
+    core::{
+        config::{Config, WorkerEntry},
+        error::WorkerError,
+        protocol::{
+            HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
+            WorkerHealth as ProbeWorkerHealth, WorkersReport,
+        },
+    },
     dashboard::{
         model::{DashboardError, DashboardQueueEntryKind, DashboardSnapshot},
         service::{
@@ -25,25 +35,23 @@ use mac_worker::{
         source::{DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource},
         task::{DashboardTaskSource, MAX_TASK_LOG_LIMIT, MacWorkerTaskSource},
     },
-    error::WorkerError,
-    job::{
-        AdmissionObservation, CommandSummary, JobId, LogChunk, LogStream, QueueEntry,
-        QueueEntryKind, QueueRunReference, RunId as QueueRunId,
+    host::{
+        job::{
+            AdmissionObservation, CommandSummary, JobId, LogChunk, LogStream, QueueEntry,
+            QueueEntryKind, QueueRunReference, RunId as QueueRunId,
+        },
+        lease::SlotState,
     },
-    lease::SlotState,
-    project_config::ProjectSettings,
-    protocol::{
-        HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION,
-        WorkerHealth as ProbeWorkerHealth, WorkersReport,
-    },
-    scheduler::{CandidateSlot, WorkerPreference},
     task::{
-        ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery, RunId, RunRecord,
-        RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome,
-        TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+        model::{
+            ClosePolicy, DeliveryState, GitIdentity, LocalTaskRecord, OriginDelivery, RunId,
+            RunRecord, RunnerIdentity, RunnerState, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
+            TaskOutcome, TaskSource, TaskState, TaskStatus, TurnId, TurnSummary,
+        },
+        project_config::ProjectSettings,
+        store::{TaskStatusRequest, TaskStatusResponse},
+        view::{ReviewState, TaskListJson},
     },
-    task_store::{TaskStatusRequest, TaskStatusResponse},
-    task_view::{ReviewState, TaskListJson},
 };
 use uuid::Uuid;
 
@@ -70,7 +78,10 @@ fn active_remote_task_status_overrides_local_status_without_a_write() {
 
     assert_eq!(row.state, TaskState::Open);
     assert_eq!(row.last_outcome, Some(TaskOutcome::NeedsInput));
-    assert_eq!(row.freshness, mac_worker::task_view::TaskFreshness::Current);
+    assert_eq!(
+        row.freshness,
+        mac_worker::test_support::task::view::TaskFreshness::Current
+    );
     assert_eq!(before, harness.local_state_fingerprint());
     assert_eq!(harness.mutation_calls(), 0);
 }
@@ -138,8 +149,11 @@ fn remote_status_failure_keeps_a_stale_row_and_dead_runner() {
     let harness = DashboardTaskHarness::active_local_task()
         .with_runner_liveness(Some(RunnerState::Dead))
         .with_remote_failure("SSH_UNAVAILABLE");
-    let runner =
-        mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(2_000_000_000), 1).unwrap();
+    let runner = mac_worker::test_support::host::job::ProcessIdentity::new(
+        fixture_pid::fixture_pid(2_000_000_000),
+        1,
+    )
+    .unwrap();
     assert_eq!(
         harness.state.runner_liveness(harness.task_id()).unwrap(),
         Some(RunnerState::Live),
@@ -154,7 +168,10 @@ fn remote_status_failure_keeps_a_stale_row_and_dead_runner() {
         .find(|row| row.task_id == harness.task_id())
         .unwrap();
 
-    assert_eq!(row.freshness, mac_worker::task_view::TaskFreshness::Stale);
+    assert_eq!(
+        row.freshness,
+        mac_worker::test_support::task::view::TaskFreshness::Stale
+    );
     assert_eq!(row.runner, Some(RunnerState::Dead));
     assert!(
         snapshot
@@ -293,7 +310,7 @@ fn task_source_uses_typed_ids_and_stale_detail_without_mutation() {
     let detail = source.task_detail(harness.task_id()).unwrap();
     assert_eq!(
         detail.task.freshness,
-        mac_worker::task_view::TaskFreshness::Stale
+        mac_worker::test_support::task::view::TaskFreshness::Stale
     );
 
     let turn_id = harness
@@ -503,7 +520,7 @@ fn closed_task_detail_uses_local_status_without_a_remote_call() {
     assert_eq!(detail.task.state, TaskState::Closed);
     assert_eq!(
         detail.task.freshness,
-        mac_worker::task_view::TaskFreshness::Current
+        mac_worker::test_support::task::view::TaskFreshness::Current
     );
     assert_eq!(harness.remote.task_status_calls(), 0);
     assert_eq!(harness.mutation_calls(), 0);
@@ -634,7 +651,7 @@ fn closed_task_with_pending_delivery_stays_visible_when_the_host_is_unreachable(
     assert_eq!(detail.task.state, TaskState::Closed);
     assert_eq!(
         detail.task.freshness,
-        mac_worker::task_view::TaskFreshness::Stale
+        mac_worker::test_support::task::view::TaskFreshness::Stale
     );
     assert_eq!(
         detail.delivery.as_ref().map(OriginDelivery::state),
@@ -652,7 +669,10 @@ fn closed_task_with_pending_delivery_stays_visible_when_the_host_is_unreachable(
         .iter()
         .find(|row| row.task_id == harness.task_id())
         .unwrap();
-    assert_eq!(row.freshness, mac_worker::task_view::TaskFreshness::Stale);
+    assert_eq!(
+        row.freshness,
+        mac_worker::test_support::task::view::TaskFreshness::Stale
+    );
     assert_eq!(
         row.delivery.as_ref().map(OriginDelivery::state),
         Some(DeliveryState::Retrying)
@@ -804,7 +824,9 @@ impl DashboardTaskHarness {
             None,
         );
         let record = harness.state.load_task(harness.task_id).unwrap();
-        let intent = mac_worker::task::TaskCloseIntent::from_record(&record, false).unwrap();
+        let intent =
+            mac_worker::test_support::task::model::TaskCloseIntent::from_record(&record, false)
+                .unwrap();
         harness
             .state
             .replace_task_fixture(record.with_close_intent(intent).unwrap())
@@ -1046,8 +1068,11 @@ impl QueueHarness {
             .write_turn_prompt(queued, task_turn_id, SECRET)
             .unwrap();
 
-        let owner =
-            mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(42), 1_000).unwrap();
+        let owner = mac_worker::test_support::host::job::ProcessIdentity::new(
+            fixture_pid::fixture_pid(42),
+            1_000,
+        )
+        .unwrap();
         state
             .enqueue(
                 QueueEntry::new(
@@ -1254,7 +1279,7 @@ impl DashboardWorkerReader for FakeWorkers {
 fn config_with_workers(names: &[&str]) -> Config {
     let config = Config {
         version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
+        notifications: mac_worker::test_support::core::config::NotificationsConfig::default(),
         controller: Default::default(),
         ssh: Default::default(),
         workers: names
@@ -1288,11 +1313,13 @@ fn probe(slot_state: SlotState, active_turn: Option<TurnId>) -> ProbeResponse {
         available_memory_bytes: Some(50),
         cpu_counters: None,
         slot_state,
-        active_lease: active_turn.map(|turn_id| mac_worker::lease::LeaseSummary {
-            job_id: turn_id,
-            project_id: PROJECT_ID.into(),
-            worktree_id: WORKTREE_ID.into(),
-            created_at_millis: 1_000,
+        active_lease: active_turn.map(|turn_id| {
+            mac_worker::test_support::host::lease::LeaseSummary {
+                job_id: turn_id,
+                project_id: PROJECT_ID.into(),
+                worktree_id: WORKTREE_ID.into(),
+                created_at_millis: 1_000,
+            }
         }),
         capabilities: vec!["swift".into()],
         agent_facts: None,
@@ -1354,7 +1381,7 @@ fn task_record(
                 wip: false,
                 push_target: None,
             },
-            publish: vec![mac_worker::task::PublishMode::Fetch],
+            publish: vec![mac_worker::test_support::task::model::PublishMode::Fetch],
             publish_branch: None,
             base_oid: BASE_OID.parse().unwrap(),
             limits: TaskLimits::new(TurnLimits::new(60_000, None, None).unwrap(), 2).unwrap(),
@@ -1370,8 +1397,11 @@ fn task_record(
         None,
         with_runner.then(|| {
             RunnerIdentity::new(
-                mac_worker::job::ProcessIdentity::new(fixture_pid::fixture_pid(2_000_000_000), 1)
-                    .unwrap(),
+                mac_worker::test_support::host::job::ProcessIdentity::new(
+                    fixture_pid::fixture_pid(2_000_000_000),
+                    1,
+                )
+                .unwrap(),
             )
         }),
         None,
@@ -1473,7 +1503,8 @@ impl DashboardDataSource for EmptyTaskSource {
 
     fn queue_entries(
         &self,
-    ) -> Result<Vec<mac_worker::dashboard::model::DashboardQueueEntry>, DashboardError> {
+    ) -> Result<Vec<mac_worker::test_support::dashboard::model::DashboardQueueEntry>, DashboardError>
+    {
         Ok(Vec::new())
     }
 }

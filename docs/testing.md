@@ -9,6 +9,25 @@ test such as `task_turn::setup_and_agent_share_one_total_turn_budget` runs in th
 remain in `tests/support/` and are declared once in each area's root.
 New integration test modules go in an existing area and must be declared in that area's `main.rs`.
 
+Integration tests import implementation contracts through `mac_worker::test_support`. Its explicit
+domain namespaces include `core`, `runtime`, `cli`, `client_state`, `controller`, `channel`, `events`,
+`host`, `task`, `transfer`, `dashboard`, and `agents`. Use the CLI fixture accessors and `from_parts`
+constructor instead of accessing `Cli` fields. Source unit tests keep importing `crate::...` so their
+types belong to the unit-test crate instance.
+
+The non-default `test-support` feature is enabled by the package's self dev-dependency. Cargo test
+targets therefore compile the facade into the integration library and the spawned `worker` binary;
+ordinary builds leave the feature disabled. The permanent fixture probe checks both artifacts with a
+cleared child environment and `--version`:
+
+```sh
+CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=6 cargo nextest run --locked --test cli \
+  -E 'test(test_support::spawned_worker_has_test_support_feature)'
+```
+
+Existing SSH and tunnel timing fixtures still depend on `debug_assertions`. Run their process tests
+with the existing debug profiles; enabling `test-support` does not enable those hooks in release profiles.
+
 ## Commands
 
 ```sh

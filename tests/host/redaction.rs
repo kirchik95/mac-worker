@@ -1,11 +1,11 @@
-use mac_worker::{
-    agent::Question,
-    redaction::{
+use mac_worker::test_support::{
+    agents::agent::Question,
+    core::redaction::{
         MAX_CHANGED_FILE_BYTES, MAX_CHANGED_FILE_COUNT, MAX_FAILURE_REASON_BYTES,
         MAX_QUESTION_BYTES, MAX_QUESTION_COUNT, MAX_QUESTION_OPTION_BYTES,
         MAX_QUESTION_OPTION_COUNT, MAX_SUMMARY_BYTES, RedactionBoundary,
     },
-    task::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
+    task::model::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
 };
 use proptest::prelude::*;
 
@@ -13,7 +13,7 @@ fn boundary() -> RedactionBoundary {
     RedactionBoundary::new("/Users/alice")
 }
 
-fn turn_id() -> mac_worker::task::TurnId {
+fn turn_id() -> mac_worker::test_support::task::model::TurnId {
     "018f0f4a6b5c7d8e9f00112233445566"
         .parse()
         .expect("fixture turn id")
@@ -192,7 +192,7 @@ proptest! {
         let reason = boundary.failure_reason(&input);
         prop_assert!(reason.len() <= MAX_FAILURE_REASON_BYTES);
         let title = boundary.title(&input);
-        prop_assert!(title.len() <= mac_worker::redaction::MAX_TITLE_BYTES);
+        prop_assert!(title.len() <= mac_worker::test_support::core::redaction::MAX_TITLE_BYTES);
         let questions = boundary.questions([
             Question::new(input.clone(), vec![input.clone()]),
             Question::open(input.clone()),

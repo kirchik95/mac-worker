@@ -1,6 +1,6 @@
 //! T4 rooted image, identity, pin and forward lifecycle acceptance.
-use mac_worker::{
-    controller::channel::{
+use mac_worker::test_support::{
+    channel::{
         contracts::*,
         files::{PrivateChannelFiles, bind_leader},
         identity::{is_socket_selector, serve_identity_selector},
@@ -11,7 +11,7 @@ use mac_worker::{
         },
     },
     controller::{ControllerLeader, ControllerReadReply, decode_frame},
-    paths::PathLayout,
+    core::paths::PathLayout,
 };
 use serde_json::json;
 use std::{
@@ -145,7 +145,10 @@ fn client_account_and_stored_route_mismatch_never_rotate_a_pin() {
     for case in 0..4 {
         let mut peer = identity.clone();
         match case {
-            0 => peer.service.controller_client_id = mac_worker::job::ClientId::generate(),
+            0 => {
+                peer.service.controller_client_id =
+                    mac_worker::test_support::host::job::ClientId::generate()
+            }
             1 => peer.service.account.uid += 1,
             2 => peer.service.account.home = "/Users/other".into(),
             _ => peer.service.account.username = "other".into(),
@@ -224,7 +227,7 @@ fn repin_requires_expected_fresh_client_and_preserves_notify_and_envelopes() {
         .map(|file| fs::metadata(file).unwrap())
         .collect();
     let mut fresh = old.clone();
-    fresh.service.controller_client_id = mac_worker::job::ClientId::generate();
+    fresh.service.controller_client_id = mac_worker::test_support::host::job::ClientId::generate();
     assert!(
         store
             .repin(&paths, &fresh, old.service.controller_client_id)
@@ -486,7 +489,7 @@ fn live_fixture() -> (
     tempfile::TempDir,
     PathLayout,
     ControllerLeader,
-    mac_worker::controller::channel::files::LeaderSocketLease,
+    mac_worker::test_support::channel::files::LeaderSocketLease,
     ServiceIdentity,
 ) {
     let (temp, paths) = fixture();
@@ -548,7 +551,7 @@ fn context(runtime: &dyn ChannelRuntime) -> ClientContext<'_> {
 }
 #[test]
 fn live_identity_uses_existing_state_id_and_no_journal_receipt_or_active_rows() {
-    use mac_worker::controller::channel::identity::read_live_service;
+    use mac_worker::test_support::channel::identity::read_live_service;
     let (temp, paths, _leader, mut lease, mut service) = live_fixture();
     service.journal_id = None;
     lease.publish(&service).unwrap();
@@ -627,7 +630,7 @@ fn identity_reply_echoes_route_and_optional_journal_changes_do_not_authenticate(
 }
 #[test]
 fn missing_or_mismatched_client_id_and_dead_leader_do_not_advertise() {
-    use mac_worker::controller::channel::identity::read_live_service;
+    use mac_worker::test_support::channel::identity::read_live_service;
     let (temp, paths, leader, mut lease, service) = live_fixture();
     lease.publish(&service).unwrap();
     let runtime = ManualRuntime::default();
@@ -666,7 +669,7 @@ fn missing_or_mismatched_client_id_and_dead_leader_do_not_advertise() {
 }
 #[test]
 fn listener_ready_must_match_every_required_service_field() {
-    use mac_worker::controller::channel::identity::read_live_service;
+    use mac_worker::test_support::channel::identity::read_live_service;
     for field in 0..5 {
         let (temp, paths, _leader, mut lease, service) = live_fixture();
         lease.publish(&service).unwrap();
@@ -674,7 +677,10 @@ fn listener_ready_must_match_every_required_service_field() {
             lease.take_listener().unwrap(),
             move |identity| match field {
                 0 => identity.service.service_generation = UuidString::new_v4(),
-                1 => identity.service.controller_client_id = mac_worker::job::ClientId::generate(),
+                1 => {
+                    identity.service.controller_client_id =
+                        mac_worker::test_support::host::job::ClientId::generate()
+                }
                 2 => identity.service.account.username.push('x'),
                 3 => identity.service.features = vec!["controller.socket".into()],
                 _ => identity.route_sha256 = RouteDigest::parse(&"c".repeat(64)).unwrap(),
@@ -692,7 +698,7 @@ fn listener_ready_must_match_every_required_service_field() {
 }
 #[test]
 fn swapped_socket_or_record_after_local_hello_is_never_advertised() {
-    use mac_worker::controller::channel::identity::read_live_service;
+    use mac_worker::test_support::channel::identity::read_live_service;
     for swap in 0..2 {
         let (temp, paths, _leader, mut lease, service) = live_fixture();
         lease.publish(&service).unwrap();
@@ -721,7 +727,7 @@ fn swapped_socket_or_record_after_local_hello_is_never_advertised() {
 }
 #[test]
 fn invalid_socket_record_types_modes_and_link_bindings_preserve_residue() {
-    use mac_worker::controller::channel::identity::read_live_service;
+    use mac_worker::test_support::channel::identity::read_live_service;
     for case in 0..7 {
         let (temp, paths, _leader, mut lease, service) = live_fixture();
         lease.publish(&service).unwrap();
@@ -765,7 +771,7 @@ fn simulate_prior_process_identity(paths: &PathLayout) {
     // Give the prior record a valid distinct start time to model process reuse.
     let path = paths.controller_state_root().join("rpc/service.json");
     let mut record: ServiceRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    record.service.leader = mac_worker::job::ProcessIdentity::new(
+    record.service.leader = mac_worker::test_support::host::job::ProcessIdentity::new(
         record.service.leader.pid(),
         record.service.leader.start_time_micros() + 1,
     )
@@ -807,7 +813,7 @@ fn stale_record_recovers_only_after_dead_leader_and_exact_refusal() {
 }
 #[test]
 fn missing_stale_socket_recovers_and_prior_image_cleanup_needs_rpc_exit_proof() {
-    use mac_worker::controller::channel::files::cleanup_prior_generation;
+    use mac_worker::test_support::channel::files::cleanup_prior_generation;
     let (_temp, paths, leader, mut old, service) = live_fixture();
     old.publish(&service).unwrap();
     let executable = old.executable();
@@ -873,14 +879,14 @@ fn missing_creation_record_preserves_unknown_bare_image_socket_and_other_entries
     }
 }
 
-use mac_worker::{
-    controller::channel::{
+use mac_worker::test_support::{
+    channel::{
         identity::{StdioIdentitySource, read_live_service},
         testing::{RecordingRunner, result_fixture},
     },
     controller::{encode_json_frame, parse_request},
-    error::{ProcessError, WorkerError},
-    process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    core::error::{ProcessError, WorkerError},
+    host::process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
 };
 use std::{
     io::{Read, Write},
@@ -1211,7 +1217,7 @@ fn identity_length_cap_is_checked_before_codec_allocates() {
         }
         fn encode_reply(
             &self,
-            request: &mac_worker::controller::ControllerRequest,
+            request: &mac_worker::test_support::controller::ControllerRequest,
             result: &ProcessResult,
         ) -> Result<Vec<u8>, ChannelFailure> {
             StubCodec.encode_reply(request, result)
@@ -1219,7 +1225,7 @@ fn identity_length_cap_is_checked_before_codec_allocates() {
         fn decode_reply(
             &self,
             payload: &[u8],
-            request: &mac_worker::controller::ControllerRequest,
+            request: &mac_worker::test_support::controller::ControllerRequest,
         ) -> Result<ProcessResult, ChannelFailure> {
             StubCodec.decode_reply(payload, request)
         }
@@ -1272,7 +1278,10 @@ fn record_publication_rejects_invalid_identity_and_current_image_substitution() 
         match case {
             0 => invalid.service_generation = UuidString::new_v4(),
             1 => invalid.socket_path = "/private/other/s".into(),
-            2 => invalid.leader = mac_worker::job::ProcessIdentity::new(1, 1).unwrap(),
+            2 => {
+                invalid.leader =
+                    mac_worker::test_support::host::job::ProcessIdentity::new(1, 1).unwrap()
+            }
             _ => invalid.features = vec!["controller.events".into()],
         }
         assert!(lease.publish(&invalid).is_err());

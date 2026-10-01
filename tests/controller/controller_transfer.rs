@@ -1,4 +1,5 @@
 use crate::support;
+use mac_worker::test_support::cli::into_command;
 
 use std::{
     collections::BTreeMap,
@@ -14,22 +15,21 @@ use std::{
 };
 
 use clap::Parser;
-use mac_worker::{
+use mac_worker::test_support::{
     cli::{Cli, Command as WorkerCommand, HostCommand},
     controller::{
         CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerResultIdentity, ControllerTransfer,
         VerifiedResultMeta, controller_transfer_cache_id, controller_transfer_git_path,
         frozen_result_ref, import_controller_result, result_digest, source_digest,
     },
-    error::WorkerError,
-    git_transport::{GitServerExecutor, GitTransport, PushReceipt},
-    job::RequestFingerprint,
-    paths::PathLayout,
-    process::SystemProcessRunner,
-    protocol::PROTOCOL_VERSION,
-    task::{BaseOid, TaskId, TurnId},
-    transfer::HostOperation,
-    transfer_repo::{TransferRepo, repo_id_for},
+    core::{error::WorkerError, paths::PathLayout, protocol::PROTOCOL_VERSION},
+    host::{job::RequestFingerprint, process::SystemProcessRunner},
+    task::model::{BaseOid, TaskId, TurnId},
+    transfer::{
+        HostOperation,
+        git::{GitServerExecutor, GitTransport, PushReceipt},
+        repo::{TransferRepo, repo_id_for},
+    },
 };
 use support::GitRepo;
 use tempfile::TempDir;
@@ -124,7 +124,7 @@ impl GitServerExecutor for HaltExecutor {
     fn exec(
         &self,
         _program: &str,
-        _mirror: &mac_worker::rooted_fs::RootedDir,
+        _mirror: &mac_worker::test_support::host::rooted_fs::RootedDir,
         _environment: &[(OsString, OsString)],
     ) -> Result<Infallible, WorkerError> {
         *self.calls.lock().unwrap() += 1;
@@ -432,7 +432,7 @@ fn nested_digests_ignore_token_and_client_payload_sha256() {
     assert_ne!(first, result);
     assert_eq!(
         result,
-        mac_worker::controller::protocol::canonical_request_sha256(
+        mac_worker::test_support::controller::protocol::canonical_request_sha256(
             PROTOCOL_VERSION,
             "controller.transfer.result",
             &serde_json::json!({
@@ -461,7 +461,7 @@ fn hidden_commands_parse_and_stay_off_host_help() {
     ])
     .unwrap();
     assert!(matches!(
-        receive.command,
+        into_command(receive),
         WorkerCommand::Host {
             command: HostCommand::ControllerReceivePack { .. }
         }
@@ -480,7 +480,7 @@ fn hidden_commands_parse_and_stay_off_host_help() {
     ])
     .unwrap();
     assert!(matches!(
-        upload.command,
+        into_command(upload),
         WorkerCommand::Host {
             command: HostCommand::ControllerUploadPack { .. }
         }

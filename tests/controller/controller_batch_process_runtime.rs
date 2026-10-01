@@ -15,15 +15,15 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use controller_process::ProcessFixture;
-use mac_worker::{
+use mac_worker::test_support::{
+    client_state::dag::DagBase,
     controller::{
         BatchKind, FrozenBatchBody, OperationEnvelope, canonical_request_sha256, decode_frame,
         encode_json_frame, load_operation_envelope,
     },
-    dag::DagBase,
-    process::SystemProcessRunner,
-    project_state::ProjectState,
-    protocol::PROTOCOL_VERSION,
+    core::protocol::PROTOCOL_VERSION,
+    host::process::SystemProcessRunner,
+    task::project_state::ProjectState,
 };
 use serde_json::{Value, json};
 
@@ -286,13 +286,15 @@ fn runtime_dag_from_parent_requires_actual_close() {
         String::from_utf8_lossy(&reconcile_stderr)
     );
     {
-        let state =
-            mac_worker::client_state::ClientStateStore::open(&fixture.controller_state()).unwrap();
+        let state = mac_worker::test_support::client_state::ClientStateStore::open(
+            &fixture.controller_state(),
+        )
+        .unwrap();
         let dag = state.load_run_dag(body.run_id).unwrap().unwrap();
         let child = &dag.nodes["child"];
         assert_eq!(
             child.state,
-            mac_worker::dag::DagNodeState::Waiting,
+            mac_worker::test_support::client_state::dag::DagNodeState::Waiting,
             "an evaluated Open+Done parent must not admit its child"
         );
         assert!(child.bound_oid.is_none());

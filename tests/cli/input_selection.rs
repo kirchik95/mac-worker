@@ -10,12 +10,16 @@ use std::{
     time::Duration,
 };
 
-use mac_worker::{
-    error::WorkerError,
-    inputs::{InputOrigin, InputSelector, RelativePath, SelectedInputKind},
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    project::{ProjectContext, ProjectInspector},
-    project_config::SnapshotSettings,
+use mac_worker::test_support::{
+    core::{
+        error::WorkerError,
+        inputs::{InputOrigin, InputSelector, RelativePath, SelectedInputKind},
+    },
+    host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    task::{
+        project::{ProjectContext, ProjectInspector},
+        project_config::SnapshotSettings,
+    },
 };
 use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
@@ -158,7 +162,10 @@ fn context(repo: &GitRepo) -> ProjectContext {
 fn select(
     repo: &GitRepo,
     settings: &SnapshotSettings,
-) -> Result<mac_worker::inputs::InputSelection, mac_worker::inputs::SelectionFailure> {
+) -> Result<
+    mac_worker::test_support::core::inputs::InputSelection,
+    mac_worker::test_support::core::inputs::SelectionFailure,
+> {
     // Selection reads the user's Git configuration through HOME. Another test
     // may point HOME at a temporary directory, so serialize with it unless
     // this thread already holds the lock.
