@@ -1,50 +1,36 @@
 use crate::support;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ffi::OsStr,
-    os::unix::process::ExitStatusExt,
-    process::ExitStatus,
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::task_ports_fixture as task_fixture;
 use mac_worker::{
     client_state::{
         ClientStateConcurrencyHook, ClientStateConcurrencyPoint, ClientStateStore,
         RunnerSlotDecision,
     },
-    config::{Config, WorkerEntry},
     error::WorkerError,
     host_store::HostStore,
     job::{
-        AdmissionObservation, CommandSpec, FleetReconcileJobResult, FleetReconcileRequest,
-        FleetReconcileResponse, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseToken, LocalJobRecord, ProcessIdentity, QueueEntry,
-        QueueEntryKind, QueueRunReference, QueueState, RequestFingerprintMaterial, RunId,
-        StatusResponse, SubmitRequest, SubmitResponse,
+        AdmissionObservation, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseToken, ProcessIdentity, QueueEntry, QueueEntryKind,
+        QueueRunReference, QueueState, RequestFingerprintMaterial, RunId,
     },
     lease::{AdmissionFacts, LeaseService},
-    paths::PathLayout,
-    process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
-    protocol::{CpuCounters, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
-    run::{
-        JobFollower, RunCompletion, RunObserver, RunRequest, RunService, RunStage, SchedulerRuntime,
-    },
+    protocol::MemoryPressure,
     scheduler::{CandidateSlot, WorkerPreference},
-    scheduler_adapter::SchedulerProbeAdapter,
     supervisor::{
         ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
-        SystemProcessInspector,
     },
-    transfer::HostOperation,
-    transport::{SshTransport, WorkersService},
+    task::{TaskId, TaskOutcome},
 };
 use support::GitRepo;
 
@@ -111,7 +97,9 @@ fn lease_request(entry: &QueueEntry, worker: &str, seed: u128) -> LeaseAcquireRe
         CommandSpec::argv(vec!["safe-command-summary-only".into()]).unwrap(),
     )
     .unwrap();
-    LeaseAcquireRequest::new(material)
+    LeaseAcquireRequest::new(material).with_execution_scope(ExecutionScope::task(TaskId::new(
+        uuid::Uuid::from_u128(seed + 200_000),
+    )))
 }
 
 struct OneShotGate {
@@ -225,392 +213,12 @@ fn queued_at(
     .unwrap()
 }
 
-const PRODUCTION_RSYNC_STATS: &[u8] = b"Number of files: 2\nNumber of files transferred: 1\nTotal file size: 8 B\nTotal transferred file size: 8 B\nUnmatched data: 8 B\nMatched data: 0 B\nFile list size: 64 B\nTotal sent: 128 B\nTotal received: 32 B\n\nsent 128 bytes  received 32 bytes  1000 bytes/sec\ntotal size is 8  speedup is 0.05\n";
-
-fn canonical_process(value: &impl serde::Serialize) -> Result<ProcessResult, WorkerError> {
-    let mut stdout = serde_json::to_vec(value).map_err(|error| {
-        WorkerError::Protocol(format!("test response serialization failed: {error}"))
-    })?;
-    stdout.push(b'\n');
-    Ok(ProcessResult {
-        status: ExitStatus::from_raw(0),
-        stdout,
-        stderr: Vec::new(),
-    })
-}
-
-fn host_error_process(code: &'static str, message: String) -> Result<ProcessResult, WorkerError> {
-    let mut result = canonical_process(&HostControlError::new(code, message)?)?;
-    result.status = ExitStatus::from_raw(23 << 8);
-    Ok(result)
-}
-
-struct ProductionLeaseRunner {
-    host: HostStore,
-    lease_acquires: AtomicUsize,
-    acquires: Mutex<HashMap<JobId, LeaseAcquireRequest>>,
-}
-
-impl ProductionLeaseRunner {
-    fn new(host: HostStore) -> Self {
-        Self {
-            host,
-            lease_acquires: AtomicUsize::new(0),
-            acquires: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn lease_acquires(&self) -> usize {
-        self.lease_acquires.load(Ordering::SeqCst)
-    }
-
-    fn accepted_jobs(&self) -> HashSet<JobId> {
-        self.acquires.lock().unwrap().keys().copied().collect()
-    }
-
-    fn abandon_and_release(&self, job_id: JobId) -> Result<(), WorkerError> {
-        let request = self
-            .acquires
-            .lock()
-            .unwrap()
-            .get(&job_id)
-            .cloned()
-            .ok_or_else(|| {
-                WorkerError::Protocol(
-                    "production test runner is missing the acquire request".into(),
-                )
-            })?;
-        self.host.record_abandoned(&request, 200)?;
-        let Some(lease) = LeaseService::new(&self.host).load_for_job(job_id)? else {
-            return Ok(());
-        };
-        let receipt = self.host.cleanup_job_owned(&lease)?;
-        LeaseService::new(&self.host).release_after_cleanup(&lease, &receipt)
-    }
-}
-
-impl ProcessRunner for ProductionLeaseRunner {
-    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
-        if request.program == OsStr::new("/usr/bin/git") {
-            return SystemProcessRunner.run(request);
-        }
-        if request.program == OsStr::new("/usr/bin/rsync") {
-            return Ok(ProcessResult {
-                status: ExitStatus::from_raw(0),
-                stdout: PRODUCTION_RSYNC_STATS.to_vec(),
-                stderr: Vec::new(),
-            });
-        }
-
-        let operation = request
-            .args
-            .last()
-            .and_then(|argument| argument.to_str())
-            .unwrap_or_default();
-        match operation {
-            "~/.local/bin/worker host probe" => {
-                let occupancy = LeaseService::new(&self.host).occupancy()?;
-                canonical_process(&ProbeResponse {
-                    features: None,
-                    protocol_version: PROTOCOL_VERSION,
-                    supervision_version: SUPERVISION_VERSION,
-                    hostname: "scheduler-test-host".into(),
-                    arch: "arm64".into(),
-                    os_version: "26.2".into(),
-                    free_disk_bytes: 100 * 1024 * 1024 * 1024,
-                    total_disk_bytes: 250 * 1024 * 1024 * 1024,
-                    memory_pressure: MemoryPressure::Normal,
-                    swap_used_bytes: Some(0),
-                    available_memory_bytes: Some(12 * 1024 * 1024 * 1024),
-                    cpu_counters: Some(CpuCounters {
-                        user_ticks: 10,
-                        system_ticks: 20,
-                        idle_ticks: 30,
-                        nice_ticks: 40,
-                    }),
-                    slot_state: occupancy.slot_state,
-                    active_lease: occupancy.active_lease,
-                    capabilities: Vec::new(),
-                    agent_facts: None,
-                    facts_age_millis: None,
-                    configured_slots: occupancy.configured_slots,
-                    busy_slots: occupancy.busy_slots,
-                    build_id: None,
-                    binary_sha256: None,
-                })
-            }
-            value if value == HostOperation::LeaseAcquire.command() => {
-                let bytes = request.stdin.as_deref().ok_or_else(|| {
-                    WorkerError::Protocol(
-                        "lease acquire request was missing in test transport".into(),
-                    )
-                })?;
-                let acquire: LeaseAcquireRequest =
-                    serde_json::from_slice(bytes).map_err(|error| {
-                        WorkerError::Protocol(format!("invalid lease request: {error}"))
-                    })?;
-                match LeaseService::new(&self.host).acquire(
-                    &acquire,
-                    &healthy_admission(),
-                    acquire.material().created_at_millis(),
-                ) {
-                    Ok(response) => {
-                        if matches!(response, LeaseAcquireResponse::Acquired { .. }) {
-                            let job_id = acquire.material().job_id();
-                            let mut accepted = self.acquires.lock().unwrap();
-                            if accepted.insert(job_id, acquire).is_none() {
-                                self.lease_acquires.fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-                        canonical_process(&response)
-                    }
-                    Err(WorkerError::Capacity { code, message, .. }) => {
-                        host_error_process(code, message.into_owned())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            value if value == HostOperation::SnapshotVerify.command() => {
-                let bytes = request.stdin.as_deref().ok_or_else(|| {
-                    WorkerError::Protocol(
-                        "snapshot verify request was missing in test transport".into(),
-                    )
-                })?;
-                let verify: SnapshotVerifyRequest =
-                    serde_json::from_slice(bytes).map_err(|error| {
-                        WorkerError::Protocol(format!("invalid snapshot verify request: {error}"))
-                    })?;
-                canonical_process(
-                    &VerifiedSnapshotResponse::new(
-                        verify.job_id(),
-                        verify.client_id(),
-                        verify.project_id().into(),
-                        verify.worktree_id().into(),
-                        verify.manifest_digest().into(),
-                        102,
-                        false,
-                    )
-                    .unwrap(),
-                )
-            }
-            value if value == HostOperation::Submit.command() => {
-                let bytes = request.stdin.as_deref().ok_or_else(|| {
-                    WorkerError::Protocol("submit request was missing in test transport".into())
-                })?;
-                let submit: SubmitRequest = serde_json::from_slice(bytes).map_err(|error| {
-                    WorkerError::Protocol(format!("invalid submit request: {error}"))
-                })?;
-                let meta = JobMeta::new(submit.material(), submit.request_fingerprint().clone())?;
-                canonical_process(&SubmitResponse::Accepted {
-                    meta: Box::new(meta),
-                    status: JobStatus::accepted(submit.material().created_at_millis() + 1)?,
-                })
-            }
-            value if value == HostOperation::Reconcile.command() => {
-                let bytes = request.stdin.as_deref().ok_or_else(|| {
-                    WorkerError::Protocol(
-                        "fleet reconcile request was missing in test transport".into(),
-                    )
-                })?;
-                let reconcile: FleetReconcileRequest =
-                    serde_json::from_slice(bytes).map_err(|error| {
-                        WorkerError::Protocol(format!("invalid fleet reconcile request: {error}"))
-                    })?;
-                let results = reconcile
-                    .known_job_ids()
-                    .iter()
-                    .map(|job_id| FleetReconcileJobResult::Error {
-                        job_id: *job_id,
-                        error: HostControlError::new("JOB_NOT_FOUND", "job ID is not indexed")
-                            .expect("JOB_NOT_FOUND is a valid host control error"),
-                    })
-                    .collect();
-                canonical_process(&FleetReconcileResponse::new(results).unwrap())
-            }
-            _ => panic!("unexpected production-path test request: {request:?}"),
-        }
-    }
-}
-
-struct DispatchHandoffGate {
-    entered: mpsc::Sender<()>,
-    release: Mutex<mpsc::Receiver<()>>,
-    hits: AtomicUsize,
-}
-
-impl DispatchHandoffGate {
-    fn new(entered: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> Self {
-        Self {
-            entered,
-            release: Mutex::new(release),
-            hits: AtomicUsize::new(0),
-        }
-    }
-
-    fn hits(&self) -> usize {
-        self.hits.load(Ordering::SeqCst)
-    }
-}
-
-impl RunObserver for DispatchHandoffGate {
-    fn observe(&self, stage: RunStage) -> Result<(), WorkerError> {
-        if stage == RunStage::DispatchToLeaseHandoff {
-            self.hits.fetch_add(1, Ordering::SeqCst);
-            self.entered.send(()).map_err(|_| {
-                WorkerError::Protocol("production dispatch handoff receiver disappeared".into())
-            })?;
-            self.release
-                .lock()
-                .unwrap()
-                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
-                .map_err(|_| {
-                    WorkerError::Protocol("production dispatch handoff timed out".into())
-                })?;
-        }
-        Ok(())
-    }
-}
-
-struct SuccessfulRunFollower;
-
-impl JobFollower for SuccessfulRunFollower {
-    fn follow(
-        &self,
-        record: &LocalJobRecord,
-        _json: bool,
-        _stdout: &mut dyn std::io::Write,
-        _stderr: &mut dyn std::io::Write,
-    ) -> Result<StatusResponse, WorkerError> {
-        StatusResponse::new(
-            record.meta().clone(),
-            JobStatus::succeeded(record.meta().created_at_millis() + 2, 0, 0)?,
-        )
-    }
-}
-
-fn production_run_repo() -> GitRepo {
+fn task_repo() -> GitRepo {
     let repo = GitRepo::init();
     repo.write(".worker.toml", b"version = 1\n");
     repo.write("tracked.txt", b"tracked\n");
-    repo.commit_all("scheduler production path fixture");
+    repo.commit_all("scheduler task path fixture");
     repo
-}
-
-fn production_run_paths(temp: &tempfile::TempDir) -> PathLayout {
-    let root = temp.path().canonicalize().unwrap();
-    PathLayout {
-        config: root.join("config.toml"),
-        state: root.join("state"),
-        cache: root.join("cache"),
-        data: root.join("data"),
-    }
-}
-
-fn production_run_config() -> Config {
-    production_run_config_with_slots(1)
-}
-
-fn production_run_config_with_slots(slots: u8) -> Config {
-    Config {
-        version: 1,
-        notifications: mac_worker::config::NotificationsConfig::default(),
-        controller: Default::default(),
-        ssh: Default::default(),
-        workers: vec![WorkerEntry {
-            name: "mini-a".into(),
-            ssh: "mini-a".into(),
-            slots,
-            capabilities: Vec::new(),
-            remote_binary: "~/.local/bin/worker".into(),
-            herdr: false,
-        }],
-    }
-}
-
-fn wait_path_diagnostics(
-    label: &str,
-    store: &ClientStateStore,
-    host: &HostStore,
-    runner: &ProductionLeaseRunner,
-    config: &Config,
-) -> String {
-    let occupancy = LeaseService::new(host).occupancy().unwrap();
-    let occupied = LeaseService::new(host).occupied_slots().unwrap();
-    let inspect = WorkersService::new(SshTransport::new(runner)).inspect(config);
-    let health = &inspect.workers[0];
-    let adapter = SchedulerProbeAdapter::observations(config, &inspect.workers)
-        .map(|facts| {
-            facts
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "ready={} slot={:?} worker={}",
-                        candidate.ready(),
-                        candidate.slot(),
-                        candidate.worker_name()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .unwrap_or_else(|error| format!("adapter error: {error}"));
-    let queue = store
-        .queue_snapshot()
-        .unwrap()
-        .entries()
-        .iter()
-        .map(|entry| {
-            format!(
-                "job={} state={:?} owner={:?}",
-                entry.job_id(),
-                entry.state(),
-                entry.owner_opt()
-            )
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "{label}: occupancy slot={:?} configured={} busy={} active_lease={} occupied_jobs={} health={:?} error={:?}/{:?} probe_slots={:?}/{:?} probe_active={} free_slot={:?} adapter=[{adapter}] queue={queue:?}",
-        occupancy.slot_state,
-        occupancy.configured_slots,
-        occupancy.busy_slots,
-        occupancy.active_lease.is_some(),
-        occupied.len(),
-        health.status,
-        health.error_code,
-        health.error_message,
-        health.probe.as_ref().map(|probe| probe.configured_slots),
-        health.probe.as_ref().map(|probe| probe.busy_slots),
-        health
-            .probe
-            .as_ref()
-            .and_then(|probe| probe.active_lease.as_ref())
-            .is_some(),
-        health
-            .probe
-            .as_ref()
-            .map(ProbeResponse::has_free_execution_slot),
-    )
-}
-
-fn production_run_request(repo: &GitRepo) -> RunRequest {
-    production_run_request_with(repo, false, "scheduler-production-path")
-}
-
-fn production_run_request_with(
-    repo: &GitRepo,
-    wait_for_capacity: bool,
-    command: &str,
-) -> RunRequest {
-    RunRequest {
-        preference: WorkerPreference::Pinned {
-            worker: "mini-a".into(),
-        },
-        wait_for_capacity,
-        project: repo.root().to_path_buf(),
-        cli_includes: Vec::new(),
-        timeout: None,
-        command: CommandSpec::argv(vec![command.into()]).unwrap(),
-    }
 }
 
 fn simultaneous_clients_preserve_fifo(client_count: u32) {
@@ -930,7 +538,8 @@ fn simultaneous_clients_preserve_fifo(client_count: u32) {
 }
 
 #[test]
-fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker() {
+fn task_fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker() {
+    // Supersedes scheduler_concurrency::fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker.
     // Six clients on three workers still exercise every worker and a contended
     // slot: two jobs share each worker, and only the FIFO head is reserved.
     simultaneous_clients_preserve_fifo(6);
@@ -939,12 +548,15 @@ fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_w
 // Nightly: cargo nextest run --locked -E 'test(/_stress$/)' --run-ignored ignored
 #[test]
 #[ignore = "stress: 50 simultaneous clients"]
-fn fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker_stress() {
+fn task_fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker_stress()
+{
+    // Supersedes scheduler_concurrency::fifty_simultaneous_clients_preserve_fifo_and_never_start_two_heavy_jobs_per_worker_stress.
     simultaneous_clients_preserve_fifo(50);
 }
 
 #[test]
-fn queue_publication_and_claim_interleavings_preserve_fifo_reservations() {
+fn task_queue_publication_and_claim_interleavings_preserve_fifo_reservations() {
+    // Supersedes scheduler_concurrency::queue_publication_and_claim_interleavings_preserve_fifo_reservations.
     // Break caught: publication outside the queue lock lets a later claimant
     // observe an unsequenced row or reserve one worker twice.
     // The gate interleaving does not change with the index; only owner and job
@@ -995,7 +607,8 @@ fn queue_publication_and_claim_interleavings_preserve_fifo_reservations() {
 }
 
 #[test]
-fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
+fn task_enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
+    // Supersedes scheduler_concurrency::enqueue_claim_handoff_matrix_preserves_the_published_fifo_head.
     // Break caught: a claimant can observe a queue row before its canonical
     // publication, bypass the head, or claim a different worker after the
     // publisher hands off the queue lock.
@@ -1079,65 +692,83 @@ fn enqueue_claim_handoff_matrix_preserves_the_published_fifo_head() {
 }
 
 #[test]
-fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
-    // Break caught: a QueueState::Dispatching claim can be decoupled from the
-    // RunService lease transfer, allowing a direct test-only lease acquire to
-    // pass while production dispatch never reaches the authoritative host.
-    let repo = production_run_repo();
+fn task_claim_lease_handoff_matrix_uses_turn_runner_dispatch() {
+    // Supersedes scheduler_concurrency::claim_lease_handoff_matrix_uses_production_run_dispatch.
+    let repo = task_repo();
     let mut schedule_counts = [0usize; 4];
     #[allow(clippy::needless_range_loop)]
     for schedule in 0..4 {
         schedule_counts[schedule] += 1;
-        let case = schedule as u128;
         let temp = tempfile::tempdir().unwrap();
-        let paths = production_run_paths(&temp);
+        let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
         let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
-        let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
-        let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
-        let config = production_run_config();
-        let follower = SuccessfulRunFollower;
+        let host = HostStore::open(&paths.data.join("host")).unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let observer = Arc::new(DispatchHandoffGate::new(entered_tx, release_rx));
+        let release_rx = Mutex::new(release_rx);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let gate_hits = Arc::clone(&hits);
+        let mut remote = task_fixture::TaskRemote::new(host.clone());
+        remote.before_acquire = Some(Arc::new(move || {
+            gate_hits.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(support::HANDSHAKE_TIMEOUT)
+                .unwrap();
+        }));
+        let remote = Arc::new(remote);
+        let config = task_fixture::config(1);
         let run_store = Arc::clone(&store);
-        let run_runner = Arc::clone(&runner);
-        let run_observer = Arc::clone(&observer);
+        let run_remote = Arc::clone(&remote);
         let run_paths = paths.clone();
         let run_config = config.clone();
-        let run_request = production_run_request(&repo);
+        let project = repo.root().to_path_buf();
         let run = thread::spawn(move || {
-            let service = RunService::with_follower(
-                &*run_runner,
+            let mut request = task_fixture::request_from_path(&project, false);
+            request.attached = false;
+            let report = mac_worker::task_client::TaskClient::new(
+                &*run_remote,
                 &run_config,
                 &run_paths,
                 &run_store,
-                &follower,
+                &mac_worker::turn_runner::InlineRunnerExecutor,
             )
-            .with_observer(&*run_observer);
-            service.submit_and_follow(run_request, false, &mut Vec::new(), &mut Vec::new())
+            .submit(request, &mut Vec::new(), &mut Vec::new())?;
+            let turn = run_store
+                .queue_entry_for_task_turn(report.task_id())?
+                .unwrap()
+                .job_id();
+            let completion = task_fixture::run(
+                &*run_remote,
+                &run_config,
+                &run_paths,
+                &run_store,
+                report.task_id(),
+                turn,
+            )?;
+            Ok::<_, WorkerError>((turn, completion))
         });
-
-        entered_rx
-            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
-            .unwrap_or_else(|_| panic!("case {case} never reached dispatch-to-lease handoff"));
+        entered_rx.recv_timeout(support::HANDSHAKE_TIMEOUT).unwrap();
         let before = store.queue_snapshot().unwrap();
-        assert_eq!(before.entries().len(), 1, "case {case}");
+        assert_eq!(before.entries().len(), 1, "case {schedule}");
         let entry = &before.entries()[0];
-        let job_id = entry.job_id();
-        assert!(matches!(
-            entry.state(),
-            QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-a"
-        ));
+        let job = entry.job_id();
+        assert_eq!(entry.kind(), QueueEntryKind::TaskTurn);
         assert!(
-            store.load_job(job_id).is_ok(),
-            "case {case} local record exists"
+            matches!(entry.state(), QueueState::Dispatching { selected_worker, .. } if selected_worker == "mini-a")
+        );
+        let task = store.task_id_for_turn(job).unwrap().unwrap();
+        assert!(
+            store.load_task(task).is_ok(),
+            "case {schedule} local record exists"
         );
         assert_eq!(
             LeaseService::new(&host).load().unwrap(),
             None,
-            "case {case}"
+            "case {schedule}"
         );
-
         match schedule {
             0 => {
                 assert!(matches!(
@@ -1152,455 +783,259 @@ fn claim_lease_handoff_matrix_uses_production_run_dispatch() {
             }
             2 => {
                 let reader_store = Arc::clone(&store);
-                let reader_host = Arc::clone(&host);
-                let (reader_started_tx, reader_started_rx) = mpsc::channel();
-                let (reader_done_tx, reader_done_rx) = mpsc::channel();
+                let reader_host = host.clone();
                 let reader = thread::spawn(move || {
-                    reader_started_tx.send(()).unwrap();
-                    let snapshot = reader_store.queue_snapshot().unwrap();
-                    let lease = LeaseService::new(&reader_host).load().unwrap();
-                    reader_done_tx.send((snapshot, lease)).unwrap();
+                    (
+                        reader_store.queue_snapshot().unwrap(),
+                        LeaseService::new(&reader_host).load().unwrap(),
+                    )
                 });
-                reader_started_rx.recv().unwrap();
-                let (snapshot, lease) = reader_done_rx.recv().unwrap();
+                let (snapshot, lease) = reader.join().unwrap();
                 assert!(matches!(
                     snapshot.entries()[0].state(),
                     QueueState::Dispatching { .. }
                 ));
-                assert_eq!(lease, None, "case {case} reader precedes lease transfer");
+                assert_eq!(
+                    lease, None,
+                    "case {schedule} reader precedes lease transfer"
+                );
                 release_tx.send(()).unwrap();
-                reader.join().unwrap();
             }
             3 => {
                 release_tx.send(()).unwrap();
                 let reader_store = Arc::clone(&store);
-                let reader = thread::spawn(move || reader_store.queue_snapshot().unwrap());
-                let _ = reader.join().unwrap();
+                let _ = thread::spawn(move || reader_store.queue_snapshot().unwrap())
+                    .join()
+                    .unwrap();
             }
             _ => unreachable!(),
         }
-
-        let completion = run
-            .join()
-            .unwrap()
-            .unwrap_or_else(|error| panic!("case {case} production dispatch failed: {error}"));
+        let (turn, completion) = run.join().unwrap().unwrap();
         assert_eq!(
-            observer.hits(),
+            hits.load(Ordering::SeqCst),
             1,
-            "case {case} named handoff is reached once"
+            "case {schedule} named handoff reached once"
         );
-        assert_eq!(runner.lease_acquires(), 1, "case {case}");
-        assert_eq!(completion.report.job_id, job_id, "case {case}");
-        assert_eq!(completion.report.worker, "mini-a", "case {case}");
-        assert_eq!(
-            completion.report.status.state(),
-            mac_worker::job::JobState::Succeeded,
-            "case {case} terminal outcome follows authoritative lease"
-        );
-        let live = LeaseService::new(&host)
-            .load()
-            .unwrap()
-            .expect("case must retain the one authoritative host lease");
-        assert_eq!(live.job_id(), job_id, "case {case}");
-        assert_eq!(live.worker_name(), "mini-a", "case {case}");
-        assert!(
-            store.queue_snapshot().unwrap().entries().is_empty(),
-            "case {case}"
-        );
+        assert_eq!(remote.accepted_jobs().len(), 1, "case {schedule}");
+        assert_eq!(turn, job);
+        assert_eq!(completion.status().worker(), Some("mini-a"));
+        assert_eq!(completion.status().last_outcome(), Some(&TaskOutcome::Done));
+        let lease = LeaseService::new(&host).load().unwrap().unwrap();
+        assert_eq!(lease.job_id(), job);
+        assert_eq!(lease.worker_name(), "mini-a");
+        assert!(store.queue_snapshot().unwrap().entries().is_empty());
     }
     assert_eq!(schedule_counts, [1, 1, 1, 1]);
 }
 
-/// CLI `worker run` owns one Batch row per process. Sequential initial
-/// `RunService::submit_and_follow` calls keep that contract: two overlapping
-/// same-owner Waiting rows in one process let untargeted claim take the FIFO
-/// head (`QUEUE_CLAIM_CONFLICT`). Production lease acquire and follower stay
-/// on the real path; waiting-third concurrency is a later, separate thread.
-fn sequential_two_slot_run_submits(
-    runner: &ProductionLeaseRunner,
-    config: &Config,
-    paths: &PathLayout,
+fn dispatch_task(
+    remote: &task_fixture::TaskRemote,
+    config: &mac_worker::config::Config,
+    paths: &mac_worker::paths::PathLayout,
     store: &ClientStateStore,
     repo: &GitRepo,
-    first_command: &'static str,
-    second_command: &'static str,
-) -> (RunCompletion, RunCompletion) {
-    let submit = |command: &'static str, label: &str| {
-        RunService::with_follower(runner, config, paths, store, &SuccessfulRunFollower)
-            .submit_and_follow(
-                production_run_request_with(repo, false, command),
-                false,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
-            .unwrap_or_else(|error| panic!("{label} production dispatch failed: {error}"))
-    };
-    (
-        submit(first_command, "first"),
-        submit(second_command, "second"),
-    )
+    wait: bool,
+) -> Result<JobId, WorkerError> {
+    let (task, turn) = task_fixture::enqueue(remote, config, paths, store, repo, wait)?;
+    let report = task_fixture::run(remote, config, paths, store, task, turn)?;
+    assert_eq!(report.status().last_outcome(), Some(&TaskOutcome::Done));
+    Ok(turn)
 }
 
 #[test]
-fn two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot() {
-    // Break caught: config slots=2 and host capacity 2 are not both carried
-    // through RunService + production lease acquire, so a second job parks or
-    // a third still acquires, or cancelling one does not free exactly one slot.
-    let repo = production_run_repo();
+fn task_two_slot_dispatch_accepts_two_turns_and_cancel_frees_one_slot() {
+    // Supersedes scheduler_concurrency::two_slot_production_dispatch_accepts_two_jobs_and_cancel_frees_one_slot.
+    let repo = task_repo();
     let temp = tempfile::tempdir().unwrap();
-    let paths = production_run_paths(&temp);
-    let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
-    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let host = HostStore::open(&paths.data.join("host")).unwrap();
     LeaseService::new(&host).set_slot_count(2).unwrap();
-    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
-    let config = production_run_config_with_slots(2);
-    let (first, second) = sequential_two_slot_run_submits(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        "scheduler-two-slot-first",
-        "scheduler-two-slot-second",
-    );
-    assert_ne!(first.report.job_id, second.report.job_id);
+    let remote = task_fixture::TaskRemote::new(host.clone());
+    let config = task_fixture::config(2);
+    let first = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    let second = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    assert_ne!(first, second);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
-    let occupied_ids: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
-    assert_eq!(occupied_ids.len(), 2);
+    let ids: HashSet<_> = occupied.iter().map(|s| s.lease.job_id()).collect();
+    assert_eq!(ids.len(), 2);
     assert_eq!(
-        runner.accepted_jobs(),
-        occupied_ids,
-        "idempotent Acquired retries must not count as extra accepted jobs"
+        remote.accepted_jobs(),
+        ids,
+        "idempotent acquire retries never count twice"
     );
-
-    let third =
-        RunService::with_follower(&*runner, &config, &paths, &store, &SuccessfulRunFollower)
-            .submit_and_follow(
-                production_run_request_with(&repo, false, "scheduler-two-slot-third"),
-                false,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
-            .unwrap_err();
+    let third = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap_err();
     assert_eq!(third.public_code(), "CAPACITY_BUSY");
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
-    assert_eq!(runner.accepted_jobs().len(), 2);
-
-    runner
-        .abandon_and_release(first.report.job_id)
-        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    assert_eq!(remote.accepted_jobs().len(), 2);
+    remote.release(first);
     store.invalidate_admission_observation("mini-a").unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
     assert_eq!(
         LeaseService::new(&host)
-            .load_for_job(second.report.job_id)
+            .load_for_job(second)
             .unwrap()
             .unwrap()
             .job_id(),
-        second.report.job_id
+        second
     );
-
-    let fourth =
-        RunService::with_follower(&*runner, &config, &paths, &store, &SuccessfulRunFollower)
-            .submit_and_follow(
-                production_run_request_with(&repo, false, "scheduler-two-slot-fourth"),
-                false,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
-            .unwrap_or_else(|error| panic!("fourth production dispatch failed: {error}"));
-    assert_eq!(runner.accepted_jobs().len(), 3);
+    let fourth = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    assert_eq!(remote.accepted_jobs().len(), 3);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
     assert_eq!(occupied.len(), 2);
-    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
-    assert!(live.contains(&second.report.job_id));
-    assert!(live.contains(&fourth.report.job_id));
-    assert!(!live.contains(&first.report.job_id));
+    let live: HashSet<_> = occupied.iter().map(|s| s.lease.job_id()).collect();
+    assert!(live.contains(&second));
+    assert!(live.contains(&fourth));
+    assert!(!live.contains(&first));
 }
 
-struct FrozenAdmissionRuntime {
-    now_millis: AtomicU64,
-    owner: ProcessIdentity,
-}
-
-impl FrozenAdmissionRuntime {
-    fn new() -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock predates Unix epoch")
-            .as_millis() as u64;
-        let owner = SystemProcessInspector
-            .identity_for_pid(std::process::id())
-            .expect("admission clock must match the live client-state inspector");
-        Self {
-            now_millis: AtomicU64::new(now),
-            owner,
-        }
-    }
-
-    fn expire_observation_ttl(&self) {
-        self.now_millis.fetch_add(3_000, Ordering::SeqCst);
-    }
-}
-
-impl SchedulerRuntime for FrozenAdmissionRuntime {
-    fn now_millis(&self) -> Result<u64, WorkerError> {
-        Ok(self.now_millis.load(Ordering::SeqCst))
-    }
-
-    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
-        Ok(self.owner)
-    }
-
-    fn sleep(&self, _duration: Duration) {
-        panic!("no-wait production dispatch must not sleep on capacity");
-    }
-}
-
-fn submit_two_slot_with_runtime(
-    runner: &ProductionLeaseRunner,
-    config: &Config,
-    paths: &PathLayout,
-    store: &ClientStateStore,
-    repo: &GitRepo,
-    runtime: &dyn SchedulerRuntime,
-    command: &'static str,
-) -> Result<RunCompletion, WorkerError> {
-    RunService::with_follower(runner, config, paths, store, &SuccessfulRunFollower)
-        .with_scheduler_runtime(runtime)
-        .submit_and_follow(
-            production_run_request_with(repo, false, command),
-            false,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-}
-
-/// Mechanism: after the third dispatch probes a full two-slot host, the
-/// advisory cache keeps that Ready+Busy `AdmissionObservation` reusable for
-/// `OBSERVATION_TTL_MILLIS`. A local lease release does not age the row, so
-/// the fourth dispatch reused the saturated observation and returned
-/// `CAPACITY_BUSY` even though the lease store already showed a free slot.
-/// Invalidating the worker's observation on local release makes the freed
-/// slot visible without waiting for TTL.
 #[test]
-fn fourth_production_dispatch_reprobes_after_local_release_within_observation_ttl() {
-    let repo = production_run_repo();
+fn task_fourth_dispatch_reprobes_after_local_release_within_observation_ttl() {
+    // Supersedes scheduler_concurrency::fourth_production_dispatch_reprobes_after_local_release_within_observation_ttl.
+    let repo = task_repo();
     let temp = tempfile::tempdir().unwrap();
-    let paths = production_run_paths(&temp);
-    let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
-    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
+    let now = Arc::new(AtomicU64::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    ));
+    let clock = Arc::clone(&now);
+    let store = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .with_admission_clock(Arc::new(move || Ok(clock.load(Ordering::SeqCst))));
+    let host = HostStore::open(&paths.data.join("host")).unwrap();
     LeaseService::new(&host).set_slot_count(2).unwrap();
-    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
-    let config = production_run_config_with_slots(2);
-    let runtime = FrozenAdmissionRuntime::new();
-    let first = submit_two_slot_with_runtime(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        &runtime,
-        "scheduler-ttl-first",
-    )
-    .unwrap_or_else(|error| panic!("first production dispatch failed: {error}"));
-    let second = submit_two_slot_with_runtime(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        &runtime,
-        "scheduler-ttl-second",
-    )
-    .unwrap_or_else(|error| panic!("second production dispatch failed: {error}"));
-    assert_ne!(first.report.job_id, second.report.job_id);
+    let remote = task_fixture::TaskRemote::new(host.clone());
+    let config = task_fixture::config(2);
+    let first = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    let second = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    assert_ne!(first, second);
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
-
-    runtime.expire_observation_ttl();
-    let third = submit_two_slot_with_runtime(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        &runtime,
-        "scheduler-ttl-third",
-    )
-    .expect_err("third production dispatch must see a full host");
+    now.fetch_add(3_000, Ordering::SeqCst);
+    let third = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap_err();
     assert_eq!(third.public_code(), "CAPACITY_BUSY");
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
-
-    runner
-        .abandon_and_release(first.report.job_id)
-        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    let probes = remote.probe_count.load(Ordering::SeqCst);
+    remote.release(first);
     store.invalidate_admission_observation("mini-a").unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
-
-    let fourth = submit_two_slot_with_runtime(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        &runtime,
-        "scheduler-ttl-fourth",
-    )
-    .unwrap_or_else(|error| panic!("fourth production dispatch failed: {error}"));
-    assert_eq!(runner.accepted_jobs().len(), 3);
+    let frozen = now.load(Ordering::SeqCst);
+    let fourth = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    assert_eq!(
+        now.load(Ordering::SeqCst),
+        frozen,
+        "release must be visible without aging the clock"
+    );
+    assert!(remote.probe_count.load(Ordering::SeqCst) > probes);
+    assert_eq!(remote.accepted_jobs().len(), 3);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
     assert_eq!(occupied.len(), 2);
-    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
-    assert!(live.contains(&second.report.job_id));
-    assert!(live.contains(&fourth.report.job_id));
-    assert!(!live.contains(&first.report.job_id));
-}
-
-struct CapacityWaitRuntime {
-    now_millis: AtomicU64,
-    owner: ProcessIdentity,
-    waiting: Mutex<Option<mpsc::Sender<()>>>,
-    resume: Mutex<mpsc::Receiver<()>>,
-    sleeps: AtomicUsize,
-}
-
-impl CapacityWaitRuntime {
-    fn new(waiting: mpsc::Sender<()>, resume: mpsc::Receiver<()>) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock predates Unix epoch")
-            .as_millis() as u64;
-        let owner = SystemProcessInspector
-            .identity_for_pid(std::process::id())
-            .expect("waiting dispatcher must match the live client-state inspector");
-        Self {
-            now_millis: AtomicU64::new(now),
-            owner,
-            waiting: Mutex::new(Some(waiting)),
-            resume: Mutex::new(resume),
-            sleeps: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl SchedulerRuntime for CapacityWaitRuntime {
-    fn now_millis(&self) -> Result<u64, WorkerError> {
-        Ok(self.now_millis.load(Ordering::SeqCst))
-    }
-
-    fn process_identity(&self) -> Result<ProcessIdentity, WorkerError> {
-        Ok(self.owner)
-    }
-
-    fn sleep(&self, _duration: Duration) {
-        let n = self.sleeps.fetch_add(1, Ordering::SeqCst);
-        const WAIT_SLEEP_BUDGET: usize = 8;
-        if n >= WAIT_SLEEP_BUDGET {
-            panic!("waiting dispatcher exceeded {WAIT_SLEEP_BUDGET} capacity polls");
-        }
-        if let Some(waiting) = self.waiting.lock().unwrap().take() {
-            waiting
-                .send(())
-                .expect("capacity wait observer disappeared");
-            self.resume
-                .lock()
-                .unwrap()
-                .recv()
-                .expect("capacity wait resume disappeared");
-        }
-        // Expire the cached Busy observation so the next probe sees the freed slot.
-        self.now_millis.fetch_add(3_000, Ordering::SeqCst);
-    }
+    let live: HashSet<_> = occupied.iter().map(|s| s.lease.job_id()).collect();
+    assert!(live.contains(&second));
+    assert!(live.contains(&fourth));
+    assert!(!live.contains(&first));
 }
 
 #[test]
-fn two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
-    // Break caught: wait_for_capacity=true does not observe a full two-slot
-    // host, or a freed slot lets the waiter in while dropping the live peer.
-    let repo = production_run_repo();
+fn task_two_slot_dispatch_waits_for_a_freed_slot_and_keeps_the_peer() {
+    // Supersedes scheduler_concurrency::two_slot_production_dispatch_waits_for_a_freed_slot_and_keeps_the_peer.
+    let repo = task_repo();
     let temp = tempfile::tempdir().unwrap();
-    let paths = production_run_paths(&temp);
+    let paths = support::task_harness::paths(temp.path().canonicalize().unwrap());
     let store = Arc::new(ClientStateStore::open(&paths.state).unwrap());
-    let host = Arc::new(HostStore::open(&paths.data.join("host")).unwrap());
+    let host = HostStore::open(&paths.data.join("host")).unwrap();
     LeaseService::new(&host).set_slot_count(2).unwrap();
-    let runner = Arc::new(ProductionLeaseRunner::new((*host).clone()));
-    let config = production_run_config_with_slots(2);
-    let (first, second) = sequential_two_slot_run_submits(
-        &runner,
-        &config,
-        &paths,
-        &store,
-        &repo,
-        "scheduler-two-slot-wait-first",
-        "scheduler-two-slot-wait-second",
-    );
-    assert_ne!(first.report.job_id, second.report.job_id);
-    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
-
     let (waiting_tx, waiting_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let gate_waits = Arc::clone(&waits);
+    let mut remote = task_fixture::TaskRemote::new(host.clone());
+    remote.on_busy_probe = Some(Arc::new(move || {
+        let n = gate_waits.fetch_add(1, Ordering::SeqCst);
+        assert!(n < 8, "waiter exceeded eight capacity polls");
+        if n == 0 {
+            waiting_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }
+    }));
+    let remote = Arc::new(remote);
+    let config = task_fixture::config(2);
+    let first = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    let second = dispatch_task(&remote, &config, &paths, &store, &repo, false).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
+    store.invalidate_admission_observation("mini-a").unwrap();
     let wait_store = Arc::clone(&store);
-    let wait_runner = Arc::clone(&runner);
+    let wait_remote = Arc::clone(&remote);
     let wait_paths = paths.clone();
     let wait_config = config.clone();
-    let wait_request = production_run_request_with(&repo, true, "scheduler-two-slot-waiting-third");
+    let project = repo.root().to_path_buf();
     let (done_tx, done_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let runtime = CapacityWaitRuntime::new(waiting_tx, resume_rx);
-        let follower = SuccessfulRunFollower;
-        let result = RunService::with_follower(
-            &*wait_runner,
+    let waiter = thread::spawn(move || {
+        let report = mac_worker::task_client::TaskClient::new(
+            &*wait_remote,
             &wait_config,
             &wait_paths,
             &wait_store,
-            &follower,
+            &mac_worker::turn_runner::InlineRunnerExecutor,
         )
-        .with_scheduler_runtime(&runtime)
-        .submit_and_follow(wait_request, false, &mut Vec::new(), &mut Vec::new());
-        let _ = done_tx.send(result);
+        .submit(
+            task_fixture::request_from_path(&project, true),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let turn = wait_store
+            .queue_entry_for_task_turn(report.task_id())
+            .unwrap()
+            .unwrap()
+            .job_id();
+        let result = task_fixture::run(
+            &*wait_remote,
+            &wait_config,
+            &wait_paths,
+            &wait_store,
+            report.task_id(),
+            turn,
+        );
+        done_tx.send((turn, result)).unwrap();
     });
-    waiting_rx
-        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
-        .expect("waiting third job never blocked on a full two-slot host");
-    eprintln!(
-        "{}",
-        wait_path_diagnostics("blocked", &store, &host, &runner, &config)
-    );
+    waiting_rx.recv_timeout(support::HANDSHAKE_TIMEOUT).unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 2);
     assert_eq!(
         LeaseService::new(&host)
-            .load_for_job(second.report.job_id)
+            .load_for_job(second)
             .unwrap()
             .unwrap()
             .job_id(),
-        second.report.job_id
+        second
     );
-
-    runner
-        .abandon_and_release(first.report.job_id)
-        .unwrap_or_else(|error| panic!("production cancel/release failed: {error}"));
+    remote.release(first);
     store.invalidate_admission_observation("mini-a").unwrap();
     assert_eq!(LeaseService::new(&host).occupied_slots().unwrap().len(), 1);
-    let after_release = wait_path_diagnostics("after-release", &store, &host, &runner, &config);
-    eprintln!("{after_release}");
-    resume_tx.send(()).expect("waiting third resume failed");
-
-    let third = match done_rx.recv_timeout(crate::support::HANDSHAKE_TIMEOUT) {
-        Ok(result) => result
-            .unwrap_or_else(|error| panic!("waiting third production dispatch failed: {error}")),
-        Err(_) => panic!("waiting third timed out; {after_release}"),
-    };
-    assert_ne!(third.report.job_id, second.report.job_id);
+    resume_tx.send(()).unwrap();
+    let (third, result) = done_rx.recv_timeout(support::HANDSHAKE_TIMEOUT).unwrap();
+    assert_eq!(
+        result.unwrap().status().last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    waiter.join().unwrap();
+    assert_ne!(third, second);
     let occupied = LeaseService::new(&host).occupied_slots().unwrap();
     assert_eq!(occupied.len(), 2);
-    let live: HashSet<_> = occupied.iter().map(|slot| slot.lease.job_id()).collect();
-    assert!(live.contains(&second.report.job_id));
-    assert!(live.contains(&third.report.job_id));
-    assert!(!live.contains(&first.report.job_id));
+    let live: HashSet<_> = occupied.iter().map(|s| s.lease.job_id()).collect();
+    assert!(live.contains(&second));
+    assert!(live.contains(&third));
+    assert!(!live.contains(&first));
+    assert!(waits.load(Ordering::SeqCst) <= 8);
 }
 
 #[test]
-fn cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
+fn task_cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
+    // Supersedes scheduler_concurrency::cancel_claim_handoff_matrix_has_one_queue_terminal_outcome.
     // Break caught: cancellation removes a row after it has been claimed,
     // claims a row after cancellation removed it, or loses the exact row
     // identity at the claim/cancel boundary.
@@ -1699,7 +1134,8 @@ fn cancel_claim_handoff_matrix_has_one_queue_terminal_outcome() {
 }
 
 #[test]
-fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
+fn task_run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
+    // Supersedes scheduler_concurrency::run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers.
     // Break caught: a claim evaluates the final run slot outside the queue
     // lock, or stale readers independently publish more than one refresh.
     // The claim-cap gate interleaving does not change with the index; only
@@ -1806,7 +1242,8 @@ fn run_cap_and_observation_refresh_are_atomic_under_competing_dispatchers() {
 }
 
 #[test]
-fn same_reserver_two_jobs_cap_one_grants_exactly_one_acquired() {
+fn task_same_reserver_two_jobs_cap_one_grants_exactly_one_acquired() {
+    // Supersedes scheduler_concurrency::same_reserver_two_jobs_cap_one_grants_exactly_one_acquired.
     // Break caught: unique-PID occupancy collapsed two outstanding spawns
     // from one TaskClient into a single slot.
     let (_directory, store, entered, release) =
@@ -1858,7 +1295,8 @@ fn same_reserver_two_jobs_cap_one_grants_exactly_one_acquired() {
 }
 
 #[test]
-fn same_reserver_same_job_starts_executor_once() {
+fn task_same_reserver_same_job_starts_executor_once() {
+    // Supersedes scheduler_concurrency::same_reserver_same_job_starts_executor_once.
     // Break caught: idempotent "return the existing generation" let two threads
     // with the same ProcessIdentity both call executor.start.
     let (_directory, store, entered, release) =
@@ -1914,7 +1352,8 @@ fn same_reserver_same_job_starts_executor_once() {
 }
 
 #[test]
-fn concurrent_enqueue_coalesces_inverted_clocks() {
+fn task_concurrent_enqueue_coalesces_inverted_clocks() {
+    // Supersedes scheduler_concurrency::concurrent_enqueue_coalesces_inverted_clocks.
     // Break caught: a later enqueue with an earlier wall clock failed snapshot
     // validation / QUEUE_TIME_REGRESSION instead of taking max(caller, last).
     let (_directory, store, entered, release) =

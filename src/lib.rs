@@ -7176,6 +7176,587 @@ mod tests {
 
         assert!(matches!(error, WorkerError::Config(_)));
     }
+    mod rm_v1_writer_ports {
+        use crate::{
+            controller::events::{
+                EventReadResult, EventSelector, EventSupport, JournalWindow, Seq, SnapshotRequired,
+                tail::TailLoop,
+                testing::{ManualEventRuntime, ScriptedEventSource},
+            },
+            error::WorkerError,
+        };
+        use std::{
+            collections::VecDeque,
+            io::{self, Write},
+            sync::Arc,
+        };
+
+        enum ScriptedIo {
+            Write(io::Result<usize>),
+            Flush(io::Result<()>),
+        }
+        struct ScriptedWriter {
+            script: VecDeque<ScriptedIo>,
+            writes: usize,
+            flushes: usize,
+            bytes: Vec<u8>,
+        }
+        impl ScriptedWriter {
+            fn scripted(script: Vec<ScriptedIo>) -> Self {
+                Self {
+                    script: script.into(),
+                    writes: 0,
+                    flushes: 0,
+                    bytes: Vec::new(),
+                }
+            }
+        }
+        impl Write for ScriptedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                match self.script.pop_front() {
+                    Some(ScriptedIo::Write(Ok(n))) => {
+                        let n = n.min(bytes.len());
+                        self.bytes.extend_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                    Some(ScriptedIo::Write(Err(error))) => Err(error),
+                    Some(ScriptedIo::Flush(_)) => panic!("write expected before flush"),
+                    None => {
+                        self.bytes.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                match self.script.pop_front() {
+                    Some(ScriptedIo::Flush(result)) => result,
+                    Some(ScriptedIo::Write(_)) => panic!("flush expected before write"),
+                    None => Ok(()),
+                }
+            }
+        }
+        fn broken_pipe() -> io::Error {
+            io::Error::new(io::ErrorKind::BrokenPipe, "planted stdout failure")
+        }
+        fn source() -> ScriptedEventSource {
+            let source = ScriptedEventSource::new();
+            source.queue_discovery(Ok(EventSupport::Supported)).unwrap();
+            source
+                .queue_read(Ok(EventReadResult::SnapshotRequired(SnapshotRequired {
+                    reason: "bootstrap".into(),
+                    window: JournalWindow {
+                        journal_id: uuid::Uuid::from_u128(1),
+                        oldest_seq: Seq::new(1),
+                        head_seq: Seq::ZERO,
+                    },
+                })))
+                .unwrap();
+            source
+        }
+        fn stream(source: &ScriptedEventSource, writer: &mut dyn Write) -> Result<(), WorkerError> {
+            TailLoop {
+                source,
+                runtime: Arc::new(ManualEventRuntime::new()),
+                json: true,
+                stop_at: None,
+            }
+            .run(writer)
+        }
+        fn assert_no_duplicate(writer: &ScriptedWriter) {
+            assert!(!String::from_utf8_lossy(&writer.bytes).contains("\"event\":\"error\""));
+        }
+        fn assert_live_failure(script: Vec<ScriptedIo>, writes: usize, flushes: usize) {
+            let source = source();
+            let mut writer = ScriptedWriter::scripted(script);
+            let mut live = super::super::LiveJsonStdout::new(&mut writer);
+            let error = stream(&source, &mut live).unwrap_err();
+            assert_eq!(error.exit_code(), 74);
+            assert!(live.failed);
+            // A recovering underlying writer still cannot publish a second error event.
+            let duplicate = super::super::write_json_error_event(
+                &mut live,
+                &WorkerError::Protocol("INVALID_REQUEST: planted".into()),
+            )
+            .unwrap_err();
+            assert_eq!(duplicate.exit_code(), 74);
+            assert_eq!(writer.writes, writes);
+            assert_eq!(writer.flushes, flushes);
+            assert_no_duplicate(&writer);
+            assert_eq!(
+                source.requests().len(),
+                1,
+                "failed flush must never advance to another cursor read"
+            );
+            match &source.requests()[0].selector {
+                EventSelector::Read(query) => assert_eq!(query.after, None),
+                _ => panic!("tail only reads the journal"),
+            }
+        }
+        #[test]
+        fn controller_diag_json_live_stdout_fail_once_recovering_is_74() {
+            // Supersedes run_command::public_diag_json_live_stdout_fail_once_recovering_is_74.
+            assert_live_failure(vec![ScriptedIo::Write(Err(broken_pipe()))], 1, 0);
+        }
+        #[test]
+        fn controller_diag_json_live_stdout_partial_then_error_is_74() {
+            // Supersedes run_command::public_diag_json_live_stdout_partial_then_error_is_74.
+            assert_live_failure(
+                vec![
+                    ScriptedIo::Write(Ok(8)),
+                    ScriptedIo::Write(Err(broken_pipe())),
+                ],
+                2,
+                0,
+            );
+        }
+        #[test]
+        fn controller_diag_json_live_stdout_zero_write_is_74() {
+            // Supersedes run_command::public_diag_json_live_stdout_zero_write_is_74.
+            assert_live_failure(vec![ScriptedIo::Write(Ok(0))], 1, 0);
+        }
+        #[test]
+        fn controller_diag_json_live_stdout_flush_failure_is_74() {
+            // Supersedes run_command::public_diag_json_live_stdout_flush_failure_is_74.
+            assert_live_failure(
+                vec![
+                    ScriptedIo::Write(Ok(usize::MAX)),
+                    ScriptedIo::Write(Ok(usize::MAX)),
+                    ScriptedIo::Flush(Err(broken_pipe())),
+                ],
+                2,
+                1,
+            );
+        }
+        #[test]
+        fn json_error_serialization_failure_leaves_live_writer_untouched() {
+            // Supersedes run::tests::json_event_serialization_failure_leaves_writer_untouched.
+            for message in [String::new(), "INVALID\0MESSAGE".into(), "X".repeat(4097)] {
+                let mut bytes = vec![b'!'];
+                let mut live = super::super::LiveJsonStdout::new(&mut bytes);
+                let error = super::super::write_json_error_event(
+                    &mut live,
+                    &WorkerError::Capacity {
+                        code: "CAPACITY_BUSY",
+                        message: message.into(),
+                        public: true,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.exit_code(), 74);
+                assert!(!live.failed);
+                assert_eq!(bytes, [b'!']);
+            }
+        }
+        #[test]
+        fn json_error_writer_failure_preserves_io_kind_after_complete_serialization() {
+            // Supersedes run::tests::json_writer_failure_preserves_io_kind_after_complete_serialize.
+            let mut writer = ScriptedWriter::scripted(vec![ScriptedIo::Write(Err(broken_pipe()))]);
+            let mut live = super::super::LiveJsonStdout::new(&mut writer);
+            let error = super::super::write_json_error_event(
+                &mut live,
+                &WorkerError::Protocol("INVALID_REQUEST: private".into()),
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 74);
+            assert!(
+                matches!(error, WorkerError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe)
+            );
+            assert!(live.failed);
+            assert!(writer.bytes.is_empty());
+            assert_eq!(writer.writes, 1);
+            assert_eq!(writer.flushes, 0);
+        }
+        #[test]
+        fn live_json_flush_failure_stops_before_reading_the_next_controller_cursor() {
+            // Supersedes run::tests::flush_failure_leaves_drain_and_cursor_uncommitted.
+            let source = source();
+            let journal_id = uuid::Uuid::from_u128(1);
+            source
+                .queue_read(Ok(EventReadResult::Batch(
+                    crate::controller::events::ReadBatch {
+                        schema_version: 1,
+                        journal_id,
+                        oldest_seq: Seq::new(1),
+                        head_seq: Seq::new(1),
+                        next_after: crate::controller::events::EventCursor {
+                            journal_id,
+                            seq: Seq::new(1),
+                        },
+                        events: vec![crate::controller::events::WireEvent {
+                            schema_version: 1,
+                            journal_id,
+                            seq: Seq::new(1),
+                            time_millis: 100,
+                            kind: "controller.drained".into(),
+                            data: serde_json::json!({"drained": true}),
+                        }],
+                        has_more: false,
+                    },
+                )))
+                .unwrap();
+            let mut writer = ScriptedWriter::scripted(vec![
+                ScriptedIo::Write(Ok(usize::MAX)),
+                ScriptedIo::Write(Ok(usize::MAX)),
+                ScriptedIo::Flush(Ok(())),
+                ScriptedIo::Write(Ok(usize::MAX)),
+                ScriptedIo::Write(Ok(usize::MAX)),
+                ScriptedIo::Flush(Err(broken_pipe())),
+            ]);
+            let mut live = super::super::LiveJsonStdout::new(&mut writer);
+            let error = stream(&source, &mut live).unwrap_err();
+            assert_eq!(error.exit_code(), 74);
+            assert!(
+                matches!(error, WorkerError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe)
+            );
+            assert!(live.failed);
+            assert!(!writer.bytes.is_empty());
+            let messages = writer
+                .bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["event"], "ready");
+            assert_eq!(messages[1]["seq"], "1");
+            assert_eq!(messages[1]["kind"], "controller.drained");
+            assert_eq!(writer.writes, 4);
+            assert_eq!(writer.flushes, 2);
+            let reads = source.requests();
+            assert_eq!(reads.len(), 2);
+            match &reads[0].selector {
+                EventSelector::Read(query) => assert_eq!(query.after, None),
+                _ => panic!("tail advanced another stream"),
+            }
+            match &reads[1].selector {
+                EventSelector::Read(query) => assert_eq!(query.after.unwrap().seq, Seq::ZERO),
+                _ => panic!("tail advanced another stream"),
+            }
+        }
+        #[test]
+        fn controller_json_stream_errors_keep_stdout_only_and_writer_failure_is_74() {
+            // Supersedes run_command::json_stream_errors_use_stdout_only_and_writer_failure_is_74.
+            for fail_error_write in [false, true] {
+                let source = source();
+                source
+                    .queue_read(Err(WorkerError::Transport {
+                        code: "SSH_UNAVAILABLE",
+                        message: "private mac1".into(),
+                    }))
+                    .unwrap();
+                let mut script = vec![
+                    ScriptedIo::Write(Ok(usize::MAX)),
+                    ScriptedIo::Write(Ok(usize::MAX)),
+                    ScriptedIo::Flush(Ok(())),
+                ];
+                if fail_error_write {
+                    script.push(ScriptedIo::Write(Err(broken_pipe())));
+                }
+                let mut writer = ScriptedWriter::scripted(script);
+                let mut live = super::super::LiveJsonStdout::new(&mut writer);
+                let error = stream(&source, &mut live).unwrap_err();
+                assert_eq!(error.exit_code(), 69);
+                let exit = match super::super::write_json_error_event(&mut live, &error) {
+                    Ok(()) => error.exit_code(),
+                    Err(error) => error.exit_code(),
+                };
+                assert_eq!(exit, if fail_error_write { 74 } else { 69 });
+                let events = writer
+                    .bytes
+                    .split(|b| *b == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(events.len(), if fail_error_write { 1 } else { 2 });
+                assert_eq!(events[0]["event"], "ready");
+                if fail_error_write {
+                    assert_no_duplicate(&writer);
+                } else {
+                    assert_eq!(events[1]["event"], "error");
+                    assert_eq!(events[1]["code"], "SSH_UNAVAILABLE");
+                    assert_eq!(events[1]["message"], "transport error");
+                    assert_eq!(
+                        events[1]["protocol_version"],
+                        crate::protocol::PROTOCOL_VERSION
+                    );
+                }
+                assert!(!String::from_utf8_lossy(&writer.bytes).contains("mac1"));
+            }
+        }
+    }
+    mod rm_v1_capture_ports {
+        use crate::{
+            error::WorkerError,
+            process::SystemProcessRunner,
+            project_state::{
+                ProjectPreparationError, ProjectPreparationRequest, ProjectPreparationStage,
+                ProjectState,
+            },
+        };
+        use std::{
+            fs, io,
+            os::unix::fs::{PermissionsExt, symlink},
+            path::{Path, PathBuf},
+            process::Command,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Fixture {
+            _root: tempfile::TempDir,
+            project: PathBuf,
+            cache: PathBuf,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let project = root.path().join("project");
+                fs::create_dir(&project).unwrap();
+                let home = root.path().join("home");
+                fs::create_dir(&home).unwrap();
+                for args in [
+                    vec!["init", "--initial-branch=main"],
+                    vec!["config", "user.name", "Fixture"],
+                    vec!["config", "user.email", "fixture@example.test"],
+                ] {
+                    git(&project, &home, &args);
+                }
+                fs::write(project.join(".worker.toml"), "version = 1\n").unwrap();
+                fs::write(project.join("README.md"), "tracked\n").unwrap();
+                git(&project, &home, &["add", ".worker.toml", "README.md"]);
+                git(&project, &home, &["commit", "-m", "capture fixture"]);
+                let cache = root.path().join("cache");
+                Self {
+                    _root: root,
+                    project,
+                    cache,
+                }
+            }
+            fn request(&self) -> ProjectPreparationRequest {
+                ProjectPreparationRequest {
+                    project: self.project.clone(),
+                    cli_includes: Vec::new(),
+                }
+            }
+            fn state(&self) -> ProjectState {
+                ProjectState::load(&SystemProcessRunner, &self.project, &[]).unwrap()
+            }
+        }
+        fn git(project: &Path, home: &Path, args: &[&str]) {
+            let mut command = Command::new("/usr/bin/git");
+            command
+                .current_dir(project)
+                .env("HOME", home)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+            ] {
+                command.env_remove(name);
+            }
+            let result = command.args(args).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fn assert_no_capture(cache: &Path) {
+            for directory in [
+                cache.join("snapshots/staging"),
+                cache.join("snapshots/ready"),
+            ] {
+                if !directory.exists() {
+                    continue;
+                }
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    assert_eq!(entry.file_name(), ".mac-worker-rooted-fs");
+                    assert!(fs::read_dir(entry.path()).unwrap().next().is_none());
+                }
+            }
+        }
+        fn failure(error: ProjectPreparationError) -> WorkerError {
+            match error {
+                ProjectPreparationError::Worker { error, .. } => error,
+                other => panic!("unexpected selection failure {other}"),
+            }
+        }
+        fn sabotage(publication: &Path) -> PathBuf {
+            let moved = publication.with_file_name("moved-owned-capture");
+            fs::rename(publication, &moved).unwrap();
+            symlink(&moved, publication).unwrap();
+            moved
+        }
+        fn remove_sabotage(publication: &Path, moved: &Path) {
+            fs::remove_file(publication).unwrap();
+            // The fixture retains immutable capture bytes after the fail-closed refusal.
+            fn writable(path: &Path) {
+                if path.is_dir() {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                    for entry in fs::read_dir(path).unwrap() {
+                        writable(&entry.unwrap().path());
+                    }
+                } else {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            writable(moved);
+            fs::remove_dir_all(moved).unwrap();
+        }
+
+        #[test]
+        fn project_preparation_cleans_once_at_six_owned_capture_frontiers() {
+            // Supersedes the shared capture ownership assertions in run_command::actual_snapshot_cleanup_runs_once_on_representative_prepared_paths.
+            for case in 0..6 {
+                let fixture = Fixture::new();
+                let state = fixture.state();
+                let cleanups = AtomicUsize::new(0);
+                let observer = |stage| {
+                    if stage == ProjectPreparationStage::SnapshotCleanup {
+                        cleanups.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if stage == ProjectPreparationStage::SnapshotCaptured {
+                        match case {
+                            1 => {
+                                return Err(WorkerError::Protocol(
+                                    "INVALID_REQUEST: capture observer".into(),
+                                ));
+                            }
+                            2 => fs::write(fixture.project.join(".worker.toml"), "invalid toml [")
+                                .unwrap(),
+                            3 => fs::write(
+                                fixture.project.join(".worker.toml"),
+                                "version = 1\nrequires = ['changed']\n",
+                            )
+                            .unwrap(),
+                            _ => {}
+                        }
+                    }
+                    if case == 4 && stage == ProjectPreparationStage::SnapshotCleanup {
+                        return Err(WorkerError::Protocol(
+                            "INVALID_REQUEST: cleanup observer".into(),
+                        ));
+                    }
+                    Ok(())
+                };
+                let prepared = ProjectState::prepare_observed(
+                    &SystemProcessRunner,
+                    &fixture.cache,
+                    fixture.request(),
+                    &state,
+                    &observer,
+                );
+                let result = match prepared {
+                    Ok(prepared) => {
+                        assert_eq!(prepared.state, state);
+                        let publication = prepared.snapshot.publication_root().to_owned();
+                        assert!(publication.is_dir());
+                        let output: Result<(), WorkerError> = if case == 5 {
+                            Err(io::Error::new(io::ErrorKind::BrokenPipe, "caller output").into())
+                        } else {
+                            Ok(())
+                        };
+                        let cleanup = prepared.cleanup_observed(&observer);
+                        assert!(!publication.exists());
+                        cleanup.and(output)
+                    }
+                    Err(error) => Err(failure(error)),
+                };
+                if case == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.is_err(), "case={case}");
+                }
+                if case == 3 {
+                    assert_eq!(result.unwrap_err().public_code(), "SNAPSHOT_CHANGED");
+                }
+                assert_eq!(cleanups.load(Ordering::SeqCst), 1, "case={case}");
+                assert_no_capture(&fixture.cache);
+            }
+        }
+        #[test]
+        fn real_project_cleanup_failure_precedes_observer_failure_without_double_cleanup() {
+            // Supersedes run_command::real_cleanup_failure_precedes_cleanup_observer_failure_without_double_cleanup.
+            let fixture = Fixture::new();
+            let prepared = ProjectState::prepare(
+                &SystemProcessRunner,
+                &fixture.cache,
+                fixture.request(),
+                &fixture.state(),
+            )
+            .unwrap();
+            let publication = prepared.snapshot.publication_root().to_owned();
+            let moved = sabotage(&publication);
+            let cleanups = AtomicUsize::new(0);
+            let error = prepared
+                .cleanup_observed(&|stage| {
+                    assert_eq!(stage, ProjectPreparationStage::SnapshotCleanup);
+                    cleanups.fetch_add(1, Ordering::SeqCst);
+                    Err(WorkerError::Protocol("OBSERVER_FAILURE: planted".into()))
+                })
+                .unwrap_err();
+            assert!(matches!(error, WorkerError::Io(_)));
+            assert_eq!(error.exit_code(), 74);
+            assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+            assert!(publication.is_symlink());
+            assert!(moved.join("tree/README.md").is_file());
+            remove_sabotage(&publication, &moved);
+        }
+        #[test]
+        fn project_preparation_cleanup_handles_success_caller_and_writer_failures_once() {
+            // Supersedes the shared capture assertions in run_command::snapshot_cleanup_runs_once_on_every_success_and_failure_path.
+            for case in 0..4 {
+                let fixture = Fixture::new();
+                let prepared = ProjectState::prepare(
+                    &SystemProcessRunner,
+                    &fixture.cache,
+                    fixture.request(),
+                    &fixture.state(),
+                )
+                .unwrap();
+                let publication = prepared.snapshot.publication_root().to_owned();
+                let moved = (case == 3).then(|| sabotage(&publication));
+                let cleanups = AtomicUsize::new(0);
+                let caller = match case {
+                    0 => Ok(()),
+                    2 => Err(WorkerError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "writer",
+                    ))),
+                    _ => Err(WorkerError::Protocol("CALLER_FAILURE: planted".into())),
+                };
+                let cleanup = prepared.cleanup_observed(&|stage| {
+                    assert_eq!(stage, ProjectPreparationStage::SnapshotCleanup);
+                    cleanups.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                let result = cleanup.and(caller);
+                assert_eq!(cleanups.load(Ordering::SeqCst), 1, "case={case}");
+                if case == 0 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.is_err());
+                }
+                if let Some(moved) = moved {
+                    assert!(matches!(result.unwrap_err(), WorkerError::Io(_)));
+                    assert!(publication.is_symlink());
+                    remove_sabotage(&publication, &moved);
+                } else {
+                    assert!(!publication.exists());
+                    assert_no_capture(&fixture.cache);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
