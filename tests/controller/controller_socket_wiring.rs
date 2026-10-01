@@ -1285,10 +1285,9 @@ mod loop_fixtures {
             channel::{
                 ChannelFailure, ClientContext, ClientDeps, ConfiguredRoute, SocketConnector,
                 SocketIdentity, SocketSession,
-                testing::{
-                    FakeForwardControl, ManualRuntime, MemoryPinStore, ScriptedIdentitySource,
-                    identity_fixture, result_fixture,
-                },
+                identity::StdioIdentitySource,
+                pin::{Pin, PrivatePinStore},
+                testing::{FakeForwardControl, ManualRuntime, identity_fixture, result_fixture},
             },
             decode_request,
         },
@@ -1313,7 +1312,7 @@ mod loop_fixtures {
         pub endpoint: Arc<Endpoint>,
         pub forwards: Arc<FakeForwardControl>,
         pub clock: Arc<ManualRuntime>,
-        pub pins: Arc<MemoryPinStore>,
+        pub pins: Arc<PrivatePinStore>,
         pub connector: Arc<Connector>,
         pub order: Arc<Mutex<Vec<String>>>,
         environment: BTreeMap<OsString, OsString>,
@@ -1352,17 +1351,23 @@ mod loop_fixtures {
             std::fs::write(&paths.config, text).unwrap();
             let config = Config::parse(text).unwrap();
             let order = Arc::new(Mutex::new(vec![]));
+            let mut identity = identity_fixture();
+            identity.route_sha256 = ConfiguredRoute::new(&config.controller, &config.ssh)
+                .unwrap()
+                .digest()
+                .unwrap();
             Self {
                 runtime: RuntimeContext::isolated(environment.clone(), home, root),
                 paths,
                 config,
                 endpoint: Arc::new(Endpoint {
                     order: order.clone(),
+                    identity: Some(identity),
                     ..Endpoint::default()
                 }),
                 forwards: Arc::new(FakeForwardControl::new("/private/fake-forward/s".into())),
                 clock: Arc::new(ManualRuntime::default()),
-                pins: Arc::new(MemoryPinStore::default()),
+                pins: Arc::new(PrivatePinStore::new()),
                 connector: Arc::new(Connector {
                     order: order.clone(),
                     ..Connector::default()
@@ -1381,21 +1386,36 @@ mod loop_fixtures {
             self
         }
         pub fn deps(&self) -> ClientDeps {
-            let mut identity = identity_fixture();
-            identity.route_sha256 = ConfiguredRoute::new(&self.config.controller, &self.config.ssh)
-                .unwrap()
-                .digest()
-                .unwrap();
             ClientDeps {
-                identity: Arc::new(ScriptedIdentitySource::new(vec![
-                    Ok(identity.clone()),
-                    Ok(identity),
-                ])),
+                identity: Arc::new(StdioIdentitySource::new()),
                 pins: self.pins.clone(),
                 forwards: self.forwards.clone(),
                 connector: self.connector.clone(),
                 runtime: self.clock.clone(),
             }
+        }
+        pub fn pin(&self) -> Option<Pin> {
+            let digest = ConfiguredRoute::new(&self.config.controller, &self.config.ssh)
+                .unwrap()
+                .digest()
+                .unwrap();
+            let path = self
+                .paths
+                .controller_cache_root()
+                .join("channel/pins")
+                .join(format!("{digest}.json"));
+            match std::fs::read(path) {
+                Ok(bytes) => Some(serde_json::from_slice(&bytes).unwrap()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read isolated pin: {error}"),
+            }
+        }
+        pub fn assert_authenticated_pin(&self) {
+            assert_eq!(self.endpoint.identity_calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                self.pin(),
+                Some(Pin::from_identity(self.endpoint.identity.as_ref().unwrap()))
+            );
         }
         pub fn run(&self, args: &[&str]) -> (u8, String, String) {
             let context = self
@@ -1421,7 +1441,9 @@ mod loop_fixtures {
     #[derive(Default)]
     pub struct Endpoint {
         pub calls: Mutex<Vec<ControllerRequest>>,
+        pub identity_calls: Mutex<Vec<ControllerRequest>>,
         pub processes: Mutex<Vec<ProcessRequest>>,
+        identity: Option<SocketIdentity>,
         order: Arc<Mutex<Vec<String>>>,
     }
     impl ProcessRunner for Endpoint {
@@ -1455,8 +1477,25 @@ mod loop_fixtures {
                 }
                 return mac_worker::process::SystemProcessRunner.run(process);
             }
-            assert_eq!(process.program, "/usr/bin/ssh");
+            assert!(process.program == "/usr/bin/ssh" || process.program == "fake-ssh");
             self.processes.lock().unwrap().push(process.clone());
+            if let Some(frame) = &process.stdin
+                && let Ok(request) = decode_request(frame)
+                && request.body().get("controller_socket").is_some()
+            {
+                assert_eq!(request.command(), "task.list");
+                assert_eq!(request.body()["controller_socket"]["op"], "identity");
+                self.identity_calls.lock().unwrap().push(request.clone());
+                self.order
+                    .lock()
+                    .unwrap()
+                    .push("stdio:channel.identity".into());
+                return Ok(result_fixture(
+                    &request,
+                    json!({"available":self.identity.as_ref().unwrap()}),
+                    0,
+                ));
+            }
             if !process
                 .args
                 .last()
@@ -1691,12 +1730,14 @@ fn loop_wait_mutation_separation() {
         assert!(!commands(&fixture.endpoint.calls).contains(&"task.wait.poll".into()));
         assert_eq!(fixture.forwards.opens(), 1);
         assert_eq!(fixture.forwards.cancels(), 1);
+        fixture.assert_authenticated_pin();
         if args.contains(&"--interrupt") {
             assert_eq!(
                 *fixture.order.lock().unwrap(),
                 [
                     "stdio:task.status",
                     "stdio:task.cancel",
+                    "stdio:channel.identity",
                     "socket:task.wait.poll",
                     "stdio:task.status",
                     "stdio:task.say"
@@ -1707,6 +1748,7 @@ fn loop_wait_mutation_separation() {
                 *fixture.order.lock().unwrap(),
                 [
                     "stdio:task.say",
+                    "stdio:channel.identity",
                     "socket:task.wait.poll",
                     "stdio:task.status"
                 ]
@@ -1762,10 +1804,12 @@ fn loop_submit_and_batch_transfer_finish_before_wait_setup() {
                 }
             ]
         );
-        assert_eq!(order[4], "socket:task.wait.poll");
+        assert_eq!(order[4], "stdio:channel.identity");
+        assert_eq!(order[5], "socket:task.wait.poll");
         assert_eq!(commands(&fixture.connector.requests), ["task.wait.poll"]);
         assert_eq!(fixture.forwards.opens(), 1);
         assert_eq!(fixture.forwards.cancels(), 1);
+        fixture.assert_authenticated_pin();
     }
 }
 
@@ -1798,7 +1842,7 @@ fn raw_exclusions_stay_stdio() {
         assert_eq!(fixture.forwards.resolutions(), 0, "{args:?}");
         assert_eq!(fixture.forwards.opens(), 0, "{args:?}");
         assert!(fixture.connector.requests.lock().unwrap().is_empty());
-        assert!(fixture.pins.pin().is_none());
+        assert!(fixture.pin().is_none());
     }
 }
 
@@ -1905,7 +1949,7 @@ fn raw_fetch_doctor_and_local_wait_allocate_no_channel() {
     let (exit, _, _) = fixture.run(&["worker", "task", "wait", "--task-id", TASK]);
     assert_ne!(exit, 0);
     assert_eq!(fixture.forwards.resolutions(), 0);
-    assert!(fixture.pins.pin().is_none());
+    assert!(fixture.pin().is_none());
     assert!(fixture.connector.requests.lock().unwrap().is_empty());
     assert!(
         clap::Parser::try_parse_from(["worker", "events"])
@@ -1931,6 +1975,7 @@ fn route_loop_scopes_only() {
     assert!(fixture.endpoint.calls.lock().unwrap().is_empty());
     assert_eq!(fixture.forwards.opens(), 1);
     assert_eq!(fixture.forwards.cancels(), 1);
+    fixture.assert_authenticated_pin();
 }
 
 #[test]
@@ -1958,7 +2003,7 @@ fn loop_short_wait_skips_cold_setup() {
             .deadline
             <= std::time::Duration::from_secs(1)
     );
-    assert!(fixture.pins.pin().is_none());
+    assert!(fixture.pin().is_none());
 }
 
 #[test]
@@ -2017,6 +2062,7 @@ fn route_events_and_notify_own_one_scoped_runner() {
             assert_eq!(fixture.forwards.opens(), 1);
         }
         assert_eq!(fixture.forwards.cancels(), 1);
+        fixture.assert_authenticated_pin();
         assert_eq!(
             fixture.connector.requests.lock().unwrap().len(),
             if scope == ReadLoopScope::Notify { 4 } else { 2 }

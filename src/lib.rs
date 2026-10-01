@@ -1392,11 +1392,12 @@ fn run_controller_command(
             }
             let route = controller::channel::ConfiguredRoute::new(&config.controller, &config.ssh)
                 .map_err(controller_channel_error)?;
-            let deps = runtime.controller_channel.as_deref().ok_or_else(|| {
-                controller_channel_error(controller::channel::ChannelFailure::Unavailable(
-                    controller::channel::ChannelReason::ServiceUnavailable,
-                ))
-            })?;
+            let deps = controller_channel_dependencies(
+                &paths,
+                &config,
+                controller_channel_clock(runtime),
+                runtime,
+            );
             let context = controller::channel::ClientContext {
                 runtime: &*deps.runtime,
                 deadline: deps
@@ -6240,11 +6241,7 @@ fn controller_loop_runner<'a>(
     config: &Config,
     context: &RuntimeContext,
 ) -> Option<controller::channel::client::ChannelProcessRunner<&'a dyn ProcessRunner>> {
-    let clock: std::sync::Arc<dyn controller::channel::ChannelRuntime> =
-        context.controller_channel.as_ref().map_or_else(
-            || std::sync::Arc::new(ControllerReadRuntime) as _,
-            |deps| deps.runtime.clone(),
-        );
+    let clock = controller_channel_clock(context);
     let deps = controller_read_channel_dependencies(paths, config, clock, context)?;
     let route = controller::channel::ConfiguredRoute::new(&config.controller, &config.ssh).ok()?;
     Some(controller::channel::client::ChannelProcessRunner::new(
@@ -6266,8 +6263,17 @@ impl controller::channel::ChannelRuntime for ControllerReadRuntime {
     }
 }
 
+fn controller_channel_clock(
+    context: &RuntimeContext,
+) -> std::sync::Arc<dyn controller::channel::ChannelRuntime> {
+    context.controller_channel.as_ref().map_or_else(
+        || std::sync::Arc::new(ControllerReadRuntime) as _,
+        |deps| deps.runtime.clone(),
+    )
+}
+
 pub(crate) fn controller_read_channel_dependencies(
-    _paths: &PathLayout,
+    paths: &PathLayout,
     config: &Config,
     clock: std::sync::Arc<dyn controller::channel::ChannelRuntime>,
     context: &RuntimeContext,
@@ -6275,10 +6281,39 @@ pub(crate) fn controller_read_channel_dependencies(
     if !config.ssh.multiplex {
         return None;
     }
-    context
-        .controller_channel
-        .as_deref()
-        .map(|deps| clone_controller_channel_dependencies(deps, clock))
+    Some(controller_channel_dependencies(
+        paths, config, clock, context,
+    ))
+}
+
+fn controller_channel_dependencies(
+    paths: &PathLayout,
+    config: &Config,
+    clock: std::sync::Arc<dyn controller::channel::ChannelRuntime>,
+    context: &RuntimeContext,
+) -> controller::channel::ClientDeps {
+    use controller::channel::{
+        codec::{FramedSocketConnector, SessionCodec},
+        files::PrivateChannelFiles,
+        forward::MasterForwardControl,
+        identity::StdioIdentitySource,
+        pin::PrivatePinStore,
+    };
+    use std::sync::Arc;
+    if let Some(deps) = context.controller_channel.as_deref() {
+        return clone_controller_channel_dependencies(deps, clock);
+    }
+    controller::channel::ClientDeps {
+        identity: Arc::new(StdioIdentitySource::new()),
+        pins: Arc::new(PrivatePinStore::new()),
+        forwards: Arc::new(MasterForwardControl::new(
+            paths.clone(),
+            Arc::new(PrivateChannelFiles::new()),
+            config.ssh.clone(),
+        )),
+        connector: Arc::new(FramedSocketConnector::new(Arc::new(SessionCodec::new()))),
+        runtime: clock,
+    }
 }
 
 pub(crate) fn clone_controller_channel_dependencies(
