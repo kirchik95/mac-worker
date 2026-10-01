@@ -830,35 +830,6 @@ def handle_resolve(_body: dict[str, Any], _store: Store) -> dict[str, Any]:
     return {"protocol_version": PROTOCOL_VERSION, "outcome": "abandoned"}
 
 
-def handle_snapshot(body: dict[str, Any], store: Store) -> dict[str, Any]:
-    material = None
-    job_id = first_str(body, "job_id")
-    with store.mutate() as data:
-        if job_id and job_id in data["jobs"]:
-            material = data["jobs"][job_id]["meta"]
-    if material is None:
-        material = {
-            "job_id": job_id or first_str(body, "job_id"),
-            "client_id": first_str(body, "client_id"),
-            "project_id": first_str(body, "project_id"),
-            "worktree_id": first_str(body, "worktree_id"),
-            "manifest_digest": first_str(body, "manifest_digest"),
-        }
-    missing = [key for key in ("job_id", "client_id", "project_id", "worktree_id", "manifest_digest") if not material.get(key)]
-    if missing:
-        fail(f"snapshot-verify missing {missing}")
-    return {
-        "protocol_version": PROTOCOL_VERSION,
-        "job_id": material["job_id"],
-        "client_id": material["client_id"],
-        "project_id": material["project_id"],
-        "worktree_id": material["worktree_id"],
-        "manifest_digest": material["manifest_digest"],
-        "verified_at_millis": 100,
-        "cache_reused": False,
-    }
-
-
 HANDLERS = {
     "probe": handle_probe,
     "lease-acquire": handle_lease,
@@ -874,7 +845,6 @@ HANDLERS = {
     "task-close": handle_task_close,
     "task-diff": handle_task_diff,
     "resolve-or-abandon": handle_resolve,
-    "snapshot-verify": handle_snapshot,
 }
 
 

@@ -26,10 +26,11 @@ use mac_worker::{
         LeaseAcquireResponse, LeaseRecord, LeaseToken, RequestFingerprintMaterial,
     },
     lease::{AdmissionFacts, LeaseService},
+    legacy_snapshot_receipt::VerifiedReceipt,
     manifest::{ManifestEntry, ManifestEntryKind, SnapshotManifest},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION},
-    remote_snapshot::{SnapshotVerifyRequest, VerifiedReceipt, VerifiedSnapshotResponse},
+    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     run_with_stdio_in_context,
     transfer::{
         HostOperation, HostTransferService, RsyncServerExecutor, RsyncServerInvocation,
@@ -45,7 +46,6 @@ const FINGERPRINT: &str = "ddddddddddddddddddddddddddddddddddddddddddddddddddddd
 const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MANIFEST_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const TOKEN_HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 struct NoProcess;
 
@@ -171,27 +171,6 @@ fn verify_request_bytes() -> Vec<u8> {
     .into_bytes()
 }
 
-fn receipt_bytes() -> Vec<u8> {
-    format!(
-        concat!(
-            r#"{{"version":1,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
-            r#""lease_token_sha256":"{TOKEN_HASH}","request_fingerprint":"{FINGERPRINT}","#,
-            r#""project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
-            r#""manifest_digest":"{MANIFEST_DIGEST}","cache_key":{{"project_id":"{PROJECT_ID}","#,
-            r#""worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}"}},"#,
-            r#""verified_at_millis":42}}"#,
-        ),
-        JOB_ID = JOB_ID,
-        CLIENT_ID = CLIENT_ID,
-        TOKEN_HASH = TOKEN_HASH,
-        FINGERPRINT = FINGERPRINT,
-        PROJECT_ID = PROJECT_ID,
-        WORKTREE_ID = WORKTREE_ID,
-        MANIFEST_DIGEST = MANIFEST_DIGEST,
-    )
-    .into_bytes()
-}
-
 fn response_bytes() -> Vec<u8> {
     format!(
         concat!(
@@ -217,7 +196,7 @@ fn insert_before_final_brace(bytes: &[u8], insertion: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn manifest_request_receipt_and_response_reject_unknown_duplicate_and_invalid_fields() {
+fn manifest_request_and_response_reject_unknown_duplicate_and_invalid_fields() {
     // Break caught: an ambiguous or semantically invalid remote record is
     // accepted merely because serde can populate its Rust fields.
     let manifest: SnapshotManifest = serde_json::from_slice(&valid_manifest_bytes()).unwrap();
@@ -243,17 +222,6 @@ fn manifest_request_receipt_and_response_reject_unknown_duplicate_and_invalid_fi
     let invalid_version =
         verify_request_bytes().replace_bytes(current_version.as_bytes(), b"\"protocol_version\":1");
     assert!(serde_json::from_slice::<SnapshotVerifyRequest>(&invalid_version).is_err());
-
-    let receipt: VerifiedReceipt = serde_json::from_slice(&receipt_bytes()).unwrap();
-    assert_eq!(serde_json::to_vec(&receipt).unwrap(), receipt_bytes());
-    let mismatched_cache_key = receipt_bytes().replace_bytes(
-        format!(r#""manifest_digest":"{MANIFEST_DIGEST}"}}"#).as_bytes(),
-        format!(r#""manifest_digest":"{}"}}"#, "f".repeat(64)).as_bytes(),
-    );
-    assert!(serde_json::from_slice::<VerifiedReceipt>(&mismatched_cache_key).is_err());
-    let unknown_receipt =
-        insert_before_final_brace(&receipt_bytes(), b",\"lease_token\":\"secret\"");
-    assert!(serde_json::from_slice::<VerifiedReceipt>(&unknown_receipt).is_err());
 
     let response: VerifiedSnapshotResponse = serde_json::from_slice(&response_bytes()).unwrap();
     assert_eq!(serde_json::to_vec(&response).unwrap(), response_bytes());
@@ -1462,7 +1430,9 @@ fn snapshot_verify_transport_uses_the_fixed_command_and_strict_response_dto() {
         .request(&worker, HostOperation::SnapshotVerify, &request, policy)
         .unwrap();
 
+    // Supersedes the retired snapshot step in controller_process_runtime::harness_fake_exec_protocol_and_descendant_git.
     assert_eq!(response.job_id(), request.job_id());
+    assert!(!response.cache_reused());
     assert_eq!(
         runner.request(),
         ProcessRequest {

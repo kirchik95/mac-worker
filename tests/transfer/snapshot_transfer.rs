@@ -26,30 +26,34 @@ use mac_worker::{
     cli::Cli,
     config::WorkerEntry,
     error::{ProcessError, ProcessStream, WorkerError},
+    git_transport::{GitServerExecutor, GitTransport, HostGitService, ReceivePackComponents},
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
-    inputs::RelativePath,
     job::{
-        ClientId, CommandSpec, HostControlError, JobId, JobMeta, JobStatus, LeaseAcquireRequest,
-        LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk, LogChunkResponse, LogStream,
-        PreacceptanceDisposition, RequestFingerprint, RequestFingerprintMaterial,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusLogsRequest, StatusLogsResponse, StatusResponse, SubmitRequest, SubmitResponse,
+        ClientId, CommandSpec, ExecutionScope, HostControlError, JobId, JobMeta, JobStatus,
+        LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord, LeaseToken, LogChunk,
+        LogChunkResponse, LogStream, PreacceptanceDisposition, RequestFingerprint,
+        RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse, StatusResponse,
+        SubmitRequest, SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
+    legacy_snapshot_receipt::VerifiedReceipt,
     paths::PathLayout,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
     project::{ProjectContext, ProjectInspector},
     project_config::SnapshotSettings,
     protocol::{MemoryPressure, PROTOCOL_VERSION},
-    remote_snapshot::{RemoteSnapshotService, VerifiedReceipt},
+    remote_snapshot::RemoteSnapshotService,
+    rooted_fs::RootedDir,
     run_with_rsync_executor_in_context, run_with_stdio_in_context,
     snapshot::{Snapshot, SnapshotBuilder},
+    task::{BaseOid, TaskId},
     transfer::{
-        AbandonTransferResult, HostOperation, HostTransferService, OptionalHostResponse,
-        RemoteJobClient, ResolutionRuntime, RsyncServerExecutor, RsyncServerInvocation,
-        RsyncTransport, SshJsonTransport, TransferFailureDisposition, TransferIdentity,
-        TransferReceipt, transfer_failure_disposition,
+        HostOperation, HostTransferService, OptionalHostResponse, RemoteJobClient,
+        ResolutionRuntime, RsyncServerExecutor, RsyncServerInvocation, RsyncTransport,
+        SshJsonTransport, TransferFailureDisposition, TransferIdentity, TransferReceipt,
+        transfer_failure_disposition,
     },
 };
 use sha2::Digest;
@@ -289,6 +293,123 @@ fn leased_store(root: &Path, seed: u128) -> (HostStore, LeaseAcquireRequest, Tra
         .unwrap();
     let identity = TransferIdentity::from_acquire_request(&request).unwrap();
     (store, request, identity)
+}
+
+fn task_acquire_request(seed: u128) -> LeaseAcquireRequest {
+    acquire_request(seed).with_execution_scope(ExecutionScope::task(TaskId::new(
+        uuid::Uuid::from_u128(seed + 1_000_000),
+    )))
+}
+
+fn git_components(request: &LeaseAcquireRequest) -> ReceivePackComponents {
+    ReceivePackComponents::new(
+        request.material().job_id(),
+        request.material().client_id(),
+        request.material().lease_token(),
+        request.request_fingerprint().clone(),
+    )
+}
+
+fn git_leased_store(
+    root: &Path,
+    seed: u128,
+) -> (HostStore, LeaseAcquireRequest, ReceivePackComponents) {
+    let store = HostStore::open(root).unwrap();
+    let request = task_acquire_request(seed);
+    LeaseService::new(&store)
+        .acquire(&request, &healthy(), 1)
+        .unwrap();
+    let identity = git_components(&request);
+    (store, request, identity)
+}
+
+// Adapter for the existing Git exec boundary: a labeled fixture exit stands for
+// explicit release. The real HostGitService owns validation, mirrors and locks.
+struct GitReceiverFixture<'a>(&'a HostStore);
+
+impl<'a> GitReceiverFixture<'a> {
+    fn new(store: &'a HostStore) -> Self {
+        Self(store)
+    }
+
+    fn receive(
+        &self,
+        identity: &ReceivePackComponents,
+        executor: &dyn GitServerExecutor,
+    ) -> Result<(), WorkerError> {
+        let result = HostGitService::new(self.0).receive_pack(identity, &"a".repeat(64), executor);
+        match result {
+            Err(WorkerError::CommandExit { code: 0 }) => Ok(()),
+            Err(error) => Err(error),
+            Ok(never) => match never {},
+        }
+    }
+
+    fn abandon(
+        &self,
+        request: &LeaseAcquireRequest,
+        _now: u64,
+    ) -> Result<ResolveOrAbandonOutcome, WorkerError> {
+        let submit = SubmitRequest::new(request.material().clone())
+            .with_execution_scope(request.execution_scope().clone());
+        let response = JobService::new(self.0, &NeverLaunchResolution)
+            .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit)?)?;
+        match response.outcome() {
+            ResolveOrAbandonOutcome::CleanupPending { .. } => Err(WorkerError::Protocol(
+                "exact abandonment cleanup remains pending".into(),
+            )),
+            outcome => Ok(outcome.clone()),
+        }
+    }
+}
+
+struct GitGateExecutor {
+    entered: mpsc::Sender<mpsc::Sender<()>>,
+    calls: AtomicUsize,
+}
+
+impl GitServerExecutor for GitGateExecutor {
+    fn exec(
+        &self,
+        program: &str,
+        mirror: &RootedDir,
+        environment: &[(OsString, OsString)],
+    ) -> Result<std::convert::Infallible, WorkerError> {
+        assert_eq!(program, "git-receive-pack");
+        assert_eq!(
+            environment,
+            &[
+                (
+                    OsString::from("GIT_CONFIG_GLOBAL"),
+                    OsString::from("/dev/null")
+                ),
+                (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1"))
+            ]
+        );
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        fs::create_dir(mirror.path().join(format!("payload-{call}")))?;
+        let (release, wait) = mpsc::channel();
+        self.entered.send(release).unwrap();
+        wait.recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .map_err(|_| WorkerError::Protocol("test Git executor release timed out".into()))?;
+        Err(WorkerError::CommandExit { code: 0 })
+    }
+}
+
+#[derive(Default)]
+struct GitCountingExecutor(AtomicUsize);
+
+impl GitServerExecutor for GitCountingExecutor {
+    fn exec(
+        &self,
+        program: &str,
+        _mirror: &RootedDir,
+        _environment: &[(OsString, OsString)],
+    ) -> Result<std::convert::Infallible, WorkerError> {
+        assert_eq!(program, "git-receive-pack");
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(WorkerError::CommandExit { code: 0 })
+    }
 }
 
 fn stock_server_args() -> Vec<OsString> {
@@ -960,40 +1081,6 @@ fn stock_macos_client_generates_the_single_allowed_server_shape() {
     }
 }
 
-struct GateExecutor {
-    entered: mpsc::Sender<mpsc::Sender<()>>,
-    calls: AtomicUsize,
-}
-
-impl RsyncServerExecutor for GateExecutor {
-    fn execute(&self, invocation: RsyncServerInvocation<'_>) -> Result<(), WorkerError> {
-        assert_eq!(
-            invocation.server_args(),
-            [
-                OsStr::new("--server"),
-                OsStr::new("--delete-before"),
-                OsStr::new("-l"),
-                OsStr::new("-p"),
-                OsStr::new("-D"),
-                OsStr::new("-r"),
-                OsStr::new("-t"),
-                OsStr::new("--dirs"),
-                OsStr::new("."),
-                OsStr::new("."),
-            ]
-        );
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        invocation.destination().create_empty_directory(
-            &RelativePath::parse(format!("payload-{call}").as_bytes()).unwrap(),
-        )?;
-        let (release, wait) = mpsc::channel();
-        self.entered.send(release).unwrap();
-        wait.recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
-            .map_err(|_| WorkerError::Protocol("test executor release timed out".into()))?;
-        Ok(())
-    }
-}
-
 #[derive(Default)]
 struct CountingExecutor(AtomicUsize);
 
@@ -1078,23 +1165,30 @@ fn receiver_rewrites_only_the_literal_sink_and_rejects_every_other_server_shape(
 }
 
 #[test]
-fn exact_receiver_identity_must_match_the_live_lease_before_sink_creation() {
+// Supersedes snapshot_transfer::exact_receiver_identity_must_match_the_live_lease_before_sink_creation via Task-scoped Git receive.
+fn git_exact_receiver_identity_must_match_the_live_lease_before_sink_creation() {
     let fixture = tempfile::tempdir().unwrap();
-    let (store, request, identity) = leased_store(&fixture.path().join("host"), 20);
-    let wrong = TransferIdentity::new(
+    let (store, request, identity) = git_leased_store(&fixture.path().join("host"), 20);
+    let wrong = ReceivePackComponents::new(
         identity.job_id(),
         identity.client_id(),
         LeaseToken::new(uuid::Uuid::from_u128(999)),
         identity.request_fingerprint().clone(),
     );
-    let executor = CountingExecutor::default();
+    let executor = GitCountingExecutor::default();
 
-    let error = HostTransferService::new(&store)
-        .receive(&wrong, &stock_server_args(), &executor)
+    let error = GitReceiverFixture::new(&store)
+        .receive(&wrong, &executor)
         .unwrap_err();
 
     assert!(error.to_string().contains("LEASE_IDENTITY_MISMATCH"));
     assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .mirror_if_present(request.material().project_id())
+            .unwrap()
+            .is_none()
+    );
     assert!(
         !store
             .incoming_job(
@@ -1107,14 +1201,15 @@ fn exact_receiver_identity_must_match_the_live_lease_before_sink_creation() {
 }
 
 #[test]
-fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() {
+// Supersedes snapshot_transfer::receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver via Task-scoped Git receive.
+fn git_receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() {
     // Break caught: abandon can win while a receiver still writes, or a
-    // delayed receiver recreates incoming after Abandoned is returned.
+    // delayed receiver opens or changes the Git sink after Abandoned is returned.
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, request, identity) = leased_store(&root, 30);
+    let (store, request, identity) = git_leased_store(&root, 30);
     let (entered_tx, entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1123,22 +1218,26 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
     let receiver_identity = identity.clone();
     let receiver_executor = Arc::clone(&executor);
     let receiver = std::thread::spawn(move || {
-        HostTransferService::new(&receiver_store).receive(
-            &receiver_identity,
-            &stock_server_args(),
-            receiver_executor.as_ref(),
-        )
+        GitReceiverFixture::new(&receiver_store)
+            .receive(&receiver_identity, receiver_executor.as_ref())
     });
     let release = entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
 
+    let mirror = store
+        .mirror_if_present(request.material().project_id())
+        .unwrap()
+        .unwrap();
+    let mirror_identity = fs::metadata(mirror.path()).unwrap();
+    let payload_identity = fs::metadata(mirror.path().join("payload-0")).unwrap();
     let (resolved_tx, resolved_rx) = mpsc::channel();
     let (classified_tx, classified_rx) = mpsc::channel();
     let resolver_store = HostStore::open(&root).unwrap();
-    let resolver_request = ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(
-        request.material().clone(),
-    ))
+    let resolver_request = ResolveOrAbandonRequest::from_submit_request(
+        &SubmitRequest::new(request.material().clone())
+            .with_execution_scope(request.execution_scope().clone()),
+    )
     .unwrap();
     let resolver = std::thread::spawn(move || {
         let service = JobService::new_with_resolution_before_transfer(
@@ -1176,25 +1275,43 @@ fn receiver_first_blocks_abandon_then_tombstone_fences_every_delayed_receiver() 
         )
         .unwrap();
     assert!(!sink.exists());
-    let delayed = CountingExecutor::default();
-    let error = HostTransferService::new(&store)
-        .receive(&identity, &stock_server_args(), &delayed)
+    let delayed = GitCountingExecutor::default();
+    let error = GitReceiverFixture::new(&store)
+        .receive(&identity, &delayed)
         .unwrap_err();
-    assert!(error.to_string().contains("JOB_ABANDONED"));
+    assert!(error.to_string().contains("LEASE_IDENTITY_MISMATCH"));
     assert_eq!(delayed.0.load(Ordering::SeqCst), 0);
     assert!(!sink.exists());
+    assert_eq!(
+        fs::metadata(mirror.path()).unwrap().dev(),
+        mirror_identity.dev()
+    );
+    assert_eq!(
+        fs::metadata(mirror.path()).unwrap().ino(),
+        mirror_identity.ino()
+    );
+    assert_eq!(
+        fs::metadata(mirror.path().join("payload-0")).unwrap().dev(),
+        payload_identity.dev()
+    );
+    assert_eq!(
+        fs::metadata(mirror.path().join("payload-0")).unwrap().ino(),
+        payload_identity.ino()
+    );
+    assert!(!mirror.path().join("payload-1").exists());
 }
 
 #[test]
-fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_transfer() {
+// Supersedes snapshot_transfer::post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_transfer via Task-scoped Git receive.
+fn git_post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_transfer() {
     // Break caught: resolution trusts its pre-transfer lease observation and
     // tombstones/cleans after the receiver releases even though live authority
     // changed while it was blocked on the shared transfer lock.
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, request, identity) = leased_store(&root, 35);
+    let (store, request, identity) = git_leased_store(&root, 35);
     let (receiver_entered_tx, receiver_entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: receiver_entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1202,17 +1319,15 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
     let receiver_identity = identity.clone();
     let receiver_executor = Arc::clone(&executor);
     let receiver = std::thread::spawn(move || {
-        HostTransferService::new(&receiver_store).receive(
-            &receiver_identity,
-            &stock_server_args(),
-            receiver_executor.as_ref(),
-        )
+        GitReceiverFixture::new(&receiver_store)
+            .receive(&receiver_identity, receiver_executor.as_ref())
     });
     let release_receiver = receiver_entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
         .unwrap();
 
-    let submit = SubmitRequest::new(request.material().clone());
+    let submit = SubmitRequest::new(request.material().clone())
+        .with_execution_scope(request.execution_scope().clone());
     let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
     let (classified_tx, classified_rx) = mpsc::channel();
     let resolver_store = HostStore::open(&root).unwrap();
@@ -1275,14 +1390,17 @@ fn post_transfer_reread_rejects_live_authority_changed_while_receiver_owned_tran
 }
 
 #[test]
-fn tombstone_first_refuses_before_opening_or_recreating_the_sink() {
+// Supersedes snapshot_transfer::tombstone_first_refuses_before_opening_or_recreating_the_sink via Task-scoped Git receive.
+fn git_tombstone_first_refuses_before_opening_or_recreating_the_sink() {
     let fixture = tempfile::tempdir().unwrap();
-    let (store, request, identity) = leased_store(&fixture.path().join("host"), 40);
-    assert_eq!(
-        HostTransferService::new(&store)
-            .abandon(&request, 2)
-            .unwrap(),
-        AbandonTransferResult::Abandoned
+    let (store, request, identity) = git_leased_store(&fixture.path().join("host"), 40);
+    // Seed the canonical tombstone while the exact Task lease is still live,
+    // so the retained disposition fence reports JOB_ABANDONED before mirror creation.
+    store.record_abandoned(&request, 2).unwrap();
+    assert!(
+        fs::read_to_string(store.job_index(identity.job_id()).unwrap())
+            .unwrap()
+            .contains("\"disposition\":\"abandoned\"")
     );
     let sink = store
         .incoming_job(
@@ -1291,38 +1409,48 @@ fn tombstone_first_refuses_before_opening_or_recreating_the_sink() {
         )
         .unwrap();
     assert!(!sink.exists());
+    assert!(
+        store
+            .mirror_if_present(request.material().project_id())
+            .unwrap()
+            .is_none()
+    );
 
-    let executor = CountingExecutor::default();
-    let error = HostTransferService::new(&store)
-        .receive(&identity, &stock_server_args(), &executor)
+    let executor = GitCountingExecutor::default();
+    let error = GitReceiverFixture::new(&store)
+        .receive(&identity, &executor)
         .unwrap_err();
     assert!(error.to_string().contains("JOB_ABANDONED"));
     assert_eq!(executor.0.load(Ordering::SeqCst), 0);
     assert!(!sink.exists());
+    assert!(
+        store
+            .mirror_if_present(request.material().project_id())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
-fn index_only_accepted_fences_receiver_but_both_resolution_entries_fail_closed() {
+// Supersedes snapshot_transfer::index_only_accepted_fences_receiver_but_both_resolution_entries_fail_closed via Task-scoped Git receive.
+fn git_index_only_accepted_fences_receiver_but_both_resolution_entries_fail_closed() {
     // Break caught: the legacy transfer entry returns JOB_ACCEPTED from the
     // index alone while the canonical resolver rejects the missing final job.
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
-    let (store, request, identity) = leased_store(&fixture.path().join("host"), 41);
+    let (store, request, identity) = git_leased_store(&fixture.path().join("host"), 41);
     store
         .record_accepted(&request, &JobStatus::accepted(2).unwrap(), 2)
         .unwrap();
-    let receiver_error = HostTransferService::new(&store)
-        .receive(
-            &identity,
-            &stock_server_args(),
-            &CountingExecutor::default(),
-        )
+    let receiver_error = GitReceiverFixture::new(&store)
+        .receive(&identity, &GitCountingExecutor::default())
         .unwrap_err();
-    let submit = SubmitRequest::new(request.material().clone());
+    let submit = SubmitRequest::new(request.material().clone())
+        .with_execution_scope(request.execution_scope().clone());
     let direct_error = JobService::new(&store, &NeverLaunchResolution)
         .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
         .unwrap_err();
-    let abandon_error = HostTransferService::new(&store)
+    let abandon_error = GitReceiverFixture::new(&store)
         .abandon(&request, 3)
         .unwrap_err();
     assert!(receiver_error.to_string().contains("JOB_ACCEPTED"));
@@ -1331,7 +1459,8 @@ fn index_only_accepted_fences_receiver_but_both_resolution_entries_fail_closed()
 }
 
 #[test]
-fn accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
+// Supersedes snapshot_transfer::accepted_disposition_immutable_mismatches_are_job_id_conflicts via Task-scoped Git receive.
+fn git_accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     // Break caught: an unrelated accepted record is misclassified as an
     // idempotent acceptance fence instead of a global job-ID conflict.
@@ -1345,7 +1474,7 @@ fn accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
         ("worktree", "f".repeat(64)),
     ] {
         let fixture = tempfile::tempdir().unwrap();
-        let (store, request, identity) = leased_store(&fixture.path().join("host"), 42);
+        let (store, request, identity) = git_leased_store(&fixture.path().join("host"), 42);
         store
             .record_accepted(&request, &JobStatus::accepted(2).unwrap(), 2)
             .unwrap();
@@ -1358,14 +1487,10 @@ fn accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
         };
         replace_disposition_value(&store, identity.job_id(), &old, &replacement);
 
-        let receiver_error = HostTransferService::new(&store)
-            .receive(
-                &identity,
-                &stock_server_args(),
-                &CountingExecutor::default(),
-            )
+        let receiver_error = GitReceiverFixture::new(&store)
+            .receive(&identity, &GitCountingExecutor::default())
             .unwrap_err();
-        let abandon_error = HostTransferService::new(&store)
+        let abandon_error = GitReceiverFixture::new(&store)
             .abandon(&request, 3)
             .unwrap_err();
         assert!(
@@ -1380,11 +1505,12 @@ fn accepted_disposition_immutable_mismatches_are_job_id_conflicts() {
 }
 
 #[test]
-fn abandoned_disposition_requires_the_full_exact_request_identity() {
+// Supersedes snapshot_transfer::abandoned_disposition_requires_the_full_exact_request_identity via Task-scoped Git receive.
+fn git_abandoned_disposition_requires_the_full_exact_request_identity() {
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     for field in ["client", "fingerprint", "project", "worktree", "token_hash"] {
         let fixture = tempfile::tempdir().unwrap();
-        let (store, request, identity) = leased_store(&fixture.path().join("host"), 43);
+        let (store, request, identity) = git_leased_store(&fixture.path().join("host"), 43);
         store.record_abandoned(&request, 2).unwrap();
         let token_hash = format!(
             "{:x}",
@@ -1402,14 +1528,10 @@ fn abandoned_disposition_requires_the_full_exact_request_identity() {
             _ => unreachable!(),
         };
         replace_disposition_value(&store, identity.job_id(), &old, &replacement);
-        let receiver_error = HostTransferService::new(&store)
-            .receive(
-                &identity,
-                &stock_server_args(),
-                &CountingExecutor::default(),
-            )
+        let receiver_error = GitReceiverFixture::new(&store)
+            .receive(&identity, &GitCountingExecutor::default())
             .unwrap_err();
-        let abandon_error = HostTransferService::new(&store)
+        let abandon_error = GitReceiverFixture::new(&store)
             .abandon(&request, 3)
             .unwrap_err();
         for error in [receiver_error, abandon_error] {
@@ -1421,16 +1543,17 @@ fn abandoned_disposition_requires_the_full_exact_request_identity() {
 }
 
 #[test]
-fn independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
+// Supersedes snapshot_transfer::independent_and_cloned_stores_share_one_64_way_transfer_lock_domain via Task-scoped Git receive.
+fn git_independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
     // Break caught: flock self-coalescing or replacement creates concurrent
     // receiver domains. Each entrant stays blocked until explicitly released.
     const CONTENDERS: usize = 64;
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, _request, identity) = leased_store(&root, 50);
+    let (store, _request, identity) = git_leased_store(&root, 50);
     let (entered_tx, entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1447,11 +1570,8 @@ fn independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
         let contender_barrier = Arc::clone(&barrier);
         threads.push(std::thread::spawn(move || {
             contender_barrier.wait();
-            HostTransferService::new(&contender_store).receive(
-                &contender_identity,
-                &stock_server_args(),
-                contender_executor.as_ref(),
-            )
+            GitReceiverFixture::new(&contender_store)
+                .receive(&contender_identity, contender_executor.as_ref())
         }));
     }
     barrier.wait();
@@ -1470,12 +1590,13 @@ fn independent_and_cloned_stores_share_one_64_way_transfer_lock_domain() {
 }
 
 #[test]
-fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
+// Supersedes snapshot_transfer::replacing_an_initialized_transfer_lock_cannot_create_a_second_domain via Task-scoped Git receive.
+fn git_replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, _request, identity) = leased_store(&root, 60);
+    let (store, _request, identity) = git_leased_store(&root, 60);
     let (entered_tx, entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1483,11 +1604,7 @@ fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
     let active_identity = identity.clone();
     let active_executor = Arc::clone(&executor);
     let active = std::thread::spawn(move || {
-        HostTransferService::new(&active_store).receive(
-            &active_identity,
-            &stock_server_args(),
-            active_executor.as_ref(),
-        )
+        GitReceiverFixture::new(&active_store).receive(&active_identity, active_executor.as_ref())
     });
     let release = entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -1510,9 +1627,9 @@ fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
     permissions.set_mode(0o600);
     fs::set_permissions(transfer_dir.join("transfer.lock"), permissions).unwrap();
 
-    let second = CountingExecutor::default();
-    let error = HostTransferService::new(&HostStore::open(&root).unwrap())
-        .receive(&identity, &stock_server_args(), &second)
+    let second = GitCountingExecutor::default();
+    let error = GitReceiverFixture::new(&HostStore::open(&root).unwrap())
+        .receive(&identity, &second)
         .unwrap_err();
     assert_eq!(second.0.load(Ordering::SeqCst), 0);
     assert!(
@@ -1524,15 +1641,16 @@ fn replacing_an_initialized_transfer_lock_cannot_create_a_second_domain() {
 }
 
 #[test]
-fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
+// Supersedes snapshot_transfer::self_consistent_internal_lock_and_identity_replacement_fails_closed via Task-scoped Git receive.
+fn git_self_consistent_internal_lock_and_identity_replacement_fails_closed() {
     // Break caught: replacing both files consistently lets a fresh store lock
     // a new inode while the active receiver still owns the original flock.
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, _request, identity) = leased_store(&root, 61);
+    let (store, _request, identity) = git_leased_store(&root, 61);
     let (entered_tx, entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1540,11 +1658,7 @@ fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
     let active_identity = identity.clone();
     let active_executor = Arc::clone(&executor);
     let active = std::thread::spawn(move || {
-        HostTransferService::new(&active_store).receive(
-            &active_identity,
-            &stock_server_args(),
-            active_executor.as_ref(),
-        )
+        GitReceiverFixture::new(&active_store).receive(&active_identity, active_executor.as_ref())
     });
     let release = entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -1573,12 +1687,9 @@ fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
             .join(format!("{}.transfer-lock.json", identity.job_id())),
     );
 
-    let second = CountingExecutor::default();
-    let result = HostTransferService::new(&HostStore::open(&root).unwrap()).receive(
-        &identity,
-        &stock_server_args(),
-        &second,
-    );
+    let second = GitCountingExecutor::default();
+    let result =
+        GitReceiverFixture::new(&HostStore::open(&root).unwrap()).receive(&identity, &second);
     release.send(()).unwrap();
     active.join().unwrap().unwrap();
 
@@ -1591,15 +1702,16 @@ fn self_consistent_internal_lock_and_identity_replacement_fails_closed() {
 }
 
 #[test]
-fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
+// Supersedes snapshot_transfer::self_consistent_whole_transfer_directory_replacement_fences_resolver via Task-scoped Git receive.
+fn git_self_consistent_whole_transfer_directory_replacement_fences_resolver() {
     // Break caught: a resolver locks a replacement directory and publishes an
     // abandonment while the active receiver still owns the detached lock.
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
-    let (store, request, identity) = leased_store(&root, 62);
+    let (store, request, identity) = git_leased_store(&root, 62);
     let (entered_tx, entered_rx) = mpsc::channel();
-    let executor = Arc::new(GateExecutor {
+    let executor = Arc::new(GitGateExecutor {
         entered: entered_tx,
         calls: AtomicUsize::new(0),
     });
@@ -1607,11 +1719,7 @@ fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
     let active_identity = identity.clone();
     let active_executor = Arc::clone(&executor);
     let active = std::thread::spawn(move || {
-        HostTransferService::new(&active_store).receive(
-            &active_identity,
-            &stock_server_args(),
-            active_executor.as_ref(),
-        )
+        GitReceiverFixture::new(&active_store).receive(&active_identity, active_executor.as_ref())
     });
     let release = entered_rx
         .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
@@ -1640,7 +1748,7 @@ fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
             .join(format!("{}.transfer-lock.json", identity.job_id())),
     );
 
-    let result = HostTransferService::new(&HostStore::open(&root).unwrap()).abandon(&request, 2);
+    let result = GitReceiverFixture::new(&HostStore::open(&root).unwrap()).abandon(&request, 2);
     release.send(()).unwrap();
     active.join().unwrap().unwrap();
 
@@ -1653,18 +1761,15 @@ fn self_consistent_whole_transfer_directory_replacement_fences_resolver() {
 }
 
 #[test]
-fn missing_replaced_and_unsafe_external_transfer_identities_fail_closed() {
+// Supersedes snapshot_transfer::missing_replaced_and_unsafe_external_transfer_identities_fail_closed via Task-scoped Git receive.
+fn git_missing_replaced_and_unsafe_external_transfer_identities_fail_closed() {
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     for attack in ["missing", "replaced", "symlink", "permissive"] {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("host");
-        let (store, request, identity) = leased_store(&root, 63);
-        HostTransferService::new(&store)
-            .receive(
-                &identity,
-                &stock_server_args(),
-                &CountingExecutor::default(),
-            )
+        let (store, request, identity) = git_leased_store(&root, 63);
+        GitReceiverFixture::new(&store)
+            .receive(&identity, &GitCountingExecutor::default())
             .unwrap();
         let external = root
             .join("locks/jobs")
@@ -1694,9 +1799,9 @@ fn missing_replaced_and_unsafe_external_transfer_identities_fail_closed() {
             _ => unreachable!(),
         }
 
-        let second = CountingExecutor::default();
-        let error = HostTransferService::new(&HostStore::open(&root).unwrap())
-            .receive(&identity, &stock_server_args(), &second)
+        let second = GitCountingExecutor::default();
+        let error = GitReceiverFixture::new(&HostStore::open(&root).unwrap())
+            .receive(&identity, &second)
             .unwrap_err();
         assert_eq!(second.0.load(Ordering::SeqCst), 0, "{attack}");
         assert!(
@@ -1808,13 +1913,14 @@ fn hidden_binary_receiver_ignores_json_and_keeps_stdout_and_errors_protocol_clea
 }
 
 #[test]
-fn cleanup_failure_keeps_the_tombstone_and_unsafe_evidence_for_an_exact_retry() {
+// Supersedes snapshot_transfer::cleanup_failure_keeps_the_tombstone_and_unsafe_evidence_for_an_exact_retry via Task-scoped Git receive.
+fn git_cleanup_failure_keeps_the_tombstone_and_unsafe_evidence_for_an_exact_retry() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
     let outside = fixture.path().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("sentinel"), b"keep").unwrap();
-    let (store, request, identity) = leased_store(&root, 80);
+    let (store, request, identity) = git_leased_store(&root, 80);
     let sink = store
         .incoming_job(
             request.material().job_id(),
@@ -1828,7 +1934,7 @@ fn cleanup_failure_keeps_the_tombstone_and_unsafe_evidence_for_an_exact_retry() 
     fs::set_permissions(sink.parent().unwrap(), parent_permissions).unwrap();
     std::os::unix::fs::symlink(&outside, &sink).unwrap();
 
-    let error = HostTransferService::new(&store)
+    let error = GitReceiverFixture::new(&store)
         .abandon(&request, 2)
         .unwrap_err();
     assert!(
@@ -1853,24 +1959,25 @@ fn cleanup_failure_keeps_the_tombstone_and_unsafe_evidence_for_an_exact_retry() 
     fs::set_permissions(sink.join("partial"), evidence_permissions).unwrap();
 
     assert_eq!(
-        HostTransferService::new(&store)
+        GitReceiverFixture::new(&store)
             .abandon(&request, 3)
             .unwrap(),
-        AbandonTransferResult::Abandoned
+        ResolveOrAbandonOutcome::Abandoned
     );
     assert!(!sink.exists());
     assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
-    let delayed = CountingExecutor::default();
+    let delayed = GitCountingExecutor::default();
     assert!(
-        HostTransferService::new(&store)
-            .receive(&identity, &stock_server_args(), &delayed)
+        GitReceiverFixture::new(&store)
+            .receive(&identity, &delayed)
             .is_err()
     );
     assert_eq!(delayed.0.load(Ordering::SeqCst), 0);
 }
 
 #[test]
-fn every_transfer_lock_initialization_crash_is_recoverable_or_fully_published() {
+// Supersedes snapshot_transfer::every_transfer_lock_initialization_crash_is_recoverable_or_fully_published via Task-scoped Git receive.
+fn git_every_transfer_lock_initialization_crash_is_recoverable_or_fully_published() {
     // Break caught: a crash leaves a split/adopted lock identity or permanently
     // wedges the exact leased job.
     for point in [
@@ -1882,15 +1989,15 @@ fn every_transfer_lock_initialization_crash_is_recoverable_or_fully_published() 
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("host");
         let store = HostStore::open_with_write_fault(&root, point).unwrap();
-        let request = acquire_request(100 + point as u128);
+        let request = task_acquire_request(100 + point as u128);
         LeaseService::new(&store)
             .acquire(&request, &healthy(), 1)
             .unwrap();
-        let identity = TransferIdentity::from_acquire_request(&request).unwrap();
-        let first = CountingExecutor::default();
+        let identity = git_components(&request);
+        let first = GitCountingExecutor::default();
         assert!(
-            HostTransferService::new(&store)
-                .receive(&identity, &stock_server_args(), &first)
+            GitReceiverFixture::new(&store)
+                .receive(&identity, &first)
                 .is_err(),
             "fault {point:?} must interrupt first initialization"
         );
@@ -1898,16 +2005,17 @@ fn every_transfer_lock_initialization_crash_is_recoverable_or_fully_published() 
         drop(store);
 
         let reopened = HostStore::open(&root).unwrap();
-        let retry = CountingExecutor::default();
-        HostTransferService::new(&reopened)
-            .receive(&identity, &stock_server_args(), &retry)
+        let retry = GitCountingExecutor::default();
+        GitReceiverFixture::new(&reopened)
+            .receive(&identity, &retry)
             .unwrap();
         assert_eq!(retry.0.load(Ordering::SeqCst), 1);
     }
 }
 
 #[test]
-fn tampered_external_marker_never_publishes_its_staged_transfer_directory() {
+// Supersedes snapshot_transfer::tampered_external_marker_never_publishes_its_staged_transfer_directory via Task-scoped Git receive.
+fn git_tampered_external_marker_never_publishes_its_staged_transfer_directory() {
     let _serial = HOST_FD_STRESS_LOCK.lock().unwrap();
     // Break caught: recovery mutates the canonical namespace before comparing
     // every externally anchored identity field against the staged directory.
@@ -1916,18 +2024,14 @@ fn tampered_external_marker_never_publishes_its_staged_transfer_directory() {
     let store =
         HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterTransferIdentityPublish)
             .unwrap();
-    let request = acquire_request(119);
+    let request = task_acquire_request(119);
     LeaseService::new(&store)
         .acquire(&request, &healthy(), 1)
         .unwrap();
-    let identity = TransferIdentity::from_acquire_request(&request).unwrap();
+    let identity = git_components(&request);
     assert!(
-        HostTransferService::new(&store)
-            .receive(
-                &identity,
-                &stock_server_args(),
-                &CountingExecutor::default(),
-            )
+        GitReceiverFixture::new(&store)
+            .receive(&identity, &GitCountingExecutor::default(),)
             .is_err()
     );
     drop(store);
@@ -1946,12 +2050,8 @@ fn tampered_external_marker_never_publishes_its_staged_transfer_directory() {
     )
     .unwrap();
 
-    let error = HostTransferService::new(&HostStore::open(&root).unwrap())
-        .receive(
-            &identity,
-            &stock_server_args(),
-            &CountingExecutor::default(),
-        )
+    let error = GitReceiverFixture::new(&HostStore::open(&root).unwrap())
+        .receive(&identity, &GitCountingExecutor::default())
         .unwrap_err();
     assert!(error.to_string().contains("transfer lock identity"));
     assert!(
@@ -2086,7 +2186,8 @@ fn query_operations_use_only_the_three_fixed_commands_and_compact_requests() {
 }
 
 #[test]
-fn hidden_submit_failures_are_versioned() {
+// Supersedes snapshot_transfer::hidden_submit_failures_are_versioned at the task-turn control boundary.
+fn hidden_task_turn_failures_are_versioned() {
     // Break caught: submit emits its legacy unversioned error shape or leaks
     // private request material instead of one canonical public error line.
     let fixture = tempfile::tempdir().unwrap();
@@ -2099,7 +2200,7 @@ fn hidden_submit_failures_are_versioned() {
         fixture.path().join("PLANTED-HOST-PATH"),
     );
     let input = br#"{"protocol_version":2,"lease_token":"PLANTED-LEASE-TOKEN","project_path":"/tmp/PLANTED-PROJECT-PATH","command":"PLANTED-COMMAND"}"#;
-    let cli = Cli::try_parse_from(["worker", "host", "submit"]).unwrap();
+    let cli = Cli::try_parse_from(["worker", "host", "task-turn"]).unwrap();
     let mut stdin = Cursor::new(input);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -2919,12 +3020,13 @@ fn resolution_outcomes_keep_host_authority_and_submission_error_rules_exact() {
 }
 
 fn isolated_leased_job(root: &Path, seed: u128) -> (HostStore, LeaseRecord, SubmitRequest) {
-    let (store, request, _) = leased_store(root, seed);
+    let (store, request, _) = git_leased_store(root, seed);
     let lease = LeaseService::new(&store)
         .load()
         .unwrap()
         .expect("acquired lease");
-    let submit = SubmitRequest::new(request.material().clone());
+    let submit = SubmitRequest::new(request.material().clone())
+        .with_execution_scope(request.execution_scope().clone());
     (store, lease, submit)
 }
 
@@ -3182,7 +3284,8 @@ fn matching_manifest_lease(
 }
 
 #[test]
-fn resolution_verified_receipt_after_delete_keeps_lease_and_converges_on_reopen() {
+// Supersedes snapshot_transfer::resolution_verified_receipt_after_delete_keeps_lease_and_converges_on_reopen with a Task lease and seeded legacy receipt.
+fn legacy_resolution_verified_receipt_after_delete_keeps_lease_and_converges_on_reopen() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
     let (store, lease, submit) = isolated_leased_job(&root, 401);
@@ -3229,7 +3332,8 @@ fn resolution_verified_receipt_after_delete_keeps_lease_and_converges_on_reopen(
 }
 
 #[test]
-fn resolution_verified_pending_after_delete_keeps_lease_and_converges_on_reopen() {
+// Supersedes snapshot_transfer::resolution_verified_pending_after_delete_keeps_lease_and_converges_on_reopen with a Task lease and seeded legacy receipt.
+fn legacy_resolution_verified_pending_after_delete_keeps_lease_and_converges_on_reopen() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
     let (store, lease, submit) = isolated_leased_job(&root, 402);
@@ -3276,7 +3380,8 @@ fn resolution_verified_pending_after_delete_keeps_lease_and_converges_on_reopen(
 }
 
 #[test]
-fn resolution_verified_legacy_residue_stays_fail_closed() {
+// Supersedes snapshot_transfer::resolution_verified_legacy_residue_stays_fail_closed with a Task lease and seeded legacy receipt.
+fn legacy_resolution_verified_legacy_residue_stays_fail_closed() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path().join("host");
     let (store, lease, submit) = isolated_leased_job(&root, 403);
@@ -3788,4 +3893,284 @@ fn unsupported_status_logs_on_one_worker_does_not_suppress_a_supported_peer() {
         host_command(&requests[4]),
         HostOperation::StatusLogs.command()
     );
+}
+
+#[test]
+// Supersedes the shared redaction assertions in snapshot_transfer::transfer_identity_debug_and_failures_never_expose_the_lease_token.
+fn git_transfer_identity_debug_and_failures_never_expose_the_lease_token() {
+    // Break caught: the rsync-path secret is copied into Debug or a public
+    // process diagnostic.
+    let token = "00000000000000000000000000000003";
+    assert!(!format!("{:?}", transfer_identity()).contains(token));
+
+    let cache = tempfile::tempdir().unwrap();
+    let runner = RecordingRunner::returning(vec![Err(WorkerError::Io(std::io::Error::other(
+        format!("launch failed near {token}"),
+    )))]);
+    let error = GitTransport::new(&runner)
+        .push_base(
+            &worker(),
+            &transfer_identity(),
+            &"a".repeat(64),
+            TaskId::new(uuid::Uuid::from_u128(4)),
+            &"0123456789012345678901234567890123456789"
+                .parse::<BaseOid>()
+                .unwrap(),
+            cache.path(),
+        )
+        .unwrap_err();
+
+    assert!(!error.to_string().contains(token));
+    assert!(
+        !format!("{:?}", runner.requests()[0]).contains(token),
+        "ProcessRequest Debug must redact its argument payload"
+    );
+}
+
+#[test]
+// Supersedes remote_snapshot::tests::resolver_cannot_tombstone_while_verification_owns_admission_and_transfer at the Git receive/abandon boundary.
+fn git_resolver_waits_for_admission_and_transfer_before_tombstone_and_receipt_cleanup() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, request, identity) = git_leased_store(&root, 500);
+    let lease = LeaseService::new(&store)
+        .load_for_job(identity.job_id())
+        .unwrap()
+        .unwrap();
+    let receipt = plant_verified_receipt(&store, &lease);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let executor = Arc::new(GitGateExecutor {
+        entered: entered_tx,
+        calls: AtomicUsize::new(0),
+    });
+    let receiver_store = HostStore::open(&root).unwrap();
+    let admission = store.admission_lock(identity.job_id()).unwrap();
+    let receiver_identity = identity.clone();
+    let receiver_executor = Arc::clone(&executor);
+    let receiver = std::thread::spawn(move || {
+        GitReceiverFixture::new(&receiver_store)
+            .receive(&receiver_identity, receiver_executor.as_ref())
+    });
+    assert!(entered_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert!(!store.job_index(identity.job_id()).unwrap().exists());
+    drop(admission);
+    let release = entered_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    let resolver_store = HostStore::open(&root).unwrap();
+    let submit = SubmitRequest::new(request.material().clone())
+        .with_execution_scope(request.execution_scope().clone());
+    let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    let (classified_tx, classified_rx) = mpsc::channel();
+    let (resolved_tx, resolved_rx) = mpsc::channel();
+    let resolver = std::thread::spawn(move || {
+        let service = JobService::new_with_resolution_before_transfer(
+            &resolver_store,
+            &NeverLaunchResolution,
+            Arc::new(move || classified_tx.send(()).unwrap()),
+        );
+        resolved_tx
+            .send(service.resolve_or_abandon(resolve))
+            .unwrap();
+    });
+    classified_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    assert!(
+        resolved_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    assert!(!store.job_index(identity.job_id()).unwrap().exists());
+    assert!(receipt.exists());
+    release.send(()).unwrap();
+    receiver.join().unwrap().unwrap();
+    let resolved = resolved_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resolved.outcome(),
+        ResolveOrAbandonOutcome::Abandoned
+    ));
+    assert!(
+        !HostStore::open(&root)
+            .unwrap()
+            .verified_receipt(identity.job_id())
+            .unwrap()
+            .exists()
+    );
+    resolver.join().unwrap();
+}
+
+#[test]
+// Supersedes the retained conflict/nonmutation proposition in snapshot_transfer::publish_receipt_conflicting_pending_is_fail_closed.
+fn legacy_resolution_conflicting_pending_preserves_lease_and_every_receipt() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, submit) = isolated_leased_job(&root, 405);
+    let foreign = plant_sibling_verified_receipt(&store, 905);
+    let pending = plant_verified_pending(&store, &lease, &fs::read(&foreign).unwrap());
+    let pending_identity = file_identity(&pending);
+    let foreign_identity = file_identity(&foreign);
+    let error = JobService::new(&store, &NeverLaunchResolution)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap_err();
+    assert!(
+        matches!(&error, WorkerError::Protocol(message) if message.contains("JOB_ID_CONFLICT")),
+        "{error}"
+    );
+    assert_file_identity_unchanged(&pending, pending_identity);
+    assert_file_identity_unchanged(&foreign, foreign_identity);
+    assert!(!store.verified_receipt(lease.job_id()).unwrap().exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+    assert!(
+        !store
+            .job_index(submit.material().job_id())
+            .unwrap()
+            .exists()
+    );
+}
+
+#[test]
+// Supersedes snapshot_transfer::publish_receipt_noncanonical_pending_is_fail_closed using seeded legacy evidence.
+fn legacy_resolution_noncanonical_pending_is_fail_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let (store, lease, submit) = isolated_leased_job(&fixture.path().join("host"), 406);
+    let mut garbage = canonical_receipt_bytes(&lease, 42);
+    garbage.extend_from_slice(b"\n");
+    let pending = plant_verified_pending(&store, &lease, &garbage);
+    let pending_identity = file_identity(&pending);
+    let error = JobService::new(&store, &NeverLaunchResolution)
+        .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WorkerError::Snapshot {
+                code: "UNSAFE_REMOTE_SNAPSHOT",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_file_identity_unchanged(&pending, pending_identity);
+    assert!(!store.verified_receipt(lease.job_id()).unwrap().exists());
+    assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+}
+
+#[test]
+// Supersedes the shared ESTALE/nonmutation assertions in snapshot_transfer::publish_receipt_estale_cleanup_is_unsafe_remote_snapshot.
+fn legacy_resolution_estale_cleanup_keeps_lease_journal_and_sibling_identity() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("host");
+    let (store, lease, submit) = isolated_leased_job(&root, 407);
+    let receipt = store.verified_receipt(lease.job_id()).unwrap();
+    let pending = plant_verified_pending(&store, &lease, &canonical_receipt_bytes(&lease, 42));
+    let request = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let response = JobService::new(&faulted, &NeverLaunchResolution)
+        .resolve_or_abandon(request.clone())
+        .unwrap();
+    assert!(
+        matches!(response.outcome(), ResolveOrAbandonOutcome::CleanupPending { code } if code == "MUTABLE_CLEANUP_FAILED")
+    );
+    assert!(!pending.exists());
+    assert_canonical_regular_delete_journal(&verified_namespace(&root));
+    let sibling = plant_sibling_verified_receipt(&faulted, 907);
+    let sibling_identity = file_identity(&sibling);
+    let namespace = verified_namespace(&root);
+    fs::set_permissions(&namespace, fs::Permissions::from_mode(0o755)).unwrap();
+    let namespace_ino = fs::symlink_metadata(&namespace).unwrap().ino();
+    drop(faulted);
+    let reopened = HostStore::open(&root).unwrap();
+    let response = JobService::new(&reopened, &NeverLaunchResolution)
+        .resolve_or_abandon(request)
+        .unwrap();
+    assert!(
+        matches!(response.outcome(), ResolveOrAbandonOutcome::CleanupPending { code } if code == "MUTABLE_CLEANUP_FAILED"),
+        "{response:?}"
+    );
+    assert_eq!(
+        LeaseService::new(&reopened).load().unwrap(),
+        Some(lease.clone())
+    );
+    assert!(!receipt.exists());
+    assert_eq!(
+        fs::symlink_metadata(&namespace)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::symlink_metadata(&namespace).unwrap().ino(),
+        namespace_ino
+    );
+    assert_file_identity_unchanged(&sibling, sibling_identity);
+    assert_canonical_regular_delete_journal(&namespace);
+}
+
+#[test]
+// Supersedes the shared no-follow receipt rejection in remote_snapshot::fresh_helper_revalidates_cache_and_rejects_a_hard_linked_receipt.
+fn legacy_resolution_rejects_unsafe_receipts_without_following_or_mutating_them() {
+    for pending in [false, true] {
+        for attack in ["symlink", "hardlink", "permissive", "oversized"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("host");
+            let (store, lease, submit) = isolated_leased_job(&root, 410);
+            let outside = fixture.path().join("outside");
+            fs::write(&outside, canonical_receipt_bytes(&lease, 42)).unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+            let outside_identity = file_identity(&outside);
+            let path = if pending {
+                plant_verified_pending(&store, &lease, &canonical_receipt_bytes(&lease, 42))
+            } else {
+                plant_verified_receipt(&store, &lease)
+            };
+            match attack {
+                "symlink" => {
+                    fs::remove_file(&path).unwrap();
+                    std::os::unix::fs::symlink(&outside, &path).unwrap();
+                }
+                "hardlink" => {
+                    fs::remove_file(&path).unwrap();
+                    fs::hard_link(&outside, &path).unwrap();
+                }
+                "permissive" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "oversized" => fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap(),
+                _ => unreachable!(),
+            }
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let error = JobService::new(&store, &NeverLaunchResolution)
+                .resolve_or_abandon(ResolveOrAbandonRequest::from_submit_request(&submit).unwrap())
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    WorkerError::Snapshot {
+                        code: "UNSAFE_REMOTE_SNAPSHOT",
+                        ..
+                    }
+                ),
+                "{pending}/{attack}: {error}"
+            );
+            assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), metadata.ino());
+            assert_file_identity_unchanged(&outside, outside_identity);
+            assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+            assert!(
+                !store
+                    .job_index(submit.material().job_id())
+                    .unwrap()
+                    .exists()
+            );
+        }
+    }
 }

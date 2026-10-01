@@ -380,3 +380,263 @@ pub(crate) fn validate_digest(value: &str, field: &str) -> Result<(), WorkerErro
 pub(crate) fn protocol_error(message: &str) -> WorkerError {
     WorkerError::Protocol(message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const JOB_ID: &str = "00000000000000000000000000000001";
+    const CLIENT_ID: &str = "00000000000000000000000000000002";
+    const FINGERPRINT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const PROJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const WORKTREE_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MANIFEST_DIGEST: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const TOKEN_HASH: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    fn receipt_bytes() -> Vec<u8> {
+        format!(
+        concat!(
+            r#"{{"version":1,"job_id":"{JOB_ID}","client_id":"{CLIENT_ID}","#,
+            r#""lease_token_sha256":"{TOKEN_HASH}","request_fingerprint":"{FINGERPRINT}","#,
+            r#""project_id":"{PROJECT_ID}","worktree_id":"{WORKTREE_ID}","#,
+            r#""manifest_digest":"{MANIFEST_DIGEST}","cache_key":{{"project_id":"{PROJECT_ID}","#,
+            r#""worktree_id":"{WORKTREE_ID}","manifest_digest":"{MANIFEST_DIGEST}"}},"#,
+            r#""verified_at_millis":42}}"#,
+        ),
+        JOB_ID = JOB_ID,
+        CLIENT_ID = CLIENT_ID,
+        TOKEN_HASH = TOKEN_HASH,
+        FINGERPRINT = FINGERPRINT,
+        PROJECT_ID = PROJECT_ID,
+        WORKTREE_ID = WORKTREE_ID,
+        MANIFEST_DIGEST = MANIFEST_DIGEST,
+    )
+    .into_bytes()
+    }
+
+    trait ReplaceBytes {
+        fn replace_bytes(&self, from: &[u8], to: &[u8]) -> Vec<u8>;
+    }
+    impl ReplaceBytes for [u8] {
+        fn replace_bytes(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
+            let offset = self
+                .windows(from.len())
+                .position(|window| window == from)
+                .expect("fixture needle");
+            [&self[..offset], to, &self[offset + from.len()..]].concat()
+        }
+    }
+    fn insert_before_final_brace(bytes: &[u8], insertion: &[u8]) -> Vec<u8> {
+        let mut changed = bytes[..bytes.len() - 1].to_vec();
+        changed.extend_from_slice(insertion);
+        changed.push(b'}');
+        changed
+    }
+
+    #[test]
+    // Supersedes the receipt/cache-key assertions in remote_snapshot::manifest_request_receipt_and_response_reject_unknown_duplicate_and_invalid_fields.
+    fn receipt_and_cache_key_reject_unknown_duplicate_and_invalid_fields() {
+        let receipt: VerifiedReceipt = serde_json::from_slice(&receipt_bytes()).unwrap();
+        assert_eq!(serde_json::to_vec(&receipt).unwrap(), receipt_bytes());
+        let mismatched_cache_key = receipt_bytes().replace_bytes(
+            format!(r#""manifest_digest":"{MANIFEST_DIGEST}"}}"#).as_bytes(),
+            format!(r#""manifest_digest":"{}"}}"#, "f".repeat(64)).as_bytes(),
+        );
+        assert!(serde_json::from_slice::<VerifiedReceipt>(&mismatched_cache_key).is_err());
+        let unknown_receipt =
+            insert_before_final_brace(&receipt_bytes(), b",\"lease_token\":\"secret\"");
+        assert!(serde_json::from_slice::<VerifiedReceipt>(&unknown_receipt).is_err());
+
+        let duplicate = insert_before_final_brace(
+            &receipt_bytes(),
+            format!(",\"job_id\":\"{JOB_ID}\"").as_bytes(),
+        );
+        assert!(serde_json::from_slice::<VerifiedReceipt>(&duplicate).is_err());
+        for (old, new) in [
+            ("\"version\":1".to_owned(), "\"version\":2".to_owned()),
+            (
+                format!("\"lease_token_sha256\":\"{TOKEN_HASH}\""),
+                "\"lease_token_sha256\":\"NOT-A-HASH\"".into(),
+            ),
+        ] {
+            assert!(
+                serde_json::from_slice::<VerifiedReceipt>(
+                    &receipt_bytes().replace_bytes(old.as_bytes(), new.as_bytes())
+                )
+                .is_err()
+            );
+        }
+        let bytes = serde_json::to_vec(receipt.cache_key()).unwrap();
+        let key: SnapshotCacheKey = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&key).unwrap(), bytes);
+        assert!(
+            serde_json::from_slice::<SnapshotCacheKey>(&insert_before_final_brace(
+                &bytes,
+                b",\"extra\":1"
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_slice::<SnapshotCacheKey>(&insert_before_final_brace(
+                &bytes,
+                format!(",\"project_id\":\"{PROJECT_ID}\"").as_bytes()
+            ))
+            .is_err()
+        );
+        for field in ["project_id", "worktree_id", "manifest_digest"] {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value[field] = serde_json::json!("NOT-A-DIGEST");
+            assert!(serde_json::from_value::<SnapshotCacheKey>(value).is_err());
+        }
+    }
+
+    fn task_fixture(
+        root: &std::path::Path,
+    ) -> (HostStore, crate::job::LeaseRecord, ResolutionIdentity) {
+        use crate::{
+            job::{
+                CommandSpec, ExecutionScope, LeaseAcquireRequest, LeaseAcquireResponse, LeaseToken,
+                RequestFingerprintMaterial, ResolveOrAbandonRequest, SubmitRequest,
+            },
+            lease::{AdmissionFacts, LeaseService},
+            protocol::MemoryPressure,
+            task::TaskId,
+        };
+        let store = HostStore::open(root).unwrap();
+        let material = RequestFingerprintMaterial::new(
+            JobId::new(uuid::Uuid::from_u128(501)),
+            ClientId::new(uuid::Uuid::from_u128(502)),
+            LeaseToken::new(uuid::Uuid::from_u128(503)),
+            1,
+            "mini-1".into(),
+            PROJECT_ID.into(),
+            WORKTREE_ID.into(),
+            MANIFEST_DIGEST.into(),
+            String::new(),
+            60_000,
+            "heavy".into(),
+            CommandSpec::shell("true".into()).unwrap(),
+        )
+        .unwrap();
+        let scope = ExecutionScope::task(TaskId::new(uuid::Uuid::from_u128(504)));
+        let acquire =
+            LeaseAcquireRequest::new(material.clone()).with_execution_scope(scope.clone());
+        let lease = match LeaseService::new(&store)
+            .acquire(
+                &acquire,
+                &AdmissionFacts {
+                    free_disk_bytes: 100 * 1024 * 1024 * 1024,
+                    total_disk_bytes: 250 * 1024 * 1024 * 1024,
+                    memory_pressure: MemoryPressure::Normal,
+                    swap_used_bytes: Some(0),
+                },
+                1,
+            )
+            .unwrap()
+        {
+            LeaseAcquireResponse::Acquired { lease } => lease,
+            _ => unreachable!(),
+        };
+        let submit = SubmitRequest::new(material).with_execution_scope(scope);
+        let identity = ResolutionIdentity::from_request(
+            &ResolveOrAbandonRequest::from_submit_request(&submit).unwrap(),
+        )
+        .unwrap();
+        (store, lease, identity)
+    }
+
+    fn write_receipt(
+        path: &std::path::Path,
+        lease: &crate::job::LeaseRecord,
+        identity: &ResolutionIdentity,
+    ) {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let receipt = VerifiedReceipt::new(
+            lease.job_id(),
+            lease.client_id(),
+            identity.token_hash(),
+            lease.request_fingerprint().clone(),
+            SnapshotCacheKey::new(
+                lease.project_id().into(),
+                lease.worktree_id().into(),
+                lease.manifest_digest().into(),
+            )
+            .unwrap(),
+            42,
+        )
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&receipt).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    #[test]
+    // Supersedes the shared typed-Io/lease-retention proposition in snapshot_transfer::publish_receipt_matching_pending_after_delete_is_retryable_io, including both moved cleanup fault points.
+    fn exact_receipt_cleanup_faults_remain_io_keep_lease_and_converge_after_reopen() {
+        use crate::lease::LeaseService;
+        for point in [
+            HostStoreWritePoint::AfterCleanupIntentCommit,
+            HostStoreWritePoint::AfterResolutionVerifiedReceiptRemoval,
+            HostStoreWritePoint::AfterResolutionVerificationStageRemoval,
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().join("host");
+            let (store, lease, identity) = task_fixture(&root);
+            let receipt = store.verified_receipt(lease.job_id()).unwrap();
+            let pending = receipt
+                .parent()
+                .unwrap()
+                .join(format!(".verify-{}.json.pending", lease.job_id()));
+            write_receipt(&receipt, &lease, &identity);
+            write_receipt(&pending, &lease, &identity);
+            drop(store);
+            let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
+            let admission = faulted.admission_lock(lease.job_id()).unwrap();
+            let transfer = faulted
+                .transfer_lock_after(&admission, lease.job_id())
+                .unwrap();
+            let error = LegacySnapshotReceiptService::new(&faulted)
+                .remove_resolution_evidence_after(&admission, &transfer, &identity)
+                .unwrap_err();
+            assert!(matches!(error, WorkerError::Io(_)), "{point:?}: {error}");
+            assert_eq!(
+                LeaseService::new(&faulted).load().unwrap(),
+                Some(lease.clone())
+            );
+            assert!(!receipt.exists());
+            if point == HostStoreWritePoint::AfterResolutionVerificationStageRemoval {
+                assert!(!pending.exists());
+            }
+            drop(transfer);
+            drop(admission);
+            drop(faulted);
+            let reopened = HostStore::open(&root).unwrap();
+            let admission = reopened.admission_lock(lease.job_id()).unwrap();
+            let transfer = reopened
+                .transfer_lock_after(&admission, lease.job_id())
+                .unwrap();
+            let service = LegacySnapshotReceiptService::new(&reopened);
+            service
+                .remove_resolution_evidence_after(&admission, &transfer, &identity)
+                .unwrap();
+            service
+                .resolution_evidence_absent_after(&admission, &transfer, &identity)
+                .unwrap();
+            assert!(!receipt.exists());
+            assert!(!pending.exists());
+            assert_eq!(LeaseService::new(&reopened).load().unwrap(), Some(lease));
+            let namespace = root.join("verified/.mac-worker-rooted-fs");
+            assert!(!namespace.exists() || std::fs::read_dir(namespace).unwrap().next().is_none());
+        }
+    }
+}

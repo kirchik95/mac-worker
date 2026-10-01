@@ -1583,6 +1583,7 @@ mod tests {
     }
 
     #[test]
+    // Supersedes the SSH/Git/forward assertions in the original mixed direct_ssh_argv_matches_the_historical_option_list; rsync assertions stay in legacy_rsync_shell_preserves_direct_and_managed_worker_options.
     fn direct_ssh_argv_matches_the_historical_option_list() {
         with_ssh_settings(SshSettings::direct(), || {
             let exec =
@@ -1607,12 +1608,6 @@ mod tests {
             assert_eq!(
                 git_ssh_command_line(SshTarget::Worker, OsStr::new("/usr/bin/ssh")).unwrap(),
                 "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
-            );
-            assert_eq!(
-                rsync_ssh_shell(SshTarget::Worker).unwrap(),
-                OsString::from(
-                    "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
-                )
             );
             let forward = ssh_local_forward_request(
                 SshTarget::Worker,
@@ -1708,6 +1703,7 @@ mod tests {
     }
 
     #[test]
+    // Supersedes the SSH/Git/origin assertions in the original mixed managed_config_is_used_by_every_worker_builder_and_never_by_origin; rsync assertions are split unchanged.
     fn managed_config_is_used_by_every_worker_builder_and_never_by_origin() {
         let path = "/tmp/controller owner's/.ssh/mac-worker-controller.conf";
         with_ssh_settings(
@@ -1745,12 +1741,6 @@ mod tests {
                     .git_ssh_command(&worker)
                     .unwrap();
                 assert_eq!(git, prefix);
-                assert_eq!(
-                    rsync_ssh_shell(SshTarget::Worker).unwrap(),
-                    OsString::from(
-                        "/usr/bin/ssh -F '/tmp/controller owner'\"'\"'s/.ssh/mac-worker-controller.conf' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
-                    )
-                );
                 assert_eq!(
                     git_ssh_command_line(SshTarget::Origin, OsStr::new("/usr/bin/ssh")).unwrap(),
                     "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes"
@@ -1813,6 +1803,74 @@ mod tests {
                 assert!(
                     args.windows(2).any(|pair| pair == ["-F", config_file]),
                     "rsync child argv: {args:?}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            },
+        );
+    }
+
+    #[test]
+    // Preserves the rsync-only assertions split from direct_ssh_argv_matches_the_historical_option_list and managed_config_is_used_by_every_worker_builder_and_never_by_origin.
+    fn legacy_rsync_shell_preserves_direct_and_managed_worker_options() {
+        with_ssh_settings(SshSettings::direct(), || {
+            assert_eq!(
+                rsync_ssh_shell(SshTarget::Worker).unwrap(),
+                OsString::from(
+                    "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
+                )
+            );
+        });
+        with_ssh_settings(
+            SshSettings {
+                config_file: Some("/tmp/controller owner's/.ssh/mac-worker-controller.conf".into()),
+                ..SshSettings::direct()
+            },
+            || {
+                assert_eq!(
+                    rsync_ssh_shell(SshTarget::Worker).unwrap(),
+                    OsString::from(
+                        "/usr/bin/ssh -F '/tmp/controller owner'\"'\"'s/.ssh/mac-worker-controller.conf' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
+                    )
+                );
+            },
+        );
+    }
+
+    #[test]
+    // Supersedes the shared literal-path assertion in managed_rsync_config_path_reaches_the_child_as_one_literal_argument via offline Git.
+    fn managed_git_config_path_reaches_the_child_as_one_literal_argument() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let fake = temp.path().join("fake-transport");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_file = "/tmp/controller owner's/\"managed config\".conf";
+        with_ssh_settings(
+            SshSettings {
+                config_file: Some(config_file.into()),
+                ..SshSettings::direct()
+            },
+            || {
+                let shell = git_ssh_command_line(SshTarget::Worker, fake.as_os_str()).unwrap();
+                let output = std::process::Command::new("/usr/bin/git")
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_SSH_COMMAND", shell)
+                    .env("GIT_SSH_VARIANT", "ssh")
+                    .args(["ls-remote", "ssh://offline-worker/fixture"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                let captured = fs::read_to_string(fake.with_extension("args")).unwrap_or_default();
+                let args: Vec<_> = captured.lines().collect();
+                assert!(
+                    args.windows(2).any(|pair| pair == ["-F", config_file]),
+                    "Git child argv: {args:?}; stderr: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             },

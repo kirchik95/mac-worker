@@ -20,7 +20,6 @@ use mac_worker::{
         SubmitResponse,
     },
     protocol::{PROTOCOL_VERSION, ProbeResponse, SUPERVISION_VERSION},
-    remote_snapshot::{SnapshotVerifyRequest, VerifiedSnapshotResponse},
     task::{
         BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta, TaskMetaInput,
     },
@@ -225,7 +224,8 @@ fn fakeexec_ok<T: DeserializeOwned>(fixture: &ProcessFixture, opcode: &str, stdi
 /// Protocol-valid fakeexec on de610: JSON opcodes + descendant Git objects.
 /// This is not FLOW runtime acceptance (enabled routing still missing).
 #[test]
-fn harness_fake_exec_protocol_and_descendant_git() {
+// Supersedes the shared assertions in harness_fake_exec_protocol_and_descendant_git; snapshot DTO coverage is split into transfer::remote_snapshot.
+fn harness_task_protocol_and_descendant_git() {
     let fixture = ProcessFixture::new();
     let source = support_git_repo();
     let base_oid = seed_controller_transfer(&fixture, &source);
@@ -267,24 +267,6 @@ fn harness_fake_exec_protocol_and_descendant_git() {
         }
         other => panic!("expected acquired lease, got {other:?}"),
     }
-
-    let snapshot = SnapshotVerifyRequest::new(
-        plumbing_job_id(),
-        plumbing_client_id(),
-        plumbing_lease_token(),
-        material.fingerprint(),
-        PROJECT_ID.into(),
-        WORKTREE_ID.into(),
-        material.manifest_digest().to_owned(),
-    )
-    .unwrap();
-    let verified: VerifiedSnapshotResponse = fakeexec_ok(
-        &fixture,
-        "host snapshot-verify",
-        &serde_json::to_vec(&snapshot).unwrap(),
-    );
-    assert_eq!(verified.job_id(), plumbing_job_id());
-    assert!(!verified.cache_reused());
 
     let prepare_req = TaskPrepareRequest::new(
         plumbing_task_meta(base.clone()),

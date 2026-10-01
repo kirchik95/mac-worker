@@ -2730,6 +2730,460 @@ mod exec_inheritance_tests {
         assert_receive_reports(&Exit23, 23);
         assert_receive_reports(&SignalTerm, 143);
     }
+    const GIT_ROOT_ENV: &str = "MAC_WORKER_TEST_GIT_RECEIVER_ROOT";
+    const GIT_HOOKS_ENV: &str = "MAC_WORKER_TEST_GIT_RECEIVER_HOOKS";
+    const GIT_ARM_ENV: &str = "MAC_WORKER_TEST_GIT_LEAF_ARM_FIFO";
+
+    struct ProbedSystemGitExecutor {
+        lock_path: PathBuf,
+        sentinel_fd: RawFd,
+        hooks: PathBuf,
+    }
+
+    impl crate::git_transport::GitServerExecutor for ProbedSystemGitExecutor {
+        fn exec(
+            &self,
+            program: &str,
+            mirror: &RootedDir,
+            environment: &[(OsString, OsString)],
+        ) -> Result<std::convert::Infallible, WorkerError> {
+            let metadata = std::fs::metadata(&self.lock_path)?;
+            let ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            assert!(ceiling > 0 && ceiling <= i64::from(i32::MAX));
+            // Locate the descriptor already held by HostGitService. Opening a
+            // second lock or changing CLOEXEC here would manufacture inheritance.
+            let transfer_fd = (3..ceiling as RawFd)
+                .find(|descriptor| {
+                    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                    (unsafe { libc::fstat(*descriptor, &mut stat) }) == 0
+                        && stat.st_dev as u64 == metadata.dev()
+                        && stat.st_ino == metadata.ino()
+                })
+                .expect("Git receive must hold the exact transfer descriptor before exec");
+            let mut environment = environment.to_vec();
+            environment.extend([
+                (CHILD_FD_ENV.into(), transfer_fd.to_string().into()),
+                (SENTINEL_FD_ENV.into(), self.sentinel_fd.to_string().into()),
+                // A local pre-receive hook is our observation point after the
+                // real SystemGitServerExecutor and stock receive-pack execute.
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+                (
+                    "GIT_CONFIG_VALUE_0".into(),
+                    self.hooks.as_os_str().to_owned(),
+                ),
+            ]);
+            // The shell fixture parks Git's protocol stdio on 8/9 while libtest
+            // prints its preamble to stderr. Restore it before the production exec.
+            assert_eq!(unsafe { libc::dup2(8, 0) }, 0);
+            assert_eq!(unsafe { libc::dup2(9, 1) }, 1);
+            assert_eq!(unsafe { libc::close(8) }, 0);
+            assert_eq!(unsafe { libc::close(9) }, 0);
+            crate::git_transport::GitServerExecutor::exec(
+                &crate::git_transport::SystemGitServerExecutor,
+                program,
+                mirror,
+                &environment,
+            )
+        }
+    }
+
+    #[test]
+    fn git_receiver_process_probe() {
+        let Some(root) = std::env::var_os(GIT_ROOT_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        OpenOptions::new()
+            .write(true)
+            .open(std::env::var_os(INTERMEDIARY_PID_FIFO_ENV).unwrap())
+            .unwrap()
+            .write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+        let store = HostStore::open(&root).unwrap();
+        let request = request().with_execution_scope(crate::job::ExecutionScope::task(
+            crate::task::TaskId::new(uuid::Uuid::from_u128(904)),
+        ));
+        let material = request.material();
+        let components = crate::git_transport::ReceivePackComponents::new(
+            material.job_id(),
+            material.client_id(),
+            material.lease_token(),
+            request.request_fingerprint().clone(),
+        );
+        let sentinel = inheritable_sentinel(&root.parent().unwrap().join("git-sentinel"));
+        let executor = ProbedSystemGitExecutor {
+            lock_path: root
+                .join("locks/jobs")
+                .join(material.job_id().to_string())
+                .join("transfer/transfer.lock"),
+            sentinel_fd: sentinel.as_raw_fd(),
+            hooks: std::env::var_os(GIT_HOOKS_ENV).unwrap().into(),
+        };
+        let result = crate::git_transport::HostGitService::new(&store).receive_pack(
+            &components,
+            material.project_id(),
+            &executor,
+        );
+        panic!("production Git exec unexpectedly returned: {result:?}");
+    }
+
+    #[test]
+    fn git_receiver_leaf_probe() {
+        let Some(ready_fifo) = std::env::var_os(GIT_ARM_ENV) else {
+            return;
+        };
+        OpenOptions::new()
+            .write(true)
+            .open(std::env::var_os(LEAF_PID_FIFO_ENV).unwrap())
+            .unwrap()
+            .write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+        let mut armed = [0_u8; 1];
+        OpenOptions::new()
+            .read(true)
+            .open(ready_fifo)
+            .unwrap()
+            .read_exact(&mut armed)
+            .unwrap();
+        assert_eq!(
+            armed, *b"A",
+            "leaf must wait until exact PID cleanup is armed"
+        );
+        let transfer_fd: RawFd = std::env::var(CHILD_FD_ENV).unwrap().parse().unwrap();
+        let sentinel_fd: RawFd = std::env::var(SENTINEL_FD_ENV).unwrap().parse().unwrap();
+        let checked = std::panic::catch_unwind(|| {
+            let transfer_flags = unsafe { libc::fcntl(transfer_fd, libc::F_GETFD) };
+            assert_ne!(
+                transfer_flags, -1,
+                "transfer fd must survive Git receive-pack and hook exec"
+            );
+            assert_eq!(transfer_flags & libc::FD_CLOEXEC, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(sentinel_fd, libc::F_GETFD) },
+                -1,
+                "unrelated inheritable fd survived Git exec"
+            );
+            let path_metadata =
+                std::fs::metadata(std::env::var_os(TRANSFER_LOCK_PATH_ENV).unwrap()).unwrap();
+            let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(transfer_fd, &mut fd_stat) }, 0);
+            assert_eq!(fd_stat.st_dev as u64, path_metadata.dev());
+            assert_eq!(fd_stat.st_ino, path_metadata.ino());
+        });
+        let ready = match &checked {
+            Ok(()) => "R".to_owned(),
+            Err(panic) => format!(
+                "F: {}",
+                panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown descriptor assertion failure")
+            ),
+        };
+        OpenOptions::new()
+            .write(true)
+            .open(std::env::var_os(READY_FIFO_ENV).unwrap())
+            .unwrap()
+            .write_all(ready.as_bytes())
+            .unwrap();
+        assert!(
+            checked.is_ok(),
+            "Git descriptor inheritance failed before READY"
+        );
+        let mut release = [0_u8; 1];
+        OpenOptions::new()
+            .read(true)
+            .open(std::env::var_os(RELEASE_FIFO_ENV).unwrap())
+            .unwrap()
+            .read_exact(&mut release)
+            .unwrap();
+        assert_eq!(release, *b"X");
+        OpenOptions::new()
+            .write(true)
+            .open(std::env::var_os(LEAF_EXIT_FIFO_ENV).unwrap())
+            .unwrap()
+            .write_all(b"E")
+            .unwrap();
+    }
+
+    struct ReapedGitClient(Option<std::process::Child>);
+    impl Drop for ReapedGitClient {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn fifo_message(path: PathBuf) -> (mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut message = String::new();
+            OpenOptions::new()
+                .read(true)
+                .open(path)
+                .unwrap()
+                .read_to_string(&mut message)
+                .unwrap();
+            let _ = tx.send(message);
+        });
+        (rx, reader)
+    }
+
+    fn shell_literal(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    fn assert_system_git_lock_inheritance(kill_intermediary: bool) {
+        use crate::{
+            host_store::SupervisorGuard,
+            job::{ExecutionScope, ResolveOrAbandonOutcome, ResolveOrAbandonRequest},
+            task::TaskId,
+        };
+        struct NeverLaunch;
+        impl SupervisorLauncher for NeverLaunch {
+            fn launch(
+                &self,
+                _job: JobId,
+                _guard: SupervisorGuard,
+            ) -> Result<LaunchCandidate, WorkerError> {
+                panic!("preacceptance Git resolution must never launch");
+            }
+        }
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let request = request().with_execution_scope(ExecutionScope::task(TaskId::new(
+            uuid::Uuid::from_u128(904),
+        )));
+        LeaseService::new(&store)
+            .acquire(&request, &healthy(), 1)
+            .unwrap();
+        let lock_path = root
+            .join("locks/jobs")
+            .join(request.material().job_id().to_string())
+            .join("transfer/transfer.lock");
+        let source = fixture.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&source)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "offline Git fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(source.join("payload"), b"offline Git lock fixture\n").unwrap();
+        git(&["add", "payload"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let hooks = fixture.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let hook = hooks.join("pre-receive");
+        std::fs::write(&hook, format!("#!/bin/sh\nexec {} --exact transfer::exec_inheritance_tests::git_receiver_leaf_probe --nocapture --test-threads=1\n", shell_literal(&executable))).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server_pid = fixture.path().join("server-pid.fifo");
+        let leaf_pid = fixture.path().join("leaf-pid.fifo");
+        let leaf_arm = fixture.path().join("leaf-arm.fifo");
+        let ready = fixture.path().join("ready.fifo");
+        let release = fixture.path().join("release.fifo");
+        let exit = fixture.path().join("exit.fifo");
+        let status = fixture.path().join("status.fifo");
+        for fifo in [
+            &server_pid,
+            &leaf_pid,
+            &leaf_arm,
+            &ready,
+            &release,
+            &exit,
+            &status,
+        ] {
+            create_fifo(fifo);
+        }
+        let (server_pid_rx, server_pid_thread) = fifo_message(server_pid.clone());
+        let (leaf_pid_rx, leaf_pid_thread) = fifo_message(leaf_pid.clone());
+        let (ready_rx, ready_thread) = fifo_message(ready.clone());
+        let (exit_rx, exit_thread) = fifo_message(exit.clone());
+        let (status_rx, status_thread) = fifo_message(status.clone());
+        let wrapper = fixture.path().join("receive-pack");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nexec 8<&0\nexec 9>&1\nexec 1>&2\n{} --exact transfer::exec_inheritance_tests::git_receiver_process_probe --nocapture --test-threads=1\ncode=$?\nprintf '%s' \"$code\" > {}\nexit \"$code\"\n", shell_literal(&executable), shell_literal(&status))).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let child = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&source)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(GIT_ROOT_ENV, &root)
+            .env(GIT_HOOKS_ENV, &hooks)
+            .env(INTERMEDIARY_PID_FIFO_ENV, &server_pid)
+            .env(LEAF_PID_FIFO_ENV, &leaf_pid)
+            .env(GIT_ARM_ENV, &leaf_arm)
+            .env(READY_FIFO_ENV, &ready)
+            .env(RELEASE_FIFO_ENV, &release)
+            .env(LEAF_EXIT_FIFO_ENV, &exit)
+            .env(TRANSFER_LOCK_PATH_ENV, &lock_path)
+            .arg("push")
+            .arg(format!("--receive-pack={}", wrapper.display()))
+            .arg(fixture.path().join("unused-repository-path"))
+            .arg("HEAD:refs/mac-worker/bases/00000000000000000000000000000904")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut client = ReapedGitClient(Some(child));
+        let server_pid: libc::pid_t = server_pid_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        server_pid_thread.join().unwrap();
+        let mut server_cleanup = IdentityCheckedProcessCleanup::new(server_pid);
+        let leaf_pid: libc::pid_t = leaf_pid_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        leaf_pid_thread.join().unwrap();
+        let mut leaf_cleanup = IdentityCheckedProcessCleanup::new(leaf_pid);
+        OpenOptions::new()
+            .write(true)
+            .open(&leaf_arm)
+            .unwrap()
+            .write_all(b"A")
+            .unwrap();
+        let ready = ready_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        ready_thread.join().unwrap();
+        assert_eq!(
+            ready, "R",
+            "leaf must prove exact lock/descriptor inheritance across real Git exec before READY"
+        );
+        if kill_intermediary {
+            server_cleanup
+                .signal(libc::SIGKILL)
+                .expect("must signal only the exact Git intermediary identity");
+            assert_eq!(
+                status_rx
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap()
+                    .trim(),
+                "137",
+                "Git receiver intermediary must be reaped with the SIGKILL shell status before leaf release"
+            );
+            server_cleanup.disarm();
+        }
+        assert_nonblocking_lock_contended(&lock_path);
+        let resolver_store = HostStore::open(&root).unwrap();
+        let submit = SubmitRequest::new(request.material().clone())
+            .with_execution_scope(request.execution_scope().clone());
+        let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+        let (classified_tx, classified_rx) = mpsc::channel();
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let resolver = thread::spawn(move || {
+            let service = JobService::new_with_resolution_before_transfer(
+                &resolver_store,
+                &NeverLaunch,
+                std::sync::Arc::new(move || classified_tx.send(()).unwrap()),
+            );
+            resolved_tx
+                .send(service.resolve_or_abandon(resolve))
+                .unwrap();
+        });
+        classified_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(
+            matches!(resolved_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "resolver completed while the exact Git leaf still held the transfer lock"
+        );
+        assert!(
+            !root
+                .join("job-index")
+                .join(format!("{}.json", request.material().job_id()))
+                .exists()
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(&release)
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        assert_eq!(
+            exit_rx
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .unwrap()
+                .as_bytes(),
+            b"E",
+            "leaf must acknowledge explicit release before exiting"
+        );
+        exit_thread.join().unwrap();
+        leaf_cleanup.disarm();
+        if !kill_intermediary {
+            assert_eq!(
+                status_rx
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap()
+                    .trim(),
+                "0"
+            );
+            server_cleanup.disarm();
+        }
+        status_thread.join().unwrap();
+        let output = client.0.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            !kill_intermediary,
+            "offline Git push stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response = resolved_rx
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.outcome(),
+            ResolveOrAbandonOutcome::Abandoned
+        ));
+        assert!(
+            LeaseService::new(&store)
+                .load_for_job(request.material().job_id())
+                .unwrap()
+                .is_none()
+        );
+        resolver.join().unwrap();
+    }
+
+    #[test]
+    // Supersedes production_exec_inherits_only_stdio_and_transfer_lock_and_fences_resolver through stock Git receive-pack and its real child hook.
+    fn git_exec_inherits_only_stdio_and_transfer_lock_and_fences_resolver() {
+        assert_system_git_lock_inheritance(false);
+    }
+
+    #[test]
+    // Supersedes transfer_lock_inheritance_survives_intermediary_sigkill_and_fences_resolver_until_leaf_release through stock Git receive-pack.
+    fn git_transfer_lock_survives_intermediary_sigkill_until_explicit_leaf_release() {
+        assert_system_git_lock_inheritance(true);
+    }
 }
 
 #[cfg(test)]
