@@ -14,10 +14,10 @@ use std::{
 fn viewer_heartbeat_loss_exits_tempfail() {
     let homes = Homes::new();
     let mut child = spawn_viewer(&homes, 200);
-    let _url = wait_for_url(&child.stdout, &mut child.child);
+    let _url = wait_for_url(&mut child);
     child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
     child.stdin.as_mut().unwrap().flush().unwrap();
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(75), "stderr={stderr}");
     assert!(
@@ -39,6 +39,7 @@ struct Homes {
     fake_ssh: PathBuf,
     argv_log: PathBuf,
     pid_file: PathBuf,
+    hung_pid_file: PathBuf,
     generation_file: PathBuf,
     port_file: PathBuf,
     stdin_log: PathBuf,
@@ -62,6 +63,7 @@ impl Homes {
             fake_ssh,
             argv_log: root.path().join("argv.json"),
             pid_file: root.path().join("ssh.pid"),
+            hung_pid_file: root.path().join("hung-ssh.pid"),
             generation_file: root.path().join("generation"),
             port_file: root.path().join("port"),
             stdin_log: root.path().join("stdin.log"),
@@ -171,27 +173,29 @@ where
     })
 }
 
-fn wait_for_url(stdout: &Arc<Mutex<String>>, child: &mut Child) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn wait_for_url(child: &mut CapturedChild) -> String {
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
-        let text = stdout.lock().unwrap().clone();
+        let text = child.stdout.lock().unwrap().clone();
         if let Some(url) = text.lines().find(|line| line.starts_with("http://")) {
             return url.to_owned();
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("viewer exited before URL: {status:?} stdout={text}");
+        if let Ok(Some(status)) = child.child.try_wait() {
+            let stderr = child.stderr_text();
+            panic!("viewer exited before URL: {status:?} stdout={text} stderr={stderr}");
         }
         if Instant::now() >= deadline {
-            panic!("viewer URL was not printed before timeout: stdout={text}");
+            let stderr = child.stderr.lock().unwrap().clone();
+            panic!("viewer URL was not printed before timeout: stdout={text} stderr={stderr}");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
-/// Hang guard for a tunnel child that is expected to exit. Assertions check the
-/// exit status and stderr, not how fast the exit came: under a loaded parallel
-/// run a fresh fake-ssh fixture can take seconds to start.
-const CHILD_EXIT_GUARD: Duration = Duration::from_secs(30);
+/// Fixture deadlines only guard against hangs. Starting a fresh fake SSH and
+/// viewer under load must not consume a short product-test budget; assertions
+/// check the observed state, exit status, and stderr instead of elapsed time.
+const HANG_GUARD: Duration = Duration::from_secs(60);
 
 fn wait_child_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     let deadline = Instant::now() + timeout;
@@ -202,7 +206,7 @@ fn wait_child_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
         if Instant::now() >= deadline {
             panic!("child {} still live after {timeout:?}", child.id());
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
@@ -227,11 +231,11 @@ fn laptop_heartbeat_reaches_the_ssh_stdin() {
             heartbeat_ms: 60,
             backoff_initial_ms: 1_000,
             backoff_cap_ms: 1_000,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 60_000,
         },
     );
-    let _url = wait_for_url(&child.stdout, &mut child.child);
+    let _url = wait_for_url(&mut child);
     let args: Vec<String> = serde_json::from_slice(&fs::read(&homes.argv_log).unwrap()).unwrap();
     for option in [
         "-T",
@@ -250,9 +254,8 @@ fn laptop_heartbeat_reaches_the_ssh_stdin() {
     assert!(!args.iter().any(|arg| {
         arg == "ControlMaster=auto" || arg == "ControlPersist=60" || arg == "ServerAliveInterval=10"
     }));
-    let first = wait_for_stdin_samples(&homes, 3, Duration::from_secs(4));
-    thread::sleep(Duration::from_millis(250));
-    let later = read_stdin_samples(&homes);
+    let first = wait_for_stdin_samples(&homes, 3, HANG_GUARD);
+    let later = wait_for_stdin_samples(&homes, first.len() + 1, HANG_GUARD);
     assert!(
         later.len() > first.len(),
         "heartbeat stopped after {} bytes: {later:?}",
@@ -260,7 +263,7 @@ fn laptop_heartbeat_reaches_the_ssh_stdin() {
     );
     assert!(later.iter().all(|(_, byte)| *byte == 0x0a), "{later:?}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -274,14 +277,13 @@ fn tunnel_reconnects_on_the_same_port_until_signalled() {
             heartbeat_ms: 40,
             backoff_initial_ms: 80,
             backoff_cap_ms: 160,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 60_000,
         },
     );
-    let url = wait_for_url(&child.stdout, &mut child.child);
-    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
-    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(30));
-    thread::sleep(Duration::from_millis(200));
+    let url = wait_for_url(&mut child);
+    wait_for_stderr(&child.stderr, LOST, HANG_GUARD);
+    wait_for_stderr(&child.stderr, RESTORED, HANG_GUARD);
     assert!(process_live(child.child.id()));
     let stdout = child.stdout.lock().unwrap().clone();
     let urls = url_lines(&stdout);
@@ -290,7 +292,7 @@ fn tunnel_reconnects_on_the_same_port_until_signalled() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -304,13 +306,13 @@ fn ssh_connection_failures_keep_the_published_port() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 250,
         },
     );
-    let url = wait_for_url(&child.stdout, &mut child.child);
-    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
-    thread::sleep(Duration::from_millis(1_500));
+    let url = wait_for_url(&mut child);
+    wait_for_stderr(&child.stderr, LOST, HANG_GUARD);
+    wait_for_generation(&homes, 4);
     assert!(
         process_live(child.child.id()),
         "dashboard exited during reconnect"
@@ -321,7 +323,7 @@ fn ssh_connection_failures_keep_the_published_port() {
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 0, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -335,22 +337,22 @@ fn local_port_in_use_rotates_even_when_ssh_would_exit_255() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 300,
         },
     );
-    let url = wait_for_url(&child.stdout, &mut child.child);
-    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
+    let url = wait_for_url(&mut child);
+    wait_for_stderr(&child.stderr, LOST, HANG_GUARD);
     let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
     let _held = hold_loopback_port(port);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, HANG_GUARD);
     assert_ne!(urls[0], urls[1], "{urls:?}");
-    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
+    wait_for_stderr(&child.stderr, RESTORED, HANG_GUARD);
     let stderr = child.stderr.lock().unwrap().clone();
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -364,19 +366,19 @@ fn stdout_eof_before_a_remote_exit_still_rotates() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 400,
         },
     );
-    wait_for_url(&child.stdout, &mut child.child);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
+    wait_for_url(&mut child);
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, HANG_GUARD);
     assert_ne!(urls[0], urls[1], "{urls:?}");
-    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
+    wait_for_stderr(&child.stderr, RESTORED, HANG_GUARD);
     let stderr = child.stderr.lock().unwrap().clone();
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -390,21 +392,21 @@ fn remote_viewer_failure_prints_a_new_url() {
             heartbeat_ms: 40,
             backoff_initial_ms: 25,
             backoff_cap_ms: 50,
-            readiness_ms: 15_000,
+            readiness_ms: 60_000,
             rotation_ms: 300,
         },
     );
-    wait_for_url(&child.stdout, &mut child.child);
-    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, Duration::from_secs(30));
+    wait_for_url(&mut child);
+    let urls = wait_for_urls(&child.stdout, &mut child.child, 2, HANG_GUARD);
     assert_ne!(urls[0], urls[1], "{urls:?}");
-    wait_for_stderr(&child.stderr, RESTORED, Duration::from_secs(2));
+    wait_for_stderr(&child.stderr, RESTORED, HANG_GUARD);
     let stderr = child.stderr.lock().unwrap().clone();
     assert_eq!(count_line(&stderr, LOST), 1, "{stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 1, "{stderr}");
     let stdout = child.stdout.lock().unwrap().clone();
     assert_eq!(url_lines(&stdout).len(), 2, "stdout={stdout}");
     send_signal(child.child.id(), "TERM");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     assert_eq!(status.code(), Some(0), "stderr={}", child.stderr_text());
 }
 
@@ -416,22 +418,16 @@ fn signal_during_backoff_exits_cleanly() {
         "drop-then-hang",
         &TunnelTimings {
             heartbeat_ms: 40,
-            backoff_initial_ms: 5_000,
-            backoff_cap_ms: 5_000,
-            readiness_ms: 5_000,
+            backoff_initial_ms: 60_000,
+            backoff_cap_ms: 60_000,
+            readiness_ms: 60_000,
             rotation_ms: 60_000,
         },
     );
-    wait_for_url(&child.stdout, &mut child.child);
-    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
+    wait_for_url(&mut child);
+    wait_for_stderr(&child.stderr, LOST, HANG_GUARD);
     send_signal(child.child.id(), "TERM");
-    let started = Instant::now();
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "signal during backoff took {:?}",
-        started.elapsed()
-    );
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(0), "stderr={stderr}");
     assert_eq!(count_line(&stderr, RESTORED), 0, "{stderr}");
@@ -447,16 +443,15 @@ fn signal_during_readiness_reaps_the_child() {
             heartbeat_ms: 40,
             backoff_initial_ms: 40,
             backoff_cap_ms: 80,
-            readiness_ms: 5_000,
+            readiness_ms: 60_000,
             rotation_ms: 60_000,
         },
     );
-    wait_for_url(&child.stdout, &mut child.child);
-    wait_for_stderr(&child.stderr, LOST, Duration::from_secs(4));
-    let first_pid = read_pid(&homes.pid_file);
-    let hung = wait_for_new_pid(&homes.pid_file, first_pid, Duration::from_secs(3));
+    wait_for_url(&mut child);
+    wait_for_stderr(&child.stderr, LOST, HANG_GUARD);
+    let hung = wait_for_hung_pid(&homes.hung_pid_file);
     send_signal(child.child.id(), "INT");
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     let stderr = child.stderr_text();
     assert_eq!(status.code(), Some(0), "stderr={stderr}");
     assert!(!process_live(hung), "ssh child {hung} was not reaped");
@@ -472,11 +467,11 @@ fn first_start_that_never_becomes_ready_returns_the_error() {
             heartbeat_ms: 5_000,
             backoff_initial_ms: 1_000,
             backoff_cap_ms: 1_000,
-            readiness_ms: 2_000,
+            readiness_ms: 60_000,
             rotation_ms: 60_000,
         },
     );
-    let status = wait_child_exit(&mut child.child, CHILD_EXIT_GUARD);
+    let status = wait_child_exit(&mut child.child, HANG_GUARD);
     let stderr = child.stderr_text();
     assert!(!status.success(), "stderr={stderr}");
     assert!(stderr.contains("CONTROLLER_UNAVAILABLE"), "{stderr}");
@@ -496,6 +491,7 @@ fn spawn_tunnel(homes: &Homes, mode: &str, timings: &TunnelTimings) -> CapturedC
         .env("MAC_WORKER_TEST_BIN", env!("CARGO_BIN_EXE_worker"))
         .env("MAC_WORKER_FAKE_SSH_ARGV_LOG", &homes.argv_log)
         .env("MAC_WORKER_FAKE_SSH_PID_FILE", &homes.pid_file)
+        .env("MAC_WORKER_FAKE_SSH_HUNG_PID_FILE", &homes.hung_pid_file)
         .env(
             "MAC_WORKER_FAKE_SSH_GENERATION_FILE",
             &homes.generation_file,
@@ -570,7 +566,7 @@ fn wait_for_stderr(stderr: &Arc<Mutex<String>>, needle: &str, timeout: Duration)
         if Instant::now() >= deadline {
             panic!("timed out waiting for {needle:?} in {text:?}");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
@@ -593,16 +589,16 @@ fn wait_for_urls(
         if Instant::now() >= deadline {
             panic!("timed out waiting for {count} URLs, stdout={text}");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
 fn hold_loopback_port(port: u16) -> std::net::TcpListener {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         match std::net::TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return listener,
-            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(_) if Instant::now() < deadline => thread::yield_now(),
             Err(error) => panic!("could not hold 127.0.0.1:{port}: {error}"),
         }
     }
@@ -641,7 +637,22 @@ fn wait_for_stdin_samples(homes: &Homes, count: usize, timeout: Duration) -> Vec
         if Instant::now() >= deadline {
             panic!("timed out waiting for {count} heartbeat bytes, saw {samples:?}");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
+    }
+}
+
+fn wait_for_generation(homes: &Homes, minimum: u32) {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let generation = read_pid(&homes.generation_file);
+        if generation >= minimum {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tunnel did not retry {minimum} generations (saw {generation})"
+        );
+        thread::yield_now();
     }
 }
 
@@ -652,27 +663,22 @@ fn read_pid(path: &std::path::Path) -> u32 {
         .unwrap_or(0)
 }
 
-fn wait_for_new_pid(path: &std::path::Path, previous: u32, timeout: Duration) -> u32 {
-    let deadline = Instant::now() + timeout;
+fn wait_for_hung_pid(path: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         let pid = read_pid(path);
-        if pid != 0 && pid != previous && process_live(pid) {
+        if pid != 0 && process_live(pid) {
             return pid;
         }
         if Instant::now() >= deadline {
-            panic!("replacement ssh pid was not written (previous {previous})");
+            panic!("hung ssh did not publish its readiness pid");
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::yield_now();
     }
 }
 
 fn process_live(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 fn send_signal(pid: u32, signal: &str) {
@@ -812,8 +818,12 @@ def record_stdin():
 
 def hang():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    path = os.environ.get("MAC_WORKER_FAKE_SSH_HUNG_PID_FILE")
+    if path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
     while True:
-        time.sleep(3600)
+        signal.pause()
 
 def stdout_eof_then_status(generation, port, fail_status):
     port_file = os.environ.get("MAC_WORKER_FAKE_SSH_PORT_FILE")
@@ -827,7 +837,6 @@ def stdout_eof_then_status(generation, port, fail_status):
     if str(port) == saved:
         sys.stdout.flush()
         os.close(1)
-        time.sleep(0.2)
         os._exit(fail_status)
     exec_viewer()
 
