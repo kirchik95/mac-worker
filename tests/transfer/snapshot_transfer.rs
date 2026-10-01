@@ -822,6 +822,103 @@ fn transfer_identity_debug_and_failures_never_expose_the_lease_token() {
 }
 
 #[test]
+// Supersedes the shared failure/redaction matrix in rsync_runtime_failures_are_ambiguous_and_content_free through task base push.
+fn git_base_push_runtime_failure_matrix_is_content_free() {
+    let cache = tempfile::tempdir().unwrap();
+    let cases = vec![
+        (
+            Ok(result(status(23), b"PLANTED-OUT", b"PLANTED-ERR")),
+            "base push failed",
+        ),
+        (
+            Ok(result(
+                signalled(libc::SIGKILL),
+                b"PLANTED-OUT",
+                b"PLANTED-ERR",
+            )),
+            "base push failed",
+        ),
+        (
+            Err(ProcessError::DeadlineExceeded {
+                deadline: Duration::from_secs(15 * 60),
+            }
+            .into()),
+            "base push timed out",
+        ),
+        (
+            Err(ProcessError::OutputLimitExceeded {
+                stream: ProcessStream::Stdout,
+                limit: 256 * 1024,
+            }
+            .into()),
+            "base push output exceeded its limit",
+        ),
+        (
+            Err(ProcessError::OutputLimitExceeded {
+                stream: ProcessStream::Stderr,
+                limit: 256 * 1024,
+            }
+            .into()),
+            "base push output exceeded its limit",
+        ),
+    ];
+    let base: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
+    for (scripted, message) in cases {
+        let runner = RecordingRunner::returning(vec![scripted]);
+        let error = GitTransport::new(&runner)
+            .push_base(
+                &worker(),
+                &transfer_identity(),
+                &"a".repeat(64),
+                TaskId::new(uuid::Uuid::from_u128(4)),
+                &base,
+                cache.path(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, WorkerError::Git { code: "BASE_PUSH_FAILED", message: actual } if actual == message),
+            "{error}"
+        );
+        assert_eq!(runner.requests().len(), 1);
+        let rendered = error.to_string();
+        assert!(!rendered.contains("PLANTED"), "{rendered}");
+        assert!(!rendered.contains("00000000000000000000000000000003"));
+    }
+}
+
+#[test]
+// Supersedes invalid_local_transport_configuration_proves_no_receiver_started at the task Git transport boundary.
+fn git_invalid_local_transport_configuration_proves_no_receiver_started() {
+    let cache = tempfile::tempdir().unwrap();
+    let runner = RecordingRunner::returning(Vec::new());
+    let mut invalid = worker();
+    invalid.ssh = "-oProxyCommand=PLANTED".into();
+    let base: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
+    let error = GitTransport::new(&runner)
+        .push_base(
+            &invalid,
+            &transfer_identity(),
+            &"a".repeat(64),
+            TaskId::new(uuid::Uuid::from_u128(4)),
+            &base,
+            cache.path(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            WorkerError::Transport {
+                code: "INVALID_REQUEST",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(runner.requests().is_empty());
+    assert!(!error.to_string().contains("PLANTED"));
+}
+
+#[test]
 fn rsync_runtime_failures_are_ambiguous_and_content_free() {
     // Break caught: a launched rsync failure is falsely classified as proving
     // the receiver never started, or captured output reaches diagnostics.
