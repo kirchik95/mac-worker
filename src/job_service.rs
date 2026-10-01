@@ -1722,16 +1722,20 @@ impl<'a> JobService<'a> {
                 "unindexed final job is not an exact prelaunch Accepted job",
             ));
         }
-        validate_empty_prelaunch_private_directories(&job)?;
-        let request = reconstruct_submit_request(&job, &meta, &lease)?;
-        let verified = self.snapshots.load_verified_after(
-            &admission,
-            &lease,
-            request.request_fingerprint(),
-        )?;
-        let Some((validated_meta, validated_status)) =
+        let (request, section) = self.reconstruct_prelaunch_request(&job, &meta, &lease)?;
+        let repairable = if let Some(section) = section {
+            validate_empty_prelaunch_private_directories(&job, &["tmp"])?;
+            self.read_repairable_turn_final(&request, &lease, &section)?
+        } else {
+            validate_empty_prelaunch_private_directories(&job, &["home", "tmp"])?;
+            let verified = self.snapshots.load_verified_after(
+                &admission,
+                &lease,
+                request.request_fingerprint(),
+            )?;
             self.read_repairable_final(&request, &lease, &verified)?
-        else {
+        };
+        let Some((validated_meta, validated_status)) = repairable else {
             return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
         };
         if validated_meta != meta || validated_status != status {
@@ -1995,15 +1999,23 @@ impl<'a> JobService<'a> {
             return AuthoritativeJob::new(job, meta, lost);
         }
 
-        validate_empty_prelaunch_private_directories(&job)?;
-        let request = reconstruct_submit_request(&job, &meta, &lease)?;
-        let verified = self.snapshots.load_verified_for_accepted_after(
-            &admission,
-            &lease,
-            meta.request_fingerprint(),
-        )?;
-        drop(admission);
-        match self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false) {
+        let (request, section) = self.reconstruct_prelaunch_request(&job, &meta, &lease)?;
+        let launch_result = if let Some(section) = section {
+            validate_empty_prelaunch_private_directories(&job, &["tmp"])?;
+            validate_indexed_turn_prelaunch_job(&job, &request, &section)?;
+            drop(admission);
+            self.launch_and_observe(job_id, supervisor, &request, &lease, false, meta)
+        } else {
+            validate_empty_prelaunch_private_directories(&job, &["home", "tmp"])?;
+            let verified = self.snapshots.load_verified_for_accepted_after(
+                &admission,
+                &lease,
+                meta.request_fingerprint(),
+            )?;
+            drop(admission);
+            self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false)
+        };
+        match launch_result {
             Ok(_) => self.authoritative_job_with_supervisor_ensure(job_id, false, false),
             Err(error) if matches!(&error, WorkerError::Protocol(message) if message.starts_with("SUPERVISOR_PRELAUNCH_FAILED:")) => {
                 match self.authoritative_job_with_supervisor_ensure(job_id, false, false) {
@@ -2016,6 +2028,30 @@ impl<'a> JobService<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn reconstruct_prelaunch_request(
+        &self,
+        job: &RootedDir,
+        meta: &JobMeta,
+        lease: &LeaseRecord,
+    ) -> Result<(SubmitRequest, Option<TurnSection>), WorkerError> {
+        let request = reconstruct_submit_request(job, meta, lease)?;
+        let payload: ExecutionPayload = read_canonical_json(job, "execution.json")?;
+        payload.validate_for_durable_job(lease, meta)?;
+        let Some(section) = payload.turn().cloned() else {
+            return Ok((request, None));
+        };
+        let scope = ExecutionScope::task(section.turn().task_id());
+        let request = request.with_execution_scope(scope.clone());
+        require_bound_scope(
+            &self.leases,
+            meta.job_id(),
+            request.execution_scope(),
+            &scope,
+        )?;
+        payload.validate_for_turn(&request, &section)?;
+        Ok((request, Some(section)))
     }
 
     fn authoritative_after_terminal_cleanup(
@@ -2954,6 +2990,9 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
             "indexed prelaunch turn has an unsafe top-level layout".into(),
         ));
     }
+    if names.contains(".mac-worker-rooted-fs") {
+        job.open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?;
+    }
     job.open_child_directory(&relative("tmp")?, false)?;
     let prompt = job.read_private_regular("prompt.md", crate::task::MAX_PROMPT_BYTES as u64)?;
     if format!("{:x}", sha2::Sha256::digest(&prompt)) != section.turn().prompt_sha256() {
@@ -2995,7 +3034,6 @@ pub(crate) fn validate_indexed_turn_prelaunch_job(
 
 fn indexed_turn_prelaunch_layout(names: &std::collections::BTreeSet<String>) -> bool {
     let expected = [
-        ".mac-worker-rooted-fs",
         "execution.json",
         "meta.json",
         "prompt.md",
@@ -3010,6 +3048,7 @@ fn indexed_turn_prelaunch_layout(names: &std::collections::BTreeSet<String>) -> 
     .map(String::from)
     .collect::<std::collections::BTreeSet<_>>();
     let mut allowed = expected.clone();
+    allowed.insert(".mac-worker-rooted-fs".into());
     allowed.insert("supervisor.log".into());
     allowed.insert(crate::turn::LAUNCHED_REDACTION_FILE.into());
     expected.is_subset(names) && names.is_subset(&allowed)
@@ -3337,8 +3376,11 @@ pub(crate) fn reconstruct_submit_request(
     Ok(request)
 }
 
-fn validate_empty_prelaunch_private_directories(job: &RootedDir) -> Result<(), WorkerError> {
-    for name in ["home", "tmp"] {
+fn validate_empty_prelaunch_private_directories(
+    job: &RootedDir,
+    names: &[&str],
+) -> Result<(), WorkerError> {
+    for name in names {
         let directory = job
             .open_child_directory(&relative(name)?, false)
             .map_err(|_| job_state_invalid("prelaunch private directory is absent or unsafe"))?;
@@ -3667,5 +3709,39 @@ mod tests {
         let mut missing = names(&[]);
         missing.remove("tmp");
         assert!(!indexed_turn_prelaunch_layout(&missing));
+    }
+
+    #[test]
+    fn indexed_turn_prelaunch_layout_accepts_every_namespace_and_optional_file_combination() {
+        for namespace in [false, true] {
+            for supervisor_log in [false, true] {
+                for redaction in [false, true] {
+                    let mut entries = names(&[]);
+                    if !namespace {
+                        entries.remove(".mac-worker-rooted-fs");
+                    }
+                    if supervisor_log {
+                        entries.insert("supervisor.log".into());
+                    }
+                    if redaction {
+                        entries.insert("launched-redaction.json".into());
+                    }
+                    assert!(indexed_turn_prelaunch_layout(&entries), "{entries:?}");
+                    for required in names(&[]) {
+                        if required == ".mac-worker-rooted-fs" {
+                            continue;
+                        }
+                        let mut missing = entries.clone();
+                        missing.remove(&required);
+                        assert!(
+                            !indexed_turn_prelaunch_layout(&missing),
+                            "missing {required}"
+                        );
+                    }
+                    entries.insert("notes.txt".into());
+                    assert!(!indexed_turn_prelaunch_layout(&entries));
+                }
+            }
+        }
     }
 }

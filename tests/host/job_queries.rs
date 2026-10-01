@@ -9008,6 +9008,363 @@ mod task_turn_ports {
         (lease, request)
     }
 
+    fn interrupted_turn(
+        root: &Path,
+        marker: &Path,
+        indexed: bool,
+    ) -> (HostStore, LeaseRecord, TaskTurnRequest) {
+        let store = HostStore::open(root).unwrap();
+        let (lease, request) = prepared_turn(&store, marker);
+        drop(store);
+        let point = if indexed {
+            HostStoreWritePoint::AfterJobIndexParentSync
+        } else {
+            HostStoreWritePoint::AfterJobPublish
+        };
+        let faulted = HostStore::open_with_write_fault(root, point).unwrap();
+        assert!(
+            JobService::new(&faulted, &RejectLauncher)
+                .submit_turn(request.clone())
+                .is_err()
+        );
+        assert_eq!(faulted.job_index(lease.job_id()).unwrap().exists(), indexed);
+        assert!(!marker.exists());
+        drop(faulted);
+        let store = HostStore::open(root).unwrap();
+        (store, lease, request)
+    }
+
+    fn prelaunch_evidence_snapshot(
+        root: &Path,
+        store: &HostStore,
+        submit: &SubmitRequest,
+        marker: &Path,
+    ) -> (MatrixDurableSnapshot, MatrixPathSnapshot) {
+        let (mut durable, tasks) = matrix_durable_snapshot(root, store, submit, marker);
+        // Election can bootstrap locks even when validation refuses recovery.
+        // All job, lease, Task, disposition and cleanup evidence stays covered.
+        durable.job_locks = MatrixPathSnapshot::Absent;
+        (durable, tasks)
+    }
+
+    #[test]
+    fn task_turn_status_repairs_an_unindexed_final_without_a_submit_retry() {
+        for namespace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("executions");
+            let (store, lease, request) = interrupted_turn(&root, &marker, false);
+            let job = store
+                .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                .unwrap();
+            if namespace {
+                fs::create_dir(job.join(".mac-worker-rooted-fs")).unwrap();
+                fs::set_permissions(
+                    job.join(".mac-worker-rooted-fs"),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            }
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launcher = MatrixInlineLauncher {
+                store: store.clone(),
+                launches: Arc::clone(&launches),
+            };
+            let service = JobService::new(&store, &launcher);
+            let response = service.status(lease.job_id()).unwrap();
+            matrix_assert_meta_identity(response.meta(), request.submit());
+            assert_eq!(response.status().state(), JobState::Succeeded);
+            assert_eq!(fs::read(&marker).unwrap(), b"x");
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            assert!(store.job_index(lease.job_id()).unwrap().is_file());
+            assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+            let before = matrix_durable_snapshot(&root, &store, request.submit(), &marker);
+            assert_eq!(service.status(lease.job_id()).unwrap(), response);
+            assert_eq!(
+                matrix_durable_snapshot(&root, &store, request.submit(), &marker),
+                before
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn task_turn_status_preserves_unsafe_or_conflicting_prelaunch_evidence() {
+        for indexed in [false, true] {
+            for damage in [
+                "nonempty-tmp",
+                "unsafe-tmp",
+                "unsafe-namespace",
+                "missing-tmp",
+                "missing-log",
+                "missing-prompt",
+                "missing-schema",
+                "corrupt-payload",
+                "foreign-payload",
+                "foreign-meta",
+                "changed-prompt",
+                "changed-schema",
+                "nonempty-log",
+                "unrelated-entry",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("host");
+                let marker = temp.path().join("must-not-execute");
+                let (store, lease, request) = interrupted_turn(&root, &marker, indexed);
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                let outside = temp.path().join("outside");
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("sentinel"), b"outside evidence").unwrap();
+                match damage {
+                    "nonempty-tmp" => fs::write(job.join("tmp/foreign"), b"keep").unwrap(),
+                    "unsafe-tmp" => {
+                        fs::remove_dir(job.join("tmp")).unwrap();
+                        symlink(&outside, job.join("tmp")).unwrap();
+                    }
+                    "unsafe-namespace" => {
+                        symlink(&outside, job.join(".mac-worker-rooted-fs")).unwrap()
+                    }
+                    "missing-tmp" => fs::remove_dir(job.join("tmp")).unwrap(),
+                    "missing-log" => remove_and_sync(&job.join("stdout.log")),
+                    "missing-prompt" => remove_and_sync(&job.join("prompt.md")),
+                    "missing-schema" => remove_and_sync(&job.join("result.schema.json")),
+                    "corrupt-payload" => replace_bytes(&job.join("execution.json"), b"{").unwrap(),
+                    "foreign-payload" | "foreign-meta" => {
+                        let path = job.join(if damage == "foreign-meta" {
+                            "meta.json"
+                        } else {
+                            "execution.json"
+                        });
+                        let original = fs::read_to_string(&path).unwrap();
+                        let foreign =
+                            original.replace(CLIENT_ID, "112f0f4a6b5c7d8e9f00112233445566");
+                        assert_ne!(original, foreign);
+                        replace_bytes(&path, foreign.as_bytes()).unwrap();
+                    }
+                    "changed-prompt" => {
+                        replace_bytes(&job.join("prompt.md"), b"private damaged prompt").unwrap()
+                    }
+                    "changed-schema" => {
+                        replace_bytes(&job.join("result.schema.json"), b"{}").unwrap()
+                    }
+                    "nonempty-log" => {
+                        fs::write(job.join("stdout.log"), b"possible execution").unwrap()
+                    }
+                    "unrelated-entry" => fs::write(job.join("notes.txt"), b"keep").unwrap(),
+                    _ => unreachable!(),
+                }
+                let before = prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker);
+                let outside_before = matrix_snapshot_path(&outside);
+                let launches = Arc::new(AtomicUsize::new(0));
+                let launcher = CountingRejectLauncher {
+                    launches: Arc::clone(&launches),
+                };
+                let error = JobService::new(&store, &launcher)
+                    .status(lease.job_id())
+                    .unwrap_err();
+                assert!(!error.to_string().contains("private damaged prompt"));
+                assert_eq!(launches.load(Ordering::SeqCst), 0, "{indexed}/{damage}");
+                assert_eq!(
+                    prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker),
+                    before,
+                    "{indexed}/{damage}"
+                );
+                assert_eq!(
+                    matrix_snapshot_path(&outside),
+                    outside_before,
+                    "{indexed}/{damage}"
+                );
+                assert_eq!(LeaseService::new(&store).load().unwrap(), Some(lease));
+            }
+        }
+    }
+
+    #[test]
+    fn task_turn_status_requires_the_matching_live_task_scope() {
+        for indexed in [false, true] {
+            for scope in ["job", "other-task", "absent", "corrupt"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("host");
+                let marker = temp.path().join("must-not-execute");
+                let (store, lease, request) = interrupted_turn(&root, &marker, indexed);
+                let path = root.join("leases/slots/0/scope.json");
+                match scope {
+                    "job" => replace_bytes(&path, br#"{"kind":"job"}"#).unwrap(),
+                    "other-task" => replace_json(
+                        &path,
+                        &ExecutionScope::task(TaskId::new(uuid::Uuid::from_u128(99))),
+                    )
+                    .unwrap(),
+                    "absent" => remove_and_sync(&path),
+                    "corrupt" => replace_bytes(&path, b"{").unwrap(),
+                    _ => unreachable!(),
+                }
+                let before = prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker);
+                let launches = Arc::new(AtomicUsize::new(0));
+                let launcher = CountingRejectLauncher {
+                    launches: Arc::clone(&launches),
+                };
+                let error = JobService::new(&store, &launcher)
+                    .status(lease.job_id())
+                    .unwrap_err();
+                assert_error_code(
+                    error,
+                    if matches!(scope, "absent" | "corrupt") {
+                        "JOB_STATE_INVALID"
+                    } else {
+                        "EXECUTION_SCOPE_CONFLICT"
+                    },
+                    scope,
+                );
+                assert_eq!(launches.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker),
+                    before
+                );
+                if matches!(scope, "absent" | "corrupt") {
+                    assert!(LeaseService::new(&store).occupied_slots().is_err());
+                } else {
+                    let slots = LeaseService::new(&store).occupied_slots().unwrap();
+                    assert_eq!(slots.len(), 1);
+                    assert_eq!(slots[0].lease, lease);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_turn_status_never_recreates_a_missing_live_lease() {
+        for indexed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("must-not-execute");
+            let (store, lease, request) = interrupted_turn(&root, &marker, indexed);
+            fs::remove_dir_all(root.join("leases/slots/0")).unwrap();
+            let before = prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker);
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launcher = CountingRejectLauncher {
+                launches: Arc::clone(&launches),
+            };
+            let error = JobService::new(&store, &launcher)
+                .status(lease.job_id())
+                .unwrap_err();
+            assert_error_code(
+                error,
+                if indexed {
+                    "JOB_STATE_INVALID"
+                } else {
+                    "JOB_NOT_FOUND"
+                },
+                "missing lease",
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+            assert_eq!(
+                prelaunch_evidence_snapshot(&root, &store, request.submit(), &marker),
+                before
+            );
+        }
+    }
+
+    struct GatedTurnLauncher {
+        inner: MatrixInlineLauncher,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl SupervisorLauncher for GatedTurnLauncher {
+        fn launch(
+            &self,
+            job_id: JobId,
+            guard: SupervisorGuard,
+        ) -> Result<LaunchCandidate, WorkerError> {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+                .unwrap();
+            self.inner.launch(job_id, guard)
+        }
+    }
+
+    #[test]
+    fn task_turn_status_and_resolution_elect_once_and_drop_admission_before_launch() {
+        for indexed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let marker = temp.path().join("executions");
+            let (store, lease, request) = interrupted_turn(&root, &marker, indexed);
+            let launches = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let launcher = Arc::new(GatedTurnLauncher {
+                inner: MatrixInlineLauncher {
+                    store: store.clone(),
+                    launches: Arc::clone(&launches),
+                },
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            });
+            let first_store = store.clone();
+            let first_launcher = Arc::clone(&launcher);
+            let job_id = lease.job_id();
+            let first = thread::spawn(move || {
+                JobService::new(&first_store, first_launcher.as_ref()).status(job_id)
+            });
+            entered_rx
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+                .unwrap();
+            let execution = store
+                .job(lease.project_id(), lease.worktree_id(), job_id)
+                .unwrap()
+                .join("execution.json");
+            let execution_bytes = fs::read(&execution).unwrap();
+            remove_and_sync(&execution);
+            let second_store = store.clone();
+            let resolve = ResolveOrAbandonRequest::from_submit_request(request.submit()).unwrap();
+            let rejected = Arc::new(AtomicUsize::new(0));
+            let second_rejected = Arc::clone(&rejected);
+            let (observed_tx, observed_rx) = mpsc::channel();
+            let second = thread::spawn(move || {
+                let observer = CountingRejectLauncher {
+                    launches: second_rejected,
+                };
+                let service = JobService::new(&second_store, &observer);
+                let status = service.status(job_id).unwrap();
+                let resolved = service.resolve_or_abandon(resolve).unwrap();
+                observed_tx.send((status, resolved)).unwrap();
+            });
+            let (observed, resolved) = observed_rx
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+                .unwrap();
+            assert_eq!(observed.status().state(), JobState::Accepted);
+            assert_eq!(observed.status().supervisor_identity(), None);
+            assert!(
+                matches!(resolved.outcome(), ResolveOrAbandonOutcome::Accepted { response } if response == &observed)
+            );
+            assert_eq!(rejected.load(Ordering::SeqCst), 0);
+            assert!(!marker.exists());
+            second.join().unwrap();
+            replace_bytes(&execution, &execution_bytes).unwrap();
+            release_tx.send(()).unwrap();
+            let finished = first.join().unwrap().unwrap();
+            assert_eq!(finished.status().state(), JobState::Succeeded);
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            assert_eq!(fs::read(&marker).unwrap(), b"x");
+            assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+            assert_eq!(
+                JobService::new(&store, launcher.as_ref())
+                    .status(job_id)
+                    .unwrap(),
+                finished
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[test]
     // Supersedes v1 test: host_reconcile_replays_an_indexed_terminal_status_without_discovery_or_mutation.
     fn task_turn_replays_an_indexed_terminal_status_without_discovery_or_mutation() {
