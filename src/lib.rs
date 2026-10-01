@@ -112,7 +112,6 @@ pub mod project_readiness;
 pub mod project_state;
 pub mod protocol;
 pub mod redaction;
-pub mod remote_snapshot;
 pub mod requirements;
 pub mod rooted_fs;
 pub(crate) mod runner_log;

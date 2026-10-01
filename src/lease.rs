@@ -759,16 +759,14 @@ fn protocol_code(code: &'static str, message: &str) -> WorkerError {
 #[cfg(test)]
 mod lifecycle_tests {
     use std::{
-        collections::BTreeSet,
         fs,
         os::unix::fs::{PermissionsExt, symlink},
         path::Path,
     };
 
     use super::*;
-    use crate::{
-        inputs::RelativePath,
-        job::{ClientId, CommandSpec, JobMeta, JobStatus, LeaseToken, RequestFingerprintMaterial},
+    use crate::job::{
+        ClientId, CommandSpec, JobMeta, JobStatus, LeaseToken, RequestFingerprintMaterial,
     };
     use tempfile::tempdir;
 
@@ -810,23 +808,30 @@ mod lifecycle_tests {
     }
 
     fn publish_job(store: &HostStore, lease: &LeaseRecord, request: &LeaseAcquireRequest) {
-        let mut staged = store
+        let staged = store
             .begin_job(lease.project_id(), lease.worktree_id(), lease.job_id())
             .unwrap();
-        let payload = RelativePath::parse(b"payload").unwrap();
-        staged
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
+        let task_id = match request.execution_scope() {
+            ExecutionScope::Task { task_id } => *task_id,
+            ExecutionScope::Job => panic!("new publication fixtures require Task scope"),
+        };
+        let workspace = staged
+            .rooted_dir()
+            .open_child_directory(&relative("workspace").unwrap(), true)
             .unwrap();
-        let receipt = staged
-            .complete_snapshot_materialization(
-                &BTreeSet::from([payload]),
-                lease.project_id(),
-                lease.worktree_id(),
-                lease.manifest_digest(),
-            )
+        let tree = workspace
+            .open_child_directory(&relative("tree").unwrap(), true)
             .unwrap();
+        tree.create_empty_directory(&relative("payload").unwrap())
+            .unwrap();
+        tree.sync_root().unwrap();
+        workspace.sync_root().unwrap();
+        let receipt = crate::turn::TurnReceipt::new(
+            staged.job_id(),
+            task_id,
+            "a".repeat(40).parse().unwrap(),
+            staged.receipt_nonce(),
+        );
         let meta = JobMeta::new(request.material(), request.request_fingerprint().clone()).unwrap();
         let meta_file = staged
             .rooted_dir()

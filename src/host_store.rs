@@ -645,22 +645,12 @@ pub struct StagedJob {
     job_id: JobId,
     project_id: String,
     worktree_id: String,
-    snapshot_digest: Option<String>,
     receipt_nonce: [u8; 16],
     guard: AdmissionGuard,
 }
 
 pub(crate) trait PublicationReceipt {
     fn validate_for(&self, staged: &StagedJob) -> Result<(), WorkerError>;
-}
-
-#[allow(dead_code)] // Task 7 consumes the snapshot-bound opaque receipt.
-pub struct WorkspaceReceipt {
-    job_id: JobId,
-    nonce: [u8; 16],
-    project_id: String,
-    worktree_id: String,
-    manifest_digest: String,
 }
 
 pub struct PublishedJob {
@@ -835,15 +825,6 @@ impl fmt::Debug for StagedJob {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StagedJob")
-            .field("job_id", &self.job_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl fmt::Debug for WorkspaceReceipt {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WorkspaceReceipt")
             .field("job_id", &self.job_id)
             .finish_non_exhaustive()
     }
@@ -2280,7 +2261,6 @@ impl HostStore {
             job_id: job,
             project_id: project.into(),
             worktree_id: worktree.into(),
-            snapshot_digest: None,
             receipt_nonce: nonce,
             guard,
         })
@@ -2312,31 +2292,6 @@ impl HostStore {
         consume_write_fault_io(self, HostStoreWritePoint::AfterJobPublish)?;
         published.validate()?;
         Ok(published)
-    }
-
-    pub(crate) fn repair_indexed_publication_after(
-        &self,
-        admission: &AdmissionGuard,
-        project: &str,
-        worktree: &str,
-        job: JobId,
-    ) -> Result<(), WorkerError> {
-        admission.validate_for(job)?;
-        validate_digest(project, "project ID")?;
-        validate_digest(worktree, "worktree ID")?;
-        let leases = self.open_directory("leases", false)?;
-        let final_parent = self.open_directory(&format!("jobs/{project}/{worktree}"), false)?;
-        let final_job = final_parent.open_child_directory(&relative(&job.to_string())?, false)?;
-        let index = self.open_directory("job-index", false)?;
-        final_job.verify_bound()?;
-        admission.validate_for(job)?;
-        leases.sync_root()?;
-        final_parent.sync_root()?;
-        consume_write_fault_io(self, HostStoreWritePoint::AfterJobPublish)?;
-        index.sync_root()?;
-        consume_write_fault_io(self, HostStoreWritePoint::AfterJobIndexParentSync)?;
-        final_job.verify_bound()?;
-        admission.validate_for(job)
     }
 
     pub fn record_accepted(
@@ -4921,50 +4876,6 @@ impl StagedJob {
         self.receipt_nonce
     }
 
-    pub(crate) fn create_workspace_tree(&self) -> Result<RootedDir, WorkerError> {
-        if self.root.entry_exists("workspace")? {
-            return Err(WorkerError::Protocol(
-                "staged workspace already exists".into(),
-            ));
-        }
-        let workspace = self
-            .root
-            .open_child_directory(&relative("workspace")?, true)?;
-        Ok(workspace.open_child_directory(&relative("tree")?, true)?)
-    }
-
-    pub(crate) fn complete_snapshot_materialization(
-        &mut self,
-        declared: &BTreeSet<RelativePath>,
-        project_id: &str,
-        worktree_id: &str,
-        manifest_digest: &str,
-    ) -> Result<WorkspaceReceipt, WorkerError> {
-        validate_digest(project_id, "workspace project ID")?;
-        validate_digest(worktree_id, "workspace worktree ID")?;
-        validate_digest(manifest_digest, "workspace manifest digest")?;
-        if project_id != self.project_id || worktree_id != self.worktree_id {
-            return Err(WorkerError::Protocol(
-                "workspace snapshot identity does not match staged job".into(),
-            ));
-        }
-        let workspace = self
-            .root
-            .open_child_directory(&relative("workspace")?, false)?;
-        let tree = workspace.open_child_directory(&relative("tree")?, false)?;
-        tree.validate_and_sync_snapshot_workspace(declared)?;
-        workspace.sync_root()?;
-        self.root.sync_root()?;
-        self.snapshot_digest = Some(manifest_digest.into());
-        Ok(WorkspaceReceipt {
-            job_id: self.job_id,
-            nonce: self.receipt_nonce,
-            project_id: project_id.into(),
-            worktree_id: worktree_id.into(),
-            manifest_digest: manifest_digest.into(),
-        })
-    }
-
     pub(crate) fn publish_complete<R: PublicationReceipt>(
         self,
         receipt: R,
@@ -5001,22 +4912,6 @@ impl StagedJob {
         };
         published.validate()?;
         Ok(published)
-    }
-}
-
-impl PublicationReceipt for WorkspaceReceipt {
-    fn validate_for(&self, staged: &StagedJob) -> Result<(), WorkerError> {
-        if self.job_id != staged.job_id
-            || self.nonce != staged.receipt_nonce
-            || self.project_id != staged.project_id
-            || self.worktree_id != staged.worktree_id
-            || staged.snapshot_digest.as_deref() != Some(self.manifest_digest.as_str())
-        {
-            return Err(WorkerError::Protocol(
-                "workspace receipt does not match staged job".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -5846,127 +5741,6 @@ mod review_regression_tests {
                     material.project_id(),
                     material.worktree_id(),
                     material.job_id(),
-                )
-                .unwrap()
-                .exists()
-        );
-    }
-
-    #[test]
-    fn empty_staging_tree_cannot_mint_a_publishable_workspace_receipt() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let request = request(1);
-        let material = request.material();
-        let mut staged = store
-            .begin_job(
-                material.project_id(),
-                material.worktree_id(),
-                material.job_id(),
-            )
-            .unwrap();
-        assert!(
-            staged
-                .complete_snapshot_materialization(
-                    &BTreeSet::new(),
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.manifest_digest(),
-                )
-                .is_err()
-        );
-        assert!(
-            !store
-                .job(
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.job_id()
-                )
-                .unwrap()
-                .exists()
-        );
-
-        let payload = RelativePath::parse(b"payload").unwrap();
-        staged
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
-            .unwrap();
-        let receipt = staged
-            .complete_snapshot_materialization(
-                &BTreeSet::from([payload]),
-                material.project_id(),
-                material.worktree_id(),
-                material.manifest_digest(),
-            )
-            .unwrap();
-        staged.publish_complete(receipt).unwrap();
-    }
-
-    #[test]
-    fn workspace_receipt_from_another_staging_nonce_cannot_publish() {
-        let temp = tempdir().unwrap();
-        let root = temp.path().join("host");
-        let store = HostStore::open(&root).unwrap();
-        let request = request(17);
-        let material = request.material();
-        let payload = RelativePath::parse(b"payload").unwrap();
-
-        let first_receipt = {
-            let mut first = store
-                .begin_job(
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.job_id(),
-                )
-                .unwrap();
-            first
-                .create_workspace_tree()
-                .unwrap()
-                .create_empty_directory(&payload)
-                .unwrap();
-            first
-                .complete_snapshot_materialization(
-                    &BTreeSet::from([payload.clone()]),
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.manifest_digest(),
-                )
-                .unwrap()
-        };
-
-        let mut second = store
-            .begin_job(
-                material.project_id(),
-                material.worktree_id(),
-                material.job_id(),
-            )
-            .unwrap();
-        second
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
-            .unwrap();
-        drop(
-            second
-                .complete_snapshot_materialization(
-                    &BTreeSet::from([payload]),
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.manifest_digest(),
-                )
-                .unwrap(),
-        );
-
-        let error = second.publish_complete(first_receipt).unwrap_err();
-        assert!(error.to_string().contains("workspace receipt"));
-        assert!(
-            !store
-                .job(
-                    material.project_id(),
-                    material.worktree_id(),
-                    material.job_id()
                 )
                 .unwrap()
                 .exists()

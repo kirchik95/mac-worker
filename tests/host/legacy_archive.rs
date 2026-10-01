@@ -6,7 +6,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use mac_worker::{
     host_store::{HostStore, JobDisposition},
     job::{ExecutionScope, JobMeta, JobStatus, LeaseAcquireRequest, LeaseRecord, SubmitRequest},
-    remote_snapshot::VerifiedReceipt,
+    legacy_snapshot_receipt::VerifiedReceipt,
 };
 use serde::Serialize;
 use std::{

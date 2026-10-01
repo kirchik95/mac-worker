@@ -214,6 +214,7 @@ pub struct VerifiedReceipt {
 }
 
 impl VerifiedReceipt {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         job_id: JobId,

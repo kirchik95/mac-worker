@@ -204,6 +204,10 @@ mod task7_status_file_tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 pub(crate) enum SnapshotProjection {
     TransportOrOwner,
     OwnerOnly,
@@ -211,6 +215,10 @@ pub(crate) enum SnapshotProjection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 pub(crate) enum SnapshotFsKind {
     RegularFile,
     Directory,
@@ -218,6 +226,10 @@ pub(crate) enum SnapshotFsKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 pub(crate) struct SnapshotFileRead {
     pub(crate) bytes: Vec<u8>,
     pub(crate) mode: u32,
@@ -226,6 +238,10 @@ pub(crate) struct SnapshotFileRead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 pub(crate) struct SnapshotTreeEntry {
     pub(crate) path: RelativePath,
     pub(crate) kind: SnapshotFsKind,
@@ -238,6 +254,10 @@ pub(crate) struct SnapshotTreeEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 pub(crate) struct SnapshotTreeInspection {
     pub(crate) root_mode: u32,
     pub(crate) root_device: u64,
@@ -1863,6 +1883,10 @@ impl RootedDir {
         Ok(bytes)
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn validate_snapshot_root(&self, expected_mode: u32) -> io::Result<()> {
         self.verify_root_name()?;
         let metadata = stat_fd(self.root.as_raw_fd())?;
@@ -1875,6 +1899,10 @@ impl RootedDir {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn read_snapshot_regular(
         &self,
         name: &str,
@@ -1927,6 +1955,10 @@ impl RootedDir {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn inspect_snapshot_tree(
         &self,
         name: &str,
@@ -1976,6 +2008,10 @@ impl RootedDir {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn prepare_snapshot_for_publication_with_hook(
         &self,
         mut after_first_conversion: impl FnMut() -> io::Result<()>,
@@ -2008,6 +2044,10 @@ impl RootedDir {
         self.verify_root_name()
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn seal_snapshot_root(&self) -> io::Result<()> {
         self.verify_root_name()?;
         let metadata = stat_fd(self.root.as_raw_fd())?;
@@ -3602,6 +3642,10 @@ impl RootedDir {
         self.publish_owned_into_with_hook(destination_parent, destination_name, || {})
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn publish_owned_into_with_post_rename(
         &mut self,
         destination_parent: &RootedDir,
@@ -3832,6 +3876,10 @@ impl RootedDir {
         cvt(unsafe { libc::fsync(self.root.as_raw_fd()) })
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn validate_and_sync_snapshot_workspace(
         &self,
         declared: &BTreeSet<RelativePath>,
@@ -3941,6 +3989,10 @@ impl RootedDir {
         )
     }
 
+    #[allow(
+        dead_code,
+        reason = "Retained shared filesystem safety helpers for legacy archives."
+    )]
     pub(crate) fn copy_snapshot_regular_to_writable(
         &self,
         path: &RelativePath,
@@ -5176,6 +5228,10 @@ fn collect_and_sync_tree(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn inspect_snapshot_directory(
     directory: RawFd,
     prefix: &str,
@@ -5317,6 +5373,10 @@ fn inspect_snapshot_directory(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn require_snapshot_entry(metadata: &libc::stat, expected_device: u64) -> io::Result<()> {
     if metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_dev as u64 != expected_device {
         return Err(snapshot_policy_error());
@@ -5324,6 +5384,10 @@ fn require_snapshot_entry(metadata: &libc::stat, expected_device: u64) -> io::Re
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn require_snapshot_directory(
     metadata: &libc::stat,
     expected_device: u64,
@@ -5342,6 +5406,10 @@ fn require_snapshot_directory(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn require_snapshot_regular(
     metadata: &libc::stat,
     expected_device: u64,
@@ -5366,6 +5434,10 @@ fn require_snapshot_regular(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn require_snapshot_symlink(metadata: &libc::stat, expected_device: u64) -> io::Result<()> {
     require_snapshot_entry(metadata, expected_device)?;
     if file_type(metadata.st_mode) != libc::S_IFLNK
@@ -5378,6 +5450,10 @@ fn require_snapshot_symlink(metadata: &libc::stat, expected_device: u64) -> io::
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn snapshot_symlink_mode_valid(mode: u32) -> bool {
     #[cfg(target_vendor = "apple")]
     {
@@ -5406,6 +5482,10 @@ fn snapshot_metadata_stable(left: &libc::stat, right: &libc::stat) -> bool {
         && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn make_snapshot_directory_owner_only(
     directory: RawFd,
     expected_device: u64,
@@ -5490,6 +5570,10 @@ fn make_snapshot_directory_owner_only(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retained shared filesystem safety helpers for legacy archives."
+)]
 fn snapshot_policy_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
