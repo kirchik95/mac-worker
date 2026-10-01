@@ -1,57 +1,49 @@
-# Persistent Controller Channel Implementation Plan
+# Persistent Controller Read-Loop Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement your assigned track task-by-task. Steps use checkbox (`- [ ]`) syntax. The orchestrator schedules parallel tracks and independent reviews; do not start internal subagent or review rounds.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement your assigned track task-by-task. The orchestrator schedules parallel tracks and independent reviews; no internal subagents/reviewer rounds.
 
-**Goal:** Remove per-RPC SSH sessions from warm controller traffic while preserving one-request child-process safety, authenticated identity and same-ID recovery.
+**Goal:** Remove SSH execution sessions from repeated wait/log/event/notify reads, preserving per-request child isolation and all existing stdio mutation behavior.
 
-**Architecture:** The existing controller leader listens on a private Unix socket and supervises the existing host controller-rpc child for every application request. A foreground laptop command bootstraps identity over authenticated stdio, checks a private stable pin, adds a command-private forward to the existing ControlMaster, and uses a sequential framed session. The existing ProcessRunner-based RPC clients consume a scoped adapter; stdio remains the fallback.
+**Architecture:** Leader-owned private Unix listener, generation-specific hard link to its loaded executable, existing host controller-rpc child per eligible frame. Foreground read loops bootstrap identity/pin on authenticated stdio, resolve one concrete existing master, add an exclusive config-free Unix forward, and reuse a sequential session. Loss permits one same-read stdio fallback within the existing budget. Everything outside the frozen read-loop allowlist stays raw stdio.
 
-**Tech Stack:** Rust 2024; existing serde/serde_json, UUID, SHA-256, libc, rooted_fs, ProcessRunner, Tokio net/runtime/sync/time. No new dependency, daemon, token store, TOML schema or UI asset build.
+**Tech stack:** Rust 2024; existing serde/serde_json, UUID parsing/string wrappers, SHA-256, libc, rooted_fs, ProcessRunner and Tokio. No dependency/uuid-feature/TOML/daemon/UI change.
 
-**Spec:** [2026-10-01-controller-socket-design.md](../specs/2026-10-01-controller-socket-design.md), against `0802421541679443e7d1982988a8c6482e5fdbe9`. Also read [.briefs/p3-rules.md](../../../.briefs/p3-rules.md) and [.briefs/p3-survey-report.md](../../../.briefs/p3-survey-report.md), section 3's ten process assumptions.
+**Spec:** [2026-10-01-controller-socket-design.md](../specs/2026-10-01-controller-socket-design.md). Read [rules](../../../.briefs/p3-rules.md), [D1–D10](../../../.briefs/p3-spec-round2.md), [survey section 3](../../../.briefs/p3-survey-report.md), [review](../../../.briefs/p3-review-report.md) and [coverage](../../../.briefs/p3-coverage-report.md). D1–D10 are settled; this plan applies them. Baseline `0802421541679443e7d1982988a8c6482e5fdbe9`, re-anchor at the final accepted events head before T1 on integ/p3.
 
-## Global Constraints
+## Global constraints
 
-- Phase 3 design and implementation are owner-approved. T1 starts on `integ/p3` at the final accepted `integ/ev-wave` head; update line anchors and resolve real baseline drift before freezing contracts.
-- Keep protocol 7; channel version 1 is additive. Existing strict request/reply/task/drain/service/envelope DTOs stay unchanged. Identity is a task.list controller_socket selector, never a new top-level wire command.
-- One existing host controller-rpc child per application request. Never run task/store/drain/journal handlers in leader session threads. Preserve all ten process assumptions in spec Decision 2.
-- Controller path controller_state_root()/rpc/s; laptop transport cache controller_cache_root()/channel/. Directories 0700, sockets and regular files 0600; pin 4 KiB, service/hello/ready 8 KiB. No blind unlink or chmod/adoption of unsafe entries.
-- Frame payload 1..1,048,576 bytes; four-byte big-endian length; 8 KiB read scratch; one retained frame, no pipeline/queue. Reply wrapper counts toward the frame cap; maximum-size old replies fall back intact to stdio.
-- 16 live sessions; 8 running-or-cleaning supervisors, one child each; one application request in flight per connection. Only fully captured ProcessResult releases a slot. Runner errors/supervisor panics retain slots for the leader lifetime because the runner can abandon I/O threads. No listener restart to replenish them; exhaustion withdraws availability and uses stdio until leader restart.
-- 5 s handshake/partial-frame/setup guards; 60 s idle; 30 s application guard. Client setup consumes the existing caller deadline and is skipped cold when at most 5 s remains. Keep 15 s client/20 s server long-polls and the existing 100 ms task.wait sleep.
-- Cancellation is connection close, never task.cancel or a definitive rejection. Combine session EOF, deadline and leader shutdown; preserve detached task runners and durable recovery. No unbounded join of request supervision on leader shutdown.
-- Existing multiplexed master only when multiplex=true; keep ControlPersist=60, BatchMode=yes, ForwardAgent=no, ExitOnForwardFailure=yes, 10 s/3 keepalives, StreamLocalBindMask=0177, StreamLocalBindUnlink=no and child-only umask 077. Control forward/cancel omits ClearAllForwardings; ordinary SSH retains it. No shared-master exit or dedicated -N fallback.
-- Socket paths are absolute UTF-8, contain no NUL/control/colon and are fewer than 104 bytes. Long/custom roots use stdio; no path broker or /tmp relocation.
-- Every connection gets fresh authenticated stdio identity: route digest, protocol, client/account, ProcessIdentity, service-generation UUID, persistent journal UUID and features. Stable pin contains only schema/route/client/account; journal/generation never auto-rotate the pin.
-- Pin mismatch/handshake failure disables socket use and retains stdio fallback. Wrong complete reply identity is unverified evidence, not retryable EOF. Mutation fallback retains exact frozen bytes, request ID/digest, existing envelope and settlement.
-- Ordinary reconnect eligibility is 1, 2, 4, then 5 s, in memory; callers use stdio without sleeping. Unsupported/identity/path safety failure disables this command's attempts. No persisted backoff or laptop service.
-- Frozen gate files cannot change in T2–T6. Stop and print CONTRACT ISSUE: <track> for a wrong contract; the orchestrator makes a serial correction. No shared-file edits or overlapping leases.
-- All tests use private temporary layouts, fake SSH, fixture binaries, injected clocks/channels/hooks. Run only consolidated area targets under nextest with NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4. Filters must select more than zero tests. No sleeps or wall-clock speed bounds; hang guards are 30 s or more.
-- Each behavior uses red test → exact filtered run → minimum implementation → same run green → buildable conventional commit. End each track with cargo fmt --all and CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings.
-- Never run the whole suite: the orchestrator owns that gate and independent reviews. Never contact real hosts/pool, SSH, setup, launchctl, credentials/keychains, Herdr or notifications. Do not delete target/, push, merge/rebase other branches or edit other worktrees.
+- Protocol 7, additive channel version 1, unchanged strict old DTOs and stdio EOF. No channel mutation, setter, transfer, one-shot-read, doctor or general-health optimization. No mutation classifier/error/envelope changes.
+- Freeze scope plus request grammar in T1. Wait: task.wait.poll. Logs follow: task.logs and loop-local health. Events follow/notify: task.list controller_events read/tasks/repair and loop-local health. --wait creates its adapter only after raw mutation/transfer work.
+- One existing RPC child per admitted read. Private generation-specific image link must match independently established loaded-image dev/ino before advertising. Spawn from link; installed-path rename does not retire that generation. Unverifiable image disables optional service.
+- Controller rpc directory 0700, socket/data files 0600; executable mode preserved in private directory, never chmod hard link. Stable pin <=4 KiB, service/hello/ready <=8 KiB. Journal UUID is an optional string hint, not availability/authentication authority. UUIDs use validated explicit string serde, no Cargo change.
+- 16 sessions / 8 child supervisor slots / one in flight. Up to 32 child-related native threads (8 supervisors + 16 captures + 8 stdin), plus one native control job/thread. Try-only bounds; no unbounded queues/blocking pool/Tokio spawn_blocking. Retained unknown cleanup includes its I/O threads in that budget.
+- All blocking channel metadata/image/bind/publication/withdrawal/cleanup is native control or supervisor work. Nonblocking Tokio listener/session operations only on the current-thread signal runtime. Runtime sees bounded shared-state/oneshot results, never synchronous filesystem probes.
+- 1..1 MiB frame payload including reply wrapper; 8 KiB scratch/one retained frame. 5 s handshake/partial/setup/cleanup, 60 s idle, 30 s app. Skip cold setup with <=5 s remaining; every app/fallback consumes the original per-call deadline. Preserve 15 s client/20 s server poll caps, wait 100 ms and existing outage/repair policies.
+- Borrowed should_stop is live through all synchronous client stages, without Send/Sync/'static requirements. Server cancellation context is owned. No fallback after cancellation/expiry. Close cancellation does not mean task.cancel or rollback.
+- Cleanup Completed releases permits even after cancellation/error. Unknown/abandoned/panic retains them for the leader lifetime; eight unknown slots retire only the channel. Never infer completion from time elapsed. Shutdown drives stream closure and actual child-group cancellation before run_tick_loop stops polling, then preserves tick join/leader guard ordering.
+- Master resolution uses bounded ssh -G with original worker config/options; authenticated bootstrap uses original -F/trust plus the captured literal -S. Only config-free -F /dev/null -O check/forward/cancel uses that literal endpoint and one owned -L. Explicit master mask 0177/unlink=no, BatchMode/no agent/forward failure/keepalives retained. No private-umask runner hook/pre-exec policy, master exit, dedicated -N or implicit multiplex enablement.
+- Validate private paths, owners/modes/type/dev/ino; socket paths UTF-8/absolute, byte length <104, no NUL/control/colon/%/$ and enough creation-suffix room for new masters. Unsafe/unexpanded/none/long paths decline. No /tmp shortening or manual %C expansion.
+- Cancel closes the session first, then requires ECONNREFUSED and exact bindings before cleanup. Exit 0 alone is insufficient. Unknown open/cancel cleanup preserves residue and permanently retires setup for that foreground command: at most one uncertain allocation, regardless of backoff advances.
+- Stable pin is schema/route/client/account only. Existing client-id is PathLayout.state/client-id; identity reader must not load_or_create_client_id. Notify cache retains its existing independent key and lock. Operator identity/repin always raw stdio.
+- Per eligible exchange <=1 channel application attempt +1 immediate same-read stdio fallback; no adapter retry loop. Any remaining same-exchange retries are raw stdio. Subsequent read calls can reconnect at 1/2/4/5 s eligibility without sleeping. Count setup/control separately.
+- Existing mutation four-attempt ~1/3/9 s jittered retry can expire inside launchd's 30 s ThrottleInterval. D1 leaves it unchanged on stdio; no claim that this transport fixes outcome-unknown.
+- Tests: consolidated area targets only, nextest with NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4, selected count >0. Inject clocks/channels/hooks; no sleeps or speed bounds; hang guards >=30 s. Never whole suite or real pool/SSH/setup/launchctl/credentials/Herdr/notifications; do not delete target or modify other worktrees/push/merge/rebase.
+- Each behavior: red test → exact filtered red run → implementation → same green run → buildable conventional commit. End each track with cargo fmt --all and CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings. Frozen-contract defect: stop/report CONTRACT ISSUE: <track>; orchestrator serial correction.
 
-## Review Focus
+## Ownership and dependency order
 
-- Reinstall or alias/account change with a plausible ready response: no socket application bytes before a matching stable pin and fresh generation; unexpected identity never silently repins (T4, T6, T7).
-- Concurrent mutation, stalled child, leaked hints/deadline or cancellation: requests remain separate processes; leader signal/tick continues and occupied cleanup slots are not replaced (T3, T7).
-- Partial/oversize/coalesced frames and a long-poll while another request arrives: bounded allocation, no pipelining, cancellation on EOF, independent connections and intact maximum-size stdio fallback (T2, T3, T6).
-- Existing master with old bind options, expired master, wrong -F namespace, long XDG root or SIGKILL residue: validate ownership, cancel only the exact forward, preserve uncertain files and use stdio (T4, T5, T7).
-- Complete unverified reply versus loss after durable publication: no false rejected settlement/new mutation ID; replay preserves source-finish-before-submit ordering and non-envelope recovery/idempotence (T1, T6, T7).
-
-## File ownership and dependency order
-
-| Task | Size | Depends on | Exclusive ownership |
+| Task | Size | Depends on | Exclusive files |
 | --- | --- | --- | --- |
-| T1 interface gate | L | Final events-wave baseline | Create src/controller/channel.rs, channel/contracts.rs, channel/testing.rs and facade-only channel/{codec,server,files,identity,pin,forward,client}.rs; modify src/controller/mod.rs, src/controller/health_read.rs (visibility only), src/process.rs (private spawn hook), src/error.rs and src/controller/execute.rs (unverified error guard only); declare/seed all new tests listed below in tests/controller/main.rs, tests/transfer/main.rs, tests/cli/main.rs |
-| T2 session codec / I/O | M | T1 only | src/controller/channel/codec.rs; create src/controller/channel/codec/io.rs; tests/controller/controller_socket_codec.rs |
-| T3 listener / child supervision | L | T1 only | src/controller/channel/server.rs; create src/controller/channel/server/child.rs; tests/controller/controller_socket_service.rs |
-| T4 identity / files / pin | L | T1 only | src/controller/channel/{files,identity,pin}.rs; minimal src/rooted_fs.rs socket helpers; tests/controller/controller_socket_identity.rs |
-| T5 master forward | M | T1 only | src/controller/channel/forward.rs; src/transport.rs; tests/transfer/controller_socket_forward.rs |
-| T6 scoped client / selection | L | T1 only | src/controller/channel/client.rs; tests/controller/controller_socket_client.rs |
-| T7 integration / fixtures / observations | L | T2–T6 accepted | src/lib.rs, src/cli.rs, src/features.rs, src/controller/health_read.rs, src/controller/execute.rs, src/controller/events/{foreground,tail,client}.rs, src/controller/events/notify/follow.rs; tests/controller/controller_socket_wiring.rs, controller_socket_benchmark.rs, controller_features.rs, controller_health_routes.rs; tests/cli/controller_channel.rs, cli_help.rs; predecessor files only under an explicit post-track lease |
-| T8 operator docs / acceptance | M | T7 accepted | docs/usage.md, docs/testing.md (only new filtered/measurement commands), docs/superpowers/validation/2026-10-01-controller-socket.md; these Phase 3 spec/plan files only for accepted contract/anchor corrections |
+| T1 interface gate | L | Final accepted baseline | Create src/controller/channel.rs, channel/contracts.rs, channel/testing.rs and empty facade channel/{codec,server,files,image,identity,pin,forward,client}.rs; src/controller/mod.rs; health_read.rs visibility only; src/process.rs cleanup companion/delegation seam only; seed/declare tests/controller/main.rs, tests/transfer/main.rs, tests/cli/main.rs and modules listed below |
+| T2 codec / client I/O | M | T1 only | src/controller/channel/codec.rs, new codec/io.rs; tests/controller/controller_socket_codec.rs |
+| T3 server / native jobs / child | L | T1 only | src/controller/channel/server.rs, new server/{child,control}.rs; tests/controller/controller_socket_service.rs |
+| T4 files / image / identity / pin | L | T1 only | src/controller/channel/{files,image,identity,pin}.rs; minimal src/rooted_fs.rs link/socket/evidence helpers; tests/controller/controller_socket_identity.rs |
+| T5 concrete master / forward | L | T1 only | src/controller/channel/forward.rs; src/transport.rs; tests/transfer/controller_socket_forward.rs |
+| T6 read-loop client policy | M | T1 only | src/controller/channel/client.rs; tests/controller/controller_socket_client.rs |
+| T7 serial integration / observations | L | T2–T6 accepted | src/lib.rs, src/cli.rs, src/features.rs, src/controller/{runtime,lifecycle,health_read,execute}.rs, src/controller/events/{foreground,tail,client}.rs, events/notify/follow.rs; tests/controller/{controller_socket_wiring,controller_socket_benchmark,controller_features,controller_health_routes}.rs; tests/cli/{controller_channel,cli_help}.rs; predecessor files only by exclusive post-track lease |
+| T8 docs / acceptance | M | T7 accepted | docs/usage.md, docs/testing.md, docs/superpowers/validation/2026-10-01-controller-socket.md; spec/plan only for accepted corrections |
 
-Paths in the table beginning `channel/` are beneath `src/controller/`. T1 creates `tests/controller/controller_socket_contracts.rs`, `controller_socket_codec.rs`, `controller_socket_service.rs`, `controller_socket_identity.rs`, `controller_socket_client.rs`, `controller_socket_wiring.rs`, `controller_socket_benchmark.rs`; `tests/transfer/controller_socket_forward.rs`; `tests/cli/controller_channel.rs`. These are modules of controller, transfer and cli, **not** individual Cargo targets (`docs/testing.md:6`, `tests/controller/main.rs:15`).
+T1 seeds tests/controller/controller_socket_{contracts,codec,service,identity,client,wiring,benchmark}.rs; tests/transfer/controller_socket_forward.rs; tests/cli/controller_channel.rs. These are modules of consolidated controller/transfer/cli targets, not Cargo targets (`docs/testing.md:6`, `tests/controller/main.rs:15`). No tests/support, Cargo, CI, dashboard or generated-asset edits.
 
 ```mermaid
 flowchart LR
@@ -68,15 +60,15 @@ flowchart LR
   T7 --> T8
 ```
 
-T2–T6 are **five independent parallel tracks**. The orchestrator can schedule all five subject to available capacity; each uses T1 fakes for its siblings. During this wave freeze channel.rs/contracts.rs/testing.rs, controller/mod.rs, process.rs/error.rs/execute.rs gate seams and all test main.rs roots. Facade files contain exports/module declarations only until their owner implements them; no production todo/panic stub or feature advertising. Ownership of seeded test modules transfers at T1 commit. No task changes tests/support, Cargo dependencies/lock, CI, dashboard source or generated assets. More tracks would split one of codec, supervisor, ownership, forward or selection across a safety boundary without an independent deliverable.
+Five independent parallel tracks remain after D1 shrinks T6. T6 owns policy against fakes; only T7 owns loop routing. T5 grows to endpoint/evidence work but owns no T4 implementation. T1 gate files/module/test roots freeze; facade/test ownership transfers to its named track. No sibling concrete implementation is a wave dependency. T7/T8 obtain exclusive predecessor leases only after acceptance, recording/releasing them.
 
-## T1 — committed contracts, test seams and seeded modules
+## T1 — corrected committed interface gate
 
-**Files:** Exactly T1's paths above. Freeze them after this task; do not put optional channel calls on production routes.
+**Files:** T1 row above. No src/error.rs, mutation classifier or private-spawn policy. No production channel call/advertising.
 
-**Grounding:** ControllerRequest/parser/framing `src/controller/protocol.rs:18`, `src/controller/protocol.rs:127`; current runner interface/pre-exec `src/process.rs:64`, `src/process.rs:158`; health leader check `src/controller/health_read.rs:175`; unverified classification `src/controller/execute.rs:666`, `src/controller/execute.rs:756`; ProcessIdentity `src/job.rs:687`; account `src/protocol.rs:503`; ClientId read `src/controller/events/task_reads.rs:851`.
+**Grounding:** runner methods/delegation/capture cleanup `src/process.rs:64`, `src/process.rs:86`, `src/process.rs:401`, `src/process.rs:437`, `src/process.rs:457`; envelope/read dispatch `src/controller/execute.rs:568`; leader liveness `src/controller/health_read.rs:175`; ID string serde pattern `src/job.rs:40`; ClientId existing reader `src/controller/events/task_reads.rs:851`; uuid features `Cargo.toml:27`.
 
-**Interfaces produced:** contracts.rs owns validated schema/bound types below. All constructors/serde entry points reject malformed required values before handing them to consumers. RouteDigest is 64 lowercase hex, client IDs use the existing ClientId grammar, UUIDs are canonical non-nil v4, and service/journal UUIDs must differ. Reply parsing is tolerant only of additive fields; hello, selector and pin parsing are strict. EntryIdentity includes device/inode/owner/type/mode, never a pathname-only deletion capability.
+**Frozen types/constants (contracts.rs):**
 
 ```rust
 pub const CHANNEL_VERSION: u32 = 1;
@@ -89,78 +81,71 @@ pub const SETUP_GUARD: Duration = Duration::from_secs(5);
 pub const IDLE_GUARD: Duration = Duration::from_secs(60);
 pub const REQUEST_GUARD: Duration = Duration::from_secs(30);
 
+pub enum ReadLoopScope { Wait, LogsFollow, EventsFollow, Notify }
 pub struct ConfiguredRoute {
-    pub ssh: String,
-    pub remote_binary: String,
+    pub ssh: String, pub remote_binary: String,
     pub ssh_config_file: Option<PathBuf>,
 }
 pub struct RouteDigest(String);
-pub struct ControllerAccount {
-    pub uid: u32,
-    pub username: String,
-    pub home: PathBuf,
-}
+pub struct UuidString(String);
+pub struct ControllerAccount { pub uid: u32, pub username: String, pub home: PathBuf }
 pub struct ServiceIdentity {
-    pub protocol_version: u32,
-    pub channel_version: u32,
-    pub controller_client_id: ClientId,
-    pub account: ControllerAccount,
-    pub leader: ProcessIdentity,
-    pub service_generation: Uuid,
-    pub journal_id: Uuid,
-    pub socket_path: PathBuf,
-    pub features: Vec<String>,
+    pub protocol_version: u32, pub channel_version: u32,
+    pub controller_client_id: ClientId, pub account: ControllerAccount,
+    pub leader: ProcessIdentity, pub service_generation: UuidString,
+    pub socket_path: PathBuf, pub features: Vec<String>,
+    pub journal_id: Option<UuidString>,
 }
-pub struct SocketIdentity {
-    pub route_sha256: RouteDigest,
-    pub service: ServiceIdentity,
-}
+pub struct SocketIdentity { pub route_sha256: RouteDigest, pub service: ServiceIdentity }
 pub struct Pin {
-    pub schema_version: u32,
-    pub route_sha256: RouteDigest,
-    pub controller_client_id: ClientId,
-    pub account: ControllerAccount,
+    pub schema_version: u32, pub route_sha256: RouteDigest,
+    pub controller_client_id: ClientId, pub account: ControllerAccount,
 }
 pub struct EntryIdentity {
-    pub device: u64, pub inode: u64, pub owner: u32,
-    pub kind: u32, pub mode: u32,
+    pub device: u64, pub inode: u64, pub owner: u32, pub kind: u32, pub mode: u32,
 }
-pub struct SocketBinding {
-    pub parent: EntryIdentity, pub socket: EntryIdentity,
-}
+pub struct SocketBinding { pub parent: EntryIdentity, pub socket: EntryIdentity }
+pub struct RunningImage { pub path: PathBuf, pub device: u64, pub inode: u64 }
+pub struct PinnedExecutable { pub path: PathBuf, pub binding: EntryIdentity }
 pub struct ServiceRecord {
-    pub schema_version: u32,
-    pub service: ServiceIdentity,
-    pub binding: SocketBinding,
+    pub schema_version: u32, pub service: ServiceIdentity,
+    pub binding: SocketBinding, pub executable: PinnedExecutable,
 }
 pub struct ForwardPath {
-    pub directory: PathBuf,
-    pub directory_identity: EntryIdentity,
+    pub directory: PathBuf, pub directory_identity: EntryIdentity,
     pub socket_path: PathBuf,
 }
-pub enum SocketIdentityResult {
-    Available(SocketIdentity), Unavailable(ChannelReason),
+pub struct MasterPlan {
+    pub control_path: PathBuf, pub parent: EntryIdentity,
+    pub bootstrap_request: ProcessRequest,
 }
-pub enum ChannelFailure {
-    Unavailable(ChannelReason), UnverifiedReply,
-}
+pub enum SocketIdentityResult { Available(SocketIdentity), Unavailable(ChannelReason) }
+pub enum ChannelFailure { Unavailable(ChannelReason), UnverifiedReply }
 pub enum ChannelReason {
     Unsupported, ServiceUnavailable, PinMismatch, UnsafePath,
     ForwardLost, Busy, InvalidFrame, Timeout, Cancelled,
+}
+pub enum ForwardDisposition { Cleaned, Retained }
+pub struct ForwardOpenFailure {
+    pub failure: ChannelFailure, pub disposition: ForwardDisposition,
 }
 pub trait ChannelRuntime: Send + Sync {
     fn now(&self) -> Duration;
     fn cancelled(&self) -> bool;
 }
-pub struct ExchangeContext {
-    pub runtime: Arc<dyn ChannelRuntime>,
+pub struct ClientContext<'a> {
+    pub runtime: &'a dyn ChannelRuntime,
     pub deadline: Duration,
+    pub should_stop: &'a dyn Fn() -> bool,
+}
+pub struct CleanupContext {
+    pub runtime: Arc<dyn ChannelRuntime>, pub deadline: Duration,
+}
+pub struct ServerContext {
+    pub runtime: Arc<dyn ChannelRuntime>, pub deadline: Duration,
     pub cancelled: Arc<AtomicBool>,
 }
-pub struct DecodeProgress {
-    pub consumed: usize,
-    pub payload: Option<Vec<u8>>,
-}
+pub struct DecodeProgress { pub consumed: usize, pub payload: Option<Vec<u8>> }
 pub trait FrameDecoder: Send {
     fn feed(&mut self, input: &[u8]) -> Result<DecodeProgress, ChannelFailure>;
     fn retained_bytes(&self) -> usize;
@@ -175,10 +160,14 @@ pub trait ChannelCodec: Send + Sync {
     fn decode_reply(&self, payload: &[u8], request: &ControllerRequest) -> Result<ProcessResult, ChannelFailure>;
 }
 pub trait ChannelExecutor: Send + Sync {
-    fn run(&self, wire_frame: &[u8], ctx: &ExchangeContext) -> Result<ProcessResult, WorkerError>;
+    fn run(&self, frame: &[u8], ctx: &ServerContext) -> ProcessCompletion;
+}
+pub trait RunningImageSource: Send + Sync {
+    fn capture(&self) -> Result<RunningImage, ChannelFailure>;
 }
 pub trait IdentitySource: Send + Sync {
-    fn read(&self, raw: &dyn ProcessRunner, route: &ConfiguredRoute, ctx: &ExchangeContext) -> Result<SocketIdentity, ChannelFailure>;
+    fn read(&self, raw: &dyn ProcessRunner, route: &ConfiguredRoute,
+        master: Option<&MasterPlan>, ctx: &ClientContext<'_>) -> Result<SocketIdentity, ChannelFailure>;
 }
 pub trait PinStore: Send + Sync {
     fn verify_or_create(&self, paths: &PathLayout, identity: &SocketIdentity) -> Result<(), ChannelFailure>;
@@ -187,304 +176,218 @@ pub trait PinStore: Send + Sync {
 pub trait ForwardPaths: Send + Sync {
     fn allocate(&self, paths: &PathLayout) -> Result<ForwardPath, ChannelFailure>;
     fn validate_socket(&self, path: &ForwardPath) -> Result<EntryIdentity, ChannelFailure>;
-    fn cleanup(&self, path: &ForwardPath, socket: Option<EntryIdentity>) -> Result<(), ChannelFailure>;
+    fn cleanup_if_refused(&self, path: &ForwardPath, socket: Option<EntryIdentity>,
+        ctx: &CleanupContext) -> ForwardDisposition;
 }
 pub trait ForwardLease: Send {
     fn local_socket(&self) -> &Path;
     fn verify(&self) -> Result<(), ChannelFailure>;
-    fn cancel(&mut self, raw: &dyn ProcessRunner, ctx: &ExchangeContext) -> Result<(), ChannelFailure>;
+    fn cancel(&mut self, raw: &dyn ProcessRunner, ctx: &CleanupContext) -> ForwardDisposition;
 }
 pub trait ForwardControl: Send + Sync {
-    fn open(&self, raw: &dyn ProcessRunner, route: &ConfiguredRoute, identity: &SocketIdentity, ctx: &ExchangeContext) -> Result<Box<dyn ForwardLease>, ChannelFailure>;
+    fn resolve(&self, raw: &dyn ProcessRunner, route: &ConfiguredRoute,
+        ctx: &ClientContext<'_>) -> Result<MasterPlan, ChannelFailure>;
+    fn open(&self, raw: &dyn ProcessRunner, master: &MasterPlan, identity: &SocketIdentity,
+        ctx: &ClientContext<'_>) -> Result<Box<dyn ForwardLease>, ForwardOpenFailure>;
 }
 pub trait SocketSession: Send {
-    fn exchange(&mut self, wire_frame: &[u8], request: &ControllerRequest, ctx: &ExchangeContext) -> Result<ProcessResult, ChannelFailure>;
+    fn exchange(&mut self, frame: &[u8], request: &ControllerRequest,
+        ctx: &ClientContext<'_>) -> Result<ProcessResult, ChannelFailure>;
     fn close(&mut self);
 }
 pub trait SocketConnector: Send + Sync {
-    fn connect(&self, local: &Path, identity: &SocketIdentity, ctx: &ExchangeContext) -> Result<Box<dyn SocketSession>, ChannelFailure>;
+    fn connect(&self, local: &Path, identity: &SocketIdentity,
+        ctx: &ClientContext<'_>) -> Result<Box<dyn SocketSession>, ChannelFailure>;
 }
 pub struct ClientDeps {
-    pub identity: Arc<dyn IdentitySource>,
-    pub pins: Arc<dyn PinStore>,
-    pub forwards: Arc<dyn ForwardControl>,
-    pub connector: Arc<dyn SocketConnector>,
+    pub identity: Arc<dyn IdentitySource>, pub pins: Arc<dyn PinStore>,
+    pub forwards: Arc<dyn ForwardControl>, pub connector: Arc<dyn SocketConnector>,
     pub runtime: Arc<dyn ChannelRuntime>,
 }
 ```
 
-Derive Clone/Debug/Eq where the contained types allow it, Serialize/validated Deserialize for wire/data types, and use manual equality for any reused account representation. Define `ConfiguredRoute::new(&ControllerConfig, &SshConfig) -> Result<Self, WorkerError>`, `digest() -> RouteDigest`, `Pin::from_identity(&SocketIdentity) -> Pin`, `SocketIdentity::validate()`, `verify_expected_service(expected, actual) -> Result<(), ChannelFailure>`, `ExchangeContext::remaining() -> Result<Duration, ChannelFailure>` and `ExchangeContext::for_cleanup(Arc<dyn ChannelRuntime>) -> ExchangeContext`. Cleanup context retains the monotonic clock/5 s limit but ignores an already-consumed foreground cancel signal; it cannot admit application requests. Feature lists cap 64 entries of 64 bytes each and require sorted uniqueness; final encoded identity cap also applies. Home/account fields are UTF-8/no controls, absolute home, username at most 256 bytes, and no nil IDs.
+Define `ConfiguredRoute::new(&ControllerConfig,&SshConfig)`/digest(), `UuidString::{new_v4,parse,as_str}`, `Pin::from_identity`, `eligible_read(scope,request)`, `server_eligible_read(request)`, `verify_expected_service(expected,actual)` excluding journal hints, and remaining/check methods on both contexts. Client check invokes should_stop every time as well as runtime/deadline. Cleanup context uses clock-only 5 s budget and cannot be used for application setup/read. Feature cap 64 entries/64 bytes, sorted unique; account/home bounded UTF-8/no controls and absolute home; pin schema strict. Canonical UUID string parsing rejects nil/non-v4/noncanonical text, journal equals service when present, duplicates and caps. Explicit Serialize/Deserialize wrappers, never deriving serde on bare Uuid or adding uuid features. Clone/Debug/Eq only where contained types permit.
 
-testing.rs provides `identity_fixture() -> SocketIdentity`, `request_fixture(command: &str, body: Value) -> ControllerRequest`, `result_fixture(request: &ControllerRequest, result: Value, exit_code: u8) -> ProcessResult`; `ManualRuntime::{default,advance(Duration),cancel}`; `RecordingRunner::{new(Vec<Result<ProcessResult,WorkerError>>),calls() -> Vec<ProcessRequest>}`; `ScriptedIdentitySource::new(Vec<Result<SocketIdentity,ChannelFailure>>)`; `MemoryPinStore::{default,pin() -> Option<Pin>}`; `FakeForwardControl::{new(PathBuf),opens() -> usize,cancels() -> usize,fail_next(ChannelReason)}`; `ScriptedConnector::{new(Vec<Result<ProcessResult,ChannelFailure>>),frames() -> Vec<Vec<u8>>,connections() -> usize}`; `RecordingExecutor::{new(Vec<Result<ProcessResult,WorkerError>>),frames() -> Vec<Vec<u8>>}`; `FakeForwardPaths` and `StubCodec` implementing the gate's traits. Fakes do not touch real SSH, hosts or notifications. Only real codec tests assert byte grammar; StubCodec is explicitly not a wire implementation.
-
-- [ ] Write contracts tests red: every changed route member changes the digest; stable Pin ignores leader/generation/journal/features; expected-service check rejects each changed required identity field; invalid IDs/schema/feature size/path/pin size reject. Seed every downstream test module with a relevant passing gate assertion. Add the actual mutation no-retry/pending-envelope case below before changing its classification.
+**Cleanup seam (src/process.rs, frozen):**
 
 ```rust
-#[test]
-fn stable_pin_does_not_pin_service_or_journal_generation() {
-    let first = identity_fixture();
-    let mut restarted = first.clone();
-    restarted.service.service_generation = Uuid::new_v4();
-    restarted.service.journal_id = Uuid::new_v4();
-    assert_eq!(Pin::from_identity(&first), Pin::from_identity(&restarted));
-    assert!(verify_expected_service(&first, &restarted).is_err());
+pub enum CleanupState { Completed, Unknown }
+pub struct ProcessCompletion {
+    pub outcome: Result<ProcessResult, WorkerError>, pub cleanup: CleanupState,
+}
+pub trait TrackedProcessRunner: ProcessRunner {
+    fn run_interruptible_with_cleanup(&self, request: &ProcessRequest,
+        should_stop: &dyn Fn() -> bool) -> ProcessCompletion;
 }
 ```
 
-- [ ] Run red and confirm selected counts: `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_contracts::/)'`. Build contracts/fakes and add `WorkerError::ControllerUnverifiedReply(Box<WorkerError>)`, delegating its public code/exit/redaction to the safe cause, never serializing new wire fields. In classify_mutation_exchange handle that variant before generic Err becomes Ambiguous:
+SystemProcessRunner shares one internal spawn/capture implementation for existing methods and the companion trait; existing methods return outcome unchanged. No fourth private-umask ProcessRunner method. Completed requires reap/owned-group-gone and joined stdin/captures, or proven no child; unknown detach/cleanup failure/panic never becomes Completed. Preserve original error/status/code/redaction. Extend three-method delegation for &T and add Arc<T> delegation; tracked wrappers delegate the companion only where T implements it. Fakes explicitly supply cleanup evidence, with no unsafe default proof.
 
-```rust
-Err(WorkerError::ControllerUnverifiedReply(error)) =>
-    return MutationOutcome::UnverifiedAck(*error),
-Err(error) => return MutationOutcome::Ambiguous(error),
-```
+**Fakes (testing.rs):** concrete constructors frozen: identity_fixture(), request_fixture(command,body), result_fixture(request,result,exit_code); ManualRuntime::{default,advance,cancel}; RecordingRunner::{new(Vec<Result<ProcessResult,WorkerError>>),calls}; RecordingTrackedRunner::{new(Vec<ProcessCompletion>),calls}; ScriptedImageSource::new(Vec<Result<RunningImage,ChannelFailure>>); ScriptedIdentitySource::new(Vec<Result<SocketIdentity,ChannelFailure>>); MemoryPinStore::{default,pin}; FakeForwardControl::{new(PathBuf),opens,cancels,resolutions,set_disposition(ForwardDisposition),fail_next(ForwardOpenFailure)}; ScriptedConnector::{new(Vec<Result<ProcessResult,ChannelFailure>>),frames,connections}; RecordingExecutor::{new(Vec<ProcessCompletion>),frames}; FakeForwardPaths and StubCodec. All receive/poll the frozen context; fake identity/forward work consumes no raw application replies. Byte grammar is proved only with real codec tests. Test modules define their own local layout/config/gate fixtures; no unspecified tests/support APIs.
 
-- [ ] Add `ProcessRunner::run_private_interruptible(&self, request: &ProcessRequest, should_stop: &dyn Fn() -> bool) -> Result<ProcessResult,WorkerError>` with default delegation; implement SystemProcessRunner by sharing its existing spawn/capture path and setting umask 077 only in child pre_exec. Preserve run/run_in_new_session/run_interruptible behavior. Extend the existing `ProcessRunner for &T` delegation (`src/process.rs:86`) and add `ProcessRunner for Arc<T>` for all four methods, including the private hook: T7 uses both borrowed and owned shared raw runners. Test child mask and unchanged normal/new-session policies using a fixture process, plus fake delegation/cancellation through both wrappers. No new ProcessRequest field or shell wrapper. Expose existing health `observe_leader` as pub(crate) without changing its behavior/DTO.
-- [ ] Rerun controller contracts plus `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^process::tests::|^controller::execute::tests::|^error::tests::/)'`; inspect actual module names/nonzero counts before relying on the filter. Run all seeded modules using controller `/^controller_socket_/`, transfer `/^controller_socket_forward::/`, cli `/^controller_channel::/`. None is an empty target. Format/clippy; review the complete frozen API and serde fixtures against spec Decisions 3, 6–8, 10.
-- [ ] Commit all gate paths: `feat(controller): freeze persistent channel interfaces and fakes`. Record commit hash/API ownership and hand off T2–T6. No feature advertisement or production socket attempt.
+- [ ] Red contract tests: every route field changes digest; scope/body allowlist includes four loop families and excludes every D1 raw family, even identical logs bytes outside follow; mixed selectors invalid. Expected service rejects changed required fields but accepts absent/changed journal; malformed UUID string/size/schema rejects. ClientContext polls a borrowed non-Send/non-Sync predicate after entry without command-runtime cancellation. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_contracts::/)'`, count >0.
+- [ ] Implement contracts/fakes, empty facade/test declarations and meaningful gate seeds. Expose observe_leader as pub(crate) only. No concrete sibling imports, todo/panic production stubs or advertising.
+- [ ] Red runner cleanup tests before refactor: success, nonzero exit, no-child spawn failure, fully cleaned timeout/cancel, stdin error, abandoned capture/kill-budget uncertainty; outcome identical for old callers. Fake/wrapper delegation preserves should_stop. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^process::tests::/)'` red; implement tracked seam; same green. Do not change session policies/umask.
+- [ ] Green contracts and all seeded modules: controller `/^controller_socket_/`, transfer `/^controller_socket_forward::/`, cli `/^controller_channel::/`; each exact filter selects nonzero. Check frozen serialization fixtures and cleanup ownership; fmt/clippy. Commit `feat(controller): freeze read channel contracts and cleanup evidence` and publish gate hash. No process.rs edit mid-wave.
 
-**Acceptance:** all consumers can compile against one gate; fakes have concrete method names; no unverified reply can enter mutation retry; private-spawn hook is tested; old send functions/stdio tests remain usable; downstream modules exist with nonzero seeded tests.
+**Acceptance:** D1 eligibility, D4 disposition, D6 predicate and D7 evidence are compile-ready; optional journal/string UUID and three-method runner compatibility tested. Every parallel consumer can build against sibling fakes.
 
-## T2 — bounded codec and client session I/O
+## T2 — bounded codec and synchronous client session I/O
 
-**Files:** Modify src/controller/channel/codec.rs; create src/controller/channel/codec/io.rs; own tests/controller/controller_socket_codec.rs. No controller/protocol.rs, Cargo or frozen contract edit.
+**Files:** codec.rs, codec/io.rs, tests/controller/controller_socket_codec.rs. **Produces:** `SessionCodec::new()` implementing ChannelCodec; `BoundedFrameDecoder`; `FramedSocketConnector::new(Arc<dyn ChannelCodec>)` implementing SocketConnector. **Consumes:** frozen contexts/identities/decoder/limits. No protocol.rs/Cargo edit.
 
-**Consumes:** ChannelCodec/FrameDecoder/SocketConnector/SocketSession, validated SocketIdentity, ExchangeContext and bound constants from T1; existing encode_frame/parse_request/deserialize_unique_json. **Produces:** `SessionCodec::new() -> SessionCodec` implementing ChannelCodec; `FramedSocketConnector::new(Arc<dyn ChannelCodec>) -> FramedSocketConnector` implementing SocketConnector. Its connection sends hello, validates ready and then exchanges one raw existing RPC frame for one wrapped reply. `BoundedFrameDecoder` implements FrameDecoder.
+**Grounding:** strict EOF/bounds/duplicates `src/controller/protocol.rs:62`, `src/controller/protocol.rs:90`, `src/controller/protocol.rs:199`, `src/controller/protocol.rs:211`; status interpretation `src/controller/execute.rs:872`.
 
-**Grounding:** inclusive frame bound/EOF `src/controller/protocol.rs:62`, `src/controller/protocol.rs:90`, `src/controller/protocol.rs:199`; duplicate JSON `src/controller/protocol.rs:211`; stdio statuses/errors `src/lib.rs:1778`, `src/controller/execute.rs:872`.
+- [ ] Red prefix/payload splits, coalesced frames consumed count, EOF partial, zero/oversize/u32 max before allocation, retained bytes, nested duplicate keys, strict hello/tolerant ready, UUID string errors and null/missing journal accepted. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_codec::/)'` red/nonzero; implement one-frame decoder without tail queue; same green.
+- [ ] Red wrapper status 0/69/75, exact outer ID/digest, unchanged inner read/error JSON, wrong common inner version/command/ID/digest, signalled/invalid output, whole cap including wrapper and maximum-size inner requiring intact fallback. Decode uses ControllerReadReply<Value>::verify_envelope for non-error payloads before returning ProcessResult; typed payload checks stay downstream. Preserve status/framed inner JSON; no mutation classifier. Implement, same filter green.
+- [ ] Red UnixStream fixture hello-before-RPC, changed stable/service/route identity, optional journal changes, partial read/write, EOF/cancel/deadline. Borrow independent should_stop through connect/write/read with a predicate capturing Rc plus an externally toggled flag; command runtime stays uncancelled. Use readiness channels/hooks, >=30 s hang guards. Implement nonblocking readiness/poll client I/O with live ClientContext, no predicate moved into 'static worker. No application frame on failed hello.
+- [ ] Rerun filter, fmt/clippy, commit `feat(controller): frame sequential read channel sessions`.
 
-- [ ] Write red cases for every prefix/payload split, two coalesced frames with exact consumed count, multiple sequential frames, EOF partial prefix/payload, zero/oversize/u32 max length before allocation, retained-bytes bound, duplicate nested keys, hello/ready 8 KiB cap, unknown hello fields and missing identity. Seed with the real decoder behavior:
+**Acceptance:** real grammar/I/O bounds, required identity checks, optional journal and independent cancellation pass; old EOF stays strict; exit/status payload survives.
 
-```rust
-#[test]
-fn decoder_extracts_one_frame_without_retaining_the_next() {
-    let one = encode_frame(br#"{"kind":"hello"}"#).unwrap();
-    let two = encode_frame(br#"{"command":"task.list"}"#).unwrap();
-    let both = [one.as_slice(), two.as_slice()].concat();
-    let codec = SessionCodec::new();
-    let mut decoder = codec.decoder();
-    let decoded = decoder.feed(&both).unwrap();
-    assert_eq!(decoded.consumed, one.len());
-    assert_eq!(decoded.payload.unwrap(), br#"{"kind":"hello"}"#);
-    assert!(decoder.retained_bytes() <= MAX_FRAME_BYTES + 4);
-}
-```
+## T3 — nonblocking listener, bounded native control and tracked child
 
-- [ ] Run red: `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_codec::/)'`. Implement prefix-first length validation, one-frame extraction, unique JSON parsing and schema checks. No buffering tail frames or modifying strict stdio read_frame.
-- [ ] Add red wrapper tests: unchanged inner ACK/read/HostControlError, exit codes 0/69/75, signalled child as loss, wrong outer request ID/digest as UnverifiedReply, additive ready/reply fields, payload with split UTF-8/log bytes, exact 1 MiB final frame, inner-at-limit requiring fallback instead of truncation. Test requests retain original bytes. Rerun red, then implement wrapper encoding/decoding into ProcessResult; old inner DTO validators remain downstream.
-- [ ] Add isolated UnixStream fixture tests red for hello-before-RPC, EOF/deadline/cancel while reading/writing, short/partial writes, ready generation/journal/client/account/route mismatch and no application write on mismatch. Use channels/ManualRuntime; for real blocking waits use at least a 30 s hang guard. Implement nonblocking readiness/poll I/O with the context's remaining budget and 8 KiB scratch, closing on failure. No general connection pool or signal installer.
-- [ ] Rerun the same filter green, format/clippy and commit: `feat(controller): add bounded persistent channel framing`.
+**Files:** server.rs, server/child.rs, server/control.rs, tests/controller/controller_socket_service.rs. No runtime.rs/lib.rs/process.rs during wave.
 
-**Acceptance:** grammar and identity are tested with the real codec/I/O; per-connection allocations are bounded; no stdio EOF relaxation; whole reply status/identity survives; a malformed or stale ready never sends a task request.
+**Consumes:** T1 ChannelCodec/ChannelExecutor/RunningImageSource, owned ServerContext, ProcessCompletion and tracked runner; prebound nonblocking std UnixListener and ServiceIdentity. Test with StubCodec/RecordingExecutor/source gates. **Produces:** `NativeControl::new()` with `try_run<T:Send+'static>(Box<dyn FnOnce()->T+Send>) -> Result<tokio::sync::oneshot::Receiver<T>,ChannelFailure>`, at most one native job/no queued replacement; `ServerDeps { codec:Arc<dyn ChannelCodec>, executor:Arc<dyn ChannelExecutor>, runtime:Arc<dyn ChannelRuntime> }`; `SocketService::start(listener:std::os::unix::net::UnixListener,service:ServiceIdentity,deps:ServerDeps,shutdown:Arc<AtomicBool>) -> Result<SocketService,WorkerError>` called inside the already-entered runtime; `ready(&self) -> bool`; `async wait_ready(&self) -> Result<(),WorkerError>` backed by an explicit readiness notification; `async shutdown(&self,ctx:&ServerContext) -> ShutdownEvidence`, where evidence contains completed/unknown usize counts. Caller awaits readiness before submitting publication; neither a bound pathname nor start returning implies readiness. `ChildRpcSpec { executable:PinnedExecutable, config:PathBuf, environment:Vec<(OsString,OsString)> }`; `ChildRpcExecutor::new(Arc<dyn TrackedProcessRunner>,ChildRpcSpec)` implementing ChannelExecutor. Caller owns blocking filesystem/image work via NativeControl, and publication after readiness.
 
-## T3 — bounded server and per-request child supervisor
+**Grounding:** child entry/exit `src/lib.rs:1755`, `src/lib.rs:1778`; current-thread signals/tick `src/lib.rs:1678`, `src/controller/runtime.rs:81`, `src/controller/runtime.rs:95`; capture/group cleanup `src/process.rs:401`, `src/process.rs:457`; survey ten-item audit/spec Decisions 2–3.
 
-**Files:** Modify src/controller/channel/server.rs; create src/controller/channel/server/child.rs; own tests/controller/controller_socket_service.rs. No lib.rs/runtime.rs/store/client-state/events/process changes during the wave.
+- [ ] Red tests for hello/peer uid, no app before ready, 16 sessions including incomplete handshakes, 8 permits including unknown cleanup, disallowed command/body before spawn, independent progress during long-poll, malformed/empty/oversize child reply, supervisor panic containment. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_service::/)'` red/nonzero.
+- [ ] Implement Tokio nonblocking listener/session state machine and try-only bounds. Native child threads hold permits and report completion through oneshot; no spawn_blocking/unbounded join. NativeControl accepts one job; a gated RunningImageSource/stat/write job cannot block runtime signal or control-task progress. Test native metadata entry barrier plus signal/another runtime task. Runtime only sees shared status, not a direct image/stat call.
+- [ ] Red completion-handoff test: hold final reply write, prove early next bytes are rejected; release completion, send next request immediately, and prove simultaneous read/write readiness handles final write completion before next-request inspection. Implement explicit reply-completed state transition. No read-ahead queue.
+- [ ] Red fixed child argv/roots/EOF/caps/deadline and recorded pinned executable path. Constructor refuses arbitrary argv/env. Child uses tracked runner/ServerContext cancellation; no installed-path check per request. Use completed versus unknown fake results, then more than 8 real fully cleaned cancellations retain availability and 8 deliberate abandoned cleanups retire it. Retain unknown permit on panic; normal nonzero child with joined cleanup may release it.
+- [ ] Red actual child-group cancellation: a fixture child plus group descendant report entry; close stream/cancel/deadline/shutdown; prove group gone/reap plus capture completion, and detached task group survives. A flag assertion alone is insufficient. Test bounded Unknown outcome for gated cleanup; never replenish. Runtime shutdown closes listener/streams and drives native cancellation before its future finishes; no synchronous record withdrawal/runtime joins. Caller handles exact native cleanup.
+- [ ] Green same filter, fmt/clippy; commit `feat(controller): supervise pinned read RPC children`.
 
-**Consumes:** prebound std::os::unix::net::UnixListener; ServiceIdentity; ChannelCodec, ChannelExecutor, ChannelRuntime/ExchangeContext; a shared Arc<AtomicBool> shutdown flag. Test with StubCodec/RecordingExecutor and a gate-based blocking executor, independently of T2/T4. **Produces:** `ServerDeps { codec: Arc<dyn ChannelCodec>, executor: Arc<dyn ChannelExecutor>, runtime: Arc<dyn ChannelRuntime> }`; `SocketService::start(listener: UnixListener, service: ServiceIdentity, deps: ServerDeps, shutdown: Arc<AtomicBool>, runtime: &tokio::runtime::Runtime) -> Result<SocketService,WorkerError>`; `SocketService::{ready() -> bool, stop()}`. Start drives a readiness barrier on the caller's runtime before returning success; a bound pathname alone is not readiness. The leader calls start before entering its tick block_on, rather than nesting block_on inside an async task. `ChildRpcSpec { executable: PathBuf, config: PathBuf, environment: Vec<(OsString,OsString)>, binary_identity: Arc<dyn BinaryIdentitySource> }`; `ChildRpcExecutor::new(Arc<dyn ProcessRunner>, ChildRpcSpec) -> ChildRpcExecutor` implementing ChannelExecutor with fixed argv and raw frame stdin/EOF. Production injects the captured SystemBinaryIdentitySource; tests use the existing FixedBinaryIdentitySource. Caller owns filesystem advertisement/unlink.
+**Acceptance:** ten process assumptions preserved in children, runtime remains signal-responsive during gated blocking control work, real group cancellation and cleanup evidence govern permits, correct sequential handoff, no synchronous filesystem admission.
 
-ServerDeps also contains `binary_identity: Arc<dyn BinaryIdentitySource>`, shared with ChildRpcSpec. Server checks it before hello and admission; executor checks again immediately before spawn. Missing/changed evidence or exhausted permits retires only the optional listener/streams and makes ready false, without setting the leader's shared shutdown flag. No new listener starts in that leader. A remaining service record is unavailable because its local hello probe fails; caller-owned withdraw/cleanup still uses exact bindings on stop.
+## T4 — rooted image link, service identity, stable pin and refusal cleanup
 
-**Grounding:** child entry/error `src/lib.rs:1755`, `src/lib.rs:1778`; handler branches/publisher `src/controller/execute.rs:568`; process cancellation/groups/capture `src/process.rs:131`, `src/process.rs:185`, `src/process.rs:401`; leader tick/signal `src/controller/runtime.rs:56`, `src/lib.rs:1683`; binary source/test fake `src/binary_identity.rs:57`, `src/binary_identity.rs:85`; survey section 3/spec Decision 2.
+**Files:** files/image/identity/pin.rs; minimal rooted_fs.rs; tests/controller/controller_socket_identity.rs. No sibling server or transport concrete dependency.
 
-- [ ] Write red tests for not-ready admission, wrong peer uid/hello identity, no request before hello, 16-session cap including incomplete hello, 8-supervisor cap including cleanup, one in flight, pipeline bytes/partial second frame causing cancel, independent session progress while another long-poll blocks, child panic/invalid/empty/oversize/signalled result closing only one connection. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_service::/)'` red with nonzero count.
-- [ ] Implement the small state machine and try-only permit admission; no request queues or detached unbounded task spawning. Use the caller's runtime for I/O; share its shutdown flag. Run each admitted synchronous executor on a native thread holding its permit, with oneshot completion and panic containment. Do not put it on Tokio spawn_blocking or join it during runtime/leader shutdown. Set cancellation on socket EOF/extra data/deadline. An executor gate is the deterministic stall probe:
+**Consumes:** RunningImageSource/RunningImage/PinnedExecutable, records/bindings, identity/pin/ForwardPaths/context traits, exposed observe_leader. **Produces:** `SystemRunningImageSource::new()` implementing RunningImageSource; `PrivateChannelFiles::new()` implementing ForwardPaths; `bind_leader(paths:&PathLayout,leader:&ControllerLeader,image:&RunningImage,generation:&UuidString) -> Result<LeaderSocketLease,WorkerError>`; lease methods take_listener(), binding(), executable(), publish(&ServiceIdentity), withdraw(). All are blocking and called only on T3 native control jobs. `read_live_service(paths,home,codec,ctx:&ClientContext) -> Result<Option<ServiceIdentity>,WorkerError>` for stdio child readers, no new store/journal. `is_socket_selector(request)`, `serve_identity_selector(request,paths,home,codec,ctx) -> Result<Vec<u8>,WorkerError>`. `StdioIdentitySource::new()` implements IdentitySource; Some(MasterPlan) uses its validated original-config bootstrap request, None uses ordinary raw request. `PrivatePinStore::new()` implements PinStore.
 
-```rust
-struct GatedExecutor {
-    entered: std::sync::mpsc::Sender<Vec<u8>>,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<ProcessResult>>,
-}
+**Grounding:** existing client-id location/read `src/client_state.rs:70`, `src/controller/events/task_reads.rs:851`; account/liveness `src/controller/init.rs:654`, `src/controller/health_read.rs:175`; unsafe pathname-only image stat `src/binary_identity.rs:31`; rooted read/create/replace `src/rooted_fs.rs:1383`, `src/rooted_fs.rs:2216`, `src/rooted_fs.rs:1831`. Loaded-image API and hard-link rules are spec Decision 2.
 
-impl ChannelExecutor for GatedExecutor {
-    fn run(&self, bytes: &[u8], ctx: &ExchangeContext) -> Result<ProcessResult, WorkerError> {
-        self.entered.send(bytes.to_vec()).unwrap();
-        while ctx.remaining().is_ok() {
-            match self.release.lock().unwrap().try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => std::thread::yield_now(),
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        Err(ProcessError::Cancelled.into())
-    }
-}
-```
+- [ ] Red loaded-image vs current_exe/installed dev/ino agreement, unsupported/unverifiable source, source/link swap hook and EXDEV. Implement macOS mapped main-header vnode lookup plus strict result/region validation, and rooted no-replace link/evidence. Original file must be owned regular executable without unsafe write modes; preserve mode, never chmod link. Name includes full generation UUID to prevent path reuse. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_identity::/)'` red/nonzero, then green.
+- [ ] Red executable replacement/rollback barrier between leader link creation and spawn: temp executables output old/new markers; spawning pinned link still executes old. Source replaced before linking must fail when it differs from the loaded image. Unknown identity means no publication and healthy raw service. Test exact prior-link cleanup only; unknown link residue preserved. No binary hash or installer-fence dependency.
+- [ ] Red socket/record matrix: private owner/mode/type/dev/ino, wrong-owner/symlink/FIFO/file/live socket preserved, exact prior record + dead/reused identity + ECONNREFUSED before stale unlink; swapped parent/entry hooks preserve replacements. Missing creation evidence disables optional setup; missing socket/safely stale record can recover. Implement descriptor-relative unlink, before/after lineage for bind/connect, native-only publication/withdrawal. No broad deletion or cleanup journal.
+- [ ] Red read-only selector grammar/mixed selectors, existing PathLayout.state/client-id, missing client-id does not create it, zero receipts/active rows, live listener proof, unavailable journal still available for wait/logs, optional journal/string validation. Implement existing-only identity with no load_or_create_client_id, ControllerStore or journal initializer; journal hint comes from service record/leader initialization. Borrowed should_stop interrupts raw bootstrap; Some master retains original -F/trust and literal -S.
+- [ ] Red pin first/concurrent bootstrap, generation/journal restart stable, route/client/account mismatch, unsafe/corrupt/hardlink/oversize pin, exact expected-client repin with fresh raw identity. Implement private no-replace/exact replacement and preserve notify-cache digest/path/lock and envelopes. Tests inspect bytes/mode/inode, not API success alone.
+- [ ] Red fresh forward allocation and cleanup-if-refused: active listener, exit-code-only/no proof, missing entry/timeout, swapped socket/parent all return Retained with residue intact; positive ECONNREFUSED plus exact bindings cleans. Implement bounded local connect and exact unlink/rmdir; no implicit GC. T5 tests with FakeForwardPaths until integration.
+- [ ] Green identity plus `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^rooted_fs::tests::.*channel_socket/)'` using new nonzero channel_socket_* tests; fmt/clippy; commit `feat(controller): pin service images and channel identity`.
 
-The fixture defines entered/release channels and is bounded by a test hang guard; production uses ProcessRunner, not this loop. Hold one gate, obtain another session's verified reply, then close the first and assert cancellation without replenishing its slot. Test an intentionally stuck cleanup gate keeps the slot occupied and never grows the supervisor count. Because ProcessRunner may detach I/O threads on error, retain every runner-error/panic permit for this leader lifetime; only fully captured ProcessResult releases it. Prove eight successive faults/cancellations withdraw availability and fall back to stdio, with no same-leader listener restart. No new cleanup-observer contract is needed.
+**Acceptance:** exact loaded image is executable through link across rename, safe private startup/cleanup, read-only correct client-id source, optional journal, independent notify cache and proven refusal cleanup.
 
-- [ ] Add red ChildRpcExecutor argv/environment/EOF tests with RecordingRunner: absolute captured binary/config, fixed host/controller-rpc args, exact stdin bytes, same HOME/XDG roots, 30 s/1 MiB+4/256 KiB policy, no request-supplied program/env, cancellation through run_interruptible. Add command allowlist tests covering baseline reads/lifecycle/drain/health/transfer/durable commands and unknown shell-looking strings. Implement constructor validation and the existing runner call; require known started/installed binary identities matching the captured path before every spawn, and stop admission on missing/changed identity. Inject the existing identity source for red unknown/replaced-binary tests; binary_is_outdated alone treats unknown as false. Do not hash the binary each request.
-- [ ] Add red shutdown tests: closes listener/streams before another child can enter, sends owned-child cancellation, independently progresses leader-control fake while child is stalled, no second signal installer, no unconditional join of stalled supervision/capture. Detached task execution is outside the cancelled transient RPC group. Server stop is idempotent. Resource permits remain tied to actual cleanup; no "timed out therefore free" shortcut.
-- [ ] Run the same filter green, format/clippy; commit: `feat(controller): supervise RPC children on a private socket`.
+## T5 — expanded master endpoint and exclusive forward lifecycle
 
-**Acceptance:** the ten survey assumptions remain in actual child processes; transport/supervision never invokes handlers in the leader; fault/stall containment and overload are deterministic; shutdown does not wait forever for a request worker; original tick guard ordering remains an integration responsibility.
+**Files:** forward.rs, transport.rs, tests/transfer/controller_socket_forward.rs. **Produces:** `MasterForwardControl::new(paths:PathLayout,files:Arc<dyn ForwardPaths>,ssh:SshConfig)` implementing resolve/open; private transport constructors for resolution/validated bootstrap and config-free check/forward/cancel from MasterPlan. Lease captures endpoint and complete -L cancel request once. **Consumes:** T1 MasterPlan/ForwardDisposition/ForwardOpenFailure and borrowed contexts; FakeForwardPaths for wave tests.
 
-## T4 — rooted socket files, identity selector and stable pin
+**Grounding:** original -F/options/master namespace `src/transport.rs:894`, `src/transport.rs:943`, `src/transport.rs:979`, `src/transport.rs:1001`; managed Host * fallback `src/controller/provision.rs:536`; ordinary forwarding clearing `src/transport.rs:938`; ssh program override safety `src/transport.rs:1194`. External expansion/control rationale is spec Decision 5.
 
-**Files:** src/controller/channel/files.rs, identity.rs, pin.rs; minimal src/rooted_fs.rs socket bind/evidence/unlink helpers only; tests/controller/controller_socket_identity.rs. No changes to health_read.rs or execute.rs after the gate, and no events journal implementation edits.
+- [ ] Red bounded ssh -G resolution with exactly original worker configuration and command-line master options; one concrete expanded controlpath, owner/private parent, socket mode/type/dev/ino after bootstrap, byte lengths/creation suffix, none/unexpanded/%/$/ambiguous output fail before allocation. Fake managed -F includes Host */ControlMaster no/ControlPath none: command-line options win; bootstrap captures literal -S and actual master is that socket, never none. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test transfer -E 'test(/^controller_socket_forward::/)'` red/nonzero; implement resolution/plan with no manual expansion or config parser; same green.
+- [ ] Red actual mux/config fixture, not argv alone: unrelated LocalForward/RemoteForward/DynamicForward, configuration changes between open/cancel, original -F/trust used on identity bootstrap, config-free -F /dev/null literal -S check/open/cancel. Assert exact control messages contain only owned -L (check none), unchanged endpoint after edits and unrelated forwards untouched. Constructors retain BatchMode/no agent/forward failure/keepalives, master mask 0177/unlink=no, ordinary ClearAllForwardings and no private-umask hook/-N/-O exit. Structured argv with spaces/quotes tested.
+- [ ] Red open success/no endpoint, unsafe old-master socket, multiplex off, master expiry, control cancellation exit 0 with an error and listener still live. Close session before cancellation. Require actual refusal/binding proof via ForwardPaths; return Cleaned only on proof, otherwise Retained for caller retirement. Failed open after allocation uses the same proof policy through ForwardOpenFailure. No config reload or shared-master cleanup.
+- [ ] Borrow independent should_stop through -G/-O check/open; bootstrap is tested with T4 fake, no extra cancellation/signal installer. Cleanup uses bounded clock-only context and retains uncertainty on deadline. Same filter green plus `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^transport::tests::.*(multiplex|forward|managed|ssh_argv)/)'`; confirm nonzero; fmt/clippy. Commit `feat(transport): own forwards on a concrete existing master`.
 
-**Consumes:** T1 identities/records/bindings/PinStore/ForwardPaths/IdentitySource, pub(crate) observe_leader, existing RootedDir/private publication and JournalReader::window. Tests use seeded owned roots and real local sockets; no sibling server needed. **Produces:** `PrivateChannelFiles::new() -> PrivateChannelFiles` implementing ForwardPaths; `bind_leader(paths: &PathLayout, leader: &ControllerLeader) -> Result<LeaderSocketLease,WorkerError>`; `LeaderSocketLease::{take_listener() -> UnixListener, binding() -> SocketBinding, publish(&ServiceIdentity), withdraw()}`. `read_live_service(paths: &PathLayout, home: &Path, codec: &dyn ChannelCodec, ctx: &ExchangeContext) -> Result<Option<ServiceIdentity>,WorkerError>` validates existing record/account/client/journal/leader/socket and local hello. `is_socket_selector(&ControllerRequest) -> bool`; `serve_identity_selector(request: &ControllerRequest, paths: &PathLayout, home: &Path, codec: &dyn ChannelCodec, ctx: &ExchangeContext) -> Result<Vec<u8>,WorkerError>`. `StdioIdentitySource::new() -> StdioIdentitySource` implements IdentitySource through the raw private runner. `PrivatePinStore::new() -> PrivatePinStore` implements PinStore.
+**Acceptance:** original authenticated endpoint captured reliably; actual config-defined forward lists cannot leak into control calls; managed no/none overridden for bootstrap; positive cancellation evidence/disposition explicit.
 
-**Grounding:** read-selector rejection `src/controller/read.rs:450`, safe health pattern `src/controller/health_read.rs:233`; account `src/controller/init.rs:654`; client read `src/controller/events/task_reads.rs:851`; journal UUID/window `src/controller/events/journal.rs:355`, `src/controller/events/journal.rs:426`; rooted exact publication/bindings `src/rooted_fs.rs:1003`, `src/rooted_fs.rs:1383`, `src/rooted_fs.rs:1831`, `src/rooted_fs.rs:2216`.
+## T6 — scoped read selection, live cancellation and single fallback
 
-- [ ] Write red socket/file matrix: 0700/0600/euid/type/inode/link checks; symlink/FIFO/regular/wrong-owner/permissive/listening socket untouched; only matching prior record + dead/reused prior ProcessIdentity + ECONNREFUSED + retained parent/entry can unlink stale s. Replace the parent/socket at a pre-unlink hook and assert both replacements survive. Missing evidence/crash before publish disables channel; missing socket plus safely stale record can restart; long/non-UTF-8/colon/control paths decline. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_identity::/)'` red.
-- [ ] Implement descriptor-relative exact-evidence socket unlink and binding validation in rooted_fs, scoped to this socket use. Keep pathname bind/connect's before/after lineage checks and no global cwd/umask. Reuse regular-file publication; do not implement a socket cleanup journal, prefix deletion or a new native enumeration mechanism. Unknown residue is preserved and diagnosed. Use fresh generation after a successful bind; service publication follows ready, never precedes it.
-- [ ] Write red read-selector cases: strict grammar, mixed controller_health/controller_events/list filter rejection, existing-only opener with zero req/active receipts and no new client/journal, unavailable journal/leader/record omits feature, account/client/journal/leader/binding mismatch, generation distinct from journal, local hello probe failure. Implement the minimal identity read. Use a fake codec/probe endpoint for the wave; no actual server dependency. Verify route digest echo/envelope is checked by StdioIdentitySource; raw stdio always, deadline/cancel/private spawn hook, no recursion.
-- [ ] Write red pin cases for first bootstrap, concurrent same/different stable identity, generation/journal restart retained, client/account/route mismatch preserved, corrupt/oversize/symlink/hardlink/wrong-owner pin fail closed, exact repin only with expected ClientId and freshly trusted identity. A concrete file test can use the declared public pin API:
+**Files:** client.rs, tests/controller/controller_socket_client.rs. No execute/error/envelope/lifecycle or event-policy edits.
 
-```rust
-#[test]
-fn a_service_restart_keeps_the_private_stable_pin() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = fixture_paths(root.path());
-    let pins = PrivatePinStore::new();
-    let first = identity_fixture();
-    pins.verify_or_create(&paths, &first).unwrap();
-    let mut restarted = first.clone();
-    restarted.service.service_generation = Uuid::new_v4();
-    restarted.service.leader = ProcessIdentity::new(fixture_pid(2), 2).unwrap();
-    pins.verify_or_create(&paths, &restarted).unwrap();
-}
-```
+**Produces:** `ChannelProcessRunner<R:ProcessRunner>::new(raw:R,scope:ReadLoopScope,route:ConfiguredRoute,paths:PathLayout,deps:ClientDeps)` implementing existing three ProcessRunner methods; `close(&self) -> ForwardDisposition` idempotently closes session then reports cleanup disposition. R is borrowed &dyn ProcessRunner or owned Arc<dyn ProcessRunner>. run_interruptible constructs a borrowed ClientContext directly from should_stop; run uses a local false predicate. No predicate stored/moved into 'static state. **Consumes:** sibling fakes/T1 allowlist; raw arguments to resolve/bootstrap/control avoid recursion/lifetime boxing.
 
-Define `fixture_paths(root: &Path) -> PathLayout` in this owned test file using four private subdirectories; do not invent a tests/support change. Assert file bytes/mode/inode through the actual pin path as well, not only API success.
+- [ ] Red exact configured controller-rpc/frame **and scope** interception; every D1 excluded family delegates byte-identically with zero resolution/pin/forward/socket calls. Same logs bytes outside follow remain raw. New-session/unrelated host/Git/dashboard delegates. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_client::/)'` red/nonzero.
+- [ ] Red setup ordering: resolve concrete master → authenticated raw identity on plan → durable pin → forward → hello → eligible read. Fake siblings consume no raw app replies. Wrong stable/volatile identity, missing feature, unsafe pin, unavailable service use raw; optional journal does not block. Cold <=5 s skips all setup; remaining budget decreases through stages. Implement try-only lazy owner/session checkout; concurrent caller during poll uses raw without queue.
+- [ ] Red loss after partial/full read and no reply, child timeout/EOF, wrapper overflow: exactly one byte-identical raw fallback with same ID/digest and remaining budget. Complete wrong identity means no fallback/new mutation guard; valid read/error remains original outcome. Assert app transmission <=2; eligibility advancing during this exchange cannot create another socket attempt. Existing outer read retry calls retain baseline semantics; no adapter retry loop.
+- [ ] Red independent borrowed should_stop after fixture operation entry at resolve/bootstrap/open/connect/read/write, without runtime cancellation, including Rc-capturing predicate. Cancellation/expiry closes stream and does **not** send raw fallback. Implement polling through frozen context; default ProcessRunner interruptible behavior is insufficient. Cleanup-only clock context cannot admit application work.
+- [ ] Red 1/2/4/5 s backoff with ManualRuntime/no sleeps, one setup owner, reset after verified read, and permanent retirement for unsafe/unsupported/unverified/Retained cleanup. Exit-0 cancel error returns Retained; advance many eligibility instants and assert allocations/opens remain one and residue remains. Include uncertain failed-open disposition, no session reuse, exact close-before-cancel order.
+- [ ] Green same filter, fmt/clippy; commit `feat(controller): select read loops with bounded stdio fallback`.
 
-- [ ] Implement no-replace first pin/exact replacement repin with fsync/rename, ≤4 KiB; preserve the old pin and all envelopes/notify cache on failure. Implement command-private forward-directory allocation and retained owner/type/inode validation/cleanup behind ForwardPaths for T5. No implicit GC of other commands. Rerun identity filter and targeted rooted helpers (`NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^rooted_fs::tests::.*channel_socket/)'`, actual new tests named channel_socket_* and nonzero); format/clippy; commit: `feat(controller): bind channel identity and private laptop pins`.
+**Acceptance:** no cold one-shot/mutation interception; live borrowed cancellation and same-read <=2 bound; one uncertain allocation/command; no extra classifier or envelope state.
 
-**Acceptance:** safe bootstrap/rotation is independently testable; optional service failure leaves existing state/read path intact; no socket or pin is deleted/adopted based on filename alone; stale cleanup/probe races retain evidence; known journal/client/account identities are reused.
+## T7 — serial integration in four buildable commits
 
-## T5 — exact ControlMaster forward lifecycle
+**Files:** T7 ownership row. Predecessor fixes require exclusive accepted-track leases. **Consumes:** all accepted concrete implementations; no whole suite/deploy. Grounding: routing `src/lib.rs:940`, wait `src/controller/lifecycle.rs:164`, logs `src/lib.rs:6140`, selector `src/controller/execute.rs:579`, leader runtime `src/lib.rs:1678`, `src/controller/runtime.rs:95`, service proof `src/controller/service.rs:648`.
 
-**Files:** src/controller/channel/forward.rs, src/transport.rs, tests/transfer/controller_socket_forward.rs. No dashboard/tunnel.rs, config schema, process gate or identity/files implementation changes.
+### T7a — leader, selector and feature lifecycle
 
-**Consumes:** T1 ForwardControl/ForwardLease/ForwardPaths/ConfiguredRoute/SocketIdentity/ExchangeContext and run_private_interruptible; FakeForwardPaths for independent wave tests. **Produces:** `MasterForwardControl::new(paths: PathLayout, files: Arc<dyn ForwardPaths>, ssh: SshConfig) -> MasterForwardControl`; implements ForwardControl. Transport adds private `controller_socket_forward_request(route: &ConfiguredRoute, local: &Path, remote: &Path) -> Result<ProcessRequest,WorkerError>` and matching `controller_socket_cancel_request` returning a request with the captured same control namespace/-L pair. A lease captures the complete cancel request/namespace at open and never resolves a different master on close.
+- [ ] Red actual isolated leader/process fixtures: lock before native startup; independently verified image → private link → listener readiness → native record publish. Journal missing/failing still serves wait/logs; event own epoch errors unchanged. Feature absent on unsafe bind/image/record, before ready and after stop. Selector uses PathLayout.state/client-id and leaves no new client/req/active receipt. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_wiring::.*(leader|selector|feature|shutdown|image|journal)/)'` red/nonzero.
+- [ ] Register existing signals before launching bounded NativeControl startup jobs. Runtime polls their receivers/signals; startup journal hint is optional from the existing initialization result. Convert already-nonblocking listener inside runtime, create tracked pinned ChildRpcExecutor; advertise only after ready/native publish. Metadata/image/stat/write/withdraw never enters runtime callbacks. Define system ChannelRuntime and share owned shutdown, with separate channel-retired status.
+- [ ] Add `run_tick_loop_with_shutdown` async before-unpoll hook; preserve existing run_tick_loop wrapper/API and tick join/leader-guard order. Red signal barrier with blocked tick + actual live RPC group: close streams and prove native child-group termination while tick remains gated, **before** runtime exits/join begins. Include gated image/withdrawal job: signal/control task progresses and shutdown may return bounded Unknown, preserving residue. Never rely on destructor to deliver cancel.
+- [ ] Wire native exact file/link withdrawal, feature constant/dynamic live proof, task.list selector before durable dispatch. No mutation/strict DTO change. Green wiring filter plus existing service/health/drain regressions below, fmt/clippy; commit `feat(controller): serve pinned read channel generations`.
 
-**Grounding:** worker -F `src/transport.rs:894`, mux/control path `src/transport.rs:943`, `src/transport.rs:979`, namespace isolation `src/transport.rs:1001`; original exec clear-forwarding `src/transport.rs:938`; dedicated dashboard `src/transport.rs:879`; real SSH override safety `src/transport.rs:1188`. External syntax/options rationale is spec Decision 5, not an assumption that -O success proves the endpoint.
+### T7b — scoped loop adapters and operator CLI
 
-- [ ] Write red argv/policy tests for -S captured private %C path, -O forward/cancel, Unix -L pair, destination/--/-F retention; mask 0177/unlink=no/BatchMode/no agent/forward failure/keepalives/private umask hook; no -N/-f/-O exit, no shell, no ClearAllForwardings on control calls. Multiplex-off/unsafe control namespace/invalid paths must decline before calling SSH. Use a configured route with spaces/quotes in the config path to prove argv is structured. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test transfer -E 'test(/^controller_socket_forward::/)'` red.
-- [ ] Implement the two short control constructors using the existing worker SSH settings and ssh_program fail-closed override. Do not reuse control_directory_unusable's broad socket scan as channel ownership validation; do not create/delete a master. Add mask/unlink settings to mac-worker master creation while retaining existing RPC/Git argv and dashboard options. No settings mutation on the parent process; old masters are accepted only after owned local mode/ready checks.
-- [ ] Write red fake-SSH lifecycle cases: forward success but no endpoint, unsupported stream-local error, old master producing a nonprivate socket, master expires between bootstrap/-O, cancellation failure, long route paths, two commands/disjoint paths, one cancellation cannot remove the other's forward, command after SIGKILL cannot reuse residue. Capture exact opens/cancels and assert unrelated SSH/delegated traffic remains valid. FakeForwardPaths supplies deterministic ownership failure; actual private-directory cases belong to T4/T7.
-- [ ] Implement open/readiness ownership verification and lease cancel; cancel exact forward with bounded private raw runner, then exact cleanup. A failed cancel or replaced binding preserves uncertain entries. No loop/sleep or persistent -N fallback; caller reconnect policy belongs to T6. Test negative ExitOnForwardFailure result and successful control response separately from ready verification.
-- [ ] Run the same transfer filter green and existing library transport regressions: `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^transport::tests::.*(multiplex|forward|managed|ssh_argv)/)'`, confirm nonzero. Format/clippy; commit: `feat(transport): manage controller forwards on the existing master`.
+- [ ] Red routing/count tests: wait/run wait/submit-say-batch --wait/interrupt-settle use channel only for polls; transfers and mutations before wait are raw. task logs -f and its health discovery scoped; one-shot logs/status/list/diff/result, events without follow, doctor/general health, drain set/observe, reconcile/publish-retry, checkpoint and controller retry all raw with zero channel allocations. Events/notify bypass injected lib runner today: construct owned Arc adapter in foreground setup; ordinary wait/log uses borrowed adapter. Reuse ForegroundRuntime cancellation through `EventChannelRuntime(Arc<dyn EventRuntime>)`, no second signals.
+- [ ] Wire loop-local factories preserving public sends, WaitDeadlineRunner and borrowed should_stop. Leave logs polling/outage, event 200 ms pause, notify 15 s repair/30 s one-shot budget and own cache key/lock unchanged. Verify short waits and notify budget with injected clocks.
+- [ ] Red CLI tests identity --json raw; repin requires canonical expected ClientId, refreshed stdio identity before exact replacement, no unsafe force/prompt/state/cache deletion. Wire ControllerCommand::Channel Identity/Repin to T4. `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test cli -E 'test(/^controller_channel::|^cli_help::/)'` red/nonzero then green, and wiring loop/raw/route tests. fmt/clippy; commit `feat(controller): scope persistent reads to foreground loops`.
 
-**Acceptance:** on-demand forwarding uses exactly the authenticated bootstrap route/master; no extra persistent process or user SSH/trust change; old/direct/unusable masters decline; precise graceful cancel and uncertain-residue preservation are tested; dashboard and worker/origin routing regressions pass.
+### T7c — compatibility, isolation and read recovery
 
-## T6 — command-scoped session choice, fallback and retry evidence
-
-**Files:** src/controller/channel/client.rs; tests/controller/controller_socket_client.rs. No execute.rs/envelope/lifecycle/event policy or frozen DTO changes.
-
-**Consumes:** ClientDeps/IdentitySource/PinStore/ForwardControl/SocketConnector/runtime from T1; gate typed ControllerUnverifiedReply; existing ProcessRequest and canonical parsed request. Use all sibling fakes. **Produces:** `ChannelProcessRunner<R: ProcessRunner>::new(raw: R, route: ConfiguredRoute, paths: PathLayout, deps: ClientDeps) -> ChannelProcessRunner<R>` implementing ProcessRunner and owning one forward/session; `close(&self)` is idempotent and closes session before cancelling/cleaning the forward. R can be `&dyn ProcessRunner` for existing scoped synchronous calls or `Arc<dyn ProcessRunner>` for event foreground clients. Identity/forward traits receive raw runner arguments, so they need no borrowed runner stored inside a 'static Arc.
-
-**Grounding:** shared sends `src/controller/execute.rs:727`, `src/controller/execute.rs:842`; independent event exchange `src/controller/events/client.rs:52`; one-shot wait deadlines `src/controller/lifecycle.rs:170`; retained frame/settlement `src/controller/execute.rs:728`, `src/controller/execute.rs:731`; new classification seam from T1.
-
-- [ ] Write red selection tests: only exact configured controller-rpc shape + valid framed stdin intercepts; worker/origin/Git/service/probe/dashboard/non-RPC/new-session traffic delegates byte-identically; local/multiplex-off and unsupported identity use raw SSH. Valid setup order must be identity→pin durable→forward→hello→RPC. Wrong account/client/route/generation/journal/missing feature/unsafe pin yields zero application socket frames. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_client::/)'` red.
-- [ ] Implement one lazy setup owner and try-only session checkout, no global broker, no waiting behind an active long-poll. Do not rebuild/mutate the input ProcessRequest.stdin. Pass only the raw runner to bootstrap/control and use its private spawn hook. Share supplied cancellation runtime; install no signals. Cold short-deadline request delegates immediately, setup consumes time, and fallback ProcessPolicy uses only the remaining original deadline.
-- [ ] Write red failure tests before implementing fallback: partial/full request/lost reply, wrapped oversize, child timeout/panic/EOF → one same-byte raw stdio fallback; cancelled/expired caller → no fallback; wrong complete outer identity → typed ControllerUnverifiedReply and no fallback; correctly wrapped inner wrong ACK → existing classifier; typed rejection/resumable/success keep original exit code and semantics. Keep request IDs/digests frozen and preserve server conflict behavior.
-
-```rust
-#[test]
-fn lost_socket_reply_replays_the_original_stdio_input() {
-    let request = request_fixture("task.submit", serde_json::json!({}));
-    let mut ssh = controller_rpc_ssh_request(&controller_fixture()).unwrap();
-    ssh.stdin = Some(encode_json_frame(&serde_json::json!({
-        "protocol_version": 7, "request_id": request.request_id(),
-        "command": request.command(), "body": request.body()
-    })).unwrap());
-    let original = ssh.stdin.clone();
-    let raw = RecordingRunner::new(vec![Ok(result_fixture(&request, serde_json::json!({}), 0))]);
-    let connector = Arc::new(ScriptedConnector::new(vec![Err(
-        ChannelFailure::Unavailable(ChannelReason::ForwardLost)
-    )]));
-    let deps = fake_client_deps(connector.clone());
-    let adapter = ChannelProcessRunner::new(&raw, route_fixture(), paths_fixture(), deps);
-    let _ = adapter.run(&ssh);
-    assert_eq!(connector.frames(), vec![original.clone().unwrap()]);
-    assert_eq!(raw.calls()[0].stdin, original);
-}
-```
-
-Define controller_fixture/route_fixture/paths_fixture/fake_client_deps in this test file from T1's ConfiguredRoute, ManualRuntime, ScriptedIdentitySource, MemoryPinStore and FakeForwardControl constructors. They must share one identity/route and provide no real filesystem or SSH; fake IdentitySource/ForwardControl do not consume raw replies. The test is about transport bytes; T7 tests a real durable mutation.
-
-- [ ] Implement typed failure handling: unavailable causes eligibility backoff plus permitted same-request stdio fallback; UnverifiedReply wraps the gate error and bypasses both fallback and outer mutation retry. Valid complete application outcomes are returned as ProcessResult to existing classification, never reinterpreted from message strings. Subsequent retries after a lost socket remain stdio until eligibility, with same request bytes.
-- [ ] Write/run red backoff/deadline/cleanup cases: ManualRuntime advances 1/2/4/5 s, earlier calls use stdio without sleep, one eligible setup owner, success resets only after a verified reply, permanent mismatch/unsupported disable lifetime, concurrent call while long-poll returns via stdio, command close/cancel verifies exact forward cleanup with for_cleanup context. Implement then rerun green; format/clippy; commit: `feat(controller): select persistent sessions with safe stdio fallback`.
-
-**Acceptance:** existing request identity/envelopes and inner checks remain authoritative; no recursive bootstrap or accidental other-process interception; loss and unverified evidence stay distinct; no application timing/polling policy is rewritten; teardown is bounded and precise.
-
-## T7 — wire real paths, compatibility, recovery and fixture measurement
-
-**Files:** Exactly T7 paths in ownership table. Predecessor fixes require an exclusive lease after that owner's commit; document lease and release. Do not expand into dashboard/UI/Git or real deployment.
-
-**Consumes:** T2 SessionCodec/FramedSocketConnector, T3 SocketService/ChildRpcExecutor, T4 files/selector/stdio/pin, T5 MasterForwardControl, T6 ChannelProcessRunner and T1 guard/hook/contracts. **Produces:** real leader socket lifecycle; read selector; conditional feature advertisement; scoped laptop adapters on both ordinary and event RPC paths; operator identity/repin command; actual process/fake-SSH tests and benchmark observation output. `EventChannelRuntime(Arc<dyn EventRuntime>)` implements ChannelRuntime by delegating now/cancelled; existing foreground EventRuntime remains signal owner. System channel runtime uses the existing monotonic ResolutionRuntime plus a supplied shutdown flag.
-
-**Grounding:** command routing/events early returns `src/lib.rs:912`, `src/lib.rs:940`; leader/journal/signal/tick `src/lib.rs:1631`, `src/lib.rs:1635`, `src/lib.rs:1683`, `src/lib.rs:1693`, `src/lib.rs:1738`; selector insertion `src/controller/execute.rs:579`; event runner ownership `src/controller/events/client.rs:31`; service restart proof `src/controller/service.rs:648`; submit ordering `src/lib.rs:5946`, transfer `src/controller/stream_client.rs:66`; survey sections 1, 3 and 7.
-
-- [ ] Before wiring, write real red process tests in controller_socket_wiring: isolated leader starts socket only after lock/journal; socket identity matches authenticated stdio; feature absent before ready, on bind/journal/record failure, after installed-binary replacement and after shutdown; state-only stdio stays available. Dispatch controller_socket before event/health/read/durable branches, rejecting mixed selectors without receipts. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_wiring::/)'` red, nonzero.
-- [ ] Wire leader start and ready→service publication using existing account/client/journal window and a fresh generation, captured executable/config/HOME/XDG and one shared captured binary identity source. Use the existing runtime and Arc shutdown flag; withdraw/stop before the leader guard drops without changing tick join ordering. Prove retirement on exhausted slots or unknown/replaced binary keeps the leader tick/stdio alive and does not restart the optional service. Add socket feature constant and dynamic composition in health/identity/ready with the required live hello probe. Keep common static features and host registry intact; no feature from mere compiled support/stale file.
-- [ ] Add scoped adapters to enabled laptop task/controller/retry/health/drain/transfer-RPC paths, including doctor's health RPC (`src/lib.rs:422`, `src/doctor.rs:52`), preserving public send APIs and raw runner for unrelated processes. Events and notify **currently bypass the injected runner** at lib.rs:940 and create their own foreground clients: explicitly construct an owned ChannelProcessRunner<Arc<dyn ProcessRunner>> inside their command setup and pass it to ControllerEventClient. Reuse ForegroundRuntime cancellation through EventChannelRuntime, with no second signal listener. Ordinary lib entry accepts a borrowed runner: use ChannelProcessRunner<&dyn ProcessRunner>. Do not intercept host/controller run/local mode; setup/restart proof and identity/repin remain raw.
-- [ ] Add red CLI parse/help/behavior tests in tests/cli/controller_channel.rs and cli_help.rs: identity --json raw read; repin required canonical --expect-client-id, refreshed identity before replacement, mismatch failure, no state/config/cache deletion, invalid combinations. Wire new ControllerCommand::Channel with Identity/Repin variants to T4. Run `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test cli -E 'test(/^controller_channel::|^cli_help::/)'` red/green. No auto-repin/prompt/setup.
-- [ ] Add red compatibility/recovery matrix using a frozen baseline fixture response/server, not only new-new fakes: old laptop strict status/list/log/wait/drain/ACK/service decode against new stdio; new identity selector to old task.list and new discovery→old execution leave zero req/active receipts; new binary/old leader omits feature; restart keeps stable pin/journal but changes ProcessIdentity/service generation; alias/account/reinstall mismatch never sends socket RPC. Fixtures must pin their version and be seeded in this owned module, not tests/support. Implement/fix under leases, rerun.
-- [ ] Add red real-child concurrency/isolation tests for the survey's ten items: two simultaneous same-ID mutations still exclude across processes and execute once; another connection progresses during a gated child; distinct child pids per request; no cross-request DeferredHints/WaitDeadline/config state; per-child publisher exit behavior; child stdout never leader log frames; SIGINT/TERM once in the leader; EOF child framing; request cancel closes only its group and preserves detached task runner. Crash/kill leader between publication and reply, stdio replay same frame and one durable task/turn; hardkill stale exact socket cleanup; ambiguous cleanup leaves residue and feature absent. Barriers/fixture hooks establish ordering, not sleeps or elapsed-time assertions.
-- [ ] Add red mid-request mutation tests against the actual adapter + send_controller_mutation: before send, partial send, after active receipt, after durable publication, after effect, during reply, valid ACK, definitive rejection, resumable, wrong wrapper/inner IDs and cache settlement failure. Assert pending/settled envelope and same frozen request in all attempts, one logical effect and preserved source transfer finish order. Test typed unverified errors produce one attempt/no settlement. Test at-limit reply wrapper fallback gives original complete DTO.
-- [ ] Add red lost-reply replay coverage for non-envelope surfaces: drain desired-value set twice has one final value; wait/reconcile/publish-retry resume existing work; source.prepare/source.finish/result.prepare preserve identities, receipt and finish-before-task.submit. Include task.result's follow-up status. Keep any unproven surface stdio-only and report CONTRACT ISSUE: p3-integration; do not invent a request journal. Apply leases if code fails, rerun.
-- [ ] Run targeted existing regressions after wiring, separately:
+- [ ] Red N-1/rollback through frozen baseline server/DTO fixtures in owned wiring module: old client strict read/log/wait/drain/ACK/service stdio unchanged; new selector to old task.list rejects with no receipts; installed binary rename between link and child spawn executes old generation, next leader executes replacement; unverifiable loaded identity has no feature. Restart refreshes service/leader, preserves stable pin; account/reinstall mismatch sends no socket reads. Missing/reset journal stays eligible for wait/logs; actual events reply drives cursor reset. No uuid feature changes.
+- [ ] Red ten-assumption actual-child matrix: distinct RPC pids, cross-process state locks, no DeferredHints/WaitDeadline/config leakage, captured HOME/XDG with real per-child config loads, existing publisher exit grace, stdout never leader frames, one SIGINT/TERM registration, exact EOF, actual transient-group cancellation while detached runners survive. Real >8 fully cleaned cancellations remain available; eight deliberately Unknown cleanups retire without replacements. Reply-completion barrier protects immediate sequential requests.
+- [ ] Red read-loss/cancel matrix: before/partial/full send, handler in progress, partial reply, wrapper oversize, valid errors/capacity/cursor invalidity, wrong ID/turn/digest. At most one socket+one immediate raw transmission per eligible read, exact preserved frame, shared budget, no post-cancel fallback or artificial task cancellation. Reconnect/master loss uses concrete captured endpoint; exit-0 cancellation error with many eligibility advances makes no second allocation. Include actual config-defined forwards and edited config using accepted T5/T4 together.
+- [ ] Raw regression cases preserve opposing drain writes, intervening publish-retry/reconcile effects, mutation same-ID/envelope/retry/source-finish ordering; these **prove exclusion**, not new channel replay. Document unchanged retry can finish inside 30 s throttle with outcome-unknown, without widening policy. Keep notify cache separate from pin even when config-file route digest changes. Apply predecessor fixes only under leases.
+- [ ] Run targeted existing/new groups separately, nonzero counts; fmt/clippy and commit `test(controller): verify read channel compatibility and recovery`.
 
 ```sh
-NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_|^controller_retry::|^controller_lifecycle_compat::|^controller_say_wait_exit::/)'
-NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_read_routes::|^controller_event_rpc::|^controller_event_wiring::|^controller_event_notifier::|^controller_features::|^controller_health_routes::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_socket_wiring::|^controller_lifecycle_compat::|^controller_say_wait_exit::|^controller_say_interrupt::|^controller_read_routes::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_event_rpc::|^controller_event_wiring::|^controller_event_notifier::|^controller_features::|^controller_health_routes::|^controller_health_runtime::|^controller_service::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller -E 'test(/^controller_drain::|^controller_drain_attached::|^controller_drain_rpc::|^controller_publish_retry::|^controller_retry::|^controller_task_mutations::|^controller_transfer::|^controller_streamed_submit::/)'
 NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test transfer -E 'test(/^controller_socket_forward::|^transport::/)'
 NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test dashboard -E 'test(/^dashboard_tunnel_reconnect::|^dashboard_events::/)'
+NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --lib -E 'test(/^controller::runtime::tests::|^process::tests::/)'
 ```
 
-Inspect each selected count >0. Preserve WAIT_TIMEOUT/WAIT_BLOCKED, IDs/aggregate exit/DAG progress, log offsets/turn identity, notify eligibility/cursor/repair, source streams and dashboard liveness. Add specific short wait and one-shot notify deadline regressions rather than weakening existing assertions.
+controller_read_routes includes baseline logs-follow/outage/deadline tests; list exact names and count them before relying on the selection. T7a runs its service/health/drain groups when lifecycle first wires; T7b runs read/logs/lifecycle/events/raw-exclusion groups when routing first wires. Do not defer relevant regressions until T7c or select only seed tests.
 
-- [ ] Implement ignored observation test `controller_socket_benchmark::fixture_transport_cost_observations` with correctness/count assertions only: identical seeded roots/requests/real RPC children, fake-SSH stdio vs local forward/session, 10 warmups + 200 samples for each cheap/representative request class, cold setup separately. Print JSON rows with scenario/sample count, mean/p50/p95, fake SSH/control/child counts, framing bytes and max supervisor/buffer observations. No speed threshold or sleep; zero-wait and injected-readiness long-poll scenarios separate deliberate idle time. Run once using `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller --run-ignored only --no-capture -E 'test(/^controller_socket_benchmark::fixture_transport_cost_observations$/)'`; record actual results for T8. Gate seed test is not ignored so the ordinary module has a nonzero contract test too.
-- [ ] Format/clippy. Review real route construction, fakes absent from production, allowed command list and outer/inner checks; commit: `feat(controller): wire persistent channel and compatibility fallback`. Record all targeted counts/results, fixture measurements, leases and any contract issues. Do not run the whole suite or deploy.
+### T7d — ignored paired fixture observations
 
-**Acceptance:** real process entry points use the channel with all old safety properties; both laptop transports are wired; unavailable service never blocks healthy stdio; strict N-1/rollback tests pass; lifecycle/retry/replay/short-deadline semantics are verified; benchmark records observations honestly and shows zero per-warm-RPC SSH invocations with one child each.
+- [ ] Add ignored `controller_socket_benchmark::fixture_transport_cost_observations` with real RPC children/fake SSH-mux and comparable seeded roots, paired/alternating stdio/socket order. 10 warmups/200 samples per cheap wait and representative logs/events class; complete cold command lifetimes (resolution, bootstrap, pin create/verify, forward, hello, reads, cancel/refusal proof/cleanup); fallback/reconnect; zero-wait and deliberately waiting scenarios labeled separately. Reuse manual readiness/clocks/barriers for correctness, not wall-clock speed assertions.
+- [ ] Print JSON rows: scenario/order/sample count, mean/p50/p95, command/RPC/setup/teardown and requested-wait components, SSH execution/control/process/child counts, bytes/max buffers/supervisors, fallback/reconnect/cancel disposition. S+W+H+D vs W+H+D+O yields expected S-O; fixture does not measure real SSH S. Assert warm execution SSH count zero, one worker child/read, completed teardown or bounded retained allocation and no mutation channel attempts. Never assert latency improvement.
+- [ ] Run only observation filter: `NEXTEST_TEST_THREADS=6 CARGO_BUILD_JOBS=4 cargo nextest run --locked --test controller --run-ignored only --no-capture -E 'test(/^controller_socket_benchmark::fixture_transport_cost_observations$/)'`; actual nonzero results, not projected timings. Keep a nonignored gate seed for the module. fmt/clippy; commit `test(controller): measure paired read channel fixture costs`.
 
-## T8 — operator documentation and acceptance evidence
+**T7 acceptance:** four separate buildable commits; scoped real commands, preserved stdio exclusions, ten process assumptions, source-pinned generation, live cancellation/cleanup/shutdown, N-1 and observations proven; counts/results/leases recorded. No whole suite, deployment or live hosts.
 
-**Files:** docs/usage.md, docs/testing.md, docs/superpowers/validation/2026-10-01-controller-socket.md. Spec/plan corrections only for accepted contract/baseline changes; no UI/generated asset work. Proven source defect requires a documented exclusive post-track lease.
+## T8 — operator docs and acceptance evidence
 
-**Consumes:** integrated T7 build/identities, tests and fixture measurement rows. **Produces:** exact operator behavior/defaults and acceptance record. The orchestrator, not this track, supplies whole-suite gate and independent reviews.
+**Files:** docs/usage.md, docs/testing.md, docs/superpowers/validation/2026-10-01-controller-socket.md. **Grounding:** SSH/service guidance `docs/usage.md:485`, `docs/usage.md:500`; testing areas `docs/testing.md:6`, `docs/testing.md:26`; unchanged throttle/retry `src/controller/service.rs:356`, `src/controller/execute.rs:757`.
 
-**Grounding:** service/SSH user guidance `docs/usage.md:485`, `docs/usage.md:500`; area target/nextest rules `docs/testing.md:6`, `docs/testing.md:26`; current installed binary/restart proof `src/controller/service.rs:648`; spec Decisions 4–7, 10–12.
+- [ ] Document only repeated read-loop selection, all explicit raw exclusions, multiplex/default-off, exact image-link generation across installs, master resolution/original bootstrap/config-free control, modes/bind options without umask hook, pin/operator repin, optional journal/cursor authority, separate notify-cache key, bounded resources/threads/budgets and proof-based cleanup/one uncertain allocation. Explain positive cancellation versus exit 0, no post-cancel fallback and unchanged mutation throttle limitation. No automatic deletion/GC or unmeasured gain.
+- [ ] Add targeted testing/ignored benchmark commands with actual counts; validation distinguishes completed local correctness/measurements from pending orchestrator full gate/reviews/live evidence. Record paired cold/warm/fallback/reconnect/wait observations, process counts, versions/baseline/build identity and S-O limitations. No successful release claim based only on seed tests or fake network timings.
+- [ ] Verify usage examples against integrated CLI/help with the exact cli filter, and cross-check record/pin/UUID/schema/ownership names against T1/T7. Documentation-only corrections use link/structure checks; source defect requires exclusive lease and its meaningful filtered red/green test.
+- [ ] cargo fmt --all; CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings. Commit `docs(controller): document scoped read channel acceptance`; report actual evidence and pending checks.
 
-- [ ] Update usage: multiplex-enabled selection; child-per-RPC remaining cost; private controller/laptop paths and all resource/deadline bounds, including the conservative error-slot retention and stdio-only behavior until leader restart after exhaustion; stable pin/bootstrap/reinstall identity and repin commands; StreamLocalBindUnlink=no rationale and exact cleanup; long-path/unknown-residue fallback; graceful/hardkill/master-expiry limitations; transport cancellation vs task.cancel; same-ID loss recovery; wrong reply identity fail closed; unchanged Git/dashboard/local mode. Explain cold one-shot setup penalty and optional journal-startup requirement. No laptop/phone/per-mini setup instructions, automatic reset/delete command or unmeasured speed claim.
-- [ ] Add exact targeted/ignored-fixture measurement commands to testing docs without changing whole-suite policy. Publish validation with commit/build/base identity, test commands/counts/results, boundary/race/mutation/N-1 matrix, T7 observation rows and known limitations. Label live measurements pending; do not present fake-SSH milliseconds as live latency. Record every stopped/unverified/gated scenario and accepted risk.
-- [ ] Verify doc links/code anchors/commands, exact spec-to-plan matrix below, ownership leases released and no deferred mechanism implemented. Run `cargo fmt --all` and `CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets -- -D warnings`; targeted tests only if a correction introduced new code/failure. Record the orchestrator's full-gate/review status as supplied or pending. Commit: `docs(controller): document channel pinning fallback and measurements`.
-- [ ] Hand the following checklist to the future deployment integrator. Record unperformed checks pending. This design/docs work does not authorize host contact, deployment or notifications.
+**Acceptance:** user-facing behavior and conservative fallbacks exact; unchanged raw mutation risks explicit; local evidence honest, live performance pending.
 
-**Acceptance:** documents accurately describe the deployed candidate's behavior, fixture data and limitations; local gates are distinguished from pending orchestrator/live evidence; no UI artifacts or real-pool work.
+## Live acceptance — future authorized integrator
 
-## Live acceptance / measurement — future authorized integrator
+- [ ] Confirm fleet/OpenSSH stream-local support/permissions with isolated approved tasks; old/new pairing, managed -F master override, concrete control path and config-free exclusive forward behavior.
+- [ ] Pair/alternate raw/channel read loops with identical state/sample counts; record complete cold command lifecycle, warm RPCs, requested waits, start-to-start wait cadence, events/notify process/CPU cost, fallback/reconnect, S-O and remaining worker cost. Numbers are observations.
+- [ ] Exercise approved restart/master/network loss and actual transient-child cancellation; wait/log traffic survives unavailable journal, events retains cursor identity/reset behavior, mutations remain existing stdio retry even inside throttle.
+- [ ] Verify positive graceful cleanup and one retained residue on uncertain cancel; shared master/unrelated configured forwards survive, no later allocation for that command. Inspect identity/repin only on an approved fixture reinstall without notify/envelope cache relocation/deletion.
+- [ ] Dashboard/Git unchanged. Record pending checks; only the orchestrator owns deploy/full gate/independent review.
 
-- [ ] Record accepted commit/build/macOS/OpenSSH versions and route configuration; deploy new controller/laptop through the existing authorized process. Verify protocol 7, private permissions, served feature and stdio identity/ready agreement.
-- [ ] Old laptop uses unchanged stdio; new laptop on old controller uses fallback without receipts. New binary with unrestarted leader omits the socket feature. Confirm service restart changes leader/generation, retains client/pin/journal, and existing restart verification still works.
-- [ ] On an approved disposable task, capture paired warm/cold stdio vs channel observations: 10 warmups/200 exchanges where useful; per-RPC mean/p50/p95, setup cost, effective task.wait start-to-start cadence versus unchanged 100 ms sleep, quiet/busy logs/events/notify requested wait vs transport overhead, SSH/control/child counts and CPU.
-- [ ] Confirm warm sessions issue no per-RPC SSH but retain one worker child; report small/no benefit honestly, including cold one-shot penalty and the remaining child/store/publisher overhead.
-- [ ] Observe approved network/master loss, leader restart and a lost mutation reply; same ID settles/resumes one logical operation, no false rejection/new ID, pending envelope guidance remains correct. Short waits and notify budgets still behave correctly.
-- [ ] Check graceful cancel removes only its forward; a hard-killed command's residual path cannot be reused by another command. Shared master remains available to other clients. Long/unsafe paths and socket/service/pin residue use stdio without blind deletion.
-- [ ] Perform legitimate reinstall/repin only on an approved fixture installation; unexpected stable identity blocks socket requests, explicit authenticated expected-client rotation restores them without deleting task/envelope/notification state.
-- [ ] Verify dashboard dedicated viewer/SSE and Git streams still use their own transports. Record measurements and any pending checks in validation; no test latency thresholds or automatic bound tuning.
+## Coverage and handoff
 
-## Spec coverage and handoff
-
-| Spec decision | Tasks and required evidence |
+| Decision / finding | Required evidence |
 | --- | --- |
-| 1 reuse / scope | T1 gate, T7 existing-route regressions, T8 docs |
-| 2 child serving / ten survey assumptions | T3 isolated supervisor and fixed spawn; T7 actual child/process matrix |
-| 3 bounds / cancellation / shutdown | T1 values; T2 decoder/I/O; T3 permits/control; T6 deadline fallback; T7 real shutdown |
-| 4 controller permissions / stale evidence | T4 rooted/race fixtures; T7 publication/restart |
-| 5 master forward / laptop lifetime | T1 private spawn; T4 ForwardPaths; T5 exact argv/lease; T7 fake-master hardkill cases |
-| 6 identity selector / handshake | T1 schemas; T2 hello/ready; T4 existing-only bootstrap; T6 order; T7 safe dispatch/N-1 |
-| 7 pin / repin | T4 file/rotation tests; T6 fail-closed selection; T7 CLI; T8 docs |
-| 8 multi-frame / IDs / wrapper status | T2 byte grammar; T3 state machine; T6 evidence classification; T7 maximum-size fallback |
-| 9 caller selection | T6 adapter; T7 ordinary and independent event command setup, exclusions and short deadlines |
-| 10 fallback / mutation / non-envelope replay | T1 unverified guard; T6 byte/backoff tests; T7 durable and idempotence/order process matrix |
-| 11 advertising / N-1 | T4 live identity; T7 dynamic feature/strict baseline/rollback fixtures; T8 matrix |
-| 12 measurement | T7 ignored fixture observations; T8 validation/live checklist; orchestrator live/full gate |
-| 13 parallel ownership | T1 freeze; five T2–T6 tracks; T7 leases/integration; T8 evidence |
-| Deferred / open defaults | T8 documents; no implementation tasks for deferred work |
+| D1 / R1,R9 | T1 scope/grammar; T6 byte-identical exclusions; T7b/c opposing setter/raw retry/source order and <=2 eligible-read bound |
+| D2 / R2 | T4 loaded image/link/rename probes; T7a/c actual generation/rollback |
+| D3 / R3, coverage #1 | T1 concrete MasterPlan; T5 -G/config-free actual mux/managed no-none/config edit; T7c real combination |
+| D4 / R4 | T1 disposition; T4 positive refusal/binding; T5 exit-0 errors; T6 no second allocation |
+| D5 / R5 | T3 native-control gate; T7a before-unpoll signal/blocked-tick/group cancellation |
+| D6 / R6 | T1 borrowed context; T2/T4/T5/T6 independent should_stop during live operations |
+| D7 / R7 | T1 frozen tracked cleanup; T3/T7c >8 cleaned cancels versus 8 abandoned slots |
+| D8 / R8 | No private hook/umask policy; T5 explicit master options/old-mode decline |
+| D9 | T1 optional UUID string/hint; T4/T7a/c unavailable journal with wait/logs still served and events epoch authority |
+| D10 acceptance/benchmark | T3 actual groups/reply barrier/thread counts; four T7 commits/existing filters/paired whole-command observations |
+| Coverage #3/#4 | T4 existing state/client-id reader and separate notify key; T7c fixtures; T8 docs |
+| Coverage #2/#5 | Spec Decision 10 unchanged mutation throttle limitation; T7c raw policy; T8 docs |
+| Five semantic citation mismatches | Correct features:6, rooted read vs create/replace, protocol constant, actual lock-order anchors and tunnel backoff in revised spec |
+| Survey ten assumptions | Spec Decision 2; T3 and T7c actual isolated process proof |
 
-Self-review checks spec coverage, signatures/field names, exact nonzero consolidated filters, numeric bounds, all ten survey assumptions, no unspecified fake/harness methods, five disjoint tracks and no automatic pin/socket trust reset. Execution order is T1 committed interface gate → five parallel tracks → T7 integration → T8 docs/acceptance. Every track writes .briefs/<track>-report.md with commits, changes/why, tests/results, leases, risks and contract issues, then prints TRACK DONE: <track>. The orchestrator assigns concrete track names and owns independent review/full-suite/deploy gates.
+Each track writes .briefs/<track>-report.md with commits, changes/why, tests/counts/results, leases, risks and contract issues, then prints TRACK DONE: <track>. The orchestrator assigns names and reviews. T1 → five parallel tracks → four serial T7 commits → T8; no sibling API invention during the wave.
