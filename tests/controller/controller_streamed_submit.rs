@@ -29,7 +29,7 @@ use mac_worker::{
     lease::{AdmissionFacts, LeaseService},
     paths::PathLayout,
     prepared_submit::FrozenSubmitBody,
-    process::SystemProcessRunner,
+    process::{ProcessPolicy, ProcessRequest, SystemProcessRunner},
     protocol::{MemoryPressure, PROTOCOL_VERSION},
     task::{BaseOid, ClosePolicy, TaskId, TurnId},
     transfer_repo::TransferRepo,
@@ -77,7 +77,7 @@ impl Isolated {
         fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\n# fake SSH hop: destination is not a live network host.\nexport HOME={home:?}\nexport XDG_CACHE_HOME={xdg_cache:?}\nexport XDG_STATE_HOME={xdg_state:?}\nexport XDG_CONFIG_HOME={xdg_config:?}\nexport XDG_DATA_HOME={xdg_data:?}\nexport XDG_RUNTIME_DIR={runtime:?}\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) shift 2 ;;\n    --) shift; break ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\n[ \"$#\" -gt 0 ] && shift\nif [ \"$#\" -eq 1 ]; then exec /bin/sh -c \"$1\"; fi\nexec \"$@\"\n"
+                "#!/bin/sh\n# fake SSH hop: destination is not a live network host.\nexport HOME={home:?}\nexport XDG_CACHE_HOME={xdg_cache:?}\nexport XDG_STATE_HOME={xdg_state:?}\nexport XDG_CONFIG_HOME={xdg_config:?}\nexport XDG_DATA_HOME={xdg_data:?}\nexport XDG_RUNTIME_DIR={runtime:?}\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) shift 2 ;;\n    --) shift; break ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\n[ \"$#\" -gt 0 ] && shift\nif [ \"$#\" -eq 1 ] && [ \"$1\" = '~/.local/bin/worker host probe' ] && [ -f \"$HOME/slot-probe.json\" ]; then exec /bin/cat \"$HOME/slot-probe.json\"; fi\nif [ \"$#\" -eq 1 ]; then exec /bin/sh -c \"$1\"; fi\nexec \"$@\"\n"
             ),
         )
         .unwrap();
@@ -734,9 +734,48 @@ fn controller_rpc_child(isolated: &Isolated, frame: &[u8]) -> std::process::Outp
     spawned.wait_with_output().unwrap()
 }
 
-/// Probe the configured worker through the real `workers` command and return
-/// `(configured_slots, busy_slots, slot_state)`.
+/// Collect real isolated host readiness before entering the SSH probe budget.
+/// The fake hop serves this snapshot until capacity changes and we refresh it.
+fn refresh_slot_probe(isolated: &Isolated) {
+    use mac_worker::process::ProcessRunner;
+
+    let mut environment: Vec<_> = isolated
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    environment.push((
+        "XDG_RUNTIME_DIR".into(),
+        isolated.home.parent().unwrap().join("xdg-runtime").into(),
+    ));
+    let probe = RUNNER
+        .run_in_new_session(&ProcessRequest {
+            program: env!("CARGO_BIN_EXE_worker").into(),
+            args: vec!["host".into(), "probe".into()],
+            environment,
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: 1024 * 1024,
+                stderr_limit: 1024 * 1024,
+                deadline: std::time::Duration::from_secs(60),
+            },
+            isolate_parent_environment: false,
+        })
+        .expect("isolated host probe must finish within the setup hang guard");
+    assert!(
+        probe.status.success(),
+        "isolated host probe failed: {} {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    fs::write(isolated.home.join("slot-probe.json"), probe.stdout).unwrap();
+}
+
+/// Probe the configured worker through the real `workers` command with injected
+/// readiness and return `(configured_slots, busy_slots, slot_state)`.
 fn probe_slots(isolated: &Isolated) -> (u64, u64, String) {
+    refresh_slot_probe(isolated);
     let output = worker_child(isolated, &["--json", "workers"]);
     assert!(
         output.status.success(),
