@@ -3298,11 +3298,27 @@ mod t7a {
                     let (pid,group,bytes,_)=children::entered(&courier).await;
                     use base64::Engine;
                     assert_eq!(base64::engine::general_purpose::STANDARD.decode(bytes).unwrap(),original.stdin.as_ref().unwrap().as_slice());
-                    tokio::time::timeout(GUARD,async {while !command_line(pid as u32).starts_with(record.executable.path.to_str().unwrap()) {tokio::task::yield_now().await;}}).await.expect("actual worker exec barrier");
+                    // A changed argv is visible before dyld has entered the
+                    // worker. Prove the actual RPC reached StateLock: it takes
+                    // the directory lock before blocking on our jobs.lock.
+                    let state = fs::File::open(&fixture.paths.state).unwrap();
+                    tokio::time::timeout(GUARD, async {
+                        loop {
+                            if unsafe { libc::flock(state.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+                                let error = std::io::Error::last_os_error();
+                                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+                                break;
+                            }
+                            assert_eq!(unsafe { libc::flock(state.as_raw_fd(), libc::LOCK_UN) }, 0);
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("actual RPC blocked on the state fence");
+                    assert!(command_line(pid as u32).starts_with(record.executable.path.to_str().unwrap()));
                     assert_eq!(unsafe{libc::kill(pid,0)},0);clock.advance(Duration::from_secs(5));
                     let shutdown=channel.shutdown().await;assert_eq!(shutdown.rpc.completed,1);assert_eq!(shutdown.rpc.unknown,0);assert_eq!(shutdown.files,ForwardDisposition::Cleaned);
                     assert_eq!(unsafe{libc::killpg(group,0)},-1);assert!(!record.executable.path.exists());drop(lock);
-                    let result=tokio::time::timeout(GUARD,result_rx).await.unwrap().unwrap().unwrap();assert!(result.status.success());work.join().unwrap();
+                    let result=tokio::time::timeout(GUARD,result_rx).await.expect("fallback result hang guard").unwrap().expect("stdio fallback process");
+                    assert!(result.status.success(),"stdio fallback status={} stderr={} stdout={}",result.status,String::from_utf8_lossy(&result.stderr),String::from_utf8_lossy(&result.stdout));work.join().unwrap();
                     let calls=raw.calls.lock().unwrap();assert_eq!(calls.len(),1);assert_eq!(frame(&calls[0]),original.stdin.unwrap());drop(calls);
                     let processes=raw.processes.lock().unwrap();let mut expected=processes[0].clone();expected.policy.deadline=Duration::from_secs(30);
                     let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));assert_eq!(expected,original);assert_eq!(processes[0].policy.deadline,Duration::from_secs(25));drop(processes);
