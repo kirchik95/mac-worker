@@ -1153,6 +1153,45 @@ fn cleanup_after_durable_intent_releases_the_heavy_slot() {
 }
 
 #[test]
+// Supersedes v1 test: cleanup_after_durable_intent_releases_the_heavy_slot.
+fn task_turn_cleanup_after_durable_intent_releases_the_heavy_slot() {
+    let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
+    fs::write(origin.join("reject"), b"1").unwrap();
+    let request = prepared_origin_push_turn(&store, &origin_url, &oid);
+    let lease = LeaseService::new(&store).load().unwrap().unwrap();
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Busy
+    );
+    assert!(
+        lease.expires_at_millis() > wall_clock_millis(),
+        "durable cleanup fixture must start with a live execution lease"
+    );
+    let launcher = InlineSupervisorLauncher {
+        store: store.clone(),
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap();
+    assert_eq!(response.submit().status().state(), JobState::Succeeded);
+    assert_eq!(response.task().last_outcome(), Some(&TaskOutcome::Done));
+    // The real turn commits its delivery intent and pin before supervisor cleanup.
+    let delivery = outbox(&store).dto(PROJECT_ID, task_id(1)).unwrap().unwrap();
+    assert_eq!(delivery.state(), DeliveryState::Pending);
+    assert_eq!(delivery.turn_id(), turn_id(2));
+    let pin = OriginOutbox::delivery_refs(task_id(1), turn_id(2));
+    assert!(ref_exists(
+        store.mirror_if_present(PROJECT_ID).unwrap().unwrap().path(),
+        &pin
+    ));
+    assert_eq!(
+        LeaseService::new(&store).occupancy().unwrap().slot_state,
+        SlotState::Idle
+    );
+    assert!(LeaseService::new(&store).load().unwrap().is_none());
+}
+
+#[test]
 fn failing_origin_retries_without_flipping_agent_outcome() {
     let (_temp, store, _source, _origin_dir, origin, origin_url, oid) = fixture();
     fs::write(origin.join("reject"), b"1").unwrap();

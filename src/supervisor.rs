@@ -7013,8 +7013,9 @@ mod tests {
     }
 
     #[test]
-    fn prepared_command_preserves_raw_home_and_tmpdir_bytes_under_non_utf8_host_root() {
-        let command = CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap();
+    // Supersedes v1 test: prepared_command_preserves_raw_home_and_tmpdir_bytes_under_non_utf8_host_root.
+    fn task_prepared_command_preserves_raw_home_and_tmpdir_bytes_under_non_utf8_host_root() {
+        let command = CommandSpec::shell("true".into()).unwrap();
         let material = RequestFingerprintMaterial::new(
             "018f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
             "102f0f4a6b5c7d8e9f00112233445566".parse().unwrap(),
@@ -7037,7 +7038,20 @@ mod tests {
         let home = host_root.join("jobs/job/home");
         let tmp = host_root.join("jobs/job/tmp");
 
-        let prepared = PreparedCommand::new(&command, &lease, &home, &tmp).unwrap();
+        let section = pump_turn_section();
+        let plan = LaunchPlan::turn_at_with_helper(
+            &command,
+            &lease,
+            &section,
+            &home,
+            &EnvProfile::empty(),
+            section.git_identity(),
+            tmp.parent().unwrap(),
+            &host_root.join("tasks/task/workspace"),
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let prepared = PreparedCommand::from_plan(&plan).unwrap();
         let environment = prepared
             ._environment
             .iter()
@@ -7076,19 +7090,11 @@ mod tests {
         }
     }
 
-    fn child_descriptors(root: &Path) -> (File, File, File) {
+    fn task_child_descriptors(root: &Path) -> (File, File) {
         let cwd = File::open(root).unwrap();
-        let stdout = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(root.join("stdout"))
-            .unwrap();
-        let stderr = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(root.join("stderr"))
-            .unwrap();
-        (cwd, stdout, stderr)
+        let prompt = root.join("prompt.md");
+        fs::write(&prompt, b"gate fixture prompt").unwrap();
+        (cwd, File::open(prompt).unwrap())
     }
 
     fn assert_already_reaped(pid: libc::pid_t) {
@@ -7109,16 +7115,16 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_pre_go_child_closes_the_gate_reaps_and_executes_zero_bytes() {
+    // Supersedes v1 test: dropping_a_pre_go_child_closes_the_gate_reaps_and_executes_zero_bytes.
+    fn task_dropping_a_pre_go_child_closes_the_gate_reaps_and_executes_zero_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let command = prepared_touch(&marker);
-        let (cwd, stdout, stderr) = child_descriptors(temp.path());
-        let child = GatedChild::spawn(
+        let (cwd, stdin) = task_child_descriptors(temp.path());
+        let (child, _stdout, _stderr) = GatedChild::spawn_turn(
             &command,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7131,22 +7137,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_rejection_after_ready_closes_the_gate_and_reaps() {
+    // Supersedes v1 test: identity_rejection_after_ready_closes_the_gate_and_reaps.
+    fn task_identity_rejection_after_ready_closes_the_gate_and_reaps() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let command = prepared_touch(&marker);
-        let (cwd, stdout, stderr) = child_descriptors(temp.path());
+        let (cwd, stdin) = task_child_descriptors(temp.path());
         let inspector = RejectingInspector::new();
 
-        let error = GatedChild::spawn(
-            &command,
-            cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
-            &inspector,
-        )
-        .err()
-        .expect("injected inspector rejects the child identity");
+        let error =
+            GatedChild::spawn_turn(&command, cwd.as_raw_fd(), stdin.as_raw_fd(), &inspector)
+                .err()
+                .expect("injected inspector rejects the child identity");
 
         assert!(error.to_string().contains("PROCESS_AMBIGUOUS"));
         let pid = inspector.observed_pid.load(Ordering::SeqCst) as libc::pid_t;
@@ -7156,16 +7158,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_exec_ack_capability_is_rejected_before_go_and_executes_zero_bytes() {
+    // Supersedes v1 test: missing_exec_ack_capability_is_rejected_before_go_and_executes_zero_bytes.
+    fn task_missing_exec_ack_capability_is_rejected_before_go_and_executes_zero_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let command = prepared_touch(&marker);
-        let (cwd, stdout, stderr) = child_descriptors(temp.path());
-        let mut child = GatedChild::spawn(
+        let (cwd, stdin) = task_child_descriptors(temp.path());
+        let (mut child, _stdout, _stderr) = GatedChild::spawn_turn(
             &command,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7181,16 +7183,16 @@ mod tests {
     }
 
     #[test]
-    fn exec_ack_read_failure_after_go_is_classified_ambiguous_and_child_is_owned() {
+    // Supersedes v1 test: exec_ack_read_failure_after_go_is_classified_ambiguous_and_child_is_owned.
+    fn task_exec_ack_read_failure_after_go_is_classified_ambiguous_and_child_is_owned() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("did-execute");
         let command = prepared_touch(&marker);
-        let (cwd, stdout, stderr) = child_descriptors(temp.path());
-        let mut child = GatedChild::spawn(
+        let (cwd, stdin) = task_child_descriptors(temp.path());
+        let (mut child, _stdout, _stderr) = GatedChild::spawn_turn(
             &command,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7216,6 +7218,7 @@ mod tests {
     }
 
     #[test]
+    // Supersedes the batch-spawn helper in v1 test: parent_death_helper_process.
     fn parent_death_helper_process() {
         let Some(marker) = std::env::var_os("MAC_WORKER_TEST_PARENT_DEATH_MARKER") else {
             return;
@@ -7228,12 +7231,11 @@ mod tests {
             .parent()
             .expect("parent-death helper has a parent directory");
         let command = prepared_touch(Path::new(&marker));
-        let (cwd, stdout, stderr) = child_descriptors(root);
-        let child = GatedChild::spawn(
+        let (cwd, stdin) = task_child_descriptors(root);
+        let (child, _stdout, _stderr) = GatedChild::spawn_turn(
             &command,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7246,7 +7248,8 @@ mod tests {
     }
 
     #[test]
-    fn real_parent_process_exit_closes_go_before_exec() {
+    // Supersedes v1 test: real_parent_process_exit_closes_go_before_exec.
+    fn task_real_parent_process_exit_closes_go_before_exec() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("must-not-exist");
         let identity_path = temp.path().join("child-identity.json");
@@ -7281,7 +7284,8 @@ mod tests {
     }
 
     #[test]
-    fn gated_exec_closes_a_planted_unrelated_descriptor() {
+    // Supersedes v1 test: gated_exec_closes_a_planted_unrelated_descriptor.
+    fn task_gated_exec_closes_a_planted_unrelated_descriptor() {
         const PLANTED_FD: RawFd = 200;
         const HELPER_ROOT: &str = "MAC_WORKER_TEST_FD_INVENTORY_ROOT";
         let Some(root) = std::env::var_os(HELPER_ROOT) else {
@@ -7290,7 +7294,7 @@ mod tests {
                 .env(HELPER_ROOT, temp.path())
                 .args([
                     "--exact",
-                    "supervisor::tests::gated_exec_closes_a_planted_unrelated_descriptor",
+                    "supervisor::tests::task_gated_exec_closes_a_planted_unrelated_descriptor",
                     "--nocapture",
                     "--test-threads=1",
                 ])
@@ -7340,12 +7344,11 @@ mod tests {
             _environment: environment,
             environment_pointers,
         };
-        let (cwd, stdout, stderr) = child_descriptors(&root);
-        let mut child = GatedChild::spawn(
+        let (cwd, stdin) = task_child_descriptors(&root);
+        let (mut child, _stdout, _stderr) = GatedChild::spawn_turn(
             &command,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7497,21 +7500,13 @@ mod tests {
         );
         let prepared = PreparedCommand::from_plan(&plan).unwrap();
         let cwd = File::open(&workspace).unwrap();
-        let stdout = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stdio.join("stdout"))
-            .unwrap();
-        let stderr = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stdio.join("stderr"))
-            .unwrap();
-        let mut child = GatedChild::spawn(
+        let prompt = stdio.join("prompt.md");
+        fs::write(&prompt, b"setup fixture prompt").unwrap();
+        let stdin = File::open(prompt).unwrap();
+        let (mut child, _stdout, _stderr) = GatedChild::spawn_turn(
             &prepared,
             cwd.as_raw_fd(),
-            stdout.as_raw_fd(),
-            stderr.as_raw_fd(),
+            stdin.as_raw_fd(),
             &SystemProcessInspector,
         )
         .unwrap();
@@ -7603,6 +7598,7 @@ mod tests {
     }
 
     #[test]
+    // Supersedes the batch-spawn fixture in v1 test: gated_child_setup_timeout_reaps_grandchild_without_agent_or_receipt.
     fn gated_child_setup_timeout_reaps_grandchild_without_agent_or_receipt() {
         let fixture = run_gated_setup_through_worker_helper(
             r#"
@@ -7615,6 +7611,7 @@ commands = ["PATH=/bin:/usr/bin printf $$ > leader.pid; /bin/sleep 60 & printf $
     }
 
     #[test]
+    // Supersedes the batch-spawn fixture in v1 test: gated_child_setup_output_cap_reaps_grandchild_without_agent_or_receipt.
     fn gated_child_setup_output_cap_reaps_grandchild_without_agent_or_receipt() {
         let fixture = run_gated_setup_through_worker_helper(
             r#"
@@ -7653,6 +7650,7 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 60 & printf $! > grandchild.pid; whil
     }
 
     #[test]
+    // Supersedes the batch-spawn fixture in v1 test: expired_wall_clock_lease_does_not_renew_setup_or_agent_budget.
     fn expired_wall_clock_lease_does_not_renew_setup_or_agent_budget() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

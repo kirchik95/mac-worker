@@ -21,18 +21,27 @@ use std::{
 };
 
 use mac_worker::{
+    agent::{AgentKind, PermissionPolicy, PromptDelivery, TurnLaunch, TurnLimits},
     error::WorkerError,
     host_store::{HostStore, HostStoreWritePoint, SupervisorGuard},
     job::{
-        CommandSpec, JobState, JobStatus, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
-        LogChunkRequest, LogChunkResponse, LogStream, ProcessIdentity, RequestFingerprintMaterial,
-        StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+        CommandSpec, ExecutionScope, JobState, JobStatus, LeaseAcquireRequest,
+        LeaseAcquireResponse, LeaseRecord, LogChunkRequest, LogChunkResponse, LogStream,
+        ProcessIdentity, RequestFingerprintMaterial, StatusRequest, StatusResponse, SubmitRequest,
+        SubmitResponse,
     },
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
     lease::{AdmissionFacts, LeaseService},
+    process::SystemProcessRunner,
     protocol::{MemoryPressure, PROTOCOL_VERSION},
     remote_snapshot::RemoteSnapshotService,
     supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+    task::{
+        BaseOid, ClosePolicy, GitIdentity, PublishMode, TaskId, TaskLimits, TaskMeta,
+        TaskMetaInput, TaskSource,
+    },
+    task_store::{SessionBinding, TaskPrepareRequest, TaskStore},
+    turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
 };
 use sha2::{Digest, Sha256};
 
@@ -94,6 +103,172 @@ fn wall_clock_millis() -> u64 {
         .as_millis()
         .try_into()
         .expect("system clock is outside the supported range")
+}
+
+pub(super) const HOST_SAFETY_TURN_PROMPT: &str = "host safety turn prompt";
+
+// Reuse the task_turn fixture's Git base, scoped lease and TaskStore preparation.
+pub(super) fn task_turn_request_on(
+    store: &HostStore,
+    command: CommandSpec,
+) -> (TaskTurnRequest, TaskMeta) {
+    let source = crate::support::GitRepo::init();
+    source.write("base.txt", b"base\n");
+    source.commit_all("base");
+    let base_oid: BaseOid = String::from_utf8(source.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let task_id = TaskId::new(uuid::Uuid::from_u128(17));
+    let mirror = store.mirror(PROJECT_ID).unwrap();
+    assert!(
+        source
+            .git(&[
+                "push",
+                mirror.path().to_str().unwrap(),
+                &format!("HEAD:refs/mac-worker/bases/{task_id}"),
+            ])
+            .status
+            .success()
+    );
+    let prompt = HOST_SAFETY_TURN_PROMPT;
+    let limits = TurnLimits::new(30_000, None, None).unwrap();
+    let turn = TurnMaterial::from_prompt(
+        task_id,
+        1,
+        AgentKind::Codex,
+        None,
+        None,
+        PermissionPolicy::Workspace,
+        limits.clone(),
+        base_oid.clone(),
+        prompt,
+        None,
+        uuid::Uuid::from_u128(18),
+        false,
+    )
+    .unwrap();
+    let launch = match command {
+        CommandSpec::Argv { argv } => TurnLaunch::new(
+            &argv[0],
+            argv[1..].to_vec(),
+            PromptDelivery::Stdin,
+            Vec::new(),
+            false,
+        ),
+        CommandSpec::Shell { shell } => TurnLaunch::new(
+            "/bin/sh",
+            vec!["-c".into(), shell],
+            PromptDelivery::Stdin,
+            Vec::new(),
+            false,
+        ),
+    };
+    let seed = RequestFingerprintMaterial::new(
+        JOB_ID.parse().unwrap(),
+        CLIENT_ID.parse().unwrap(),
+        LEASE_TOKEN.parse().unwrap(),
+        10,
+        "mini-1".into(),
+        PROJECT_ID.into(),
+        WORKTREE_ID.into(),
+        turn.digest(),
+        String::new(),
+        30_000,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    let seed_lease = LeaseRecord::new(&seed, seed.fingerprint(), 10, 30_010).unwrap();
+    let material = turn.v1_material(&seed_lease, &launch).unwrap();
+    let request = TaskTurnRequest::new(
+        SubmitRequest::new(material).with_execution_scope(ExecutionScope::task(task_id)),
+        turn,
+        prompt,
+    );
+    request.validate().unwrap();
+    let meta = TaskMeta::new(TaskMetaInput {
+        task_id,
+        run_id: None,
+        project_id: PROJECT_ID.into(),
+        worktree_id: WORKTREE_ID.into(),
+        agent: AgentKind::Codex,
+        model: None,
+        effort: None,
+        policy: PermissionPolicy::Workspace,
+        source: TaskSource::Local {
+            wip: false,
+            push_target: None,
+        },
+        publish: vec![PublishMode::Fetch],
+        publish_branch: None,
+        base_oid,
+        limits: TaskLimits::new(limits, 3).unwrap(),
+        close_policy: ClosePolicy::Never,
+        env_profile: None,
+        git_identity: GitIdentity::new("Host Test", "host@example.test").unwrap(),
+        title: None,
+        prompt: prompt.into(),
+        created_at_millis: 10,
+    })
+    .unwrap();
+    (request, meta)
+}
+
+pub(super) fn acquire_task_turn(store: &HostStore, request: &TaskTurnRequest) -> LeaseRecord {
+    match LeaseService::new(store)
+        .acquire(
+            &LeaseAcquireRequest::new(request.submit().material().clone())
+                .with_execution_scope(ExecutionScope::task(request.turn().task_id())),
+            &healthy(),
+            wall_clock_millis(),
+        )
+        .unwrap()
+    {
+        LeaseAcquireResponse::Acquired { lease } => lease,
+        LeaseAcquireResponse::ExistingAccepted { .. } => {
+            panic!("fresh task turn was already accepted")
+        }
+    }
+}
+
+pub(super) fn prepare_task_turn(store: &HostStore, request: &TaskTurnRequest, meta: TaskMeta) {
+    let job = request.submit().material().job_id();
+    let admission = store.admission_lock(job).unwrap();
+    let transfer = store.transfer_lock_after(&admission, job).unwrap();
+    TaskStore::new(store, &SystemProcessRunner)
+        .prepare(&TaskPrepareRequest::new(meta, job, "mini-1"), &transfer)
+        .unwrap();
+    bind_task_probe_session(store, request).unwrap();
+}
+
+pub(super) fn bind_task_probe_session(
+    store: &HostStore,
+    request: &TaskTurnRequest,
+) -> Result<(), WorkerError> {
+    // As in task_turn::existing_session_and_parsed_last_md_still_record_raw_stdout_auth_failure,
+    // prebind a fixture session so the original probe's exact stdout stays unchanged.
+    TaskStore::new(store, &SystemProcessRunner).bind_session(
+        request.submit().material().project_id(),
+        request.turn().task_id(),
+        SessionBinding::new(
+            request.turn().agent(),
+            "host-safety-session",
+            wall_clock_millis(),
+        )?,
+    )
+}
+
+fn prepared_task_host_with_command(
+    root: &Path,
+    command: CommandSpec,
+) -> (HostStore, LeaseRecord, TaskTurnRequest) {
+    let store = HostStore::open(root).unwrap();
+    let (request, meta) = task_turn_request_on(&store, command);
+    let lease = acquire_task_turn(&store, &request);
+    prepare_task_turn(&store, &request, meta);
+    (store, lease, request)
 }
 
 fn prepared_host(root: &Path) -> (HostStore, LeaseRecord, SubmitRequest) {
@@ -3460,6 +3635,340 @@ fn accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_a
         reconnected_log.chunk().decoded_bytes().unwrap(),
         b"reconnected"
     );
+    assert!(!job.join("execution.json").exists());
+
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+            .load()
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < release_deadline,
+            "detached cleanup did not release the lease after the client disconnect"
+        );
+        std::thread::yield_now();
+    }
+    detached_cleanup.disarm();
+}
+
+#[test]
+// Supersedes v1 test: hidden_submit_detaches_the_same_worker_and_inherited_lock_runs_supervisor.
+fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    let host_root = data.join("mac-worker/host");
+    let (store, lease, request) = prepared_task_host_with_command(
+        &host_root,
+        CommandSpec::argv(vec!["/usr/bin/true".into()]).unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    drop(store);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["host", "task-turn"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: TaskTurnResponse = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response.submit().status().supervisor_identity().is_some());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        let status: JobStatus =
+            serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+        if status.state().is_terminal() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached supervisor did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(terminal.state(), JobState::Succeeded);
+    while job.join("execution.json").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "detached turn publication did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!job.join("execution.json").exists());
+    loop {
+        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+            .load()
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached cleanup did not release lease"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_worker"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .args(["host", "supervise", &lease.job_id().to_string()])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}
+
+#[test]
+// Supersedes v1 test: accepted_client_disconnect_after_the_launch_handshake_preserves_supervision_and_status_reconnect.
+fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_and_status_reconnect()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data = temp.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    let ready_fifo = temp.path().join("command-ready.fifo");
+    let release_fifo = temp.path().join("command-release.fifo");
+    let client_exit_fifo = temp.path().join("client-exit.fifo");
+    create_fifo(&ready_fifo);
+    create_fifo(&release_fifo);
+    create_fifo(&client_exit_fifo);
+    let exit_parking_dylib = compile_exit_parking_dylib(temp.path());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let ready_reader = ready_fifo.clone();
+    let ready_thread = std::thread::spawn(move || {
+        let result = (|| -> std::io::Result<u8> {
+            let mut ready = [0_u8; 1];
+            OpenOptions::new()
+                .read(true)
+                .open(ready_reader)?
+                .read_exact(&mut ready)?;
+            Ok(ready[0])
+        })();
+        let _ = ready_tx.send(result);
+    });
+
+    let host_root = data.join("mac-worker/host");
+    let (store, lease, request) = prepared_task_host_with_command(
+        &host_root,
+        CommandSpec::argv(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "printf R > \"$1\"; ",
+                "IFS= read -r release < \"$2\"; ",
+                "[ \"$release\" = X ] || exit 9; ",
+                "printf reconnected"
+            )
+            .into(),
+            "disconnect-probe".into(),
+            ready_fifo.to_string_lossy().into_owned(),
+            release_fifo.to_string_lossy().into_owned(),
+        ])
+        .unwrap(),
+    );
+    let job = store
+        .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+        .unwrap();
+    let mut detached_cleanup = DetachedJobCleanup::new(job.clone());
+    drop(store);
+
+    let mut submit_client = DirectChildCleanup::new(
+        Command::new(env!("CARGO_BIN_EXE_worker"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env("DYLD_INSERT_LIBRARIES", &exit_parking_dylib)
+            .env("MAC_WORKER_TEST_CLIENT_EXIT_FIFO", &client_exit_fifo)
+            .args(["host", "task-turn"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    submit_client
+        .child_mut()
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&request).unwrap())
+        .unwrap();
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let submit_stdout = submit_client.child_mut().stdout.take().unwrap();
+    let ack_thread = std::thread::spawn(move || {
+        let result = (|| -> std::io::Result<String> {
+            let mut ack_line = String::new();
+            BufReader::new(submit_stdout).read_line(&mut ack_line)?;
+            Ok(ack_line)
+        })();
+        let _ = ack_tx.send(result);
+    });
+    let ack_line = ack_rx
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .expect("accepted submit client did not emit its response within the deadline")
+        .unwrap();
+    ack_thread.join().unwrap();
+    let accepted_turn: TaskTurnResponse = serde_json::from_str(ack_line.trim_end()).unwrap();
+    let accepted = accepted_turn.submit();
+    assert!(accepted.status().supervisor_identity().is_some());
+
+    assert_eq!(
+        ready_rx
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap()
+            .unwrap(),
+        b'R',
+        "the command must be FIFO-parked before the client is disconnected"
+    );
+    ready_thread.join().unwrap();
+
+    // After the accepted response, prove the submitting process is still live
+    // and SIGKILL that exact PID. The detached supervisor was already handed
+    // off before the response was written, so its lifetime must not depend on
+    // this process surviving.
+    assert!(
+        submit_client.child_mut().try_wait().unwrap().is_none(),
+        "accepted submit client must still be live immediately before SIGKILL"
+    );
+    let submit_status = submit_client.kill_and_reap();
+    assert_eq!(
+        submit_status.signal(),
+        Some(libc::SIGKILL),
+        "accepted submit client must be reaped with SIGKILL status"
+    );
+
+    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+    let running: StatusResponse = loop {
+        match try_host_control::<StatusRequest, StatusResponse>(
+            &home,
+            &data,
+            "status",
+            &StatusRequest::new(lease.job_id()),
+        ) {
+            Ok(response) if response.status().state() == JobState::Running => break response,
+            Ok(response) if response.status().state().is_terminal() => {
+                panic!(
+                    "FIFO-parked command became terminal before release: {:?}",
+                    response.status().state()
+                )
+            }
+            Ok(_) | Err(_) => {
+                assert!(
+                    Instant::now() < reconnect_deadline,
+                    "status reconnect never crossed the detached-supervisor handoff"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    assert_eq!(
+        running.status().supervisor_identity(),
+        accepted.status().supervisor_identity()
+    );
+    assert_eq!(running.status().state(), JobState::Running);
+
+    OpenOptions::new()
+        .write(true)
+        .open(&release_fifo)
+        .unwrap()
+        .write_all(b"X\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_status_error = String::from("none observed");
+    let terminal = loop {
+        let response: StatusResponse = match try_host_control(
+            &home,
+            &data,
+            "status",
+            &StatusRequest::new(lease.job_id()),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                last_status_error = error;
+                assert!(
+                    Instant::now() < deadline,
+                    "reconnected status polling never recovered a valid response; last control error: {last_status_error}"
+                );
+                std::thread::yield_now();
+                continue;
+            }
+        };
+        assert_eq!(
+            response.status().supervisor_identity(),
+            accepted.status().supervisor_identity()
+        );
+        if response.status().state().is_terminal() {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reconnected status polling never observed a terminal outcome; last control error: {last_status_error}"
+        );
+        std::thread::yield_now();
+    };
+
+    assert_eq!(terminal.status().state(), JobState::Succeeded);
+    assert_eq!(terminal.status().exit_code(), Some(0));
+    assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"reconnected");
+    let log_deadline = Instant::now() + Duration::from_secs(5);
+    let reconnected_log: LogChunkResponse = loop {
+        match try_host_control(
+            &home,
+            &data,
+            "log-chunk",
+            &LogChunkRequest::new(lease.job_id(), LogStream::Stdout, 0, 1024),
+        ) {
+            Ok(response) => break response,
+            Err(error) => {
+                assert!(
+                    Instant::now() < log_deadline,
+                    "same-ID log reconnect never recovered a valid response; last control error: {error}"
+                );
+                std::thread::yield_now();
+            }
+        }
+    };
+    assert_eq!(reconnected_log.chunk().stream(), LogStream::Stdout);
+    assert_eq!(reconnected_log.chunk().offset(), 0);
+    assert_eq!(
+        reconnected_log.chunk().decoded_bytes().unwrap(),
+        b"reconnected"
+    );
+    while job.join("execution.json").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "disconnected turn publication did not finish"
+        );
+        std::thread::yield_now();
+    }
     assert!(!job.join("execution.json").exists());
 
     let release_deadline = Instant::now() + Duration::from_secs(5);

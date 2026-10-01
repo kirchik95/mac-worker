@@ -5798,6 +5798,58 @@ mod review_regression_tests {
         LeaseAcquireRequest::new(material)
     }
 
+    fn staged_turn_receipt(staged: &StagedJob) -> crate::turn::TurnReceipt {
+        staged
+            .rooted_dir()
+            .write_new_private_file("prompt.md", b"turn prompt")
+            .unwrap();
+        crate::turn::TurnReceipt::new(
+            staged.job_id(),
+            crate::task::TaskId::new(uuid::Uuid::from_u128(17)),
+            "a".repeat(40).parse().unwrap(),
+            staged.receipt_nonce(),
+        )
+    }
+
+    #[test]
+    // Supersedes v1 test: workspace_receipt_from_another_staging_nonce_cannot_publish.
+    fn turn_receipt_from_another_staging_nonce_cannot_publish() {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let request = request(17);
+        let material = request.material();
+        let first_receipt = {
+            let first = store
+                .begin_job(
+                    material.project_id(),
+                    material.worktree_id(),
+                    material.job_id(),
+                )
+                .unwrap();
+            staged_turn_receipt(&first)
+        };
+        let second = store
+            .begin_job(
+                material.project_id(),
+                material.worktree_id(),
+                material.job_id(),
+            )
+            .unwrap();
+        drop(staged_turn_receipt(&second));
+        let error = second.publish_complete(first_receipt).unwrap_err();
+        assert!(error.to_string().contains("turn receipt"));
+        assert!(
+            !store
+                .job(
+                    material.project_id(),
+                    material.worktree_id(),
+                    material.job_id(),
+                )
+                .unwrap()
+                .exists()
+        );
+    }
+
     #[test]
     fn empty_staging_tree_cannot_mint_a_publishable_workspace_receipt() {
         let temp = tempdir().unwrap();
@@ -5920,7 +5972,8 @@ mod review_regression_tests {
     }
 
     #[test]
-    fn staged_publication_fails_closed_when_nested_final_ancestor_is_swapped() {
+    // Supersedes v1 test: staged_publication_fails_closed_when_nested_final_ancestor_is_swapped.
+    fn task_staged_publication_fails_closed_when_nested_final_ancestor_is_swapped() {
         use std::os::unix::fs::symlink;
 
         let temp = tempdir().unwrap();
@@ -5930,27 +5983,14 @@ mod review_regression_tests {
         let store = HostStore::open(&root).unwrap();
         let request = request(1);
         let material = request.material();
-        let mut staged = store
+        let staged = store
             .begin_job(
                 material.project_id(),
                 material.worktree_id(),
                 material.job_id(),
             )
             .unwrap();
-        let payload = RelativePath::parse(b"payload").unwrap();
-        staged
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
-            .unwrap();
-        let receipt = staged
-            .complete_snapshot_materialization(
-                &BTreeSet::from([payload]),
-                material.project_id(),
-                material.worktree_id(),
-                material.manifest_digest(),
-            )
-            .unwrap();
+        let receipt = staged_turn_receipt(&staged);
         let worktree = root
             .join("jobs")
             .join(material.project_id())
@@ -5965,7 +6005,8 @@ mod review_regression_tests {
     }
 
     #[test]
-    fn staged_publication_fails_closed_when_final_grandparent_is_relocated() {
+    // Supersedes v1 test: staged_publication_fails_closed_when_final_grandparent_is_relocated.
+    fn task_staged_publication_fails_closed_when_final_grandparent_is_relocated() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().unwrap();
@@ -5973,27 +6014,14 @@ mod review_regression_tests {
         let store = HostStore::open(&root).unwrap();
         let request = request(1);
         let material = request.material();
-        let mut staged = store
+        let staged = store
             .begin_job(
                 material.project_id(),
                 material.worktree_id(),
                 material.job_id(),
             )
             .unwrap();
-        let payload = RelativePath::parse(b"payload").unwrap();
-        staged
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
-            .unwrap();
-        let receipt = staged
-            .complete_snapshot_materialization(
-                &BTreeSet::from([payload]),
-                material.project_id(),
-                material.worktree_id(),
-                material.manifest_digest(),
-            )
-            .unwrap();
+        let receipt = staged_turn_receipt(&staged);
         let project = root.join("jobs").join(material.project_id());
         let detached = temp.path().join("detached-project");
         fs::rename(&project, &detached).unwrap();
@@ -6584,7 +6612,8 @@ mod review_regression_tests {
     }
 
     #[test]
-    fn task7_publication_retains_final_descriptor_and_matching_admission() {
+    // Supersedes v1 test: task7_publication_retains_final_descriptor_and_matching_admission.
+    fn task_turn_publication_retains_final_descriptor_and_matching_admission() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("host");
         let store = HostStore::open(&root).unwrap();
@@ -6592,7 +6621,7 @@ mod review_regression_tests {
         let submit = crate::job::SubmitRequest::new(acquire.material().clone());
         let material = submit.material();
         let admission = store.admission_lock(material.job_id()).unwrap();
-        let mut staged = store
+        let staged = store
             .begin_job_after(
                 admission,
                 material.project_id(),
@@ -6600,20 +6629,7 @@ mod review_regression_tests {
                 material.job_id(),
             )
             .unwrap();
-        let payload = RelativePath::parse(b"payload").unwrap();
-        staged
-            .create_workspace_tree()
-            .unwrap()
-            .create_empty_directory(&payload)
-            .unwrap();
-        let receipt = staged
-            .complete_snapshot_materialization(
-                &BTreeSet::from([payload]),
-                material.project_id(),
-                material.worktree_id(),
-                material.manifest_digest(),
-            )
-            .unwrap();
+        let receipt = staged_turn_receipt(&staged);
 
         let published = staged.publish_complete(receipt).unwrap();
         assert_eq!(published.job_id(), material.job_id());

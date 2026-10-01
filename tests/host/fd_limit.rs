@@ -9,11 +9,13 @@ use std::{
 use mac_worker::{
     host_store::HostStore,
     job::{
-        ClientId, CommandSpec, JobId, LeaseAcquireRequest, LeaseToken, RequestFingerprintMaterial,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse, SubmitRequest,
+        ClientId, CommandSpec, ExecutionScope, JobId, LeaseAcquireRequest, LeaseToken,
+        RequestFingerprintMaterial, ResolveOrAbandonOutcome, ResolveOrAbandonRequest,
+        ResolveOrAbandonResponse, SubmitRequest,
     },
     lease::{AdmissionFacts, LeaseService},
     protocol::MemoryPressure,
+    task::TaskId,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -29,7 +31,8 @@ fn healthy() -> AdmissionFacts {
 }
 
 #[test]
-fn resolve_or_abandon_completes_under_the_default_macos_ssh_fd_limit() {
+// Supersedes v1 test: resolve_or_abandon_completes_under_the_default_macos_ssh_fd_limit.
+fn task_resolve_or_abandon_completes_under_the_default_macos_ssh_fd_limit() {
     // Break caught: cloning every rooted lineage anchor exhausts the default
     // 256-descriptor SSH soft limit before the transfer lock can be published.
     let fixture = tempfile::Builder::new()
@@ -62,9 +65,12 @@ fn resolve_or_abandon_completes_under_the_default_macos_ssh_fd_limit() {
     )
     .unwrap();
     let job_id = material.job_id();
-    let lease = LeaseAcquireRequest::new(material.clone());
-    let resolve =
-        ResolveOrAbandonRequest::from_submit_request(&SubmitRequest::new(material)).unwrap();
+    let scope = ExecutionScope::task(TaskId::new(uuid::Uuid::from_u128(910_004)));
+    let lease = LeaseAcquireRequest::new(material.clone()).with_execution_scope(scope.clone());
+    let resolve = ResolveOrAbandonRequest::from_submit_request(
+        &SubmitRequest::new(material).with_execution_scope(scope),
+    )
+    .unwrap();
     let store = HostStore::open(&host_root).unwrap();
     LeaseService::new(&store)
         .acquire(&lease, &healthy(), now)

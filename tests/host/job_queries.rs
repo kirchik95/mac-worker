@@ -9211,3 +9211,1493 @@ fn identity(seed: u32) -> ProcessIdentity {
     let pid = fixture_pid::fixture_pid(seed);
     ProcessIdentity::new(pid, u64::from(pid) * 1_000).unwrap()
 }
+
+mod task_turn_ports {
+    use super::super::supervisor::HOST_SAFETY_TURN_PROMPT;
+    use super::*;
+    use mac_worker::{
+        job::ExecutionScope,
+        task::{TaskId, TaskMeta},
+        task_store::{TaskPrepareRequest, TaskStore},
+        turn::{TaskTurnRequest, TaskTurnResponse, TurnMaterial},
+    };
+
+    fn matrix_task_request(
+        store: &HostStore,
+        submit: &SubmitRequest,
+    ) -> Result<TaskTurnRequest, WorkerError> {
+        let task = TaskId::new(uuid::Uuid::from_u128(17));
+        let meta = TaskStore::new(store, &SystemProcessRunner)
+            .load_meta(submit.material().project_id(), task)?;
+        let turn = TurnMaterial::from_prompt(
+            task,
+            1,
+            meta.agent(),
+            meta.model().map(str::to_owned),
+            meta.effort().map(str::to_owned),
+            meta.policy(),
+            meta.limits().turn.clone(),
+            meta.base_oid().clone(),
+            HOST_SAFETY_TURN_PROMPT,
+            meta.env_profile().map(str::to_owned),
+            uuid::Uuid::from_u128(18),
+            false,
+        )?;
+        let request = TaskTurnRequest::new(submit.clone(), turn, HOST_SAFETY_TURN_PROMPT);
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn matrix_prepare_turn(
+        store: &HostStore,
+        meta: &TaskMeta,
+        request: &TaskTurnRequest,
+        calls: &Arc<AtomicUsize>,
+    ) -> Result<(), WorkerError> {
+        let job = request.submit().material().job_id();
+        let admission = store.admission_lock(job)?;
+        let transfer = store.transfer_lock_after(&admission, job)?;
+        TaskStore::new(store, &SystemProcessRunner).prepare(
+            &TaskPrepareRequest::new(meta.clone(), job, "mini-1"),
+            &transfer,
+        )?;
+        super::super::supervisor::bind_task_probe_session(store, request)?;
+        assert_eq!(
+            calls.fetch_add(1, Ordering::SeqCst),
+            0,
+            "task preparation ran twice"
+        );
+        Ok(())
+    }
+
+    struct MatrixInlineLauncher {
+        store: HostStore,
+        launches: Arc<AtomicUsize>,
+    }
+    impl SupervisorLauncher for MatrixInlineLauncher {
+        fn launch(
+            &self,
+            job_id: JobId,
+            guard: SupervisorGuard,
+        ) -> Result<LaunchCandidate, WorkerError> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            let inspector = SystemProcessInspector;
+            let identity = inspector.identity_for_pid(std::process::id())?;
+            Supervisor::new(&self.store, &inspector)
+                .with_prepare_turn_helper(PathBuf::from(env!("CARGO_BIN_EXE_worker")))
+                .run_with_guard(job_id, guard)?;
+            Ok(LaunchCandidate::new(identity))
+        }
+    }
+
+    fn matrix_exact_submit(
+        store: &HostStore,
+        submit: &SubmitRequest,
+        launches: &Arc<AtomicUsize>,
+        _now: u64,
+    ) -> Result<SubmitResponse, WorkerError> {
+        let launcher = MatrixInlineLauncher {
+            store: store.clone(),
+            launches: Arc::clone(launches),
+        };
+        JobService::new(store, &launcher)
+            .submit_turn(matrix_task_request(store, submit)?)
+            .map(|response| response.submit().clone())
+    }
+
+    struct MatrixOriginalMutation<'a> {
+        boundary: usize,
+        store: &'a HostStore,
+        lease: Option<&'a LeaseRecord>,
+        submit: &'a SubmitRequest,
+        manifest: &'a TaskMeta,
+        receiver_calls: &'a Arc<AtomicUsize>,
+        launches: &'a Arc<AtomicUsize>,
+    }
+    impl MatrixOriginalMutation<'_> {
+        fn prepare(&self, _now: u64) -> Result<LeaseRecord, WorkerError> {
+            let lease = match self.lease {
+                Some(lease) => lease.clone(),
+                None => match LeaseService::new(self.store).acquire(
+                    &LeaseAcquireRequest::new(self.submit.material().clone())
+                        .with_execution_scope(ExecutionScope::task(self.manifest.task_id())),
+                    &healthy(),
+                    matrix_execution_now_millis(),
+                )? {
+                    LeaseAcquireResponse::Acquired { lease } => lease,
+                    _ => panic!("original task admission was unexpectedly accepted"),
+                },
+            };
+            if self.boundary == 0 {
+                let turn = TurnMaterial::from_prompt(
+                    self.manifest.task_id(),
+                    1,
+                    self.manifest.agent(),
+                    None,
+                    None,
+                    self.manifest.policy(),
+                    self.manifest.limits().turn.clone(),
+                    self.manifest.base_oid().clone(),
+                    HOST_SAFETY_TURN_PROMPT,
+                    None,
+                    uuid::Uuid::from_u128(18),
+                    false,
+                )?;
+                matrix_prepare_turn(
+                    self.store,
+                    self.manifest,
+                    &TaskTurnRequest::new(self.submit.clone(), turn, HOST_SAFETY_TURN_PROMPT),
+                    self.receiver_calls,
+                )?;
+            }
+            Ok(lease)
+        }
+        fn complete(&self, now: u64) -> Result<(LeaseRecord, SubmitResponse), WorkerError> {
+            let lease = self.prepare(now)?;
+            matrix_exact_submit(self.store, self.submit, self.launches, now + 2)
+                .map(|response| (lease, response))
+        }
+    }
+
+    fn matrix_assert_abandoned_fences(
+        store: &HostStore,
+        _lease: Option<&LeaseRecord>,
+        submit: &SubmitRequest,
+        request: &TaskTurnRequest,
+    ) {
+        let acquire = LeaseAcquireRequest::new(submit.material().clone())
+            .with_execution_scope(ExecutionScope::task(request.turn().task_id()));
+        let error = LeaseService::new(store)
+            .acquire(&acquire, &healthy(), matrix_execution_now_millis())
+            .expect_err("delayed task lease resurrected abandoned work");
+        matrix_assert_protocol_code(&error, "JOB_ABANDONED", "delayed task lease fence");
+        let launches = Arc::new(AtomicUsize::new(0));
+        let error = JobService::new(
+            store,
+            &CountingRejectLauncher {
+                launches: Arc::clone(&launches),
+            },
+        )
+        .submit_turn(request.clone())
+        .expect_err("delayed task submit resurrected abandoned work");
+        matrix_assert_protocol_code(&error, "JOB_ABANDONED", "delayed task submit fence");
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    fn matrix_assert_recorded_endpoint_identity(
+        command: &str,
+        bytes: &[u8],
+        submit: &SubmitRequest,
+    ) {
+        if command == "task-turn" {
+            let request: TaskTurnRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(request.submit(), submit);
+            request.validate().unwrap();
+        } else {
+            super::matrix_assert_recorded_endpoint_identity(command, bytes, submit);
+        }
+    }
+
+    fn matrix_durable_snapshot(
+        root: &Path,
+        store: &HostStore,
+        submit: &SubmitRequest,
+        marker: &Path,
+    ) -> (MatrixDurableSnapshot, MatrixPathSnapshot) {
+        (
+            super::matrix_durable_snapshot(root, store, submit, marker),
+            matrix_snapshot_path(&root.join("tasks")),
+        )
+    }
+
+    struct MatrixSubmitLossRunner<'a> {
+        endpoint: &'a MatrixEndpointRunner,
+        store: HostStore,
+        expected: TaskTurnRequest,
+        launches: Arc<AtomicUsize>,
+        marker: PathBuf,
+        serialize_success: bool,
+        submit_calls: AtomicUsize,
+        injected_losses: AtomicUsize,
+        captured_success: Mutex<Option<Vec<u8>>>,
+        events: Mutex<Vec<&'static str>>,
+        service_stage: Mutex<&'static str>,
+        pre_mapping: Mutex<Option<String>>,
+    }
+
+    impl MatrixSubmitLossRunner<'_> {
+        fn captured_success(&self) -> Option<Vec<u8>> {
+            self.captured_success.lock().unwrap().clone()
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn note_pre_mapping(&self, stage: &'static str, error: &WorkerError) {
+            let mut recorded_stage = self.service_stage.lock().unwrap();
+            if *recorded_stage == "unset" {
+                *recorded_stage = stage;
+            }
+            let mut recorded = self.pre_mapping.lock().unwrap();
+            if recorded.is_none() {
+                *recorded = Some(matrix_worker_error_provenance(error));
+            }
+        }
+
+        fn append_pre_mapping(&self, extra: &str) {
+            if let Some(recorded) = self.pre_mapping.lock().unwrap().as_mut() {
+                recorded.push(' ');
+                recorded.push_str(extra);
+            }
+        }
+
+        fn service_stage(&self) -> &'static str {
+            *self.service_stage.lock().unwrap()
+        }
+
+        fn pre_mapping(&self) -> Option<String> {
+            self.pre_mapping.lock().unwrap().clone()
+        }
+    }
+
+    impl ProcessRunner for MatrixSubmitLossRunner<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.last() != Some(&OsString::from(HostOperation::TaskTurn.command())) {
+                return self.endpoint.run(request);
+            }
+            assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
+            assert_eq!(
+                request.args,
+                [
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "ForwardAgent=no",
+                    "-o",
+                    "ClearAllForwardings=yes",
+                    "--",
+                    "matrix-host",
+                    "~/.local/bin/worker host task-turn",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+            );
+            assert!(request.environment.is_empty());
+            assert!(request.environment_remove.is_empty());
+            assert_eq!(request.policy, matrix_control_policy());
+            let input = request.stdin.as_ref().expect("submit request has stdin");
+            assert_eq!(input, &serde_json::to_vec(&self.expected).unwrap());
+            let decoded: TaskTurnRequest = serde_json::from_slice(input).unwrap();
+            assert_eq!(decoded, self.expected);
+            assert_eq!(
+                self.submit_calls.fetch_add(1, Ordering::SeqCst),
+                0,
+                "original submit ran more than once through the loss runner"
+            );
+            self.endpoint
+                .requests
+                .lock()
+                .unwrap()
+                .push(("task-turn".into(), input.clone()));
+
+            let launcher = MatrixInlineLauncher {
+                store: self.store.clone(),
+                launches: Arc::clone(&self.launches),
+            };
+            let response =
+                match JobService::new(&self.store, &launcher).submit_turn(self.expected.clone()) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.note_pre_mapping("job_service.submit_turn", &error);
+                        return Err(error);
+                    }
+                };
+            if let Err(error) = response.submit().validate() {
+                self.note_pre_mapping("submit_response.validate", &error);
+                return Err(error);
+            }
+            assert!(
+                matches!(response.submit(), SubmitResponse::Accepted { .. }),
+                "loss runner must execute the original submit, not an Existing replay"
+            );
+            match fs::read(&self.marker) {
+                Ok(bytes) => {
+                    assert_eq!(
+                        bytes, b"x",
+                        "submit loss occurred before actual command execution"
+                    );
+                }
+                Err(error) => {
+                    let error = WorkerError::from(error);
+                    self.note_pre_mapping("execution_marker_read", &error);
+                    let status = match response.submit() {
+                        SubmitResponse::Accepted { status, .. } => Some(("Accepted", status)),
+                        SubmitResponse::Existing { status } => Some(("Existing", status)),
+                    };
+                    if let Some((kind, status)) = status {
+                        self.append_pre_mapping(&format!(
+                        "submit={kind} job_state={:?} exit={:?} signal={:?} error_code={:?} stdout_bytes={:?} stderr_bytes={:?}",
+                        status.state(),
+                        status.exit_code(),
+                        status.terminating_signal(),
+                        status.error_code(),
+                        status.final_stdout_bytes(),
+                        status.final_stderr_bytes(),
+                    ));
+                    }
+                    if let Ok(Some(lease)) = LeaseService::new(&self.store).load() {
+                        let wall_now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .ok()
+                            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+                        let remaining =
+                            wall_now.map(|now| lease.expires_at_millis().saturating_sub(now));
+                        self.append_pre_mapping(&format!(
+                        "lease_expires={} wall_now={wall_now:?} remaining_saturating={remaining:?}",
+                        lease.expires_at_millis(),
+                    ));
+                    }
+                    if let Ok(job_path) = self.store.job(
+                        self.expected.submit().material().project_id(),
+                        self.expected.submit().material().worktree_id(),
+                        self.expected.submit().material().job_id(),
+                    ) {
+                        self.append_pre_mapping(&format!(
+                            "stdout_log={:?} stderr_log={:?}",
+                            matrix_truncate_log(&job_path.join("stdout.log")),
+                            matrix_truncate_log(&job_path.join("stderr.log")),
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+            self.events.lock().unwrap().push("real-submit-complete");
+
+            if self.serialize_success {
+                let canonical = serde_json::to_vec(&response).unwrap();
+                let wire = [canonical.as_slice(), b"\n"].concat();
+                let decoded: TaskTurnResponse = serde_json::from_slice(&wire).unwrap();
+                decoded.submit().validate().unwrap();
+                assert_eq!(decoded, response);
+                assert_eq!(
+                    wire,
+                    [serde_json::to_vec(&decoded).unwrap().as_slice(), b"\n"].concat()
+                );
+                *self.captured_success.lock().unwrap() = Some(wire);
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push("canonical-success-captured");
+            } else {
+                assert!(self.captured_success.lock().unwrap().is_none());
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push("pre-serialization-loss-point");
+            }
+
+            self.events.lock().unwrap().push("loss-injected");
+            assert_eq!(
+                self.injected_losses.fetch_add(1, Ordering::SeqCst),
+                0,
+                "original submit response loss was injected more than once"
+            );
+            Err(WorkerError::Transport {
+                code: "MATRIX_SUBMIT_RESPONSE_LOST",
+                message: "the test runner dropped the original submit response".into(),
+            })
+        }
+    }
+
+    fn matrix_run_submit_loss(
+        endpoint: &MatrixEndpointRunner,
+        store: &HostStore,
+        submit: &SubmitRequest,
+        launches: &Arc<AtomicUsize>,
+        marker: &Path,
+        row: MatrixLossRow,
+    ) -> (Result<SubmitResponse, WorkerError>, Option<Vec<u8>>) {
+        assert!(row.now > 0);
+        let runner = MatrixSubmitLossRunner {
+            endpoint,
+            store: store.clone(),
+            expected: matrix_task_request(store, submit).unwrap(),
+            launches: Arc::clone(launches),
+            marker: marker.to_path_buf(),
+            serialize_success: row.serialize_success,
+            submit_calls: AtomicUsize::new(0),
+            injected_losses: AtomicUsize::new(0),
+            captured_success: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            service_stage: Mutex::new("unset"),
+            pre_mapping: Mutex::new(None),
+        };
+        let result = SshJsonTransport::new(&runner).request::<_, TaskTurnResponse>(
+            &matrix_worker(),
+            HostOperation::TaskTurn,
+            &matrix_task_request(store, submit).unwrap(),
+            matrix_control_policy(),
+        );
+        let error = result
+            .as_ref()
+            .expect_err("submit success escaped the loss runner");
+        let context = format!(
+            "case_index={} boundary={} schedule={} serialize_success={} submit_calls={} injected_losses={} launches={} marker_exists={} events={:?} service_stage={} pre_mapping={} mapped={}",
+            row.case_index,
+            row.boundary,
+            row.schedule,
+            row.serialize_success,
+            runner.submit_calls.load(Ordering::SeqCst),
+            runner.injected_losses.load(Ordering::SeqCst),
+            runner.launches.load(Ordering::SeqCst),
+            marker.exists(),
+            runner.events(),
+            runner.service_stage(),
+            runner.pre_mapping().as_deref().unwrap_or("<none>"),
+            matrix_worker_error_provenance(error),
+        );
+        match error {
+            WorkerError::Transport { code, message } => {
+                assert_eq!(*code, "SSH_LAUNCH_FAILED", "{context}");
+                assert_eq!(message, "failed to launch SSH control request", "{context}");
+            }
+            unexpected => {
+                panic!(
+                    "submit loss runner returned the wrong actual error: {unexpected}; {context}"
+                )
+            }
+        }
+        assert_eq!(runner.submit_calls.load(Ordering::SeqCst), 1, "{context}");
+        assert_eq!(
+            runner.injected_losses.load(Ordering::SeqCst),
+            1,
+            "{context}"
+        );
+        assert_eq!(
+            runner.events(),
+            if row.serialize_success {
+                vec![
+                    "real-submit-complete",
+                    "canonical-success-captured",
+                    "loss-injected",
+                ]
+            } else {
+                vec![
+                    "real-submit-complete",
+                    "pre-serialization-loss-point",
+                    "loss-injected",
+                ]
+            },
+            "submit loss runner crossed its boundary out of order; {context}"
+        );
+        let captured = runner.captured_success();
+        assert_eq!(captured.is_some(), row.serialize_success);
+        (result.map(|response| response.submit().clone()), captured)
+    }
+
+    fn matrix_resolution_after_boundary(
+        boundary: usize,
+        store: &HostStore,
+        submit: &SubmitRequest,
+        launches: &Arc<AtomicUsize>,
+        runner: &MatrixEndpointRunner,
+    ) -> mac_worker::job::ResolveOrAbandonResponse {
+        let request = ResolveOrAbandonRequest::from_submit_request(submit).unwrap();
+        if boundary == 3 {
+            let launcher = MatrixInlineLauncher {
+                store: store.clone(),
+                launches: Arc::clone(launches),
+            };
+            // Resume an indexed task through its surviving turn entry point;
+            // the standalone resolver recovery proposition has its own test below.
+            JobService::new(store, &launcher)
+                .submit_turn(matrix_task_request(store, submit).unwrap())
+                .unwrap();
+            JobService::new(store, &launcher)
+                .resolve_or_abandon(request)
+                .unwrap()
+        } else {
+            matrix_remote_resolve(runner, &request)
+        }
+    }
+
+    #[test]
+    // Supersedes v1 test: acceptance_disconnect_matrix_100.
+    fn task_turn_acceptance_disconnect_matrix_preserves_all_24_boundary_order_classes() {
+        // Preserve all 24 actual rows (six boundaries by four channel orderings),
+        // including the exact original counters despite its legacy `_100` name.
+        // Scoped leases, TaskStore preparation, submit_turn and real task supervision
+        // replace rsync receipt/verification; the canonical status/resolve path stays.
+        let mut boundary_counts = [0usize; 6];
+        let mut accepted = 0usize;
+        let mut abandoned = 0usize;
+        let mut execution_markers = 0usize;
+        let mut launcher_total = 0usize;
+        let mut coverage = [[0usize; 4]; 6];
+        let mut receiver_invocations = [0usize; 6];
+        let mut forwarded_submit_losses = [0usize; 6];
+        let mut pre_serialization_losses = 0usize;
+        let mut canonical_success_losses = 0usize;
+        let mut schedule_traces: [BTreeSet<Vec<&'static str>>; 6] =
+            std::array::from_fn(|_| BTreeSet::new());
+        let mut trace_table: [[Option<Vec<&'static str>>; 4]; 6] =
+            std::array::from_fn(|_| std::array::from_fn(|_| None));
+        let mut primary_boundaries: [BTreeSet<&'static str>; 6] =
+            std::array::from_fn(|_| BTreeSet::new());
+
+        for case_index in 0..24 {
+            let boundary = case_index % 6;
+            let schedule = case_index / 6;
+            boundary_counts[boundary] += 1;
+            coverage[boundary][schedule] += 1;
+
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, root) = matrix_runtime(&temp);
+            let marker = temp.path().join("actual-child-marker");
+            let command = matrix_command(&marker);
+            let mut store = HostStore::open(&root).unwrap();
+            let (task_request, manifest) =
+                super::super::supervisor::task_turn_request_on(&store, command);
+            let submit = task_request.submit().clone();
+            let mut retained_lease = if boundary == 0 {
+                None
+            } else {
+                Some(super::super::supervisor::acquire_task_turn(
+                    &store,
+                    &task_request,
+                ))
+            };
+            matrix_assert_original_identity(&submit);
+            if let Some(lease) = retained_lease.as_ref() {
+                matrix_assert_lease_identity(lease, &submit);
+            }
+
+            let launches = Arc::new(AtomicUsize::new(0));
+            let receiver_calls = Arc::new(AtomicUsize::new(0));
+            let resolve = ResolveOrAbandonRequest::from_submit_request(&submit).unwrap();
+            let runner = MatrixEndpointRunner::new(runtime);
+            let resolution_runtime = MatrixResolutionRuntime::default();
+
+            if boundary >= 1 {
+                matrix_prepare_turn(&store, &manifest, &task_request, &receiver_calls).unwrap();
+            }
+
+            let row_forwarded_submit_loss = AtomicUsize::new(0);
+            let mut primary_submit_result: Option<Result<SubmitResponse, WorkerError>> = None;
+            let mut primary_canonical_success: Option<SubmitResponse> = None;
+            let primary_event = match boundary {
+                0 => {
+                    assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+                    assert_eq!(receiver_calls.load(Ordering::SeqCst), 0);
+                    assert!(
+                        !store
+                            .incoming_job(
+                                submit.material().job_id(),
+                                submit.material().lease_token(),
+                            )
+                            .unwrap()
+                            .exists()
+                    );
+                    "before-task-lease-disconnect"
+                }
+                1 => {
+                    assert_eq!(receiver_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        TaskStore::new(&store, &SystemProcessRunner)
+                            .load_status(manifest.project_id(), manifest.task_id())
+                            .unwrap()
+                            .state(),
+                        mac_worker::task::TaskState::Active
+                    );
+                    assert!(
+                        !store
+                            .verified_receipt(submit.material().job_id())
+                            .unwrap()
+                            .exists()
+                    );
+                    "post-task-prepare-disconnect"
+                }
+                2 => {
+                    drop(store);
+                    let faulted = HostStore::open_with_write_fault(
+                        &root,
+                        HostStoreWritePoint::AfterJobMetaWrite,
+                    )
+                    .unwrap();
+                    let result = JobService::new(&faulted, &RejectLauncher)
+                        .submit_turn(task_request.clone())
+                        .map(|r| r.submit().clone());
+                    assert!(result.is_err(), "post-meta fault did not interrupt submit");
+                    drop(faulted);
+                    store = HostStore::open(&root).unwrap();
+                    assert!(
+                        !store
+                            .job_index(submit.material().job_id())
+                            .unwrap()
+                            .exists()
+                    );
+                    assert_eq!(
+                        matrix_count_named_file(&root.join("leases"), "meta.json"),
+                        1,
+                        "post-meta boundary did not retain exactly one canonical meta"
+                    );
+                    assert!(!marker.exists());
+                    "post-meta-disconnect"
+                }
+                3 => {
+                    drop(store);
+                    let faulted = HostStore::open_with_write_fault(
+                        &root,
+                        HostStoreWritePoint::AfterJobIndexParentSync,
+                    )
+                    .unwrap();
+                    let result = JobService::new(&faulted, &RejectLauncher)
+                        .submit_turn(task_request.clone())
+                        .map(|r| r.submit().clone());
+                    assert!(result.is_err(), "post-index fault did not interrupt submit");
+                    primary_submit_result = Some(result);
+                    drop(faulted);
+                    store = HostStore::open(&root).unwrap();
+                    let disposition: JobDisposition = serde_json::from_slice(
+                        &fs::read(store.job_index(submit.material().job_id()).unwrap()).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(matches!(disposition, JobDisposition::Accepted { .. }));
+                    assert!(!marker.exists());
+                    assert_eq!(launches.load(Ordering::SeqCst), 0);
+                    "post-index-parent-sync-disconnect"
+                }
+                4 | 5 => {
+                    let (lost, captured) = matrix_run_submit_loss(
+                        &runner,
+                        &store,
+                        &submit,
+                        &launches,
+                        &marker,
+                        MatrixLossRow {
+                            case_index,
+                            boundary,
+                            schedule,
+                            now: 6 + boundary as u64,
+                            serialize_success: boundary == 5,
+                        },
+                    );
+                    primary_submit_result = Some(lost);
+                    assert_eq!(fs::read(&marker).unwrap(), b"x");
+                    if boundary == 4 {
+                        pre_serialization_losses += 1;
+                        assert!(
+                            captured.is_none(),
+                            "boundary 5 serialized bytes before its loss point"
+                        );
+                        "post-execution-pre-serialization-disconnect"
+                    } else {
+                        canonical_success_losses += 1;
+                        let wire = captured.expect("boundary 6 did not capture success bytes");
+                        let body = wire
+                            .strip_suffix(b"\n")
+                            .expect("boundary 6 success omitted its sole allowed LF");
+                        assert!(!body.contains(&b'\n'));
+                        let decoded: TaskTurnResponse = serde_json::from_slice(&wire).unwrap();
+                        decoded.submit().validate().unwrap();
+                        assert!(matches!(decoded.submit(), SubmitResponse::Accepted { .. }));
+                        assert_eq!(body, serde_json::to_vec(&decoded).unwrap());
+                        primary_canonical_success = Some(decoded.submit().clone());
+                        "post-canonical-success-bytes-disconnect"
+                    }
+                }
+                _ => unreachable!(),
+            };
+            primary_boundaries[boundary].insert(primary_event);
+
+            let schedule_trace = Arc::new(Mutex::new(Vec::new()));
+            let first = match schedule {
+                0 => {
+                    let primary_loss = (boundary >= 4).then(|| {
+                        primary_submit_result
+                            .take()
+                            .expect("response-loss boundary omitted its actual submit error")
+                    });
+                    let expected_canonical = primary_canonical_success.clone();
+                    let mutation_store = store.clone();
+                    let mutation_lease = retained_lease.clone();
+                    let mutation_submit = submit.clone();
+                    let mutation_manifest = manifest.clone();
+                    let mutation_receiver_calls = Arc::clone(&receiver_calls);
+                    let mutation_launches = Arc::clone(&launches);
+                    let resolution_trace = Arc::clone(&schedule_trace);
+                    let (authority, mutation) = matrix_resolver_before_mutator(
+                        move || {
+                            MatrixOriginalMutation {
+                                boundary,
+                                store: &mutation_store,
+                                lease: mutation_lease.as_ref(),
+                                submit: &mutation_submit,
+                                manifest: &mutation_manifest,
+
+                                receiver_calls: &mutation_receiver_calls,
+                                launches: &mutation_launches,
+                            }
+                            .complete(20)
+                        },
+                        || {
+                            if let Some(lost) = primary_loss {
+                                matrix_reconcile_actual_submit_loss(
+                                    &runner,
+                                    &resolution_runtime,
+                                    &submit,
+                                    lost,
+                                    expected_canonical.as_ref(),
+                                    &row_forwarded_submit_loss,
+                                );
+                                matrix_trace(&resolution_trace, "submit-loss-reconciled");
+                            }
+                            matrix_resolution_after_boundary(
+                                boundary, &store, &submit, &launches, &runner,
+                            )
+                        },
+                        &schedule_trace,
+                        if boundary <= 2 {
+                            "original-mutator-ready"
+                        } else {
+                            "same-id-retry-ready"
+                        },
+                        if boundary <= 2 {
+                            "original-mutator-complete"
+                        } else {
+                            "same-id-retry-complete"
+                        },
+                    );
+                    match mutation {
+                        Ok((lease, response)) => {
+                            assert!(
+                                boundary >= 3,
+                                "pre-index mutator escaped durable abandonment"
+                            );
+                            assert!(response.status().state().is_terminal());
+                            retained_lease = Some(lease);
+                        }
+                        Err(error) => {
+                            assert!(
+                                boundary < 3,
+                                "accepted retry failed after authority: {error}"
+                            );
+                            let expected = "JOB_ABANDONED";
+                            matrix_assert_protocol_code(
+                                &error,
+                                expected,
+                                &format!("case {case_index} delayed original mutator fence"),
+                            );
+                        }
+                    }
+                    authority
+                }
+                1 => {
+                    let primary_loss = (boundary >= 4).then(|| {
+                        primary_submit_result
+                            .take()
+                            .expect("response-loss boundary omitted its actual submit error")
+                    });
+                    let expected_canonical = primary_canonical_success.clone();
+                    let resolver_store = store.clone();
+                    let resolver_submit = submit.clone();
+                    let resolver_launches = Arc::clone(&launches);
+                    let resolver_runner = &runner;
+                    let resolver_resolution_runtime = &resolution_runtime;
+                    let resolver_forwarded_submit_loss = &row_forwarded_submit_loss;
+                    let resolver_trace = Arc::clone(&schedule_trace);
+                    let (mutation, authority) = matrix_mutator_before_resolver(
+                        || {
+                            MatrixOriginalMutation {
+                                boundary,
+                                store: &store,
+                                lease: retained_lease.as_ref(),
+                                submit: &submit,
+                                manifest: &manifest,
+
+                                receiver_calls: &receiver_calls,
+                                launches: &launches,
+                            }
+                            .complete(30)
+                        },
+                        move || {
+                            if let Some(lost) = primary_loss {
+                                matrix_reconcile_actual_submit_loss(
+                                    resolver_runner,
+                                    resolver_resolution_runtime,
+                                    &resolver_submit,
+                                    lost,
+                                    expected_canonical.as_ref(),
+                                    resolver_forwarded_submit_loss,
+                                );
+                                matrix_trace(&resolver_trace, "submit-loss-reconciled");
+                            }
+                            matrix_resolution_after_boundary(
+                                boundary,
+                                &resolver_store,
+                                &resolver_submit,
+                                &resolver_launches,
+                                resolver_runner,
+                            )
+                        },
+                        &schedule_trace,
+                        if boundary <= 2 {
+                            "original-mutator-complete"
+                        } else {
+                            "same-id-retry-complete"
+                        },
+                    );
+                    let (lease, response) =
+                        mutation.expect("original mutator did not complete before resolution");
+                    assert!(response.status().state().is_terminal());
+                    retained_lease = Some(lease);
+                    authority
+                }
+                2 => {
+                    let lost = if boundary <= 2 {
+                        let lease = MatrixOriginalMutation {
+                            boundary,
+                            store: &store,
+                            lease: retained_lease.as_ref(),
+                            submit: &submit,
+                            manifest: &manifest,
+
+                            receiver_calls: &receiver_calls,
+                            launches: &launches,
+                        }
+                        .prepare(40)
+                        .unwrap();
+                        retained_lease = Some(lease);
+                        let (lost, captured) = matrix_run_submit_loss(
+                            &runner,
+                            &store,
+                            &submit,
+                            &launches,
+                            &marker,
+                            MatrixLossRow {
+                                case_index,
+                                boundary,
+                                schedule,
+                                now: 42,
+                                serialize_success: false,
+                            },
+                        );
+                        assert!(
+                            captured.is_none(),
+                            "recovery submit loss invented canonical-byte boundary evidence"
+                        );
+                        lost
+                    } else {
+                        if boundary == 3 {
+                            let completed =
+                                matrix_exact_submit(&store, &submit, &launches, 43).unwrap();
+                            assert!(completed.status().state().is_terminal());
+                        }
+                        primary_submit_result
+                            .take()
+                            .expect("accepted boundary did not retain its actual submit loss")
+                    };
+                    assert!(lost.is_err(), "schedule 2 observed submit success");
+                    assert_eq!(fs::read(&marker).unwrap(), b"x");
+                    matrix_trace(&schedule_trace, "accepted");
+                    matrix_trace(&schedule_trace, "submit-success-lost");
+                    let reconciled = matrix_reconcile_actual_submit_loss(
+                        &runner,
+                        &resolution_runtime,
+                        &submit,
+                        lost,
+                        primary_canonical_success.as_ref(),
+                        &row_forwarded_submit_loss,
+                    );
+                    matrix_trace(&schedule_trace, "submit-loss-reconciled");
+                    let authority = matrix_remote_resolve(&runner, &resolve);
+                    let ResolveOrAbandonOutcome::Accepted { response } = authority.outcome() else {
+                        panic!("accepted submit reconciliation lost durable authority")
+                    };
+                    assert_eq!(reconciled.status(), response.status());
+                    if let SubmitResponse::Accepted { meta, .. } = &reconciled {
+                        assert_eq!(meta.as_ref(), response.meta());
+                    }
+                    matrix_trace(&schedule_trace, "authority");
+                    authority
+                }
+                3 => {
+                    if boundary >= 4 {
+                        let lost = primary_submit_result
+                            .take()
+                            .expect("response-loss boundary omitted its actual submit error");
+                        matrix_reconcile_actual_submit_loss(
+                            &runner,
+                            &resolution_runtime,
+                            &submit,
+                            lost,
+                            primary_canonical_success.as_ref(),
+                            &row_forwarded_submit_loss,
+                        );
+                        matrix_trace(&schedule_trace, "submit-loss-reconciled");
+                    }
+                    if boundary == 3 {
+                        let completed =
+                            matrix_exact_submit(&store, &submit, &launches, 50).unwrap();
+                        assert!(completed.status().state().is_terminal());
+                    }
+                    runner.lose_success_responses.store(1, Ordering::SeqCst);
+                    let lost = SshJsonTransport::new(&runner)
+                        .request::<_, mac_worker::job::ResolveOrAbandonResponse>(
+                        &matrix_worker(),
+                        HostOperation::ResolveOrAbandon,
+                        &resolve,
+                        matrix_control_policy(),
+                    );
+                    assert!(
+                        lost.is_err(),
+                        "case {case_index} kept its first resolution response"
+                    );
+                    match lost.as_ref().unwrap_err() {
+                        WorkerError::Transport { code, message } => {
+                            assert_eq!(*code, "SSH_LAUNCH_FAILED");
+                            assert_eq!(message, "failed to launch SSH control request");
+                        }
+                        unexpected => panic!(
+                            "case {case_index} lost resolution returned wrong error: {unexpected}"
+                        ),
+                    }
+                    assert_eq!(runner.lose_success_responses.load(Ordering::SeqCst), 0);
+                    matrix_trace(&schedule_trace, "resolution-success-lost");
+                    let authority = matrix_remote_resolve(&runner, &resolve);
+                    matrix_trace(&schedule_trace, "authority-repeat");
+                    authority
+                }
+                _ => unreachable!(),
+            };
+
+            let should_accept = boundary >= 3 || matches!(schedule, 1 | 2);
+            let first_bytes = serde_json::to_vec(&first).unwrap();
+            let disposition_path = store.job_index(submit.material().job_id()).unwrap();
+            let disposition_bytes = fs::read(&disposition_path).unwrap();
+            let disposition: JobDisposition = serde_json::from_slice(&disposition_bytes).unwrap();
+            assert_eq!(disposition_bytes, serde_json::to_vec(&disposition).unwrap());
+
+            let final_job = store
+                .job(
+                    submit.material().project_id(),
+                    submit.material().worktree_id(),
+                    submit.material().job_id(),
+                )
+                .unwrap();
+            let mut observed_job_ids = BTreeSet::from([submit.material().job_id().to_string()]);
+            if let Some(lease) = retained_lease.as_ref() {
+                matrix_assert_lease_identity(lease, &submit);
+                observed_job_ids.insert(lease.job_id().to_string());
+            }
+
+            match (&disposition, first.outcome()) {
+                (
+                    JobDisposition::Accepted {
+                        job_id,
+                        client_id,
+                        project_id,
+                        worktree_id,
+                        request_fingerprint,
+                        status,
+                        ..
+                    },
+                    ResolveOrAbandonOutcome::Accepted { response },
+                ) if should_accept => {
+                    accepted += 1;
+                    assert_eq!(*job_id, submit.material().job_id());
+                    assert_eq!(*client_id, submit.material().client_id());
+                    assert_eq!(project_id, submit.material().project_id());
+                    assert_eq!(worktree_id, submit.material().worktree_id());
+                    assert_eq!(request_fingerprint, submit.request_fingerprint());
+                    status.validate().unwrap();
+                    assert_eq!(status.state(), JobState::Accepted);
+                    assert_eq!(status.supervisor_identity(), None);
+                    assert_eq!(status.child_identity(), None);
+                    response.validate().unwrap();
+                    matrix_assert_meta_identity(response.meta(), &submit);
+                    assert!(response.status().state().is_terminal());
+                    observed_job_ids.insert(job_id.to_string());
+                    observed_job_ids.insert(response.meta().job_id().to_string());
+
+                    let meta_bytes = fs::read(final_job.join("meta.json")).unwrap();
+                    let meta: JobMeta = serde_json::from_slice(&meta_bytes).unwrap();
+                    assert_eq!(meta_bytes, serde_json::to_vec(&meta).unwrap());
+                    let status_bytes = fs::read(final_job.join("status.json")).unwrap();
+                    let final_status: JobStatus = serde_json::from_slice(&status_bytes).unwrap();
+                    assert_eq!(status_bytes, serde_json::to_vec(&final_status).unwrap());
+                    matrix_assert_meta_identity(&meta, &submit);
+                    assert_eq!(&final_status, response.status());
+                    observed_job_ids.insert(meta.job_id().to_string());
+                    assert_eq!(
+                        usize::from(final_job.join("meta.json").is_file())
+                            * usize::from(final_job.join("status.json").is_file()),
+                        1,
+                        "accepted authority lacks its exact final"
+                    );
+                    assert_eq!(fs::read(final_job.join("stdout.log")).unwrap(), b"");
+                    assert_eq!(fs::read(final_job.join("stderr.log")).unwrap(), b"");
+                    assert!(!final_job.join("execution.json").exists());
+
+                    let retry = matrix_exact_submit(&store, &submit, &launches, 60).unwrap();
+                    assert!(matches!(retry, SubmitResponse::Existing { .. }));
+                    assert_eq!(retry.status(), response.status());
+                    let remote_status =
+                        RemoteJobClient::new_with_runtime(&runner, &resolution_runtime)
+                            .status(&matrix_worker(), submit.material().job_id())
+                            .unwrap();
+                    matrix_assert_meta_identity(remote_status.meta(), &submit);
+                    assert_eq!(remote_status.status(), response.status());
+
+                    assert_eq!(fs::read(&marker).unwrap(), b"x");
+                    execution_markers += 1;
+                }
+                (
+                    JobDisposition::Abandoned {
+                        job_id,
+                        client_id,
+                        project_id,
+                        worktree_id,
+                        request_fingerprint,
+                        lease_token_sha256,
+                        ..
+                    },
+                    ResolveOrAbandonOutcome::Abandoned,
+                ) if !should_accept => {
+                    abandoned += 1;
+                    assert_eq!(*job_id, submit.material().job_id());
+                    assert_eq!(*client_id, submit.material().client_id());
+                    assert_eq!(project_id, submit.material().project_id());
+                    assert_eq!(worktree_id, submit.material().worktree_id());
+                    assert_eq!(request_fingerprint, submit.request_fingerprint());
+                    assert_eq!(
+                        lease_token_sha256,
+                        &format!(
+                            "{:x}",
+                            Sha256::digest(submit.material().lease_token().to_string().as_bytes())
+                        )
+                    );
+                    observed_job_ids.insert(job_id.to_string());
+                    assert!(
+                        !final_job.join("meta.json").exists()
+                            && !final_job.join("status.json").exists()
+                            && !final_job.join("stdout.log").exists()
+                            && !final_job.join("stderr.log").exists(),
+                        "abandoned authority retained an accepted final"
+                    );
+                    matrix_assert_abandoned_fences(
+                        &store,
+                        retained_lease.as_ref(),
+                        &submit,
+                        &task_request,
+                    );
+                    assert!(!marker.exists(), "abandoned row {case_index} executed");
+                }
+                _ => panic!(
+                    "case {case_index} selected authority inconsistent with its event order: {first:?}"
+                ),
+            }
+
+            let accepted_index = matches!(disposition, JobDisposition::Accepted { .. });
+            let abandoned_tombstone = matches!(disposition, JobDisposition::Abandoned { .. });
+            let accepted_final =
+                final_job.join("meta.json").is_file() && final_job.join("status.json").is_file();
+            assert_eq!(
+                accepted_index, accepted_final,
+                "case {case_index} index/final Accepted authority disagreed"
+            );
+            assert_eq!(
+                usize::from(accepted_index && accepted_final)
+                    + usize::from(abandoned_tombstone && !accepted_final),
+                1,
+                "case {case_index} durable authority cardinality"
+            );
+            assert!(
+                root.join("locks/jobs")
+                    .join(submit.material().job_id().to_string())
+                    .join("cleanup-complete.json")
+                    .is_file(),
+                "case {case_index} retired its lease without exact cleanup proof"
+            );
+            assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+            assert!(
+                !store
+                    .incoming_job(submit.material().job_id(), submit.material().lease_token(),)
+                    .unwrap()
+                    .exists(),
+                "case {case_index} retained exact incoming state"
+            );
+            if !should_accept {
+                assert!(
+                    !store
+                        .verified_receipt(submit.material().job_id())
+                        .unwrap()
+                        .exists(),
+                    "case {case_index} abandoned authority retained a verified receipt"
+                );
+            }
+            for name in ["workspace", "home", "tmp", "execution.json"] {
+                assert!(
+                    !final_job.join(name).exists(),
+                    "case {case_index} retained exact mutable scope {name}"
+                );
+            }
+
+            let expected_launches = usize::from(should_accept);
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                expected_launches,
+                "case {case_index} launch cardinality"
+            );
+            launcher_total += launches.load(Ordering::SeqCst);
+            let receiver_call_count = receiver_calls.load(Ordering::SeqCst);
+            assert_eq!(
+                receiver_call_count,
+                if boundary == 0 {
+                    usize::from(should_accept)
+                } else {
+                    1
+                },
+                "case {case_index} receiver invocation cardinality"
+            );
+            receiver_invocations[boundary] += receiver_call_count;
+            let forwarded_count = row_forwarded_submit_loss.load(Ordering::SeqCst);
+            assert_eq!(
+                forwarded_count,
+                usize::from(schedule == 2 || boundary >= 4),
+                "case {case_index} did not forward its exact actual submit error"
+            );
+            forwarded_submit_losses[boundary] += forwarded_count;
+
+            let before_repeat = matrix_durable_snapshot(&root, &store, &submit, &marker);
+            let resolution_requests_before = runner
+                .requests()
+                .iter()
+                .filter(|(command, _)| command == "resolve-or-abandon")
+                .count();
+            let repeated = matrix_remote_resolve(&runner, &resolve);
+            assert_eq!(
+                serde_json::to_vec(&repeated).unwrap(),
+                first_bytes,
+                "case {case_index} changed exact repeated resolution"
+            );
+            matrix_trace(&schedule_trace, "repeat");
+            let resolution_requests_after = runner
+                .requests()
+                .iter()
+                .filter(|(command, _)| command == "resolve-or-abandon")
+                .count();
+            assert_eq!(
+                resolution_requests_after,
+                resolution_requests_before + 1,
+                "case {case_index} omitted or falsified its exact repeat"
+            );
+            assert_eq!(
+                matrix_durable_snapshot(&root, &store, &submit, &marker),
+                before_repeat,
+                "case {case_index} repeated resolution mutated durable state"
+            );
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                expected_launches,
+                "case {case_index} duplicated launch after repeat"
+            );
+            assert_eq!(
+                matrix_snapshot_path(&marker),
+                if should_accept {
+                    MatrixPathSnapshot::File(b"x".to_vec())
+                } else {
+                    MatrixPathSnapshot::Absent
+                },
+                "case {case_index} duplicate or missing execution marker"
+            );
+
+            let requests = runner.requests();
+            assert!(
+                !requests.is_empty(),
+                "case {case_index} made no host request"
+            );
+            for (command, bytes) in &requests {
+                matrix_assert_recorded_endpoint_identity(command, bytes, &submit);
+                match command.as_str() {
+                    "status" => {
+                        let request: StatusRequest = serde_json::from_slice(bytes).unwrap();
+                        observed_job_ids.insert(request.job_id().to_string());
+                    }
+                    "task-turn" => {
+                        let request: TaskTurnRequest = serde_json::from_slice(bytes).unwrap();
+                        observed_job_ids.insert(request.submit().material().job_id().to_string());
+                    }
+                    "resolve-or-abandon" => {
+                        let request: ResolveOrAbandonRequest =
+                            serde_json::from_slice(bytes).unwrap();
+                        observed_job_ids.insert(request.job_id().to_string());
+                    }
+                    unexpected => panic!("unexpected endpoint {unexpected}"),
+                }
+            }
+            assert_eq!(
+                observed_job_ids,
+                BTreeSet::from([submit.material().job_id().to_string()]),
+                "case {case_index} observed a replacement job ID"
+            );
+
+            let mut expected_trace = match schedule {
+                0 => vec![if boundary <= 2 {
+                    "original-mutator-ready"
+                } else {
+                    "same-id-retry-ready"
+                }],
+                1 => vec![
+                    "resolver-ready",
+                    if boundary <= 2 {
+                        "original-mutator-complete"
+                    } else {
+                        "same-id-retry-complete"
+                    },
+                    "resolver-release-sent",
+                ],
+                2 => vec!["accepted", "submit-success-lost"],
+                3 => Vec::new(),
+                _ => unreachable!(),
+            };
+            if boundary >= 4 && matches!(schedule, 0 | 1 | 3) {
+                expected_trace.push("submit-loss-reconciled");
+            }
+            match schedule {
+                0 => expected_trace.extend([
+                    "authority",
+                    "mutator-release-sent",
+                    if boundary <= 2 {
+                        "original-mutator-complete"
+                    } else {
+                        "same-id-retry-complete"
+                    },
+                    "repeat",
+                ]),
+                1 => expected_trace.extend(["authority", "repeat"]),
+                2 => expected_trace.extend(["submit-loss-reconciled", "authority", "repeat"]),
+                3 => {
+                    expected_trace.extend(["resolution-success-lost", "authority-repeat", "repeat"])
+                }
+                _ => unreachable!(),
+            }
+            let schedule_trace = schedule_trace.lock().unwrap().clone();
+            assert_eq!(schedule_trace, expected_trace, "case {case_index}");
+            if let Some(previous) = &trace_table[boundary][schedule] {
+                assert_eq!(
+                    &schedule_trace, previous,
+                    "boundary {boundary} schedule {schedule} changed order classes"
+                );
+            } else {
+                trace_table[boundary][schedule] = Some(schedule_trace.clone());
+            }
+            schedule_traces[boundary].insert(schedule_trace);
+        }
+
+        assert_eq!(boundary_counts, [4, 4, 4, 4, 4, 4]);
+        assert_eq!(
+            coverage,
+            [
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+                [1, 1, 1, 1],
+            ],
+            "boundary/schedule table did not cover every disconnect case once"
+        );
+        assert_eq!(receiver_invocations, [2, 4, 4, 4, 4, 4]);
+        assert_eq!(forwarded_submit_losses, [1, 1, 1, 1, 4, 4]);
+        assert_eq!(pre_serialization_losses, 4);
+        assert_eq!(canonical_success_losses, 4);
+        let expected_primary = [
+            "before-task-lease-disconnect",
+            "post-task-prepare-disconnect",
+            "post-meta-disconnect",
+            "post-index-parent-sync-disconnect",
+            "post-execution-pre-serialization-disconnect",
+            "post-canonical-success-bytes-disconnect",
+        ];
+        for (boundary, events) in primary_boundaries.into_iter().enumerate() {
+            assert_eq!(
+                events,
+                BTreeSet::from([expected_primary[boundary]]),
+                "boundary {boundary} did not preserve its primary disconnect"
+            );
+        }
+        for (boundary, traces) in schedule_traces.into_iter().enumerate() {
+            assert_eq!(traces.len(), 4, "boundary {boundary} collapsed schedules");
+            assert!(
+                trace_table[boundary].iter().all(Option::is_some),
+                "boundary {boundary} omitted a schedule class"
+            );
+        }
+        // Derived from the complete boundary/schedule table above: pre-index S0/S3
+        // abandon, while every post-index or mutator-first/Accepted-first row wins.
+        assert_eq!((accepted, abandoned), (18, 6));
+        assert_eq!((execution_markers, launcher_total), (18, 18));
+        assert_eq!(accepted + abandoned, 24);
+        eprintln!(
+            "matrix distribution={boundary_counts:?} schedules={coverage:?} accepted={accepted} abandoned={abandoned} markers={execution_markers} launches={launcher_total} receivers={receiver_invocations:?} forwarded-losses={forwarded_submit_losses:?} pre-serialization-losses={pre_serialization_losses} canonical-success-losses={canonical_success_losses} traces={trace_table:?}"
+        );
+    }
+
+    fn prepared_turn(store: &HostStore, marker: &Path) -> (LeaseRecord, TaskTurnRequest) {
+        let (request, meta) =
+            super::super::supervisor::task_turn_request_on(store, matrix_command(marker));
+        let lease = super::super::supervisor::acquire_task_turn(store, &request);
+        super::super::supervisor::prepare_task_turn(store, &request, meta);
+        (lease, request)
+    }
+
+    #[test]
+    // Supersedes v1 test: host_reconcile_replays_an_indexed_terminal_status_without_discovery_or_mutation.
+    fn task_turn_replays_an_indexed_terminal_status_without_discovery_or_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, root) = matrix_runtime(&temp);
+        let store = HostStore::open(&root).unwrap();
+        let marker = temp.path().join("executions");
+        let (lease, request) = prepared_turn(&store, &marker);
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher = MatrixInlineLauncher {
+            store: store.clone(),
+            launches: Arc::clone(&launches),
+        };
+        let response = JobService::new(&store, &launcher)
+            .submit_turn(request.clone())
+            .unwrap_or_else(|error| {
+                let job = store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap();
+                let names: Vec<_> = fs::read_dir(job)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                panic!("task replay failed: {error}; final names: {names:?}");
+            });
+        assert_eq!(response.submit().status().state(), JobState::Succeeded);
+        let before = matrix_durable_snapshot(&root, &store, request.submit(), &marker);
+        let input = serde_json::to_vec(&StatusRequest::new(lease.job_id())).unwrap();
+        let (first_exit, first_stdout, first_stderr) =
+            run_query_endpoint(&runtime, "status", input.clone());
+        let (second_exit, second_stdout, second_stderr) =
+            run_query_endpoint(&runtime, "status", input);
+        assert_eq!(first_exit, 0);
+        assert_eq!(second_exit, 0);
+        assert!(first_stderr.is_empty());
+        assert!(second_stderr.is_empty());
+        assert_eq!(first_stdout, second_stdout);
+        let status: StatusResponse =
+            serde_json::from_slice(first_stdout.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(status.status(), response.submit().status());
+        matrix_assert_meta_identity(status.meta(), request.submit());
+        let retry = JobService::new(&store, &launcher)
+            .submit_turn(request.clone())
+            .unwrap();
+        assert!(matches!(retry.submit(), SubmitResponse::Existing { .. }));
+        assert_eq!(retry.submit().status(), response.submit().status());
+        assert_eq!(retry.task(), response.task());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&marker).unwrap(), b"x");
+        assert_eq!(
+            matrix_durable_snapshot(&root, &store, request.submit(), &marker),
+            before
+        );
+    }
+
+    #[test]
+    // Supersedes v1 test: host_reconcile_returns_per_job_errors_for_corrupt_status_or_lease.
+    fn task_turn_status_preserves_corrupt_status_or_lease_and_reports_typed_errors() {
+        for (label, target) in [("status", "status.json"), ("lease", "lease.json")] {
+            let temp = tempfile::tempdir().unwrap();
+            let (runtime, root) = matrix_runtime(&temp);
+            let store = HostStore::open(&root).unwrap();
+            let (lease, request) = prepared_turn(&store, &temp.path().join("must-not-execute"));
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launcher = HoldingRecordingLauncher {
+                launches: Arc::clone(&launches),
+                job_path: store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap(),
+                identity: identity(41_004),
+                guard: Mutex::new(None),
+            };
+            JobService::new(&store, &launcher)
+                .submit_turn(request)
+                .unwrap();
+            let path = if label == "status" {
+                store
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap()
+                    .join(target)
+            } else {
+                root.join("leases/slots/0").join(target)
+            };
+            replace_bytes(&path, b"{").unwrap();
+            let (exit, stdout, stderr) = run_query_endpoint(
+                &runtime,
+                "status",
+                serde_json::to_vec(&StatusRequest::new(lease.job_id())).unwrap(),
+            );
+            assert_ne!(exit, 0, "{label}");
+            assert!(stderr.is_empty(), "{label}");
+            assert_eq!(stdout.last(), Some(&b'\n'));
+            assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+            let response: HostControlError =
+                serde_json::from_slice(stdout.strip_suffix(b"\n").unwrap()).unwrap();
+            assert_eq!(response.error().code(), "JOB_STATE_INVALID", "{label}");
+            assert_eq!(fs::read(path).unwrap(), b"{", "{label}");
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    // Supersedes v1 test: empty_staging_tree_cannot_mint_a_publishable_workspace_receipt.
+    fn incomplete_turn_control_files_cannot_publish_a_turn_receipt_or_launch() {
+        for point in [
+            HostStoreWritePoint::AfterJobMetaWrite,
+            HostStoreWritePoint::AfterJobStatusWrite,
+            HostStoreWritePoint::AfterJobExecutionWrite,
+            HostStoreWritePoint::AfterJobStagingDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            let marker = temp.path().join("must-not-execute");
+            let (lease, request) = prepared_turn(&store, &marker);
+            drop(store);
+            let faulted = HostStore::open_with_write_fault(&root, point).unwrap();
+            let launches = Arc::new(AtomicUsize::new(0));
+            assert!(
+                JobService::new(
+                    &faulted,
+                    &CountingRejectLauncher {
+                        launches: Arc::clone(&launches)
+                    }
+                )
+                .submit_turn(request.clone())
+                .is_err(),
+                "{point:?}"
+            );
+            assert!(
+                !faulted
+                    .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+                    .unwrap()
+                    .exists()
+            );
+            assert!(!faulted.job_index(lease.job_id()).unwrap().exists());
+            assert!(!marker.exists());
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            matrix_assert_lease_identity(
+                &LeaseService::new(&faulted).load().unwrap().unwrap(),
+                request.submit(),
+            );
+        }
+    }
+}

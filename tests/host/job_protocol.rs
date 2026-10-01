@@ -159,7 +159,8 @@ fn command_spec_preserves_empty_and_repeated_arguments() {
 }
 
 #[test]
-fn serialization_rejects_directly_constructed_invalid_public_protocol_variants() {
+// Supersedes the CommandSpec branches of v1 test: serialization_rejects_directly_constructed_invalid_public_protocol_variants.
+fn shared_command_specs_reject_directly_constructed_invalid_variants_before_serialization() {
     assert!(serde_json::to_string(&CommandSpec::Argv { argv: Vec::new() }).is_err());
     assert!(
         serde_json::to_string(&CommandSpec::Shell {
@@ -167,6 +168,11 @@ fn serialization_rejects_directly_constructed_invalid_public_protocol_variants()
         })
         .is_err()
     );
+}
+
+#[test]
+// Supersedes the Error branches of v1 test: serialization_rejects_directly_constructed_invalid_public_protocol_variants.
+fn shared_error_events_reject_invalid_versions_and_control_characters_before_serialization() {
     assert!(
         serde_json::to_string(&JsonEvent::Error {
             protocol_version: 1,
@@ -459,7 +465,8 @@ fn log_chunks_are_bounded_base64_records_with_exact_offsets() {
 }
 
 #[test]
-fn streaming_events_are_versioned_strict_ndjson_records() {
+// Supersedes the retained Error proposition of v1 test: streaming_events_are_versioned_strict_ndjson_records.
+fn shared_error_events_are_versioned_strict_ndjson_records() {
     let event = JsonEvent::Error {
         protocol_version: PROTOCOL_VERSION,
         code: "CAPACITY_BUSY".into(),
