@@ -518,6 +518,11 @@ execution session, not worker startup or handler cost. It is used only by:
 - `worker events -f`;
 - `worker notify` and `worker notify --follow`.
 
+Setup is lazy. The first eligible read in a command always uses ordinary per-request SSH, and the
+channel is set up only from the second eligible read in the same command. A short wait that
+finishes in one or two polls therefore never pays the channel's cold setup cost (about 110–120 ms
+in local measurements), and long loops still move to the channel after their first poll.
+
 The mutation or transfer before a `--wait` remains on ordinary per-request SSH. So do submit, say,
 cancel, close, batch, checkpoint, controller retry, drain reads and writes, reconcile,
 publish-retry, transfers, one-shot status/list/logs/diff/result, events without follow, doctor,

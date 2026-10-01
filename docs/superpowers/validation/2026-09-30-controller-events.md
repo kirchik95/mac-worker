@@ -210,3 +210,45 @@ Kit rows with no separate plan line, also unrun:
 | §9 rollback | not needed — not executed |
 
 No names-versus-record measurement was taken on a live `tasks/` directory. The table above is T4's fixture. A live registry count and a turn-finished-to-banner delay remain `pending — live, after deploy`.
+
+## Live acceptance results, 2026-10-01
+
+The orchestrator ran these checks on the deployed pool after the owner approved the deploy. The tables above stay as the pre-deploy record. A row marked pending here was not run live; pending is not a pass. Task ids are shortened to 8 hex digits.
+
+### Deploys
+
+| Step | Result |
+| --- | --- |
+| First deploy: main `d3cae87` (events wave + Phase 3 + dead-code removal) | Release gate 3,763/3,763. Laptop `0.1.0+d3cae878bc0e-release`; `worker setup` reached all three minis and restarted the controller. `worker controller status` lists `controller.events`, `controller.socket`, `controller.task-logs-wait`; protocol 7 |
+| Live defect after the first smoke turn | The mini-1 journal kept an empty `manifest.stage` without evidence and a `pending.json` holding events 5..11, so every reader got `CONTROLLER_EVENTS_UNAVAILABLE`. Cause: a short-lived publisher exited mid-append inside the 50 ms exit grace, and only leader init discarded an empty stage |
+| Live fix: main `6f51701` | Crash residue is recovered under journal EX, and `PUBLISHER_EXIT_GRACE` is 3 s. After deploy, the controller restart recovered the journal: head seq 11, events 5..11 preserved |
+| Stabilization: main `ca86290` | Gate 3,778/3,778 with no flaky retries; journal head 56 and clean after the restart |
+
+### Plan items
+
+| Plan item | Live result |
+| --- | --- |
+| Deploy; identities, protocol 7, features; old laptop decodes list/status/log/wait/drain | **Pass.** See Deploys above and N-1 below. The old laptop decodes the drain state (`drained: false`) in `controller status`; drain was toggled only from the new laptop, six times, for the latency measurement |
+| Task lifecycle in the viewer; one title-bearing banner; `--no-titles` | **Pass.** Smoke `d304f3cd` (mini-3): `worker events -f` received seq 12..29, including `turn.started` and `turn.finished` done; `task wait` exited 0 in 32 s. `--channel both` on `0b050265` showed one notice per channel, and the operator saw both with the title. `--no-titles` on `8180e7bc`: the macOS banner showed the id and outcome with no title |
+| NeedsInput/Blocked → Request sound, Done → Done; `--channel both` = two attempts, one decision | **Partial.** `--channel both`: one decision, two channel notices, seen by the operator. `needs_input` on `8180e7bc` (`--questions ask --close-on never`): one decision, the task stayed `open`, and the operator saw the macOS banner and heard the herdr sound. The operator did not compare the Request and Done sounds side by side. Blocked was not exercised |
+| Auto-continuation, dead runner, dispatching row, close intent never banner | **Partial.** Close intent: `8180e7bc` closed with `--discard` became `abandoned`; the next notifier run consumed seq 131→134 and recorded no decision. While `needs_input` persisted, the notifier re-checked it every 15 s and kept one decision. Auto-continuation and a dispatching row: pending (needs explicit drain authorization). Dead runner: fixture-only |
+| Detached controller child attaches the journal; laptop-local never emits | **Partial.** Socket-spawned RPC children and the leader share one journal on mini-1 (seq grows across turns). A local-mode new binary refuses `events -f` (exit 64) and creates no journal (N-1 kit step 8) |
+| Restart after dedup eviction; history silent; attention coalesces; quiet consumed | **Partial.** A restart with no new work (20:00:01) consumed seq 131→134 with 0 new decisions and no output. Outage of over 60 s: `7edf541a` and `8c0aa442` finished while the notifier was down; the restart at 20:07:53 recorded both decisions at once (5→7, seq 134→173). The owner deferred the visual check of the coalesced summary, so that part is pending. `--quiet` not run |
+| N-1: old laptop against the new controller; old controller rejects selectors with no artifact | **Pass.** Old laptop `0.1.0+37915a9c21c2-release`: `controller status` decodes and prints the controller feature strings as received (it does not use them); `task list` decodes (protocol 7, 28 tasks); `task status`, `task logs` and `task wait` decode, wait exit 0; `events` and `notify` are usage errors (exit 64). The old binary as an isolated `host controller-rpc` rejects `read`, `tasks` and `repair` selectors with `INVALID_REQUEST: task.list body contained unexpected key controller_events`, leaving 0 `req-*` rows and 0 `active/` receipts. Kit fix: the probe needs pre-created 0700 XDG directories, otherwise every request, including the positive control, answers `HOST_IO`. New laptop against an old controller: pending (rollback window) |
+| Tunnel or heartbeat loss; UI keeps data and drafts; resumes | **Pass, with gaps.** Browser on `http://127.0.0.1:9173`. Before the loss the stream sent `snapshot_required` (bootstrap), `ready`, `heartbeat`, then `snapshot.ready` about every 2 s as the collection revision advanced. At 20:22:54 the laptop `worker dashboard` got SIGINT. The page kept the last snapshot and showed "The dashboard API stopped answering" and "Showing last snapshot"; worker cards turned "Stale · capacity unknown" with their last-reported age. Snapshot polls continued every 2–3 s and the event source retried with backoff, all refused. A restart at 20:23:23 on the same port answered `/api/v1/events` with 503 while the tunnel came up, then 200; the page returned to "Dashboard refreshed 0s ago". Not checked: draft survival (no open task had a reply box), the viewer's exit on mini-1 (remote shell not permitted), and cursor reuse (no `controller.event` arrived in the window) |
+| Slow tab, foreign Host/Origin, question refresh, UTF-8 trailing bytes | Pending — not run |
+| Unchanged `task.wait` | **Partial.** `task wait` exited 0 for done (`f1b903ea`, `0b050265`, `7edf541a`, `8c0aa442`) and for `needs_input` (`8180e7bc`). WAIT_BLOCKED, run DAG and aggregate exit were not exercised live |
+| Embedded UI equals the accepted asset build | Pending — not compared |
+| Fixture-only rows (§8) | Fixture-only, as planned |
+
+### Measurements
+
+| Measurement | Result |
+| --- | --- |
+| Event → laptop latency | p50 about 340 ms (330–420 ms) over six drain toggles, corrected for mini-1's clock running about 1.43 s ahead of the laptop |
+| Turn finished → notify decision | Under 1 s: for `f1b903ea` the decision was saved at 19:51:04, the same second `task wait` returned |
+| Notifier lock | A second `worker notify` exits with `CONTROLLER_EVENTS_NOTIFY_LOCK_HELD` while one runs |
+
+### Channel selection note
+
+`--channel auto` delivers to herdr whenever the laptop herdr socket is reachable, because `[notifications] herdr` defaults to `true`. On a laptop where herdr runs, that means herdr notices and sounds, not macOS banners. `--channel macos` or `--channel both` produces a macOS banner, which also stays in Notification Center.

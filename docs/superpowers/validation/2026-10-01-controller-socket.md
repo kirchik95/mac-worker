@@ -268,3 +268,18 @@ requires the owner's approval.
 Phase 4 phone/Tailscale access and Phase 5 per-mini daemons are out of scope by owner decision.
 Shortening the SSH control directory remains an owner follow-up. Ordinary multiplexing behavior
 for the 94+17-byte cold managed path is still an open performance-phase question.
+
+## Live results, 2026-10-01
+
+Phase 3 shipped in main `d3cae87` together with the events wave and was redeployed in `6f51701` and `ca86290`. The checklist above stays as the pre-deploy record; pending below means not run live.
+
+| Plan item | Live result |
+| --- | --- |
+| Stream-local forwarding and the channel on the real fleet | **Pass for the default path.** `controller.socket` is advertised after each deploy, and `worker controller channel identity` answers. On mini-1 a socket-spawned `host controller-rpc` child ran from the generation hard link under the leader pid. Old/new pairing details, the managed `-F` override and the exclusive-forward checks were not exercised separately: pending |
+| Generation links and executable validation | **Pass.** After the stabilization deploy only the current (18:04) and previous (14:04) generation links remained on mini-1; the 13:21 link was withdrawn after its grace, as designed. A link from an earlier boot epoch now counts as expired (`5bebdd5`). syspolicyd on mini-1 stayed at 0% |
+| Lazy setup (added after T8, `81beccf`) | The first eligible read in a command uses per-request SSH; the channel starts from the second. Short waits therefore do not pay the 110–120 ms cold setup measured locally |
+| Read loops in use | `task wait`, `worker events -f` and `worker notify --follow` ran through the evening without a failed read; every smoke `task wait` exited 0 |
+| Paired raw/channel live measurement | Pending — not run. Local fixture numbers are above; the event → laptop latency of about 340 ms p50 is in the events record |
+| Leader restart, master loss, network loss, transient-child cancellation | **Partial, observational.** The controller restarted with each of three deploys, and the channel identity answered after each one. No deliberate master-loss, network-loss or cancellation drill was run: pending |
+| Graceful cleanup, single retained residue, repin on a fixture reinstall | Pending — not run |
+| Dashboard and Git unchanged | **Pass, observational.** Smoke tasks transferred and published through Git and closed normally; the dashboard served throughout, and the operator saw its completion toast |
