@@ -290,7 +290,9 @@ fn admit(
     state: &Arc<State>,
     sessions: &mut JoinSet<()>,
 ) {
-    if state.stopping() {
+    // Finished tasks still occupy the set until reaped, including failures.
+    while sessions.try_join_next().is_some() {}
+    if state.stopping() || sessions.len() >= MAX_SESSIONS {
         return;
     }
     let Some(permit) = SessionPermit::acquire(state) else {

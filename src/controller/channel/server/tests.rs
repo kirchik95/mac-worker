@@ -252,3 +252,51 @@ async fn review_early_input_is_rejected_when_read_and_write_are_both_ready() {
     .await
     .expect("hang guard: blocked writer regression must finish");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_completed_session_queue_stays_within_the_session_bound() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::new().await;
+        let state = &fixture.service.state;
+        let deps = Arc::new(ServerDeps {
+            codec: Arc::new(StubCodec),
+            executor: fixture.executor.clone(),
+            runtime: fixture.clock.clone(),
+        });
+        let mut sessions = JoinSet::new();
+        // Model repeated accept-before-reap scheduling: each closed peer ends
+        // its session, but this caller never consumes a completed task.
+        for _ in 0..MAX_SESSIONS * 4 {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            admit(
+                stream,
+                &fixture.identity.service,
+                &deps,
+                state,
+                &mut sessions,
+            );
+            assert_eq!(
+                state.sessions.load(Ordering::Acquire),
+                1,
+                "completed entries must leave capacity for a new session"
+            );
+            while state.sessions.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+            let active = state.sessions.load(Ordering::Acquire);
+            let retained = sessions.len();
+            assert!(active <= MAX_SESSIONS);
+            assert!(
+                retained <= MAX_SESSIONS,
+                "retained {retained} tasks with {active} active sessions exceeds {MAX_SESSIONS}"
+            );
+        }
+        while sessions.join_next().await.is_some() {}
+        assert_eq!(state.sessions.load(Ordering::Acquire), 0);
+        assert!(sessions.is_empty());
+        fixture.close().await;
+    })
+    .await
+    .expect("hang guard: rapid-close admission regression must finish");
+}
