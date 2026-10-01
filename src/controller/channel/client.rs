@@ -21,6 +21,8 @@ struct Session {
 struct State {
     session: Option<Session>,
     disposition: ForwardDisposition,
+    retired: bool,
+    last_read_id: Option<String>,
 }
 /// Construct only inside one of the explicitly scoped foreground read loops.
 pub struct ChannelProcessRunner<R: ProcessRunner> {
@@ -48,6 +50,8 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             state: Mutex::new(State {
                 session: None,
                 disposition: ForwardDisposition::Cleaned,
+                retired: false,
+                last_read_id: None,
             }),
         }
     }
@@ -155,6 +159,13 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
         let Ok(mut state) = self.state.try_lock() else {
             return self.raw_read(request, &ctx);
         };
+        // Existing retries of this same sequential read never re-enter the
+        // channel, even if reconnect eligibility advances between attempts.
+        if state.retired || state.last_read_id.as_deref() == Some(parsed.request_id()) {
+            drop(state);
+            return self.raw_read(request, &ctx);
+        }
+        state.last_read_id = Some(parsed.request_id().to_owned());
         if state.session.is_none() {
             if ctx.remaining() <= SETUP_GUARD {
                 drop(state);
@@ -189,14 +200,29 @@ impl<R: ProcessRunner> ChannelProcessRunner<R> {
             return self.raw_read(request, &ctx);
         }
         ctx.check().map_err(unavailable)?;
-        session
-            .socket
-            .exchange(
-                request.stdin.as_deref().expect("eligible frame"),
-                parsed,
-                &ctx,
-            )
-            .map_err(unavailable)
+        let result = session.socket.exchange(
+            request.stdin.as_deref().expect("eligible frame"),
+            parsed,
+            &ctx,
+        );
+        match result {
+            Ok(result) => Ok(result),
+            Err(failure) => {
+                self.close_session(&mut state);
+                if matches!(failure, ChannelFailure::UnverifiedReply) {
+                    state.retired = true;
+                    return Err(unavailable(failure));
+                }
+                drop(state);
+                if matches!(
+                    failure,
+                    ChannelFailure::Unavailable(ChannelReason::Cancelled)
+                ) {
+                    return Err(unavailable(failure));
+                }
+                self.raw_read(request, &ctx)
+            }
+        }
     }
 
     fn raw_read(

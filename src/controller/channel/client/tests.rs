@@ -50,6 +50,7 @@ struct Data {
     steps: Mutex<Vec<&'static str>>,
     contexts: Mutex<Vec<(&'static str, Duration, Duration)>>,
     raw_calls: Mutex<Vec<(&'static str, ProcessRequest)>>,
+    raw_error: Mutex<Option<WorkerError>>,
     frames: Mutex<Vec<Vec<u8>>>,
     replies: Mutex<VecDeque<Result<ProcessResult, ChannelFailure>>>,
     failures: Mutex<HashMap<&'static str, ChannelFailure>>,
@@ -88,6 +89,7 @@ impl Fixture {
             steps: Mutex::new(Vec::new()),
             contexts: Mutex::new(Vec::new()),
             raw_calls: Mutex::new(Vec::new()),
+            raw_error: Mutex::new(None),
             frames: Mutex::new(Vec::new()),
             replies: Mutex::new(VecDeque::new()),
             failures: Mutex::new(HashMap::new()),
@@ -155,6 +157,9 @@ impl Fixture {
             .lock()
             .unwrap()
             .push((mode, request.clone()));
+        if let Some(error) = self.0.raw_error.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok(marker("raw", 0))
     }
     fn steps(&self) -> Vec<&'static str> {
@@ -830,4 +835,175 @@ fn configured_ssh_file_is_matched_exactly() {
     assert_eq!(runner.run(&other).unwrap().stdout, b"raw");
     assert_eq!(fixture.count("resolve"), 1);
     assert_eq!(fixture.0.raw_calls.lock().unwrap().last().unwrap().1, other);
+}
+
+#[test]
+fn partial_write_or_lost_reply_has_one_identical_raw_fallback() {
+    for (stage, reason) in [
+        ("write", ChannelReason::ForwardLost),
+        ("read", ChannelReason::ForwardLost),
+        ("read", ChannelReason::Timeout),
+        ("read", ChannelReason::InvalidFrame),
+        ("read", ChannelReason::Busy),
+    ] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        fixture.fail(stage, ChannelFailure::Unavailable(reason));
+        fixture
+            .0
+            .advances
+            .lock()
+            .unwrap()
+            .insert(stage, Duration::from_secs(3));
+        let mut request = wait(1);
+        // Preserve noncanonical whitespace and the caller's complete original
+        // frame, rather than rebuilding JSON after an ambiguous transmission.
+        request.stdin = Some(
+            crate::controller::encode_frame(
+                format!(
+                    "  {}\n",
+                    std::str::from_utf8(
+                        crate::controller::decode_frame(request.stdin.as_ref().unwrap()).unwrap()
+                    )
+                    .unwrap()
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            runner.run(&request).unwrap().stdout,
+            b"raw",
+            "{stage}/{reason:?}"
+        );
+        assert_eq!(
+            *fixture.0.frames.lock().unwrap(),
+            [request.stdin.clone().unwrap()]
+        );
+        let calls = fixture.0.raw_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let mut expected = request;
+        expected.policy.deadline = Duration::from_secs(27);
+        assert_eq!(calls[0], ("interruptible", expected));
+        assert_eq!(fixture.count("close"), 1);
+        assert_eq!(fixture.count("cancel"), 1);
+        let steps = fixture.steps();
+        assert!(
+            steps.iter().position(|step| *step == "close").unwrap()
+                < steps.iter().position(|step| *step == "cancel").unwrap()
+        );
+    }
+}
+
+#[test]
+fn fallback_error_is_returned_without_an_adapter_retry() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    *fixture.0.raw_error.lock().unwrap() = Some(WorkerError::Io(std::io::Error::from(
+        std::io::ErrorKind::BrokenPipe,
+    )));
+    assert!(
+        matches!(runner.run(&wait(1)), Err(WorkerError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert_eq!(fixture.0.raw_calls.lock().unwrap().len(), 1);
+    assert_eq!(fixture.count("open"), 1);
+}
+
+#[test]
+fn same_read_outer_retry_stays_raw_after_eligibility_advances() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture.fail(
+        "read",
+        ChannelFailure::Unavailable(ChannelReason::ForwardLost),
+    );
+    let request = wait(1);
+    assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
+    fixture.0.runtime.advance(Duration::from_secs(100));
+    assert_eq!(runner.run(&request).unwrap().stdout, b"raw");
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert_eq!(fixture.count("open"), 1);
+    assert!(socket_result(&runner.run(&wait(2)).unwrap()));
+    assert_eq!(fixture.count("open"), 2);
+}
+
+#[test]
+fn unverified_complete_reply_never_replays_and_retires_the_command() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    fixture
+        .0
+        .replies
+        .lock()
+        .unwrap()
+        .push_back(Err(ChannelFailure::UnverifiedReply));
+    assert!(matches!(
+        runner.run(&wait(1)),
+        Err(WorkerError::Unavailable(_))
+    ));
+    assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
+    fixture.0.runtime.advance(Duration::from_secs(100));
+    assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+    assert_eq!(fixture.count("open"), 1);
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn verified_application_error_preserves_stdout_status_and_stderr() {
+    for (exit, code) in [(0, "ok"), (69, "CURSOR_INVALID"), (75, "CONTROLLER_BUSY")] {
+        let fixture = Fixture::new();
+        let runner = fixture.runner(ReadLoopScope::Wait);
+        let request = wait(1);
+        let parsed = crate::controller::decode_request(request.stdin.as_ref().unwrap()).unwrap();
+        let stdout = if exit == 0 {
+            encode_json_frame(&ControllerReadReply::from_request(
+                &parsed,
+                serde_json::json!({"path":"socket"}),
+            ))
+            .unwrap()
+        } else {
+            encode_json_frame(
+                &crate::job::HostControlError::new(code, "fixture application outcome").unwrap(),
+            )
+            .unwrap()
+        };
+        fixture
+            .0
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(ProcessResult {
+                status: ExitStatus::from_raw(exit << 8),
+                stdout: stdout.clone(),
+                stderr: b"bounded original".to_vec(),
+            }));
+        let outcome = runner.run(&wait(1)).unwrap();
+        assert_eq!(outcome.status.code(), Some(exit));
+        assert_eq!(outcome.stdout, stdout);
+        assert_eq!(outcome.stderr, b"bounded original");
+        assert!(fixture.0.raw_calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.count("close"), 0);
+    }
+}
+
+#[test]
+fn changed_forward_binding_is_checked_before_application_bytes() {
+    let fixture = Fixture::new();
+    let runner = fixture.runner(ReadLoopScope::Wait);
+    assert!(socket_result(&runner.run(&wait(1)).unwrap()));
+    fixture.fail(
+        "verify",
+        ChannelFailure::Unavailable(ChannelReason::UnsafePath),
+    );
+    assert_eq!(runner.run(&wait(2)).unwrap().stdout, b"raw");
+    assert_eq!(fixture.0.frames.lock().unwrap().len(), 1);
+    assert_eq!(fixture.count("close"), 1);
+    assert_eq!(fixture.count("cancel"), 1);
 }
