@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{ffi::OsStrExt, fs::PermissionsExt},
+        unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
     ptr,
@@ -25,7 +25,6 @@ use crate::{
     error::WorkerError,
     failure_receipt::{STAGE_CLEANUP, STAGE_LEASE_RELEASE, STAGE_PUBLISH},
     host_store::{HostStore, JobDisposition, SupervisorGuard},
-    inputs::RelativePath,
     job::{CommandSpec, JobId, JobMeta, JobState, JobStatus, LeaseRecord, ProcessIdentity},
     job_service::{
         ExecutionPayload, LaunchCandidate, SupervisorLauncher, reconstruct_submit_request,
@@ -38,14 +37,6 @@ use crate::{
 };
 
 const CONTROLLED_PATH: &str = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-const CONTROLLED_PATHS: &[&str] = &[
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-];
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_TRANSITION_RETRY: Duration = Duration::from_millis(250);
@@ -223,33 +214,6 @@ pub enum StdoutSink {
 }
 
 impl LaunchPlan {
-    pub fn batch(
-        command: &CommandSpec,
-        lease: &LeaseRecord,
-        home: &Path,
-        tmp: &Path,
-    ) -> Result<Self, WorkerError> {
-        command.validate()?;
-        let (program, args) = match command {
-            CommandSpec::Argv { argv } => {
-                let executable = resolve_executable(&argv[0])?;
-                (executable.to_string_lossy().into_owned(), argv.clone())
-            }
-            CommandSpec::Shell { shell } => (
-                "/bin/zsh".into(),
-                vec!["/bin/zsh".into(), "-lc".into(), shell.clone()],
-            ),
-        };
-        Ok(Self {
-            program,
-            args,
-            env: batch_environment(lease, home, tmp)?,
-            cwd: PathBuf::new(),
-            stdin: StdinSource::Null,
-            stdout: StdoutSink::Direct,
-        })
-    }
-
     pub fn turn(
         command: &CommandSpec,
         lease: &LeaseRecord,
@@ -493,46 +457,6 @@ impl LaunchPlan {
     pub fn stdout(&self) -> StdoutSink {
         self.stdout
     }
-}
-
-fn batch_environment(
-    lease: &LeaseRecord,
-    home: &Path,
-    tmp: &Path,
-) -> Result<Vec<(OsString, OsString)>, WorkerError> {
-    let mut environment: Vec<(OsString, OsString)> = vec![
-        ("LC_ALL".into(), "C".into()),
-        ("LANG".into(), "C".into()),
-        ("PATH".into(), CONTROLLED_PATH.into()),
-        ("HOME".into(), home.as_os_str().to_os_string()),
-        ("TMPDIR".into(), tmp.as_os_str().to_os_string()),
-        (
-            "MAC_WORKER_JOB_ID".into(),
-            lease.job_id().to_string().into(),
-        ),
-        (
-            "MAC_WORKER_CLIENT_ID".into(),
-            lease.client_id().to_string().into(),
-        ),
-        ("MAC_WORKER_PROJECT_ID".into(), lease.project_id().into()),
-        ("MAC_WORKER_WORKTREE_ID".into(), lease.worktree_id().into()),
-    ];
-    if let Some(account_home) = crate::task_store::herdr_account_home() {
-        environment.push((
-            crate::task_store::MAC_WORKER_ACCOUNT_HOME.into(),
-            account_home.into_os_string(),
-        ));
-    }
-    if environment
-        .iter()
-        .any(|(name, value)| name.as_bytes().contains(&0) || value.as_bytes().contains(&0))
-    {
-        return Err(protocol_code(
-            "INVALID_ENVIRONMENT",
-            "batch environment contains a NUL byte",
-        ));
-    }
-    Ok(environment)
 }
 
 pub trait ProcessInspector: Send + Sync {
@@ -1569,565 +1493,15 @@ impl<'a> Supervisor<'a> {
                 section,
             );
         }
-        if self.fault == Some(SupervisorFaultPoint::AfterPayloadRead) {
-            return self.finish_owned_prelaunch_failure(
-                &lease,
-                &job,
-                &status_bytes,
-                &status,
-                guard,
-                "CRASH_AFTER_PAYLOAD_READ",
-                injected_supervisor_fault("payload read"),
-            );
-        }
-        let workspace = match relative("workspace/tree").and_then(|path| {
-            job.open_child_directory(&path, false)
-                .map_err(WorkerError::Io)
-        }) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "COMMAND_PREPARATION_FAILED",
-                    error,
-                );
-            }
-        };
-        let cwd = if meta.relative_working_dir().is_empty() {
-            workspace
-        } else {
-            match relative(meta.relative_working_dir()).and_then(|path| {
-                workspace
-                    .open_child_directory(&path, false)
-                    .map_err(WorkerError::Io)
-            }) {
-                Ok(cwd) => cwd,
-                Err(error) => {
-                    return self.finish_owned_prelaunch_failure(
-                        &lease,
-                        &job,
-                        &status_bytes,
-                        &status,
-                        guard,
-                        "COMMAND_PREPARATION_FAILED",
-                        error,
-                    );
-                }
-            }
-        };
-        let stdout = match job.open_private_append("stdout.log") {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "LOG_BINDING_INVALID",
-                    WorkerError::Io(error),
-                );
-            }
-        };
-        let stderr = match job.open_private_append("stderr.log") {
-            Ok(stderr) => stderr,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "LOG_BINDING_INVALID",
-                    WorkerError::Io(error),
-                );
-            }
-        };
-        let job_path = match self
-            .store
-            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
-        {
-            Ok(job_path) => job_path,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "COMMAND_PREPARATION_FAILED",
-                    error,
-                );
-            }
-        };
-        let home_path = job_path.join("home");
-        let tmp_path = job_path.join("tmp");
-        let command = match PreparedCommand::new(payload.command(), &lease, &home_path, &tmp_path) {
-            Ok(command) => command,
-            Err(error) => {
-                let error_code = prelaunch_error_code(&error);
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    error_code,
-                    error,
-                );
-            }
-        };
-
-        let stdout_pipe = match Pipe::cloexec() {
-            Ok(pipe) => pipe,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "LOG_BINDING_INVALID",
-                    WorkerError::Io(error),
-                );
-            }
-        };
-        let stderr_pipe = match Pipe::cloexec() {
-            Ok(pipe) => pipe,
-            Err(error) => {
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "LOG_BINDING_INVALID",
-                    WorkerError::Io(error),
-                );
-            }
-        };
-        let mut child = match GatedChild::spawn(
-            &command,
-            cwd.raw_directory_fd(),
-            stdout_pipe.write.as_raw_fd(),
-            stderr_pipe.write.as_raw_fd(),
-            self.inspector,
-        ) {
-            Ok(child) => child,
-            Err(error) => {
-                let error_code = prelaunch_error_code(&error);
-                return self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    error_code,
-                    error,
-                );
-            }
-        };
-        drop(stdout_pipe.write);
-        drop(stderr_pipe.write);
-        let mut pumps = match JobIoPumps::start(
-            File::from(stdout_pipe.read),
-            stdout,
-            File::from(stderr_pipe.read),
-            stderr,
-        ) {
-            Ok(pumps) => pumps,
-            Err(error) => {
-                let abort = child.abort_and_reap();
-                let result = self.finish_owned_prelaunch_failure(
-                    &lease,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    guard,
-                    "LOG_BINDING_INVALID",
-                    error,
-                );
-                let _ = abort;
-                return result;
-            }
-        };
-        if self.fault == Some(SupervisorFaultPoint::AfterChildReady) {
-            let abort_result = child.abort_and_reap();
-            let _ = pumps.stop_and_join();
-            let terminal = match erase_payload_and_record_prelaunch(
-                self.store,
-                &lease,
-                &mut guard,
-                &job,
-                &status_bytes,
-                &status,
-                "CRASH_AFTER_CHILD_READY",
-            ) {
-                Ok(terminal) => terminal,
-                Err(error) => {
-                    drop(guard);
-                    return Err(error);
-                }
-            };
-            drop(guard);
-            abort_result?;
-            self.cleanup_and_release(&lease, &job, terminal)?;
-            return Err(injected_supervisor_fault("child READY"));
-        }
-        let child_identity = child.identity();
-        let child_status = if self.fault == Some(SupervisorFaultPoint::BeforeChildStatusAbortProof)
-        {
-            Err(WorkerError::Io(io::Error::other(
-                "injected child status write failure",
-            )))
-        } else {
-            now_millis()
-                .and_then(|updated_at| status.with_child(child_identity, updated_at))
-                .and_then(|child_status| {
-                    replace_status(
-                        self.store,
-                        &lease,
-                        &mut guard,
-                        &job,
-                        &status_bytes,
-                        &status,
-                        &child_status,
-                        None,
-                    )?;
-                    Ok(child_status)
-                })
-        };
-        let child_status = match child_status {
-            Ok(child_status) => child_status,
-            Err(error) => {
-                let abort_result = child.abort_and_reap().and_then(|()| {
-                    if self.fault == Some(SupervisorFaultPoint::BeforeChildStatusAbortProof) {
-                        Err(protocol_code(
-                            "CHILD_ABORT_AMBIGUOUS",
-                            "injected child abort proof ambiguity",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                });
-                let _ = pumps.stop_and_join();
-                let terminal = match erase_payload_and_record_prelaunch(
-                    self.store,
-                    &lease,
-                    &mut guard,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    "CHILD_STATUS_WRITE_FAILED",
-                ) {
-                    Ok(terminal) => terminal,
-                    Err(erase_error) => {
-                        drop(guard);
-                        return Err(erase_error);
-                    }
-                };
-                drop(guard);
-                abort_result?;
-                self.cleanup_and_release(&lease, &job, terminal)?;
-                return Err(error);
-            }
-        };
-        status = child_status;
-        status_bytes = canonical_json(&status)?;
-        if self.fault == Some(SupervisorFaultPoint::AfterChildIdentity) {
-            let abort_result = child.abort_and_reap();
-            let _ = pumps.stop_and_join();
-            let terminal = match erase_payload_and_record_prelaunch(
-                self.store,
-                &lease,
-                &mut guard,
-                &job,
-                &status_bytes,
-                &status,
-                "CHILD_PRE_GO_FAILED",
-            ) {
-                Ok(terminal) => terminal,
-                Err(error) => {
-                    drop(guard);
-                    return Err(error);
-                }
-            };
-            drop(guard);
-            abort_result?;
-            self.cleanup_and_release(&lease, &job, terminal)?;
-            return Err(injected_supervisor_fault("child identity"));
-        }
-
-        let payload_removal = if self.fault == Some(SupervisorFaultPoint::BeforePayloadErase) {
-            Err(io::Error::other("injected supervisor fault"))
-        } else {
-            self.store
-                .remove_owned_regular_committed(&job, "execution.json")
-        };
-        if let Err(error) = payload_removal {
-            child.abort();
-            let _ = pumps.stop_and_join();
-            if let (Ok(stdout), Ok(stderr)) = (
-                job.open_private_append("stdout.log"),
-                job.open_private_append("stderr.log"),
-            ) {
-                let _ = record_prelaunch_failure(
-                    self.store,
-                    &lease,
-                    &mut guard,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    &stdout,
-                    &stderr,
-                    "PAYLOAD_ERASURE_FAILED",
-                );
-            }
-            drop(guard);
-            return Err(WorkerError::Io(error));
-        }
-        if self.fault == Some(SupervisorFaultPoint::AfterPayloadErase) {
-            let abort_result = child.abort_and_reap();
-            let _ = pumps.stop_and_join();
-            drop(guard);
-            abort_result?;
-            return Err(injected_supervisor_fault("payload erasure"));
-        }
-
-        match child.allow_exec(self.fault) {
-            Ok(()) => {}
-            Err(ExecStartError::ProvenPrelaunch { code, error }) => {
-                child.abort();
-                let _ = pumps.stop_and_join();
-                let stdout = job.open_private_append("stdout.log")?;
-                let stderr = job.open_private_append("stderr.log")?;
-                let terminal = prelaunch_terminal(
-                    self.store,
-                    &lease,
-                    &mut guard,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    &stdout,
-                    &stderr,
-                    code,
-                )?;
-                drop(guard);
-                self.cleanup_and_release(&lease, &job, terminal)?;
-                return Err(error);
-            }
-            Err(ExecStartError::Ambiguous(error)) => {
-                finish_ambiguous_child(
-                    self.store,
-                    &lease,
-                    &mut guard,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    &mut pumps,
-                    child_identity,
-                    lease.timeout_millis(),
-                    self.inspector,
-                    "EXEC_ACK_AMBIGUOUS",
-                    self.timings,
-                )?;
-                drop(guard);
-                return Err(error);
-            }
-        }
-
-        let running_result = if self.fault == Some(SupervisorFaultPoint::BeforeRunningStatus) {
-            Err(WorkerError::Io(io::Error::other(
-                "injected supervisor fault",
-            )))
-        } else {
-            now_millis()
-                .and_then(|updated_at| status.into_running(updated_at))
-                .and_then(|running| {
-                    replace_status(
-                        self.store,
-                        &lease,
-                        &mut guard,
-                        &job,
-                        &status_bytes,
-                        &status,
-                        &running,
-                        None,
-                    )?;
-                    Ok(running)
-                })
-        };
-        let running = match running_result {
-            Ok(running) => running,
-            Err(error) => {
-                finish_ambiguous_child(
-                    self.store,
-                    &lease,
-                    &mut guard,
-                    &job,
-                    &status_bytes,
-                    &status,
-                    &mut pumps,
-                    child_identity,
-                    lease.timeout_millis(),
-                    self.inspector,
-                    "RUNNING_STATUS_WRITE_FAILED",
-                    self.timings,
-                )?;
-                drop(guard);
-                return Err(error);
-            }
-        };
-        status = running;
-
-        // Running is the sole durable handoff boundary. Before this fsynced
-        // status, the elected guard stays held and prelaunch ownership is
-        // unchanged; afterwards an explicit cancellation may acquire the
-        // guard and fence this supervisor while it waits for the child.
-        drop(guard);
-
-        if self.fault == Some(SupervisorFaultPoint::AfterRunningStatus) {
-            let _ = wait_for_child(
-                child_identity,
-                remaining_lease_millis(&lease)?,
-                self.inspector,
-                self.timings,
-            )?;
-            let _ = pumps.stop_and_join();
-            return Err(injected_supervisor_fault("running status"));
-        }
-        if self.fault == Some(SupervisorFaultPoint::CrashAfterRunning) {
-            let _ = pumps.stop_and_join();
-            return Err(injected_supervisor_fault("running crash"));
-        }
-
-        let outcome = wait_for_child(
-            child_identity,
-            remaining_lease_millis(&lease)?,
-            self.inspector,
-            self.timings,
-        )?;
-
-        // Reacquire through the documented admission -> supervisor order.
-        // Cancellation may have won while we were intentionally unlocked,
-        // published Cancelled, cleaned mutable scopes, and released the lease;
-        // in that case do not touch stale status/log capabilities.
-        let admission = self.store.admission_lock(job_id)?;
-        let Some(mut guard) = self.store.supervisor_lock_after(&admission, job_id, true)? else {
-            let _ = pumps.stop_and_join();
-            return Err(protocol_code(
-                "SUPERVISOR_LOCK_UNAVAILABLE",
-                "supervisor lock was unavailable after running handoff",
-            ));
-        };
-        let live = LeaseService::new(self.store).load_after(&admission, job_id);
-        let (current_job, current_bytes, _current, terminal_lease) = match live {
-            // A readable live lease remains the authoritative handoff proof.
-            // Do not allow a valid replacement lease to inherit this
-            // supervisor's terminal-write capability.
-            Ok(Some(live)) if live == lease => {
-                let values = self.revalidate_running_handoff(&lease, &status, &live)?;
-                if values.2.state().is_terminal() {
-                    let _ = pumps.stop_and_join();
-                    drop(guard);
-                    drop(admission);
-                    return Ok(());
-                }
-                values
-            }
-            Ok(Some(_)) => {
-                let _ = pumps.stop_and_join();
-                drop(guard);
-                drop(admission);
-                return Err(protocol_code(
-                    "STATUS_CHANGED",
-                    "live lease changed during supervisor handoff",
-                ));
-            }
-            // A completed cancellation removes the exact lease before this
-            // supervisor returns from its intentional unlocked wait. It owns
-            // the terminal state now, so leave it untouched.
-            Ok(None) => {
-                let _ = pumps.stop_and_join();
-                drop(guard);
-                drop(admission);
-                return Ok(());
-            }
-            Err(_) => {
-                // Phase 3 deliberately publishes the terminal result before
-                // attempting exact lease retirement. Preserve that recovery
-                // property when the child has made the known lease unreadable:
-                // the still-held supervisor guard plus the same Accepted
-                // disposition, metadata, and active Running status prove that
-                // neither cancellation nor another lifecycle owner won the
-                // handoff. The cached exact lease is then used only to publish
-                // the terminal result; cleanup/release will retain and enrich
-                // the failure as before.
-                let values = self.revalidate_running_handoff(&lease, &status, &lease)?;
-                if values.2.state().is_terminal() {
-                    let _ = pumps.stop_and_join();
-                    drop(guard);
-                    drop(admission);
-                    return Ok(());
-                }
-                values
-            }
-        };
-        drop(admission);
-
-        let pump_result = pumps.drain_after_wait(outcome)?;
-        let stdout = current_job.open_private_append("stdout.log")?;
-        let stderr = current_job.open_private_append("stderr.log")?;
-        stdout.sync_all()?;
-        stderr.sync_all()?;
-        if self.fault == Some(SupervisorFaultPoint::AfterLogSync) {
-            return Err(injected_supervisor_fault("log sync"));
-        }
-        let stdout_length = current_job.validate_private_append_binding("stdout.log", &stdout)?;
-        let stderr_length = current_job.validate_private_append_binding("stderr.log", &stderr)?;
-        if stdout_length != pump_result.stdout_bytes || stderr_length != pump_result.stderr_bytes {
-            return Err(protocol_code(
-                "LOG_BINDING_INVALID",
-                "job log length differs from pump accounting",
-            ));
-        }
-        let terminal = match outcome {
-            ChildOutcome::Exited(0) => {
-                status.into_succeeded(now_millis()?, stdout_length, stderr_length)?
-            }
-            ChildOutcome::Exited(code) => {
-                status.into_failed_exit(now_millis()?, code, stdout_length, stderr_length)?
-            }
-            ChildOutcome::Signalled(signal) => {
-                status.into_failed_signal(now_millis()?, signal, stdout_length, stderr_length)?
-            }
-            ChildOutcome::TimedOut => status.into_infrastructure_terminal(
-                JobState::TimedOut,
-                now_millis()?,
-                stdout_length,
-                stderr_length,
-                "COMMAND_TIMEOUT".into(),
-            )?,
-        };
-        replace_status(
-            self.store,
-            &terminal_lease,
-            &mut guard,
-            &current_job,
-            &current_bytes,
+        self.finish_owned_prelaunch_failure(
+            &lease,
+            &job,
+            &status_bytes,
             &status,
-            &terminal,
-            None,
-        )?;
-        if self.fault == Some(SupervisorFaultPoint::AfterTerminalStatus) {
-            return Err(injected_supervisor_fault("terminal status"));
-        }
-        drop(guard);
-        self.cleanup_and_release(&terminal_lease, &current_job, terminal)
+            guard,
+            "EXECUTION_SCOPE_CONFLICT",
+            protocol_code("EXECUTION_SCOPE_CONFLICT", "batch execution is retired"),
+        )
     }
 
     fn revalidate_running_handoff(
@@ -3129,16 +2503,6 @@ struct PreparedCommand {
 }
 
 impl PreparedCommand {
-    fn new(
-        command: &CommandSpec,
-        lease: &LeaseRecord,
-        home: &Path,
-        tmp: &Path,
-    ) -> Result<Self, WorkerError> {
-        let plan = LaunchPlan::batch(command, lease, home, tmp)?;
-        Self::from_plan(&plan)
-    }
-
     fn from_plan(plan: &LaunchPlan) -> Result<Self, WorkerError> {
         let program = CString::new(plan.program.as_bytes())
             .map_err(|_| protocol_code("INVALID_EXECUTABLE", "executable path contains NUL"))?;
@@ -3227,26 +2591,6 @@ impl std::fmt::Display for ExecStartError {
 }
 
 impl GatedChild {
-    fn spawn(
-        command: &PreparedCommand,
-        cwd: RawFd,
-        stdout: RawFd,
-        stderr: RawFd,
-        inspector: &dyn ProcessInspector,
-    ) -> Result<Self, WorkerError> {
-        let dev_null = open_dev_null()?;
-        let result = Self::spawn_with_fds(
-            command,
-            cwd,
-            dev_null.as_raw_fd(),
-            stdout,
-            stderr,
-            inspector,
-        );
-        drop(dev_null);
-        result
-    }
-
     fn spawn_turn(
         command: &PreparedCommand,
         cwd: RawFd,
@@ -3639,113 +2983,6 @@ impl Drop for TurnStderrPump {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JobPumpResult {
-    stdout_bytes: u64,
-    stderr_bytes: u64,
-}
-
-struct JobStreamPump {
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<Result<u64, WorkerError>>>,
-}
-
-impl JobStreamPump {
-    fn start(read: File, mut dest: File, name: &'static str) -> Result<Self, WorkerError> {
-        set_nonblocking(read.as_raw_fd())?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let join = std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || pump_job_stream(read, &mut dest, &thread_stop))
-            .map_err(WorkerError::Io)?;
-        Ok(Self {
-            stop,
-            join: Some(join),
-        })
-    }
-
-    fn stop_and_join(&mut self) -> Result<u64, WorkerError> {
-        self.stop.store(true, Ordering::Release);
-        self.join()
-    }
-
-    fn join(&mut self) -> Result<u64, WorkerError> {
-        let join = self
-            .join
-            .take()
-            .ok_or_else(|| protocol_code("TURN_PUMP_INVALID", "job log pump was joined twice"))?;
-        match join.join() {
-            Ok(result) => result,
-            Err(_) => Err(protocol_code(
-                "TURN_PUMP_FAILED",
-                "job log pump thread panicked",
-            )),
-        }
-    }
-}
-
-impl Drop for JobStreamPump {
-    fn drop(&mut self) {
-        if let Some(join) = self.join.take() {
-            self.stop.store(true, Ordering::Release);
-            let _ = join.join();
-        }
-    }
-}
-
-struct JobIoPumps {
-    stdout: JobStreamPump,
-    stderr: JobStreamPump,
-}
-
-impl JobIoPumps {
-    fn start(
-        stdout_read: File,
-        stdout: File,
-        stderr_read: File,
-        stderr: File,
-    ) -> Result<Self, WorkerError> {
-        let stdout = JobStreamPump::start(stdout_read, stdout, "mac-worker-job-stdout-pump")?;
-        let stderr = match JobStreamPump::start(stderr_read, stderr, "mac-worker-job-stderr-pump") {
-            Ok(stderr) => stderr,
-            Err(error) => {
-                let mut stdout = stdout;
-                let _ = stdout.stop_and_join();
-                return Err(error);
-            }
-        };
-        Ok(Self { stdout, stderr })
-    }
-
-    fn stop_and_join(&mut self) -> Result<JobPumpResult, WorkerError> {
-        let stdout = self.stdout.stop_and_join();
-        let stderr = self.stderr.stop_and_join();
-        Ok(JobPumpResult {
-            stdout_bytes: stdout?,
-            stderr_bytes: stderr?,
-        })
-    }
-
-    fn join_until_eof(&mut self) -> Result<JobPumpResult, WorkerError> {
-        arm_drain_watchdog(&self.stdout.stop, JOB_LOG_DRAIN_GRACE);
-        arm_drain_watchdog(&self.stderr.stop, JOB_LOG_DRAIN_GRACE);
-        let stdout = self.stdout.join();
-        let stderr = self.stderr.join();
-        Ok(JobPumpResult {
-            stdout_bytes: stdout?,
-            stderr_bytes: stderr?,
-        })
-    }
-
-    fn drain_after_wait(&mut self, _outcome: ChildOutcome) -> Result<JobPumpResult, WorkerError> {
-        // Every wait outcome has already reaped the leader. Join until EOF so
-        // last pipe bytes reach the log before terminal status; the drain
-        // watchdog still bounds a grandchild that never closes the write end.
-        self.join_until_eof()
-    }
-}
-
 fn arm_drain_watchdog(stop: &Arc<AtomicBool>, grace: Duration) {
     let stop = Arc::clone(stop);
     let _ = std::thread::Builder::new()
@@ -3754,36 +2991,6 @@ fn arm_drain_watchdog(stop: &Arc<AtomicBool>, grace: Duration) {
             std::thread::sleep(grace);
             stop.store(true, Ordering::Release);
         });
-}
-
-fn pump_job_stream(mut read: File, dest: &mut File, stop: &AtomicBool) -> Result<u64, WorkerError> {
-    let mut stored = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut idle_since = None;
-    loop {
-        match read.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                idle_since = None;
-                dest.write_all(&buffer[..count]).map_err(WorkerError::Io)?;
-                stored += count as u64;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !pump_should_keep_idling(
-                    stop.load(Ordering::Acquire),
-                    &mut idle_since,
-                    Duration::from_millis(50),
-                ) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(WorkerError::Io(error)),
-        }
-    }
-    dest.sync_all().map_err(WorkerError::Io)?;
-    Ok(stored)
 }
 
 fn pump_should_keep_idling(
@@ -4604,49 +3811,6 @@ fn erase_payload_and_record_prelaunch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_ambiguous_child(
-    store: &HostStore,
-    lease: &LeaseRecord,
-    status_guard: &mut SupervisorGuard,
-    job: &RootedDir,
-    expected_bytes: &[u8],
-    status: &JobStatus,
-    pumps: &mut JobIoPumps,
-    child_identity: ProcessIdentity,
-    timeout_millis: u64,
-    inspector: &dyn ProcessInspector,
-    code: &str,
-    timings: SupervisorTimings,
-) -> Result<JobStatus, WorkerError> {
-    let _ = wait_for_child(child_identity, timeout_millis, inspector, timings)?;
-    let _ = pumps.stop_and_join();
-    let stdout = job.open_private_append("stdout.log")?;
-    let stderr = job.open_private_append("stderr.log")?;
-    stdout.sync_all()?;
-    stderr.sync_all()?;
-    let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
-    let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
-    let terminal = status.into_infrastructure_terminal(
-        JobState::Lost,
-        now_millis()?,
-        stdout_length,
-        stderr_length,
-        code.into(),
-    )?;
-    replace_status(
-        store,
-        lease,
-        status_guard,
-        job,
-        expected_bytes,
-        status,
-        &terminal,
-        None,
-    )?;
-    Ok(terminal)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn record_prelaunch_failure(
     store: &HostStore,
     lease: &LeaseRecord,
@@ -4891,33 +4055,6 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, WorkerError> {
         .map_err(|_| WorkerError::Protocol("host JSON serialization failed".into()))
 }
 
-fn resolve_executable(program: &str) -> Result<PathBuf, WorkerError> {
-    let candidate = Path::new(program);
-    if candidate.is_absolute() {
-        return require_executable(candidate);
-    }
-    if program.contains('/') {
-        return Ok(candidate.to_owned());
-    }
-    CONTROLLED_PATHS
-        .iter()
-        .map(|directory| Path::new(directory).join(program))
-        .find_map(|path| require_executable(&path).ok())
-        .ok_or_else(|| protocol_code("EXECUTABLE_NOT_FOUND", "executable was not found"))
-}
-
-fn require_executable(path: &Path) -> Result<PathBuf, WorkerError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|_| protocol_code("EXECUTABLE_NOT_FOUND", "executable was not found"))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(protocol_code(
-            "EXECUTABLE_NOT_FOUND",
-            "executable is not a regular executable file",
-        ));
-    }
-    Ok(path.to_owned())
-}
-
 fn open_dev_null() -> io::Result<OwnedFd> {
     let descriptor = unsafe {
         libc::open(
@@ -4958,11 +4095,6 @@ fn descriptor_stat(descriptor: RawFd) -> Result<libc::stat, WorkerError> {
         return Err(WorkerError::Io(io::Error::last_os_error()));
     }
     Ok(unsafe { metadata.assume_init() })
-}
-
-fn relative(path: &str) -> Result<RelativePath, WorkerError> {
-    RelativePath::parse(path.as_bytes())
-        .map_err(|_| WorkerError::Protocol("job relative directory is invalid".into()))
 }
 
 fn now_millis() -> Result<u64, WorkerError> {
@@ -5150,7 +4282,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         fs::{self, OpenOptions},
-        os::unix::{ffi::OsStringExt, process::CommandExt},
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt, process::CommandExt},
         process::{Command, Stdio},
         sync::{
             Mutex,
@@ -5371,42 +4503,57 @@ mod tests {
     }
 
     #[test]
-    fn job_pump_copies_stderr_written_after_the_writer_pauses() {
+    fn task_pump_copies_stderr_written_after_the_writer_pauses() {
         let temp = tempfile::tempdir().unwrap();
         let (read, mut writer) = open_pipe();
         let stderr_path = temp.path().join("stderr.log");
         let stderr = File::create(&stderr_path).unwrap();
-        let mut pump = JobStreamPump::start(read, stderr, "test-job-stderr-pump").unwrap();
+        let mut pump =
+            TurnStderrPump::start_with(read, stderr, StreamPumpConfig::production()).unwrap();
         writer.write_all(&[0; 17]).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         writer.write_all(&[0; 65_545]).unwrap();
         drop(writer);
         arm_drain_watchdog(&pump.stop, JOB_LOG_DRAIN_GRACE);
-        let stored = pump.join().unwrap();
+        let stored = pump.join().unwrap().stored;
         assert_eq!(stored, 17 + 65_545);
         assert_eq!(fs::read(&stderr_path).unwrap().len(), 17 + 65_545);
     }
 
     #[test]
-    fn job_pump_drains_a_one_byte_write_before_timeout_accounting() {
+    fn task_pump_drains_a_one_byte_write_before_timeout_accounting() {
         let temp = tempfile::tempdir().unwrap();
         let (stdout_read, mut stdout_writer) = open_pipe();
         let (stderr_read, stderr_writer) = open_pipe();
         let stdout_path = temp.path().join("stdout.log");
         let stderr_path = temp.path().join("stderr.log");
-        let mut pumps = JobIoPumps::start(
-            stdout_read,
-            File::create(&stdout_path).unwrap(),
-            stderr_read,
-            File::create(&stderr_path).unwrap(),
-        )
-        .unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let mut pumps = TurnIoPumps {
+            stdout: TurnOutputPump::start(
+                stdout_read,
+                File::create(&stdout_path).unwrap(),
+                File::create(temp.path().join("tail.log")).unwrap(),
+                store,
+                pump_turn_section(),
+                StreamPumpConfig::production(),
+            )
+            .unwrap(),
+            stderr: TurnStderrPump::start_with(
+                stderr_read,
+                File::create(&stderr_path).unwrap(),
+                StreamPumpConfig::production(),
+            )
+            .unwrap(),
+        };
         stdout_writer.write_all(b"x").unwrap();
         drop(stdout_writer);
         drop(stderr_writer);
-        let result = pumps.drain_after_wait(ChildOutcome::TimedOut).unwrap();
-        assert_eq!(result.stdout_bytes, 1);
-        assert_eq!(result.stderr_bytes, 0);
+        arm_drain_watchdog(&pumps.stdout.stop, JOB_LOG_DRAIN_GRACE);
+        arm_drain_watchdog(&pumps.stderr.stop, JOB_LOG_DRAIN_GRACE);
+        let stdout = pumps.stdout.join().unwrap();
+        let stderr = pumps.stderr.join().unwrap();
+        assert_eq!(stdout.stdout_bytes, 1);
+        assert_eq!(stderr.stored, 0);
         assert_eq!(fs::read(&stdout_path).unwrap(), b"x");
         assert_eq!(fs::read(&stderr_path).unwrap(), b"");
     }

@@ -1749,12 +1749,16 @@ impl<'a> JobService<'a> {
             self.read_repairable_turn_final(&request, &lease, &section)?
         } else {
             validate_empty_prelaunch_private_directories(&job, &["home", "tmp"])?;
-            let verified = self.snapshots.load_verified_after(
-                &admission,
-                &lease,
-                request.request_fingerprint(),
+            let identity = ResolutionIdentity::from_request(
+                &ResolveOrAbandonRequest::from_submit_request(&request)?,
             )?;
-            self.read_repairable_final(&request, &lease, &verified)?
+            if !matches!(
+                self.classify_resolution_final(&identity, Some(&lease))?,
+                Some(ResolutionFinal::Complete)
+            ) {
+                return Err(job_state_invalid("unindexed legacy final is incomplete"));
+            }
+            Some((meta.clone(), status.clone()))
         };
         let Some((validated_meta, validated_status)) = repairable else {
             return Err(protocol_code("JOB_NOT_FOUND", "job ID is not indexed"));
@@ -2027,14 +2031,8 @@ impl<'a> JobService<'a> {
             drop(admission);
             self.launch_and_observe(job_id, supervisor, &request, &lease, false, meta)
         } else {
-            validate_empty_prelaunch_private_directories(&job, &["home", "tmp"])?;
-            let verified = self.snapshots.load_verified_for_accepted_after(
-                &admission,
-                &lease,
-                meta.request_fingerprint(),
-            )?;
             drop(admission);
-            self.launch_after_election(job_id, supervisor, &request, &lease, &verified, false)
+            self.launch_and_observe(job_id, supervisor, &request, &lease, false, meta)
         };
         match launch_result {
             Ok(_) => self.authoritative_job_with_supervisor_ensure(job_id, false, false),

@@ -452,6 +452,100 @@ fn archived_host_with_command(
     (store, lease, request)
 }
 
+#[test]
+fn indexed_payload_without_turn_is_refused_without_execution() {
+    assert_turnless_prelaunch_refusal(true, false);
+}
+
+#[test]
+fn unindexed_payload_without_turn_is_refused_without_execution() {
+    assert_turnless_prelaunch_refusal(false, false);
+}
+
+#[test]
+fn resolving_payload_without_turn_is_refused_without_execution() {
+    for indexed in [true, false] {
+        assert_turnless_prelaunch_refusal(indexed, true);
+    }
+}
+
+fn assert_turnless_prelaunch_refusal(indexed: bool, resolve: bool) {
+    for task_scope in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("turnless-archive");
+        let marker = temp.path().join("must-not-execute");
+        let command = CommandSpec::argv(vec![
+            "/usr/bin/touch".into(),
+            marker.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let (store, lease, request) = archived_host_with_command(&root, command);
+        if task_scope {
+            let scope = ExecutionScope::task(TaskId::new(uuid::Uuid::from_u128(17)));
+            let path = root
+                .join("leases/slots")
+                .join(
+                    LeaseService::new(&store)
+                        .occupied_slot_for_job(lease.job_id())
+                        .unwrap()
+                        .unwrap()
+                        .slot_id
+                        .to_string(),
+                )
+                .join("scope.json");
+            fs::write(&path, serde_json::to_vec(&scope).unwrap()).unwrap();
+            File::open(&path).unwrap().sync_all().unwrap();
+        }
+        if !indexed {
+            let path = store.job_index(lease.job_id()).unwrap();
+            fs::remove_file(&path).unwrap();
+            File::open(path.parent().unwrap())
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        let launcher = CountingInlineSupervisorLauncher {
+            store: store.clone(),
+            launches: Arc::new(AtomicUsize::new(0)),
+        };
+        let service = JobService::new(&store, &launcher);
+        let error = if resolve {
+            service
+                .resolve_or_abandon(
+                    mac_worker::job::ResolveOrAbandonRequest::from_submit_request(&request)
+                        .unwrap(),
+                )
+                .unwrap_err()
+        } else {
+            service.status(lease.job_id()).unwrap_err()
+        };
+        assert_protocol_code(error, "EXECUTION_SCOPE_CONFLICT");
+        let response = service.status(lease.job_id()).unwrap();
+        assert_eq!(response.status().state(), JobState::Lost);
+        assert_eq!(
+            response.status().error_code(),
+            Some("EXECUTION_SCOPE_CONFLICT")
+        );
+        assert!(response.status().supervisor_identity().is_some());
+        assert_eq!(response.status().child_identity(), None);
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+        assert!(!marker.exists(), "turnless payload executed a user command");
+        let job = store
+            .job(lease.project_id(), lease.worktree_id(), lease.job_id())
+            .unwrap();
+        assert!(!job.join("execution.json").exists());
+        assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"");
+        assert_eq!(fs::read(job.join("stderr.log")).unwrap(), b"");
+        assert_eq!(LeaseService::new(&store).load().unwrap(), None);
+        assert!(store.job_index(lease.job_id()).unwrap().is_file());
+        let before = durable_tree(&root);
+        assert_eq!(service.status(lease.job_id()).unwrap(), response);
+        assert_eq!(durable_tree(&root), before);
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+        assert!(!marker.exists());
+    }
+}
+
 fn compile_exit_parking_dylib(directory: &Path) -> PathBuf {
     let source = directory.join("exit-parking.c");
     let library = directory.join("libexit-parking.dylib");

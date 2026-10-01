@@ -1193,55 +1193,7 @@ fn failed_origin_push_keeps_task_open_and_retains_the_mirror_branch() {
 }
 
 #[test]
-fn launch_plans_keep_batch_golden_and_turns_use_the_account_environment() {
-    let batch_command = CommandSpec::argv(vec!["/usr/bin/true".into(), "literal".into()]).unwrap();
-    let batch_lease = lease(batch_command.clone(), "d".repeat(64));
-    let batch = LaunchPlan::batch(
-        &batch_command,
-        &batch_lease,
-        std::path::Path::new("/job/home"),
-        std::path::Path::new("/job/tmp"),
-    )
-    .unwrap();
-    assert_eq!(batch.program(), "/usr/bin/true");
-    assert_eq!(
-        batch.args(),
-        &["/usr/bin/true".to_string(), "literal".to_string()]
-    );
-    assert_eq!(
-        batch.env(),
-        &[
-            ("LC_ALL".into(), "C".into()),
-            ("LANG".into(), "C".into()),
-            (
-                "PATH".into(),
-                "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
-            ),
-            ("HOME".into(), "/job/home".into()),
-            ("TMPDIR".into(), "/job/tmp".into()),
-            (
-                "MAC_WORKER_JOB_ID".into(),
-                "00000000000000000000000000000003".into()
-            ),
-            (
-                "MAC_WORKER_CLIENT_ID".into(),
-                "00000000000000000000000000000004".into(),
-            ),
-            ("MAC_WORKER_PROJECT_ID".into(), "b".repeat(64).into()),
-            ("MAC_WORKER_WORKTREE_ID".into(), "c".repeat(64).into()),
-            (
-                "MAC_WORKER_ACCOUNT_HOME".into(),
-                std::env::var_os("MAC_WORKER_ACCOUNT_HOME")
-                    .filter(|home| !home.is_empty())
-                    .or_else(|| std::env::var_os("HOME"))
-                    .expect("HOME"),
-            ),
-        ]
-    );
-    assert!(batch.cwd().as_os_str().is_empty());
-    assert_eq!(batch.stdin(), &StdinSource::Null);
-    assert_eq!(batch.stdout(), StdoutSink::Direct);
-
+fn turn_launch_plans_use_the_account_environment() {
     let turn = material("prompt");
     let section = TurnSection::new(
         turn.clone(),
