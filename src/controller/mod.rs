@@ -40,27 +40,24 @@ use std::time::Duration;
 
 pub use batch::{
     BatchExecuteContext, BatchKind, ControllerCheckoutMap, FrozenBatchBody, FrozenBatchSource,
-    PreparedBatchSource, PreparedTaskBatch, execute_task_batch, prepare_task_batch,
+    PreparedTaskBatch, execute_task_batch, prepare_task_batch,
 };
-pub use batch_freeze::{LaptopBatchSourceStream, LaptopFrozenBatch, freeze_laptop_batch};
+pub use batch_freeze::{LaptopFrozenBatch, freeze_laptop_batch};
 pub use envelope::{
     OperationEnvelope, OperationOutcome, PendingEnvelopes, list_pending_envelopes,
     load_operation_envelope, persist_operation_envelope,
 };
 pub use execute::{
     RpcExecution, TaskSubmitHandler, send_controller_mutation, send_controller_read,
-    send_controller_request, serve_rpc_with_execution, serve_rpc_with_runtime,
-    tick_controller_leader,
+    serve_rpc_with_execution, serve_rpc_with_runtime, tick_controller_leader,
 };
 pub use leader::ControllerLeader;
 pub use lifecycle::{
-    ControllerReconcileResult, ControllerWaitPollResult, ControllerWaitSelector,
-    reconcile_via_controller, wait_via_controller,
+    ControllerWaitPollResult, ControllerWaitSelector, reconcile_via_controller, wait_via_controller,
 };
 pub use protocol::{
     ControllerRequest, MAX_FRAME_BYTES, MAX_STORED_REQUEST_BYTES, canonical_request_sha256,
     decode_frame, decode_request, encode_frame, encode_json_frame, parse_request, read_frame,
-    write_frame,
 };
 pub use read::{
     ControllerReadIdentity, ControllerReadReply, ControllerTaskDiffResult,
@@ -76,10 +73,10 @@ pub use store::{
 pub use stream_client::{fetch_via_controller, stream_nested_source, stream_source_receive};
 pub use task_mutations::{PreparedTaskMutation, execute_task_mutation, prepare_task_mutation};
 pub use transfer::{
-    CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerReceiveIdentity, ControllerResultIdentity,
-    ControllerSourceReceipt, ControllerTransfer, SourceSubmitBind, VerifiedResultMeta,
-    controller_transfer_cache_id, controller_transfer_git_path, frozen_result_ref,
-    import_controller_result, result_digest, source_digest,
+    CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerResultIdentity, ControllerTransfer,
+    SourceSubmitBind, VerifiedResultMeta, controller_transfer_cache_id,
+    controller_transfer_git_path, frozen_result_ref, import_controller_result, result_digest,
+    source_digest,
 };
 
 use crate::{

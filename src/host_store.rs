@@ -34,10 +34,7 @@ use crate::{
     task::{TaskId, TaskStatus},
 };
 
-pub use crate::gc::{
-    BRANCH_RETENTION_MILLIS, GcCandidate, GcReport, GcRequest, HostGc, JOB_RETENTION_MILLIS,
-    TASK_RETENTION_MILLIS,
-};
+pub use crate::gc::{BRANCH_RETENTION_MILLIS, HostGc, JOB_RETENTION_MILLIS, TASK_RETENTION_MILLIS};
 
 const MAX_HOST_FILE_BYTES: u64 = 1024 * 1024;
 pub const HOST_LAYOUT_VERSION: u32 = 3;

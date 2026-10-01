@@ -26,10 +26,7 @@ pub(crate) use deadline::WaitDeadline;
 mod runner_dispatch;
 mod task_context;
 
-pub use active_tasks::{
-    ActiveTaskBootstrapReport, ActiveTaskConfig, ActiveTaskRefreshReport, ActiveTaskSelection,
-    task_record_needs_active_index,
-};
+pub use active_tasks::{ActiveTaskConfig, ActiveTaskSelection, task_record_needs_active_index};
 
 #[cfg(test)]
 mod tests;
