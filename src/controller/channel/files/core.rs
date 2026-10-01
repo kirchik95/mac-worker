@@ -308,7 +308,9 @@ fn bind_generation_inner(
         {
             return Err(invalid());
         }
-    } else if root.entry_exists("service.json")? {
+    } else if !root.list_names()?.is_empty() {
+        // Without a valid prior record, even a bare generation link is a
+        // creation gap. Preserve the private directory's residue and decline.
         return Err(invalid());
     }
     let name = format!("e{}", uuid.simple());
@@ -728,5 +730,36 @@ mod tests {
         assert!(prepare_stale(&lease.root, &evidence, true, true).is_err());
         assert!(lease.root.path().join("s").exists());
         assert!(lease.executable.exists());
+    }
+
+    #[test]
+    fn missing_creation_record_preserves_bare_image_and_disables_setup() {
+        let temp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let source = temp.path().join("worker");
+        fs::write(&source, b"#!/bin/sh\nprintf old").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let root = RootedDir::create(&temp.path().join("rpc")).unwrap();
+        let old_name = "e11111111111141118111111111111111";
+        root.channel_link_executable(&source, metadata.dev(), metadata.ino(), old_name)
+            .unwrap();
+        let rpc = root.path().to_owned();
+        assert!(
+            bind_generation(
+                root,
+                &source,
+                metadata.dev(),
+                metadata.ino(),
+                "22222222-2222-4222-8222-222222222222"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(rpc.join(old_name)).unwrap(),
+            b"#!/bin/sh\nprintf old"
+        );
+        assert!(!rpc.join("s").exists());
+        assert!(!rpc.join("service.json").exists());
+        assert!(!rpc.join("e22222222222242228222222222222222").exists());
     }
 }
