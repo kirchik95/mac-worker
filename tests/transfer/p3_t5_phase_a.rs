@@ -264,3 +264,64 @@ fn resolution_rejects_ambiguous_and_unsafe_paths_before_allocation() {
     );
     assert_eq!(files.allocations.load(Ordering::SeqCst), 0);
 }
+
+fn endpoint_at_94_bytes(master: &std::path::Path) -> PathBuf {
+    let documented = format!(
+        "/Users/kirchik/.cache/mac-worker/ssh-{}/{}",
+        "a".repeat(16),
+        "b".repeat(40)
+    );
+    assert_eq!(documented.len(), 94);
+    let cold_length = format!("{documented}.{}", "c".repeat(16)).len();
+    assert_eq!(cold_length, 111);
+    assert!(cold_length >= 104);
+    let parent = master.parent().unwrap();
+    let endpoint = parent.join("d".repeat(94 - parent.as_os_str().as_encoded_bytes().len() - 1));
+    assert_eq!(endpoint.as_os_str().as_encoded_bytes().len(), 94);
+    endpoint
+}
+
+#[test]
+fn cold_master_creation_includes_openssh_suffix_guard() {
+    if isolated("cold_master_creation_includes_openssh_suffix_guard") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    let master = endpoint_at_94_bytes(&master);
+    let files = Arc::new(Files::default());
+    let control = MasterForwardControl::new(paths, files.clone(), ssh);
+    let raw = ResolutionRunner {
+        output: format!("controlpath {}\n", master.display()).into_bytes(),
+        calls: Mutex::default(),
+    };
+    assert!(matches!(
+        control.resolve(&raw, &route, &context(&Clock::default())),
+        Err(ChannelFailure::Unavailable(ChannelReason::UnsafePath))
+    ));
+    assert_eq!(raw.calls.lock().unwrap().len(), 1);
+    assert_eq!(files.allocations.load(Ordering::SeqCst), 0);
+    assert!(!master.exists());
+}
+
+#[test]
+fn live_94_byte_master_does_not_pay_creation_suffix() {
+    if isolated("live_94_byte_master_does_not_pay_creation_suffix") {
+        return;
+    }
+    let (paths, ssh, route, master) = fixture();
+    let master = endpoint_at_94_bytes(&master);
+    let _listener = std::os::unix::net::UnixListener::bind(&master).unwrap();
+    fs::set_permissions(&master, fs::Permissions::from_mode(0o600)).unwrap();
+    let control = MasterForwardControl::new(paths, Arc::new(Files::default()), ssh);
+    let raw = ResolutionRunner {
+        output: format!("controlpath {}\n", master.display()).into_bytes(),
+        calls: Mutex::default(),
+    };
+    assert_eq!(
+        control
+            .resolve(&raw, &route, &context(&Clock::default()))
+            .unwrap()
+            .control_path,
+        master
+    );
+}

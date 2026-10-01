@@ -85,7 +85,19 @@ impl ForwardControl for MasterForwardControl {
         }
         match socket_binding(&parent, &endpoint) {
             Ok(_) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                // OpenSSH creates <endpoint>.<16 random hex> before publishing
+                // a cold master. Keep the existing namespace unchanged.
+                if endpoint
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    .saturating_add(17)
+                    >= 104
+                {
+                    return Err(unavailable(ChannelReason::UnsafePath));
+                }
+            }
             Err(_) => return Err(unavailable(ChannelReason::UnsafePath)),
         }
         let bootstrap_request = transport::channel_bootstrap_request(
