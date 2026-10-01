@@ -1047,7 +1047,7 @@ impl RootedDir {
         )?))
     }
 
-    fn channel_private_root(&self) -> io::Result<()> {
+    pub(crate) fn channel_private_root(&self) -> io::Result<()> {
         let metadata = self.root_metadata()?;
         require_private_directory(&metadata)?;
         if metadata.st_mode & 0o7777 != 0o700 {

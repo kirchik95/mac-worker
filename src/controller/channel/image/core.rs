@@ -2,15 +2,10 @@
 use std::{
     io,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CapturedImage {
-    pub(crate) path: PathBuf,
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
-}
+use super::RunningImage as CapturedImage;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LoadedImage {
