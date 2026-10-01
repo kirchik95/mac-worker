@@ -95,10 +95,12 @@ impl BaseCommit {
         self.kind
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn head_oid(&self) -> &BaseOid {
         &self.head_oid
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn branch(&self) -> Option<&str> {
         self.branch.as_deref()
     }
@@ -615,6 +617,7 @@ impl TransferRepo {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn controller_transfer_git_path(
         cache_root: &Path,
         project_id: &str,

@@ -262,6 +262,7 @@ impl VerifiedReceipt {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -286,6 +287,7 @@ impl VerifiedReceipt {
         &self.cache_key
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn verified_at_millis(&self) -> u64 {
         self.verified_at_millis
     }

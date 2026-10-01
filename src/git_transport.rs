@@ -635,6 +635,7 @@ impl UploadPackComponents {
         self.task_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }

@@ -342,6 +342,7 @@ impl DurableRequest {
         self.turn_id.as_deref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn created_at_millis(&self) -> u64 {
         self.created_at_millis
     }
@@ -395,6 +396,7 @@ impl ControllerAck {
         self.result.as_ref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_result(&mut self, result: Value) {
         self.result = Some(result);
     }

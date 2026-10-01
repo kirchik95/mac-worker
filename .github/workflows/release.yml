@@ -48,6 +48,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo clippy --locked --all-targets -- -D warnings
+          CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
           cargo test --locked --all-targets --no-fail-fast
           scripts/test-install.sh
 

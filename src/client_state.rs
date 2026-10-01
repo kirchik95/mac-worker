@@ -1,7 +1,8 @@
 #[cfg(any(test, feature = "test-support"))]
 use crate::{
     job::{
-        CachedAdmissionObservation, QueueAbandonmentProof, QueueCancel, ResolveOrAbandonRequest,
+        CachedAdmissionObservation, QueueAbandonmentProof, QueueCancel, RemoteUncertainty,
+        ResolveOrAbandonRequest,
     },
     task::TaskOutcome,
     transfer::PreacceptanceAbandonmentReceipt,
@@ -60,7 +61,7 @@ use crate::{
     job::{
         AdmissionObservation, ClientId, JobId, JobState, JobStatus, LocalJobRecord,
         ProcessIdentity, QueueClaim, QueueEntry, QueueEntryKind, QueueSnapshot, QueueState,
-        RemoteUncertainty, ReplacementFailureBudget, RunnerSlotReservation,
+        ReplacementFailureBudget, RunnerSlotReservation,
     },
     rooted_fs::{RootedDir, is_private_replacement_name},
     scheduler::{
@@ -246,20 +247,32 @@ pub enum ClientStateCreationRacePoint {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientStateConcurrencyPoint {
+    #[cfg(any(test, feature = "test-support"))]
     QueuePublication,
+    #[cfg(any(test, feature = "test-support"))]
     ParkedTaskTurnPublication,
+    #[cfg(any(test, feature = "test-support"))]
     ClaimRunCapEvaluation,
+    #[cfg(any(test, feature = "test-support"))]
     SubmissionIntentClear,
+    #[cfg(any(test, feature = "test-support"))]
     SubmissionIntentClearResultUncertain,
+    #[cfg(any(test, feature = "test-support"))]
     SubmissionIntentReconciliationBeforeTransferLock,
+    #[cfg(any(test, feature = "test-support"))]
     SubmissionIntentReconciliationAfterTransferLock,
+    #[cfg(any(test, feature = "test-support"))]
     DagClaim,
     DagSubmit,
     DagSubmitWait,
     SubmissionRollbackRecover,
+    #[cfg(any(test, feature = "test-support"))]
     ObservationRefreshPublication,
+    #[cfg(any(test, feature = "test-support"))]
     TaskReplacementPreExchange,
+    #[cfg(any(test, feature = "test-support"))]
     RunnerLogContention,
+    #[cfg(any(test, feature = "test-support"))]
     RunnerSlotReservation,
     AfterTaskFetchLoad,
     BeforeTaskMutation,
@@ -2910,6 +2923,7 @@ impl ClientStateStore {
     /// uncertainty. Lease-busy and other pre-acceptance retries must not leave
     /// a reservation-bound identity behind when the authoritative host refused
     /// admission without mutation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_unpublished_job(
         &self,
         job_id: JobId,

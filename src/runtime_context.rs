@@ -12,24 +12,27 @@ pub struct RuntimeContext {
     pub(crate) environment: BTreeMap<OsString, OsString>,
     pub(crate) home: PathBuf,
     current_dir: RuntimeCurrentDir,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) controller_channel: Option<std::sync::Arc<controller::channel::ClientDeps>>,
 }
 
 impl std::fmt::Debug for RuntimeContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RuntimeContext")
+        let mut debug = formatter.debug_struct("RuntimeContext");
+        debug
             .field("environment", &self.environment)
             .field("home", &self.home)
-            .field("current_dir", &self.current_dir)
-            .field("controller_channel", &self.controller_channel.is_some())
-            .finish()
+            .field("current_dir", &self.current_dir);
+        #[cfg(any(test, feature = "test-support"))]
+        debug.field("controller_channel", &self.controller_channel.is_some());
+        debug.finish()
     }
 }
 
 #[derive(Debug, Clone)]
 enum RuntimeCurrentDir {
     Process,
+    #[cfg(any(test, feature = "test-support"))]
     Fixed(PathBuf),
 }
 
@@ -44,11 +47,13 @@ impl RuntimeContext {
             environment,
             home,
             current_dir: RuntimeCurrentDir::Process,
+            #[cfg(any(test, feature = "test-support"))]
             controller_channel: None,
         }
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn isolated(
         environment: BTreeMap<OsString, OsString>,
         home: PathBuf,
@@ -64,6 +69,7 @@ impl RuntimeContext {
 
     /// Supply the foreground read channel's dependencies without changing raw RPCs.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_controller_channel_dependencies(
         mut self,
         dependencies: controller::channel::ClientDeps,
@@ -75,6 +81,7 @@ impl RuntimeContext {
     pub(crate) fn current_dir(&self) -> Result<PathBuf, WorkerError> {
         match &self.current_dir {
             RuntimeCurrentDir::Process => std::env::current_dir().map_err(WorkerError::Io),
+            #[cfg(any(test, feature = "test-support"))]
             RuntimeCurrentDir::Fixed(current_dir) => Ok(current_dir.clone()),
         }
     }
@@ -186,6 +193,7 @@ impl ControllerEventPublisher {
     pub fn runtime(&self) -> std::sync::Arc<ControllerEventRuntime> {
         self.runtime.clone()
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn diagnostics(&self) -> Vec<controller::events::journal::PublisherDiagnostic> {
         self.publisher.diagnostics()
     }

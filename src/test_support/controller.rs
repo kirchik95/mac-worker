@@ -20,13 +20,16 @@ pub use crate::controller::protocol::{
     encode_frame, encode_json_frame, parse_request,
 };
 pub use crate::controller::read::{
-    ControllerReadIdentity, ControllerReadReply, ControllerTaskLogsResult,
-    ControllerTaskStatusResult, is_read_command,
+    ControllerReadIdentity, ControllerReadReply, ControllerTaskDiffResult,
+    ControllerTaskLogsResult, ControllerTaskResult, ControllerTaskStatusResult, is_read_command,
 };
 pub use crate::controller::registry::{OwnedCheckoutMap, ProjectRegistry};
 pub use crate::controller::store::{
     ActiveResumeConfig, ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
     FakeControllerExecutor, OperationMeta, RequestPhase, default_prepare_operation, serve_rpc,
+};
+pub use crate::controller::stream_rpc::{
+    ControllerResultPrepareResult, ControllerSourceFinishResult,
 };
 pub use crate::controller::task_mutations::{
     PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,

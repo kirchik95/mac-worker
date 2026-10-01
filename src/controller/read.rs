@@ -47,6 +47,7 @@ impl<T> ControllerReadReply<T> {
         &self.request_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn payload_sha256(&self) -> &str {
         &self.payload_sha256
     }
@@ -195,6 +196,7 @@ impl ControllerTaskStatusResult {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -262,6 +264,7 @@ impl ControllerTaskLogsResult {
         self.complete
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -271,6 +274,7 @@ impl ControllerTaskLogsResult {
         self.offset
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn raw(&self) -> bool {
         self.raw
     }
@@ -279,6 +283,7 @@ impl ControllerTaskLogsResult {
         self.turn_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn turn_number(&self) -> u32 {
         self.turn_number
     }
@@ -344,10 +349,12 @@ impl ControllerTaskDiffResult {
         &self.text
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stat(&self) -> bool {
         self.stat
     }
@@ -390,6 +397,7 @@ pub struct ControllerTaskResult {
 }
 
 impl ControllerTaskResult {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -468,7 +476,7 @@ fn list_reply(
         .map(parse_task_outcome_kind)
         .transpose()?
         .map(str::to_owned);
-    let full = match request.body().get("full") {
+    let _full = match request.body().get("full") {
         None => false,
         Some(Value::Bool(value)) => *value,
         Some(_) => {
@@ -481,7 +489,8 @@ fn list_reply(
         run_id,
         state,
         outcome,
-        full,
+        #[cfg(any(test, feature = "test-support"))]
+        full: _full,
     })?;
     Ok(reply(request, report.projection().clone()))
 }

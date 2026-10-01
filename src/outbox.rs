@@ -256,6 +256,7 @@ impl<'a> OriginOutbox<'a> {
         Self { store, runner }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn host_root(&self) -> &Path {
         self.store.root()
     }

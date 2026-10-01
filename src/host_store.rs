@@ -76,11 +76,17 @@ const OWNED_DIRECTORIES: &[&str] = &[
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostStoreWritePoint {
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeaseWrite = 1,
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeaseFileSync = 2,
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeaseDirectorySync = 3,
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeaseParentSync = 4,
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeasePublish = 5,
+    #[cfg(any(test, feature = "test-support"))]
     AfterLeasePublishSync = 6,
     AfterHostRootCreate = 7,
     AfterHostNamespaces = 8,
@@ -90,25 +96,44 @@ pub enum HostStoreWritePoint {
     AfterInstallationLock = 12,
     BeforeInstallationIdentityPublish = 13,
     AfterInstallationIdentityPublish = 14,
+    #[cfg(any(test, feature = "test-support"))]
     AfterTransferDirectoryCreate = 15,
+    #[cfg(any(test, feature = "test-support"))]
     AfterTransferLockSync = 16,
+    #[cfg(any(test, feature = "test-support"))]
     AfterTransferIdentityPublish = 17,
+    #[cfg(any(test, feature = "test-support"))]
     AfterTransferPublish = 18,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotValidation = 19,
+    #[cfg(any(test, feature = "test-support"))]
     DuringSnapshotConversion = 20,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotConversion = 21,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotRename = 22,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotCacheSync = 23,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotRootSeal = 24,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotReceiptFileSync = 25,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotReceiptPublish = 26,
+    #[cfg(any(test, feature = "test-support"))]
     AfterSnapshotReceiptParentSync = 27,
     AfterJobPublish = 28,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobHomeSync = 29,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobTmpSync = 30,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobStdoutWrite = 31,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobStdoutFileSync = 32,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobStderrWrite = 33,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobStderrFileSync = 34,
     AfterJobMetaWrite = 35,
     AfterJobMetaFileSync = 36,
@@ -121,20 +146,35 @@ pub enum HostStoreWritePoint {
     AfterJobIndexFileSync = 43,
     AfterJobIndexRename = 44,
     AfterJobIndexParentSync = 45,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobCleanupProof = 46,
+    #[cfg(any(test, feature = "test-support"))]
     AfterJobLeaseRetirement = 47,
+    #[cfg(any(test, feature = "test-support"))]
     BeforeJobStatusReplace = 48,
+    #[cfg(any(test, feature = "test-support"))]
     BeforeJobLeaseRetirement = 49,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionTombstone = 50,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionExecutionRemoval = 51,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionIncomingRemoval = 52,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionVerifiedReceiptRemoval = 53,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionVerificationStageRemoval = 54,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionJobMutableRemoval = 55,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionJobStageRemoval = 56,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionAbsenceProof = 57,
+    #[cfg(any(test, feature = "test-support"))]
     AfterResolutionCleanupMarker = 58,
+    #[cfg(any(test, feature = "test-support"))]
     BeforeResolutionLeaseRelease = 59,
+    #[cfg(any(test, feature = "test-support"))]
     AfterCleanupIntentCommit = 60,
     AfterHostLayoutRefreshUnlink = 61,
     AfterHostLayoutRefreshPublish = 62,
@@ -2225,10 +2265,12 @@ impl HostStore {
 
     /// Fail closed while any in-flight host work remains. Must be used by
     /// setup/migrate before replacing a helper or rewriting layout.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn require_protocol_upgrade_drain(&self) -> Result<(), WorkerError> {
         self.with_installation_lock(|| self.inspect_protocol_upgrade_locked())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn inspect_protocol_upgrade_locked(&self) -> Result<(), WorkerError> {
         inspect_protocol_upgrade_namespaces(&self.inner.namespaces)
     }

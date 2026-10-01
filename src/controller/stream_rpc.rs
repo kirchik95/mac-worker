@@ -107,6 +107,7 @@ pub struct ControllerSourceFinishResult {
 }
 
 impl ControllerSourceFinishResult {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -156,6 +157,7 @@ impl ControllerResultPrepareResult {
     pub fn project_id(&self) -> &str {
         &self.project_id
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn worktree_id(&self) -> &str {
         &self.worktree_id
     }

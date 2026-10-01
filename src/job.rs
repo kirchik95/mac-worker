@@ -35,7 +35,7 @@ pub const MAX_CONTROL_CODE_BYTES: usize = 128;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
 
 macro_rules! canonical_uuid_id {
-    ($name:ident $(, $new_cfg:meta)?) => {
+    ($name:ident $(, $new_cfg:meta $(, $uuid_cfg:meta)?)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name(Uuid);
 
@@ -49,6 +49,7 @@ macro_rules! canonical_uuid_id {
                 Self(Uuid::new_v4())
             }
 
+            $($(#[$uuid_cfg])?)?
             pub fn as_uuid(self) -> Uuid {
                 self.0
             }
@@ -89,7 +90,11 @@ macro_rules! canonical_uuid_id {
 }
 
 canonical_uuid_id!(JobId);
-canonical_uuid_id!(ClientId, cfg(any(test, feature = "test-support")));
+canonical_uuid_id!(
+    ClientId,
+    cfg(any(test, feature = "test-support")),
+    cfg(any(test, feature = "test-support"))
+);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(Uuid);
@@ -102,6 +107,7 @@ impl LeaseToken {
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn as_uuid(self) -> Uuid {
         self.0
     }
@@ -1127,6 +1133,7 @@ pub struct QueueAbandonmentProof {
 }
 
 impl QueueAbandonmentProof {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_resolution(
         entry: &QueueEntry,
         request: &ResolveOrAbandonRequest,
@@ -1222,6 +1229,7 @@ impl QueueAbandonmentProof {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn queue_id(&self) -> QueueId {
         self.queue_id
     }
@@ -1231,22 +1239,27 @@ impl QueueAbandonmentProof {
         self.job_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn selected_worker(&self) -> &str {
         &self.selected_worker
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn project_id(&self) -> &str {
         &self.project_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn worktree_id(&self) -> &str {
         &self.worktree_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn command_summary(&self) -> &CommandSummary {
         &self.command_summary
     }
@@ -1256,6 +1269,7 @@ impl QueueAbandonmentProof {
         &self.request_fingerprint
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn claimed_at_millis(&self) -> u64 {
         self.claimed_at_millis
     }
@@ -1417,6 +1431,7 @@ impl ReplacementFailureBudget {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn last_failed_at_millis(&self) -> u64 {
         self.last_failed_at_millis
     }
@@ -1701,6 +1716,7 @@ impl QueueEntry {
         self.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_preacceptance_abandoned(
         &mut self,
         proof: QueueAbandonmentProof,
@@ -1998,6 +2014,7 @@ impl QueueClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum QueueCancel {
     RemovedWaiting {
         job_id: JobId,
@@ -2245,11 +2262,13 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct CachedAdmissionObservation {
     observation: AdmissionObservation,
     age_millis: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CachedAdmissionObservation {
     pub(crate) fn new(
         observation: AdmissionObservation,
@@ -2616,7 +2635,12 @@ impl JobStatus {
         Ok(next)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_running(&self, updated_at_millis: u64) -> Result<Self, WorkerError> {
+        self.to_running(updated_at_millis)
+    }
+
+    pub fn to_running(&self, updated_at_millis: u64) -> Result<Self, WorkerError> {
         let next = Self::new(
             JobState::Running,
             updated_at_millis,
@@ -2635,7 +2659,17 @@ impl JobStatus {
         Ok(next)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_succeeded(
+        &self,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.to_succeeded(updated_at_millis, stdout, stderr)
+    }
+
+    pub fn to_succeeded(
         &self,
         updated_at_millis: u64,
         stdout: u64,
@@ -2652,7 +2686,18 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_failed_exit(
+        &self,
+        updated_at_millis: u64,
+        exit_code: u8,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.to_failed_exit(updated_at_millis, exit_code, stdout, stderr)
+    }
+
+    pub fn to_failed_exit(
         &self,
         updated_at_millis: u64,
         exit_code: u8,
@@ -2670,7 +2715,18 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_failed_signal(
+        &self,
+        updated_at_millis: u64,
+        signal: u32,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.to_failed_signal(updated_at_millis, signal, stdout, stderr)
+    }
+
+    pub fn to_failed_signal(
         &self,
         updated_at_millis: u64,
         signal: u32,
@@ -2688,7 +2744,19 @@ impl JobStatus {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_infrastructure_terminal(
+        &self,
+        state: JobState,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+        error_code: String,
+    ) -> Result<Self, WorkerError> {
+        self.to_infrastructure_terminal(state, updated_at_millis, stdout, stderr, error_code)
+    }
+
+    pub fn to_infrastructure_terminal(
         &self,
         state: JobState,
         updated_at_millis: u64,
@@ -2719,7 +2787,17 @@ impl JobStatus {
     /// cancelled.  This is deliberately narrower than the generic
     /// infrastructure-terminal constructor: query validation recognizes this
     /// one no-child terminal shape as the launch-fence cancellation outcome.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn into_prelaunch_cancelled(
+        &self,
+        updated_at_millis: u64,
+        stdout: u64,
+        stderr: u64,
+    ) -> Result<Self, WorkerError> {
+        self.to_prelaunch_cancelled(updated_at_millis, stdout, stderr)
+    }
+
+    pub fn to_prelaunch_cancelled(
         &self,
         updated_at_millis: u64,
         stdout: u64,
@@ -2994,6 +3072,7 @@ impl JobMeta {
         self.validate_shape()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn validate_current_wire(&self) -> Result<(), WorkerError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(incompatible_protocol(
@@ -3138,6 +3217,7 @@ impl RemoteUncertainty {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn code(&self) -> Option<&str> {
         match self {
             Self::None => None,
@@ -3827,6 +3907,7 @@ impl ResolveOrAbandonRequest {
         self.command_summary.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -4043,6 +4124,7 @@ impl StatusRequest {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(self) -> u32 {
         self.protocol_version
     }
@@ -4145,6 +4227,7 @@ impl StatusResponse {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -4292,6 +4375,7 @@ impl CancelResponse {
         self.status.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -4365,6 +4449,7 @@ impl LogChunkRequest {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(self) -> u32 {
         self.protocol_version
     }
@@ -4595,10 +4680,12 @@ impl LogCursor {
         self.next_offset
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn limit(&self) -> u32 {
         self.limit
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn terminal_target(&self) -> Option<u64> {
         self.terminal_target
     }
@@ -4734,6 +4821,7 @@ impl LogChunkResponse {
         self.chunk.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -4811,6 +4899,7 @@ impl StatusLogsRequest {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(self) -> u32 {
         self.protocol_version
     }
@@ -4912,6 +5001,7 @@ impl StatusLogsResponse {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -4919,6 +5009,7 @@ impl StatusLogsResponse {
     pub fn status(&self) -> &StatusResponse {
         &self.status
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stdout(&self) -> &LogChunk {
         &self.stdout
     }
@@ -5071,6 +5162,7 @@ impl ResolveOrAbandonResponse {
         self.outcome.validate()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }

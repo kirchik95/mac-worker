@@ -11,78 +11,60 @@
 //! Dashboard transport: managed SSH local-forward to a loopback HTTP viewer
 //! (`controller_dashboard_ssh_request`). Not RPC DTOs.
 
-pub mod batch;
-pub mod batch_freeze;
-pub mod channel;
-pub mod control;
-pub mod drain;
-pub mod envelope;
-pub mod events;
-pub mod execute;
-pub mod health;
-pub mod health_read;
-pub mod init;
-pub mod leader;
-pub mod lifecycle;
-pub mod protocol;
-pub mod provision;
-pub mod read;
-pub mod registry;
-pub mod runtime;
-pub mod service;
-pub mod store;
-pub mod stream_client;
-pub mod stream_rpc;
-pub mod task_mutations;
-pub mod transfer;
+pub(crate) mod batch;
+pub(crate) mod batch_freeze;
+pub(crate) mod channel;
+pub(crate) mod control;
+pub(crate) mod drain;
+pub(crate) mod envelope;
+pub(crate) mod events;
+pub(crate) mod execute;
+pub(crate) mod health;
+pub(crate) mod health_read;
+pub(crate) mod init;
+pub(crate) mod leader;
+pub(crate) mod lifecycle;
+pub(crate) mod protocol;
+pub(crate) mod provision;
+pub(crate) mod read;
+pub(crate) mod registry;
+pub(crate) mod runtime;
+pub(crate) mod service;
+pub(crate) mod store;
+pub(crate) mod stream_client;
+pub(crate) mod stream_rpc;
+pub(crate) mod task_mutations;
+pub(crate) mod transfer;
 
 use std::time::Duration;
 
-pub use batch::{
-    BatchExecuteContext, BatchKind, ControllerCheckoutMap, FrozenBatchBody, FrozenBatchSource,
-    PreparedTaskBatch, execute_task_batch, prepare_task_batch,
+pub(crate) use batch_freeze::freeze_laptop_batch;
+pub(crate) use envelope::{
+    PendingEnvelopes, list_pending_envelopes, load_operation_envelope, persist_operation_envelope,
 };
-pub use batch_freeze::{LaptopFrozenBatch, freeze_laptop_batch};
-pub use envelope::{
-    OperationEnvelope, OperationOutcome, PendingEnvelopes, list_pending_envelopes,
-    load_operation_envelope, persist_operation_envelope,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use execute::serve_rpc_with_runtime;
-pub use execute::{
+pub(crate) use execute::{
     RpcExecution, TaskSubmitHandler, send_controller_mutation, send_controller_read,
     serve_rpc_with_execution, tick_controller_leader,
 };
-pub use leader::ControllerLeader;
-pub use lifecycle::{
-    ControllerWaitPollResult, ControllerWaitSelector, reconcile_via_controller, wait_via_controller,
+pub(crate) use leader::ControllerLeader;
+pub(crate) use lifecycle::{ControllerWaitSelector, reconcile_via_controller, wait_via_controller};
+#[cfg(test)]
+pub(crate) use protocol::canonical_request_sha256;
+pub(crate) use protocol::{
+    ControllerRequest, MAX_FRAME_BYTES, decode_frame, decode_request, encode_frame,
+    encode_json_frame, parse_request,
 };
-pub use protocol::{
-    ControllerRequest, MAX_FRAME_BYTES, MAX_STORED_REQUEST_BYTES, canonical_request_sha256,
-    decode_frame, decode_request, encode_frame, encode_json_frame, parse_request, read_frame,
-};
-pub use read::{
+pub(crate) use read::{
     ControllerReadIdentity, ControllerReadReply, ControllerTaskDiffResult,
-    ControllerTaskLogsResult, ControllerTaskResult, ControllerTaskStatusResult, is_read_command,
+    ControllerTaskLogsResult, ControllerTaskResult, ControllerTaskStatusResult,
 };
-pub use registry::{OwnedCheckoutMap, ProjectRegistry};
-pub use store::default_prepare_operation;
-#[cfg(any(test, feature = "test-support"))]
-pub use store::serve_rpc;
-pub use store::{
-    ActiveBootstrapReport, ActiveResumeConfig, ActiveResumeReport, ControllerAck,
-    ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
-    FakeControllerExecutor, OperationMeta, RequestPhase,
+pub(crate) use store::default_prepare_operation;
+pub(crate) use store::{
+    ActiveBootstrapReport, ActiveResumeReport, ControllerAck, ControllerCommandHandler,
+    ControllerFault, ControllerStore, DurableRequest,
 };
-pub use stream_client::{fetch_via_controller, stream_nested_source, stream_source_receive};
-pub use task_mutations::{PreparedTaskMutation, execute_task_mutation, prepare_task_mutation};
-#[cfg(any(test, feature = "test-support"))]
-pub use transfer::{CONTROLLER_TRANSFER_CACHE_DOMAIN, controller_transfer_git_path};
-pub use transfer::{
-    ControllerResultIdentity, ControllerTransfer, SourceSubmitBind, VerifiedResultMeta,
-    controller_transfer_cache_id, frozen_result_ref, import_controller_result, result_digest,
-    source_digest,
-};
+pub(crate) use stream_client::{fetch_via_controller, stream_nested_source, stream_source_receive};
+pub(crate) use transfer::{ControllerTransfer, SourceSubmitBind, controller_transfer_cache_id};
 
 use crate::{
     config::{ControllerConfig, WorkerEntry, valid_ssh_destination},

@@ -82,6 +82,7 @@ impl SessionBinding {
         &self.session_ref
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bound_at_millis(&self) -> u64 {
         self.bound_at_millis
     }
@@ -145,6 +146,7 @@ impl TaskSessionRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -232,6 +234,7 @@ impl TaskPrebindRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -299,6 +302,7 @@ impl TaskCancelRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -364,6 +368,7 @@ impl TaskPrepareRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -437,6 +442,7 @@ impl TaskStatusRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -490,6 +496,7 @@ impl TaskStatusResponse {
         &self.status
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delivery(&self) -> Option<&OriginDelivery> {
         self.delivery.as_ref()
     }
@@ -518,6 +525,7 @@ impl TaskDiffRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -590,6 +598,7 @@ impl TaskCloseRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -675,6 +684,7 @@ impl TaskCloseResponse {
         &self.warnings
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn delivery(&self) -> Option<&OriginDelivery> {
         self.delivery.as_ref()
     }

@@ -682,6 +682,7 @@ impl TaskHint {
         }
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn try_new(
         task_id: TaskId,
         run_id: Option<RunId>,
@@ -716,6 +717,7 @@ impl QueueHint {
         }
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn try_new(
         turn_id: Option<TurnId>,
         state: Option<String>,

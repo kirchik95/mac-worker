@@ -1,4 +1,7 @@
 #[cfg(any(test, feature = "test-support"))]
+use crate::job::CommandSummary;
+
+#[cfg(any(test, feature = "test-support"))]
 use crate::{
     job::{SubmitRequest, SubmitResponse},
     job_service::{JobService, LaunchCandidate, SupervisorLauncher},
@@ -23,11 +26,11 @@ use crate::{
     gc::{GcReport, GcRequest},
     host_store::{HostStore, JobDisposition},
     job::{
-        CancelRequest, CancelResponse, ClientId, CommandSummary, HostControlError, JobId,
-        LeaseAcquireRequest, LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse,
-        LogStream, MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint,
-        ResolveOrAbandonOutcome, ResolveOrAbandonRequest, ResolveOrAbandonResponse,
-        StatusLogsRequest, StatusLogsResponse, StatusRequest, StatusResponse,
+        CancelRequest, CancelResponse, ClientId, HostControlError, JobId, LeaseAcquireRequest,
+        LeaseRecord, LeaseToken, LogChunk, LogChunkRequest, LogChunkResponse, LogStream,
+        MAX_LOG_CHUNK_BYTES, PreacceptanceDisposition, RequestFingerprint, ResolveOrAbandonOutcome,
+        ResolveOrAbandonRequest, ResolveOrAbandonResponse, StatusLogsRequest, StatusLogsResponse,
+        StatusRequest, StatusResponse,
     },
     process::{ProcessPolicy, ProcessRunner},
     task::TaskId,
@@ -76,7 +79,9 @@ pub enum HostOperation {
     ControllerService,
     ControllerProbe,
     ControllerRpc,
+    #[cfg(any(test, feature = "test-support"))]
     ControllerReceivePack,
+    #[cfg(any(test, feature = "test-support"))]
     ControllerUploadPack,
     OutboxRetry,
 }
@@ -111,7 +116,9 @@ impl HostOperation {
             Self::ControllerService => "~/.local/bin/worker host controller-service",
             Self::ControllerProbe => "~/.local/bin/worker host controller-probe",
             Self::ControllerRpc => "~/.local/bin/worker host controller-rpc",
+            #[cfg(any(test, feature = "test-support"))]
             Self::ControllerReceivePack => "~/.local/bin/worker host controller-receive-pack",
+            #[cfg(any(test, feature = "test-support"))]
             Self::ControllerUploadPack => "~/.local/bin/worker host controller-upload-pack",
             Self::OutboxRetry => "~/.local/bin/worker host outbox-retry",
         }
@@ -161,6 +168,7 @@ pub struct RemoteJobClient<'a> {
 
 /// Process-local authority proving that one exact remote resolution returned
 /// `Abandoned`. It deliberately has no serialization implementation.
+#[cfg(any(test, feature = "test-support"))]
 pub struct PreacceptanceAbandonmentReceipt {
     job_id: JobId,
     client_id: ClientId,
@@ -172,6 +180,7 @@ pub struct PreacceptanceAbandonmentReceipt {
     resolution_request_digest: [u8; 32],
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PreacceptanceAbandonmentReceipt {
     fn from_remote_abandonment(request: &ResolveOrAbandonRequest) -> Result<Self, WorkerError> {
         request.validate()?;
@@ -207,12 +216,14 @@ impl PreacceptanceAbandonmentReceipt {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn resolution_request_digest(request: &ResolveOrAbandonRequest) -> Result<[u8; 32], WorkerError> {
     let bytes = serde_json::to_vec(request)
         .map_err(|_| transport_error("INVALID_REQUEST", "control request is invalid"))?;
     Ok(Sha256::digest(bytes).into())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl fmt::Debug for PreacceptanceAbandonmentReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -230,12 +241,14 @@ impl fmt::Debug for PreacceptanceAbandonmentReceipt {
 
 /// Opaque result of the receipt-bearing resolution path. Its private fields
 /// keep the disposition/receipt invariant caller-unforgeable.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct PreacceptanceResolution {
     disposition: PreacceptanceDisposition,
     abandonment_receipt: Option<PreacceptanceAbandonmentReceipt>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PreacceptanceResolution {
     fn from_remote_result(
         request: &ResolveOrAbandonRequest,
@@ -903,10 +916,12 @@ impl<'a> RemoteJobClient<'a> {
         worker: &WorkerEntry,
         request: &ResolveOrAbandonRequest,
     ) -> Result<PreacceptanceDisposition, WorkerError> {
-        self.resolve_preacceptance_with_receipt(worker, request)
-            .map(PreacceptanceResolution::into_disposition)
+        let disposition = self.resolve_preacceptance_disposition(worker, request)?;
+        disposition.validate()?;
+        Ok(disposition)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resolve_preacceptance_with_receipt(
         &self,
         worker: &WorkerEntry,

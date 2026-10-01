@@ -37,6 +37,7 @@ pub struct ProjectPreparationRequest {
 
 #[derive(Debug)]
 pub struct PreparedProject {
+    #[cfg(any(test, feature = "test-support"))]
     pub state: ProjectState,
     pub selection_warnings: Vec<SelectionWarning>,
     pub snapshot: Snapshot,
@@ -365,6 +366,7 @@ impl ProjectState {
         }
 
         Ok(PreparedProject {
+            #[cfg(any(test, feature = "test-support"))]
             state: before_capture,
             selection_warnings,
             snapshot,

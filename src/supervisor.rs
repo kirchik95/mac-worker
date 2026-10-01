@@ -203,6 +203,7 @@ impl fmt::Debug for LaunchPlan {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StdinSource {
+    #[cfg(any(test, feature = "test-support"))]
     Null,
     File(String),
 }
@@ -210,6 +211,7 @@ pub enum StdinSource {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdoutSink {
+    #[cfg(any(test, feature = "test-support"))]
     Direct,
     Pipe,
 }
@@ -2046,7 +2048,7 @@ impl<'a> Supervisor<'a> {
         }
         let mut write_running_status = || {
             now_millis()
-                .and_then(|updated_at| status.into_running(updated_at))
+                .and_then(|updated_at| status.to_running(updated_at))
                 .and_then(|running| {
                     replace_status(
                         self.store,
@@ -2260,7 +2262,7 @@ impl<'a> Supervisor<'a> {
         stderr.sync_all()?;
         let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
         let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
-        let terminal = status.into_infrastructure_terminal(
+        let terminal = status.to_infrastructure_terminal(
             JobState::Lost,
             now_millis()?,
             stdout_length,
@@ -2316,7 +2318,7 @@ impl<'a> Supervisor<'a> {
         let stdout = job.open_private_append("stdout.log")?;
         let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
         let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
-        let terminal = status.into_infrastructure_terminal(
+        let terminal = status.to_infrastructure_terminal(
             JobState::Lost,
             now_millis()?,
             stdout_length,
@@ -3818,7 +3820,7 @@ fn prelaunch_terminal(
     stderr.sync_all()?;
     let stdout_length = job.validate_private_append_binding("stdout.log", stdout)?;
     let stderr_length = job.validate_private_append_binding("stderr.log", stderr)?;
-    let terminal = status.into_infrastructure_terminal(
+    let terminal = status.to_infrastructure_terminal(
         JobState::Lost,
         now_millis()?,
         stdout_length,
@@ -4254,7 +4256,7 @@ fn terminal_from_setup_or_outcome(
     if let Some(setup) = setup {
         return match setup.code.as_str() {
             "SETUP_TIMEOUT" => Ok((
-                current_status.into_infrastructure_terminal(
+                current_status.to_infrastructure_terminal(
                     JobState::TimedOut,
                     now,
                     stdout_length,
@@ -4266,7 +4268,7 @@ fn terminal_from_setup_or_outcome(
                 TerminalPath::Timeout,
             )),
             "SETUP_CANCELLED" => Ok((
-                current_status.into_infrastructure_terminal(
+                current_status.to_infrastructure_terminal(
                     JobState::Cancelled,
                     now,
                     stdout_length,
@@ -4278,7 +4280,7 @@ fn terminal_from_setup_or_outcome(
                 TerminalPath::HostCancel,
             )),
             "SETUP_FAILED" => Ok((
-                current_status.into_infrastructure_terminal(
+                current_status.to_infrastructure_terminal(
                     JobState::Lost,
                     now,
                     stdout_length,
@@ -4312,25 +4314,25 @@ fn outcome_terminal(
 > {
     match outcome {
         ChildOutcome::Exited(0) => Ok((
-            current_status.into_succeeded(now, stdout_length, stderr_length)?,
+            current_status.to_succeeded(now, stdout_length, stderr_length)?,
             crate::task::TurnTerminal::Succeeded,
             Some(0),
             TerminalPath::ChildExit(0),
         )),
         ChildOutcome::Exited(code) => Ok((
-            current_status.into_failed_exit(now, code, stdout_length, stderr_length)?,
+            current_status.to_failed_exit(now, code, stdout_length, stderr_length)?,
             crate::task::TurnTerminal::Failed,
             Some(i32::from(code)),
             TerminalPath::ChildExit(i32::from(code)),
         )),
         ChildOutcome::Signalled(signal) => Ok((
-            current_status.into_failed_signal(now, signal, stdout_length, stderr_length)?,
+            current_status.to_failed_signal(now, signal, stdout_length, stderr_length)?,
             crate::task::TurnTerminal::Cancelled,
             None,
             TerminalPath::ChildExit(outcome_code(ChildOutcome::Signalled(signal))),
         )),
         ChildOutcome::TimedOut => Ok((
-            current_status.into_infrastructure_terminal(
+            current_status.to_infrastructure_terminal(
                 JobState::TimedOut,
                 now,
                 stdout_length,

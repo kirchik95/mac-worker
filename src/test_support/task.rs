@@ -53,7 +53,8 @@ pub mod store {
 }
 pub mod turn {
     pub use crate::turn::{
-        EnvProfile, TaskTurnRequest, TaskTurnResponse, TurnMaterial, TurnSection, prebind_session,
+        EnvProfile, PreparedTask, TaskTurnRequest, TaskTurnResponse, TurnMaterial, TurnPublisher,
+        TurnReceipt, TurnResult, TurnSection, prebind_session,
     };
 }
 pub mod turn_log {

@@ -337,6 +337,7 @@ pub enum AgentEvent {
         summary: String,
         exit_code: Option<i32>,
     },
+    #[cfg(any(test, feature = "test-support"))]
     Usage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,

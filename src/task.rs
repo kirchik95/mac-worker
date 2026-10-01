@@ -27,7 +27,7 @@ const MAX_HEX_ID_BYTES: usize = 64;
 pub type TurnId = JobId;
 
 macro_rules! canonical_uuid_id {
-    ($name:ident) => {
+    ($name:ident $(, $uuid_cfg:meta)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name(Uuid);
 
@@ -41,6 +41,7 @@ macro_rules! canonical_uuid_id {
                 Self(Uuid::new_v4())
             }
 
+            $(#[$uuid_cfg])?
             pub fn as_uuid(self) -> Uuid {
                 self.0
             }
@@ -81,7 +82,7 @@ macro_rules! canonical_uuid_id {
 }
 
 canonical_uuid_id!(TaskId);
-canonical_uuid_id!(RunId);
+canonical_uuid_id!(RunId, cfg(any(test, feature = "test-support")));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BaseOid(String);
@@ -454,6 +455,7 @@ impl DeliveryState {
         matches!(self, Self::Pending | Self::Retrying)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Delivered | Self::Failed)
     }
@@ -1601,14 +1603,17 @@ impl TaskCloseIntent {
         self.discard
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn last_turn_id(&self) -> Option<TurnId> {
         self.last_turn_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn turn_count(&self) -> u32 {
         self.turn_count
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn head_oid(&self) -> Option<&BaseOid> {
         self.head_oid.as_ref()
     }

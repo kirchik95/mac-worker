@@ -85,6 +85,7 @@ impl GcRequest {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
@@ -270,10 +271,12 @@ impl GcReport {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn apply(&self) -> bool {
         self.apply
     }

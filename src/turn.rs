@@ -568,14 +568,17 @@ impl TurnReceipt {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn job_id(&self) -> JobId {
         self.job_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prepared_head(&self) -> &BaseOid {
         &self.prepared_head
     }
@@ -1116,6 +1119,7 @@ impl<'a> TurnPublisher<'a> {
         Self { store, runner }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish(
         &self,
         task: &PreparedTask,
@@ -1925,6 +1929,7 @@ fn now_millis() -> Result<u64, WorkerError> {
 }
 
 impl TurnResult {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(outcome: TaskOutcome) -> Self {
         Self {
             outcome,
@@ -1942,14 +1947,17 @@ impl TurnResult {
         &self.outcome
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn agent_committed(&self) -> bool {
         self.agent_committed
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn log_truncated(&self) -> bool {
         self.log_truncated
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn head_oid(&self) -> Option<&BaseOid> {
         self.head_oid.as_ref()
     }
@@ -1962,10 +1970,12 @@ impl TurnResult {
         &self.questions
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn files_changed(&self) -> &[String] {
         &self.files_changed
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn diff_stat(&self) -> Option<&str> {
         self.diff_stat.as_deref()
     }

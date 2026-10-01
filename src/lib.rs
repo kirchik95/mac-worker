@@ -1,6 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
+use std::io::Cursor;
+
 use std::{
     future::Future,
-    io::{self, Cursor, Read, Write},
+    io::{self, Read, Write},
     path::PathBuf,
     pin::Pin,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,8 +11,7 @@ use std::{
 
 use agent_settings::{AgentSettingsGetRequest, AgentSettingsSaveRequest, NativeAgentSettingsStore};
 use cli::{
-    Cli, Command, ControllerChannelCommand, ControllerCommand, HiddenComponent, HostCommand,
-    TaskCommand,
+    Command, ControllerChannelCommand, ControllerCommand, HiddenComponent, HostCommand, TaskCommand,
 };
 use client_state::ClientStateStore;
 use config::{Config, WorkerEntry};
@@ -17,7 +19,6 @@ use dashboard::command::{
     DashboardCommandRequest, SystemBrowserOpener, SystemDashboardLauncher, run_dashboard,
 };
 use doctor::{DoctorRequest, DoctorService};
-use error::WorkerError;
 use gc::{GcReport, GcRequest, HostGc};
 use git_transport::{
     GitServerExecutor, HostGitService, ReceivePackComponents, SystemGitServerExecutor,
@@ -38,7 +39,6 @@ use lease::{AdmissionFacts, LeaseService};
 use output::CommandOutput;
 use paths::PathLayout;
 use probe::ProbeCollector;
-use process::ProcessRunner;
 use protocol::{PROTOCOL_VERSION, SetupReport, SetupWarning, SetupWarningCode, WorkersReport};
 use scheduler::WorkerPreference;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -58,76 +58,76 @@ use turn::TaskTurnRequest;
 use turn_runner::{DetachedRunnerExecutor, InlineRunnerExecutor, TurnRunner};
 
 mod account_launch;
-pub(crate) mod admission;
-pub mod agent;
-pub mod agent_facts;
-pub mod agent_settings;
-pub mod auth_incidents;
-pub mod binary_identity;
-pub mod build_id;
-pub mod cli;
-pub mod client_state;
-pub mod config;
-pub mod controller;
+mod admission;
+mod agent;
+mod agent_facts;
+mod agent_settings;
+mod auth_incidents;
+mod binary_identity;
+mod build_id;
+mod cli;
+mod client_state;
+mod config;
+mod controller;
 #[cfg(test)]
 mod controller_logs_tests;
-pub mod cursor_catalog;
-pub mod dag;
-pub mod dashboard;
-pub mod doctor;
-pub mod error;
-pub mod failure_receipt;
-pub mod features;
-pub mod follow_turn;
-pub mod gc;
-pub mod git_transport;
-pub mod herdr;
-pub mod herdr_notify;
-pub mod herdr_reporter;
-pub mod host_store;
-pub mod inputs;
-pub mod install;
-pub mod job;
-pub mod job_service;
-pub mod keychain;
-pub mod laptop;
-pub mod lease;
-pub mod legacy_snapshot_receipt;
-pub mod manifest;
+mod cursor_catalog;
+mod dag;
+mod dashboard;
+mod doctor;
+mod error;
+mod failure_receipt;
+mod features;
+mod follow_turn;
+mod gc;
+mod git_transport;
+mod herdr;
+mod herdr_notify;
+mod herdr_reporter;
+mod host_store;
+mod inputs;
+mod install;
+mod job;
+mod job_service;
+mod keychain;
+mod laptop;
+mod lease;
+mod legacy_snapshot_receipt;
+mod manifest;
 mod model_catalog;
-pub mod onboarding;
-pub mod outbox;
-pub mod output;
-pub mod paths;
-pub mod prepare_turn;
-pub mod prepared_followup;
-pub mod prepared_submit;
-pub mod probe;
-pub mod process;
-pub mod project;
-pub mod project_config;
-pub mod project_readiness;
-pub mod project_state;
-pub mod protocol;
-pub mod redaction;
-pub mod requirements;
-pub mod rooted_fs;
-pub(crate) mod runner_log;
-pub mod scheduler;
-pub mod scheduler_adapter;
-pub mod skills;
-pub mod snapshot;
-pub mod supervisor;
-pub mod task;
-pub mod task_client;
-pub mod task_store;
-pub mod task_view;
-pub mod transfer;
-pub mod transfer_repo;
-pub mod transport;
-pub mod turn;
-pub mod turn_log;
-pub mod turn_runner;
+mod onboarding;
+mod outbox;
+mod output;
+mod paths;
+mod prepare_turn;
+mod prepared_followup;
+mod prepared_submit;
+mod probe;
+mod process;
+mod project;
+mod project_config;
+mod project_readiness;
+mod project_state;
+mod protocol;
+mod redaction;
+mod requirements;
+mod rooted_fs;
+mod runner_log;
+mod scheduler;
+mod scheduler_adapter;
+mod skills;
+mod snapshot;
+mod supervisor;
+mod task;
+mod task_client;
+mod task_store;
+mod task_view;
+mod transfer;
+mod transfer_repo;
+mod transport;
+mod turn;
+mod turn_log;
+mod turn_runner;
 
 #[cfg(test)]
 pub(crate) mod fixture_pid;
@@ -138,8 +138,17 @@ pub mod test_support;
 pub(crate) mod test_sync;
 
 mod runtime_context;
-// Transitional compatibility; S2 closes these legacy paths after domains land.
-pub use runtime_context::{ControllerEventPublisher, ControllerEventRuntime, RuntimeContext};
+pub(crate) use runtime_context::{
+    ControllerEventPublisher, ControllerEventRuntime, RuntimeContext,
+};
+
+pub use cli::Cli;
+pub use error::{ExitKind, ProcessError, ProcessStream, WorkerError};
+pub use failure_receipt::FailureReceipt;
+pub use prepare_turn::{requested as prepare_turn_requested, run as run_prepare_turn};
+pub use process::{
+    ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner,
+};
 
 pub(crate) fn open_existing_controller_event_publisher(
     paths: &PathLayout,
@@ -160,7 +169,7 @@ pub(crate) fn open_existing_controller_event_publisher(
 
 /// Open authoritative state and attach only this host's initialized journal.
 /// This entry point never initializes the journal or consults routing config.
-pub fn open_with_existing_controller_events(
+pub(crate) fn open_with_existing_controller_events(
     paths: &PathLayout,
     runtime: std::sync::Arc<dyn controller::events::EventRuntime>,
 ) -> Result<(ClientStateStore, Option<ControllerEventPublisher>), WorkerError> {
@@ -173,7 +182,11 @@ pub fn open_with_existing_controller_events(
     Ok((store, publisher))
 }
 
-pub fn execute_with(cli: Cli, runner: &dyn ProcessRunner) -> Result<CommandOutput, WorkerError> {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn execute_with(
+    cli: Cli,
+    runner: &dyn ProcessRunner,
+) -> Result<CommandOutput, WorkerError> {
     let runtime = RuntimeContext::capture();
     execute_with_context(cli, runner, &runtime)
 }
@@ -466,7 +479,8 @@ fn execute_with_context(
     }
 }
 
-pub fn run_with_io(
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn run_with_io(
     cli: Cli,
     runner: &dyn ProcessRunner,
     stdout: &mut dyn Write,
@@ -559,7 +573,8 @@ fn write_public_diagnostic(stderr: &mut dyn Write, error: &WorkerError) {
 }
 
 #[doc(hidden)]
-pub fn run_with_io_in_context(
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn run_with_io_in_context(
     cli: Cli,
     runner: &dyn ProcessRunner,
     runtime: &RuntimeContext,
@@ -571,7 +586,7 @@ pub fn run_with_io_in_context(
 }
 
 #[doc(hidden)]
-pub fn run_with_stdio_in_context(
+pub(crate) fn run_with_stdio_in_context(
     cli: Cli,
     runner: &dyn ProcessRunner,
     runtime: &RuntimeContext,
@@ -1810,7 +1825,7 @@ fn run_task_subcommand(
             run,
             state,
             outcome,
-            full,
+            full: _full,
         } => {
             let filter = TaskListFilter {
                 run_id: run
@@ -1823,7 +1838,8 @@ fn run_task_subcommand(
                     .map(parse_task_outcome_kind)
                     .transpose()?
                     .map(str::to_owned),
-                full,
+                #[cfg(any(test, feature = "test-support"))]
+                full: _full,
             };
             let report = client.list(filter)?;
             write_task_list_report(&report, json, stdout)?;
@@ -5640,12 +5656,13 @@ impl controller::channel::ChannelRuntime for ControllerReadRuntime {
 }
 
 fn controller_channel_clock(
-    context: &RuntimeContext,
+    _context: &RuntimeContext,
 ) -> std::sync::Arc<dyn controller::channel::ChannelRuntime> {
-    context.controller_channel.as_ref().map_or_else(
-        || std::sync::Arc::new(ControllerReadRuntime) as _,
-        |deps| deps.runtime.clone(),
-    )
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(deps) = _context.controller_channel.as_ref() {
+        return deps.runtime.clone();
+    }
+    std::sync::Arc::new(ControllerReadRuntime)
 }
 
 pub(crate) fn controller_read_channel_dependencies(
@@ -5666,7 +5683,7 @@ fn controller_channel_dependencies(
     paths: &PathLayout,
     config: &Config,
     clock: std::sync::Arc<dyn controller::channel::ChannelRuntime>,
-    context: &RuntimeContext,
+    _context: &RuntimeContext,
 ) -> controller::channel::ClientDeps {
     use controller::channel::{
         codec::{FramedSocketConnector, SessionCodec},
@@ -5676,7 +5693,8 @@ fn controller_channel_dependencies(
         pin::PrivatePinStore,
     };
     use std::sync::Arc;
-    if let Some(deps) = context.controller_channel.as_deref() {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(deps) = _context.controller_channel.as_deref() {
         return clone_controller_channel_dependencies(deps, clock);
     }
     controller::channel::ClientDeps {

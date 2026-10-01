@@ -174,7 +174,9 @@ pub struct LeaderChannelDeps {
 
 #[derive(Clone, Copy, Debug)]
 pub struct LeaderChannelShutdown {
+    #[cfg(any(test, feature = "test-support"))]
     pub rpc: ShutdownEvidence,
+    #[cfg(any(test, feature = "test-support"))]
     pub files: ForwardDisposition,
 }
 
@@ -259,10 +261,12 @@ impl LeaderChannel {
     pub async fn shutdown(self) -> LeaderChannelShutdown {
         self.stop.stop();
         self.task.await.unwrap_or(LeaderChannelShutdown {
+            #[cfg(any(test, feature = "test-support"))]
             rpc: ShutdownEvidence {
                 completed: 0,
                 unknown: 1,
             },
+            #[cfg(any(test, feature = "test-support"))]
             files: ForwardDisposition::Retained,
         })
     }
@@ -417,7 +421,7 @@ async fn finish_generation(
             .map(|(generation, _)| generation),
         _ => None,
     };
-    let files = if let Some(generation) = generation {
+    let _files = if let Some(generation) = generation {
         if generation.withdrawn == Some(ForwardDisposition::Cleaned) {
             ForwardDisposition::Cleaned
         } else {
@@ -437,7 +441,12 @@ async fn finish_generation(
     } else {
         ForwardDisposition::Retained
     };
-    LeaderChannelShutdown { rpc, files }
+    LeaderChannelShutdown {
+        #[cfg(any(test, feature = "test-support"))]
+        rpc,
+        #[cfg(any(test, feature = "test-support"))]
+        files: _files,
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -467,7 +476,9 @@ async fn drive_generation(
         retired,
     };
     let retained = || LeaderChannelShutdown {
+        #[cfg(any(test, feature = "test-support"))]
         rpc: ShutdownEvidence::default(),
+        #[cfg(any(test, feature = "test-support"))]
         files: ForwardDisposition::Retained,
     };
     let (image, prepare_stop) = (deps.image.clone(), stop.clone());

@@ -13,12 +13,12 @@ use crate::task::TaskId;
 pub struct Cli {
     /// Configuration file path (default: ~/.config/mac-worker/config.toml)
     #[arg(long, global = true)]
-    pub config: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
     /// Print machine-readable JSON on stdout
     #[arg(long, global = true)]
-    pub json: bool,
+    pub(crate) json: bool,
     #[command(subcommand)]
-    pub command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]

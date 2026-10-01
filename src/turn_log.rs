@@ -160,6 +160,7 @@ fn render_event(event: AgentEvent) -> String {
         AgentEvent::ToolCall { name, summary } => format!("{name}: {summary}"),
         AgentEvent::FileChange { paths } => paths.join(", "),
         AgentEvent::Command { summary, exit_code } => format!("{summary} ({exit_code:?})"),
+        #[cfg(any(test, feature = "test-support"))]
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::SessionStarted { session_ref } => format!("session {session_ref}"),
         AgentEvent::TurnEnd { reason } => reason,

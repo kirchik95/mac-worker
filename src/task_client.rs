@@ -1,3 +1,6 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::task_view::TaskRunProjection;
+
 use std::{
     borrow::Cow,
     cell::Cell,
@@ -43,9 +46,8 @@ use crate::{
         TaskStatus, TurnId, TurnSummary, TurnTerminal, merge_origin_deliveries,
     },
     task_view::{
-        TaskFreshness, TaskListProjection, TaskListRow, TaskRunProjection, TaskViewError,
-        filter_task_list, last_turn_delivery, project_task_list_with_blocking_codes,
-        remote_observation_allowed,
+        TaskFreshness, TaskListProjection, TaskListRow, TaskViewError, filter_task_list,
+        last_turn_delivery, project_task_list_with_blocking_codes, remote_observation_allowed,
     },
     transfer::RemoteJobClient,
     transfer_repo::TransferRepo,
@@ -323,6 +325,7 @@ pub struct TaskListFilter {
     /// Canonical `TaskOutcome::kind` name; `needs_input` is the orchestrator's
     /// query for tasks waiting on an answer.
     pub outcome: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
     pub full: bool,
 }
 
@@ -503,10 +506,12 @@ impl TaskListReport {
         &self.projection.tasks
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn runs(&self) -> &[TaskRunProjection] {
         &self.projection.runs
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn progress(&self) -> crate::task::RunProgress {
         self.projection.progress
     }
@@ -1426,7 +1431,7 @@ impl<'a> TaskClient<'a> {
                 // Bound from: objects live in the local TransferRepo. Rewrite Origin
                 // to Local so host prepare consumes the pushed cache object instead of
                 // fetching an unpublished OID. Keep push_target and frozen requires.
-                let imported_from_parent = node.from_parent().is_some() && node.bound_oid.is_some();
+                let imported_from_parent = node.parent_id().is_some() && node.bound_oid.is_some();
                 let source = if imported_from_parent {
                     execution_source_for_bound_from(source, &publish)?
                 } else {
@@ -5167,14 +5172,14 @@ impl<'a> TaskClient<'a> {
             .nodes
             .iter()
             .filter(|(_, node)| {
-                node.from_parent().is_some()
+                node.parent_id().is_some()
                     && node.bound_oid.is_none()
                     && node.state != DagNodeState::Blocked
             })
             .map(|(batch_id, node)| (batch_id.clone(), node.clone()))
             .collect();
         for (batch_id, node) in candidates {
-            let Some(parent_id) = node.from_parent() else {
+            let Some(parent_id) = node.parent_id() else {
                 continue;
             };
             let Some(parent_node) = dag.nodes.get(parent_id) else {

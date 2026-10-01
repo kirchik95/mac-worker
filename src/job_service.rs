@@ -883,7 +883,7 @@ impl<'a> JobService<'a> {
             // identity to signal; publish the deliberate no-child terminal
             // form before any mutable data is removed.
             let (stdout_length, stderr_length) = synced_log_lengths(&job)?;
-            let cancelled = status.into_prelaunch_cancelled(
+            let cancelled = status.to_prelaunch_cancelled(
                 reconciliation_timestamp(status.updated_at_millis())?,
                 stdout_length,
                 stderr_length,
@@ -927,7 +927,7 @@ impl<'a> JobService<'a> {
             drop(admission);
             terminate_exact_recorded_group(self.reconciliation.as_ref(), status.child_identity())?;
             let (stdout_length, stderr_length) = synced_log_lengths(&job)?;
-            let cancelled = status.into_infrastructure_terminal(
+            let cancelled = status.to_infrastructure_terminal(
                 JobState::Cancelled,
                 reconciliation_timestamp(status.updated_at_millis())?,
                 stdout_length,
@@ -1979,7 +1979,7 @@ impl<'a> JobService<'a> {
             stderr.sync_all()?;
             let stdout_length = job.validate_private_append_binding("stdout.log", &stdout)?;
             let stderr_length = job.validate_private_append_binding("stderr.log", &stderr)?;
-            let lost = current.into_infrastructure_terminal(
+            let lost = current.to_infrastructure_terminal(
                 JobState::Lost,
                 reconciliation_timestamp(current.updated_at_millis())?,
                 stdout_length,

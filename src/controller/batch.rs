@@ -99,6 +99,7 @@ impl PreparedBatchSource {
     pub fn cache_id(&self) -> &str {
         &self.cache_id
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn receipt_oid(&self) -> &BaseOid {
         &self.receipt_oid
     }
@@ -129,6 +130,7 @@ impl PreparedTaskBatch {
     pub fn turn_id(&self) -> Option<TurnId> {
         None
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn run_id(&self) -> RunId {
         self.run_id
     }
@@ -143,9 +145,11 @@ impl PreparedTaskBatch {
     pub fn max_parallel(&self) -> u32 {
         self.max_parallel
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn kind(&self) -> BatchKind {
         self.kind
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }

@@ -1,6 +1,6 @@
 # Testing
 
-The suite has about 3,000 tests: the library's unit tests and nine integration test binaries grouped by product
+The suite has about 3,600 tests: the library's unit tests and nine integration test binaries grouped by product
 area. Most of its cost is filesystem sync and real processes, not CPU.
 
 Cargo discovers each `tests/<area>/main.rs` as an integration target: `agents`, `cli`, `controller`, `dashboard`,
@@ -27,6 +27,22 @@ CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=6 cargo nextest run --locked --test cli 
 
 Existing SSH and tunnel timing fixtures still depend on `debug_assertions`. Run their process tests
 with the existing debug profiles; enabling `test-support` does not enable those hooks in release profiles.
+
+Implementation modules remain private in both modes. Ordinary callers use the narrow library-root
+boundary: `Cli`, the process runner and its signature types, `run_with_stdio`, and the prepare-turn
+helper entries. The CLI fields and runtime fixture entries are accessible through the facade only.
+
+All-target Clippy enables the self dev-dependency's support feature. Check the ordinary production
+graph separately, without dev targets, and build the release without that feature:
+
+```sh
+CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
+CARGO_BUILD_JOBS=4 cargo build --locked --release --no-default-features
+```
+
+The CLI lint fixture compiles metadata in both feature modes and verifies that an unused helper in
+a private owner is diagnosed as `dead_code`. It also checks that explicit facade exports do not
+exempt unrelated helpers from the lint.
 
 ## Commands
 
@@ -170,6 +186,7 @@ concurrent clients, and the real 10 s supervisor TERM grace.
 
 ## CI
 
-- **Pushes and pull requests** run formatting, clippy and the library and binary unit tests.
+- **Pushes and pull requests** run formatting, all-target and production Clippy, and the library and binary unit tests.
 - **The full suite** runs nightly and on manual dispatch, through `scripts/test-gate.sh --profile ci` without a RAM
   disk, followed by the stress tests.
+- Both CI tiers and release verification check the production graph separately from support-enabled targets.

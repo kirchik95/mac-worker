@@ -67,6 +67,7 @@ impl OwnedCheckoutMap {
         Ok(map)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn checkout(&self, project_id: &str, worktree_id: &str) -> Result<&Path, WorkerError> {
         self.inner
             .get(&(project_id.to_owned(), worktree_id.to_owned()))

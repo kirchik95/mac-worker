@@ -55,6 +55,8 @@ jobs:
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check production graph without test support
+        run: CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
       - run: cargo test --locked --lib --bins --no-fail-fast
 
   rust-full:
@@ -72,6 +74,8 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check production graph without test support
+        run: CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
       - run: scripts/test-gate.sh --profile ci
       - name: Stress tests
         run: scripts/test-gate.sh --profile ci --run-ignored only -E 'test(/_stress$/)'

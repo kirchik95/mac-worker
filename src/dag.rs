@@ -332,10 +332,12 @@ impl DagRecord {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn node(&self, batch_id: &str) -> Option<&DagNode> {
         self.nodes.get(batch_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pending(&self) -> bool {
         self.nodes
             .values()
@@ -364,7 +366,12 @@ impl DagNode {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_parent(&self) -> Option<&str> {
+        self.parent_id()
+    }
+
+    pub fn parent_id(&self) -> Option<&str> {
         match &self.base {
             DagBase::From { parent } => Some(parent.as_str()),
             DagBase::Frozen { .. } => None,

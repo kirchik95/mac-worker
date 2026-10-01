@@ -4,7 +4,9 @@ use std::{
 };
 
 use clap::{Parser, error::ErrorKind};
-use mac_worker::{cli::Cli, process::SystemProcessRunner, run_with_stdio};
+use mac_worker::{
+    Cli, SystemProcessRunner, prepare_turn_requested, run_prepare_turn, run_with_stdio,
+};
 
 fn main() -> ExitCode {
     #[cfg(feature = "test-support")]
@@ -14,8 +16,8 @@ fn main() -> ExitCode {
         println!("{}", mac_worker::test_support::runtime::FEATURE_MARKER);
         return ExitCode::SUCCESS;
     }
-    if mac_worker::prepare_turn::requested() {
-        return mac_worker::prepare_turn::run();
+    if prepare_turn_requested() {
+        return run_prepare_turn();
     }
     let stdout = io::stdout();
     let stderr = io::stderr();
