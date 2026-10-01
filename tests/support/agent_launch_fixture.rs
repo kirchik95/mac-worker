@@ -243,6 +243,27 @@ pub fn fixture_home_from_env() -> PathBuf {
     PathBuf::from(std::env::var("FIXTURE_HOME").expect("FIXTURE_HOME must be set in subtest"))
 }
 
+/// Wait for an explicit child handshake, with a hang guard rather than a
+/// process-startup speed requirement. Empty files may still be being written.
+pub fn wait_for_fixture_file(path: &Path) -> Vec<u8> {
+    let started = Instant::now();
+    loop {
+        match fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() => return bytes,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot read fixture handshake {}: {error}", path.display()),
+        }
+        assert!(
+            started.elapsed() < crate::support::HANDSHAKE_TIMEOUT,
+            "fixture handshake {} did not arrive within {:?}",
+            path.display(),
+            crate::support::HANDSHAKE_TIMEOUT,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub fn refresh_cursor_facts(home: &Path) -> AgentFacts {
     let _guard = shell_fixture_lock();
     let host_root = home.join("host-state");

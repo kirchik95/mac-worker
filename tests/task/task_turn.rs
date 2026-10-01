@@ -407,6 +407,19 @@ fn prepared_task_turn_at(
     mac_worker::turn::TaskTurnRequest,
     TaskCancelRequest,
 ) {
+    prepared_task_turn_at_with_lease_clock(host, script, spec, wall_clock_millis)
+}
+
+fn prepared_task_turn_at_with_lease_clock(
+    host: &Path,
+    script: &str,
+    spec: PreparedTaskTurnSpec,
+    lease_clock: impl FnOnce() -> u64,
+) -> (
+    HostStore,
+    mac_worker::turn::TaskTurnRequest,
+    TaskCancelRequest,
+) {
     let PreparedTaskTurnSpec {
         setup,
         task_source,
@@ -507,7 +520,7 @@ fn prepared_task_turn_at(
                 memory_pressure: MemoryPressure::Normal,
                 swap_used_bytes: Some(0),
             },
-            wall_clock_millis(),
+            lease_clock(),
         )
         .unwrap();
 
@@ -3308,31 +3321,93 @@ fn setup_and_agent_share_one_total_turn_budget() {
     if support::agent_launch_fixture::skip_unless_subtest() {
         return;
     }
-    let script = "printf started > agent.started; sleep 4.5; printf done > agent.ran";
-    let (_temp, store, request, _cancel) = prepared_task_turn_with_setup(
+    // Leave a 30 s startup hang guard in an already-aged 120 s lease. The
+    // injected acquisition clock avoids spending 90 real seconds, while a
+    // fresh 120 s budget for setup or the agent cannot fit the 60 s hang guard.
+    const TOTAL_BUDGET_MILLIS: u64 = 120_000;
+    const ELAPSED_BUDGET_MILLIS: u64 = 90_000;
+    const TURN_HANG_GUARD: Duration = Duration::from_secs(60);
+    let script = concat!(
+        "test -f setup.done || exit 1; ",
+        "printf '%s' \"$MAC_WORKER_LEASE_DEADLINE_MILLIS\" > agent.deadline; ",
+        "printf started > agent.started; ",
+        "while [ ! -f agent.release ]; do /bin/sleep 0.05; done; ",
+        "printf done > agent.ran",
+    );
+    let temp = tempdir().unwrap();
+    let (store, request, _cancel) = prepared_task_turn_at_with_lease_clock(
+        &temp.path().join("host"),
         script,
-        5_000,
-        Some(
-            r#"
+        PreparedTaskTurnSpec {
+            setup: Some(
+                r#"
 version = 1
 [setup]
-timeout = "5s"
-commands = ["PATH=/bin:/usr/bin /bin/sleep 1; printf done > setup.done"]
-"#,
-        ),
+timeout = "120s"
+commands = ["printf started > setup.started; while [ ! -f setup.release ]; do /bin/sleep 0.05; done; printf done > setup.done"]
+"#
+                .into(),
+            ),
+            task_source: TaskSource::Local {
+                wip: false,
+                push_target: None,
+            },
+            publish: vec![PublishMode::Fetch],
+            publish_branch: None,
+            origin_url: None,
+            timeout_millis: TOTAL_BUDGET_MILLIS,
+            close_policy: ClosePolicy::Never,
+        },
+        || wall_clock_millis().checked_sub(ELAPSED_BUDGET_MILLIS).unwrap(),
     );
     let workspace = store.task_workspace(PROJECT_ID, task_id()).unwrap();
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let job_id = JobId::new(Uuid::from_u128(3));
+    let lease = LeaseService::new(&store)
+        .load_for_job(job_id)
+        .unwrap()
+        .expect("fixture lease");
     let started = Instant::now();
-    let started_at = SystemTime::now();
+    let started_at = UNIX_EPOCH + Duration::from_millis(lease.created_at_millis());
     let launcher = BudgetTurnLauncher {
         store: store.clone(),
     };
-    let result = JobService::new(&store, &launcher).submit_turn(request);
-    let elapsed = started.elapsed();
-    let job_path = store
-        .job(PROJECT_ID, WORKTREE_ID, JobId::new(Uuid::from_u128(3)))
-        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let result = thread::scope(|scope| {
+        let submit = scope.spawn(|| {
+            let result = JobService::new(&store, &launcher).submit_turn(request);
+            let _ = done_tx.send(());
+            result
+        });
+        // Release parked children before scope joins if any handshake fails.
+        let _release_on_panic = support::on_drop(|| {
+            if thread::panicking() {
+                let _ = fs::write(workspace.join("setup.release"), b"release");
+                let _ = fs::write(workspace.join("agent.release"), b"release");
+            }
+        });
+        assert_eq!(
+            support::agent_launch_fixture::wait_for_fixture_file(&workspace.join("setup.started")),
+            b"started",
+        );
+        assert!(
+            !workspace.join("agent.started").exists(),
+            "agent must not start while setup is waiting for release"
+        );
+        fs::write(workspace.join("setup.release"), b"release").unwrap();
+        assert_eq!(
+            support::agent_launch_fixture::wait_for_fixture_file(&workspace.join("agent.started")),
+            b"started",
+        );
+        done_rx
+            .recv_timeout(TURN_HANG_GUARD)
+            .expect("turn must exhaust its remaining lease budget, not grant a fresh total budget");
+        submit
+            .join()
+            .expect("budget turn submission thread panicked")
+    });
+    let elapsed = SystemTime::now().duration_since(started_at).unwrap();
+    let job_path = store.job(PROJECT_ID, WORKTREE_ID, job_id).unwrap();
     let job_status: JobStatus =
         serde_json::from_slice(&fs::read(job_path.join("status.json")).unwrap()).unwrap();
     assert_eq!(job_status.state(), JobState::TimedOut);
@@ -3347,6 +3422,19 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 1; printf done > setup.done"]
         workspace.join("agent.started").exists(),
         "agent must start after setup and share the remaining budget"
     );
+    assert_eq!(
+        fs::read_to_string(workspace.join("agent.deadline")).unwrap(),
+        lease.expires_at_millis().to_string(),
+        "agent must retain the original absolute lease deadline",
+    );
+    let child = job_status.child_identity().expect("recorded turn child");
+    assert!(
+        matches!(
+            SystemProcessInspector.observe(child),
+            ProcessObservation::Absent | ProcessObservation::Reused
+        ),
+        "agent must be interrupted and reaped at the execution deadline",
+    );
     let setup_at = fs::metadata(workspace.join("setup.done"))
         .unwrap()
         .modified()
@@ -3356,7 +3444,7 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 1; printf done > setup.done"]
         .modified()
         .unwrap();
     assert!(agent_at >= setup_at, "agent started before setup completed");
-    let execution_deadline = Duration::from_millis(5_000);
+    let execution_deadline = Duration::from_millis(TOTAL_BUDGET_MILLIS);
     let setup_age = setup_at
         .duration_since(started_at)
         .unwrap_or(Duration::ZERO);
@@ -3373,15 +3461,16 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 1; printf done > setup.done"]
     );
     assert!(
         !workspace.join("agent.ran").exists(),
-        "agent must be interrupted at the execution deadline, not after setup+agent=5.5s"
+        "agent must be interrupted at the original execution deadline"
     );
     assert!(
         elapsed >= execution_deadline,
         "turn ended before its total budget"
     );
     assert!(
-        elapsed < (execution_deadline + Duration::from_millis(250) + Duration::from_secs(3)) * 3,
-        "turn waited {elapsed:?}, expected execution deadline plus cleanup grace"
+        started.elapsed() < TURN_HANG_GUARD,
+        "turn waited {:?}, expected the remaining lease budget plus cleanup within the hang guard",
+        started.elapsed(),
     );
     assert_setup_receipt(&home);
 }
