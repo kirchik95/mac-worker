@@ -1583,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    // Supersedes the SSH/Git/forward assertions in the original mixed direct_ssh_argv_matches_the_historical_option_list; rsync assertions stay in legacy_rsync_shell_preserves_direct_and_managed_worker_options.
+    // Supersedes the SSH/Git/forward assertions in the original mixed direct_ssh_argv_matches_the_historical_option_list; rsync-only assertions are retired with the batch tests.
     fn direct_ssh_argv_matches_the_historical_option_list() {
         with_ssh_settings(SshSettings::direct(), || {
             let exec =
@@ -1703,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    // Supersedes the SSH/Git/origin assertions in the original mixed managed_config_is_used_by_every_worker_builder_and_never_by_origin; rsync assertions are split unchanged.
+    // Supersedes the SSH/Git/origin assertions in the original mixed managed_config_is_used_by_every_worker_builder_and_never_by_origin; rsync-only assertions are retired with the batch tests.
     fn managed_config_is_used_by_every_worker_builder_and_never_by_origin() {
         let path = "/tmp/controller owner's/.ssh/mac-worker-controller.conf";
         with_ssh_settings(
@@ -1754,84 +1754,6 @@ mod tests {
                 )
                 .unwrap();
                 assert!(!origin.args.iter().any(|arg| arg == "-F"));
-            },
-        );
-    }
-
-    #[test]
-    fn managed_rsync_config_path_reaches_the_child_as_one_literal_argument() {
-        if !Path::new("/usr/bin/rsync").is_file() {
-            eprintln!("skipping rsync argv capture: /usr/bin/rsync is missing");
-            return;
-        }
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
-        let fake = temp.path().join("fake-transport");
-        fs::write(
-            &fake,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nexit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        let source = temp.path().join("source");
-        fs::write(&source, b"offline fixture\n").unwrap();
-        let config_file = "/tmp/controller owner's/\"managed config\".conf";
-        with_ssh_settings(
-            SshSettings {
-                config_file: Some(config_file.into()),
-                ..SshSettings::direct()
-            },
-            || {
-                // Replace only the executable, so even a parser failure can never
-                // fall through to a real SSH invocation or host connection.
-                let shell = rsync_ssh_shell(SshTarget::Worker)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .replacen("/usr/bin/ssh", fake.to_str().unwrap(), 1);
-                let output = std::process::Command::new("/usr/bin/rsync")
-                    .env_clear()
-                    .env("PATH", "/usr/bin:/bin")
-                    .arg("-e")
-                    .arg(shell)
-                    .arg(&source)
-                    .arg("offline-worker:incoming")
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .unwrap();
-                let captured = fs::read_to_string(fake.with_extension("args")).unwrap_or_default();
-                let args: Vec<_> = captured.lines().collect();
-                assert!(
-                    args.windows(2).any(|pair| pair == ["-F", config_file]),
-                    "rsync child argv: {args:?}; stderr: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            },
-        );
-    }
-
-    #[test]
-    // Preserves the rsync-only assertions split from direct_ssh_argv_matches_the_historical_option_list and managed_config_is_used_by_every_worker_builder_and_never_by_origin.
-    fn legacy_rsync_shell_preserves_direct_and_managed_worker_options() {
-        with_ssh_settings(SshSettings::direct(), || {
-            assert_eq!(
-                rsync_ssh_shell(SshTarget::Worker).unwrap(),
-                OsString::from(
-                    "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
-                )
-            );
-        });
-        with_ssh_settings(
-            SshSettings {
-                config_file: Some("/tmp/controller owner's/.ssh/mac-worker-controller.conf".into()),
-                ..SshSettings::direct()
-            },
-            || {
-                assert_eq!(
-                    rsync_ssh_shell(SshTarget::Worker).unwrap(),
-                    OsString::from(
-                        "/usr/bin/ssh -F '/tmp/controller owner'\"'\"'s/.ssh/mac-worker-controller.conf' -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes --"
-                    )
-                );
             },
         );
     }
