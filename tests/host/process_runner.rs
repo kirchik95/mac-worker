@@ -506,7 +506,7 @@ mod termination {
 
     fn accept_fixture_gate(listener: &UnixListener) -> UnixStream {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::support::HANDSHAKE_TIMEOUT;
         loop {
             match listener.accept() {
                 // BSD sockets inherit O_NONBLOCK from the listener; the read
@@ -676,22 +676,47 @@ mod termination {
     #[test]
     fn cancellation_abandons_escaped_pipes_and_a_blocked_stdin_writer() {
         let fixture = Fixture::new();
+        let listener = UnixListener::bind(fixture.0.path().join("escape.sock")).unwrap();
         let mut request = fixture.request("cancel");
         request.stdin = Some(vec![b'x'; 16 * 1024 * 1024]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let runner = thread::spawn(move || {
+            let result =
+                SystemProcessRunner.run_interruptible(&request, &|| flag.load(Ordering::SeqCst));
+            let _ = sender.send(result);
+        });
+        let mut gate = accept_fixture_gate(&listener);
+        gate.set_read_timeout(Some(crate::support::HANDSHAKE_TIMEOUT))
+            .unwrap();
+        let mut bytes = Vec::new();
+        gate.read_to_end(&mut bytes).unwrap();
+        let escaped = FixtureProcess(serde_json::from_slice(&bytes).unwrap());
+        // The socket handshake proves setsid completed, and keeps every pipe
+        // open without racing a final exec or waiting for a 60 s sleep. No
+        // fixture reads stdin, so the 16 MiB upload cannot finish either.
+        // Startup/assessment is outside the cancellation latency assertion.
         let started = Instant::now();
-        let error = SystemProcessRunner
-            .run_interruptible(&request, &|| {
-                fixture.0.path().join("escaped.ready").exists()
-            })
+        cancel.store(true, Ordering::SeqCst);
+        let error = receiver
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .expect("runner cancellation hang guard after confirmed escape")
             .unwrap_err();
+        runner.join().unwrap();
         assert!(matches!(
             error,
             WorkerError::Process(ProcessError::Cancelled)
         ));
-        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "cancellation cleanup waited {:?} with escaped pipes and blocked stdin",
+            started.elapsed()
+        );
         fixture.assert_original_group_gone();
+        assert_eq!(fixture.identity("escaped.pid"), escaped.0);
         assert!(matches!(
-            SystemProcessInspector.observe(fixture.identity("escaped.pid")),
+            SystemProcessInspector.observe(escaped.0),
             ProcessObservation::Matching { .. }
         ));
     }
