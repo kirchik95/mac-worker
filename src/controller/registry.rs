@@ -269,7 +269,7 @@ pub struct TaskRequestBind {
 
 /// Remap logical IDs only after a validated registry hit whose checkout
 /// actually contains `project`. Ordinary callers keep `load_for_task`.
-pub fn load_registered_or_local(
+pub(crate) fn load_registered_or_local(
     runner: &dyn ProcessRunner,
     paths: &PathLayout,
     project: &Path,
@@ -287,7 +287,7 @@ pub fn load_registered_or_local(
 
 /// Validated controller-DAG mapping: logical laptop worktree IDs to a
 /// trusted registered checkout. Ordinary local DAG callers see `None`.
-pub fn mapped_controller_checkout(
+pub(crate) fn mapped_controller_checkout(
     paths: &PathLayout,
     project_id: &str,
     worktree_id: &str,
@@ -300,7 +300,7 @@ pub fn mapped_controller_checkout(
 
 /// Registered controller contexts open `controller-transfer/<logical>.git`.
 /// Ordinary unregistered local still uses `transfer/<physicalhash>`.
-pub fn open_transfer_repo(
+pub(crate) fn open_transfer_repo(
     paths: &PathLayout,
     project: &ProjectState,
     meta: &TaskMeta,
@@ -353,7 +353,7 @@ fn is_registered_checkout(project: &Path, checkout: &Path) -> bool {
     project == checkout || project.starts_with(&checkout)
 }
 
-pub fn checkout_path(
+pub(super) fn checkout_path(
     project_root: &Path,
     project_id: &str,
     worktree_id: &str,
@@ -363,7 +363,7 @@ pub fn checkout_path(
     Ok(project_root.join(project_id).join(worktree_id))
 }
 
-pub fn ensure_checkout_dir(path: &Path) -> Result<(), WorkerError> {
+pub(super) fn ensure_checkout_dir(path: &Path) -> Result<(), WorkerError> {
     fs::create_dir_all(path).map_err(WorkerError::Io)?;
     Ok(())
 }

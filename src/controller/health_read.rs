@@ -154,7 +154,7 @@ pub fn assess_health(
     status
 }
 
-pub fn read_health_status(path: &Path) -> Result<ControllerHealthStatus, WorkerError> {
+pub(crate) fn read_health_status(path: &Path) -> Result<ControllerHealthStatus, WorkerError> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -288,6 +288,7 @@ fn valid_health_request(request: &ControllerRequest) -> bool {
             && request.body() == &serde_json::json!({"controller_health": true}))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec<u8>, WorkerError> {
     if !valid_health_request(request) {
         return Err(WorkerError::Protocol(
@@ -310,7 +311,7 @@ pub fn serve_health_read(request: &ControllerRequest, path: &Path) -> Result<Vec
     super::encode_json_frame(&ControllerReadReply::from_request(request, status))
 }
 
-pub fn serve_health_read_with_paths(
+pub(super) fn serve_health_read_with_paths(
     request: &ControllerRequest,
     paths: &crate::paths::PathLayout,
     home: &Path,

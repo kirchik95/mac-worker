@@ -93,6 +93,7 @@ pub(crate) fn initialize(root: &RootedDir) -> Result<(), WorkerError> {
 
 /// Persist the valve under the same lock used for runner admission. This
 /// does not stop a running turn or prevent durable request publication.
+#[cfg(any(test, feature = "test-support"))]
 pub fn set_drained(state_root: &Path, drained: bool) -> Result<(), WorkerError> {
     set_drained_with_event_sink(state_root, drained, None)
 }

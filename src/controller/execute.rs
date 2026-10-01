@@ -565,6 +565,7 @@ impl crate::controller::events::EventRuntime for RpcEventRuntime {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn serve_rpc_with_runtime(
     paths: &PathLayout,
     config: &Config,
@@ -691,7 +692,7 @@ pub fn serve_rpc_with_execution(
 }
 
 #[cfg(test)]
-pub fn send_controller_request(
+fn send_controller_request(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,
     request: &ControllerRequest,

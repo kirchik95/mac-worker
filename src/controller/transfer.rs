@@ -39,6 +39,7 @@ const SOURCE_COMMAND: &str = "controller.transfer.source";
 const RESULT_COMMAND: &str = "controller.transfer.result";
 const RECORD_LIMIT: u64 = 16 * 1024;
 
+#[cfg(any(test, feature = "test-support"))]
 pub const CONTROLLER_TRANSFER_CACHE_DOMAIN: &[u8] = TransferRepo::CONTROLLER_TRANSFER_CACHE_DOMAIN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +214,7 @@ pub fn controller_transfer_cache_id(
     TransferRepo::controller_transfer_cache_id(project_id, worktree_id)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn controller_transfer_git_path(
     cache_root: &Path,
     project_id: &str,

@@ -17,9 +17,9 @@ use crate::{
     task_client::{TaskClient, TaskReport, task_error},
 };
 
-pub const COMMAND_SAY: &str = "task.say";
-pub const COMMAND_CANCEL: &str = "task.cancel";
-pub const COMMAND_CLOSE: &str = "task.close";
+const COMMAND_SAY: &str = "task.say";
+const COMMAND_CANCEL: &str = "task.cancel";
+const COMMAND_CLOSE: &str = "task.close";
 
 /// Frozen mutation identity. Persist this before any task/queue/runner write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +62,7 @@ struct CloseBody {
 }
 
 impl PreparedTaskMutation {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn command(&self) -> &'static str {
         match self {
             Self::Say { .. } => COMMAND_SAY,
@@ -102,6 +103,7 @@ impl PreparedTaskMutation {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn discard(&self) -> Option<bool> {
         match self {
             Self::Close { discard, .. } => Some(*discard),
@@ -112,7 +114,7 @@ impl PreparedTaskMutation {
 
 /// Typed body parse only. Validates the mutation body and returns the
 /// targeted task id without loading or freezing expected state.
-pub fn mutation_task_id(request: &ControllerRequest) -> Result<TaskId, WorkerError> {
+pub(super) fn mutation_task_id(request: &ControllerRequest) -> Result<TaskId, WorkerError> {
     match request.command() {
         COMMAND_SAY => Ok(parse_body::<SayBody>(request.body(), COMMAND_SAY)?.task_id),
         COMMAND_CANCEL => Ok(parse_body::<CancelBody>(request.body(), COMMAND_CANCEL)?.task_id),

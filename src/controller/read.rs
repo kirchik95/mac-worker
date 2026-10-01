@@ -32,14 +32,17 @@ pub struct ControllerReadReply<T> {
 }
 
 impl<T> ControllerReadReply<T> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn command(&self) -> &str {
         &self.command
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -263,6 +266,7 @@ impl ControllerTaskLogsResult {
         self.task_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn offset(&self) -> u64 {
         self.offset
     }

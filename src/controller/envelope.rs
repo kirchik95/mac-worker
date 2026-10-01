@@ -18,7 +18,7 @@ use crate::{
 const OPERATIONS_LOCK: &str = "operations.lock";
 const ADOPTION_MARKER: &str = "operations-adopted-v1.json";
 const MAX_ENVELOPE_BYTES: u64 = crate::controller::protocol::MAX_STORED_REQUEST_BYTES as u64;
-pub const ENVELOPE_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+const ENVELOPE_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_SCAN_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +85,7 @@ impl OperationEnvelope {
         &self.request_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn payload_sha256(&self) -> &str {
         &self.payload_sha256
     }
@@ -101,10 +102,12 @@ impl OperationEnvelope {
         self.created_at_millis
     }
 
-    pub fn settled_at_millis(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(super) fn settled_at_millis(&self) -> Option<u64> {
         self.settled_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn outcome(&self) -> Option<&OperationOutcome> {
         self.outcome.as_ref()
     }
@@ -163,7 +166,7 @@ pub fn persist_operation_envelope(
 }
 
 /// Publish settlement without changing the frozen payload or creation time.
-pub fn settle_operation_envelope(
+pub(crate) fn settle_operation_envelope(
     cache_root: &Path,
     request: &ControllerRequest,
     outcome: OperationOutcome,

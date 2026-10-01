@@ -17,7 +17,7 @@ use crate::{
     rooted_fs::{PrivateEntryIdentity, RootedDir},
 };
 
-pub const LABEL: &str = "com.mac-worker.controller";
+pub(super) const LABEL: &str = "com.mac-worker.controller";
 const PLIST_NAME: &str = "com.mac-worker.controller.plist";
 const LOG_NAME: &str = "controller.log";
 const MAX_PLIST_BYTES: u64 = 64 * 1024;
@@ -645,7 +645,7 @@ fn parse_observation(bytes: &[u8], target: &str) -> LaunchdObservation {
 
 /// Init and setup use the same bounded proof. launchctl registration alone is
 /// never readiness; all observations must identify the newly supervised build.
-pub fn verify_restart(
+pub(super) fn verify_restart(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,
     restarted: ServiceStatus,
@@ -751,7 +751,7 @@ pub fn verify_restart(
     )))
 }
 
-pub fn fetch_status(
+pub(crate) fn fetch_status(
     runner: &dyn ProcessRunner,
     controller: &crate::config::ControllerConfig,
 ) -> Result<ServiceStatus, WorkerError> {

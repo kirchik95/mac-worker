@@ -25,7 +25,7 @@ use crate::{
     task::{BaseOid, TaskId, TaskState, TurnId},
 };
 
-pub fn is_transfer_command(command: &str) -> bool {
+pub(super) fn is_transfer_command(command: &str) -> bool {
     matches!(
         command,
         "controller.transfer.source.prepare"
@@ -34,7 +34,7 @@ pub fn is_transfer_command(command: &str) -> bool {
     )
 }
 
-pub fn serve_transfer_command(
+pub(super) fn serve_transfer_command(
     request: &ControllerRequest,
     paths: &PathLayout,
     runner: &dyn ProcessRunner,

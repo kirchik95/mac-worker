@@ -493,7 +493,7 @@ fn trusted_keys(
     )
 }
 
-pub fn configure_host(
+pub(crate) fn configure_host(
     home: &Path,
     config_path: &Path,
     request: &ControllerConfigureRequest,

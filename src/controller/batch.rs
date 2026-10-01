@@ -91,9 +91,11 @@ impl PreparedBatchSource {
     pub fn expected_oid(&self) -> &BaseOid {
         &self.expected_oid
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn cache_id(&self) -> &str {
         &self.cache_id
     }
@@ -117,6 +119,7 @@ pub struct PreparedTaskBatch {
 }
 
 impl PreparedTaskBatch {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn command(&self) -> &'static str {
         COMMAND
     }
@@ -132,9 +135,11 @@ impl PreparedTaskBatch {
     pub fn created_at_millis(&self) -> u64 {
         self.created_at_millis
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn requested_max_parallel(&self) -> Option<u32> {
         self.requested_max_parallel
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn max_parallel(&self) -> u32 {
         self.max_parallel
     }

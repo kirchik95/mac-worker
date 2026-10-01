@@ -2,23 +2,41 @@
 
 pub use super::{channel, events};
 
-pub use crate::controller::{
-    ActiveResumeConfig, BatchExecuteContext, BatchKind, CONTROLLER_TRANSFER_CACHE_DOMAIN,
-    ControllerCheckoutMap, ControllerCommandHandler, ControllerFault, ControllerLeader,
-    ControllerReadIdentity, ControllerReadReply, ControllerRequest, ControllerResultIdentity,
-    ControllerStore, ControllerTaskLogsResult, ControllerTaskStatusResult, ControllerTransfer,
-    ControllerWaitSelector, DurableRequest, FakeControllerExecutor, FrozenBatchBody,
-    FrozenBatchSource, LaptopFrozenBatch, MAX_FRAME_BYTES, OperationEnvelope, OperationMeta,
-    OperationOutcome, OwnedCheckoutMap, PreparedTaskBatch, PreparedTaskMutation, ProjectRegistry,
-    RequestPhase, TaskSubmitHandler, VerifiedResultMeta, canonical_request_sha256,
-    controller_dashboard_ssh_request, controller_rpc_ssh_request, controller_transfer_cache_id,
-    controller_transfer_git_path, decode_frame, decode_request, default_prepare_operation,
-    encode_frame, encode_json_frame, execute_task_batch, execute_task_mutation,
-    freeze_laptop_batch, frozen_result_ref, import_controller_result, is_read_command,
-    load_operation_envelope, parse_request, persist_operation_envelope, prepare_task_batch,
-    prepare_task_mutation, result_digest, serve_rpc, serve_rpc_with_runtime, source_digest,
-    tick_controller_leader, wait_via_controller,
+pub use crate::controller::batch::{
+    BatchExecuteContext, BatchKind, ControllerCheckoutMap, FrozenBatchBody, FrozenBatchSource,
+    PreparedTaskBatch, execute_task_batch, prepare_task_batch,
 };
+pub use crate::controller::batch_freeze::{LaptopFrozenBatch, freeze_laptop_batch};
+pub use crate::controller::envelope::{
+    OperationEnvelope, OperationOutcome, load_operation_envelope, persist_operation_envelope,
+};
+pub use crate::controller::execute::{
+    TaskSubmitHandler, serve_rpc_with_runtime, tick_controller_leader,
+};
+pub use crate::controller::leader::ControllerLeader;
+pub use crate::controller::lifecycle::{ControllerWaitSelector, wait_via_controller};
+pub use crate::controller::protocol::{
+    ControllerRequest, MAX_FRAME_BYTES, canonical_request_sha256, decode_frame, decode_request,
+    encode_frame, encode_json_frame, parse_request,
+};
+pub use crate::controller::read::{
+    ControllerReadIdentity, ControllerReadReply, ControllerTaskLogsResult,
+    ControllerTaskStatusResult, is_read_command,
+};
+pub use crate::controller::registry::{OwnedCheckoutMap, ProjectRegistry};
+pub use crate::controller::store::{
+    ActiveResumeConfig, ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
+    FakeControllerExecutor, OperationMeta, RequestPhase, default_prepare_operation, serve_rpc,
+};
+pub use crate::controller::task_mutations::{
+    PreparedTaskMutation, execute_task_mutation, prepare_task_mutation,
+};
+pub use crate::controller::transfer::{
+    CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerResultIdentity, ControllerTransfer,
+    VerifiedResultMeta, controller_transfer_cache_id, controller_transfer_git_path,
+    frozen_result_ref, import_controller_result, result_digest, source_digest,
+};
+pub use crate::controller::{controller_dashboard_ssh_request, controller_rpc_ssh_request};
 pub mod batch {
     pub use crate::controller::batch::{BatchKind, FrozenBatchBody};
 }

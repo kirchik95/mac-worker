@@ -61,23 +61,30 @@ const LOCK_SUFFIX: &str = ".lock";
 pub enum ControllerFault {
     None,
     /// Durable published row exists; fake ACK has not started.
+    #[cfg(any(test, feature = "test-support"))]
     StopAfterPublish,
     /// Executor ran; the result was NOT persisted. Resume must re-execute the
     /// same prepared operation/identity.
+    #[cfg(any(test, feature = "test-support"))]
     StopAfterExecuteBeforeResult,
     /// Result is durable; ACK has not started. Resume must reuse the saved
     /// result without re-executing.
+    #[cfg(any(test, feature = "test-support"))]
     StopAfterResultBeforeAck,
     /// Pending receipt exists; the request row was NOT published. The next
     /// `handle` for the same request heals; bootstrap keeps the orphan.
+    #[cfg(any(test, feature = "test-support"))]
     StopAfterActiveReceiptBeforePublish,
     /// Replacement staging is complete; the live name still holds the full
     /// published record. Process loss must resume from that record.
+    #[cfg(any(test, feature = "test-support"))]
     CrashBeforeAckExchange,
     /// Live name already holds the ACK record; directory sync has not finished.
+    #[cfg(any(test, feature = "test-support"))]
     CrashAfterAckExchangeBeforeSync,
     /// ACK is durable; the pending receipt was NOT retired. The next tick
     /// retires it idempotently without re-executing.
+    #[cfg(any(test, feature = "test-support"))]
     CrashAfterAckBeforeRetire,
 }
 
@@ -339,10 +346,12 @@ impl DurableRequest {
         self.created_at_millis
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn phase(&self) -> RequestPhase {
         self.phase
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn result(&self) -> Option<&Value> {
         self.result.as_ref()
     }
@@ -377,6 +386,7 @@ impl ControllerAck {
         self.turn_id.as_deref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn created_at_millis(&self) -> u64 {
         self.created_at_millis
     }
@@ -430,6 +440,7 @@ impl ControllerStore {
 
     /// Legacy row count (scans history). Kept for tests/compat; the leader
     /// tick path must use `resume_active_bounded`, never this.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn request_count(&self) -> Result<usize, WorkerError> {
         Ok(self.request_names()?.len())
     }
@@ -521,12 +532,14 @@ impl ControllerStore {
             // Discoverability BEFORE publication: a crash from here on leaves a
             // pending receipt that bootstrap keeps and the next `handle` heals.
             self.ensure_pending_receipt(request)?;
+            #[cfg(any(test, feature = "test-support"))]
             if fault == ControllerFault::StopAfterActiveReceiptBeforePublish {
                 return Err(store_io(injected_fault()));
             }
             // Stable identity/time frozen BEFORE any executor effect.
             let meta = executor.prepare(request)?;
             let record = self.publish_with(request, &meta)?;
+            #[cfg(any(test, feature = "test-support"))]
             if fault == ControllerFault::StopAfterPublish {
                 return Ok(ack_from(&record));
             }
@@ -775,10 +788,12 @@ impl ControllerStore {
     /// path must use `resume_active_bounded`. No global lock is held across
     /// executor work here either: each row advances under its own
     /// per-request lock.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resume_incomplete(&self) -> Result<Vec<ControllerAck>, WorkerError> {
         self.resume_incomplete_with(&FakeControllerExecutor)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resume_incomplete_with(
         &self,
         executor: &dyn ControllerCommandHandler,
@@ -850,6 +865,7 @@ impl ControllerStore {
                 }
                 Err(error) => return Err(error),
             };
+            #[cfg(any(test, feature = "test-support"))]
             if fault == ControllerFault::StopAfterExecuteBeforeResult {
                 return Ok(ack_from(&current));
             }
@@ -878,6 +894,7 @@ impl ControllerStore {
                 Err(error) => return Err(op_io("cas-result", &name, error)),
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
         if fault == ControllerFault::StopAfterResultBeforeAck {
             return Ok(ack_from(&current));
         }
@@ -896,8 +913,16 @@ impl ControllerStore {
                 &name,
                 &expected,
                 &next,
-                || fault_before_exchange(fault),
-                || fault_after_exchange(fault),
+                || {
+                    #[cfg(any(test, feature = "test-support"))]
+                    fault_before_exchange(fault)?;
+                    Ok(())
+                },
+                || {
+                    #[cfg(any(test, feature = "test-support"))]
+                    fault_after_exchange(fault)?;
+                    Ok(())
+                },
                 || Ok(()),
             ) {
                 Ok(()) => current = acked,
@@ -915,8 +940,9 @@ impl ControllerStore {
         settled(&current)
     }
 
-    fn retire_receipt(&self, request_id: &str, fault: ControllerFault) -> Result<(), WorkerError> {
-        if fault == ControllerFault::CrashAfterAckBeforeRetire {
+    fn retire_receipt(&self, request_id: &str, _fault: ControllerFault) -> Result<(), WorkerError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if _fault == ControllerFault::CrashAfterAckBeforeRetire {
             return Err(store_io(injected_fault()));
         }
         let name = active_file_name(request_id)?;
@@ -1260,6 +1286,7 @@ fn request_file_name(request_id: &str) -> Result<String, WorkerError> {
     Ok(format!("req-{request_id}.json"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn request_id_from_name(name: &str) -> Option<String> {
     let id = name.strip_prefix("req-")?.strip_suffix(".json")?;
     validate_request_id(id).ok()?;
@@ -1519,6 +1546,7 @@ fn invalid_stored(message: &str) -> WorkerError {
     WorkerError::Protocol(format!("CONTROLLER_TRANSPORT: {message}"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn fault_before_exchange(fault: ControllerFault) -> io::Result<()> {
     if fault == ControllerFault::CrashBeforeAckExchange {
         Err(injected_fault())
@@ -1527,6 +1555,7 @@ fn fault_before_exchange(fault: ControllerFault) -> io::Result<()> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn fault_after_exchange(fault: ControllerFault) -> io::Result<()> {
     if fault == ControllerFault::CrashAfterAckExchangeBeforeSync {
         Err(injected_fault())
@@ -1535,10 +1564,12 @@ fn fault_after_exchange(fault: ControllerFault) -> io::Result<()> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn injected_fault() -> io::Error {
     io::Error::other("injected controller replacement fault")
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn serve_rpc(
     state_root: &Path,
     stdin: &mut dyn io::Read,

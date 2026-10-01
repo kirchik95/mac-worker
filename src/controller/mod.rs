@@ -47,9 +47,11 @@ pub use envelope::{
     OperationEnvelope, OperationOutcome, PendingEnvelopes, list_pending_envelopes,
     load_operation_envelope, persist_operation_envelope,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use execute::serve_rpc_with_runtime;
 pub use execute::{
     RpcExecution, TaskSubmitHandler, send_controller_mutation, send_controller_read,
-    serve_rpc_with_execution, serve_rpc_with_runtime, tick_controller_leader,
+    serve_rpc_with_execution, tick_controller_leader,
 };
 pub use leader::ControllerLeader;
 pub use lifecycle::{
@@ -65,17 +67,20 @@ pub use read::{
 };
 pub use registry::{OwnedCheckoutMap, ProjectRegistry};
 pub use store::default_prepare_operation;
+#[cfg(any(test, feature = "test-support"))]
+pub use store::serve_rpc;
 pub use store::{
     ActiveBootstrapReport, ActiveResumeConfig, ActiveResumeReport, ControllerAck,
     ControllerCommandHandler, ControllerFault, ControllerStore, DurableRequest,
-    FakeControllerExecutor, OperationMeta, RequestPhase, serve_rpc,
+    FakeControllerExecutor, OperationMeta, RequestPhase,
 };
 pub use stream_client::{fetch_via_controller, stream_nested_source, stream_source_receive};
 pub use task_mutations::{PreparedTaskMutation, execute_task_mutation, prepare_task_mutation};
+#[cfg(any(test, feature = "test-support"))]
+pub use transfer::{CONTROLLER_TRANSFER_CACHE_DOMAIN, controller_transfer_git_path};
 pub use transfer::{
-    CONTROLLER_TRANSFER_CACHE_DOMAIN, ControllerResultIdentity, ControllerTransfer,
-    SourceSubmitBind, VerifiedResultMeta, controller_transfer_cache_id,
-    controller_transfer_git_path, frozen_result_ref, import_controller_result, result_digest,
+    ControllerResultIdentity, ControllerTransfer, SourceSubmitBind, VerifiedResultMeta,
+    controller_transfer_cache_id, frozen_result_ref, import_controller_result, result_digest,
     source_digest,
 };
 

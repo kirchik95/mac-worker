@@ -22,11 +22,11 @@ use super::{
 };
 
 const HEALTH_FILE: &str = "health.json";
-pub const MAX_HEALTH_BYTES: u64 = 16 * 1024;
+const MAX_HEALTH_BYTES: u64 = 16 * 1024;
 const MAX_FAILURE_CODES: usize = 32;
 const LOG_INTERVAL_MILLIS: u64 = 30_000;
-pub const TICK_INTERVAL_MILLIS: u64 = 2_000;
-pub const STALE_AFTER_MILLIS: u64 = 5 * TICK_INTERVAL_MILLIS;
+pub(super) const TICK_INTERVAL_MILLIS: u64 = 2_000;
+pub(super) const STALE_AFTER_MILLIS: u64 = 5 * TICK_INTERVAL_MILLIS;
 
 #[derive(Debug)]
 pub struct ControllerRequestTickReport {

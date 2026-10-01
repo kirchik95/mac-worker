@@ -199,7 +199,7 @@ pub fn reconcile_via_controller(
     ))
 }
 
-pub fn publish_retry_via_controller(
+pub(crate) fn publish_retry_via_controller(
     runner: &dyn ProcessRunner,
     controller: &ControllerConfig,
     task_id: TaskId,

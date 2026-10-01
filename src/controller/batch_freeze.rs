@@ -62,6 +62,7 @@ impl LaptopBatchSourceStream {
     pub fn expected_oid(&self) -> &crate::task::BaseOid {
         &self.expected_oid
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pin_ref(&self) -> &str {
         &self.pin_ref
     }

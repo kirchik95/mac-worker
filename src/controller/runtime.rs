@@ -131,6 +131,7 @@ pub fn run_tick_loop_with_shutdown(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn run_tick_loop(
     runtime: &tokio::runtime::Runtime,
     shutdown_flag: &AtomicBool,
@@ -204,7 +205,9 @@ impl ChannelStop {
 /// The task's shutdown is explicitly awaited before the runtime is unpolled.
 pub struct LeaderChannel {
     stop: Arc<ChannelStop>,
+    #[cfg(any(test, feature = "test-support"))]
     ready: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
     retired: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<LeaderChannelShutdown>,
 }
@@ -222,26 +225,34 @@ impl LeaderChannel {
             leader_shutdown: shutdown,
             changed: Notify::new(),
         });
+        #[cfg(any(test, feature = "test-support"))]
         let ready = Arc::new(AtomicBool::new(false));
+        #[cfg(any(test, feature = "test-support"))]
         let retired = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(drive_generation(
             config,
             leader,
             deps,
             stop.clone(),
+            #[cfg(any(test, feature = "test-support"))]
             ready.clone(),
+            #[cfg(any(test, feature = "test-support"))]
             retired.clone(),
         ));
         Self {
             stop,
+            #[cfg(any(test, feature = "test-support"))]
             ready,
+            #[cfg(any(test, feature = "test-support"))]
             retired,
             task,
         }
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire) && !self.stop.stopping()
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
@@ -429,10 +440,12 @@ async fn finish_generation(
     LeaderChannelShutdown { rpc, files }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct GenerationStatus {
     ready: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for GenerationStatus {
     fn drop(&mut self) {
         self.ready.store(false, Ordering::Release);
@@ -445,9 +458,10 @@ async fn drive_generation(
     leader: Arc<super::ControllerLeader>,
     deps: LeaderChannelDeps,
     stop: Arc<ChannelStop>,
-    ready: Arc<AtomicBool>,
-    retired: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))] ready: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))] retired: Arc<AtomicBool>,
 ) -> LeaderChannelShutdown {
+    #[cfg(any(test, feature = "test-support"))]
     let _status = GenerationStatus {
         ready: ready.clone(),
         retired,
@@ -545,6 +559,7 @@ async fn drive_generation(
             .await;
     };
     if published && service.ready() && !stop.stopping() {
+        #[cfg(any(test, feature = "test-support"))]
         ready.store(true, Ordering::Release);
         // Retirement (including eight uncertain supervisors) does not set the
         // leader's cancellation flag or replenish capacity for this generation.
@@ -555,6 +570,7 @@ async fn drive_generation(
             }
         }
     }
+    #[cfg(any(test, feature = "test-support"))]
     ready.store(false, Ordering::Release);
     finish_generation(
         Some(&service),
