@@ -82,7 +82,7 @@ impl ForwardControl for MasterForwardControl {
                     .as_encoded_bytes()
                     .len()
                     .saturating_add(17)
-                    >= 104
+                    >= SOCKET_PATH_BYTES
                 {
                     return Err(unavailable(ChannelReason::UnsafePath));
                 }
@@ -146,10 +146,7 @@ impl ForwardControl for MasterForwardControl {
             return Err(clean_failure(unavailable(ChannelReason::Timeout)));
         }
         let path = self.files.allocate(&self.paths).map_err(clean_failure)?;
-        let retained = |failure| ForwardOpenFailure {
-            failure,
-            disposition: ForwardDisposition::Retained,
-        };
+        let retained = ForwardOpenFailure::retained;
         validate_allocation(&path).map_err(retained)?;
         check_client(ctx).map_err(retained)?;
         if ctx.runtime.now() >= deadline {
@@ -187,9 +184,7 @@ impl ForwardControl for MasterForwardControl {
         // for refusal cleanup. Validation failure still needs positive proof.
         let socket = self.files.validate_socket(&path);
         let validation = socket
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(validate_socket_identity)
+            .and_then(|binding| validate_socket_identity(&binding))
             .and_then(|()| endpoint.verify())
             .and_then(|()| check_client(ctx));
         if let Err(failure) = validation {
@@ -295,7 +290,7 @@ impl ForwardLease for MasterForwardLease {
                 ForwardDisposition::Retained
             } else {
                 self.files
-                    .cleanup_if_refused(&self.path, Some(self.socket.clone()), ctx)
+                    .cleanup_if_refused(&self.path, Some(self.socket), ctx)
             }
         };
         self.disposition = Some(disposition);
@@ -360,15 +355,10 @@ impl ChannelRuntime for CleanupClock {
     }
 }
 fn cleanup_context() -> CleanupContext {
-    CleanupContext {
-        runtime: Arc::new(CleanupClock(Instant::now())),
-        deadline: SETUP_GUARD,
-    }
+    CleanupContext::new(Arc::new(CleanupClock(Instant::now())))
 }
 fn cleanup_remaining(ctx: &CleanupContext) -> Duration {
-    ctx.deadline
-        .saturating_sub(ctx.runtime.now())
-        .min(SETUP_GUARD)
+    ctx.remaining().min(SETUP_GUARD)
 }
 fn cancel_owned(
     raw: &dyn ProcessRunner,
@@ -394,14 +384,7 @@ fn unavailable(reason: ChannelReason) -> ChannelFailure {
 }
 
 fn check_client(ctx: &ClientContext<'_>) -> Result<(), ChannelFailure> {
-    let stopped = (ctx.should_stop)();
-    if stopped || ctx.runtime.cancelled() {
-        return Err(unavailable(ChannelReason::Cancelled));
-    }
-    if ctx.runtime.now() >= ctx.deadline {
-        return Err(unavailable(ChannelReason::Timeout));
-    }
-    Ok(())
+    ctx.check()
 }
 
 fn policy(remaining: Duration) -> ProcessPolicy {
@@ -424,7 +407,7 @@ fn safe_socket_path(path: &Path) -> bool {
     path.to_str().is_some_and(|text| {
         path.is_absolute()
             && !text.is_empty()
-            && text.len() < 104
+            && text.len() < SOCKET_PATH_BYTES
             && !text
                 .bytes()
                 .any(|byte| byte.is_ascii_control() || matches!(byte, b':' | b'%' | b'$'))
