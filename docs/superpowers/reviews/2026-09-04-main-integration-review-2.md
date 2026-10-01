@@ -1,5 +1,10 @@
 # Main integration review follow-up - 2026-09-04
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 ## Scope and outcome
 
 Reviewed the integrated `main` baseline across Phase 4, the Phase 5 host

@@ -1,5 +1,10 @@
 # Herdr reporter design: pool turns in the herdr sidebar
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 - Date: 2026-09-08 (revision 1, written after the live spike of the same evening; see section 18)
 - Status: approved for implementation on 2026-09-08 (decisions in section 18)
 - Repository: `mac-worker`

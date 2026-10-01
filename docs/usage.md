@@ -1,6 +1,6 @@
 # Using mac-worker
 
-Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, and remote commands. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
+Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, and the remote controller. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
 
 ## Agents
 
@@ -482,7 +482,7 @@ worker controller status
 
 `init` requires the controller helper's SHA-256 to match the running laptop CLI. Run `worker setup` for the whole inventory first: every worker needs the new helper operation that authorizes the controller key. Init resolves the inventory with laptop `ssh -G`, removes a first ProxyJump through the controller, and maps the controller's own worker to loopback. Controller matching requires the same account, hostname, port, and resolved ProxyJump chain. Equal endpoints behind different jump chains are ambiguous: init requires a named `--worker-ssh` override, and setup warns without restarting a service. Generated `mac-worker-controller-<sanitized>-<hash8>` SSH aliases preserve each resolved user and port; worker names stay unchanged. The label replaces unsafe bytes with `_`, keeps its first 32 bytes, and adds eight SHA-256 hex digits of the full name. Init refuses any remaining alias collision. Repeat `--worker-ssh NAME=DESTINATION` for explicit controller-reachable overrides. Remaining jump chains require a direct override; they are never copied silently from the laptop.
 
-The controller receives `~/.config/mac-worker/config.toml`, a dedicated `~/.ssh/mac-worker-controller_ed25519` key, managed SSH settings, and laptop-trusted host keys in per-worker `~/.ssh/<alias>.known_hosts` files (with a combined `mac-worker-controller_known_hosts` copy). Only public keys returned by laptop `ssh-keygen -F` are seeded; missing or revoked trust stops setup for that worker. Strict host-key checking stays enabled, including loopback; the verification name is pinned explicitly and each worker has its own trusted-key file. The controller helper records the absolute managed config path in `[ssh] config_file`. Every controller-to-worker SSH connection, including Git and rsync, uses `-F` with that file, bypassing the account and system SSH configs. Init does not edit `~/.ssh/config`. The managed file disables multiplexing; opting into `[ssh] multiplex = true` uses a separate private control directory named for a hash of the managed config path. Origin Git connections keep the account's SSH settings and shared control directory. To debug a worker alias on the controller, run `ssh -F ~/.ssh/mac-worker-controller.conf <alias>` (add `-G` to inspect settings without connecting). Authorization appends one recognizable `mac-worker-controller` line, preserves all existing restrictions/keys, and is idempotent. Existing controller private keys are retained.
+The controller receives `~/.config/mac-worker/config.toml`, a dedicated `~/.ssh/mac-worker-controller_ed25519` key, managed SSH settings, and laptop-trusted host keys in per-worker `~/.ssh/<alias>.known_hosts` files (with a combined `mac-worker-controller_known_hosts` copy). Only public keys returned by laptop `ssh-keygen -F` are seeded; missing or revoked trust stops setup for that worker. Strict host-key checking stays enabled, including loopback; the verification name is pinned explicitly and each worker has its own trusted-key file. The controller helper records the absolute managed config path in `[ssh] config_file`. Every controller-to-worker SSH connection, including Git, uses `-F` with that file, bypassing the account and system SSH configs. Init does not edit `~/.ssh/config`. The managed file disables multiplexing; opting into `[ssh] multiplex = true` uses a separate private control directory named for a hash of the managed config path. Origin Git connections keep the account's SSH settings and shared control directory. To debug a worker alias on the controller, run `ssh -F ~/.ssh/mac-worker-controller.conf <alias>` (add `-G` to inspect settings without connecting). Authorization appends one recognizable `mac-worker-controller` line, preserves all existing restrictions/keys, and is idempotent. Existing controller private keys are retained.
 
 Before any remote write, init checks the helper digest on the controller and every worker; stale workers are listed with a `worker setup` instruction. Rerun `init` after correcting access or inventory. Identical controller configuration is kept; a different existing config produces a diff and requires `--force`. Init installs and restarts the service, probes every worker from the controller, and verifies through RPC that the LaunchAgent PID is the live supervised leader, started after this restart, running the expected binary digest with the verified config and storage roots, before enabling laptop controller mode. A foreign manual leader produces `CONTROLLER_FOREIGN_LEADER` with its PID; stop that process and rerun init. It prints a per-worker result. Before the first remote write, init atomically records the pending destination and stage under `$XDG_STATE_HOME/mac-worker-controller/pending-init.json` (default `~/.local/state/mac-worker-controller/`). This does not enable laptop mode. Partial initialization is recoverable by rerunning init or by running `worker controller disable`; failures after an attempted remote write print that recovery command. Preflight refusals and confirmed config conflicts leave no new pending record or disable suggestion; an already enabled controller remains enabled. Recovery information from an earlier partial init is retained. Success clears the pending record. The laptop keeps its `[[workers]]`, so `setup`, `doctor`, `workers`, and `gc` remain usable there.
 
@@ -503,7 +503,7 @@ A LaunchAgent **requires a logged-in GUI session after reboot**. No auto-login m
 
 For manual foreground operation, stop/unload the service first, then run `worker controller run` on the controller. It holds the leader lock, resumes the same durable store, and prints `controller leader acquired`; a second leader gets `CONTROLLER_LOCK_HELD`.
 
-These stay on the laptop in controller mode: `init`, `setup`, `doctor`, `workers`, `gc`, `run`, job status/logs/cancel, and `worker task batch FILE --preview`. Controller-only hand-written laptop configs may omit workers, but inventory-based commands still require them. Turn runners run on the controller host.
+These stay on the laptop in controller mode: `init`, `setup`, `doctor`, `workers`, `gc`, and `worker task batch FILE --preview`. Controller-only hand-written laptop configs may omit workers, but inventory-based commands still require them. Turn runners run on the controller host.
 
 ### Persistent controller read channel
 
@@ -933,18 +933,11 @@ daemon on every mini remain outside both phases.
 - `worker task reconcile` repairs task ownership after a laptop reboot (or on the controller host when enabled). It waits 750 ms to confirm an `Absent` owner in that same invocation; a still-unverifiable owner is not treated as dead. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
 - The laptop owns the queue unless you opt in to a remote controller (`[controller] enabled = true`). That mode is off by default. Setup: [Remote controller](#remote-controller).
 
-## Plain remote commands
+## Legacy batch retirement
 
-The task system is built on a simpler layer that is still available: run any trusted, non-interactive command on a worker from a snapshot of the current worktree.
+The snapshot-backed v1 batch commands (`worker run`, top-level `worker status`, `worker logs`, and `worker cancel`) and their rsync transport are retired. Use the [task lifecycle](#task-lifecycle) for coding tasks, including `worker task batch` and task DAGs. `worker doctor --project .` still validates a project before its first task.
 
-```bash
-worker run -- cargo test --locked           # scheduler picks a worker
-worker run --worker mini-2 -- npm test      # pin one
-worker status                               # recent jobs
-worker logs -f <job-id>
-worker cancel <job-id>
-worker doctor --project .                   # validate a project before its first job
-```
+Before upgrading an installation that used batch execution, drain its work with the old tools. Valid legacy queue rows and job records remain readable; existing host leases remain busy. The upgrade adds no automatic legacy cleanup. See [retired batch state](legacy-batch-state.md) for the drain-first procedure and the exact boundary for manual cleanup.
 
 ## Exit codes and errors
 
@@ -961,8 +954,6 @@ JSON error events keep a plain public `message`. Human-readable diagnostics on s
 | 70 | Infrastructure: the worker, protocol, or wait failed |
 | 74 | I/O: a local read or write failed |
 | 75 | Capacity: a slot, resource, or agent login is not available |
-
-When `worker run` finishes, the process status is the remote command's own exit code.
 
 <!-- error-catalog:start -->
 | Code | Exit | Hint |

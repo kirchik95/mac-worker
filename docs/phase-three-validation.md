@@ -1,5 +1,10 @@
 # Phase 3 validation record
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](legacy-batch-state.md).
+
 Phase 3 implements one explicitly selected worker per `worker run` invocation. It is not an automatic scheduler or queue. This record separates automated local evidence from the completed live single-host acceptance evidence required before relying on the feature operationally.
 
 ## Automated local and fake-transport evidence

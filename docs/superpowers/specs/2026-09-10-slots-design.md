@@ -1,5 +1,11 @@
 # Multiple execution slots
 
+> **Retirement note (2026-10-01):** New `kind: job` leases, including
+> requests with omitted scope, are now refused before any write. The
+> legacy admission table below is historical. Existing stored Job scopes
+> still count as busy; task scopes, slot APIs, and layout 3 remain. See
+> [drain and legacy cleanup](../../legacy-batch-state.md).
+
 A host may run more than one concurrent job. Default remains **one** live lease until the operator opts in. This is a host-layout change, not a protocol bump: `PROTOCOL_VERSION` and `SUPERVISION_VERSION` stay as the current release advertises.
 
 Laptop `[[workers]].slots` is a **client ceiling** used for admission and runner-cap sums. The host’s durable `leases/capacity.json` is the authority for how many live leases that Mac will accept.

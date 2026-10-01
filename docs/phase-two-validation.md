@@ -1,5 +1,10 @@
 # Phase-two snapshot validation
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](legacy-batch-state.md).
+
 Validation was performed on 2026-08-27 with the release binary, the normal three-worker inventory, one temporary clone of a real Node-family repository, and one temporary clone of this Rust repository. The original working trees were never changed. Each clone used an ephemeral home and isolated XDG config, state, cache, and data roots; their values, repository origins, and complete local paths are intentionally omitted.
 
 The local clone operation initially supplied a filesystem-path origin. Doctor rejected it with `INVALID_ORIGIN` before worker probing or cache creation. The clone-only origin metadata was then removed, leaving the original repositories untouched and exercising the documented common-directory identity fallback.

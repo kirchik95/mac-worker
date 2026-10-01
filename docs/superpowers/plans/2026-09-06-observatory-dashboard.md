@@ -1,5 +1,10 @@
 # Observatory dashboard implementation
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 Implement the approved Paper Overview and Settings artboards in the existing local dashboard. Reference exports: `/private/tmp/mac-worker-paper-overview.jsx` and `/private/tmp/mac-worker-paper-settings.jsx`.
 
 ## Global constraints

@@ -1,5 +1,10 @@
 # Phase 4 validation record
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](legacy-batch-state.md).
+
 This record separates automated local evidence from live observations of the configured Mac workers. All live commands were executed directly from an isolated terminal environment. It contains only revision and version data, shortened identifiers, logical worker aliases, counts, states, result categories, and fingerprints of mac-worker-owned namespaces. It intentionally omits raw payloads, command output and logs, complete paths, repository origins, credentials, and environment values.
 
 ## Commit and protocol

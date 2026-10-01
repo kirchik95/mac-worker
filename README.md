@@ -18,6 +18,8 @@ https://github.com/user-attachments/assets/42c5a94c-e1ba-4ecb-a30b-c94fe3417efa
 
 [Worker preparation](docs/setup-macos-worker.md) covers SSH, agents and project tools. Run trusted tasks: agents have the worker account's access to files and credentials.
 
+Upgrading an installation that used snapshot batch execution? [Drain the old work first](docs/legacy-batch-state.md#drain-before-upgrading); legacy state has an explicit cleanup boundary.
+
 ## Quick start
 
 Run the commands below on your **laptop**.

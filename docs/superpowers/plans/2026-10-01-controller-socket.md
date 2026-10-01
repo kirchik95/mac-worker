@@ -1,5 +1,9 @@
 # Persistent Controller Read-Loop Implementation Plan
 
+> **Local sources:** `.briefs/` paths below identify excluded working
+> briefs, not published repository pages. They remain historical
+> references; no decisions or recorded results are changed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement your assigned track task-by-task. The orchestrator schedules parallel tracks and independent reviews; no internal subagents/reviewer rounds.
 
 **Goal:** Remove SSH execution sessions from repeated wait/log/event/notify reads, preserving per-request child isolation and all existing stdio mutation behavior.
@@ -8,7 +12,7 @@
 
 **Tech stack:** Rust 2024; existing serde/serde_json, UUID parsing/string wrappers, SHA-256, libc, rooted_fs, ProcessRunner and Tokio. No dependency/uuid-feature/TOML/daemon/UI change.
 
-**Spec:** [2026-10-01-controller-socket-design.md](../specs/2026-10-01-controller-socket-design.md). Read [rules](../../../.briefs/p3-rules.md), [D1–D10](../../../.briefs/p3-spec-round2.md), [E1–E5](../../../.briefs/p3-spec-round3.md), [survey section 3](../../../.briefs/p3-survey-report.md), [review](../../../.briefs/p3-review-report.md), [coverage](../../../.briefs/p3-coverage-report.md) and [re-review F1–F4](../../../.briefs/p3-review2-report.md). D1–D10 and E1–E5 are settled; this plan applies them. Baseline `0802421541679443e7d1982988a8c6482e5fdbe9`, re-anchor at the final accepted events head before T1 on integ/p3.
+**Spec:** [2026-10-01-controller-socket-design.md](../specs/2026-10-01-controller-socket-design.md). Read rules (`.briefs/p3-rules.md`), D1–D10 (`.briefs/p3-spec-round2.md`), E1–E5 (`.briefs/p3-spec-round3.md`), survey section 3 (`.briefs/p3-survey-report.md`), review (`.briefs/p3-review-report.md`), coverage (`.briefs/p3-coverage-report.md`) and re-review F1–F4 (`.briefs/p3-review2-report.md`). D1–D10 and E1–E5 are settled; this plan applies them. Baseline `0802421541679443e7d1982988a8c6482e5fdbe9`, re-anchor at the final accepted events head before T1 on integ/p3.
 
 ## Global constraints
 

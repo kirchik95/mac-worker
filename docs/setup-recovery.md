@@ -1,6 +1,6 @@
 # Recover a helper installation
 
-Use this reference only when `worker init` or `worker setup` reports an installation error. For first-time setup, start with [the worker setup guide](setup-macos-worker.md). Run remote recovery commands as the configured worker account.
+Use this reference only when `worker init` or `worker setup` reports an installation error. For first-time setup, start with [the worker setup guide](setup-macos-worker.md). Before upgrading an installation that used the retired snapshot batch path, [drain old work and review the legacy cleanup boundary](legacy-batch-state.md). Run remote recovery commands as the configured worker account.
 
 ## Recovery from retained setup state
 

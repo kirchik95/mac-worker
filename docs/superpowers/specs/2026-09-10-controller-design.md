@@ -1,5 +1,11 @@
 # Persistent controller — design
 
+> **Retirement note (2026-10-01):** The laptop-local `run` and public job
+> status/logs/cancel entries below describe the old batch release. Those
+> commands and rsync execution are retired. Task/controller routing and
+> durable request contracts remain. See [current usage](../../usage.md)
+> and [drain and legacy cleanup](../../legacy-batch-state.md).
+
 Date: 2026-09-10. Owner: FLOW. Operator steps (default off): [usage — Remote controller](../../usage.md#remote-controller). This file keeps locks, digests, and protocol detail.
 
 Foundation: `bdc08d8c30ff80b0e3610fa89c8e15da37244682`. PROTOCOL_VERSION **7** transports typed `TaskStatus.reported_checks`. Helpers and clients still on protocol 6 mismatch at preflight; upgrade them together.

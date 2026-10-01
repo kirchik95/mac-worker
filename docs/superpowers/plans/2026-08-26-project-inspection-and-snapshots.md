@@ -1,5 +1,10 @@
 # Project Inspection and Immutable Snapshots Implementation Plan
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add `worker doctor` and a race-detecting immutable local snapshot pipeline that captures the current filesystem state of any supported Git worktree without copying secrets, Git metadata, or uncovered untracked inputs.

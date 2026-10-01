@@ -1,5 +1,10 @@
 # Herdr reporter implementation plan
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 > **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Show every pool turn in the operator's herdr sidebar with live state and a rendered log pane, notify the MacBook's herdr when a turn ends, and make herdr availability a worker fact that `doctor`, `setup`, and `workers` report.

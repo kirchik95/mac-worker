@@ -272,12 +272,13 @@ Node.js is needed only when changing the dashboard source in `ui/`; its built as
 ## More documentation
 
 - [Prepare a Mac worker](setup-macos-worker.md): SSH, agents, profiles, power settings and removal.
-- [Usage reference](usage.md): tasks, follow-ups, batches, defaults, dashboard, remote controller and remote commands.
+- [Usage reference](usage.md): tasks, follow-ups, batches, defaults, dashboard and remote controller.
 - [Remote controller](usage.md#remote-controller): opt-in always-on queue; default remains the laptop.
 - [Batch DAG](dag-design.md): named `depends_on` / `from:` lifecycle, Closed+Done parent gate, freeze, wait, and reconcile.
 - [Multiple execution slots](superpowers/specs/2026-09-10-slots-design.md): host `slot_count`, occupancy, migrate, and execution scope.
 - [Durable origin outbox](superpowers/specs/2026-09-10-origin-outbox.md): per-turn origin delivery, slot release, and host `--watch` / `--enable` / `--once`.
 - [Installation recovery](setup-recovery.md): retained installer state and older host layouts.
+- [Retired batch state](legacy-batch-state.md): drain old executions before upgrading and clean up only proven legacy artifacts.
 - [Build and publish a release](releasing.md): archives, checksums and Homebrew distribution.
 - [Acceptance runbook](phase-five-acceptance-runbook.md) and [validation record](phase-five-validation.md).
 - [Herdr reporter validation](herdr-reporter-validation.md): turns in the herdr sidebar, notifications, and the herdr facts, proven on the pool.

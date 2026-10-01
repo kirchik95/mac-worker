@@ -19,7 +19,7 @@ The CLI is the only interface. The skill contains no scheduling logic.
 
 **Command availability:** the release exposes `worker task …`, `worker dashboard`, `worker controller run`, and `worker workers --refresh`. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar; do not replace a rejected public form with direct worker access, SSH, or another tool.
 
-Default dispatch is the laptop queue (`[controller]` missing or `enabled = false`). If the operator already enabled a remote controller, keep this same `worker task …` grammar — do not invent a second CLI, and do not start `worker controller run` from this skill. A controller-only laptop config may omit `[[workers]]`; commands that need a local worker list then fail with `at least one worker is required` (for example `worker workers`, `setup`, `doctor`, `run`, `gc`, and streaming `worker logs`). Public job `status` and `cancel` stay laptop-local and do not use that inventory error. Operator notes: repository `docs/usage.md` section Remote controller.
+Default dispatch is the laptop queue (`[controller]` missing or `enabled = false`). If the operator already enabled a remote controller, keep this same `worker task …` grammar — do not invent a second CLI, and do not start `worker controller run` from this skill. A controller-only laptop config may omit `[[workers]]`; commands that need a local worker list then fail with `at least one worker is required` (for example `worker workers`, `setup`, `doctor`, and `gc`). Operator notes: repository `docs/usage.md` section Remote controller.
 
 ## Grammar Source
 

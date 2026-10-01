@@ -1,5 +1,10 @@
 # mac-worker v2 design: agent tasks on the worker pool
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 - Date: 2026-09-03 (revision 2.3, after three rounds of design review and the Task 0 spike on the same day; see section 25)
 - Status: draft for review
 - Repository: `mac-worker`

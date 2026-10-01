@@ -1,5 +1,10 @@
 # Agent Task Execution Core Implementation Plan
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the agent task job kind so that `worker task submit` sends a prompt to the pool, a Mac mini materializes a Git worktree for it, runs Codex or Claude Code headless inside that worktree under the existing durable supervisor and one-slot lease, and the MacBook can watch, converse between turns, fetch the result branch, and close the task, with a bounded local runner carrying every turn after the CLI has returned.

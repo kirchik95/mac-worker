@@ -1,5 +1,11 @@
 # Dashboard validation record
 
+> **Retirement note (2026-10-01):** Recorded batch CLI comparisons below
+> are historical evidence. Batch execution and its public job commands
+> are retired; the read-only legacy job/log routes, job arrays, and queue
+> adapters remain. The operator checklist uses the task CLI. See
+> [drain and legacy cleanup](legacy-batch-state.md).
+
 This record contains only build identities, protocol versions, shortened identifiers, state transitions, counts, timings, and outcomes. It intentionally omits paths, connection details, environment values, source data, and raw logs.
 
 ## Build identities
@@ -70,5 +76,5 @@ These rows record the v7 live dashboard observation against the matched release/
 ### Operator checklist
 
 1. Start `worker dashboard --no-open`, then inspect the worker cards, run-progress cards, queue, tasks table, selected task detail/timeline, and active stdout/stderr panes. Exercise the run/state/worker/agent filters locally.
-2. Compare the task rows and run progress with `worker --json task list --run <run-id>`, compare selected state with `worker --json task status <task-id>`, compare the result with `worker --json task result <task-id>`, and inspect reconnect behavior with `worker task logs <task-id>`. Keep task turns distinct from legacy `worker status`/`worker logs` jobs.
+2. Compare the task rows and run progress with `worker --json task list --run <run-id>`, compare selected state with `worker --json task status <task-id>`, compare the result with `worker --json task result <task-id>`, and inspect reconnect behavior with `worker task logs <task-id>`. Legacy job/log routes and arrays remain read-only compatibility projections; use task commands for current executions.
 3. Note only shortened task/run/turn IDs, state and last-outcome categories, task/queue/worker/byte counts, observed durations and polling cadence, revision/protocol matches, and pass/fail results. For privacy checks, record hit counts or a pass/fail result—not the values found. Record zero dashboard mutation calls and unchanged task/turn status after shutdown.

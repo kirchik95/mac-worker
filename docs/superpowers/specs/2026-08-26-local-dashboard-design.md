@@ -1,5 +1,10 @@
 # mac-worker local dashboard design
 
+> **Retirement note (2026-10-01):** The snapshot-backed v1 batch product
+> and rsync execution path are retired. Original designs and recorded
+> results below remain historical; shared task/turn safety and read-only
+> dashboard contracts remain. See [drain and legacy cleanup](../../legacy-batch-state.md).
+
 - Date: 2026-08-26
 - Status: approved for implementation
 - Repository: `mac-worker`
