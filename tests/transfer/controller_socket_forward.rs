@@ -1106,6 +1106,16 @@ fn scoped_client_unacknowledged_bind_before_listen_retires_across_all_eligibilit
             runtime: clock.clone(),
         },
     );
+    let priming = scoped_request(&route);
+    assert!(client.run(&priming).unwrap().status.success());
+    assert_eq!(raw.reads.lock().unwrap().as_slice(), [priming]);
+    assert!(raw.bootstraps.lock().unwrap().is_empty());
+    assert!(raw.inner.base.calls.lock().unwrap().is_empty());
+    assert!(files.allocations.lock().unwrap().is_empty());
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.connections(), 0);
+    assert!(connector.frames().is_empty());
+    assert!(!paths.controller_cache_root().join("channel").exists());
     assert!(client.run(&scoped_request(&route)).is_err());
     let allocation = files.allocations.lock().unwrap()[0].clone();
     let parent = entry(&allocation.directory);
@@ -1156,7 +1166,7 @@ fn scoped_client_unacknowledged_bind_before_listen_retires_across_all_eligibilit
     assert_eq!(files.allocations.lock().unwrap().len(), 1);
     assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
     assert_eq!(connector.connections(), 0);
-    assert_eq!(raw.reads.lock().unwrap().len(), 128);
+    assert_eq!(raw.reads.lock().unwrap().len(), 129);
     let calls = raw.inner.base.calls.lock().unwrap();
     for op in ["forward", "cancel"] {
         assert_eq!(
@@ -1204,15 +1214,26 @@ fn scoped_client_exit_zero_cancel_error_preserves_one_real_allocation_after_conf
         ClientDeps {
             identity: Arc::new(StdioIdentitySource::new()),
             pins: Arc::new(PrivatePinStore::new()),
-            forwards: Arc::new(MasterForwardControl::new(paths, files.clone(), ssh)),
+            forwards: Arc::new(MasterForwardControl::new(paths.clone(), files.clone(), ssh)),
             connector: connector.clone(),
             runtime: clock.clone(),
         },
     );
+    let priming = scoped_request(&route);
+    assert!(client.run(&priming).unwrap().status.success());
+    assert_eq!(raw.reads.lock().unwrap().as_slice(), [priming]);
+    assert!(raw.bootstraps.lock().unwrap().is_empty());
+    assert!(raw.inner.calls.lock().unwrap().is_empty());
+    assert!(files.allocations.lock().unwrap().is_empty());
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.connections(), 0);
+    assert!(connector.frames().is_empty());
+    assert!(!paths.controller_cache_root().join("channel").exists());
     let first = scoped_request(&route);
     assert!(client.run(&first).unwrap().status.success());
     assert_eq!(connector.frames(), [first.stdin.clone().unwrap()]);
-    assert_eq!(raw.reads.lock().unwrap()[0].stdin, first.stdin);
+    assert_eq!(raw.reads.lock().unwrap().len(), 2);
+    assert_eq!(raw.reads.lock().unwrap()[1].stdin, first.stdin);
     // This has all three config forwarding families; teardown continues to
     // address the captured endpoint/pair after the route file is replaced.
     fs::write(route.ssh_config_file.as_ref().unwrap(), "Host fixture\n ControlPath /different/master\n LocalForward 1 localhost:2\n RemoteForward 3 localhost:4\n DynamicForward 5\n").unwrap();
@@ -1283,13 +1304,24 @@ fn scoped_offline_mux(master_lost: bool) {
         ClientDeps {
             identity: Arc::new(StdioIdentitySource::new()),
             pins: Arc::new(PrivatePinStore::new()),
-            forwards: Arc::new(MasterForwardControl::new(paths, files.clone(), ssh)),
+            forwards: Arc::new(MasterForwardControl::new(paths.clone(), files.clone(), ssh)),
             connector: connector.clone(),
             runtime: clock.clone(),
         },
     );
+    let priming = scoped_request(&route);
+    assert!(client.run(&priming).unwrap().status.success());
+    assert_eq!(raw.reads.lock().unwrap().as_slice(), [priming]);
+    assert!(raw.bootstraps.lock().unwrap().is_empty());
+    assert!(raw.inner.calls.lock().unwrap().is_empty());
+    assert!(raw.inner.mux.lock().unwrap().is_none());
+    assert!(files.allocations.lock().unwrap().is_empty());
+    assert_eq!(files.cleanups.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.connections(), 0);
+    assert!(connector.frames().is_empty());
+    assert!(!paths.controller_cache_root().join("channel").exists());
     assert!(client.run(&first).unwrap().status.success());
-    assert!(raw.reads.lock().unwrap().is_empty());
+    assert_eq!(raw.reads.lock().unwrap().len(), 1);
     let master = raw.inner.mux.lock().unwrap().as_ref().unwrap().path.clone();
     let binding = entry(&master);
     let bootstrap = strings(&raw.bootstraps.lock().unwrap()[0]);
@@ -1314,8 +1346,8 @@ fn scoped_offline_mux(master_lost: bool) {
     }
     let second = scoped_request(&route);
     assert!(client.run(&second).unwrap().status.success());
-    assert_eq!(raw.reads.lock().unwrap().len(), 1);
-    assert_eq!(raw.reads.lock().unwrap()[0].stdin, second.stdin);
+    assert_eq!(raw.reads.lock().unwrap().len(), 2);
+    assert_eq!(raw.reads.lock().unwrap()[1].stdin, second.stdin);
     assert_eq!(
         connector.frames(),
         [first.stdin.unwrap(), second.stdin.unwrap()]

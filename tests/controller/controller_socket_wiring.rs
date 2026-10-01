@@ -2293,6 +2293,24 @@ mod t7a {
                     ),
                 },
             );
+            source.discover(GUARD).unwrap();
+            {
+                let calls = raw.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].command(), "task.list");
+                assert_eq!(calls[0].body(), &json!({"controller_health":true}));
+            }
+            assert_eq!(raw.processes.lock().unwrap().len(), 1);
+            assert_eq!(forwards.resolutions(), 0);
+            assert_eq!(forwards.opens(), 0);
+            assert_eq!(forwards.cancels(), 0);
+            assert!(
+                !laptop
+                    .paths
+                    .controller_cache_root()
+                    .join("channel")
+                    .exists()
+            );
             let EventReadResult::SnapshotRequired(initial) =
                 source.read(ReadQuery::default(), GUARD).unwrap()
             else {
@@ -2356,8 +2374,8 @@ mod t7a {
             assert_eq!(forwards.opens(), 1, "journal hint cannot break the session");
             assert_eq!(
                 raw.calls.lock().unwrap().len(),
-                1,
-                "only trusted identity bootstrap uses stdio"
+                2,
+                "only the priming read and trusted identity bootstrap use stdio"
             );
             assert_eq!(fs::read(pin).unwrap(), pin_bytes);
             assert_eq!(
@@ -3404,6 +3422,36 @@ mod t7a {
                     },
                 ));
                 let original = process(&request);
+                let mut priming = original.clone();
+                priming.stdin = Some(
+                    encode_json_frame(&json!({
+                        "protocol_version":request.protocol_version(),
+                        "request_id":"11111111111141118111111111111111",
+                        "command":request.command(),
+                        "body":request.body(),
+                    }))
+                    .unwrap(),
+                );
+                let first = client.run(&priming).unwrap();
+                assert_eq!(first.status, result.status);
+                assert_eq!(first.stdout, result.stdout);
+                assert_eq!(first.stderr, result.stderr);
+                assert_eq!(
+                    raw.calls.lock().unwrap().as_slice(),
+                    std::slice::from_ref(&priming)
+                );
+                assert!(raw.identity_calls.lock().unwrap().is_empty());
+                assert_eq!(forwards.resolutions(), 0);
+                assert_eq!(forwards.opens(), 0);
+                assert_eq!(forwards.cancels(), 0);
+                assert!(observed.lock().unwrap().is_empty());
+                assert!(
+                    !fixture
+                        .paths
+                        .controller_cache_root()
+                        .join("channel")
+                        .exists()
+                );
                 // This captures a non-Send Cell; only the server's atomic flag
                 // crosses threads. The borrowed predicate remains live in I/O.
                 let calls = Cell::new(0);
@@ -3438,8 +3486,9 @@ mod t7a {
                         "typed event client rejects a valid batch from another epoch"
                     );
                     server.join().unwrap();
-                    assert!(
-                        raw.calls.lock().unwrap().is_empty(),
+                    assert_eq!(
+                        raw.calls.lock().unwrap().len(),
+                        1,
                         "typed cursor rejection cannot replay the read"
                     );
                     assert_eq!(raw.identity_calls.lock().unwrap().len(), 1);
@@ -3455,8 +3504,9 @@ mod t7a {
                     Fault::Cancel | Fault::Expire | Fault::WrongId | Fault::WrongDigest
                 ) {
                     assert!(answer.is_err(), "{fault:?} admitted a reply");
-                    assert!(
-                        raw.calls.lock().unwrap().is_empty(),
+                    assert_eq!(
+                        raw.calls.lock().unwrap().len(),
+                        1,
                         "{fault:?} replayed an unverified/cancelled read"
                     );
                 } else if matches!(fault, Fault::Error) {
@@ -3469,7 +3519,7 @@ mod t7a {
                             .unwrap()
                     );
                     assert!(answer.stderr.is_empty());
-                    assert!(raw.calls.lock().unwrap().is_empty());
+                    assert_eq!(raw.calls.lock().unwrap().len(), 1);
                 } else if matches!(fault, Fault::WrongTurn | Fault::Valid) {
                     let answer = answer.unwrap();
                     assert!(answer.status.success());
@@ -3479,7 +3529,7 @@ mod t7a {
                         serde_json::from_slice::<Value>(decode_frame(&result.stdout).unwrap())
                             .unwrap()
                     );
-                    assert!(raw.calls.lock().unwrap().is_empty());
+                    assert_eq!(raw.calls.lock().unwrap().len(), 1);
                     if matches!(fault, Fault::WrongTurn) {
                         let reply: mac_worker::controller::ControllerReadReply<
                             mac_worker::controller::read::ControllerTaskLogsResult,
@@ -3490,13 +3540,13 @@ mod t7a {
                 } else {
                     assert_eq!(answer.unwrap().stdout, result.stdout);
                     let reads = raw.calls.lock().unwrap();
-                    assert_eq!(reads.len(), 1);
-                    assert_eq!(reads[0].stdin, original.stdin);
+                    assert_eq!(reads.len(), 2);
+                    assert_eq!(reads[1].stdin, original.stdin);
                     let mut expected = original.clone();
-                    expected.policy.deadline = reads[0].policy.deadline;
-                    assert_eq!(reads[0], expected);
+                    expected.policy.deadline = reads[1].policy.deadline;
+                    assert_eq!(reads[1], expected);
                     assert_eq!(
-                        reads[0].policy.deadline,
+                        reads[1].policy.deadline,
                         Duration::from_secs(if matches!(fault, Fault::BeforeSend) {
                             28
                         } else {
@@ -3561,6 +3611,20 @@ mod t7a {
                         identity:Arc::new(mac_worker::controller::channel::testing::ScriptedIdentitySource::new(vec![Ok(identity)])),pins:Arc::new(PrivatePinStore::new()),forwards:forwards.clone(),connector:Arc::new(FramedSocketConnector::new(Arc::new(SessionCodec::new()))),runtime:clock.clone()}));
                     let request=request_fixture("task.logs",json!({"task_id":task,"raw":true,"offset":0,"wait_ms":0}));
                     let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));
+                    let mut priming = original.clone();
+                    priming.stdin = Some(encode_json_frame(&json!({
+                        "protocol_version":request.protocol_version(),
+                        "request_id":"11111111111141118111111111111111",
+                        "command":request.command(),
+                        "body":request.body(),
+                    })).unwrap());
+                    assert!(client.run(&priming).unwrap().status.success());
+                    assert_eq!(raw.processes.lock().unwrap().as_slice(), std::slice::from_ref(&priming));
+                    assert_eq!(raw.calls.lock().unwrap().len(), 1);
+                    assert_eq!(forwards.resolutions(), 0);
+                    assert_eq!(forwards.opens(), 0);
+                    assert_eq!(forwards.cancels(), 0);
+                    assert!(!laptop.paths.controller_cache_root().join("channel").exists());
                     let lock=children::state_lock(&fixture);let work_client=client.clone();let process=original.clone();
                     let (result_tx,result_rx)=tokio::sync::oneshot::channel();
                     let work=std::thread::spawn(move || {let _=result_tx.send(work_client.run(&process));});
@@ -3585,12 +3649,16 @@ mod t7a {
                     assert!(command_line(pid as u32).starts_with(record.executable.path.to_str().unwrap()));
                     assert_eq!(unsafe{libc::kill(pid,0)},0);clock.advance(Duration::from_secs(5));
                     let shutdown=channel.shutdown().await;assert_eq!(shutdown.rpc.completed,1);assert_eq!(shutdown.rpc.unknown,0);assert_eq!(shutdown.files,ForwardDisposition::Cleaned);
-                    assert_eq!(unsafe{libc::killpg(group,0)},-1);assert!(!record.executable.path.exists());drop(lock);
+                    assert_eq!(unsafe{libc::killpg(group,0)},-1);
+                    // Shutdown now retains generation links. Withdraw this
+                    // fixture's image explicitly to keep exercising generation loss.
+                    fs::remove_file(&record.executable.path).unwrap();
+                    assert!(!record.executable.path.exists());drop(lock);
                     let result=tokio::time::timeout(GUARD,result_rx).await.expect("fallback result hang guard").unwrap().expect("stdio fallback process");
                     assert!(result.status.success(),"stdio fallback status={} stderr={} stdout={}",result.status,String::from_utf8_lossy(&result.stderr),String::from_utf8_lossy(&result.stdout));work.join().unwrap();
-                    let calls=raw.calls.lock().unwrap();assert_eq!(calls.len(),1);assert_eq!(frame(&calls[0]),original.stdin.unwrap());drop(calls);
-                    let processes=raw.processes.lock().unwrap();let mut expected=processes[0].clone();expected.policy.deadline=Duration::from_secs(30);
-                    let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));assert_eq!(expected,original);assert_eq!(processes[0].policy.deadline,Duration::from_secs(25));drop(processes);
+                    let calls=raw.calls.lock().unwrap();assert_eq!(calls.len(),2);assert_eq!(frame(&calls[1]),original.stdin.unwrap());drop(calls);
+                    let processes=raw.processes.lock().unwrap();assert_eq!(processes.len(),2);let mut expected=processes[1].clone();expected.policy.deadline=Duration::from_secs(30);
+                    let mut original=controller_rpc_ssh_request(&config.controller).unwrap();original.stdin=Some(frame(&request));assert_eq!(expected,original);assert_eq!(processes[1].policy.deadline,Duration::from_secs(25));drop(processes);
                     assert_eq!(forwards.opens(),1);assert_eq!(forwards.cancels(),1);assert_eq!(client.close(),ForwardDisposition::Cleaned);
                     let reply:mac_worker::controller::ControllerReadReply<mac_worker::controller::read::ControllerTaskLogsResult>=serde_json::from_slice(decode_frame(&result.stdout).unwrap()).unwrap();
                     use mac_worker::controller::ControllerReadIdentity;
