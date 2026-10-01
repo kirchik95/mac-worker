@@ -1,6 +1,6 @@
 # Using mac-worker
 
-Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, and the remote controller. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
+Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, the remote controller, and its events and notifications. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
 
 ## Agents
 
@@ -499,7 +499,7 @@ The controller host's own config has controller mode disabled and contains its d
 
 The service is `~/Library/LaunchAgents/com.mac-worker.controller.plist` in `gui/<uid>`, with RunAtLoad, KeepAlive, and a 30-second restart throttle. It runs `worker --config <verified absolute config path> controller run --supervised` with the helper’s resolved `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `XDG_DATA_HOME`. The config home used by agent settings remains independent of an explicit config-file override. Detached runners inherit those roots and receive the same explicit config path. A supervised or explicitly configured controller refuses a missing or invalid config; stdout and stderr share `~/Library/Logs/mac-worker/controller.log`. Each supervised process start truncates that log in place, including lock-contention restarts. Long uninterrupted runs retain their current log until the next start. `worker setup` restarts an enabled configured controller after installing its helper and reports `controller: restarted` only after the same leader/build/path verification succeeds; restart failures retain the installed helper and produce `CONTROLLER_RESTART_FAILED`.
 
-A LaunchAgent **requires a logged-in GUI session after reboot**. No auto-login means it will not start before login. Successful init prints the complete, account-specific `sudo` commands and equivalent LaunchDaemon plist (including `UserName=kirchik` for the pilot) for operators who want boot startup. These commands are instructions only and are never executed by init. Review and run them on the controller; they unload the agent before loading the daemon so there is only one leader. For automatic recovery after power loss, also consider running `sudo pmset -a autorestart 1` on that host. Never-sleep settings alone do not enable boot or power-loss recovery. The init/disable/setup service commands manage the LaunchAgent; operators choosing the printed LaunchDaemon alternative manage its system-domain lifecycle themselves.
+A LaunchAgent **requires a logged-in GUI session after reboot**. No auto-login means it will not start before login. Successful init prints the complete, account-specific `sudo` commands and equivalent LaunchDaemon plist (including the account's `UserName`) for operators who want boot startup. These commands are instructions only and are never executed by init. Review and run them on the controller; they unload the agent before loading the daemon so there is only one leader. For automatic recovery after power loss, also consider running `sudo pmset -a autorestart 1` on that host. Never-sleep settings alone do not enable boot or power-loss recovery. The init/disable/setup service commands manage the LaunchAgent; operators choosing the printed LaunchDaemon alternative manage its system-domain lifecycle themselves.
 
 For manual foreground operation, stop/unload the service first, then run `worker controller run` on the controller. It holds the leader lock, resumes the same durable store, and prints `controller leader acquired`; a second leader gets `CONTROLLER_LOCK_HELD`.
 
@@ -549,12 +549,12 @@ copied into channel control operations. Master creation explicitly uses
 Unix socket paths must be absolute, private, and shorter than macOS's 104-byte `sun_path` limit.
 The ordinary default `~/.cache/mac-worker/ssh/%C` layout fits after OpenSSH expansion. A managed
 `-F` route uses a longer, config-specific directory and may not fit when a master must be created.
-For the current pilot account,
-`/Users/kirchik/.cache/mac-worker/ssh-<16hex>/<40hex>` is 94 bytes; OpenSSH needs a 17-byte
+With a seven-character account name,
+`/Users/<name>/.cache/mac-worker/ssh-<16hex>/<40hex>` is 94 bytes; OpenSSH needs a 17-byte
 temporary creation suffix, making 111 bytes. A cold channel setup declines that route and uses
 stdio. A safe, already-running 94-byte master can still qualify. Whether this also affects
 ordinary multiplexing on that managed route has not been established. Shortening the control
-directory is an owner follow-up, not part of this phase.
+directory is a follow-up.
 
 #### Identity, pin, and controller replacement
 
@@ -634,40 +634,21 @@ also restarts and verifies the leader, so the next generation pins the new image
 started leader keeps its old pinned generation until the operator stops and restarts it; replacing
 the file alone does not change that running leader.
 
-#### Local fixture observations
+#### Measurements
 
-The ignored acceptance fixture used a local fake SSH/mux and real local RPC children. It does not
-measure live SSH, network, authentication, or fleet latency. Its model is:
+The channel removes the SSH execution session per read and adds socket, supervisor and wrapper
+overhead, so the expected saving per warm read is the difference between the two. A local fixture
+with a fake SSH/mux and real local RPC children measured that structure; its paired cold and warm
+timings are in the [validation record](superpowers/validation/2026-10-01-controller-socket.md).
+They show local overhead, not live SSH, network, authentication or fleet latency.
 
-```text
-stdio  = S + W + H + D
-socket =     W + H + D + O
-expected difference = S - O
-```
+Live checks on 2026-10-01 are recorded in the same file. One-shot reads on the deployed build
+matched the pre-channel baseline, and a 65-second `task wait` loop started two SSH `controller-rpc`
+processes instead of one per poll. Per-read channel latency has no live instrumentation.
+Deliberate master-loss, network-loss and cancellation drills, graceful-cleanup verification, and a
+repin on a fixture reinstall have not been run live.
 
-`S` is the SSH execution-session/process cost already using ControlMaster; `O` is channel
-socket/supervisor/wrapper overhead. Each cell below is command mean / p50 / p95 in milliseconds,
-copied from the 200-sample paired fixture:
-
-| Scenario | Stdio ms | Socket-path ms |
-| --- | --- | --- |
-| Cold CLI wait, pin create | 41.549 / 41.368 / 46.241 | 163.514 / 161.442 / 181.007 |
-| Cold CLI wait, pin verify | 41.608 / 41.010 / 45.947 | 153.670 / 149.634 / 167.944 |
-| Cold CLI followed logs, pin verify | 71.610 / 71.058 / 77.657 | 158.923 / 157.149 / 170.441 |
-| Retired after unacknowledged cancel | 35.526 / 35.142 / 38.538 | 35.103 / 35.060 / 37.940 |
-| Warm wait, zero requested wait | 35.031 / 35.024 / 37.990 | 10.209 / 10.079 / 12.368 |
-| Warm logs, zero requested wait | 34.357 / 33.574 / 38.380 | 10.228 / 10.316 / 10.902 |
-| Warm events, zero requested wait | 33.249 / 32.982 / 36.602 | 8.396 / 8.195 / 10.906 |
-| Warm events, 5-ms requested wait | 39.963 / 39.446 / 43.800 | 14.339 / 13.647 / 16.703 |
-| Fallback/reconnect, two wait reads | 72.890 / 71.241 / 82.558 | 189.272 / 184.220 / 211.990 |
-
-The run observed 4,400 application reads/children and 1,200 fresh CLI processes. Warm socket
-classes used zero SSH application execution sessions and one worker child per read. Every measured
-cold command completed positive cleanup; the retained-open case kept exactly one allocation and
-made no later channel attempt. These numbers show local cold overhead and warm structure, not a
-deployed speedup. Live paired measurement remains **pending**, after the owner approves deployment.
-
-Phase 4 phone/Tailscale access and Phase 5 per-mini daemons are out of scope by owner decision.
+Phone or Tailscale access and a daemon on every mini are out of scope.
 
 ### Health and shutdown
 
@@ -812,7 +793,7 @@ Both `worker events` and `worker notify` require `[controller] enabled = true`. 
 worker notify [--follow] [--quiet] [--no-titles] [--channel auto|macos|herdr|both]
 ```
 
-Confirm the installed grammar with `worker notify --help`. `worker notify` turns confirmed task outcomes into notifications on your laptop. It complements the worker-side reporter under [Herdr](#herdr); it does not replace it. This command is foreground only. This wave installs no LaunchAgent and no background registration for it. Run it where you can see it, for example in a pane of the herdr you already use on the laptop.
+Confirm the installed grammar with `worker notify --help`. `worker notify` turns confirmed task outcomes into notifications on your laptop. It complements the worker-side reporter under [Herdr](#herdr); it does not replace it. This command is foreground only. There is no LaunchAgent and no background registration for it. Run it where you can see it, for example in a pane of the herdr you already use on the laptop.
 
 - `worker notify` reconciles the current attention set once and exits. It allows 30 seconds. Exit 0 means that baseline finished. Exit 69 means it did not, with one explicit line: `eligibility unknown: controller events unsupported`, `eligibility unknown: controller discovery unavailable; baseline incomplete`, `notification baseline incomplete: confirmation or repair unavailable`, or `notification baseline incomplete: deadline exhausted`.
 - `worker notify --follow` keeps running until Ctrl-C. Ctrl-C stops further reads and new banners and exits 0, including when the baseline is not finished yet. A banner already being handed to a channel can use the rest of its 2 second budget.
@@ -861,7 +842,7 @@ A new controller whose journal is unavailable is a different state. The notifier
 
 When the dashboard is the controller viewer ([Dashboard](#dashboard), or the hidden `--controller-viewer` mode) and the controller host has an initialized journal, the browser follows `GET /api/v1/events` (SSE). An ordinary laptop-local dashboard, or a viewer without an initialized journal, answers 404 and the page keeps polling. Laptop-local commands do not create a journal.
 
-Stream events are named. Only `controller.event` carries a replay cursor. Its `id:` is `<journal-uuid>:<sequence>`, and the sequence stays a decimal string so values past 2^53 are not rounded. Control events carry no `id:` and do not advance your position: `ready`, `snapshot_required`, `snapshot.ready`, and `heartbeat`. A heartbeat is an empty object plus a `keepalive` comment, every 10 seconds, including while idle. `snapshot_required` is how the viewer asks the page to rebaseline (reset, expired cursor, cursor ahead, a slow tab, or an unavailable journal). It never invents events. `snapshot.ready` carries the cache revision after a fresh local projection is visible.
+Stream events are named. Only `controller.event` carries a replay cursor. Its `id:` is `<journal-uuid>:<sequence>`, and the sequence stays a decimal string so values past 2^53 are not rounded. Control events carry no `id:` and do not advance your position: `ready`, `snapshot_required`, `snapshot.ready`, and `heartbeat`. A heartbeat is an empty object plus a `keepalive` comment, every 10 seconds, including while idle. `snapshot_required` is how the viewer asks the page to rebaseline (reset, expired cursor, cursor ahead, a slow tab, or an unavailable journal). It never invents events. `snapshot.ready` carries the cache revision after a fresh local projection is visible. It is sent only when the refreshed content changed, or when a collection recovered from a failure. A collection that differs only in volatile fields, such as observation ages and disk, memory and CPU measurements, still advances the revision but sends no event; the healthy 15-second refresh picks those up.
 
 The page does not render event payloads as the task view. A hint invalidates the view, and the cards come from a fresh snapshot fetch. On a healthy stream the background refresh stretches to 15 seconds, with a 100 ms debounce before that fetch. The controller still collects snapshots on a 2 second cadence; idle unchanged workers are probed at 10 seconds. Those remain the ceiling. On a stream error, a parse failure, an explicit repair, a 404, or 30 seconds of silence, the page returns to 2 second polling and reconnects with the last validated cursor, waiting 1, then 2, then 4, then 5 seconds, and further attempts stay at 5 seconds. Reconnects and tab visibility changes refetch so a hidden tab does not stay stale. A slow tab is told to rebaseline rather than skip ahead.
 
@@ -887,16 +868,7 @@ None of these limits change authoritative task state. A full publisher or an unr
 
 The sweep admits at most 100,000 directory entries, counting private residue and `.mac-worker-rooted-fs`. One more entry returns `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE` (`repair unavailable, registry too large`, public line `CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE: worker unavailable`, exit 69) before any task record, queue, or fact read, and before name validation and sort. The name listing still allocates the whole directory first; that cost is separate from record work. Addressed reads of specific task ids are a different selector and are not blocked by the cap. The laptop keeps this code. It is not rewritten as a generic `CONTROLLER_EVENTS_UNAVAILABLE`. The notifier keeps its last saved cache when a sweep cannot finish, and a one-shot exits 69. Shrinking the registry (close tasks, then `worker gc`) is what makes a full sweep possible again.
 
-These name-listing and record-work times were measured by T4 on 2026-10-01 in `real_names_cost_cap_and_independent_addressed_reads`. They are observations from that run, not guarantees. Times are microseconds. The fixture is about 10% private residue, and each admitted page reads one record on purpose so the record column stays the bounded work rather than the whole registry.
-
-| Entries | Name bytes | Names (µs) | Record and fact work (µs) | Records | Task input bytes | Queue reads | Associations |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 37,677 | 7,390 | 9,073 | 1 | 1,357 | 1 | 0 |
-| 10,000 | 376,977 | 30,463 | 4,086 | 1 | 1,357 | 1 | 0 |
-| 100,000 | 3,769,977 | 176,736 | 1,170 | 1 | 1,357 | 1 | 0 |
-| 100,001 | 3,770,021 | 46,120 | 0 | 0 | 0 | 0 | 0 |
-
-The 100,001 row is collection and the count only. Rejection happens before validation, sort, and every record read, which is why that names time is lower than the 100,000 row. Do not read it as a cheaper listing.
+Measured name-listing and record-work times for registries of 1,000 to 100,001 entries are in the [events validation record](superpowers/validation/2026-09-30-controller-events.md#names-and-record-work-observations-not-guarantees). They are observations from one fixture run, not guarantees.
 
 **What does not emit a hint.** A worker observation that only expires its TTL writes nothing; `worker.changed` comes from a committed observation. Leader health ticks and `health.json` are not journal events. Stale health remains the failover signal. A host `worker gc` close is silent until the controller persists that lifecycle. Runner logs, log sidecars, and byte followers are not woken by the journal.
 
@@ -913,14 +885,11 @@ The 100,001 row is collection and the count only. Rejection happens before valid
 | `CONTROLLER_EVENTS_NOTIFY_LOCK_HELD: protocol error` (exit 70) | another notifier owns this controller | stop the other one; do not run two |
 | a finished task and no banner | the decision was saved before display, or the hint was already lost at cold baseline | that banner is not repeated; a later `worker notify` stays silent for a decision already saved |
 
-### Not in this wave
+### What events and notify do not do
 
-This wave does not change `worker task wait`, does not add run-level banners or run settlement, and does not treat worker TTL expiry as availability. There is no `worker events --since`, no snapshot of every subsystem, and no emulation of the feed on an old controller. The notifier is not a LaunchAgent. The CLI has no reset command and no journal delete.
+Events do not change `worker task wait`. There are no run-level banners and no run settlement, and worker TTL expiry is not treated as availability. There is no `worker events --since`, no snapshot of every subsystem, and no emulation of the feed on an old controller. The notifier is not a LaunchAgent. The CLI has no notifier reset and no journal delete.
 
-The later persistent read channel is documented under
-[Persistent controller read channel](#persistent-controller-read-channel). It does not change the
-event journal or notifier semantics described in this section. Phone access, Tailscale, and a
-daemon on every mini remain outside both phases.
+The [persistent controller read channel](#persistent-controller-read-channel) carries these read loops but does not change the event journal or notifier semantics. Phone access, Tailscale, and a daemon on every mini are out of scope.
 
 ## What the pool will and will not do
 
@@ -937,7 +906,7 @@ daemon on every mini remain outside both phases.
 
 The snapshot-backed v1 batch commands (`worker run`, top-level `worker status`, `worker logs`, and `worker cancel`) and their rsync transport are retired. Use the [task lifecycle](#task-lifecycle) for coding tasks, including `worker task batch` and task DAGs. `worker doctor --project .` still validates a project before its first task.
 
-Before upgrading an installation that used batch execution, drain its work with the old tools. Valid legacy queue rows and job records remain readable; existing host leases remain busy. The upgrade adds no automatic legacy cleanup. See [retired batch state](legacy-batch-state.md) for the drain-first procedure and the exact boundary for manual cleanup.
+Before upgrading an installation that used batch execution, drain its work with the old tools. Valid legacy queue rows and job records stay on disk and are ignored by task scheduling; existing host leases remain busy; the dashboard no longer serves legacy job routes. The upgrade adds no automatic legacy cleanup. See [retired batch state](legacy-batch-state.md) for the drain-first procedure and the exact boundary for manual cleanup.
 
 ## Exit codes and errors
 
