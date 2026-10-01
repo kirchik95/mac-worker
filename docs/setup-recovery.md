@@ -397,12 +397,12 @@ The v2 helper migrates the host layout only through `worker setup`. Every other 
 
 ```bash
 mv ~/.local/share/mac-worker ~/.local/share/mac-worker.pre-anchor-<date>
-./target/release/worker setup mini-1
+worker setup mini-1
 ```
 
-Name the archive `mac-worker.pre-anchor-<date>`, for example `mac-worker.pre-anchor-2026-09-03`. Do not use `sudo`, `rm -rf`, or globs under `~/.local/share/mac-worker`. Keep the archive until the new helper has been probed and a trusted job has completed. After a successful setup, `worker workers` should report the worker ready again.
+Name the archive `mac-worker.pre-anchor-<date>`, for example `mac-worker.pre-anchor-2026-09-03`. Do not use `sudo`, `rm -rf`, or globs under `~/.local/share/mac-worker`. Keep the archive until the new helper has been probed and a trusted task has completed. After a successful setup, `worker workers` should report the worker ready again.
 
 Rerun `worker setup` on every worker after a helper that changes the host layout or that collects agent facts for the first time.
 
 
-The `mv` command above runs on the worker. Run `worker setup <name>` on the controller afterward; use the installed CLI instead of `./target/release/worker` when available.
+The `mv` command runs on the worker as the worker account. Run `worker setup <name>` afterward from the machine that holds the worker inventory, normally the laptop.
