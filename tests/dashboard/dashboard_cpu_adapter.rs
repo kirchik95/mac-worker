@@ -2,7 +2,7 @@ use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
 use mac_worker::{
     dashboard::{
-        model::{DashboardError, DashboardJob, DashboardQueueEntry, DashboardSnapshot},
+        model::{DashboardError, DashboardQueueEntry, DashboardSnapshot},
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
@@ -126,17 +126,6 @@ impl DashboardDataSource for SequentialSource {
         vec![WorkerObservationResult::Current(
             project_worker(&ready_health(probe), observed_at).unwrap(),
         )]
-    }
-
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<mac_worker::dashboard::model::DashboardJob, DashboardError>> {
-        Vec::new()
     }
 
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {

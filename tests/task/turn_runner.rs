@@ -452,10 +452,6 @@ struct HostReportsSuccessReader {
 }
 
 impl DashboardRemoteReader for HostReportsSuccessReader {
-    fn status(&self, _worker: &WorkerEntry, _job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        Err(WorkerError::Protocol("JOB_NOT_FOUND".into()))
-    }
-
     fn log_chunk(
         &self,
         _worker: &WorkerEntry,

@@ -156,8 +156,6 @@ export function exampleSnapshot(now = NOW): Snapshot {
           progress: progress(tasks.filter((task) => task.run_id === id(101 + index))),
         })),
     queue: [],
-    active_jobs: [],
-    recent_jobs: [],
   }
 }
 

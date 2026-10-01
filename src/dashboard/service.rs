@@ -19,9 +19,9 @@ use crate::{
         },
         model::{
             AgentFactsFreshness, CollectionSummary, DASHBOARD_API_VERSION, DashboardActiveTask,
-            DashboardError, DashboardJob, DashboardJobState, DashboardLaptop,
-            DashboardProjectDefaults, DashboardQueueEntry, DashboardSlotState, DashboardSnapshot,
-            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            DashboardError, DashboardLaptop, DashboardProjectDefaults, DashboardQueueEntry,
+            DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
+            SystemSummary, WorkerHealth,
         },
     },
     error::WorkerError,
@@ -31,7 +31,6 @@ use crate::{
     task_view::{TaskFreshness, TaskListProjection},
 };
 
-pub const MAX_RECENT_TERMINAL_JOBS: usize = 100;
 pub const MAX_COLLECTION_ERRORS: usize = 64;
 pub const WORKER_COLLECTION_DEADLINE: Duration = Duration::from_secs(15);
 pub const GLOBAL_COLLECTION_DEADLINE: Duration = Duration::from_secs(20);
@@ -43,7 +42,6 @@ const DEADLINE_OVERFLOW: &str = "DASHBOARD_DEADLINE_OVERFLOW";
 const REFRESH_TIMEOUT: &str = "DASHBOARD_REFRESH_TIMEOUT";
 const REFRESH_ABORTED: &str = "DASHBOARD_REFRESH_ABORTED";
 const WORKER_DEADLINE_EXCEEDED: &str = "WORKER_COLLECTION_DEADLINE_EXCEEDED";
-const ACTIVE_JOB_DEADLINE_EXCEEDED: &str = "ACTIVE_JOB_COLLECTION_DEADLINE_EXCEEDED";
 
 pub trait Clock: Send + Sync + 'static {
     fn now_millis(&self) -> u64;
@@ -173,11 +171,6 @@ pub trait DashboardDataSource: Send + Sync + 'static {
         let _ = names;
         self.collect_workers(deadline)
     }
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError>;
-    fn authoritative_active_jobs(
-        &self,
-        deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>>;
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError>;
     fn task_projection(
         &self,
@@ -521,8 +514,6 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
                 task_view: TaskListProjection::empty(),
                 workers: Vec::new(),
                 queue: Vec::new(),
-                active_jobs: Vec::new(),
-                recent_jobs: Vec::new(),
                 laptop: None,
             });
         let generation = self
@@ -793,16 +784,6 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
         let mut errors = Vec::new();
         let configured = self.collect_configured_workers(&mut errors);
         let mut workers = self.collect_workers(&configured, deadline, &mut errors);
-        let local_jobs = dedupe_local_jobs(self.collect_local_jobs(&mut errors), &mut errors);
-        let (remote_jobs, remote_duplicates) =
-            dedupe_remote_jobs(self.collect_remote_jobs(deadline, &mut errors), &mut errors);
-        let (active_jobs, recent_jobs) = reconcile_jobs(
-            local_jobs,
-            remote_jobs,
-            remote_duplicates,
-            &workers,
-            &mut errors,
-        );
         let task_view = self.collect_tasks(deadline, &mut errors);
         enrich_active_tasks(&mut workers, &task_view);
         let queue = match self.source.queue_entries() {
@@ -827,8 +808,6 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             task_view,
             workers,
             queue,
-            active_jobs,
-            recent_jobs,
             laptop: None,
         };
         apply_laptop_binary(&self.binary, &mut snapshot);
@@ -1109,49 +1088,6 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             });
     }
 
-    fn collect_local_jobs(&self, errors: &mut Vec<DashboardError>) -> Vec<DashboardJob> {
-        match self.source.local_jobs() {
-            Ok(jobs) => jobs,
-            Err(error) => {
-                push_error(errors, error);
-                Vec::new()
-            }
-        }
-    }
-
-    fn collect_remote_jobs(
-        &self,
-        deadline: u64,
-        errors: &mut Vec<DashboardError>,
-    ) -> Vec<DashboardJob> {
-        let remaining = remaining_duration(&self.monotonic, deadline);
-        if remaining.is_zero() {
-            push_error(
-                errors,
-                DashboardError::new(
-                    ACTIVE_JOB_DEADLINE_EXCEEDED,
-                    "active-job collection budget expired before remote status collection",
-                ),
-            );
-            return Vec::new();
-        }
-
-        let mut jobs = Vec::new();
-        let mut failures = Vec::new();
-        for row in self.source.authoritative_active_jobs(remaining) {
-            match row {
-                Ok(job) => jobs.push(job),
-                Err(error) => failures.push(bounded_error(error)),
-            }
-        }
-        failures
-            .sort_by(|left, right| (&left.code, &left.message).cmp(&(&right.code, &right.message)));
-        failures
-            .into_iter()
-            .for_each(|error| push_error(errors, error));
-        jobs
-    }
-
     fn next_revision(&self) -> Result<u64, DashboardError> {
         let current = self.revision.load(Ordering::SeqCst);
         let next = current.checked_add(1).ok_or_else(|| {
@@ -1186,8 +1122,6 @@ impl<S: DashboardDataSource, C: Clock, M: MonotonicClock> DashboardService<S, C,
             task_view: DashboardTaskCollection::empty().projection,
             workers: Vec::new(),
             queue: Vec::new(),
-            active_jobs: Vec::new(),
-            recent_jobs: Vec::new(),
             laptop: None,
         };
         apply_laptop_binary(&self.binary, &mut snapshot);
@@ -1281,117 +1215,6 @@ fn refresh_agent_facts_freshness(workers: &mut [DashboardWorker], now_millis: u6
     }
 }
 
-fn dedupe_local_jobs(
-    local_rows: Vec<DashboardJob>,
-    errors: &mut Vec<DashboardError>,
-) -> HashMap<JobId, DashboardJob> {
-    let (local, local_duplicates) = unique_jobs(local_rows);
-    for job_id in local_duplicates {
-        push_error(
-            errors,
-            DashboardError::new(
-                "DUPLICATE_LOCAL_JOB",
-                format!("local job {job_id} appears more than once"),
-            ),
-        );
-    }
-    local
-}
-
-fn dedupe_remote_jobs(
-    remote_rows: Vec<DashboardJob>,
-    errors: &mut Vec<DashboardError>,
-) -> (HashMap<JobId, DashboardJob>, Vec<JobId>) {
-    let (remote, remote_duplicates) = unique_jobs(remote_rows);
-    for job_id in &remote_duplicates {
-        push_error(
-            errors,
-            DashboardError::new(
-                "DUPLICATE_REMOTE_JOB",
-                format!("remote job {job_id} appears more than once and is quarantined"),
-            ),
-        );
-    }
-    (remote, remote_duplicates)
-}
-
-fn reconcile_jobs(
-    mut local: HashMap<JobId, DashboardJob>,
-    remote: HashMap<JobId, DashboardJob>,
-    remote_duplicates: Vec<JobId>,
-    workers: &[DashboardWorker],
-    errors: &mut Vec<DashboardError>,
-) -> (Vec<DashboardJob>, Vec<DashboardJob>) {
-    for job_id in &remote_duplicates {
-        local.remove(job_id);
-    }
-    for (job_id, remote_job) in remote {
-        local.insert(job_id, remote_job);
-    }
-
-    for worker in workers {
-        let Some(job_id) = worker.slot.active_job_id else {
-            continue;
-        };
-        if local
-            .get(&job_id)
-            .is_some_and(|job| is_terminal(&job.state))
-        {
-            push_error(
-                errors,
-                DashboardError::new(
-                    "TERMINAL_JOB_LEASE_INCONSISTENCY",
-                    format!(
-                        "worker {} reports occupied slot for terminal job {job_id}",
-                        worker.name
-                    ),
-                ),
-            );
-        }
-    }
-
-    let mut active = Vec::new();
-    let mut recent = Vec::new();
-    for job in local.into_values() {
-        if is_active(&job.state) {
-            active.push(job);
-        } else {
-            recent.push(job);
-        }
-    }
-    active.sort_by(|left, right| {
-        (left.created_at_millis, left.job_id.to_string())
-            .cmp(&(right.created_at_millis, right.job_id.to_string()))
-    });
-    recent.sort_by(|left, right| {
-        right
-            .updated_at_millis
-            .cmp(&left.updated_at_millis)
-            .then_with(|| left.job_id.to_string().cmp(&right.job_id.to_string()))
-    });
-    recent.truncate(MAX_RECENT_TERMINAL_JOBS);
-    (active, recent)
-}
-
-fn unique_jobs(rows: Vec<DashboardJob>) -> (HashMap<JobId, DashboardJob>, Vec<JobId>) {
-    let mut grouped: HashMap<JobId, Vec<DashboardJob>> = HashMap::new();
-    for job in rows {
-        grouped.entry(job.job_id).or_default().push(job);
-    }
-
-    let mut unique = HashMap::new();
-    let mut duplicates = Vec::new();
-    for (job_id, mut rows) in grouped {
-        if rows.len() == 1 {
-            unique.insert(job_id, rows.pop().expect("one row exists"));
-        } else {
-            duplicates.push(job_id);
-        }
-    }
-    duplicates.sort_by_key(ToString::to_string);
-    (unique, duplicates)
-}
-
 #[derive(Clone, PartialEq)]
 struct WorkerProbeSignature {
     health: WorkerHealth,
@@ -1468,27 +1291,6 @@ fn offline_worker(worker_name: &str, error: DashboardError, capacity: u8) -> Das
     }
 }
 
-fn is_active(state: &DashboardJobState) -> bool {
-    matches!(
-        state,
-        DashboardJobState::Uploading
-            | DashboardJobState::Verified
-            | DashboardJobState::Accepted
-            | DashboardJobState::Running
-    )
-}
-
-fn is_terminal(state: &DashboardJobState) -> bool {
-    matches!(
-        state,
-        DashboardJobState::Succeeded
-            | DashboardJobState::Failed
-            | DashboardJobState::Cancelled
-            | DashboardJobState::TimedOut
-            | DashboardJobState::Lost
-    )
-}
-
 fn absolute_deadline<M: MonotonicClock>(
     monotonic: &M,
     budget: Duration,
@@ -1554,17 +1356,6 @@ mod tests {
         }
 
         fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
-            Vec::new()
-        }
-
-        fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-            Ok(Vec::new())
-        }
-
-        fn authoritative_active_jobs(
-            &self,
-            _deadline: Duration,
-        ) -> Vec<Result<DashboardJob, DashboardError>> {
             Vec::new()
         }
 
@@ -1640,17 +1431,6 @@ mod tests {
         }
 
         fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
-            Vec::new()
-        }
-
-        fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-            Ok(Vec::new())
-        }
-
-        fn authoritative_active_jobs(
-            &self,
-            _deadline: Duration,
-        ) -> Vec<Result<DashboardJob, DashboardError>> {
             Vec::new()
         }
 

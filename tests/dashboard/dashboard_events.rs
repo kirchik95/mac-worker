@@ -373,17 +373,17 @@ use mac_worker::{
     dashboard::{
         cache::Observation,
         model::{
-            ApiError, DashboardError, DashboardJob, DashboardLogChunk, DashboardQueueEntry,
-            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
+            ApiError, DashboardError, DashboardLogChunk, DashboardQueueEntry, DashboardWorker,
+            Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
         service::{
             Clock, DashboardDataSource, DashboardService, DashboardTaskCollection, MonotonicClock,
             WorkerObservationResult,
         },
         task::DashboardTaskSource,
-        web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
+        web::{DashboardHttpServer, DashboardHttpState},
     },
-    job::{JobId, LogStream},
+    job::LogStream,
     task::{BranchName, ClosePolicy, TaskId, TaskState, TurnId},
     task_view::{
         ReviewState, TaskDetailProjection, TaskFreshness, TaskListProjection, TaskListRow,
@@ -544,12 +544,6 @@ impl DashboardDataSource for ProjectionSource {
                 active_task: None,
             },
         })]
-    }
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-    fn authoritative_active_jobs(&self, _: Duration) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
     }
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
         Ok(Vec::new())
@@ -752,28 +746,8 @@ impl DashboardDataSource for Empty {
     fn collect_workers(&self, _: Duration) -> Vec<WorkerObservationResult> {
         Vec::new()
     }
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-    fn authoritative_active_jobs(&self, _: Duration) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
-    }
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
         Ok(Vec::new())
-    }
-}
-impl DashboardLogSource for Empty {
-    fn job_detail(&self, _: JobId) -> Result<DashboardJob, ApiError> {
-        Err(ApiError::new("NOT_FOUND", "fixture"))
-    }
-    fn read_log(
-        &self,
-        _: JobId,
-        _: LogStream,
-        _: u64,
-        _: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        Err(ApiError::new("NOT_FOUND", "fixture"))
     }
 }
 impl DashboardTaskSource for Empty {
@@ -816,7 +790,6 @@ impl ViewerEventSource for ReadyViewer {
 fn state() -> Arc<DashboardHttpState<Empty, Empty, Empty>> {
     Arc::new(DashboardHttpState {
         service: Arc::new(DashboardService::new(Empty, Empty, Empty)),
-        log_source: Arc::new(Empty),
         task_source: Arc::new(Empty),
         settings_source: None,
         mutation_source: None,
@@ -1396,7 +1369,6 @@ impl SseHarness {
         );
         let state = Arc::new(DashboardHttpState {
             service: service.clone(),
-            log_source: Arc::new(Empty),
             task_source: Arc::new(Empty),
             settings_source: None,
             mutation_source: None,

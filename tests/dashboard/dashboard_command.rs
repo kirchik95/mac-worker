@@ -12,15 +12,15 @@ use mac_worker::{
     cli::{Cli, Command as WorkerCommand},
     dashboard::{
         command::{BrowserOpener, DashboardCommandRequest, DashboardLauncher, run_dashboard},
-        model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk, DashboardQueueEntry},
+        model::{ApiError, DashboardError, DashboardLogChunk, DashboardQueueEntry},
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
         task::DashboardTaskSource,
-        web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
+        web::{DashboardHttpServer, DashboardHttpState},
     },
     error::WorkerError,
-    job::{JobId, LogStream},
+    job::LogStream,
     task::{TaskId, TurnId},
     task_view::TaskDetailProjection,
 };
@@ -200,7 +200,6 @@ async fn dashboard_lifecycle_stays_read_only_after_a_browser_client_disconnects(
 struct RecordingLauncher {
     requests: Mutex<Vec<DashboardCommandRequest>>,
     source: ReadOnlySource,
-    logs: Arc<ReadOnlyLogs>,
     task_source: Arc<ReadOnlyTaskSource>,
     started: Mutex<Option<oneshot::Sender<String>>>,
 }
@@ -210,7 +209,6 @@ impl RecordingLauncher {
         Self {
             requests: Mutex::new(Vec::new()),
             source: ReadOnlySource::default(),
-            logs: Arc::new(ReadOnlyLogs::default()),
             task_source: Arc::new(ReadOnlyTaskSource::default()),
             started: Mutex::new(started),
         }
@@ -222,7 +220,7 @@ impl RecordingLauncher {
 
     fn assert_no_mutations(&self) {
         assert_eq!(
-            self.source.mutation_count() + self.logs.mutation_count(),
+            self.source.mutation_count(),
             0,
             "dashboard launch, browser requests, disconnects, and shutdown must not invoke fake submit, cancel, retry, delete, or lease operations"
         );
@@ -241,13 +239,11 @@ impl DashboardLauncher for RecordingLauncher {
     ) -> Pin<Box<dyn Future<Output = Result<DashboardHttpServer, WorkerError>> + Send + 'a>> {
         self.requests.lock().unwrap().push(request);
         let source = self.source.clone();
-        let logs = Arc::clone(&self.logs);
         let task_source = Arc::clone(&self.task_source);
         let started = self.started.lock().unwrap().take();
         Box::pin(async move {
             let state = Arc::new(DashboardHttpState {
                 service: Arc::new(DashboardService::new(source, FixedClock, FixedClock)),
-                log_source: logs,
                 task_source,
                 settings_source: None,
                 mutation_source: None,
@@ -284,53 +280,8 @@ impl DashboardDataSource for ReadOnlySource {
         Vec::new()
     }
 
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
-    }
-
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
         Ok(Vec::new())
-    }
-}
-
-#[derive(Default)]
-struct ReadOnlyLogs {
-    mutation_count: std::sync::atomic::AtomicUsize,
-}
-
-impl ReadOnlyLogs {
-    fn mutation_count(&self) -> usize {
-        self.mutation_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl DashboardLogSource for ReadOnlyLogs {
-    fn job_detail(&self, _job_id: JobId) -> Result<DashboardJob, ApiError> {
-        Err(ApiError::new(
-            "JOB_NOT_FOUND",
-            "job is not present in fake state",
-        ))
-    }
-
-    fn read_log(
-        &self,
-        _job_id: JobId,
-        _stream: LogStream,
-        _offset: u64,
-        _limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        Err(ApiError::new(
-            "JOB_NOT_FOUND",
-            "job is not present in fake state",
-        ))
     }
 }
 

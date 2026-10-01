@@ -35,8 +35,6 @@ pub struct DashboardSnapshot {
     pub task_view: TaskListProjection,
     pub workers: Vec<DashboardWorker>,
     pub queue: Vec<DashboardQueueEntry>,
-    pub active_jobs: Vec<DashboardJob>,
-    pub recent_jobs: Vec<DashboardJob>,
     /// Present only when the process was started from a binary that no
     /// longer matches the file at its executable path. Additive: older
     /// UIs ignore the object.
@@ -281,57 +279,6 @@ impl Serialize for DashboardActiveTask {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DashboardJob {
-    pub job_id: JobId,
-    pub worker_name: String,
-    pub project_id: String,
-    pub worktree_id: String,
-    pub project_label: Option<String>,
-    pub manifest_digest: String,
-    pub command_summary: DashboardCommandSummary,
-    pub resource_class: String,
-    pub created_at_millis: u64,
-    pub updated_at_millis: u64,
-    pub state: DashboardJobState,
-    pub exit_code: Option<u8>,
-    pub terminating_signal: Option<u32>,
-    pub final_stdout_bytes: Option<u64>,
-    pub final_stderr_bytes: Option<u64>,
-    pub artifact_status: Option<ArtifactStatus>,
-    pub remote_uncertainty: Option<String>,
-}
-
-impl Serialize for DashboardJob {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut record = serializer.serialize_struct("DashboardJob", 17)?;
-        record.serialize_field("job_id", &self.job_id)?;
-        record.serialize_field("worker_name", &self.worker_name)?;
-        record.serialize_field("project_id", &self.project_id)?;
-        record.serialize_field("worktree_id", &self.worktree_id)?;
-        record.serialize_field(
-            "project_label",
-            &self
-                .project_label
-                .as_deref()
-                .map(|label| sanitize_bounded(label, MAX_PROJECT_LABEL_CHARS)),
-        )?;
-        record.serialize_field("manifest_digest", &self.manifest_digest)?;
-        record.serialize_field("command_summary", &self.command_summary)?;
-        record.serialize_field("resource_class", &self.resource_class)?;
-        record.serialize_field("created_at_millis", &self.created_at_millis)?;
-        record.serialize_field("updated_at_millis", &self.updated_at_millis)?;
-        record.serialize_field("state", &self.state)?;
-        record.serialize_field("exit_code", &self.exit_code)?;
-        record.serialize_field("terminating_signal", &self.terminating_signal)?;
-        record.serialize_field("final_stdout_bytes", &self.final_stdout_bytes)?;
-        record.serialize_field("final_stderr_bytes", &self.final_stderr_bytes)?;
-        record.serialize_field("artifact_status", &self.artifact_status)?;
-        record.serialize_field("remote_uncertainty", &self.remote_uncertainty)?;
-        record.end()
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SlotSummary {
     pub state: DashboardSlotState,
@@ -456,20 +403,6 @@ pub struct CollectionSummary {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum DashboardJobState {
-    Uploading,
-    Verified,
-    Accepted,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-    TimedOut,
-    Lost,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub enum DashboardSlotState {
     Idle,
     Busy,
@@ -495,14 +428,6 @@ pub enum DashboardCommandMode {
 pub struct DashboardCommandSummary {
     pub mode: DashboardCommandMode,
     pub arg_count: Option<u16>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactStatus {
-    Pending,
-    Available,
-    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,23 +569,6 @@ impl Serialize for ApiError {
         )?;
         record.end()
     }
-}
-
-pub fn short_identifier(identifier: &str) -> String {
-    identifier.chars().take(12).collect()
-}
-
-pub fn project_label_or_fallback(job: &DashboardJob) -> String {
-    job.project_label
-        .as_deref()
-        .map(|label| sanitize_bounded(label, MAX_PROJECT_LABEL_CHARS))
-        .unwrap_or_else(|| {
-            format!(
-                "project-{}/worktree-{}",
-                short_identifier(&job.project_id),
-                short_identifier(&job.worktree_id)
-            )
-        })
 }
 
 pub fn sanitize_bounded(value: &str, limit: usize) -> String {

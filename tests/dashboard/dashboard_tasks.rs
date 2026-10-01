@@ -28,7 +28,7 @@ use mac_worker::{
     error::WorkerError,
     job::{
         AdmissionObservation, CommandSummary, JobId, LogChunk, LogStream, QueueEntry,
-        QueueEntryKind, QueueRunReference, RunId as QueueRunId, StatusResponse,
+        QueueEntryKind, QueueRunReference, RunId as QueueRunId,
     },
     lease::SlotState,
     project_config::ProjectSettings,
@@ -315,6 +315,39 @@ fn task_source_uses_typed_ids_and_stale_detail_without_mutation() {
     assert_eq!(
         harness.remote.log_requests(),
         vec![(turn_id, LogStream::Stdout, 3, 4)]
+    );
+    assert_eq!(harness.mutation_calls(), 0);
+}
+
+#[test]
+fn task_log_projects_the_typed_remote_chunk_without_reencoding_bytes() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let turn_id = harness
+        .state
+        .load_task(harness.task_id())
+        .unwrap()
+        .status()
+        .turns()[0]
+        .turn_id();
+    harness
+        .state
+        .write_turn_prompt(harness.task_id(), turn_id, SECRET)
+        .unwrap();
+    let bytes = vec![0, 255, b'\n', b'x'];
+    let expected = LogChunk::new(LogStream::Stderr, 7, bytes.clone()).unwrap();
+    *harness.remote.log_bytes.lock().unwrap() = Some(bytes);
+
+    let result = harness
+        .task_source()
+        .read_task_log(harness.task_id(), turn_id, LogStream::Stderr, 7, 12)
+        .unwrap();
+    assert_eq!(result.stream(), LogStream::Stderr);
+    assert_eq!(result.offset(), expected.offset());
+    assert_eq!(result.next_offset(), expected.next_offset());
+    assert_eq!(result.data(), expected.data());
+    assert_eq!(
+        harness.remote.log_requests(),
+        vec![(turn_id, LogStream::Stderr, 7, 12)]
     );
     assert_eq!(harness.mutation_calls(), 0);
 }
@@ -1096,6 +1129,7 @@ struct FakeRemote {
     task_status: Mutex<Option<Result<TaskStatusResponse, String>>>,
     task_status_calls: AtomicUsize,
     log_requests: Mutex<Vec<(JobId, LogStream, u64, u32)>>,
+    log_bytes: Mutex<Option<Vec<u8>>>,
     mutation_calls: AtomicUsize,
 }
 
@@ -1127,10 +1161,6 @@ impl FakeRemote {
 }
 
 impl DashboardRemoteReader for FakeRemote {
-    fn status(&self, _worker: &WorkerEntry, _job_id: JobId) -> Result<StatusResponse, WorkerError> {
-        Err(WorkerError::Protocol("JOB_NOT_FOUND".into()))
-    }
-
     fn log_chunk(
         &self,
         _worker: &WorkerEntry,
@@ -1143,7 +1173,15 @@ impl DashboardRemoteReader for FakeRemote {
             .lock()
             .unwrap()
             .push((job_id, stream, offset, limit));
-        LogChunk::new(stream, offset, b"data".to_vec())
+        LogChunk::new(
+            stream,
+            offset,
+            self.log_bytes
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| b"data".to_vec()),
+        )
     }
 
     fn task_status(
@@ -1430,19 +1468,6 @@ impl DashboardDataSource for EmptyTaskSource {
     }
 
     fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
-        Vec::new()
-    }
-
-    fn local_jobs(
-        &self,
-    ) -> Result<Vec<mac_worker::dashboard::model::DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<mac_worker::dashboard::model::DashboardJob, DashboardError>> {
         Vec::new()
     }
 

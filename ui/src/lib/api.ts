@@ -154,8 +154,6 @@ export interface Snapshot {
   progress: Progress
   workers: Worker[]
   queue: QueueEntry[]
-  active_jobs: unknown[]
-  recent_jobs: unknown[]
   laptop?: { binary_outdated?: boolean } | null
 }
 

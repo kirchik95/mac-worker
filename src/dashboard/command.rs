@@ -14,7 +14,7 @@ use crate::{
         settings::{DashboardSettingsSource, SystemDashboardSettingsSource},
         source::{
             DashboardRemoteReader, DashboardWorkerReader, MacWorkerDashboardSource,
-            MacWorkerLogSource, SystemDashboardRemoteReader, SystemDashboardWorkerReader,
+            SystemDashboardRemoteReader, SystemDashboardWorkerReader,
         },
         task::{
             DashboardTaskMutationSource, DashboardTaskSource, MacWorkerTaskMutationSource,
@@ -106,7 +106,6 @@ impl SystemDashboardLauncher {
         let mutation_source: Arc<dyn DashboardTaskMutationSource> = Arc::new(
             MacWorkerTaskMutationSource::new(Arc::clone(&config), Arc::clone(&local_jobs), paths),
         );
-        let log_source = Arc::new(MacWorkerLogSource::new(config, local_jobs, remote));
         Self {
             events: None,
             state: Arc::new(DashboardHttpState {
@@ -117,7 +116,6 @@ impl SystemDashboardLauncher {
                     DashboardDeadlines::default(),
                     dashboard_config,
                 )),
-                log_source,
                 task_source,
                 settings_source: Some(settings_source),
                 mutation_source: Some(mutation_source),

@@ -5,13 +5,13 @@ use crate::{
     config::Config,
     dashboard::{
         model::{
-            DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardJob,
-            DashboardQueueEntry, DashboardQueueEntryKind,
+            DashboardCommandMode, DashboardCommandSummary, DashboardError, DashboardQueueEntry,
+            DashboardQueueEntryKind,
         },
         service::DashboardQueueReader,
     },
     error::WorkerError,
-    job::{CommandSummary, QueueEntryKind, QueueState},
+    job::{CommandSummary, JobId, QueueEntryKind, QueueState},
     task::{RunId, TaskId, TurnId},
 };
 
@@ -23,7 +23,12 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhaseFourQueueEntry {
     pub position: u32,
-    pub job: DashboardJob,
+    pub job_id: JobId,
+    pub project_id: String,
+    pub worktree_id: String,
+    pub project_label: Option<String>,
+    pub command_summary: DashboardCommandSummary,
+    pub created_at_millis: u64,
     pub entry_kind: DashboardQueueEntryKind,
     pub task_id: Option<TaskId>,
     pub turn_id: Option<TurnId>,
@@ -158,7 +163,12 @@ impl<R: PhaseFourQueueReader + Send + Sync + 'static> DashboardQueueReader
 fn project_queue_entry(entry: PhaseFourQueueEntry) -> Result<DashboardQueueEntry, DashboardError> {
     let PhaseFourQueueEntry {
         position,
-        job,
+        job_id,
+        project_id,
+        worktree_id,
+        project_label,
+        command_summary,
+        created_at_millis,
         entry_kind,
         task_id,
         turn_id,
@@ -170,18 +180,18 @@ fn project_queue_entry(entry: PhaseFourQueueEntry) -> Result<DashboardQueueEntry
     } = entry;
     Ok(DashboardQueueEntry {
         position,
-        job_id: job.job_id,
+        job_id,
         entry_kind,
         task_id,
         turn_id,
         run_id,
         run_max_parallel,
         pinned_worker,
-        project_id: job.project_id,
-        worktree_id: job.worktree_id,
-        project_label: job.project_label,
-        command_summary: job.command_summary,
-        created_at_millis: job.created_at_millis,
+        project_id,
+        worktree_id,
+        project_label,
+        command_summary,
+        created_at_millis,
         requirements,
         blocking_code,
     })

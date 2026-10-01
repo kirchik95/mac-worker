@@ -15,15 +15,14 @@ use mac_worker::{
         cache::Observation,
         model::{
             ApiError, DASHBOARD_API_VERSION, DashboardCommandMode, DashboardCommandSummary,
-            DashboardError, DashboardJob, DashboardJobState, DashboardLogChunk,
-            DashboardMemoryPressure, DashboardQueueEntry, DashboardWorker, Freshness, SlotSummary,
-            SystemSummary, WorkerHealth,
+            DashboardError, DashboardLogChunk, DashboardMemoryPressure, DashboardQueueEntry,
+            DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
         },
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
         task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
-        web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
+        web::{DashboardHttpServer, DashboardHttpState},
     },
     job::{JobId, LogStream},
     task::{BaseOid, BranchName, RunId, RunnerState, TaskId, TaskState, TurnId, TurnTerminal},
@@ -34,7 +33,7 @@ use mac_worker::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() {
-    let (server, _logs) = started_server().await;
+    let server = started_server().await;
     let host = listener_host(&server);
 
     let shell = request(&host, "/", &host);
@@ -81,20 +80,31 @@ async fn loopback_router_serves_embedded_assets_snapshot_and_security_headers() 
     assert_eq!(snapshot_json["api_version"], DASHBOARD_API_VERSION);
     assert_eq!(snapshot_json["queue"], serde_json::json!([]));
 
+    for path in [
+        "/api/v1/jobs/0123456789abcdef0123456789abcdef",
+        "/api/v1/jobs/0123456789abcdef0123456789abcdef/logs?stream=stdout&offset=0&limit=1",
+    ] {
+        let removed = request(&host, path, &host);
+        assert_eq!(removed.status, 404);
+        assert_security(&removed);
+    }
+
     server.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn router_rejects_invalid_log_inputs_without_calling_the_log_source() {
-    let (server, logs) = started_server().await;
+async fn router_rejects_invalid_log_inputs_without_calling_the_task_source() {
+    let logs = Arc::new(FixtureTaskSource::with_log_chunk());
+    let server = started_server_with_task_source(Arc::clone(&logs)).await;
     let host = listener_host(&server);
-    let id = job_id(1);
+    let id = fixture_task_id();
+    let turn = fixture_turn_id();
 
     for path in [
-        "/api/v1/jobs/not-an-id/logs?stream=stdout&offset=0&limit=1",
-        &format!("/api/v1/jobs/{id}/logs?stream=merged&offset=0&limit=1"),
-        &format!("/api/v1/jobs/{id}/logs?stream=stdout&offset=0&limit=0"),
-        &format!("/api/v1/jobs/{id}/logs?stream=stdout&offset=0&limit=65537"),
+        "/api/v1/tasks/not-an-id/turns/018f0f4a6b5c7d8e9f00112233445567/logs?stream=stdout&offset=0&limit=1",
+        &format!("/api/v1/tasks/{id}/turns/{turn}/logs?stream=merged&offset=0&limit=1"),
+        &format!("/api/v1/tasks/{id}/turns/{turn}/logs?stream=stdout&offset=0&limit=0"),
+        &format!("/api/v1/tasks/{id}/turns/{turn}/logs?stream=stdout&offset=0&limit=65537"),
     ] {
         let response = request(&host, path, &host);
         assert_eq!(response.status, 400, "{path}");
@@ -108,45 +118,9 @@ async fn router_rejects_invalid_log_inputs_without_calling_the_log_source() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn router_projects_typed_detail_and_log_routes_and_preserves_not_found() {
-    let (server, logs) = started_server().await;
-    let host = listener_host(&server);
-    let id = job_id(1);
-
-    let detail = request(&host, &format!("/api/v1/jobs/{id}"), &host);
-    assert_eq!(detail.status, 200);
-    assert_security(&detail);
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&detail.body).unwrap()["job_id"],
-        id.to_string()
-    );
-    assert_eq!(logs.detail_calls(), 1);
-
-    let log = request(
-        &host,
-        &format!("/api/v1/jobs/{id}/logs?stream=stderr&offset=7&limit=12"),
-        &host,
-    );
-    assert_eq!(log.status, 200);
-    assert_security(&log);
-    let log_json: serde_json::Value = serde_json::from_slice(&log.body).unwrap();
-    assert_eq!(log_json["stream"], "stderr");
-    assert_eq!(log_json["offset"], 7);
-    assert_eq!(log_json["next_offset"], 12);
-    assert_eq!(logs.log_calls(), 1);
-
-    let missing = request(&host, &format!("/api/v1/jobs/{}", job_id(2)), &host);
-    assert_eq!(missing.status, 404);
-    assert_security(&missing);
-    assert_eq!(error_code(&missing), "JOB_NOT_FOUND");
-
-    server.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_detail_route_returns_safe_detail_and_preserves_legacy_routes() {
+async fn task_detail_route_returns_safe_detail() {
     let task_source = Arc::new(FixtureTaskSource::with_detail(fixture_detail()));
-    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let server = started_server_with_task_source(Arc::clone(&task_source)).await;
     let host = listener_host(&server);
     let task_id = fixture_task_id();
 
@@ -164,9 +138,6 @@ async fn task_detail_route_returns_safe_detail_and_preserves_legacy_routes() {
             .starts_with("worker task fetch ")
     );
 
-    let legacy = request(&host, &format!("/api/v1/jobs/{}", job_id(1)), &host);
-    assert_eq!(legacy.status, 200);
-    assert_security(&legacy);
     assert_eq!(task_source.detail_calls(), 1);
 
     server.shutdown().await.unwrap();
@@ -175,7 +146,7 @@ async fn task_detail_route_returns_safe_detail_and_preserves_legacy_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_log_route_validates_turn_membership_and_byte_ranges() {
     let task_source = Arc::new(FixtureTaskSource::with_log_chunk());
-    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let server = started_server_with_task_source(Arc::clone(&task_source)).await;
     let host = listener_host(&server);
     let task_id = fixture_task_id();
     let turn_id = fixture_turn_id();
@@ -223,7 +194,7 @@ async fn task_log_route_validates_turn_membership_and_byte_ranges() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_routes_keep_loopback_security_and_issue_no_mutations() {
     let task_source = Arc::new(FixtureTaskSource::with_detail(fixture_detail()));
-    let (server, _logs) = started_server_with_task_source(Arc::clone(&task_source)).await;
+    let server = started_server_with_task_source(Arc::clone(&task_source)).await;
     let host = listener_host(&server);
 
     let response = request(
@@ -244,7 +215,7 @@ async fn task_routes_keep_loopback_security_and_issue_no_mutations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_rejects_a_host_that_does_not_match_the_actual_loopback_listener() {
-    let (server, _logs) = started_server().await;
+    let server = started_server().await;
     let host = listener_host(&server);
 
     let response = request(&host, "/api/v1/snapshot", "localhost:9999");
@@ -256,18 +227,15 @@ async fn router_rejects_a_host_that_does_not_match_the_actual_loopback_listener(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_only_lifecycle() {
+async fn http_fixture_preserves_mixed_freshness_fifo_task_log_cursors_and_read_only_lifecycle() {
     let mutations = MutationRecorder::default();
-    let terminal = terminal_job(job_id(3));
-    let source = FixtureSource::new(terminal.clone(), mutations);
-    let logs = Arc::new(FixtureLogs::new(terminal.clone()));
+    let source = FixtureSource::new(mutations);
     let state = Arc::new(DashboardHttpState {
         service: Arc::new(
             DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
                 .with_collection_interval(Duration::from_millis(20)),
         ),
-        log_source: logs,
-        task_source: Arc::new(FixtureTaskSource::default()),
+        task_source: Arc::new(FixtureTaskSource::with_terminal_logs()),
         settings_source: None,
         mutation_source: None,
     });
@@ -297,20 +265,10 @@ async fn http_fixture_preserves_mixed_freshness_fifo_terminal_cursors_and_read_o
         "NO_COMPATIBLE_IDLE_WORKER"
     );
 
-    let recent = &snapshot_json["recent_jobs"][0];
-    assert_eq!(recent["project_label"], serde_json::Value::Null);
-    assert_eq!(recent["final_stdout_bytes"], 5);
-    assert_eq!(recent["final_stderr_bytes"], 3);
-
-    let detail = request(&host, &format!("/api/v1/jobs/{}", terminal.job_id), &host);
-    assert_eq!(detail.status, 200);
-    let detail_json: serde_json::Value = serde_json::from_slice(&detail.body).unwrap();
-    assert_eq!(detail_json["project_label"], serde_json::Value::Null);
-
-    let stdout_first = log_request(&host, terminal.job_id, "stdout", 0);
-    let stdout_second = log_request(&host, terminal.job_id, "stdout", 3);
-    let stderr_first = log_request(&host, terminal.job_id, "stderr", 0);
-    let stderr_second = log_request(&host, terminal.job_id, "stderr", 2);
+    let stdout_first = log_request(&host, fixture_task_id(), "stdout", 0);
+    let stdout_second = log_request(&host, fixture_task_id(), "stdout", 3);
+    let stderr_first = log_request(&host, fixture_task_id(), "stderr", 0);
+    let stderr_second = log_request(&host, fixture_task_id(), "stderr", 2);
     assert_log_chunk(&stdout_first, 0, 3, "YWJj");
     assert_log_chunk(&stdout_second, 3, 5, "ZGU=");
     assert_log_chunk(&stderr_first, 0, 2, "eHk=");
@@ -335,7 +293,6 @@ async fn two_http_clients_share_one_in_flight_snapshot_refresh() {
             DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
                 .with_collection_interval(Duration::from_secs(60)),
         ),
-        log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
         mutation_source: None,
@@ -381,7 +338,6 @@ async fn dropping_the_http_server_stops_background_collection() {
             DashboardService::new(source.clone(), FixedClock, FixedMonotonic)
                 .with_collection_interval(Duration::from_secs(60)),
         ),
-        log_source: Arc::new(RecordingLogs::new(job(job_id(1)))),
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
         mutation_source: None,
@@ -396,25 +352,22 @@ async fn dropping_the_http_server_stops_background_collection() {
     assert_eq!(source.collect_calls(), after_start);
 }
 
-async fn started_server() -> (DashboardHttpServer, Arc<RecordingLogs>) {
+async fn started_server() -> DashboardHttpServer {
     started_server_with_task_source(Arc::new(FixtureTaskSource::default())).await
 }
 
 async fn started_server_with_task_source(
     task_source: Arc<FixtureTaskSource>,
-) -> (DashboardHttpServer, Arc<RecordingLogs>) {
+) -> DashboardHttpServer {
     let source = FakeSource;
     let service = Arc::new(DashboardService::new(source, FixedClock, FixedMonotonic));
-    let logs = Arc::new(RecordingLogs::new(job(job_id(1))));
     let state = Arc::new(DashboardHttpState {
         service,
-        log_source: logs.clone(),
         task_source,
         settings_source: None,
         mutation_source: None,
     });
-    let server = DashboardHttpServer::bind(None, state).await.unwrap();
-    (server, logs)
+    DashboardHttpServer::bind(None, state).await.unwrap()
 }
 
 fn listener_host(server: &DashboardHttpServer) -> String {
@@ -475,10 +428,13 @@ fn wait_for_snapshot(host: &str, predicate: impl Fn(&HttpResponse) -> bool) -> H
     }
 }
 
-fn log_request(address: &str, job_id: JobId, stream: &str, offset: u64) -> serde_json::Value {
+fn log_request(address: &str, task_id: TaskId, stream: &str, offset: u64) -> serde_json::Value {
     let response = request(
         address,
-        &format!("/api/v1/jobs/{job_id}/logs?stream={stream}&offset={offset}&limit=65536"),
+        &format!(
+            "/api/v1/tasks/{task_id}/turns/{}/logs?stream={stream}&offset={offset}&limit=65536",
+            fixture_turn_id()
+        ),
         address,
     );
     assert_eq!(response.status, 200);
@@ -598,17 +554,6 @@ impl DashboardDataSource for FakeSource {
         })]
     }
 
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
-    }
-
     fn queue_entries(
         &self,
     ) -> Result<Vec<mac_worker::dashboard::model::DashboardQueueEntry>, DashboardError> {
@@ -635,12 +580,11 @@ impl MonotonicClock for FixedMonotonic {
 #[derive(Clone)]
 struct FixtureSource {
     observations: Arc<Mutex<VecDeque<Vec<WorkerObservationResult>>>>,
-    terminal: DashboardJob,
     mutations: MutationRecorder,
 }
 
 impl FixtureSource {
-    fn new(terminal: DashboardJob, mutations: MutationRecorder) -> Self {
+    fn new(mutations: MutationRecorder) -> Self {
         Self {
             observations: Arc::new(Mutex::new(VecDeque::from([
                 vec![
@@ -660,7 +604,6 @@ impl FixtureSource {
                     },
                 ],
             ]))),
-            terminal,
             mutations,
         }
     }
@@ -698,17 +641,6 @@ impl DashboardDataSource for FixtureSource {
             }
             row.clone()
         }
-    }
-
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(vec![self.terminal.clone()])
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
     }
 
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
@@ -769,45 +701,6 @@ impl MutationRecorder {
     }
 }
 
-struct FixtureLogs {
-    terminal: DashboardJob,
-}
-
-impl FixtureLogs {
-    fn new(terminal: DashboardJob) -> Self {
-        Self { terminal }
-    }
-}
-
-impl DashboardLogSource for FixtureLogs {
-    fn job_detail(&self, job_id: JobId) -> Result<DashboardJob, ApiError> {
-        (job_id == self.terminal.job_id)
-            .then(|| self.terminal.clone())
-            .ok_or_else(|| ApiError::new("JOB_NOT_FOUND", "job is not retained"))
-    }
-
-    fn read_log(
-        &self,
-        job_id: JobId,
-        stream: LogStream,
-        offset: u64,
-        _limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        if job_id != self.terminal.job_id {
-            return Err(ApiError::new("JOB_NOT_FOUND", "job is not retained"));
-        }
-        let bytes = match (stream, offset) {
-            (LogStream::Stdout, 0) => b"abc".to_vec(),
-            (LogStream::Stdout, 3) => b"de".to_vec(),
-            (LogStream::Stderr, 0) => b"xy".to_vec(),
-            (LogStream::Stderr, 2) => b"z".to_vec(),
-            _ => Vec::new(),
-        };
-        DashboardLogChunk::from_bytes(stream, offset, bytes)
-            .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"))
-    }
-}
-
 #[derive(Clone)]
 struct CoalescingSource {
     gate: Arc<CollectionGate>,
@@ -838,17 +731,6 @@ impl DashboardDataSource for CoalescingSource {
         vec![WorkerObservationResult::Current(worker_observation(
             "mini-1", 1_000,
         ))]
-    }
-
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
     }
 
     fn queue_entries(&self) -> Result<Vec<DashboardQueueEntry>, DashboardError> {
@@ -920,60 +802,6 @@ fn worker_observation(name: &str, observed_at_millis: u64) -> Observation {
     }
 }
 
-struct RecordingLogs {
-    job: DashboardJob,
-    detail_calls: AtomicUsize,
-    log_calls: AtomicUsize,
-    seen_log_requests: Mutex<Vec<(JobId, LogStream, u64, u32)>>,
-}
-
-impl RecordingLogs {
-    fn new(job: DashboardJob) -> Self {
-        Self {
-            job,
-            detail_calls: AtomicUsize::new(0),
-            log_calls: AtomicUsize::new(0),
-            seen_log_requests: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn detail_calls(&self) -> usize {
-        self.detail_calls.load(Ordering::SeqCst)
-    }
-
-    fn log_calls(&self) -> usize {
-        self.log_calls.load(Ordering::SeqCst)
-    }
-}
-
-impl DashboardLogSource for RecordingLogs {
-    fn job_detail(&self, job_id: JobId) -> Result<DashboardJob, ApiError> {
-        self.detail_calls.fetch_add(1, Ordering::SeqCst);
-        (job_id == self.job.job_id)
-            .then(|| self.job.clone())
-            .ok_or_else(|| ApiError::new("JOB_NOT_FOUND", "job is not retained"))
-    }
-
-    fn read_log(
-        &self,
-        job_id: JobId,
-        stream: LogStream,
-        offset: u64,
-        limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        self.log_calls.fetch_add(1, Ordering::SeqCst);
-        self.seen_log_requests
-            .lock()
-            .unwrap()
-            .push((job_id, stream, offset, limit));
-        if job_id != self.job.job_id {
-            return Err(ApiError::new("JOB_NOT_FOUND", "job is not retained"));
-        }
-        DashboardLogChunk::from_bytes(stream, offset, b"hello".to_vec())
-            .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"))
-    }
-}
-
 type TaskLogRequest = (TaskId, TurnId, LogStream, u64, u32);
 
 #[derive(Default)]
@@ -984,6 +812,7 @@ struct FixtureTaskSource {
     log_calls: AtomicUsize,
     seen_log_requests: Mutex<Vec<TaskLogRequest>>,
     mutation_calls: AtomicUsize,
+    terminal_logs: bool,
 }
 
 impl FixtureTaskSource {
@@ -1000,6 +829,14 @@ impl FixtureTaskSource {
         Self {
             detail: Some(Ok(fixture_detail())),
             log_chunk: Some(chunk),
+            ..Self::default()
+        }
+    }
+
+    fn with_terminal_logs() -> Self {
+        Self {
+            detail: Some(Ok(fixture_detail())),
+            terminal_logs: true,
             ..Self::default()
         }
     }
@@ -1059,6 +896,17 @@ impl DashboardTaskSource for FixtureTaskSource {
                 "turn is not present in the requested task",
             ));
         }
+        if self.terminal_logs {
+            let bytes = match (stream, offset) {
+                (LogStream::Stdout, 0) => b"abc".to_vec(),
+                (LogStream::Stdout, 3) => b"de".to_vec(),
+                (LogStream::Stderr, 0) => b"xy".to_vec(),
+                (LogStream::Stderr, 2) => b"z".to_vec(),
+                _ => Vec::new(),
+            };
+            return DashboardLogChunk::from_bytes(stream, offset, bytes)
+                .map_err(|_| ApiError::new("LOG_UNAVAILABLE", "log is unavailable"));
+        }
         self.log_chunk.clone().unwrap_or_else(|| {
             Err(ApiError::new(
                 "TASK_SOURCE_FAILED",
@@ -1072,6 +920,10 @@ fn fixture_task_id() -> TaskId {
     "018f0f4a6b5c7d8e9f00112233445566"
         .parse()
         .expect("valid task ID fixture")
+}
+
+fn job_id(value: u128) -> JobId {
+    format!("{value:032x}").parse().unwrap()
 }
 
 fn fixture_turn_id() -> TurnId {
@@ -1165,45 +1017,6 @@ fn fixture_detail() -> TaskDetailProjection {
     }
 }
 
-fn job(job_id: JobId) -> DashboardJob {
-    DashboardJob {
-        job_id,
-        worker_name: "mini-1".into(),
-        project_id: "project-1".into(),
-        worktree_id: "worktree-1".into(),
-        project_label: None,
-        manifest_digest: "a".repeat(64),
-        command_summary: DashboardCommandSummary {
-            mode: DashboardCommandMode::Argv,
-            arg_count: Some(2),
-        },
-        resource_class: "default".into(),
-        created_at_millis: 1,
-        updated_at_millis: 2,
-        state: DashboardJobState::Running,
-        exit_code: None,
-        terminating_signal: None,
-        final_stdout_bytes: None,
-        final_stderr_bytes: None,
-        artifact_status: None,
-        remote_uncertainty: None,
-    }
-}
-
-fn terminal_job(job_id: JobId) -> DashboardJob {
-    let mut job = job(job_id);
-    job.project_label = None;
-    job.state = DashboardJobState::Succeeded;
-    job.exit_code = Some(0);
-    job.final_stdout_bytes = Some(5);
-    job.final_stderr_bytes = Some(3);
-    job
-}
-
-fn job_id(value: u128) -> JobId {
-    format!("{value:032x}").parse().unwrap()
-}
-
 #[derive(Default)]
 struct FixtureMutationSource {
     calls: AtomicUsize,
@@ -1275,10 +1088,8 @@ async fn started_server_with_mutation(
 ) -> DashboardHttpServer {
     let source = FakeSource;
     let service = Arc::new(DashboardService::new(source, FixedClock, FixedMonotonic));
-    let logs = Arc::new(RecordingLogs::new(job(job_id(1))));
     let state = Arc::new(DashboardHttpState {
         service,
-        log_source: logs,
         task_source: Arc::new(FixtureTaskSource::default()),
         settings_source: None,
         mutation_source: Some(mutations),
@@ -1335,7 +1146,7 @@ async fn reply_and_accept_require_task_headers_and_honor_revision() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_without_mutation_source_is_unavailable() {
-    let (server, _logs) = started_server().await;
+    let server = started_server().await;
     let address = listener_host(&server);
     let origin = format!("http://{address}");
     let headers = [

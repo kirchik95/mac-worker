@@ -1,9 +1,6 @@
 use mac_worker::{
     dashboard::{
-        model::{
-            DashboardCommandMode, DashboardCommandSummary, DashboardJob, DashboardJobState,
-            DashboardQueueEntryKind,
-        },
+        model::{DashboardCommandMode, DashboardCommandSummary, DashboardQueueEntryKind},
         queue::{PhaseFourQueueEntry, PhaseFourQueueReader, SchedulerQueueAdapter},
     },
     job::JobId,
@@ -40,24 +37,8 @@ fn queue_adapter_preserves_scheduler_fifo_order_and_reasons() {
 
 #[test]
 fn queue_adapter_projects_only_the_safe_queue_fields() {
-    let mut job = queue_job(7);
-    job.worker_name = SSH_SECRET.into();
-    job.manifest_digest = PATH_SECRET.into();
-    job.remote_uncertainty = Some(COMMAND_SECRET.into());
-
     let queue = SchedulerQueueAdapter::new(FakeQueue {
-        rows: vec![PhaseFourQueueEntry {
-            position: 1,
-            job,
-            entry_kind: DashboardQueueEntryKind::Batch,
-            task_id: None,
-            turn_id: None,
-            run_id: None,
-            run_max_parallel: None,
-            pinned_worker: None,
-            requirements: vec!["swift".into()],
-            blocking_code: "NO_COMPATIBLE_IDLE_WORKER".into(),
-        }],
+        rows: vec![phase_four_entry(1, 7, "NO_COMPATIBLE_IDLE_WORKER")],
     })
     .queue_entries()
     .unwrap();
@@ -87,7 +68,15 @@ impl PhaseFourQueueReader for FakeQueue {
 fn phase_four_entry(position: u32, id: u128, blocking_code: &str) -> PhaseFourQueueEntry {
     PhaseFourQueueEntry {
         position,
-        job: queue_job(id),
+        job_id: job_id(id),
+        project_id: format!("project-{id}"),
+        worktree_id: format!("worktree-{id}"),
+        project_label: Some(format!("Project {id}")),
+        command_summary: DashboardCommandSummary {
+            mode: DashboardCommandMode::Argv,
+            arg_count: Some(2),
+        },
+        created_at_millis: 1_000 + id as u64,
         entry_kind: DashboardQueueEntryKind::Batch,
         task_id: None,
         turn_id: None,
@@ -96,31 +85,6 @@ fn phase_four_entry(position: u32, id: u128, blocking_code: &str) -> PhaseFourQu
         pinned_worker: None,
         requirements: vec!["swift".into()],
         blocking_code: blocking_code.into(),
-    }
-}
-
-fn queue_job(id: u128) -> DashboardJob {
-    DashboardJob {
-        job_id: job_id(id),
-        worker_name: "unassigned".into(),
-        project_id: format!("project-{id}"),
-        worktree_id: format!("worktree-{id}"),
-        project_label: Some(format!("Project {id}")),
-        manifest_digest: "a".repeat(64),
-        command_summary: DashboardCommandSummary {
-            mode: DashboardCommandMode::Argv,
-            arg_count: Some(2),
-        },
-        resource_class: "heavy".into(),
-        created_at_millis: 1_000 + id as u64,
-        updated_at_millis: 1_000 + id as u64,
-        state: DashboardJobState::Accepted,
-        exit_code: None,
-        terminating_signal: None,
-        final_stdout_bytes: None,
-        final_stderr_bytes: None,
-        artifact_status: None,
-        remote_uncertainty: None,
     }
 }
 

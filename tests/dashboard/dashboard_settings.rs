@@ -16,16 +16,16 @@ use mac_worker::{
     },
     config::Config,
     dashboard::{
-        model::{ApiError, DashboardJob, DashboardLogChunk, DashboardQueueEntry},
+        model::{ApiError, DashboardLogChunk, DashboardQueueEntry},
         service::{
             Clock, DashboardDataSource, DashboardService, DashboardTaskCollection, MonotonicClock,
             WorkerObservationResult,
         },
         settings::{DashboardSettingsSource, SystemDashboardSettingsSource},
         task::DashboardTaskSource,
-        web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
+        web::{DashboardHttpServer, DashboardHttpState},
     },
-    job::{JobId, LogStream},
+    job::LogStream,
     process::{ProcessRequest, ProcessResult, ProcessRunner},
     task::{TaskId, TurnId},
     task_view::TaskListProjection,
@@ -125,17 +125,6 @@ impl DashboardDataSource for EmptyDashboard {
     fn collect_workers(&self, _deadline: Duration) -> Vec<WorkerObservationResult> {
         Vec::new()
     }
-    fn local_jobs(
-        &self,
-    ) -> Result<Vec<DashboardJob>, mac_worker::dashboard::model::DashboardError> {
-        Ok(Vec::new())
-    }
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, mac_worker::dashboard::model::DashboardError>> {
-        Vec::new()
-    }
     fn queue_entries(
         &self,
     ) -> Result<Vec<DashboardQueueEntry>, mac_worker::dashboard::model::DashboardError> {
@@ -149,23 +138,6 @@ impl DashboardDataSource for EmptyDashboard {
             projection: TaskListProjection::empty(),
             errors: Vec::new(),
         })
-    }
-}
-
-#[derive(Default)]
-struct EmptyLogs;
-impl DashboardLogSource for EmptyLogs {
-    fn job_detail(&self, _job_id: JobId) -> Result<DashboardJob, ApiError> {
-        Err(ApiError::new("JOB_NOT_FOUND", "job is not available"))
-    }
-    fn read_log(
-        &self,
-        _job_id: JobId,
-        _stream: LogStream,
-        _offset: u64,
-        _limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        Err(ApiError::new("JOB_NOT_FOUND", "job is not available"))
     }
 }
 
@@ -201,7 +173,6 @@ async fn server_for_source(settings: Arc<dyn DashboardSettingsSource>) -> Dashbo
             FixedClock,
             FixedClock,
         )),
-        log_source: Arc::new(EmptyLogs),
         task_source: Arc::new(EmptyTasks),
         settings_source: Some(settings),
         mutation_source: None,

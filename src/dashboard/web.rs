@@ -28,7 +28,7 @@ use crate::{
     },
     controller::events::{ViewerEventSource, ViewerMessage},
     dashboard::{
-        model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
+        model::{ApiError, DashboardError},
         service::{
             Clock, CollectorHandle, DashboardDataSource, DashboardService, LocalRefreshHandle,
             MonotonicClock,
@@ -37,7 +37,7 @@ use crate::{
         task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
     },
     error::WorkerError,
-    job::{JobId, LogStream},
+    job::LogStream,
     task::{TaskId, TurnId},
 };
 
@@ -55,20 +55,8 @@ const DASHBOARD_CSS: &str = include_str!("static/app/assets/index.css");
 const DASHBOARD_JS: &str = include_str!("static/app/assets/index.js");
 const FAVICON_SVG: &str = include_str!("static/app/favicon.svg");
 
-pub trait DashboardLogSource: Send + Sync + 'static {
-    fn job_detail(&self, job_id: JobId) -> Result<DashboardJob, ApiError>;
-    fn read_log(
-        &self,
-        job_id: JobId,
-        stream: LogStream,
-        offset: u64,
-        limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError>;
-}
-
 pub struct DashboardHttpState<S, C, M> {
     pub service: Arc<DashboardService<S, C, M>>,
-    pub log_source: Arc<dyn DashboardLogSource>,
     pub task_source: Arc<dyn DashboardTaskSource>,
     pub settings_source: Option<Arc<dyn DashboardSettingsSource>>,
     pub mutation_source: Option<Arc<dyn DashboardTaskMutationSource>>,
@@ -258,8 +246,6 @@ where
             "/api/v1/tasks/{task_id}/accept",
             post(task_accept::<S, C, M>),
         )
-        .route("/api/v1/jobs/{job_id}", get(job_detail::<S, C, M>))
-        .route("/api/v1/jobs/{job_id}/logs", get(log_chunk::<S, C, M>))
         .route(
             "/api/v1/workers/{worker_name}/agent-settings",
             get(agent_settings_get::<S, C, M>).post(agent_settings_post::<S, C, M>),
@@ -757,63 +743,6 @@ fn request_has_settings_headers(request: &Request, expected_host: &str) -> bool 
     content_type && custom_header && origin
 }
 
-async fn job_detail<S, C, M>(
-    State(state): State<AppState<S, C, M>>,
-    Path(raw_job_id): Path<String>,
-) -> Response
-where
-    S: DashboardDataSource,
-    C: Clock,
-    M: MonotonicClock,
-{
-    let job_id = match parse_job_id(&raw_job_id) {
-        Ok(job_id) => job_id,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
-    };
-    let log_source = Arc::clone(&state.dashboard.log_source);
-    match tokio::task::spawn_blocking(move || log_source.job_detail(job_id)).await {
-        Ok(Ok(job)) => api_json(StatusCode::OK, job),
-        Ok(Err(error)) => source_error(error),
-        Err(_) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::new("DASHBOARD_SOURCE_FAILED", "dashboard job lookup failed"),
-        ),
-    }
-}
-
-async fn log_chunk<S, C, M>(
-    State(state): State<AppState<S, C, M>>,
-    Path(raw_job_id): Path<String>,
-    RawQuery(raw_query): RawQuery,
-) -> Response
-where
-    S: DashboardDataSource,
-    C: Clock,
-    M: MonotonicClock,
-{
-    let job_id = match parse_job_id(&raw_job_id) {
-        Ok(job_id) => job_id,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
-    };
-    let query = match parse_log_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
-    };
-    let log_source = Arc::clone(&state.dashboard.log_source);
-    match tokio::task::spawn_blocking(move || {
-        log_source.read_log(job_id, query.stream, query.offset, query.limit)
-    })
-    .await
-    {
-        Ok(Ok(chunk)) => api_json(StatusCode::OK, chunk),
-        Ok(Err(error)) => source_error(error),
-        Err(_) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::new("DASHBOARD_SOURCE_FAILED", "dashboard log lookup failed"),
-        ),
-    }
-}
-
 async fn task_detail<S, C, M>(
     State(state): State<AppState<S, C, M>>,
     Path(raw_task_id): Path<String>,
@@ -911,15 +840,6 @@ fn api_error(status: StatusCode, error: ApiError) -> Response {
     api_json(status, error)
 }
 
-fn source_error(error: ApiError) -> Response {
-    let status = if error.code == "JOB_NOT_FOUND" {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    api_error(status, error)
-}
-
 fn settings_error(error: ApiError) -> Response {
     let status = match error.code.as_str() {
         "SETTINGS_CONFLICT" => StatusCode::CONFLICT,
@@ -971,12 +891,6 @@ fn task_mutation_error(error: ApiError) -> Response {
 
 fn api_error_from_dashboard(error: DashboardError) -> ApiError {
     ApiError::new(error.code, error.message)
-}
-
-fn parse_job_id(raw_job_id: &str) -> Result<JobId, ApiError> {
-    raw_job_id
-        .parse()
-        .map_err(|_| ApiError::new("INVALID_JOB_ID", "job ID must be a canonical identifier"))
 }
 
 fn parse_task_id(raw_task_id: &str) -> Result<TaskId, ApiError> {

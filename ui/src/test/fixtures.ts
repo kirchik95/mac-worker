@@ -112,8 +112,6 @@ export function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     progress: { total: 1, queued: 0, active: 1, open: 0, closed: 0, failed_like: 0 },
     workers: [worker()],
     queue: [],
-    active_jobs: [],
-    recent_jobs: [],
     ...overrides,
   }
 }

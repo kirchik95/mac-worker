@@ -20,7 +20,7 @@ use mac_worker::{
     client_state::ClientStateStore,
     config::Config,
     dashboard::{
-        model::{ApiError, DashboardError, DashboardJob, DashboardLogChunk},
+        model::{ApiError, DashboardError, DashboardLogChunk},
         service::{
             Clock, DashboardDataSource, DashboardService, MonotonicClock, WorkerObservationResult,
         },
@@ -28,7 +28,7 @@ use mac_worker::{
             DashboardTaskMutationSource, DashboardTaskSource, MacWorkerTaskMutationSource,
             TaskMutationRequest,
         },
-        web::{DashboardHttpServer, DashboardHttpState, DashboardLogSource},
+        web::{DashboardHttpServer, DashboardHttpState},
     },
     error::WorkerError,
     job::{JobId, LogStream, ProcessIdentity},
@@ -501,39 +501,10 @@ impl DashboardDataSource for EmptyDashboardSource {
         Vec::new()
     }
 
-    fn local_jobs(&self) -> Result<Vec<DashboardJob>, DashboardError> {
-        Ok(Vec::new())
-    }
-
-    fn authoritative_active_jobs(
-        &self,
-        _deadline: Duration,
-    ) -> Vec<Result<DashboardJob, DashboardError>> {
-        Vec::new()
-    }
-
     fn queue_entries(
         &self,
     ) -> Result<Vec<mac_worker::dashboard::model::DashboardQueueEntry>, DashboardError> {
         Ok(Vec::new())
-    }
-}
-
-struct UnusedLogs;
-
-impl DashboardLogSource for UnusedLogs {
-    fn job_detail(&self, _job_id: JobId) -> Result<DashboardJob, ApiError> {
-        Err(ApiError::new("JOB_NOT_FOUND", "unused"))
-    }
-
-    fn read_log(
-        &self,
-        _job_id: JobId,
-        _stream: LogStream,
-        _offset: u64,
-        _limit: u32,
-    ) -> Result<DashboardLogChunk, ApiError> {
-        Err(ApiError::new("JOB_NOT_FOUND", "unused"))
     }
 }
 
@@ -637,7 +608,6 @@ async fn http_stale_reply_returns_409_with_zero_runner_starts() {
             FixedClock,
             FixedMonotonic,
         )),
-        log_source: Arc::new(UnusedLogs),
         task_source: Arc::new(UnusedTasks),
         settings_source: None,
         mutation_source: Some(Arc::new(source)),

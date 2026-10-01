@@ -1,10 +1,9 @@
 use mac_worker::{
     dashboard::model::{
-        ApiError, ArtifactStatus, CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
-        DashboardCommandSummary, DashboardError, DashboardJob, DashboardJobState,
-        DashboardLogChunk, DashboardMemoryPressure, DashboardQueueEntry, DashboardQueueEntryKind,
-        DashboardSlotState, DashboardSnapshot, DashboardWorker, Freshness, SlotSummary,
-        SystemSummary, WorkerHealth, project_label_or_fallback,
+        ApiError, CollectionSummary, DASHBOARD_API_VERSION, DashboardCommandMode,
+        DashboardCommandSummary, DashboardError, DashboardLogChunk, DashboardMemoryPressure,
+        DashboardQueueEntry, DashboardQueueEntryKind, DashboardSlotState, DashboardSnapshot,
+        DashboardWorker, Freshness, SlotSummary, SystemSummary, WorkerHealth,
     },
     job::{JobId, LogStream},
     task_view::TaskListProjection,
@@ -13,15 +12,15 @@ use mac_worker::{
 const JOB_ID: &str = "0123456789abcdef0123456789abcdef";
 
 #[test]
-fn snapshot_v1_keeps_empty_queue_and_never_serializes_private_job_fields() {
+fn snapshot_v1_keeps_empty_queue_and_never_serializes_private_fields() {
     let snapshot = fixture_snapshot();
     let value = serde_json::to_value(snapshot).unwrap();
 
     assert_eq!(value["api_version"], 1);
     assert_eq!(value["queue"], serde_json::json!([]));
-    assert_eq!(value["recent_jobs"][0]["job_id"], serde_json::json!(JOB_ID));
+    assert!(value.get("active_jobs").is_none());
+    assert!(value.get("recent_jobs").is_none());
     assert!(value["workers"][0]["system"]["cpu_busy_percent"].is_null());
-    assert!(value["recent_jobs"][0]["artifact_status"].is_null());
     assert_absent_object_keys(
         &value,
         &[
@@ -141,44 +140,6 @@ fn snapshot_v1_serializes_the_complete_projection_contract() {
                 "requirements": ["swift", "xcode"],
                 "blocking_code": "NO_COMPATIBLE_IDLE_WORKER",
             }],
-            "active_jobs": [{
-                "job_id": "fedcba9876543210fedcba9876543210",
-                "worker_name": "mini-observed",
-                "project_id": "active-project-id",
-                "worktree_id": "active-worktree-id",
-                "project_label": "Active Project",
-                "manifest_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "command_summary": {"mode": "argv", "arg_count": 3},
-                "resource_class": "heavy",
-                "created_at_millis": 1_725_000_000_020_u64,
-                "updated_at_millis": 1_725_000_000_030_u64,
-                "state": "running",
-                "exit_code": null,
-                "terminating_signal": null,
-                "final_stdout_bytes": null,
-                "final_stderr_bytes": null,
-                "artifact_status": "pending",
-                "remote_uncertainty": "STATUS_QUERY_TIMEOUT",
-            }],
-            "recent_jobs": [{
-                "job_id": "22222222222222222222222222222222",
-                "worker_name": "mini-observed",
-                "project_id": "recent-project-id",
-                "worktree_id": "recent-worktree-id",
-                "project_label": null,
-                "manifest_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                "command_summary": {"mode": "shell", "arg_count": null},
-                "resource_class": "heavy",
-                "created_at_millis": 1_725_000_000_040_u64,
-                "updated_at_millis": 1_725_000_000_050_u64,
-                "state": "lost",
-                "exit_code": null,
-                "terminating_signal": null,
-                "final_stdout_bytes": null,
-                "final_stderr_bytes": null,
-                "artifact_status": null,
-                "remote_uncertainty": null,
-            }],
         })
     );
     assert_absent_object_keys(
@@ -217,15 +178,6 @@ fn every_public_dashboard_enum_uses_its_required_snake_case_spelling() {
     assert_enum_spelling(Freshness::Offline, "offline");
     assert_enum_spelling(WorkerHealth::Ready, "ready");
     assert_enum_spelling(WorkerHealth::Unavailable, "unavailable");
-    assert_enum_spelling(DashboardJobState::Uploading, "uploading");
-    assert_enum_spelling(DashboardJobState::Verified, "verified");
-    assert_enum_spelling(DashboardJobState::Accepted, "accepted");
-    assert_enum_spelling(DashboardJobState::Running, "running");
-    assert_enum_spelling(DashboardJobState::Succeeded, "succeeded");
-    assert_enum_spelling(DashboardJobState::Failed, "failed");
-    assert_enum_spelling(DashboardJobState::Cancelled, "cancelled");
-    assert_enum_spelling(DashboardJobState::TimedOut, "timed_out");
-    assert_enum_spelling(DashboardJobState::Lost, "lost");
     assert_enum_spelling(DashboardSlotState::Idle, "idle");
     assert_enum_spelling(DashboardSlotState::Busy, "busy");
     assert_enum_spelling(DashboardMemoryPressure::Normal, "normal");
@@ -234,31 +186,14 @@ fn every_public_dashboard_enum_uses_its_required_snake_case_spelling() {
     assert_enum_spelling(DashboardMemoryPressure::Unknown, "unknown");
     assert_enum_spelling(DashboardCommandMode::Argv, "argv");
     assert_enum_spelling(DashboardCommandMode::Shell, "shell");
-    assert_enum_spelling(ArtifactStatus::Pending, "pending");
-    assert_enum_spelling(ArtifactStatus::Available, "available");
-    assert_enum_spelling(ArtifactStatus::Failed, "failed");
-}
-
-#[test]
-fn project_label_uses_short_identifiers_without_paths_when_missing() {
-    let job = fixture_job(None);
-
-    assert_eq!(
-        project_label_or_fallback(&job),
-        "project-0123456789ab/worktree-fedcba987654"
-    );
 }
 
 #[test]
 fn supplied_project_label_is_bounded_and_escapes_control_characters() {
-    let job = fixture_job(Some(format!("visible\n{}", "x".repeat(100))));
+    let queue = fixture_queue(Some(format!("visible\n{}", "x".repeat(100))));
 
     assert_eq!(
-        project_label_or_fallback(&job),
-        "visible\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
-    );
-    assert_eq!(
-        serde_json::to_value(job).unwrap()["project_label"],
+        serde_json::to_value(queue).unwrap()["project_label"],
         "visible\\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
     );
 }
@@ -386,8 +321,6 @@ fn fixture_snapshot() -> DashboardSnapshot {
             active_task: None,
         }],
         queue: Vec::new(),
-        active_jobs: Vec::new(),
-        recent_jobs: vec![fixture_job(None)],
         laptop: None,
     }
 }
@@ -479,76 +412,30 @@ fn complete_fixture_snapshot() -> DashboardSnapshot {
             requirements: vec!["swift".into(), "xcode".into()],
             blocking_code: "NO_COMPATIBLE_IDLE_WORKER".into(),
         }],
-        active_jobs: vec![DashboardJob {
-            job_id: "fedcba9876543210fedcba9876543210".parse().unwrap(),
-            worker_name: "mini-observed".into(),
-            project_id: "active-project-id".into(),
-            worktree_id: "active-worktree-id".into(),
-            project_label: Some("Active Project".into()),
-            manifest_digest: "b".repeat(64),
-            command_summary: DashboardCommandSummary {
-                mode: DashboardCommandMode::Argv,
-                arg_count: Some(3),
-            },
-            resource_class: "heavy".into(),
-            created_at_millis: 1_725_000_000_020,
-            updated_at_millis: 1_725_000_000_030,
-            state: DashboardJobState::Running,
-            exit_code: None,
-            terminating_signal: None,
-            final_stdout_bytes: None,
-            final_stderr_bytes: None,
-            artifact_status: Some(ArtifactStatus::Pending),
-            remote_uncertainty: Some("STATUS_QUERY_TIMEOUT".into()),
-        }],
-        recent_jobs: vec![DashboardJob {
-            job_id: "22222222222222222222222222222222".parse().unwrap(),
-            worker_name: "mini-observed".into(),
-            project_id: "recent-project-id".into(),
-            worktree_id: "recent-worktree-id".into(),
-            project_label: None,
-            manifest_digest: "c".repeat(64),
-            command_summary: DashboardCommandSummary {
-                mode: DashboardCommandMode::Shell,
-                arg_count: None,
-            },
-            resource_class: "heavy".into(),
-            created_at_millis: 1_725_000_000_040,
-            updated_at_millis: 1_725_000_000_050,
-            state: DashboardJobState::Lost,
-            exit_code: None,
-            terminating_signal: None,
-            final_stdout_bytes: None,
-            final_stderr_bytes: None,
-            artifact_status: None,
-            remote_uncertainty: None,
-        }],
         laptop: None,
     }
 }
 
-fn fixture_job(project_label: Option<String>) -> DashboardJob {
-    DashboardJob {
+fn fixture_queue(project_label: Option<String>) -> DashboardQueueEntry {
+    DashboardQueueEntry {
+        position: 1,
         job_id: JOB_ID.parse::<JobId>().unwrap(),
-        worker_name: "mini-a".into(),
+        entry_kind: DashboardQueueEntryKind::TaskTurn,
+        task_id: None,
+        turn_id: None,
+        run_id: None,
+        run_max_parallel: None,
+        pinned_worker: None,
         project_id: "0123456789abcdef".into(),
         worktree_id: "fedcba9876543210".into(),
         project_label,
-        manifest_digest: "a".repeat(64),
         command_summary: DashboardCommandSummary {
             mode: DashboardCommandMode::Argv,
             arg_count: Some(3),
         },
-        resource_class: "heavy".into(),
         created_at_millis: 1_725_000_000_000,
-        updated_at_millis: 1_725_000_000_001,
-        state: DashboardJobState::Succeeded,
-        exit_code: Some(0),
-        terminating_signal: None,
-        final_stdout_bytes: Some(3),
-        final_stderr_bytes: Some(0),
-        artifact_status: None,
-        remote_uncertainty: None,
+        requirements: Vec::new(),
+        blocking_code: "NO_IDLE_WORKER".into(),
     }
 }
 
