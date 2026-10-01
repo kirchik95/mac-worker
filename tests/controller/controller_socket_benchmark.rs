@@ -33,8 +33,8 @@ use mac_worker::{
     error::WorkerError,
     paths::PathLayout,
     process::{
-        CleanupState, ProcessCompletion, ProcessRequest, ProcessResult, ProcessRunner,
-        SystemProcessRunner, TrackedProcessRunner,
+        CleanupState, ProcessCompletion, ProcessPolicy, ProcessRequest, ProcessResult,
+        ProcessRunner, SystemProcessRunner, TrackedProcessRunner,
     },
     task::{
         ClosePolicy, GitIdentity, LocalTaskRecord, PublishMode, TaskId, TaskLimits, TaskMeta,
@@ -132,7 +132,9 @@ fn fixture_transport_cost_observations() {
         assert_eq!(row["mutation_channel_attempts"], 0);
         assert_eq!(row["worker_children"], row["rpc_reads"]);
         assert!(row["max_supervisors"].as_u64().unwrap() <= 8);
-        assert!(row["max_decoder_retained_bytes"].as_u64().unwrap() <= 1024 * 1024 + 4);
+        if let Some(retained) = row["max_decoder_retained_bytes"].as_u64() {
+            assert!(retained <= 1024 * 1024 + 4);
+        }
         if row["transport"] == "socket" && row["scenario"].as_str().unwrap().starts_with("warm_") {
             assert_eq!(row["ssh_application_executions"], 0);
             assert_eq!(row["socket_children"], row["rpc_reads"]);
@@ -149,7 +151,13 @@ fn fixture_observations() -> Vec<serde_json::Value> {
     let mux = Arc::new(FakeMux::new(root.join("h/.cache/mac-worker/ssh/m")));
     let raw = Fixture::new(&root.join("a"), mux.clone());
     let socket = Fixture::new(&root.join("b"), mux.clone());
-    let mut rows = retained_observations(&raw, &socket);
+    let mut rows = cold_cli_observations(&raw, &socket);
+    assert_eq!(
+        rows.len(),
+        6,
+        "missing complete paired real CLI cold lifetimes"
+    );
+    rows.extend(retained_observations(&raw, &socket));
     for class in [
         ReadClass::Wait,
         ReadClass::Logs,
@@ -164,7 +172,6 @@ fn fixture_observations() -> Vec<serde_json::Value> {
         ReadClass::Wait,
         true,
     ));
-    // Cold command scenarios are added after the authorized T7b integration.
     // Drain writes publish journal records. Probe exclusions only after the
     // paired read observations so both roots retain the same 32-record seed.
     socket.reset();
@@ -212,6 +219,10 @@ struct Stats {
     rpc_ns: u64,
     setup_ns: u64,
     teardown_ns: u64,
+    first_application: Option<Instant>,
+    last_application: Option<Instant>,
+    last_allocation: Option<PathBuf>,
+    requested_wait_ms: u64,
 }
 type Metrics = Arc<Mutex<Stats>>;
 
@@ -265,6 +276,8 @@ impl TrackedProcessRunner for RpcProbe {
             stats.max_request_bytes = stats.max_request_bytes.max(frame.len());
             stats.active_supervisors += 1;
             stats.max_supervisors = stats.max_supervisors.max(stats.active_supervisors);
+            stats.first_application.get_or_insert_with(Instant::now);
+            stats.requested_wait_ms += read.body()["wait_ms"].as_u64().unwrap_or(0);
         }
         let start = Instant::now();
         let result = SystemProcessRunner.run_interruptible_with_cleanup(request, stop);
@@ -272,6 +285,7 @@ impl TrackedProcessRunner for RpcProbe {
         let mut stats = self.0.lock().unwrap();
         stats.child_ns += ns(start.elapsed());
         stats.active_supervisors -= 1;
+        stats.last_application = Some(Instant::now());
         if let Ok(output) = &result.outcome {
             stats.bytes_out += output.stdout.len() as u64;
             stats.max_reply_bytes = stats.max_reply_bytes.max(output.stdout.len());
@@ -406,6 +420,11 @@ impl Fixture {
             config: paths.config.clone(),
             environment: environment.clone(),
         });
+        raw.mux
+            .metrics
+            .lock()
+            .unwrap()
+            .insert(installed.to_str().unwrap().into(), stats.clone());
         Self {
             paths,
             laptop,
@@ -454,6 +473,106 @@ impl Fixture {
         let mut stats = self.stats.lock().unwrap();
         assert_eq!(stats.active_supervisors, 0);
         *stats = Stats::default();
+    }
+    fn prepare_cli(&self, socket: bool) {
+        fs::write(&self.laptop.config, format!(
+            "version=1\n[controller]\nenabled=true\nssh='fixture'\nremote_binary='~/.local/bin/worker'\n[ssh]\nmultiplex={socket}\n[[workers]]\nname='unused'\nssh='must-not-connect.invalid'\nslots=1\n"
+        )).unwrap();
+        let mut environment: BTreeMap<String, String> = self
+            .raw
+            .environment
+            .iter()
+            .map(|(key, value)| (key.to_str().unwrap().into(), value.to_str().unwrap().into()))
+            .collect();
+        environment.insert(
+            "MAC_WORKER_TEST_SSH".into(),
+            PathBuf::from(std::env::var_os("P3D_ROOT").unwrap())
+                .join("fake-ssh")
+                .to_str()
+                .unwrap()
+                .into(),
+        );
+        let remote = self.installed.with_file_name("remote-env.json");
+        fs::write(&remote, serde_json::to_vec(&environment).unwrap()).unwrap();
+        fs::set_permissions(remote, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn cli_request(&self, class: ReadClass) -> ProcessRequest {
+        let mut args: Vec<OsString> = vec![
+            "--config".into(),
+            self.laptop.config.clone().into_os_string(),
+            "--json".into(),
+            "task".into(),
+        ];
+        match class {
+            ReadClass::Wait => args.extend([
+                "wait".into(),
+                "--task-id".into(),
+                ids().0.to_string().into(),
+                "--timeout".into(),
+                "30s".into(),
+            ]),
+            ReadClass::Logs => args.extend([
+                "logs".into(),
+                ids().0.to_string().into(),
+                "--follow".into(),
+                "--raw".into(),
+            ]),
+            _ => unreachable!("cold CLI observations cover wait and followed logs"),
+        }
+        ProcessRequest {
+            program: self.installed.clone().into_os_string(),
+            args,
+            environment: vec![
+                ("HOME".into(), std::env::var_os("HOME").unwrap()),
+                ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    self.installed.with_file_name("lconfig").into_os_string(),
+                ),
+                (
+                    "XDG_STATE_HOME".into(),
+                    self.laptop.state.parent().unwrap().as_os_str().to_owned(),
+                ),
+                (
+                    "XDG_CACHE_HOME".into(),
+                    self.laptop.cache.parent().unwrap().as_os_str().to_owned(),
+                ),
+                (
+                    "XDG_DATA_HOME".into(),
+                    self.laptop.data.parent().unwrap().as_os_str().to_owned(),
+                ),
+                (
+                    "MAC_WORKER_TEST_SSH".into(),
+                    PathBuf::from(std::env::var_os("P3D_ROOT").unwrap())
+                        .join("fake-ssh")
+                        .into_os_string(),
+                ),
+                (
+                    "P3D_MASTER".into(),
+                    self.raw.mux.path.clone().into_os_string(),
+                ),
+                ("P3D_WORKER".into(), self.installed.clone().into_os_string()),
+                (
+                    "P3D_CONFIG".into(),
+                    self.paths.config.clone().into_os_string(),
+                ),
+                (
+                    "P3D_REMOTE_ENV".into(),
+                    self.installed
+                        .with_file_name("remote-env.json")
+                        .into_os_string(),
+                ),
+                ("P3D_RECORD".into(), "1".into()),
+            ],
+            environment_remove: vec![],
+            stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: 8192,
+                stderr_limit: 8192,
+                deadline: GUARD,
+            },
+            isolate_parent_environment: true,
+        }
     }
     fn shutdown(&self) {
         if let Some((tx, thread)) = self.server.lock().unwrap().take() {
@@ -667,28 +786,103 @@ impl ProcessRunner for FakeSsh {
 
 fn write_fake_ssh(path: &Path) {
     fs::write(path, r#"#!/usr/bin/python3
-import json, os, socket, struct, subprocess, sys
+import json, os, socket, struct, subprocess, sys, time
 args = sys.argv[1:]
+record = os.environ.get('P3D_RECORD') == '1'
+def mux(message):
+    if record:
+        message['fixture'] = os.environ['P3D_WORKER']
+    with socket.socket(socket.AF_UNIX) as stream:
+        stream.settimeout(30)
+        stream.connect(os.environ['P3D_MASTER'])
+        data = json.dumps(message).encode()
+        stream.sendall(struct.pack('>I', len(data)) + data)
+        with stream.makefile('rb') as reader:
+            return json.loads(reader.readline())
 if '-G' in args:
+    if record:
+        mux({'op':'resolution'})
     print('controlpath ' + os.environ['P3D_MASTER'])
     sys.exit(0)
 if '-O' in args:
+    assert args[args.index('-F') + 1] == '/dev/null', args
     op = args[args.index('-O') + 1]
     pair = args[args.index('-L') + 1] if '-L' in args else None
-    with socket.socket(socket.AF_UNIX) as stream:
-        stream.connect(os.environ['P3D_MASTER'])
-        data = json.dumps({'op':op, 'pair':pair}).encode()
-        stream.sendall(struct.pack('>I', len(data)) + data)
-        with stream.makefile('rb') as reader:
-            result = json.loads(reader.readline())
+    result = mux({'op':op, 'pair':pair})
     if not result['ok']:
         print('mux_client_forward: fixture cancellation unacknowledged', file=sys.stderr)
     sys.exit(result['exit'])
 assert args[-1].endswith('host controller-rpc'), args
 frame = sys.stdin.buffer.read()
-sys.exit(subprocess.run([os.environ['P3D_WORKER'], '--config', os.environ['P3D_CONFIG'], 'host', 'controller-rpc'], input=frame).returncode)
+command = [os.environ['P3D_WORKER'], '--config', os.environ['P3D_CONFIG'], 'host', 'controller-rpc']
+if not record:
+    sys.exit(subprocess.run(command, input=frame).returncode)
+request = json.loads(frame[4:])
+assert len(frame) == 4 + struct.unpack('>I', frame[:4])[0]
+bootstrap = 'controller_socket' in request['body']
+assert bootstrap or request['command'] in ('task.wait.poll', 'task.logs', 'task.list')
+mux({'op':'rpc_start', 'bootstrap':bootstrap, 'bytes':len(frame), 'wait_ms':request['body'].get('wait_ms', 0)})
+with open(os.environ['P3D_REMOTE_ENV']) as source:
+    remote_environment = json.load(source)
+start = time.perf_counter_ns()
+output = subprocess.run(command, input=frame, capture_output=True, env=remote_environment, timeout=30)
+assert len(output.stdout) <= 1024 * 1024 + 4
+mux({'op':'rpc_end', 'bootstrap':bootstrap, 'bytes':len(output.stdout), 'worker_ns':time.perf_counter_ns() - start})
+sys.stdout.buffer.write(output.stdout)
+sys.stderr.buffer.write(output.stderr)
+sys.exit(output.returncode)
 "#).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+// Telemetry is sent by actual fake-SSH processes only for fresh CLI commands.
+// Per-RPC scenarios use the instrumented ProcessRunner instead, never both.
+fn record_cli_ssh(request: &Value, stats: &mut Stats) {
+    match request["op"].as_str().unwrap() {
+        "resolution" => {
+            stats.ssh_processes += 1;
+            stats.ssh_resolution_processes += 1;
+        }
+        "check" | "forward" | "cancel" => {
+            stats.ssh_processes += 1;
+            stats.ssh_control_processes += 1;
+            match request["op"].as_str().unwrap() {
+                "forward" => {
+                    stats.allocations += 1;
+                    let (local, _) = request["pair"].as_str().unwrap().split_once(':').unwrap();
+                    stats.last_allocation = Some(local.into());
+                }
+                "cancel" => stats.cancels += 1,
+                _ => {}
+            }
+        }
+        "rpc_start" => {
+            stats.ssh_processes += 1;
+            if request["bootstrap"].as_bool().unwrap() {
+                stats.ssh_bootstrap_executions += 1;
+            } else {
+                stats.ssh_application_executions += 1;
+                stats.stdio_children += 1;
+                stats.first_application.get_or_insert_with(Instant::now);
+                stats.requested_wait_ms += request["wait_ms"].as_u64().unwrap();
+            }
+            let bytes = request["bytes"].as_u64().unwrap() as usize;
+            assert!(bytes <= 1024 * 1024 + 4);
+            stats.bytes_in += bytes as u64;
+            stats.max_request_bytes = stats.max_request_bytes.max(bytes);
+        }
+        "rpc_end" => {
+            if !request["bootstrap"].as_bool().unwrap() {
+                stats.child_ns += request["worker_ns"].as_u64().unwrap();
+                stats.last_application = Some(Instant::now());
+            }
+            let bytes = request["bytes"].as_u64().unwrap() as usize;
+            assert!(bytes <= 1024 * 1024 + 4);
+            stats.bytes_out += bytes as u64;
+            stats.max_reply_bytes = stats.max_reply_bytes.max(bytes);
+        }
+        other => panic!("unexpected CLI telemetry: {other}"),
+    }
 }
 
 // Test-only mux producer. Its cancel acknowledgement follows listener closure
@@ -697,6 +891,7 @@ struct FakeMux {
     path: PathBuf,
     forwards: Arc<Mutex<HashMap<String, Relay>>>,
     retain_cancel: Arc<AtomicBool>,
+    metrics: Arc<Mutex<HashMap<String, Metrics>>>,
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -708,9 +903,11 @@ impl FakeMux {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let forwards = Arc::new(Mutex::new(HashMap::<String, Relay>::new()));
         let retain_cancel = Arc::new(AtomicBool::new(false));
+        let metrics = Arc::new(Mutex::new(HashMap::<String, Metrics>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (owned_forwards, retain, stopped) =
             (forwards.clone(), retain_cancel.clone(), stop.clone());
+        let recorded = metrics.clone();
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopped.load(Ordering::SeqCst) {
@@ -729,8 +926,13 @@ impl FakeMux {
                 let mut bytes = vec![0; length];
                 stream.read_exact(&mut bytes).unwrap();
                 let request: Value = serde_json::from_slice(&bytes).unwrap();
+                if let Some(fixture) = request["fixture"].as_str() {
+                    let stats = recorded.lock().unwrap().get(fixture).unwrap().clone();
+                    record_cli_ssh(&request, &mut stats.lock().unwrap());
+                }
                 let retained = request["op"] == "cancel" && retain.load(Ordering::SeqCst);
                 match request["op"].as_str().unwrap() {
+                    "resolution" | "rpc_start" | "rpc_end" => {}
                     "check" => assert!(request["pair"].is_null()),
                     "forward" => {
                         let pair = request["pair"].as_str().unwrap();
@@ -761,6 +963,7 @@ impl FakeMux {
             path,
             forwards,
             retain_cancel,
+            metrics,
             stop,
             thread: Mutex::new(Some(handle)),
         }
@@ -1234,6 +1437,213 @@ fn summary(values: &[u64]) -> Value {
     sorted.sort_unstable();
     let percentile = |percent: usize| sorted[(percent * sorted.len()).div_ceil(100) - 1];
     json!({"mean":values.iter().map(|value| *value as f64).sum::<f64>()/values.len() as f64,"p50":percentile(50),"p95":percentile(95)})
+}
+
+fn cold_cli_observations(raw: &Fixture, socket: &Fixture) -> Vec<Value> {
+    raw.prepare_cli(false);
+    socket.prepare_cli(true);
+    let mut rows = Vec::new();
+    let pin_path = socket
+        .laptop
+        .controller_cache_root()
+        .join("channel/pins")
+        .join(format!("{}.json", route().digest().unwrap()));
+    for (class, create_pin) in [
+        (ReadClass::Wait, true),
+        (ReadClass::Wait, false),
+        (ReadClass::Logs, false),
+    ] {
+        let scenario = format!(
+            "cold_cli_{}_pin_{}",
+            class.name(),
+            if create_pin { "create" } else { "verify" }
+        );
+        eprintln!("observing {scenario}: {WARMUPS} warmups, {SAMPLES} alternating pairs");
+        let mut samples = [Samples::default(), Samples::default()];
+        for index in 0..WARMUPS + SAMPLES {
+            if index == WARMUPS {
+                raw.reset();
+                socket.reset();
+            }
+            let mut values = [Vec::new(), Vec::new()];
+            for path in if index % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let fixture = if path == 0 { raw } else { socket };
+                let prior_pin = if path == 1 {
+                    if create_pin && pin_path.exists() {
+                        fs::remove_file(&pin_path).unwrap();
+                    }
+                    if create_pin {
+                        None
+                    } else {
+                        Some(fs::read(&pin_path).unwrap())
+                    }
+                } else {
+                    None
+                };
+                {
+                    let mut stats = fixture.stats.lock().unwrap();
+                    stats.first_application = None;
+                    stats.last_application = None;
+                    stats.last_allocation = None;
+                }
+                let before = fixture.stats.lock().unwrap().clone();
+                let request = fixture.cli_request(class);
+                let start = Instant::now();
+                let completion =
+                    SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false);
+                let end = Instant::now();
+                assert_eq!(completion.cleanup, CleanupState::Completed);
+                let output = completion.outcome.unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(output.stderr.is_empty());
+                match class {
+                    ReadClass::Wait => {
+                        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(report["task_ids"], json!([ids().0]));
+                        assert_eq!(report["exit_code"], 0);
+                    }
+                    ReadClass::Logs => assert_eq!(
+                        output.stdout,
+                        "fixture log: representative readable output\n"
+                            .repeat(96)
+                            .into_bytes()
+                    ),
+                    _ => unreachable!(),
+                }
+                values[path] = output.stdout;
+                let mut after = fixture.stats.lock().unwrap();
+                assert_eq!(after.active_supervisors, 0);
+                let reads = if matches!(class, ReadClass::Logs) {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(
+                    after.stdio_children + after.socket_children
+                        - before.stdio_children
+                        - before.socket_children,
+                    reads
+                );
+                if path == 1 {
+                    assert_eq!(
+                        after.ssh_application_executions, 0,
+                        "real CLI must route all loop reads through socket"
+                    );
+                    assert_eq!(after.allocations - before.allocations, 1);
+                    assert_eq!(after.cancels - before.cancels, 1);
+                    assert_eq!(
+                        after.ssh_bootstrap_executions - before.ssh_bootstrap_executions,
+                        1
+                    );
+                    assert_eq!(
+                        after.ssh_resolution_processes - before.ssh_resolution_processes,
+                        1
+                    );
+                    assert_eq!(
+                        after.ssh_control_processes - before.ssh_control_processes,
+                        3
+                    );
+                    let local = after.last_allocation.as_ref().unwrap();
+                    assert!(!local.exists(), "completed CLI must remove its socket");
+                    assert!(
+                        !local.parent().unwrap().exists(),
+                        "completed CLI must remove its allocation"
+                    );
+                    let bytes = fs::read(&pin_path).unwrap();
+                    let pin: Pin = serde_json::from_slice(&bytes).unwrap();
+                    pin.validate().unwrap();
+                    assert_eq!(pin.route_sha256, route().digest().unwrap());
+                    assert_eq!(
+                        pin.controller_client_id,
+                        ClientStateStore::open(&socket.paths.state)
+                            .unwrap()
+                            .client_id()
+                    );
+                    if let Some(prior) = prior_pin {
+                        assert_eq!(bytes, prior, "verification must preserve the stable pin");
+                        after.pin_verifies += 1;
+                    } else {
+                        after.pin_creates += 1;
+                    }
+                } else {
+                    assert_eq!(after.allocations, 0);
+                    assert_eq!(
+                        after.ssh_application_executions - before.ssh_application_executions,
+                        reads
+                    );
+                }
+                assert!(fixture.raw.mux.forwards.lock().unwrap().is_empty());
+                assert!(
+                    fixture.raw.mux.path.exists(),
+                    "command owns only its forward, not the shared master"
+                );
+                if index >= WARMUPS {
+                    let first = after.first_application.unwrap();
+                    let last = after.last_application.unwrap();
+                    assert!(start <= first && first <= last && last <= end);
+                    let sample = &mut samples[path];
+                    sample.command.push(ns(end.duration_since(start)));
+                    sample.setup.push(ns(first.duration_since(start)));
+                    sample.rpc.push(ns(last.duration_since(first)));
+                    sample.teardown.push(ns(end.duration_since(last)));
+                    sample.child.push(after.child_ns - before.child_ns);
+                }
+            }
+            assert_eq!(values[0], values[1], "paired real CLI output must match");
+        }
+        for (path, samples) in samples.iter().enumerate() {
+            let fixture = if path == 0 { raw } else { socket };
+            let stats = fixture.stats.lock().unwrap();
+            let mut row = samples.row(
+                RowSpec {
+                    scenario: &scenario,
+                    transport: if path == 0 { "stdio" } else { "socket" },
+                    class,
+                    reads: SAMPLES as u64
+                        * if matches!(class, ReadClass::Logs) {
+                            2
+                        } else {
+                            1
+                        },
+                    fallback: 0,
+                    reconnect: 0,
+                    teardown: 0,
+                },
+                &stats,
+            );
+            row["measurement_scope"] =
+                json!("complete fresh CLI launch through exit, capture and proven child cleanup");
+            row["component_boundaries"] = json!(
+                "setup: before first application child; RPC: first start to last completed child (includes health/log sequence); teardown: last child through rendering, cancel, refusal proof, deletion and exit"
+            );
+            row["cli_processes"] = json!(SAMPLES);
+            row["os_processes"] = json!(row["os_processes"].as_u64().unwrap() + SAMPLES as u64);
+            row["master_state"] =
+                json!("preexisting private fixture master; never shortened production namespace");
+            row["pin_state"] = json!(if create_pin {
+                "absent before each command"
+            } else {
+                "existing stable pin"
+            });
+            row["requested_wait_ms_per_read"] = Value::Null;
+            row["requested_wait_total_ms"] = json!(stats.requested_wait_ms);
+            row["waiting_state"] = json!(
+                "quiescent wait / completed readable logs; long-poll budget supplied but no deliberate wait"
+            );
+            row["max_decoder_retained_bytes"] = Value::Null;
+            row["buffer_observation"] = json!(
+                "actual child request/reply frame maxima; default CLI decoder cannot be instrumented; configured one-frame cap and 8-KiB scratch reported"
+            );
+            row["configured_frame_payload_bytes"] = json!(MAX_FRAME_BYTES);
+            row["socket_application_attempts"] = json!(stats.socket_children);
+            rows.push(row);
+        }
+    }
+    rows
 }
 
 fn paired_rpc_observations(
