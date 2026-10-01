@@ -30,13 +30,14 @@ From a clean checkout on an Apple Silicon Mac, run:
 
 ```sh
 cargo fmt --all --check
-cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
+scripts/test-gate.sh
 scripts/test-install.sh
 scripts/package-release.sh v0.1.0 dist
 ```
 
-For a normal release, the package command runs
+`scripts/test-gate.sh` runs the whole suite under nextest; see [Testing](testing.md) for
+the reasons and the per-area commands. For a normal release, the package command runs
 `cargo build --locked --release` before assembling the archive. The fixture
 suite alone supplies `MAC_WORKER_BINARY_PATH` to exercise packaging with a
 controlled executable and no Rust compilation. Inspect and verify the output:
@@ -78,11 +79,12 @@ git tag -s v0.1.0 -m "mac-worker v0.1.0"
 git push origin v0.1.0
 ```
 
-Pushing the tag runs `.github/workflows/release.yml` on GitHub's arm64
-`macos-14` runner. The workflow repeats formatting, tests, Clippy, and the
-installer fixtures; builds the native archive; verifies its checksum; and
-creates a **draft** GitHub release with all three generated assets. It does
-not publish the release.
+Pushing the tag runs `.github/workflows/release.yml`. A Linux job checks the
+dashboard UI (tests, lint, and parity of the committed assets with a fresh
+build). An arm64 `macos-15` job then repeats formatting, Clippy, the full
+`cargo test --locked --all-targets` run, and the installer fixtures; builds the
+native archive; verifies its checksum; and creates a **draft** GitHub release
+with all three generated assets. It does not publish the release.
 
 Review the workflow log, generated notes, archive contents, checksum, and
 formula in the draft. Publish the draft explicitly in GitHub only after that
