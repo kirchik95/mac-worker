@@ -75,6 +75,16 @@ struct State {
     runtime: Arc<dyn ChannelRuntime>,
     readiness: watch::Sender<Readiness>,
     changed: Notify,
+    #[cfg(test)]
+    before_final_write: Mutex<Option<Arc<WriteBarrier>>>,
+    #[cfg(test)]
+    after_final_write: Mutex<Option<Arc<WriteBarrier>>>,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct WriteBarrier {
+    entered: Notify,
+    release: Notify,
 }
 impl State {
     fn stopping(&self) -> bool {
@@ -151,6 +161,10 @@ impl SocketService {
             runtime: deps.runtime.clone(),
             readiness,
             changed: Notify::new(),
+            #[cfg(test)]
+            before_final_write: Mutex::new(None),
+            #[cfg(test)]
+            after_final_write: Mutex::new(None),
         });
         tokio::spawn(serve(listener, service, Arc::new(deps), state.clone()));
         Ok(Self { state })
@@ -413,8 +427,29 @@ async fn read_payload(
 
 fn quiet(stream: &UnixStream) -> Result<(), ChannelFailure> {
     match stream.try_read(&mut [0; 1]) {
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-        _ => Err(failure(ChannelReason::ForwardLost)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        _ => return Err(failure(ChannelReason::ForwardLost)),
+    }
+    // try_read may only consult Tokio's cached readiness. Check the nonblocking
+    // descriptor too, so queued early input cannot slip through admission.
+    loop {
+        let mut byte = [0u8; 1];
+        if unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_PEEK,
+            )
+        } >= 0
+        {
+            return Err(failure(ChannelReason::ForwardLost));
+        }
+        match io::Error::last_os_error().kind() {
+            io::ErrorKind::WouldBlock => return Ok(()),
+            io::ErrorKind::Interrupted => {}
+            _ => return Err(failure(ChannelReason::ForwardLost)),
+        }
     }
 }
 async fn write_reply(
@@ -424,18 +459,48 @@ async fn write_reply(
     deadline: Duration,
 ) -> Result<(), ChannelFailure> {
     quiet(stream)?;
+    #[cfg(test)]
+    let mut before = state.before_final_write.lock().unwrap().take();
     let mut offset = 0;
     while offset < bytes.len() {
         if state.stopping() || state.runtime.now() >= deadline {
             return Err(failure(ChannelReason::Timeout));
         }
-        match stream.try_write(&bytes[offset..]) {
+        #[cfg(test)]
+        if offset == bytes.len() - 1
+            && let Some(barrier) = before.take()
+        {
+            barrier.entered.notify_one();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = guard(state, deadline) => return Err(failure(ChannelReason::Timeout)),
+                    _ = barrier.release.notified() => break,
+                    readable = stream.readable() => {
+                        readable.map_err(|_| failure(ChannelReason::ForwardLost))?;
+                        quiet(stream)?;
+                    },
+                }
+            }
+        }
+        let end = bytes.len();
+        #[cfg(test)]
+        let end = if before.is_some() { end - 1 } else { end };
+        match stream.try_write(&bytes[offset..end]) {
             Ok(0) => return Err(failure(ChannelReason::ForwardLost)),
             Ok(n) => {
                 offset += n;
                 // Final write completion hands off to request state before
                 // inspecting any simultaneously readable next-request bytes.
                 if offset == bytes.len() {
+                    #[cfg(test)]
+                    {
+                        let after = state.after_final_write.lock().unwrap().take();
+                        if let Some(barrier) = after {
+                            barrier.entered.notify_one();
+                            barrier.release.notified().await;
+                        }
+                    }
                     return Ok(());
                 }
                 continue;

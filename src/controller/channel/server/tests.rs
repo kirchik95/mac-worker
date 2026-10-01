@@ -569,3 +569,255 @@ async fn gated_cleanup_has_bounded_unknown_shutdown_without_replenishing_capacit
     closed(&stream).await;
     release.send(()).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_handoff_rejects_next_bytes_while_the_final_reply_write_is_held() {
+    let fixture = Fixture::new(vec![]).await;
+    let stream = fixture.connect().await;
+    let barrier = Arc::new(WriteBarrier::default());
+    *fixture.service.state.before_final_write.lock().unwrap() = Some(barrier.clone());
+    send(&stream, &poll()).await;
+    barrier.entered.notified().await;
+    send(&stream, &poll()).await;
+    closed(&stream).await;
+    assert_eq!(fixture.executor.calls.load(Ordering::Acquire), 1);
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quiet_probe_detects_early_bytes_before_the_runtime_refreshes_readiness() {
+    let (server, client) = UnixStream::pair().unwrap();
+    client.writable().await.unwrap();
+    quiet(&server).unwrap();
+    assert_eq!(client.try_write(b"x").unwrap(), 1);
+    // No await/driver poll separates the completed write and the admission
+    // probe: a cached WouldBlock is insufficient evidence of no early input.
+    assert!(quiet(&server).is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_handoff_accepts_next_bytes_ready_at_final_write_completion() {
+    let fixture = Fixture::new(vec![]).await;
+    let stream = fixture.connect().await;
+    let barrier = Arc::new(WriteBarrier::default());
+    *fixture.service.state.after_final_write.lock().unwrap() = Some(barrier.clone());
+    send(&stream, &poll()).await;
+    receive(&stream).await.unwrap();
+    barrier.entered.notified().await;
+    // The final byte has reached the client, while the server is held at the
+    // completed-write handoff. Input is ready before it resumes that handoff.
+    send(&stream, &poll()).await;
+    barrier.release.notify_one();
+    receive(&stream)
+        .await
+        .expect("a complete reply makes the next request legal");
+    assert_eq!(fixture.executor.calls.load(Ordering::Acquire), 2);
+    fixture.close().await;
+}
+
+struct RealProcessExecutor {
+    script: String,
+    completed: Mutex<Option<oneshot::Sender<bool>>>,
+}
+impl ChannelExecutor for RealProcessExecutor {
+    fn run(&self, _: &[u8], ctx: &ServerContext) -> ProcessCompletion {
+        use crate::process::{ProcessPolicy, ProcessRequest, ProcessRunner, SystemProcessRunner};
+        let request = ProcessRequest {
+            program: "python3".into(),
+            args: vec!["-c".into(), self.script.clone().into()],
+            environment: Vec::new(),
+            environment_remove: Vec::new(),
+            stdin: None,
+            policy: ProcessPolicy {
+                stdout_limit: MAX_FRAME_BYTES + 4,
+                stderr_limit: 256 * 1024,
+                deadline: Duration::from_secs(30),
+            },
+            isolate_parent_environment: false,
+        };
+        let outcome = SystemProcessRunner.run_interruptible(&request, &|| {
+            ctx.cancelled.load(Ordering::Acquire)
+                || ctx.runtime.cancelled()
+                || ctx.runtime.now() >= ctx.deadline
+        });
+        let cancelled = matches!(
+            outcome,
+            Err(WorkerError::Process(crate::error::ProcessError::Cancelled))
+        );
+        if let Some(done) = self.completed.lock().unwrap().take() {
+            let _ = done.send(cancelled);
+        }
+        // Phase A has no T1 cleanup-proof implementation. Exercise real group
+        // termination but report Unknown rather than manufacture that proof.
+        ProcessCompletion {
+            outcome,
+            cleanup: CleanupState::Unknown,
+        }
+    }
+}
+
+struct FixtureGroups {
+    rpc: i32,
+    detached: i32,
+}
+impl Drop for FixtureGroups {
+    fn drop(&mut self) {
+        unsafe {
+            libc::killpg(self.rpc, libc::SIGKILL);
+            libc::killpg(self.detached, libc::SIGKILL);
+        }
+    }
+}
+
+async fn prove_real_group_cancellation(mode: &str) {
+    use std::os::unix::net::UnixDatagram;
+    let mut fixture = Fixture::new(vec![]).await;
+    fixture.close().await;
+    let courier_path = fixture._directory.path().join("entry");
+    let release_path = fixture._directory.path().join("release");
+    let courier = UnixDatagram::bind(&courier_path).unwrap();
+    courier
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let courier_json = serde_json::to_string(&courier_path).unwrap();
+    let release_json = serde_json::to_string(&release_path).unwrap();
+    let script = format!(
+        r#"
+import os, signal, socket, json
+def report(role):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.sendto(json.dumps([role, os.getpid(), os.getpgrp()]).encode(), {courier_json})
+    s.close()
+owned = os.fork()
+if owned == 0:
+    report('owned')
+    while True: signal.pause()
+detached = os.fork()
+if detached == 0:
+    os.setsid()
+    for fd in (0, 1, 2): os.close(fd)
+    gate = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    gate.bind({release_json})
+    report('detached')
+    gate.recv(1)
+    os._exit(0)
+report('rpc')
+while True: signal.pause()
+"#
+    );
+    let control = NativeControl::new();
+    let entered = control
+        .try_run(Box::new(move || {
+            let mut roles = std::collections::BTreeMap::new();
+            for _ in 0..3 {
+                let mut bytes = [0u8; 256];
+                let n = courier.recv(&mut bytes).unwrap();
+                let (role, pid, group): (String, i32, i32) =
+                    serde_json::from_slice(&bytes[..n]).unwrap();
+                roles.insert(role, (pid, group));
+            }
+            roles
+        }))
+        .unwrap();
+    let (done, completed) = oneshot::channel();
+    let executor = Arc::new(RealProcessExecutor {
+        script,
+        completed: Mutex::new(Some(done)),
+    });
+    fixture.identity.service.socket_path = fixture._directory.path().join("real-s");
+    let listener = UnixListener::bind(&fixture.identity.service.socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let service = SocketService::start(
+        listener,
+        fixture.identity.service.clone(),
+        ServerDeps {
+            codec: Arc::new(Codec),
+            executor,
+            runtime: fixture.clock.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    service.wait_ready().await.unwrap();
+    let stream = UnixStream::connect(&fixture.identity.service.socket_path)
+        .await
+        .unwrap();
+    send(&stream, &Codec.encode_hello(&fixture.identity).unwrap()).await;
+    assert_eq!(receive(&stream).await.unwrap(), b"ready");
+    send(&stream, &poll()).await;
+    let roles = entered.await.unwrap();
+    let (rpc, group) = roles["rpc"];
+    let (detached, detached_group) = roles["detached"];
+    let _cleanup = FixtureGroups { rpc, detached };
+    assert_eq!(rpc, group);
+    assert_eq!(roles["owned"].1, rpc);
+    assert_eq!(detached, detached_group);
+    assert_ne!(detached_group, rpc);
+    assert_eq!(unsafe { libc::killpg(rpc, 0) }, 0);
+    match mode {
+        "close" => drop(stream),
+        "deadline" => {
+            fixture.clock.advance(30_001);
+            closed(&stream).await;
+        }
+        "signal" => {
+            service.state.shutdown.store(true, Ordering::Release);
+            closed(&stream).await;
+        }
+        _ => {
+            let context = fixture.context();
+            let (evidence, ()) = tokio::join!(service.shutdown(&context), closed(&stream));
+            assert_eq!(evidence.unknown, 1);
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(60), completed)
+            .await
+            .unwrap()
+            .unwrap(),
+        "stream/guard shutdown reaches the real runner cancellation path"
+    );
+    let gone = control
+        .try_run(Box::new(move || {
+            let hang_guard = std::time::Instant::now();
+            loop {
+                if unsafe { libc::killpg(rpc, 0) } == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return true;
+                }
+                assert!(
+                    hang_guard.elapsed() < Duration::from_secs(30),
+                    "hang guard: owned group must be gone after cleanup"
+                );
+                std::thread::yield_now();
+            }
+        }))
+        .unwrap();
+    assert!(gone.await.unwrap());
+    assert_eq!(
+        unsafe { libc::killpg(detached, 0) },
+        0,
+        "detached task group survives RPC cancellation"
+    );
+    assert_eq!(unsafe { libc::getpgid(detached) }, detached);
+    let release = UnixDatagram::unbound().unwrap();
+    release.send_to(b"x", &release_path).unwrap();
+    let evidence = service.shutdown(&fixture.context()).await;
+    assert_eq!(
+        evidence.unknown, 1,
+        "Phase A must not fabricate T1 cleanup proof"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn real_process_group_close_cancellation_preserves_the_detached_group() {
+    prove_real_group_cancellation("close").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn real_process_group_deadline_signal_and_shutdown_drive_actual_termination() {
+    for mode in ["deadline", "signal", "shutdown"] {
+        prove_real_group_cancellation(mode).await;
+    }
+}
