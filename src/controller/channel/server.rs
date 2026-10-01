@@ -459,7 +459,6 @@ async fn write_reply(
     state: &State,
     deadline: Duration,
 ) -> Result<(), ChannelFailure> {
-    quiet(stream)?;
     #[cfg(test)]
     let mut before = state.before_final_write.lock().unwrap().take();
     let mut offset = 0;
@@ -467,6 +466,9 @@ async fn write_reply(
         if state.stopping() || state.runtime.now() >= deadline {
             return Err(failure(ChannelReason::Timeout));
         }
+        // Check before each incomplete write, including after a partial chunk.
+        // A final successful write returns directly without another probe.
+        quiet(stream)?;
         #[cfg(test)]
         if offset == bytes.len() - 1
             && let Some(barrier) = before.take()
@@ -513,11 +515,11 @@ async fn write_reply(
         tokio::select! {
             biased;
             _ = guard(state, deadline) => return Err(failure(ChannelReason::Timeout)),
-            result = stream.writable() => { result.map_err(|_| failure(ChannelReason::ForwardLost))?; },
             result = stream.readable() => {
                 result.map_err(|_| failure(ChannelReason::ForwardLost))?;
                 quiet(stream)?;
             },
+            result = stream.writable() => { result.map_err(|_| failure(ChannelReason::ForwardLost))?; },
         }
     }
     Ok(())

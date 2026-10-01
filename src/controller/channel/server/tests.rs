@@ -177,3 +177,78 @@ async fn completion_handoff_accepts_next_bytes_ready_at_final_write_completion()
     assert_eq!(fixture.executor.calls.load(Ordering::Acquire), 2);
     fixture.close().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_early_input_is_rejected_when_read_and_write_are_both_ready() {
+    use std::future::Future;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::new().await;
+        let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let writer = UnixStream::from_std(writer).unwrap();
+        let reader = UnixStream::from_std(reader).unwrap();
+        let send_buffer: libc::c_int = 8192;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    writer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::from_ref(&send_buffer).cast(),
+                    std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        writer.writable().await.unwrap();
+        let mut filled = 0;
+        loop {
+            match writer.try_write(&[0; 8192]) {
+                Ok(0) => panic!("fixture socket closed while filling its send buffer"),
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fixture fill: {error}"),
+            }
+        }
+        assert!(filled > 0);
+        let mut reply = std::pin::pin!(write_reply(
+            &writer,
+            b"remaining reply",
+            &fixture.service.state,
+            fixture.clock.now() + REQUEST_GUARD,
+        ));
+        let blocked =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(reply.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(blocked, "reply must be incomplete before input is queued");
+
+        send(&reader, b"early request byte").await;
+        let mut byte = 0;
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    writer.as_raw_fd(),
+                    std::ptr::from_mut(&mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK,
+                )
+            },
+            1,
+            "early input is already queued in the kernel"
+        );
+        exact(&reader, &mut vec![0; filled]).await.unwrap();
+        let (readable, writable) = tokio::join!(writer.readable(), writer.writable());
+        readable.unwrap();
+        writable.unwrap();
+        assert_eq!(
+            reply.as_mut().await,
+            Err(failure(ChannelReason::ForwardLost)),
+            "queued pre-completion input must win over simultaneous write readiness"
+        );
+        fixture.close().await;
+    })
+    .await
+    .expect("hang guard: blocked writer regression must finish");
+}
