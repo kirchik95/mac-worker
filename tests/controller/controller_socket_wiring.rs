@@ -2389,6 +2389,42 @@ mod t7a {
             runner_handoff(true);
         }
 
+        #[test]
+        fn image_runner_handoff_state_fence_waits_for_an_active_writer() {
+            let fixture = Fixture::new();
+            seed_task(&fixture, false);
+            let mut writer = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import fcntl,sys\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('locked',flush=True)\nsys.stdin.buffer.read(1)\n",
+                ])
+                .arg(fixture.paths.state.join("jobs.lock"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let stdout = writer.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(stdout).read_line(&mut line).unwrap();
+                let _ = tx.send(line);
+            });
+            assert_eq!(rx.recv_timeout(GUARD).unwrap(), "locked\n");
+            reader.join().unwrap();
+            let mut contended = false;
+            let lock = children::state_lock_on_contention(&fixture, || {
+                if !contended {
+                    contended = true;
+                    writer.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+                }
+            });
+            assert!(contended, "the real writer must hold the state fence first");
+            assert!(writer.wait().unwrap().success());
+            drop(lock);
+        }
+
         mod children {
             use super::*;
             use mac_worker::{
@@ -2496,16 +2532,35 @@ mod t7a {
                 .unwrap();
             }
             pub(super) fn state_lock(fixture: &Fixture) -> fs::File {
+                state_lock_on_contention(fixture, || {})
+            }
+            pub(super) fn state_lock_on_contention(
+                fixture: &Fixture,
+                mut on_contention: impl FnMut(),
+            ) -> fs::File {
                 let lock = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(fixture.paths.state.join("jobs.lock"))
                     .unwrap();
-                assert_eq!(
-                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                    0
-                );
-                lock
+                // A detached runner can still be publishing its state when
+                // the test reaches this barrier. Wait for the actual fence,
+                // then keep it held while the socket RPC starts and blocks.
+                let deadline = Instant::now() + GUARD;
+                loop {
+                    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+                    {
+                        return lock;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+                    assert!(
+                        Instant::now() < deadline,
+                        "state fence acquisition hang guard"
+                    );
+                    on_contention();
+                    std::thread::yield_now();
+                }
             }
 
             #[test]
