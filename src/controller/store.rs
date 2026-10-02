@@ -689,10 +689,17 @@ impl ControllerStore {
     /// One-time rebuild of the pending index for pre-kernel stores.
     /// Guarded by a durable receipt; corrupt rows are reported, never hidden.
     /// A healthy pre-existing receipt is read-back-validated and counts as
-    /// rebuilt, never as corrupt. A transient index-write failure for a
+    /// rebuilt, never as corrupt. A transient read or index-write failure for a
     /// VALID row aborts without persisting the completed marker, so a later
     /// bootstrap can finish; only genuine row corruption is reported.
     pub fn bootstrap_active_index(&self) -> Result<ActiveBootstrapReport, WorkerError> {
+        self.bootstrap_active_index_with_hook(|| {})
+    }
+
+    fn bootstrap_active_index_with_hook(
+        &self,
+        mut after_open: impl FnMut(),
+    ) -> Result<ActiveBootstrapReport, WorkerError> {
         if self
             .root
             .entry_exists(BOOTSTRAP_RECEIPT)
@@ -703,20 +710,8 @@ impl ControllerStore {
         let mut rebuilt = Vec::new();
         let mut corrupt = Vec::new();
         for name in self.request_names()? {
-            let record: Result<DurableRequest, WorkerError> = (|| {
-                let bytes = self
-                    .root
-                    .read_private_regular(&name, MAX_STORED_REQUEST_BYTES as u64)
-                    .map_err(|error| op_io("read-row", &name, error))?;
-                ensure_stored_size(&bytes)?;
-                let record: DurableRequest = serde_json::from_slice(&bytes).map_err(|_| {
-                    WorkerError::Protocol("CONTROLLER_TRANSPORT: durable request is invalid".into())
-                })?;
-                validate_record(&name, &record)?;
-                Ok(record)
-            })();
-            match record {
-                Ok(record) => {
+            match self.read_bootstrap_row(&name, &mut after_open) {
+                Ok(Some(record)) => {
                     if record.phase == RequestPhase::Published {
                         let receipt = PendingReceipt {
                             request_id: record.request_id.clone(),
@@ -732,6 +727,11 @@ impl ControllerStore {
                             Err(error) if is_already_exists(&error) => {
                                 match self.read_pending_for_bootstrap(&receipt) {
                                     Ok(()) => rebuilt.push(record.request_id.clone()),
+                                    Err(WorkerError::Io(error))
+                                        if error.kind() != io::ErrorKind::InvalidData =>
+                                    {
+                                        return Err(WorkerError::Io(error));
+                                    }
                                     Err(recheck) => {
                                         corrupt.push(format!("{name}: {}", display_error(&recheck)))
                                     }
@@ -743,6 +743,12 @@ impl ControllerStore {
                             Err(error) => return Err(error),
                         }
                     }
+                }
+                Ok(None) => {}
+                // InvalidData is the rooted reader's size check; other I/O
+                // failures must never become permanent corruption evidence.
+                Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
+                    return Err(WorkerError::Io(error));
                 }
                 Err(error) => corrupt.push(format!("{name}: {}", display_error(&error))),
             }
@@ -778,7 +784,8 @@ impl ControllerStore {
 
     /// Validated read-back of the durable bootstrap marker. Shared by the
     /// entry path and the marker-race loser path. Invalid marker fails
-    /// closed; it is never treated as success.
+    /// closed; it is never treated as success. Recheck only saved corrupt
+    /// entries, leaving the winner's marker and rebuilt array untouched.
     fn read_bootstrap_receipt(&self) -> Result<ActiveBootstrapReport, WorkerError> {
         let bytes = self
             .root
@@ -792,11 +799,99 @@ impl ControllerStore {
                 "CONTROLLER_TRANSPORT: bootstrap receipt is invalid".into(),
             ));
         }
+        let mut corrupt = Vec::new();
+        for entry in receipt.corrupt {
+            if self.bootstrap_corruption_persists(&entry)? {
+                corrupt.push(entry);
+            }
+        }
         Ok(ActiveBootstrapReport {
             already_bootstrapped: true,
             rebuilt: receipt.rebuilt,
-            corrupt: receipt.corrupt,
+            corrupt,
         })
+    }
+
+    /// Atomic row replacement can retire the opened inode. Recheck only
+    /// within this store's retained root, with the same bound as `load`.
+    fn read_bootstrap_row(
+        &self,
+        name: &str,
+        mut after_open: impl FnMut(),
+    ) -> Result<Option<DurableRequest>, WorkerError> {
+        let mut attempts = 0;
+        loop {
+            match self.read_record_with_hook(name, &mut after_open) {
+                Ok(record) => return Ok(Some(record)),
+                Err(WorkerError::Io(error))
+                    if error.kind() == io::ErrorKind::StaleNetworkFileHandle && attempts < 3 =>
+                {
+                    self.root
+                        .verify_bound()
+                        .map_err(|error| op_io("verify-root", name, error))?;
+                    attempts += 1;
+                    if !self
+                        .root
+                        .entry_exists(name)
+                        .map_err(|error| op_io("probe-row", name, error))?
+                    {
+                        return Ok(None);
+                    }
+                }
+                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    // A missing row is harmless; a missing/replaced root is
+                    // not. Verify the bound object before skipping the row.
+                    self.root
+                        .verify_bound()
+                        .map_err(|error| op_io("verify-root", name, error))?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn bootstrap_corruption_persists(&self, entry: &str) -> Result<bool, WorkerError> {
+        let Some((name, _)) = entry.split_once(": ") else {
+            return Ok(true);
+        };
+        // Legacy evidence is text, not authority to read arbitrary paths.
+        // Unrecognized entries remain reported without following them.
+        if !name.starts_with("req-") || !name.ends_with(".json") || name.contains(['/', '\0']) {
+            return Ok(true);
+        }
+        let record = match self.read_bootstrap_row(name, || {}) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(false),
+            Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
+                return Err(WorkerError::Io(error));
+            }
+            Err(_) => return Ok(true),
+        };
+        if record.phase != RequestPhase::Published {
+            return Ok(false);
+        }
+        let receipt = PendingReceipt {
+            request_id: record.request_id.clone(),
+            payload_sha256: record.payload_sha256.clone(),
+            command: record.command.clone(),
+            created_at_millis: record.created_at_millis,
+        };
+        // A repaired legacy row still needs discoverability. Never hide a
+        // pending receipt mismatch just because its request row validates.
+        match self.write_pending_receipt(&receipt) {
+            Ok(()) => Ok(false),
+            Err(error) if is_already_exists(&error) => {
+                match self.read_pending_for_bootstrap(&receipt) {
+                    Ok(()) => Ok(false),
+                    Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
+                        Err(WorkerError::Io(error))
+                    }
+                    Err(_) => Ok(true),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read-back validation for a pre-existing pending receipt during
@@ -1665,6 +1760,165 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn bootstrap_row_fixture() -> (
+        tempfile::TempDir,
+        ControllerStore,
+        ControllerRequest,
+        Vec<u8>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ControllerStore::open(&temp.path().join("controller")).unwrap();
+        let request = submit_request(json!({}));
+        store
+            .handle_with(
+                &request,
+                &FailingHandler {
+                    prepare_fails: false,
+                    terminal: false,
+                },
+                ControllerFault::StopAfterPublish,
+            )
+            .unwrap();
+        store
+            .active
+            .remove_owned_regular(&active_file_name(request.request_id()).unwrap())
+            .unwrap();
+        let bytes = store
+            .root
+            .read_private_regular(
+                &request_file_name(request.request_id()).unwrap(),
+                MAX_STORED_REQUEST_BYTES as u64,
+            )
+            .unwrap();
+        (temp, store, request, bytes)
+    }
+
+    #[test]
+    fn bootstrap_rechecks_estale_after_row_replacement() {
+        let (_temp, store, request, bytes) = bootstrap_row_fixture();
+        let name = request_file_name(request.request_id()).unwrap();
+        let mut replaced = false;
+        let report = store
+            .bootstrap_active_index_with_hook(|| {
+                if !replaced {
+                    replaced = true;
+                    store
+                        .root
+                        .replace_private_regular_exact(&name, &bytes, &bytes)
+                        .unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(report.corrupt.is_empty());
+        assert_eq!(report.rebuilt, vec![request.request_id().to_owned()]);
+        assert!(
+            store
+                .active
+                .entry_exists(&active_file_name(request.request_id()).unwrap())
+                .unwrap()
+        );
+        assert!(store.bootstrap_active_index().unwrap().corrupt.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_exhausted_estale_leaves_no_marker_for_retry() {
+        let (_temp, store, request, bytes) = bootstrap_row_fixture();
+        let name = request_file_name(request.request_id()).unwrap();
+        let mut reads = 0;
+        let error = store
+            .bootstrap_active_index_with_hook(|| {
+                reads += 1;
+                store
+                    .root
+                    .replace_private_regular_exact(&name, &bytes, &bytes)
+                    .unwrap();
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, WorkerError::Io(error)
+            if error.kind() == io::ErrorKind::StaleNetworkFileHandle));
+        assert!((2..=4).contains(&reads), "ESTALE rechecks must be bounded");
+        assert!(!store.root.entry_exists(BOOTSTRAP_RECEIPT).unwrap());
+        let retry = store.bootstrap_active_index().unwrap();
+        assert!(!retry.already_bootstrapped);
+        assert!(retry.corrupt.is_empty());
+        assert_eq!(retry.rebuilt, vec![request.request_id().to_owned()]);
+    }
+
+    #[test]
+    fn bootstrap_skips_a_row_removed_after_open() {
+        let (_temp, store, request, _bytes) = bootstrap_row_fixture();
+        let name = request_file_name(request.request_id()).unwrap();
+        let report = store
+            .bootstrap_active_index_with_hook(|| {
+                store.root.remove_owned_regular(&name).unwrap();
+            })
+            .unwrap();
+
+        assert!(report.corrupt.is_empty());
+        assert!(report.rebuilt.is_empty());
+        assert!(store.root.entry_exists(BOOTSTRAP_RECEIPT).unwrap());
+    }
+
+    #[test]
+    fn bootstrap_recheck_does_not_follow_a_replaced_root() {
+        let (temp, store, request, bytes) = bootstrap_row_fixture();
+        let original = temp.path().join("controller");
+        let moved = temp.path().join("moved-controller");
+        let name = request_file_name(request.request_id()).unwrap();
+        let error = store
+            .bootstrap_active_index_with_hook(|| {
+                std::fs::rename(&original, &moved).unwrap();
+                ControllerStore::open(&original)
+                    .unwrap()
+                    .root
+                    .write_private_atomic_no_replace(&name, &bytes)
+                    .unwrap();
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, WorkerError::Io(_)));
+        assert!(!original.join(BOOTSTRAP_RECEIPT).exists());
+        assert!(!moved.join(BOOTSTRAP_RECEIPT).exists());
+        assert_eq!(std::fs::read(original.join(name)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn bootstrap_marker_race_preserves_the_winners_report_and_fails_closed() {
+        for version in [1, 2] {
+            let (_temp, store, _request, _bytes) = bootstrap_row_fixture();
+            let winner = BootstrapReceipt {
+                version,
+                created_at_millis: 1,
+                rebuilt: vec!["018f0f4a6b5c7d8e9f00112233445567".to_owned()],
+                corrupt: vec!["unrecognized legacy evidence".to_owned()],
+            };
+            let evidence = serde_json::to_vec(&winner).unwrap();
+            let result = store.bootstrap_active_index_with_hook(|| {
+                store
+                    .root
+                    .write_private_atomic_no_replace(BOOTSTRAP_RECEIPT, &evidence)
+                    .unwrap();
+            });
+            if version == 1 {
+                let report = result.unwrap();
+                assert!(report.already_bootstrapped);
+                assert_eq!(report.rebuilt, winner.rebuilt);
+                assert_eq!(report.corrupt, winner.corrupt);
+            } else {
+                assert_eq!(result.unwrap_err().public_code(), "CONTROLLER_TRANSPORT");
+            }
+            assert_eq!(
+                store
+                    .root
+                    .read_private_regular(BOOTSTRAP_RECEIPT, MAX_STORED_REQUEST_BYTES as u64)
+                    .unwrap(),
+                evidence
+            );
+        }
     }
 
     #[test]

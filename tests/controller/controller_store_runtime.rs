@@ -14,9 +14,13 @@ use mac_worker::test_support::{
     controller::{
         ActiveResumeConfig, ControllerCommandHandler, ControllerFault, ControllerRequest,
         ControllerStore, DurableRequest, OperationMeta, RequestPhase, default_prepare_operation,
+        health::{ControllerHealth, ControllerTickReport},
         parse_request,
+        protocol::MAX_STORED_REQUEST_BYTES,
     },
     core::{error::WorkerError, protocol::PROTOCOL_VERSION},
+    host::job::ProcessIdentity,
+    task::client::ReconcileReport,
 };
 use serde_json::{Value, json};
 
@@ -602,6 +606,13 @@ fn idle_tick_never_reads_poisoned_retired_history() {
     // A history-scanning tick would choke; the index tick must stay idle-clean.
     std::fs::write(state.join(format!("req-{ID_A}.json")), b"{broken").unwrap();
     std::fs::write(state.join("req-deadbeef.json"), b"{broken").unwrap();
+    // Keep the garbage row private so bootstrap observes its bad JSON,
+    // rather than an unrelated retryable permission failure.
+    std::fs::set_permissions(
+        state.join("req-deadbeef.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let store = ControllerStore::open(&state).unwrap();
     let bootstrap = store.bootstrap_active_index().unwrap();
     assert!(!bootstrap.already_bootstrapped);
@@ -1066,6 +1077,248 @@ fn failed_index_write_leaves_bootstrap_incomplete_for_retry() {
     assert_eq!(retry.rebuilt, vec![ID_A.to_owned()]);
     assert!(retry.corrupt.is_empty());
     assert!(state.join("active-index-bootstrap-v1.json").exists());
+}
+
+#[test]
+fn bootstrap_row_io_error_leaves_no_marker_for_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    store
+        .handle_with(
+            &checkpoint_request(ID_A),
+            &executor,
+            ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    let row = state.join(format!("req-{ID_A}.json"));
+    std::fs::set_permissions(&row, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    let error = store.bootstrap_active_index().unwrap_err();
+    assert!(matches!(error, WorkerError::Io(error)
+        if error.kind() == std::io::ErrorKind::PermissionDenied));
+    assert!(!state.join("active-index-bootstrap-v1.json").exists());
+    std::fs::set_permissions(&row, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let retry = store.bootstrap_active_index().unwrap();
+    assert!(!retry.already_bootstrapped);
+    assert!(retry.corrupt.is_empty());
+    assert_eq!(retry.rebuilt, vec![ID_A.to_owned()]);
+}
+
+#[test]
+fn bootstrap_pending_receipt_io_error_leaves_no_marker_for_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    store
+        .handle_with(
+            &checkpoint_request(ID_A),
+            &executor,
+            ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    let pending = state.join("active").join(format!("{ID_A}.json"));
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    assert!(matches!(
+        store.bootstrap_active_index().unwrap_err(),
+        WorkerError::Io(_)
+    ));
+    assert!(!state.join("active-index-bootstrap-v1.json").exists());
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let retry = store.bootstrap_active_index().unwrap();
+    assert!(!retry.already_bootstrapped);
+    assert!(retry.corrupt.is_empty());
+    assert_eq!(retry.rebuilt, vec![ID_A.to_owned()]);
+}
+
+fn finish_bootstrap_health_tick(
+    store: &ControllerStore,
+    executor: &KernelTestExecutor,
+    health: &mut ControllerHealth,
+    now: u64,
+) -> ControllerTickReport {
+    let report = ControllerTickReport::collect(
+        store,
+        executor,
+        || Ok(ReconcileReport::default()),
+        || Ok(now),
+    );
+    health.begin_tick(now - 10);
+    health.finish_tick(now, 10, &report);
+    report
+}
+
+#[test]
+fn bootstrap_real_row_corruption_keeps_counting_in_health() {
+    for damage in ["json", "oversize", "validation", "identity"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+        store
+            .handle_with(&checkpoint_request(ID_A), &executor, ControllerFault::None)
+            .unwrap();
+        let row = state.join(format!("req-{ID_A}.json"));
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&row).unwrap()).unwrap();
+        let bytes = match damage {
+            "json" => b"{broken /private/secret token=private-value".to_vec(),
+            "oversize" => vec![b' '; MAX_STORED_REQUEST_BYTES + 1],
+            "validation" => {
+                value["body"] = json!([]);
+                serde_json::to_vec(&value).unwrap()
+            }
+            "identity" => {
+                value["request_id"] = json!(ID_B);
+                serde_json::to_vec(&value).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        std::fs::write(&row, bytes).unwrap();
+        let first = store.bootstrap_active_index().unwrap();
+        assert_eq!(first.corrupt.len(), 1, "{damage}");
+        assert!(first.corrupt[0].starts_with(&format!("req-{ID_A}.json: ")));
+        let mut health = ControllerHealth::new(
+            ProcessIdentity::new(crate::fixture_pid::fixture_pid(42), 1).unwrap(),
+            100,
+        );
+        for now in [200, 300] {
+            let report = finish_bootstrap_health_tick(&store, &executor, &mut health, now);
+            assert_eq!(report.requests.bootstrap.unwrap().corrupt, first.corrupt);
+        }
+        assert_eq!(health.failures["CONTROLLER_TRANSPORT"].count, 2, "{damage}");
+        assert_eq!(health.last_success_millis, None);
+        let serialized = serde_json::to_string(&health).unwrap();
+        assert!(!serialized.contains(ID_A));
+        assert!(!serialized.contains("/private/secret"));
+        assert!(!serialized.contains("private-value"));
+    }
+}
+
+#[test]
+fn bootstrap_repaired_row_stops_counting_and_rebuilds_pending_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    store
+        .handle_with(
+            &checkpoint_request(ID_A),
+            &executor,
+            ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    std::fs::remove_file(state.join("active").join(format!("{ID_A}.json"))).unwrap();
+    let row = state.join(format!("req-{ID_A}.json"));
+    let healthy = std::fs::read(&row).unwrap();
+    std::fs::write(&row, b"{broken").unwrap();
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(crate::fixture_pid::fixture_pid(42), 1).unwrap(),
+        100,
+    );
+    let broken = finish_bootstrap_health_tick(&store, &executor, &mut health, 200);
+    assert_eq!(broken.requests.bootstrap.unwrap().corrupt.len(), 1);
+    assert_eq!(health.failures["CONTROLLER_TRANSPORT"].count, 1);
+    let marker = state.join("active-index-bootstrap-v1.json");
+    let evidence = std::fs::read(&marker).unwrap();
+
+    std::fs::write(&row, healthy).unwrap();
+    let repaired = finish_bootstrap_health_tick(&store, &executor, &mut health, 300);
+    let bootstrap = repaired.requests.bootstrap.unwrap();
+    assert!(bootstrap.already_bootstrapped);
+    assert!(bootstrap.corrupt.is_empty());
+    assert!(health.last_tick_failures.is_empty());
+    assert_eq!(health.failures["CONTROLLER_TRANSPORT"].count, 1);
+    assert_eq!(health.last_success_millis, Some(300));
+    assert_eq!(repaired.requests.resume.unwrap().completed.len(), 1);
+    assert_eq!(executor.calls_for(ID_A), 1);
+    assert_eq!(
+        store.load(ID_A).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), evidence);
+    assert!(
+        ControllerStore::open(&state)
+            .unwrap()
+            .bootstrap_active_index()
+            .unwrap()
+            .corrupt
+            .is_empty()
+    );
+}
+
+#[test]
+fn bootstrap_removed_corrupt_row_is_no_longer_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    store
+        .handle_with(&checkpoint_request(ID_A), &executor, ControllerFault::None)
+        .unwrap();
+    let row = state.join(format!("req-{ID_A}.json"));
+    std::fs::write(&row, b"{broken").unwrap();
+    assert_eq!(store.bootstrap_active_index().unwrap().corrupt.len(), 1);
+    let marker = state.join("active-index-bootstrap-v1.json");
+    let evidence = std::fs::read(&marker).unwrap();
+
+    std::fs::remove_file(&row).unwrap();
+    let healed = store.bootstrap_active_index().unwrap();
+    assert!(healed.already_bootstrapped);
+    assert!(healed.corrupt.is_empty());
+    assert_eq!(std::fs::read(&marker).unwrap(), evidence);
+}
+
+#[test]
+fn bootstrap_pending_identity_mismatch_is_reported_until_repaired() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    store
+        .handle_with(
+            &checkpoint_request(ID_A),
+            &executor,
+            ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    let pending = state.join("active").join(format!("{ID_A}.json"));
+    let healthy = std::fs::read(&pending).unwrap();
+    let mut receipt: Value = serde_json::from_slice(&healthy).unwrap();
+    receipt["payload_sha256"] = json!("0".repeat(64));
+    std::fs::write(&pending, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+    let first = store.bootstrap_active_index().unwrap();
+    assert_eq!(first.corrupt.len(), 1);
+    assert!(first.corrupt[0].contains("CONTROLLER_REQUEST_CONFLICT"));
+    assert_eq!(
+        store.bootstrap_active_index().unwrap().corrupt,
+        first.corrupt
+    );
+    std::fs::write(&pending, healthy).unwrap();
+    assert!(store.bootstrap_active_index().unwrap().corrupt.is_empty());
+}
+
+#[test]
+fn bootstrap_unrecognized_evidence_is_kept_without_following_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let corrupt = vec![
+        "req-../../outside.json: IO: legacy error",
+        "req-nul\0.json: IO: legacy error",
+        "unrecognized legacy evidence",
+    ];
+    let marker = state.join("active-index-bootstrap-v1.json");
+    let evidence = serde_json::to_vec(&json!({
+        "version": 1,
+        "created_at_millis": 1,
+        "rebuilt": [],
+        "corrupt": corrupt,
+    }))
+    .unwrap();
+    std::fs::write(&marker, &evidence).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = store.bootstrap_active_index().unwrap();
+    assert!(report.already_bootstrapped);
+    assert_eq!(report.corrupt, corrupt);
+    assert_eq!(std::fs::read(&marker).unwrap(), evidence);
 }
 
 #[test]

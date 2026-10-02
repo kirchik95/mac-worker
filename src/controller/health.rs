@@ -155,8 +155,8 @@ impl ControllerHealth {
         match &report.requests.bootstrap {
             Ok(bootstrap) => {
                 progressed |= !bootstrap.already_bootstrapped && !bootstrap.rebuilt.is_empty();
-                // Bootstrap corruption is persisted evidence. Keep reporting it
-                // on later ticks until repaired; never copy its filenames/text.
+                // The store rechecks persisted bootstrap evidence each tick.
+                // Count unresolved corruption; never copy its filenames/text.
                 for _ in &bootstrap.corrupt {
                     self.record_failure("CONTROLLER_TRANSPORT", now);
                 }
