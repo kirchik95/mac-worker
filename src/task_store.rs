@@ -2231,18 +2231,27 @@ fn read_record_with_hook<T: DeserializeOwned + Serialize>(
         directory.read_private_regular_with_hook(name, MAX_TASK_RECORD_BYTES, after_open)?;
     let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
     let value = T::deserialize(&mut deserializer)
-        .map_err(|error| WorkerError::Protocol(format!("invalid task JSON: {error}")))?;
+        .map_err(|_| task_record_invalid(name, "could not be decoded"))?;
     deserializer
         .end()
-        .map_err(|error| WorkerError::Protocol(format!("trailing task JSON data: {error}")))?;
-    let canonical = serde_json::to_vec(&value).map_err(|error| {
-        WorkerError::Protocol(format!("failed to canonicalize task JSON: {error}"))
-    })?;
+        .map_err(|_| task_record_invalid(name, "has trailing data"))?;
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|_| task_record_invalid(name, "could not be encoded"))?;
     if canonical != bytes {
-        return Err(WorkerError::Protocol("task JSON is not canonical".into()));
+        return Err(task_record_invalid(name, "is not canonical"));
     }
     Ok(value)
 }
+
+/// A stored task record that fails validation is a host-side fault, not a bad
+/// request. Give it a stable code so the host does not fold it into the
+/// generic `INVALID_REQUEST` that peers read as "old helper". The detail is a
+/// record name and a fixed reason; decoder text can quote record content.
+fn task_record_invalid(name: &str, reason: &str) -> WorkerError {
+    WorkerError::Protocol(format!("{TASK_RECORD_INVALID}: {name} {reason}"))
+}
+
+const TASK_RECORD_INVALID: &str = "TASK_RECORD_INVALID";
 
 fn write_record_once<T: Serialize + DeserializeOwned + PartialEq>(
     directory: &RootedDir,
@@ -2578,6 +2587,116 @@ mod tests {
         .unwrap();
         write_record_once(&task, "status.json", &status).unwrap();
         (temp, store, task, status)
+    }
+
+    fn open_status_with_summary(
+        summary: &str,
+    ) -> (tempfile::TempDir, HostStore, TaskId, TaskStatus) {
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::generate();
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let status = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Done),
+            Some("worker".into()),
+            true,
+            None,
+            Some(summary.to_owned()),
+            Vec::new(),
+            vec!["apps/backend/src/plugins/auth.plugin.ts".into()],
+            None,
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        write_record_once(&task, "status.json", &status).unwrap();
+        (temp, store, task_id, status)
+    }
+
+    /// The client re-decodes a host response and requires the same bytes.
+    fn assert_response_round_trips(response: &TaskStatusResponse) {
+        let wire = serde_json::to_vec(response).unwrap();
+        let decoded: TaskStatusResponse = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn finished_turn_with_a_bearer_summary_stays_readable() {
+        // Break caught: three Codex turns finished with "without the Bearer
+        // prefix" in the summary. The turn boundary and TaskStatus::new each
+        // appended a `]`, the host read appended a third, and every status,
+        // diff and cancel failed as INVALID_REQUEST with the result unpublished.
+        let summary = crate::redaction::RedactionBoundary::from_env()
+            .summary("auth.plugin.ts: rejects a valid JWT without the Bearer prefix\u{201d}.");
+        let (_temp, store, task_id, written) = open_status_with_summary(&summary);
+        assert_eq!(
+            written.summary(),
+            Some("auth.plugin.ts: rejects a valid JWT without the Bearer [token]\u{201d}.")
+        );
+
+        let response = TaskStore::new(&store, &SystemProcessRunner)
+            .status(&TaskStatusRequest::new(PROJECT_ID, task_id))
+            .unwrap();
+        assert_eq!(response.status(), &written);
+        assert_response_round_trips(&response);
+    }
+
+    #[test]
+    fn status_written_by_the_old_redactor_reads_back_unchanged() {
+        // Records already on the workers carry `Bearer [token]]`. The fixed
+        // boundary must accept them as written so a redeploy releases them.
+        let (_temp, store, task_id, written) =
+            open_status_with_summary("without the Bearer [token]]\u{201d} pinned by it.fails");
+        let bytes = serde_json::to_vec(&written).unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("Bearer [token]]\u{201d}")
+        );
+
+        let response = TaskStore::new(&store, &SystemProcessRunner)
+            .status(&TaskStatusRequest::new(PROJECT_ID, task_id))
+            .unwrap();
+        assert_eq!(response.status(), &written);
+        assert_response_round_trips(&response);
+    }
+
+    #[test]
+    fn invalid_task_records_report_their_own_code() {
+        // Break caught: a stored record that failed its canonical check left
+        // the host as INVALID_REQUEST "host request was invalid", which both
+        // hid the fault and reads to peers like an old helper.
+        let (_temp, store, task_id, written) = open_status_with_summary("done");
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, false)
+            .unwrap();
+        let canonical = serde_json::to_vec(&written).unwrap();
+        let spaced = [b"{ ".as_slice(), &canonical[1..]].concat();
+        task.replace_private_regular_exact("status.json", &canonical, &spaced)
+            .unwrap();
+
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .status(&TaskStatusRequest::new(PROJECT_ID, task_id))
+            .unwrap_err();
+        assert_eq!(error.public_code(), TASK_RECORD_INVALID);
+        let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+        assert_eq!(wire["error"]["code"], TASK_RECORD_INVALID);
+        assert_eq!(wire["error"]["message"], "status.json is not canonical");
+
+        // Decoder text can quote the record; the detail never does.
+        let planted = br#"{"state":"PLANTED-RECORD-TEXT"}"#;
+        task.replace_private_regular_exact("status.json", &spaced, planted)
+            .unwrap();
+        let error = TaskStore::new(&store, &SystemProcessRunner)
+            .load_status(PROJECT_ID, task_id)
+            .unwrap_err();
+        assert_eq!(error.public_code(), TASK_RECORD_INVALID);
+        assert!(!error.to_string().contains("PLANTED"), "{error}");
+        let wire = serde_json::to_value(crate::versioned_host_error(&error)).unwrap();
+        assert_eq!(wire["error"]["message"], "status.json could not be decoded");
     }
 
     #[test]

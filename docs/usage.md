@@ -349,6 +349,23 @@ listed for that string.
   `gh auth login` and `gh auth setup-git` (HTTPS) or register the worker's
   SSH key. Delivery keeps retrying until 12 attempts; after `failed`, run
   `worker task publish-retry <task_id>` instead of resubmitting the task.
+- `TASK_RECORD_INVALID` (in `task list` as
+  `RUNNER_REPEATED_FAILURE:TASK_RECORD_INVALID`): a task record on the worker
+  (`status.json`, `meta.json`, or `session.json`) failed validation, so
+  status, diff, and cancel cannot read the task. The message names the record
+  and the check. A record the same build wrote is a bug; report it. The turn
+  may still have finished: the worker keeps the workspace and its result
+  commit. Copy that commit without changing the worker, from the project on
+  the laptop:
+
+  ```sh
+  git fetch <worker-ssh>:.local/share/mac-worker/host/tasks/<project-id>/<task-id>/workspace \
+    HEAD:refs/heads/recovered/<task-id>
+  ```
+
+  `<project-id>` is the directory under `tasks/` that holds the task id.
+  Check that the fetched commit matches `head_oid` in the worker's
+  `status.json` before you merge it.
 
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.

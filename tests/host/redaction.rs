@@ -3,7 +3,7 @@ use mac_worker::test_support::{
     core::redaction::{
         MAX_CHANGED_FILE_BYTES, MAX_CHANGED_FILE_COUNT, MAX_FAILURE_REASON_BYTES,
         MAX_QUESTION_BYTES, MAX_QUESTION_COUNT, MAX_QUESTION_OPTION_BYTES,
-        MAX_QUESTION_OPTION_COUNT, MAX_SUMMARY_BYTES, RedactionBoundary,
+        MAX_QUESTION_OPTION_COUNT, MAX_SUMMARY_BYTES, MAX_TITLE_BYTES, RedactionBoundary,
     },
     task::model::{TaskOutcome, TaskState, TaskStatus, TurnSummary, TurnTerminal},
 };
@@ -166,6 +166,35 @@ fn task_status_and_turn_summary_apply_the_same_boundary() {
 }
 
 #[test]
+fn bearer_redaction_is_a_fixed_point() {
+    // Break caught: a Codex summary said "without the Bearer prefix". Each
+    // pass turned `Bearer [token]` into `Bearer [token]]`, so the host wrote a
+    // status.json that never re-encoded canonically, and every status read
+    // failed as INVALID_REQUEST after the turn had finished.
+    let boundary = boundary();
+    for input in [
+        "rejects a valid JWT without the Bearer prefix\u{201d}.",
+        "Bearer [token]",
+        "Bearer [token]]\u{201d} pinned",
+        "Bearer [path]",
+        "Bearer ~/.netrc",
+        "Bearer ,",
+        "Bearer ",
+        "bearer\t[token]x",
+    ] {
+        let once = boundary.summary(input);
+        assert_eq!(boundary.summary(&once), once, "input {input:?}");
+    }
+    assert_eq!(
+        boundary.summary("the Bearer prefix\u{201d}"),
+        "the Bearer [token]\u{201d}"
+    );
+    // Records written by the old redactor keep their text unchanged.
+    let stored = "without the Bearer [token]]\u{201d}.";
+    assert_eq!(boundary.summary(stored), stored);
+}
+
+#[test]
 fn base64_looking_blobs_are_redacted() {
     let blob = "QWxhZGRpbjpvcGVuIHNlc2FtZUFsYWRkaW46b3Blbg== extra";
     let text = boundary().summary(blob);
@@ -192,7 +221,7 @@ proptest! {
         let reason = boundary.failure_reason(&input);
         prop_assert!(reason.len() <= MAX_FAILURE_REASON_BYTES);
         let title = boundary.title(&input);
-        prop_assert!(title.len() <= mac_worker::test_support::core::redaction::MAX_TITLE_BYTES);
+        prop_assert!(title.len() <= MAX_TITLE_BYTES);
         let questions = boundary.questions([
             Question::new(input.clone(), vec![input.clone()]),
             Question::open(input.clone()),
@@ -207,5 +236,70 @@ proptest! {
         }
         let files = boundary.changed_files([&input, &input]);
         prop_assert!(files.len() <= MAX_CHANGED_FILE_COUNT);
+    }
+}
+
+type BoundedField = fn(&RedactionBoundary, &str) -> String;
+
+fn redaction_fragment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("Bearer ".to_owned()),
+        Just("bearer\t".to_owned()),
+        Just("Bearer".to_owned()),
+        Just("[token]".to_owned()),
+        Just("[path]".to_owned()),
+        Just("[".to_owned()),
+        Just("]".to_owned()),
+        Just("sk-".to_owned()),
+        Just("0123456789abcdef".to_owned()),
+        Just("QWxhZGRpbjpvcGVu".to_owned()),
+        Just("+/".to_owned()),
+        Just("=".to_owned()),
+        Just("~/".to_owned()),
+        Just("~".to_owned()),
+        Just("/Users/tester/".to_owned()),
+        Just("/tmp/".to_owned()),
+        Just("\"".to_owned()),
+        Just("'".to_owned()),
+        Just(",".to_owned()),
+        Just(")".to_owned()),
+        Just(";".to_owned()),
+        Just(" ".to_owned()),
+        Just("\n".to_owned()),
+        Just("\\n".to_owned()),
+        Just("\u{201d}".to_owned()),
+        Just("\u{e9}".to_owned()),
+        "[a-zA-Z0-9_-]{0,12}",
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 2048,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// Stored task records are decoded through the same boundary, and the
+    /// host requires the re-encoded bytes to match the file. Any field whose
+    /// second redaction differs from its first makes the record unreadable.
+    #[test]
+    fn redaction_is_idempotent(
+        fragments in prop::collection::vec(redaction_fragment(), 0..48),
+    ) {
+        let input = fragments.concat();
+        let boundary = RedactionBoundary::new("/Users/tester");
+        let limited: [(&str, BoundedField); 6] = [
+            ("summary", |boundary, text| boundary.summary(text)),
+            ("question", |boundary, text| boundary.question(text)),
+            ("question option", |boundary, text| boundary.question_option(text)),
+            ("changed file", |boundary, text| boundary.changed_file(text)),
+            ("failure reason", |boundary, text| boundary.failure_reason(text)),
+            ("title", |boundary, text| boundary.title(text)),
+        ];
+        for (field, redact) in limited {
+            let once = redact(&boundary, &input);
+            prop_assert_eq!(redact(&boundary, &once), once, "{} of {:?}", field, input);
+        }
     }
 }

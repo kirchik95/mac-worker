@@ -15,6 +15,8 @@ pub const MAX_TITLE_BYTES: usize = 120;
 
 const PATH_PLACEHOLDER: &str = "[path]";
 const TOKEN_PLACEHOLDER: &str = "[token]";
+const UNSETTLED_PLACEHOLDER: &str = "[redacted]";
+const MAX_SETTLE_PASSES: usize = 4;
 const MIN_HEX_TOKEN: usize = 32;
 const MIN_BASE64_TOKEN: usize = 32;
 const MIN_SK_TOKEN: usize = 8;
@@ -168,10 +170,24 @@ impl RedactionBoundary {
             .collect()
     }
 
+    /// Escape, redact and bound `input`. The result is a fixed point:
+    /// `text(text(x)) == text(x)`. Task records are decoded through this
+    /// boundary again and must re-encode byte for byte, so a field that
+    /// changes on a second pass makes its record unreadable.
     pub fn text(&self, input: &str, max_bytes: usize) -> String {
         let escaped = escape_controls(input);
-        let redacted = self.redact(&escaped);
-        truncate_bytes(&redacted, max_bytes)
+        let mut text = truncate_bytes(&self.redact(&escaped), max_bytes);
+        // Truncation can leave a new token at the end: a long run whose
+        // `=x` suffix kept it from matching, or a lone `~`. Settle again.
+        for _ in 0..MAX_SETTLE_PASSES {
+            let again = truncate_bytes(&self.redact(&text), max_bytes);
+            if again == text {
+                return text;
+            }
+            text = again;
+        }
+        // Not reached by any known input; this marker is itself stable.
+        truncate_bytes(UNSETTLED_PLACEHOLDER, max_bytes)
     }
 
     fn redact(&self, input: &str) -> String {
@@ -289,6 +305,14 @@ fn redact_tokens(input: &str) -> String {
         {
             output.push_str("Bearer ");
             let value = stripped.trim_start_matches(char::is_whitespace);
+            // A value that is already a placeholder must survive whole:
+            // `skip_token_run` stops at `]`, so re-redacting `[token]` would
+            // leave one more `]` per pass, and a stored task record would
+            // never read back canonical.
+            let value = [TOKEN_PLACEHOLDER, PATH_PLACEHOLDER]
+                .iter()
+                .find_map(|placeholder| value.strip_prefix(placeholder))
+                .unwrap_or(value);
             rest = skip_token_run(value);
             output.push_str(TOKEN_PLACEHOLDER);
             continue;
