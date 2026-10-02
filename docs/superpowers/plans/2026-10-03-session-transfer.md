@@ -49,7 +49,7 @@
 
 The orchestrator merges T1, then S1 and S2 (keeping T1's `mod.rs` files and taking S1's and S2's implementations), and folds T0 and R1/R2 into spec Round 2.
 
-**Wave 2** (after wave 1 is merged, 10 agents, branches off the merged `integ/session-transfer`):
+**Wave 2** (after wave 1 and F1 are merged into `integ/session-transfer`, 10 agents). Spec Round 2 (items 1–20) is binding.
 
 | Track | Agent | Size | Exclusive files |
 | --- | --- | --- | --- |
@@ -57,15 +57,23 @@ The orchestrator merges T1, then S1 and S2 (keeping T1's `mod.rs` files and taki
 | W2 Codex capture | `st-cap-codex` | M | `src/session_transfer/capture/codex.rs`; `tests/agents/session_capture_codex.rs` |
 | W3 Claude placement | `st-place-claude` | M | `src/session_transfer/place/claude.rs`; `tests/host/session_place_claude.rs` |
 | W4 Codex placement | `st-place-codex` | M | `src/session_transfer/place/codex.rs`; `tests/host/session_place_codex.rs` |
-| W5 prepare hook and GC | `st-prepare` | L | `src/task_store.rs` (prepare hook, `delete_native_session` store resolution); `src/gc.rs` (session-ref sweep); `tests/host/session_prepare.rs` |
-| W6 direct transport | `st-transport` | M | `src/transfer_repo.rs` (`write_session_package`, pins, `validate_owned_pin_ref`); `src/git_transport.rs` (`push_base` session refspec, `PRE_RECEIVE_HOOK`); `tests/transfer/session_transport.rs` |
-| W7 controller relay | `st-controller` | L | `src/controller/{transfer,stream_client,execute,registry}.rs`; `tests/controller/controller_session_transfer.rs` |
-| W8 imported first turn | `st-runner` | M | `src/turn_runner.rs` (`TurnStart`); `src/job_service.rs` (imported resume acceptance); `tests/task/session_import_turn.rs` |
-| W9 eligibility | `st-sched` | M | `src/scheduler_adapter.rs` (`feature:` capabilities, version gate); version helper in `src/agent_facts.rs`; `tests/scheduler/session_eligibility.rs` |
+| W5 prepare and host GC | `st-prepare` | L | `src/task_store.rs` (prepare ordering, import receipt, store-root resolution through the account env profile, `delete_native_session`); `src/gc.rs` (session-ref enumeration, candidates, deletion); `tests/host/session_prepare.rs` |
+| W6 transfer pins and pushes | `st-transport` | M | `src/transfer_repo.rs` (`write_session_package`, session pin, paired release, `validate_owned_pin_ref`); `src/git_transport.rs` (`push_base` and `push_controller_source` session refspecs, `--atomic`, `PRE_RECEIVE_HOOK`); `tests/transfer/session_transport.rs` |
+| W7 controller source stream | `st-controller` | L | `src/controller/{stream_rpc,stream_client,transfer,execute}.rs` (session OID through prepare/finish/identity/receipt/hook; checkout fetch; re-pin `sessions/<task>` in the controller transfer repo); `tests/controller/controller_session_transfer.rs` |
+| W8 imported first turn | `st-runner` | M | `src/turn_runner.rs` (`TurnStart`, local seed argv, `SessionRefPush` on the single push path); `src/job_service.rs` (first-turn import validation, including repair paths); `tests/task/session_import_turn.rs` |
+| W9 eligibility | `st-sched` | M | `src/scheduler.rs` and `src/scheduler_adapter.rs` (`feature:` capabilities, `agent-min:` evaluation); version helper in `src/agent_facts.rs`; `tests/scheduler/session_eligibility.rs` |
 | W10 docs | `st-docs` | S | `docs/usage.md` (session section and handoff recipe, outside the catalog block); `.claude/skills/pool-dispatch/SKILL.md` |
 
+F1 (`st-claude-fix`, wave 1): `src/agent/claude.rs` passes `--verbose`; branch `fix/claude-stream-verbose` from `main`.
+
 **Wave 3:**
-- T7 serial integration (one agent): `src/cli.rs`, `src/lib.rs`, `src/task_client.rs`, `src/prepared_submit.rs` wiring, `src/features.rs` advertising, `tests/cli/session_submit.rs`, plus the end-to-end fixtures.
+- T7 serial integration (one agent):
+  - `src/cli.rs` (`--from-session`, agent precedence, batch and DAG rejection);
+  - `src/lib.rs` (direct and controller submit, controller health feature check, refusing envelope-only retry of source-incomplete imported requests);
+  - `src/task_client.rs` (package build and pin before the initial record; paired release on every rollback path; the `release_base` caller audit);
+  - `src/features.rs` (advertising);
+  - `tests/cli/session_submit.rs`;
+  - the end-to-end fixtures.
 - Two review agents.
 - T8 live acceptance with the owner.
 
@@ -322,41 +330,9 @@ Unit tests in the source file must cover:
 
 Adversarial review of the spec Round 1 against the code at `3a1a097`. Briefs are `briefs/st-review-laptop.md` and `briefs/st-review-host.md`. Each delivers findings ranked by severity, with `path:line` evidence and a proposed spec change. Each finding is either a wrong assumption, a missing touchpoint, or a contract that cannot be implemented as written.
 
-## Wave 2 tracks (briefed after wave 1)
+## Wave 2 tracks
 
-- **W1 / W2 — capture.**
-  - Discovery by id and latest, the `read_complete_lines` reuse, version extraction, normalization and scrubbing. Claude includes the sidecar per T0; the first-prompt preview is at most 120 characters, single line, `\n` escaped.
-  - Build the `SessionPackage` with `CLAUDE_MAIN_FILE` / `CLAUDE_SIDECAR_DIR` or `CODEX_ROLLOUT_FILE`.
-  - Set the `recently_modified` (< 10 s) flag.
-- **W3 / W4 — placement.**
-  - Materialize the tokens and write through the `StoreWriter`.
-  - Claude: `projects/<claude_project_dir(workspace)>/<id>.jsonl` plus `<id>/…`. Codex: `sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl` plus any T0-required index step.
-  - Repeating placement is a no-op.
-- **W5 — prepare.**
-  - Read the package tree from `SESSION_REF_PREFIX<task>` in the mirror, run `from_parts`, `store_root` with the task's env-profile entries, and `place_for`.
-  - Then `bind_session(agent, seed)` and delete the ref.
-  - `delete_native_session` uses the same store resolution.
-  - The GC sweep removes orphan `sessions/*` refs of terminal tasks. Malformed names are skipped with a diagnostic.
-- **W6 — transport.**
-  - Implement `write_session_package` (a parentless commit of `manifest.json` + `session/…`, pinned at `SESSION_REF_PREFIX<task>` in the transfer repo, unpinned with the base).
-  - `push_base` gets an atomic second refspec, and the hook allows `refs/mac-worker/sessions/*`.
-  - Pin validation accepts the new prefixes for valid ids only.
-- **W7 — controller.**
-  - The source stream pushes `REQUEST_SESSION_REF_PREFIX<request>`.
-  - `SourceSubmitBind.session_oid` is checked by the receive hook against the exact OID.
-  - Checkout fetches both refs, and the relay passes `SessionRefPush` to `push_base`.
-  - A missing or mismatched OID is refused before any mutation.
-- **W8 — runner.**
-  - `TurnStart::{Fresh, Imported, FollowUp}`, derived from `TaskMeta.session_import` and the turn number; it survives crash or replay.
-  - An Imported turn pushes the base plus the package, runs prepare, skips prebind discovery, and calls `resume_turn(seed)`.
-  - The host accepts resume on turn 1 only with `session_import` and a binding.
-- **W9 — eligibility.**
-  - Map `ProbeResponse.features` to `feature:<name>` capabilities.
-  - Version gate: host ≥ source, comparing `x.y.z` with suffixes; unparsable → not eligible. A pinned worker gets `SESSION_AGENT_TOO_OLD`.
-- **W10 — docs.**
-  - A usage section: selector forms, copy semantics, the `--wip` rule, scrubbing and its limits, the version gate, failure codes.
-  - The handoff-note recipe.
-  - The pool-dispatch skill section, with the kernel size kept stable and the skills test green.
+Each track has its own brief in the orchestrator's scratchpad (`briefs/st-w<N>-*.md`). The brief is binding together with spec Round 2.
 
 ## Live acceptance — T8, with the owner
 

@@ -10,6 +10,109 @@ Plan: [2026-10-03-session-transfer.md](../plans/2026-10-03-session-transfer.md).
 
 Origin: study of herdr-gpui Teleport (`github.com/penso/herdr-gpui`, Apache-2.0, `crates/herdr-gpui/src/teleport/{sessions,launch,git}.rs`) on 2026-10-03. Teleport moves an interactive herdr workspace between hosts, including each agent's native session. We take only the session part.
 
+## Round 2 changes (binding; they override the decisions below where they conflict)
+
+Sources:
+- spike reports: T0a `.briefs/st-t0-claude-report.md`, T0b `.briefs/st-t0-codex-report.md`;
+- reviews: R1 `.briefs/st-review-laptop-report.md`, R2 `.briefs/st-review-host-report.md`.
+
+These are copies of the session-scratchpad reports.
+
+**Spike facts:**
+1. **Codex placement is file-only.**
+   - A rollout written to `sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl`, with the id and checkout path rewritten everywhere, resumes with the exact pool argv. Codex fills `state_5.sqlite` and `thread_history_1.sqlite` itself on resume.
+   - No database, index or import step.
+   - v4 and v7 ids both work.
+   - `codex delete --force` removes the rollout and every database row.
+   - Verified for a `codex-tui` interactive source and a headless one, on the laptop (0.160.0) and on mini-3 (0.159.3).
+   - A different `creator_account_id` does not matter (Codex source: no creator check on resume).
+2. **Paths are everywhere.** Paths appear in dozens of fields, including tool output, instructions, sandbox roots and environment snapshots: Codex `payload.cwd`, `runtime_workspace_roots`, `permission_profile…path`, `item.aggregated_output`, …; Claude `cwd`, `attachment.*`, `message.content[].input.file_path`, `toolUseResult.filePath`, `wireToolInputs.*`. Whole-text token rewriting (Decision 2) is therefore the right tool; rewriting only `cwd` is not enough.
+3. **Claude project-dir encoding is confirmed** on the laptop for a 162-character and a 252-character path; the hash suffix matched. The minis have no `~/.claude/projects` at all: the pool has never completed a Claude turn there (fact 4).
+4. **Pre-existing pool bug.** `src/agent/claude.rs` omits `--verbose`, which `claude -p --output-format stream-json` requires on Claude Code 2.1.285 (minis) and 2.1.288 (laptop): `Error: When using --print, --output-format=stream-json requires --verbose`. Every pool Claude turn fails at launch today. Track F1 fixes it on `fix/claude-stream-verbose` from `main`; it is merged into this wave and offered to `main` separately.
+5. **Claude sidecar.** An interactive session that used a subagent has `<id>/subagents/agent-<agentId>.jsonl` plus `agent-<agentId>.meta.json`.
+   - Resume recalls the main conversation with or without it (T0a S1 and S2), but the package still carries the whole `<id>/` tree under `sidecar/`, token-rewritten. The subagent JSONL embeds the session id and paths; `meta.json` holds neither.
+   - All six amended-argv runs kept the placed id, appended in place and created no extra transcript.
+   - Claude found a transcript by UUID even under a different project directory. Canonical placement is still required, for predictability and cleanup.
+   - A resumed structured answer may restate historical `files_changed`, so the pool diff stays authoritative.
+
+**Contract corrections:**
+6. **Feature strings without digits** (the registry grammar rejects digits): `task.session-import`, `controller.session-import`.
+7. **`SessionImportMeta` deserializes through a validating wire type.** `TaskMeta` validation rejects an import combined with an origin source (`SESSION_REQUIRES_SNAPSHOT`) or with a different task agent (`SESSION_AGENT_MISMATCH`). The field lives only in `TaskMeta`, inside its custom wire codec, and never in status, list or controller-read DTOs. It propagates `FrozenSubmitBody` → `PreparedSubmit` → `TaskSubmitRequest` → `TaskMetaInput`, and `require_matching_submit_record` compares it.
+8. **JSON-safe tokens.**
+   - Roots and workspace paths that contain `"`, `\` or ASCII control characters are refused: `SESSION_UNREADABLE` on the laptop, `SESSION_PLACEMENT_FAILED` on the host. Raw-text substitution is therefore equivalent to substitution in decoded JSON strings. Non-ASCII stays allowed as raw UTF-8, which both agents write unescaped.
+   - `materialize` is fallible.
+   - Every package file is token-rewritten; only `.jsonl` and `.json` files are additionally validated as JSON.
+9. **`store_root` is fallible.** An empty or non-absolute `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is refused. The env profile is loaded exactly as the supervisor loads it, from the account home (`src/supervisor.rs:1654-1674`), and the same resolution is applied to `delete_native_session`.
+10. **Laptop scrubbing** uses the high-confidence patterns plus laptop-local explicit values only, which are none in v1. Worker env-profile secrets are never fetched. The transported package may still contain secrets the patterns miss; the docs say so.
+
+**Host placement, replacing Decision 4's step order:**
+
+11. Prepare runs in this order:
+    1. `prepare_workspace`
+    2. `ensure_active_status`
+    3. import receipt `planned`, written to the task directory as `session-import.json` with package OID, target id, agent, store-root identity and frozen `placed_at_millis`
+    4. place, via `StoreWriter`; the outcome is `Created` or `Unchanged`
+    5. `bind_session(agent, seed)`
+    6. receipt `complete`
+    7. delete the mirror ref
+
+    On a retry:
+    - **`complete`:** never touch native files again (the agent may have appended); only make sure the ref is gone and the binding matches.
+    - **`planned`:** place again deterministically (same `placed_at_millis`, so the same Codex file name), then bind, complete and delete the ref.
+
+    Fault tests cover a crash after each step.
+
+**Runner and host first turn, replacing Decision 5's mechanics:**
+
+12. **`TurnStart::{Fresh, Imported, FollowUp}`.**
+
+    | | Fresh | Imported | FollowUp |
+    | --- | --- | --- | --- |
+    | Prebind discovery | per adapter | no | no |
+    | `task_session` before lease | no | **no** | yes |
+    | argv | `first_turn` | `resume_turn(seed)` built locally | `resume_turn(bound ref)` |
+    | push base (+ package) and `task_prepare` | yes | yes (+ package) | no |
+    | Host check | as today | import meta ⇒ resume=true, binding agent = task agent, ref = seed | as today |
+
+    The host check runs on publication and on the repair paths (`src/job_service.rs:580-662`).
+13. **Single push path.** The only `push_base` caller is the shared runner (`src/turn_runner.rs:1345-1364`), used in both direct and controller execution. W8 passes `SessionRefPush` there.
+    - **Controller side:** the controller does not relay separately; it imports `request-sessions/<request>` from the laptop stream and re-pins it as `sessions/<task>` in its own transfer repo (W7).
+    - **Laptop side:** `push_controller_source` gets the atomic two-ref push (W6).
+    - **Stream RPCs:** the source-stream prepare/finish RPCs (`src/controller/stream_rpc.rs`) carry the optional session OID (W7).
+    - `src/controller/registry.rs:304-343` only opens transfer repos; the earlier "controller → host" citation was wrong.
+
+**Recovery and lifecycle:**
+
+14. **Pending imported requests.** An imported request whose source stream did not finish must not be retried envelope-only, because `controller retry` resends the envelope alone (`src/lib.rs:1090-1150`). T7 either resumes the stream from the retained laptop pins, or refuses with a clear message. The live session is never recaptured.
+15. **Laptop pin lifecycle.**
+    - The package is built and pinned before the initial task record is published.
+    - Every pre-record failure removes the unpublished pin.
+    - A durable rollback releases base and session pins before it retires the recovery marker.
+    - W6 exposes one idempotent paired release, which also works when no WIP base pin exists.
+    - T7 audits every `release_base` caller (`src/task_client.rs` around 1695, 1828, 1849, 1855, 1892, 1939, 5415, 5995, 6019).
+
+    Laptop transfer GC never treats live session refs as collectable. Controller-transfer cache GC is a pre-existing gap and stays deferred.
+16. **Host GC** of `refs/mac-worker/sessions/*` (W5) updates the ref enumeration query and the deletion helper. It removes refs of terminal tasks, and refs whose task record has been absent past retention. It never removes a pushed package whose prepare may still run.
+
+**Eligibility, replacing Decision 7's version rule:**
+
+17. **Version requirement.** The requirement is `agent-min:<agent>@<version>`, and the scheduler evaluates it against the observation's agent version (W9 owns `src/scheduler.rs` and `src/scheduler_adapter.rs`).
+    - **Policy relaxed on T0 evidence:** the host may lag the session's producing version by at most one minor version within the same major; patch differences are ignored. Codex 0.160.0 → 0.159.3 passed for both headless and interactive sources; Claude laptop 2.1.288 vs minis 2.1.285 is the same minor.
+    - Missing, unparsable or stale facts (15-minute TTL) make the host ineligible.
+    - Profile-specific binaries are not version-checked; this limitation is documented.
+    - Controller health features describe the binary serving the read, so the docs require a controller restart after upgrade.
+
+**Scope:**
+
+18. `--from-session` exists only on `task submit`. Batch files, batch defaults and DAG children reject it or never carry it; children always get `session_import: None`.
+19. **Agent precedence:** an explicit `--agent` must match the selector; otherwise the selector's agent is used. A continuation prompt is still required.
+20. **Phase B note:** upload-pack has no ref allowlist; it is gated by task and branch existence (`src/git_transport.rs:821-858`), so Phase B must define how export refs are exposed.
+
+**Citation fixes:**
+- `src/identity.rs` → `src/agent/identity.rs`.
+- `FrozenSubmitBody`'s `deny_unknown_fields` is at `src/prepared_submit.rs:20`.
+- `src/host_store.rs:3696-3703` rewrites the hook only when its bytes differ.
+
 ## Purpose and boundaries
 
 A pool task can start from an existing agent conversation instead of an empty one. Later, a pool task's conversation can be pulled back to the laptop and continued interactively.
