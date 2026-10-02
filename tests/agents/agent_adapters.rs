@@ -30,8 +30,10 @@ fn params(policy: PermissionPolicy) -> TurnParams {
 }
 
 // Claude fixtures are hand-derived from the documented stream-json
-// envelope (system/init, assistant, result). They were not captured
-// from a live Claude Code run.
+// envelope, including verbose system/status, compact_boundary, assistant
+// thinking/tool_use and user/tool_result records. Record shapes are documented
+// at https://platform.claude.com/docs/en/agent-sdk/typescript#sdkmessage.
+// They were not captured from a live Claude Code run.
 fn fixture(name: &str) -> String {
     fs::read_to_string(format!("tests/fixtures/agents/{name}"))
         .unwrap_or_else(|error| panic!("fixture {name} must be readable: {error}"))
@@ -187,8 +189,8 @@ fn claude_first_turn_binds_generated_session_budget_and_turns() {
     assert!(
         launch
             .args()
-            .windows(2)
-            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+            .windows(3)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json" && w[2] == "--verbose")
     );
     assert!(
         launch
@@ -275,8 +277,8 @@ fn claude_resume_uses_resume_and_never_session_id() {
     assert!(
         launch
             .args()
-            .windows(2)
-            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+            .windows(3)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json" && w[2] == "--verbose")
     );
     assert!(
         launch
@@ -428,6 +430,86 @@ fn results_are_extracted_or_unknown_never_an_error_for_every_adapter() {
             ResultStatus::Unknown,
             "{kind:?}"
         );
+    }
+}
+
+#[test]
+fn claude_verbose_records_normalize_activity_and_ignore_other_content() {
+    let adapter = adapter_for(AgentKind::Claude);
+    let events: Vec<_> = fixture_lines("claude-verbose-records.jsonl")
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(&line)
+                .expect("verbose fixture records must be valid JSON");
+            adapter.parse_event(&line)
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::ToolCall {
+                name: "Read".into(),
+                summary: r#"{"file_path":"/workspace/src/lib.rs"}"#.into(),
+            },
+            AgentEvent::AssistantMessage {
+                text: "The file inspection is complete.".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn claude_verbose_records_preserve_results_sessions_and_classification() {
+    let adapter = adapter_for(AgentKind::Claude);
+    let verbose = fixture("claude-verbose-records.jsonl");
+    let unknown = concat!(
+        r#"{"type":"system","subtype":"future_record","status":"blocked","summary":"not a result"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"future_block","text":"{\"status\":\"blocked\",\"summary\":\"not a result\"}"}]}}"#,
+        "\n",
+    );
+    for line in unknown.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .expect("unknown records must be valid JSON");
+        assert_eq!(adapter.parse_event(line), None);
+    }
+    for name in [
+        "claude-success.jsonl",
+        "claude-blocked.jsonl",
+        "claude-malformed.jsonl",
+    ] {
+        let stream = fixture(name);
+        // Cover both terminal result records and the final-assistant fallback.
+        let assistant_fallback = stream
+            .lines()
+            .filter(|line| !matches!(adapter.parse_event(line), Some(AgentEvent::TurnEnd { .. })))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for baseline in [&stream, &assistant_fallback] {
+            let noisy = format!("{verbose}{baseline}\n{verbose}{unknown}");
+            let baseline_events: Vec<_> = baseline
+                .lines()
+                .filter_map(|line| adapter.parse_event(line))
+                .collect();
+            let noisy_events: Vec<_> = noisy
+                .lines()
+                .filter_map(|line| adapter.parse_event(line))
+                .collect();
+            assert_eq!(
+                adapter.session_ref(&noisy_events),
+                adapter.session_ref(&baseline_events),
+                "{name}"
+            );
+            let expected = adapter.extract_result(baseline, None).unwrap();
+            let actual = adapter.extract_result(&noisy, None).unwrap();
+            assert_eq!(actual, expected, "{name}");
+            for exit_code in [Some(0), Some(1), None] {
+                assert_eq!(
+                    adapter.classify(exit_code, actual.status()),
+                    adapter.classify(exit_code, expected.status()),
+                    "{name}: {exit_code:?}"
+                );
+            }
+        }
     }
 }
 
