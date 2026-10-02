@@ -10,6 +10,7 @@ pub mod dashboard;
 pub mod events;
 pub mod host;
 pub mod runtime;
+pub mod session;
 pub mod task;
 pub mod transfer;
 

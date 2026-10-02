@@ -18,3 +18,5 @@ mod launch_identity;
 mod opencode_facts;
 mod opencode_launch_guard;
 mod result_parse_reasons;
+
+mod session_contracts;
