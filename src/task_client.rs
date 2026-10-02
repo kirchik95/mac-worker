@@ -65,6 +65,7 @@ const SUBMISSION_ROLLBACK_INCOMPLETE: &str = "SUBMISSION_ROLLBACK_INCOMPLETE";
 const CLOSE_IN_PROGRESS: &str = crate::client_state::TASK_CLOSE_IN_PROGRESS;
 const SUBMISSION_ROLLBACK_RECOVER_ATTEMPTS: usize = 2;
 const PUBLISH_RETRY_MERGE_ATTEMPTS: usize = 3;
+const REPLACEMENT_FAILURE_LOG_TAIL_BYTES: usize = 64 * 1024;
 const PUBLISH_RETRY_LOCAL_UPDATE_WARNING: &str = "origin retry was accepted on the worker, but the laptop record could not be updated with the returned deliveries";
 
 pub(crate) use crate::client_state::WaitDeadline;
@@ -5692,6 +5693,8 @@ impl<'a> TaskClient<'a> {
     /// already wrote `exited after acceptance:` but the queue field is still
     /// empty. The runner also writes the field; this covers tests that plant
     /// only the diagnostic and a runner that died after the log line.
+    /// Unreadable logs and diagnostics outside the bounded tail are ignored;
+    /// the authoritative queue budget is left unchanged.
     fn observe_replacement_failure(
         &self,
         task_id: TaskId,
@@ -5703,18 +5706,15 @@ impl<'a> TaskClient<'a> {
         if entry.replacement_failure().is_some() {
             return Ok(());
         }
-        let bytes = match self.read_runner_log(task_id, turn_id) {
+        let bytes = match self.read_runner_log_tail(task_id, turn_id) {
             Ok(bytes) => bytes,
-            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+            Err(_) => return Ok(()),
         };
         let Some(code) = last_post_acceptance_public_code(&bytes) else {
             return Ok(());
         };
         self.client_state
-            .record_replacement_failure(turn_id, code, current_time_millis()?)?;
+            .record_replacement_failure(turn_id, &code, current_time_millis()?)?;
         Ok(())
     }
 
@@ -6034,7 +6034,37 @@ impl<'a> TaskClient<'a> {
         let task = runners
             .open_child_directory(&relative_path(&task_id.to_string())?, false)
             .map_err(WorkerError::Io)?;
-        read_runner_log_snapshot(&task, &format!("{turn_id}.log"), || {}).map_err(WorkerError::Io)
+        read_runner_log_snapshot(&task, &format!("{turn_id}.log"), || {}).map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData
+                && error.to_string() == "host file exceeds limit"
+            {
+                task_error(
+                    "LOG_TOO_LARGE",
+                    "legacy runner log exceeds the 8 MiB whole-log limit",
+                )
+            } else {
+                WorkerError::Io(error)
+            }
+        })
+    }
+
+    fn read_runner_log_tail(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let mut root =
+            crate::rooted_fs::RootedDir::open(&self.paths.state).map_err(WorkerError::Io)?;
+        let device = root.root_metadata().map_err(WorkerError::Io)?.st_dev as u64;
+        root.bind_host_device(device).map_err(WorkerError::Io)?;
+        let runners = root
+            .open_child_directory(&relative_path("runners")?, false)
+            .map_err(WorkerError::Io)?;
+        let task = runners
+            .open_child_directory(&relative_path(&task_id.to_string())?, false)
+            .map_err(WorkerError::Io)?;
+        read_runner_log_tail_snapshot(&task, &format!("{turn_id}.log"), || {})
+            .map_err(WorkerError::Io)
     }
 
     fn current_project(&self, record: Option<&LocalTaskRecord>) -> Result<PathBuf, WorkerError> {
@@ -6929,6 +6959,53 @@ fn read_runner_log_snapshot(
     }
 }
 
+fn read_runner_log_tail_snapshot(
+    task: &crate::rooted_fs::RootedDir,
+    name: &str,
+    mut after_read: impl FnMut(),
+) -> io::Result<Vec<u8>> {
+    // Keep the original inode bound across append rechecks, just like the full
+    // snapshot reader. A busy writer gets at most three retries.
+    let bound = task.open_private_regular_handle(name)?;
+    let mut length = task.validate_private_append_binding(name, &bound)?;
+    let mut retries = 0;
+    loop {
+        let offset = length.saturating_sub(REPLACEMENT_FAILURE_LOG_TAIL_BYTES as u64);
+        let read = task
+            .read_private_regular_chunk(name, offset, REPLACEMENT_FAILURE_LOG_TAIL_BYTES)
+            .and_then(|mut bytes| {
+                after_read();
+                if task.validate_private_append_binding(name, &bound)? != length
+                    || bytes.len() as u64 != length - offset
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                if offset != 0 {
+                    // The window may start inside a line that merely contains
+                    // a diagnostic prefix. Only complete lines are evidence.
+                    let first_line = bytes
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(bytes.len(), |index| index + 1);
+                    bytes.drain(..first_line);
+                }
+                Ok(bytes)
+            });
+        match read {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if error.raw_os_error() == Some(libc::ESTALE) && retries < 3 => {
+                let current_length = task.validate_private_append_binding(name, &bound)?;
+                if current_length < length {
+                    return Err(error);
+                }
+                length = current_length;
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn overlapping_paths(left: &[String], right: &[String]) -> Vec<String> {
     let mut paths = Vec::new();
     for path in left {
@@ -7231,6 +7308,168 @@ fn default_publish_modes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_failure_observation_skips_missing_or_unsafe_runner_logs() {
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("observing a runner log must not launch a process");
+            }
+        }
+        for exists in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config.toml"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let task_id = TaskId::generate();
+            let turn_id = TurnId::generate();
+            store
+                .enqueue(
+                    QueueEntry::new(
+                        turn_id,
+                        store.client_id(),
+                        "a".repeat(64),
+                        "b".repeat(64),
+                        crate::job::CommandSummary::argv(1).unwrap(),
+                        Vec::new(),
+                        WorkerPreference::Automatic,
+                        QueueEntryKind::TaskTurn,
+                        None,
+                        current_process_identity().unwrap(),
+                        1,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            if exists {
+                let mut file = store.open_runner_log(task_id, turn_id).unwrap();
+                file.write_all(b"exited after acceptance: HOST_IO\n")
+                    .unwrap();
+                file.set_permissions(
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            let config = Config::parse(
+                "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"never-connect\"\nslots = 1\n",
+            )
+            .unwrap();
+            TaskClient::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &crate::turn_runner::InlineRunnerExecutor,
+            )
+            .observe_replacement_failure(task_id, turn_id)
+            .unwrap();
+            assert!(
+                store
+                    .queue_entry(turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .replacement_failure()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn runner_log_tail_preserves_inode_and_append_binding_with_bounded_rechecks() {
+        for fault in [
+            "append",
+            "busy",
+            "replace_log",
+            "replace_directory",
+            "truncate",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut root =
+                crate::rooted_fs::RootedDir::create(&temp.path().join("runner")).unwrap();
+            let device = root.root_metadata().unwrap().st_dev as u64;
+            root.bind_host_device(device).unwrap();
+            root.write_private_atomic_no_replace("turn.log", b"before\n")
+                .unwrap();
+            let mut writer = root.open_private_append("turn.log").unwrap();
+            let mut reads = 0;
+            let result = read_runner_log_tail_snapshot(&root, "turn.log", || {
+                reads += 1;
+                match fault {
+                    "append" if reads == 1 => {
+                        writer.write_all(b"after\n").unwrap();
+                        writer.sync_all().unwrap();
+                    }
+                    "busy" => {
+                        writer.write_all(b"another line\n").unwrap();
+                        writer.sync_all().unwrap();
+                    }
+                    "replace_log" => {
+                        root.replace_private_regular_exact("turn.log", b"before\n", b"unrelated\n")
+                            .unwrap();
+                    }
+                    "replace_directory" => {
+                        std::fs::rename(root.path(), temp.path().join("detached")).unwrap();
+                        let replacement = crate::rooted_fs::RootedDir::create(root.path()).unwrap();
+                        replacement
+                            .write_private_atomic_no_replace("turn.log", b"unrelated\n")
+                            .unwrap();
+                    }
+                    "truncate" => {
+                        writer.set_len(1).unwrap();
+                        writer.sync_all().unwrap();
+                    }
+                    "append" => {}
+                    _ => unreachable!(),
+                }
+            });
+            if fault == "append" {
+                assert_eq!(result.unwrap(), b"before\nafter\n");
+                assert_eq!(reads, 2);
+            } else {
+                let error = result.unwrap_err();
+                if fault == "replace_log" {
+                    // Replacing the inode unlinks the bound descriptor, which
+                    // the private-file policy rejects before identity checks.
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.raw_os_error(), None);
+                } else {
+                    assert_eq!(error.raw_os_error(), Some(libc::ESTALE), "{fault}");
+                }
+                assert_eq!(reads, if fault == "busy" { 4 } else { 1 }, "{fault}");
+            }
+        }
+    }
+
+    #[test]
+    fn runner_log_tail_keeps_offset_zero_and_discards_a_window_without_a_complete_line() {
+        let code = b"exited after acceptance: HOST_IO\n".to_vec();
+        for (contents, expected) in [
+            (Vec::new(), Vec::new()),
+            (code.clone(), code),
+            (vec![b'x'; 64 * 1024 + 1], Vec::new()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut root =
+                crate::rooted_fs::RootedDir::create(&temp.path().join("runner")).unwrap();
+            let device = root.root_metadata().unwrap().st_dev as u64;
+            root.bind_host_device(device).unwrap();
+            root.write_private_atomic_no_replace("turn.log", &contents)
+                .unwrap();
+            assert_eq!(
+                read_runner_log_tail_snapshot(&root, "turn.log", || {}).unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn runner_log_snapshot_rechecks_a_concurrent_append() {

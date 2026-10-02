@@ -735,6 +735,20 @@ fn committed_log_larger_than_eight_megabytes_is_read_completely() {
 }
 
 #[test]
+fn legacy_log_larger_than_eight_megabytes_reports_a_stable_limit_error() {
+    let turn = finished_turn(1, TaskOutcome::Done);
+    let fixture = Fixture::new(AgentKind::Codex, TaskState::Open, vec![turn.clone()]);
+    fixture
+        .store
+        .open_runner_log(fixture.task_id, turn.turn_id())
+        .unwrap()
+        .set_len(8 * 1024 * 1024 + 1)
+        .unwrap();
+    let error = fixture.logs(None, true).unwrap_err();
+    assert_eq!(error.public_code(), "LOG_TOO_LARGE");
+}
+
+#[test]
 fn historical_empty_legacy_follow_does_not_wait_for_a_later_active_turn() {
     let first = finished_turn(1, TaskOutcome::Done);
     let fixture = Fixture::new(

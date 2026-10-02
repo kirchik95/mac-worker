@@ -2869,9 +2869,9 @@ fn early_exit_diagnostic_line(
 /// Reconcile uses this when the queue row has no restart budget yet: the
 /// diagnostic is the durable signal that a replacement already died, and
 /// parsing it avoids a second on-disk record besides the queue field.
-pub(crate) fn last_post_acceptance_public_code(log: &[u8]) -> Option<&str> {
+pub(crate) fn last_post_acceptance_public_code(log: &[u8]) -> Option<String> {
     const PREFIX: &str = "exited after acceptance: ";
-    let text = std::str::from_utf8(log).ok()?;
+    let text = String::from_utf8_lossy(log);
     for line in text.lines().rev() {
         let Some(rest) = line.strip_prefix(PREFIX) else {
             continue;
@@ -2881,7 +2881,7 @@ pub(crate) fn last_post_acceptance_public_code(log: &[u8]) -> Option<&str> {
             .find_map(|part| part.strip_prefix("error="))
             .or_else(|| rest.split_whitespace().next())?;
         if crate::error::is_stable_public_code(code) {
-            return Some(code);
+            return Some(code.to_owned());
         }
     }
     None
@@ -3279,7 +3279,8 @@ mod tests {
         assert_eq!(
             last_post_acceptance_public_code(
                 b"exited after acceptance: HOST_IO stage=cleanup workers=mini-1\n"
-            ),
+            )
+            .as_deref(),
             Some("HOST_IO")
         );
     }
@@ -3288,11 +3289,61 @@ mod tests {
     fn last_post_acceptance_code_prefers_the_error_field_on_the_latest_line() {
         let log = b"exited after acceptance: WAITING_FOR_DISPATCH error=HOST_IO message=x workers=mini-1\n\
 exited after acceptance: HOST_IO message=again workers=mini-1\n";
-        assert_eq!(last_post_acceptance_public_code(log), Some("HOST_IO"));
+        assert_eq!(
+            last_post_acceptance_public_code(log).as_deref(),
+            Some("HOST_IO")
+        );
         assert_eq!(
             last_post_acceptance_public_code(b"exited: CAPACITY_BUSY workers=mini-1\n"),
             None
         );
+    }
+
+    #[test]
+    fn last_post_acceptance_code_survives_invalid_utf8_in_the_window() {
+        assert_eq!(
+            last_post_acceptance_public_code(
+                b"agent output: \xff\nexited after acceptance: WAITING_FOR_DISPATCH error=HOST_IO message=\xfe\nmore output: \x80\n"
+            ).as_deref(),
+            Some("HOST_IO")
+        );
+    }
+
+    #[test]
+    fn last_post_acceptance_code_preserves_exact_matching_rules() {
+        for (log, expected) in [
+            (
+                "exited after acceptance: HOST_IO\n exited after acceptance: PUBLISH_FAILED\n",
+                Some("HOST_IO"),
+            ),
+            (
+                "exited after acceptance: HOST_IO\nexited after acceptance: WAITING_FOR_DISPATCH error=PUBLISH_FAILED\n",
+                Some("PUBLISH_FAILED"),
+            ),
+            (
+                "exited after acceptance: WAITING_FOR_DISPATCH\u{2003}error=HOST_IO\n",
+                Some("HOST_IO"),
+            ),
+            (
+                "exited after acceptance: HOST_IO\nexited after acceptance: invalid/path\n",
+                Some("HOST_IO"),
+            ),
+            (
+                "exited after acceptance: HOST_IO\nexited after acceptance: \n",
+                None,
+            ),
+            (
+                "exited after acceptance: WAITING_FOR_DISPATCH error=\n",
+                None,
+            ),
+            ("exited: HOST_IO\n", None),
+        ] {
+            assert_eq!(
+                last_post_acceptance_public_code(log.as_bytes()).as_deref(),
+                expected,
+                "{log:?}"
+            );
+        }
     }
 
     #[test]

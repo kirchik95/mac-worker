@@ -56,7 +56,7 @@ use mac_worker::test_support::{
             TaskCancelRequest, TaskCancelResponse, TaskCloseRequest, TaskCloseResponse,
             TaskStatusResponse,
         },
-        turn_runner::InlineRunnerExecutor,
+        turn_runner::{InlineRunnerExecutor, RunnerExecutor},
         view::TaskFreshness,
     },
     transfer::{HostOperation, outbox::OutboxRetryResponse},
@@ -2710,6 +2710,203 @@ fn enqueue_dead_dispatching_turn(
         None => plant_incomplete_accepted_journal(paths, store, task_id, turn_id),
     }
     (task_id, turn_id, remote)
+}
+
+fn assert_reconcile_runner_log_observation(
+    appended: &[u8],
+    expected_code: Option<&str>,
+    other_task: bool,
+    completed: bool,
+) {
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let repo = support::GitRepo::init();
+    let _current_dir = CurrentDirGuard::enter(repo.root());
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let paths = support::task_harness::paths(state_root.path().canonicalize().unwrap());
+    let dead_owner = owner(941);
+    let store = ClientStateStore::open_with_owner_inspector(
+        &paths.state,
+        DeadOwnerInspector { dead_owner },
+    )
+    .unwrap();
+    store.note_confirmed_runner_absence(dead_owner);
+    let (task_id, turn_id, remote) =
+        enqueue_dead_dispatching_turn(&store, &paths, &project, dead_owner, 941, 942, None);
+    let mut log = store.open_runner_log(task_id, turn_id).unwrap();
+    log.write_all(appended).unwrap();
+    log.sync_all().unwrap();
+    let mut checkpoint = runner_checkpoint(&paths, task_id, turn_id);
+    checkpoint["committed"]["len"] = log.metadata().unwrap().len().into();
+    drop(log);
+    if completed {
+        let record = task_record(
+            task_id,
+            turn_id,
+            TaskState::Open,
+            project.context.project_id.clone(),
+            project.context.worktree_id.clone(),
+            "mini-1",
+            None,
+        );
+        store
+            .mutate_task(task_id, Some(turn_id), |current| {
+                current.with_status(record.status().clone())
+            })
+            .unwrap();
+        store.record_runner(task_id, None).unwrap();
+        let caller = InlineRunnerExecutor
+            .start(&paths, task_id, turn_id)
+            .unwrap()
+            .process_identity();
+        store.adopt_row(turn_id, caller).unwrap();
+        store.revert_dispatch(turn_id, caller).unwrap();
+        checkpoint["committed"]["completion"] = serde_json::json!({
+            "outcome": TaskOutcome::Done,
+            "drained": true,
+        });
+    }
+    fs::write(
+        paths
+            .state
+            .join("runners")
+            .join(task_id.to_string())
+            .join(format!("{turn_id}.checkpoint.json")),
+        serde_json::to_vec(&checkpoint).unwrap(),
+    )
+    .unwrap();
+    // Keep each task's local projection: the remote fixture has one status.
+    remote.fail_next_status();
+    let ready_task = TaskId::new(Uuid::from_u128(943));
+    if other_task {
+        let ready_turn = job(944);
+        store
+            .create_task(task_record(
+                ready_task,
+                ready_turn,
+                TaskState::Active,
+                project.context.project_id.clone(),
+                project.context.worktree_id.clone(),
+                "mini-1",
+                None,
+            ))
+            .unwrap();
+        store
+            .write_turn_prompt(ready_task, ready_turn, "fixture prompt")
+            .unwrap();
+        store
+            .enqueue(turn(
+                &store,
+                944,
+                10,
+                dead_owner,
+                WorkerPreference::Pinned {
+                    worker: "mini-1".into(),
+                },
+                None,
+            ))
+            .unwrap();
+        plant_incomplete_accepted_journal(&paths, &store, ready_task, ready_turn);
+        remote.fail_next_status();
+    }
+    // The adopted row still counts its live controller owner as one holder.
+    // Keep another slot available so only a log-read failure can block the peer.
+    let config =
+        Config::parse("version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 2\n")
+            .unwrap();
+    let client = TaskClient::new(&remote, &config, &paths, &store, &InlineRunnerExecutor);
+    let report = client.reconcile_runners().unwrap();
+    let entry = store.queue_entry(turn_id).unwrap().unwrap();
+    match expected_code {
+        Some(code) => {
+            let budget = entry
+                .replacement_failure()
+                .expect("tail diagnostic is observed");
+            assert_eq!(budget.last_public_code(), code);
+            assert_eq!(budget.consecutive_failures(), 1);
+            assert_eq!(report.started_runners(), if other_task { 1 } else { 0 });
+        }
+        None => {
+            assert!(entry.replacement_failure().is_none());
+            assert_eq!(report.started_runners(), 1);
+            assert!(store.load_task(task_id).unwrap().runner().is_some());
+        }
+    }
+    if other_task {
+        assert!(store.load_task(ready_task).unwrap().runner().is_some());
+        assert!(
+            store
+                .queue_entry(job(944))
+                .unwrap()
+                .unwrap()
+                .replacement_failure()
+                .is_none()
+        );
+    }
+}
+
+fn oversized_runner_log_with_failure() -> Vec<u8> {
+    let mut bytes = vec![b'x'; 8 * 1024 * 1024 + 17];
+    bytes.extend_from_slice(b"\nexited after acceptance: HOST_IO message=fixture\n");
+    bytes
+}
+
+#[test]
+fn reconcile_oversized_runner_log_keeps_other_tasks_starting() {
+    assert_reconcile_runner_log_observation(
+        &oversized_runner_log_with_failure(),
+        Some("HOST_IO"),
+        true,
+        false,
+    );
+}
+
+#[test]
+fn reconcile_oversized_runner_log_tail_records_replacement_budget() {
+    assert_reconcile_runner_log_observation(
+        &oversized_runner_log_with_failure(),
+        Some("HOST_IO"),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn reconcile_waiting_row_observes_oversized_runner_log_tail() {
+    assert_reconcile_runner_log_observation(
+        &oversized_runner_log_with_failure(),
+        Some("HOST_IO"),
+        true,
+        true,
+    );
+}
+
+#[test]
+fn reconcile_runner_log_tail_ignores_invalid_utf8_before_code() {
+    assert_reconcile_runner_log_observation(
+        b"invalid agent output: \xff\nexited after acceptance: HOST_IO message=fixture\n",
+        Some("HOST_IO"),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn reconcile_runner_log_tail_drops_diagnostic_outside_window() {
+    let mut bytes = b"exited after acceptance: HOST_IO message=fixture\n".to_vec();
+    bytes.extend_from_slice(&vec![b'x'; 64 * 1024]);
+    // Fail open when an old diagnostic has fallen outside the observation window.
+    assert_reconcile_runner_log_observation(&bytes, None, false, false);
+}
+
+#[test]
+fn reconcile_runner_log_tail_drops_partial_first_line() {
+    let fake = b"exited after acceptance: HOST_IO message=fixture\n";
+    let mut bytes = b"not a diagnostic: ".to_vec();
+    bytes.extend_from_slice(fake);
+    bytes.extend_from_slice(&vec![b'x'; 64 * 1024 - fake.len()]);
+    // The window begins at `fake`, in the middle of an unrelated line.
+    assert_reconcile_runner_log_observation(&bytes, None, false, false);
 }
 
 #[test]
