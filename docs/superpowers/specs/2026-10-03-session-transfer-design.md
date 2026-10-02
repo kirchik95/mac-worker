@@ -47,12 +47,14 @@ These are copies of the session-scratchpad reports.
 
 **Host placement, replacing Decision 4's step order:**
 
-11. Prepare runs in this order:
+11. **Session id.** The imported session id is `imported_session_id(task_id)`: the task id rendered as a lowercase hyphenated UUID. Host prepare never learns the first turn id (`TaskPrepareRequest` carries `meta`, `job_id` and `worker`), while both prepare and the runner know the task id. Decision 4's "first turn seed" is replaced by this; Claude's seed bind does not apply, because imported turns are resumes.
+
+    Prepare runs in this order:
     1. `prepare_workspace`
     2. `ensure_active_status`
-    3. import receipt `planned`, written to the task directory as `session-import.json` with package OID, target id, agent, store-root identity and frozen `placed_at_millis`
+    3. import receipt `planned`, written to the task directory as `session-import.json` with package OID, imported session id, agent, store-root identity and frozen `placed_at_millis`
     4. place, via `StoreWriter`; the outcome is `Created` or `Unchanged`
-    5. `bind_session(agent, seed)`
+    5. `bind_session(agent, imported_session_id(task_id))`
     6. receipt `complete`
     7. delete the mirror ref
 
@@ -70,9 +72,9 @@ These are copies of the session-scratchpad reports.
     | --- | --- | --- | --- |
     | Prebind discovery | per adapter | no | no |
     | `task_session` before lease | no | **no** | yes |
-    | argv | `first_turn` | `resume_turn(seed)` built locally | `resume_turn(bound ref)` |
+    | argv | `first_turn` | `resume_turn(imported_session_id(task_id))` built locally | `resume_turn(bound ref)` |
     | push base (+ package) and `task_prepare` | yes | yes (+ package) | no |
-    | Host check | as today | import meta ⇒ resume=true, binding agent = task agent, ref = seed | as today |
+    | Host check | as today | import meta ⇒ resume=true, binding agent = task agent, ref = `imported_session_id(task_id)` | as today |
 
     The host check runs on publication and on the repair paths (`src/job_service.rs:580-662`).
 13. **Single push path.** The only `push_base` caller is the shared runner (`src/turn_runner.rs:1345-1364`), used in both direct and controller execution. W8 passes `SessionRefPush` there.
