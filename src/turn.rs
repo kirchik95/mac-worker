@@ -2694,6 +2694,7 @@ mod tests {
         let base_oid: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
         let limits = TaskLimits::default();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: PROJECT_ID.into(),

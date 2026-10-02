@@ -728,6 +728,7 @@ impl<'de> Deserialize<'de> for TaskLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskMetaInput {
+    pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub project_id: String,
@@ -751,6 +752,7 @@ pub struct TaskMetaInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskMeta {
+    session_import: Option<crate::session_transfer::SessionImportMeta>,
     task_id: TaskId,
     run_id: Option<RunId>,
     project_id: String,
@@ -773,6 +775,10 @@ pub struct TaskMeta {
 }
 
 impl TaskMeta {
+    pub fn session_import(&self) -> Option<&crate::session_transfer::SessionImportMeta> {
+        self.session_import.as_ref()
+    }
+
     pub fn new(input: TaskMetaInput) -> Result<Self, WorkerError> {
         validate_prompt(&input.prompt)?;
         let title = match input.title {
@@ -780,6 +786,7 @@ impl TaskMeta {
             _ => title_from_prompt(&input.prompt),
         };
         let meta = Self {
+            session_import: input.session_import,
             task_id: input.task_id,
             run_id: input.run_id,
             project_id: input.project_id,
@@ -947,6 +954,21 @@ impl TaskMeta {
         validate_hex_component(&self.project_id, "project ID")?;
         validate_hex_component(&self.worktree_id, "worktree ID")?;
         self.title.validate()?;
+        if let Some(import) = &self.session_import {
+            import.validate()?;
+            if matches!(self.source, TaskSource::Origin { .. }) {
+                return Err(crate::session_transfer::session_error(
+                    "SESSION_REQUIRES_SNAPSHOT",
+                    "session import requires a laptop snapshot",
+                ));
+            }
+            if self.agent != import.agent().agent_kind() {
+                return Err(crate::session_transfer::session_error(
+                    "SESSION_AGENT_MISMATCH",
+                    "session import agent does not match task agent",
+                ));
+            }
+        }
         if let Some(model) = &self.model {
             validate_optional_text(model, MAX_IDENTITY_BYTES, "model")?;
         }
@@ -1021,8 +1043,13 @@ impl Serialize for TaskMeta {
         // re-serializes byte for byte and keeps its canonical bytes.
         let mut record = serializer.serialize_struct(
             "TaskMeta",
-            17 + usize::from(self.effort.is_some()) + usize::from(self.effective_policy.is_some()),
+            17 + usize::from(self.effort.is_some())
+                + usize::from(self.effective_policy.is_some())
+                + usize::from(self.session_import.is_some()),
         )?;
+        if let Some(import) = &self.session_import {
+            record.serialize_field("session_import", import)?;
+        }
         record.serialize_field("task_id", &self.task_id)?;
         record.serialize_field("run_id", &self.run_id)?;
         record.serialize_field("project_id", &self.project_id)?;
@@ -1055,6 +1082,8 @@ impl<'de> Deserialize<'de> for TaskMeta {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            session_import: Option<crate::session_transfer::SessionImportMeta>,
             task_id: TaskId,
             run_id: Option<RunId>,
             project_id: String,
@@ -1079,6 +1108,7 @@ impl<'de> Deserialize<'de> for TaskMeta {
         }
         let wire: Wire = deserialize_unique_object(deserializer)?;
         let meta = TaskMeta {
+            session_import: wire.session_import,
             task_id: wire.task_id,
             run_id: wire.run_id,
             project_id: wire.project_id,

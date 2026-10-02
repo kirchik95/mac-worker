@@ -994,6 +994,7 @@ mod t7a {
         let (task, turn) = (TaskId::generate(), TurnId::generate());
         let store = ClientStateStore::open(&fixture.paths.state).unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task,
             run_id: None,
             project_id: "a".repeat(64),
@@ -5315,6 +5316,7 @@ mod t7b_live {
         let (task, turn) = (TaskId::generate(), TurnId::generate());
         let store = ClientStateStore::open(&paths.state).unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task,
             run_id: None,
             project_id: "a".repeat(64),

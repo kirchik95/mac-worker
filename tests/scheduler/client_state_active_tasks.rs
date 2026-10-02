@@ -92,6 +92,7 @@ fn open_holder(n: u128, pid: u32) -> LocalTaskRecord {
 
 fn record_with_id(n: u128, state: TaskState, runner: bool) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(n)),
         run_id: None,
         project_id: PROJECT_ID.to_owned(),
@@ -211,6 +212,7 @@ fn job_id(n: u128) -> JobId {
 
 fn record_in_run(n: u128, state: TaskState, runner: bool, run_id: TaskRunId) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(n)),
         run_id: Some(run_id),
         project_id: PROJECT_ID.to_owned(),

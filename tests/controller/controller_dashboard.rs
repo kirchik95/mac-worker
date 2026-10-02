@@ -577,6 +577,7 @@ fn task_record(id: u128, state: TaskState) -> LocalTaskRecord {
     let turn_id = JobId::new(Uuid::from_u128(id + 1));
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: "b".repeat(64),

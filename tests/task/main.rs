@@ -16,6 +16,7 @@ mod project_inspection;
 mod project_state;
 mod questions_compat;
 mod runner_dispatch;
+mod session_import_turn;
 mod task_command;
 mod task_conversation;
 mod task_dag;

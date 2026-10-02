@@ -512,6 +512,7 @@ fn plant_open_first_turn(
     let task_id = TaskId::new(Uuid::from_u128(task_number));
     let turn_id = TurnId::new(Uuid::from_u128(first_turn));
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: project.context.project_id.clone(),

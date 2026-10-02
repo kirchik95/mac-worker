@@ -44,6 +44,7 @@ pub fn stream_source_receive(
         runner,
         controller,
         SourceSubmitBind {
+            session_oid: None,
             request_id: operation.request_id(),
             fingerprint: &fingerprint,
             project_id,
@@ -97,6 +98,7 @@ pub fn stream_nested_source(
         bind.worktree_id,
         bind.expected_oid,
         local_git,
+        None,
     )?;
     let finish = transfer_request(
         "controller.transfer.source.finish",

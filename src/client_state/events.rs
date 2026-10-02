@@ -554,6 +554,7 @@ pub(crate) mod tests {
 
     pub(crate) fn task_record() -> LocalTaskRecord {
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: TaskId::generate(),
             run_id: None,
             project_id: "a".repeat(64),

@@ -561,6 +561,7 @@ fn source_push_over_fake_ssh_pins_owned_graph_and_retries_the_same_oid() {
                 identity.worktree_id(),
                 identity.expected_oid(),
                 repo.root(),
+                None,
             )
         });
         let second = scope.spawn(|| {
@@ -575,6 +576,7 @@ fn source_push_over_fake_ssh_pins_owned_graph_and_retries_the_same_oid() {
                 identity.worktree_id(),
                 identity.expected_oid(),
                 repo.root(),
+                None,
             )
         });
         (first.join().unwrap(), second.join().unwrap())
@@ -593,6 +595,7 @@ fn source_push_over_fake_ssh_pins_owned_graph_and_retries_the_same_oid() {
                 identity.worktree_id(),
                 identity.expected_oid(),
                 repo.root(),
+                None,
             )
             .expect("idempotent same-OID replay after Git ref-CAS busy");
     }
@@ -638,6 +641,7 @@ fn source_push_over_fake_ssh_pins_owned_graph_and_retries_the_same_oid() {
             retry.worktree_id(),
             retry.expected_oid(),
             repo.root(),
+            None,
         )
         .unwrap();
     {
@@ -1084,6 +1088,7 @@ fn concurrent_identities_use_isolated_hooks_and_result_next_turn_keeps_the_earli
                     first.worktree_id(),
                     first.expected_oid(),
                     first_repo.root(),
+                    None,
                 )
                 .unwrap();
         });
@@ -1101,6 +1106,7 @@ fn concurrent_identities_use_isolated_hooks_and_result_next_turn_keeps_the_earli
                     second.worktree_id(),
                     second.expected_oid(),
                     second_repo.root(),
+                    None,
                 )
                 .unwrap();
         });

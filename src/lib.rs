@@ -115,6 +115,7 @@ mod rooted_fs;
 mod runner_log;
 mod scheduler;
 mod scheduler_adapter;
+pub mod session_transfer;
 mod skills;
 mod snapshot;
 mod supervisor;
@@ -1757,6 +1758,7 @@ fn run_task_subcommand(
             };
             let report = client.submit_titled(
                 TaskSubmitRequest {
+                    session_import: None,
                     questions,
                     agent: task_agent,
                     model,
@@ -5174,6 +5176,7 @@ fn run_enabled_controller_task(
                     runner,
                     &config.controller,
                     crate::controller::SourceSubmitBind {
+                        session_oid: None,
                         request_id: source.request_id(),
                         fingerprint: &fingerprint,
                         project_id: source.project_id(),
@@ -5445,6 +5448,7 @@ fn freeze_and_submit_via_controller(
         publish
     };
     let body = crate::prepared_submit::FrozenSubmitBody {
+        session_import: None,
         questions: questions.or(probed.settings.task.questions),
         task_id,
         turn_id,
@@ -6186,6 +6190,7 @@ mod tests {
         let task_id = TaskId::new(Uuid::from_u128(1));
         let base_oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

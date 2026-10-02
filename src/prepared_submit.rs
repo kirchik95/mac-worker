@@ -19,6 +19,8 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenSubmitBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     /// Explicit override only: older controllers reject unknown fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -76,6 +78,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSubmit {
+    pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
     pub task_id: TaskId,
     pub turn_id: TurnId,
@@ -131,6 +134,7 @@ impl FrozenSubmitBody {
             self.max_followups,
         )?;
         Ok(PreparedSubmit {
+            session_import: self.session_import.clone(),
             questions: self.questions,
             task_id: self.task_id,
             turn_id: self.turn_id,

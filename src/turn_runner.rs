@@ -1360,6 +1360,7 @@ impl<'a> TurnRunner<'a> {
                                 task_id,
                                 turn.base_oid(),
                                 transfer.path(),
+                                None,
                             )?;
                         }
                         remote.task_prepare(
@@ -3544,6 +3545,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         let store = ClientStateStore::open(&paths.state).unwrap();
         let (task_id, turn_id, _) = plant_reserved_turn(&store, owner, true);
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),
@@ -3890,6 +3892,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         let active = follow_task_status(TaskState::Active, turn_id);
         let open = follow_task_status(TaskState::Open, turn_id);
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

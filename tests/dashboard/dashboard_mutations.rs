@@ -257,6 +257,7 @@ fn open_done_record_for_project(
     let base_oid: mac_worker::test_support::task::model::BaseOid = "a".repeat(40).parse().unwrap();
     let meta = mac_worker::test_support::task::model::TaskMeta::new(
         mac_worker::test_support::task::model::TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id,

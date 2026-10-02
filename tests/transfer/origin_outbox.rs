@@ -433,6 +433,7 @@ fn fixture() -> (
 
 fn task_meta(task: TaskId, base_oid: BaseOid) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task,
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -606,6 +607,7 @@ fn prepared_origin_push_turn(
         )
         .unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(1),
         run_id: None,
         project_id: PROJECT_ID.into(),

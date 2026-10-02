@@ -108,6 +108,7 @@ fn result_oid() -> BaseOid {
 
 fn meta(task: TaskId) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task,
         run_id: None,
         project_id: PROJECT_ID.into(),

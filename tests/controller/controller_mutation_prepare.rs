@@ -286,6 +286,7 @@ impl Fixture {
     /// pre-prepare record snapshot for ordering comparison.
     fn finalized_dead_row(&self, task: u128, turn: u128) -> (ClientStateStore, LocalTaskRecord) {
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task_n(task),
             run_id: None,
             project_id: self.project_id.clone(),

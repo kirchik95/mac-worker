@@ -72,6 +72,7 @@ impl IsolatedHost {
         let turn_id = TurnId::generate();
         let head = "a".repeat(40).parse().unwrap();
         let mut meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

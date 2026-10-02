@@ -26,6 +26,7 @@ fn task_meta(source: TaskSource, publish: Vec<PublishMode>) -> TaskMeta {
         .contains(&PublishMode::Push)
         .then(|| "release-candidate".parse().unwrap());
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(1)),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -162,6 +163,7 @@ fn local_push_metadata_rejects_missing_or_noncanonical_pinned_targets() {
 #[test]
 fn an_origin_url_must_be_normalized_before_it_enters_the_task_record() {
     let result = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(2)),
         run_id: None,
         project_id: PROJECT_ID.into(),

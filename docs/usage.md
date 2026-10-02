@@ -944,6 +944,16 @@ JSON error events keep a plain public `message`. Human-readable diagnostics on s
 <!-- error-catalog:start -->
 | Code | Exit | Hint |
 |---|---|---|
+| `SESSION_NOT_FOUND` | 64 | check the session id, or omit it to pick the newest session of this project |
+| `SESSION_UNREADABLE` | 64 | the session is not valid JSONL; pick another session |
+| `SESSION_TOO_LARGE` | 64 | the session exceeds 64 MiB; use the handoff-note recipe instead |
+| `SESSION_OUTSIDE_PROJECT` | 64 | run the command from the project the session was started in |
+| `SESSION_NEEDS_WIP` | 64 | add --wip so the pool sees the uncommitted state the session assumes |
+| `SESSION_REQUIRES_SNAPSHOT` | 64 | origin-sourced tasks cannot carry a session; submit from the laptop snapshot |
+| `SESSION_AGENT_MISMATCH` | 64 | drop --agent or make it match the session's agent |
+| `SESSION_IMPORT_UNSUPPORTED` | 64 | only claude and codex sessions can be continued; use the handoff-note recipe |
+| `SESSION_AGENT_TOO_OLD` | 75 | update the agent on the worker to at least the session's version |
+| `SESSION_PLACEMENT_FAILED` | 70 | the worker could not install the session; check the worker and retry |
 | `CONFIG_MISSING` | 64 | connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path) |
 | `CONFIG` | 64 | check the configuration syntax, worker names, and SSH destinations |
 | `TASK_BUSY` | 64 | wait for `worker task wait` to finish, then retry |

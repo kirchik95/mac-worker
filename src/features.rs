@@ -4,6 +4,9 @@
 //! request field gets a feature string; clients must check for it before use.
 //! A missing feature list means an older peer whose features are unknown.
 
+pub const HOST_FEATURE_SESSION_IMPORT: &str = "task.session-import";
+pub const CONTROLLER_FEATURE_SESSION_IMPORT: &str = "controller.session-import";
+
 pub const HOST_FEATURES: &[&str] = &[];
 pub const CONTROLLER_FEATURES: &[&str] = &["controller.events", "controller.task-logs-wait"];
 /// Added only after an existing-only live generation/hello proof.

@@ -79,6 +79,7 @@ impl Fixture {
         let task_id = TaskId::generate();
         let turn_id = TurnId::generate();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

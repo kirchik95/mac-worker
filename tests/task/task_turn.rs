@@ -543,6 +543,7 @@ fn prepared_task_turn_at_with_lease_clock(
         .unwrap();
 
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -1417,6 +1418,7 @@ fn submit_turn_runs_and_publishes_through_the_durable_supervisor() {
         .unwrap();
 
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -1759,6 +1761,7 @@ fn successful_codex_turn_without_a_bound_session_fails_publication() {
         .unwrap();
 
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -1911,6 +1914,7 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         .unwrap();
 
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
