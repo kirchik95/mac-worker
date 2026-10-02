@@ -47,7 +47,8 @@ use mac_worker::test_support::{
             TaskId, TaskLimits, TaskMeta, TaskMetaInput, TaskOutcome, TaskSource, TaskState,
         },
         store::{
-            SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest, TaskStore,
+            SessionBinding, TaskCancelRequest, TaskCloseRequest, TaskPrepareRequest,
+            TaskStatusRequest, TaskStore,
         },
         turn::{EnvProfile, TaskTurnRequest, TurnMaterial, TurnSection},
     },
@@ -2013,6 +2014,40 @@ fn publication_tolerates_an_agent_written_last_message_with_default_mode() {
         .unwrap();
     assert_eq!(retry.task().state(), TaskState::Open);
     assert_eq!(retry.task().last_outcome(), Some(&TaskOutcome::Done));
+}
+
+#[test]
+fn publication_accepts_a_result_padded_with_blank_lines_past_the_limit() {
+    // Break caught: Codex ended a done turn with a valid result JSON padded by
+    // ~83,000 blank lines (1.7 MB). The host read last.md under the 256 KiB
+    // result cap and failed PUBLISH_FAILED before committing the workspace,
+    // so the runner reported RESULT_FETCH_FAILED. The same summary said
+    // "Bearer prefix", which must also read back after publication.
+    let script = r#"{ printf '%s' '{"status":"done","summary":"rejects a JWT without the Bearer prefix"'; yes ' ' | head -n 150000; printf '%s' ', "questions": [], "files_changed": ["agent.txt"]}'; } > "$MAC_WORKER_TURN_DIR/last.md"; printf changed > agent.txt; printf '%s\n' '{"type":"thread.started","thread_id":"session-1"}'"#;
+    let (_temp, store, request, _cancel) = prepared_task_turn(script);
+    let launcher = InlineTurnLauncher {
+        store: store.clone(),
+        fault: None,
+    };
+    let response = JobService::new(&store, &launcher)
+        .submit_turn(request)
+        .unwrap_or_else(|error| panic!("submit_turn failed: {error}"));
+    let task = response.task();
+    assert_eq!(task.last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(task.files_changed(), &["agent.txt"]);
+    assert!(task.diff_stat().is_some());
+    assert_eq!(
+        task.summary(),
+        Some("rejects a JWT without the Bearer [token]")
+    );
+
+    let read = TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .status(&TaskStatusRequest::new(PROJECT_ID, task_id()))
+    .unwrap();
+    assert_eq!(read.status(), task);
 }
 
 #[test]

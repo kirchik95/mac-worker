@@ -43,6 +43,10 @@ use crate::{
 pub const LOG_CAP_BYTES: u64 = 256 * 1024 * 1024;
 pub const LOG_TAIL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
+/// Read cap for the agent's last message. Results are parsed under
+/// `MAX_PROMPT_BYTES`; this larger cap only leaves room for blank-line padding
+/// that [`read_last_message`] removes before parsing.
+const MAX_LAST_MESSAGE_READ_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ENV_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
@@ -1170,8 +1174,7 @@ impl<'a> TurnPublisher<'a> {
                     )
                 })?;
         }
-        let last_message =
-            read_optional_text(turn_dir, "last.md", crate::task::MAX_PROMPT_BYTES as u64)?;
+        let last_message = read_last_message(turn_dir)?;
         let adapter = crate::agent::adapter_for(meta.agent());
         let last_parses = last_message.as_deref().is_some_and(|text| {
             adapter
@@ -1861,6 +1864,55 @@ fn read_optional_text(
     read_text(dir, name, max).map(Some)
 }
 
+/// The agent's last message, bounded for result parsing.
+///
+/// Codex has ended a valid result with ~83,000 blank lines (1.7 MB) between
+/// two fields. Reading that under the result cap failed publication before
+/// the workspace was committed, so the finished work was never published.
+/// An oversized message is compacted first: every whitespace run that holds a
+/// newline becomes one newline. A raw newline cannot occur inside a JSON
+/// string, so a valid result keeps every value.
+fn read_last_message(dir: &RootedDir) -> Result<Option<String>, WorkerError> {
+    let Some(text) = read_optional_text(dir, "last.md", MAX_LAST_MESSAGE_READ_BYTES)? else {
+        return Ok(None);
+    };
+    if text.len() <= crate::task::MAX_PROMPT_BYTES {
+        return Ok(Some(text));
+    }
+    let compacted = collapse_blank_runs(&text);
+    if compacted.len() > crate::task::MAX_PROMPT_BYTES {
+        return Err(turn_error(
+            "PUBLISH_FAILED",
+            "cannot read last.md: message exceeds the result limit",
+        ));
+    }
+    Ok(Some(compacted))
+}
+
+fn collapse_blank_runs(text: &str) -> String {
+    let mut output = String::with_capacity(text.len().min(crate::task::MAX_PROMPT_BYTES));
+    let mut run = String::new();
+    for character in text.chars() {
+        if matches!(character, ' ' | '\t' | '\r' | '\n') {
+            run.push(character);
+            continue;
+        }
+        push_whitespace_run(&mut output, &mut run);
+        output.push(character);
+    }
+    push_whitespace_run(&mut output, &mut run);
+    output
+}
+
+fn push_whitespace_run(output: &mut String, run: &mut String) {
+    if run.contains('\n') {
+        output.push('\n');
+    } else {
+        output.push_str(run);
+    }
+    run.clear();
+}
+
 fn read_auth_scan_tail(dir: &RootedDir, name: &str) -> Result<String, WorkerError> {
     if !dir.entry_exists(name)? {
         return Ok(String::new());
@@ -2496,6 +2548,34 @@ mod tests {
 
     fn write_stdout(turn_dir: &RootedDir, bytes: &[u8]) {
         RootedDir::write_private_atomic_no_replace(turn_dir, "stdout.log", bytes).unwrap();
+    }
+
+    #[test]
+    fn oversized_last_message_keeps_json_values_when_compacted() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let padding = " \n".repeat(crate::task::MAX_PROMPT_BYTES);
+        let message = format!(
+            "{{\"status\":\"done\",\"summary\":\"two  spaces\\nkept\"{padding}, \"questions\": []}}\n"
+        );
+        RootedDir::write_private_atomic_no_replace(&turn_dir, "last.md", message.as_bytes())
+            .unwrap();
+        let read = read_last_message(&turn_dir).unwrap().unwrap();
+        assert_eq!(
+            read,
+            "{\"status\":\"done\",\"summary\":\"two  spaces\\nkept\"\n, \"questions\": []}\n"
+        );
+        let value: serde_json::Value = serde_json::from_str(&read).unwrap();
+        assert_eq!(value["summary"], "two  spaces\nkept");
+    }
+
+    #[test]
+    fn last_message_over_the_limit_after_compaction_still_fails_publication() {
+        let (_temp, turn_dir) = open_scan_dir();
+        let message = "x ".repeat(crate::task::MAX_PROMPT_BYTES);
+        RootedDir::write_private_atomic_no_replace(&turn_dir, "last.md", message.as_bytes())
+            .unwrap();
+        let error = read_last_message(&turn_dir).unwrap_err();
+        assert_eq!(error.public_code(), "PUBLISH_FAILED");
     }
 
     #[test]
