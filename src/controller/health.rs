@@ -167,7 +167,7 @@ impl ControllerHealth {
         self.cursor_stale = false;
         match &report.requests.resume {
             Ok(resume) => {
-                progressed |= !resume.completed.is_empty();
+                progressed |= !resume.completed.is_empty() || !resume.retired_orphans.is_empty();
                 for (_, failure) in &resume.failed {
                     let code = failure
                         .split_once(": ")

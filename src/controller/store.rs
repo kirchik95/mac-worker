@@ -278,12 +278,20 @@ struct BootstrapReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveResumeConfig {
     pub max_requests_per_tick: usize,
+    /// How long a receipt without a row stays visible before the tick
+    /// retires it. The receipt holds no payload, so a later retry of the
+    /// same request simply writes it again. The tick only sees receipts
+    /// whose request lock is free, so an in-flight request is never
+    /// retired; the grace only bounds how long a crash keeps health
+    /// degraded.
+    pub orphan_grace_millis: u64,
 }
 
 impl Default for ActiveResumeConfig {
     fn default() -> Self {
         Self {
             max_requests_per_tick: 32,
+            orphan_grace_millis: 10 * 60 * 1000,
         }
     }
 }
@@ -298,6 +306,7 @@ pub struct ActiveResumeReport {
     pub completed: Vec<ControllerAck>,
     pub busy_skipped: Vec<String>,
     pub orphan_receipts: Vec<String>,
+    pub retired_orphans: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub truncated: bool,
     pub cursor_stale: bool,
@@ -539,7 +548,16 @@ impl ControllerStore {
                 return Err(store_io(injected_fault()));
             }
             // Stable identity/time frozen BEFORE any executor effect.
-            let meta = executor.prepare(request)?;
+            let meta = match executor.prepare(request) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    // A rejected preparation is final for the client, so no
+                    // retry will ever publish a row behind this receipt. If
+                    // retiring fails, the tick retires it after the grace.
+                    let _ = self.retire_receipt(request.request_id(), ControllerFault::None);
+                    return Err(error);
+                }
+            };
             let record = self.publish_with(request, &meta)?;
             #[cfg(any(test, feature = "test-support"))]
             if fault == ControllerFault::StopAfterPublish {
@@ -576,6 +594,7 @@ impl ControllerStore {
         config: &ActiveResumeConfig,
     ) -> Result<ActiveResumeReport, WorkerError> {
         let bound = config.max_requests_per_tick.max(1);
+        let now = now_millis()?;
         let sorted = self.active_names()?;
         let rotated = self.rotate_past_cursor(&sorted)?;
         let truncated = rotated.len() > bound;
@@ -584,6 +603,7 @@ impl ControllerStore {
             completed: Vec::new(),
             busy_skipped: Vec::new(),
             orphan_receipts: Vec::new(),
+            retired_orphans: Vec::new(),
             failed: Vec::new(),
             truncated,
             cursor_stale: false,
@@ -624,8 +644,18 @@ impl ControllerStore {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     // Receipt without a row: publication never finished.
-                    // Kept for the next `handle` retry; never deleted here.
-                    report.orphan_receipts.push(request_id);
+                    // Kept for the next `handle` retry until the grace ends;
+                    // nothing ran, so retiring it loses no work.
+                    let age = now.saturating_sub(receipt.created_at_millis);
+                    if age < config.orphan_grace_millis {
+                        report.orphan_receipts.push(request_id);
+                    } else if let Err(error) =
+                        self.retire_receipt(&request_id, ControllerFault::None)
+                    {
+                        report.failed.push((request_id, display_error(&error)));
+                    } else {
+                        report.retired_orphans.push(request_id);
+                    }
                     continue;
                 }
                 // A corrupt/unreadable row fails THIS entry only. The bad
@@ -1810,6 +1840,13 @@ mod tests {
             } else {
                 assert_eq!(row.unwrap().phase(), RequestPhase::Acked);
             }
+            // No receipt may outlive a final answer: nobody retries it.
+            assert_eq!(store.pending_health(0).unwrap().active_count, 0);
+            let tick = store
+                .resume_active_bounded(&handler, &ActiveResumeConfig::default())
+                .unwrap();
+            assert!(tick.orphan_receipts.is_empty());
+            assert!(tick.failed.is_empty());
         }
         let temp = tempfile::tempdir().unwrap();
         let store = ControllerStore::open(&temp.path().join("controller")).unwrap();

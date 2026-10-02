@@ -568,6 +568,7 @@ fn bounded_ticks_drain_pending_without_starvation() {
     }
     let tight = ActiveResumeConfig {
         max_requests_per_tick: 2,
+        ..ActiveResumeConfig::default()
     };
     let first = store.resume_active_bounded(&executor, &tight).unwrap();
     assert_eq!(first.completed.len(), 2);
@@ -647,6 +648,42 @@ fn index_receipt_crash_heals_on_retry_and_keeps_the_orphan_visible() {
     assert_eq!(ack.status(), "acked");
     assert_eq!(ack.result(), Some(&json!({"n": 1})));
     assert_eq!(executor.calls_for(ID_A), 1);
+}
+
+#[test]
+fn orphan_receipt_past_the_grace_is_retired_and_a_retry_still_runs_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 2}));
+    assert!(
+        store
+            .handle_with(
+                &checkpoint_request(ID_A),
+                &executor,
+                ControllerFault::StopAfterActiveReceiptBeforePublish,
+            )
+            .is_err()
+    );
+    let expired = ActiveResumeConfig {
+        orphan_grace_millis: 0,
+        ..ActiveResumeConfig::default()
+    };
+    let tick = store.resume_active_bounded(&executor, &expired).unwrap();
+    assert_eq!(tick.retired_orphans, vec![ID_A.to_owned()]);
+    assert!(tick.orphan_receipts.is_empty());
+    assert!(tick.failed.is_empty());
+    assert_eq!(store.pending_health(0).unwrap().active_count, 0);
+    let tick = store.resume_active_bounded(&executor, &expired).unwrap();
+    assert!(tick.retired_orphans.is_empty());
+
+    // The receipt carried no work: a late retry publishes and runs once.
+    let ack = store
+        .handle_with(&checkpoint_request(ID_A), &executor, ControllerFault::None)
+        .unwrap();
+    assert_eq!(ack.status(), "acked");
+    assert_eq!(ack.result(), Some(&json!({"n": 2})));
+    assert_eq!(executor.calls_for(ID_A), 1);
+    assert_eq!(store.pending_health(0).unwrap().active_count, 0);
 }
 
 #[test]
@@ -735,6 +772,7 @@ fn poisoned_early_entries_do_not_starve_later_work() {
 
     let tight = ActiveResumeConfig {
         max_requests_per_tick: 2,
+        ..ActiveResumeConfig::default()
     };
     // Tick 1 attempts the poisoned head: busy + failed, nothing completed.
     let first = ControllerStore::open(&state)
@@ -807,6 +845,7 @@ fn corrupt_row_and_lock_errors_do_not_starve_later_work() {
     let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
     let tight = ActiveResumeConfig {
         max_requests_per_tick: 2,
+        ..ActiveResumeConfig::default()
     };
     // Tick 1 attempts the poisoned head only: lock + row failures.
     let first = store.resume_active_bounded(&executor, &tight).unwrap();
