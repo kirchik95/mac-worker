@@ -115,6 +115,7 @@ mod rooted_fs;
 mod runner_log;
 mod scheduler;
 mod scheduler_adapter;
+pub mod session_transfer;
 mod skills;
 mod snapshot;
 mod supervisor;
