@@ -56,6 +56,9 @@ impl SchedulerProbeAdapter {
                             .cloned()
                             .collect();
                         append_inventory_origin_capabilities(&mut capabilities, worker);
+                        for feature in probe.features.iter().flatten() {
+                            push_unique(&mut capabilities, format!("feature:{feature}"));
+                        }
                         append_agent_capabilities(
                             &mut capabilities,
                             probe.agent_facts.as_ref(),
