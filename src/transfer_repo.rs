@@ -501,6 +501,8 @@ fn transfer_refs_are_collectable(refs: &[String]) -> bool {
 }
 
 impl TransferRepo {
+    // Wired by W6/T7; keep the production interface available at this gate.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn write_session_package(
         &self,
         _runner: &dyn ProcessRunner,

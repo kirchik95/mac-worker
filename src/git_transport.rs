@@ -70,6 +70,8 @@ impl PushReceipt {
 pub type FetchReceipt = ImportReceipt;
 
 pub struct SessionRefPush<'a> {
+    // Read by the W6 transport implementation; the gate rejects Some.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub package_oid: &'a str,
 }
 
