@@ -230,6 +230,21 @@ impl SessionPackage {
         let mut manifest: SessionManifest = serde_json::from_slice(manifest_json)
             .map_err(|_| session_error("SESSION_UNREADABLE", "invalid session manifest"))?;
         validate_files(&files)?;
+        if manifest.files.len() > MAX_PACKAGE_FILES {
+            return Err(session_error("SESSION_TOO_LARGE", "too many session files"));
+        }
+        let mut total = 0u64;
+        for file in &manifest.files {
+            total = total
+                .checked_add(file.bytes)
+                .ok_or_else(|| session_error("SESSION_TOO_LARGE", "session exceeds size cap"))?;
+            if file.bytes > MAX_FILE_BYTES || total > MAX_PACKAGE_BYTES {
+                return Err(session_error(
+                    "SESSION_TOO_LARGE",
+                    "session exceeds size cap",
+                ));
+            }
+        }
         if manifest.schema != MANIFEST_SCHEMA || manifest.format != manifest.agent.format() {
             return Err(session_error(
                 "SESSION_UNREADABLE",
@@ -334,6 +349,15 @@ impl SessionImportMeta {
         &self.source_agent_version
     }
 }
+/// The native session id of an imported conversation: the task id rendered as
+/// a lowercase hyphenated UUID. Host prepare and the runner both derive it.
+pub fn imported_session_id(task_id: &crate::task::TaskId) -> String {
+    uuid::Uuid::parse_str(&task_id.to_string())
+        .expect("TaskId is a canonical UUID")
+        .hyphenated()
+        .to_string()
+}
+
 pub const AGENT_MIN_REQUIREMENT_PREFIX: &str = "agent-min:";
 pub fn agent_min_requirement(agent: SessionAgent, version: &str) -> String {
     format!("{AGENT_MIN_REQUIREMENT_PREFIX}{}@{version}", agent.as_str())

@@ -42,10 +42,7 @@ fn claude_directory_encoding() {
         "a".repeat(64),
         "b".repeat(32)
     );
-    assert_eq!(
-        claude_project_dir(&host),
-        host.replace('/', "-").replace('.', "-")
-    );
+    assert_eq!(claude_project_dir(&host), host.replace(['/', '.'], "-"));
     assert_eq!(
         claude_project_dir(&"a".repeat(201)),
         format!("{}-rkvsv5", "a".repeat(200))
@@ -258,6 +255,13 @@ fn import_metadata_deserialization_validates_every_rule() {
 }
 
 #[test]
+fn imported_session_ids_are_hyphenated_task_ids() {
+    let task_id: mac_worker::test_support::task::model::TaskId =
+        "abcdefab1234567890ababcdefabcdef".parse().unwrap();
+    assert_eq!(imported_session_id(&task_id), ID);
+}
+
+#[test]
 fn minimum_version_requirements_round_trip() {
     for agent in [SessionAgent::Claude, SessionAgent::Codex] {
         let requirement = agent_min_requirement(agent, "0.160.0");
@@ -324,4 +328,133 @@ fn frozen_submit_is_additive_and_propagates_import_metadata() {
     let mut bad = old;
     bad["unknown"] = true.into();
     assert!(serde_json::from_value::<FrozenSubmitBody>(bad).is_err());
+}
+
+#[test]
+fn package_byte_caps_duplicate_paths_and_file_sets() {
+    let error = SessionPackage::build(
+        source(),
+        vec![PackageFile {
+            path: "main.jsonl".into(),
+            bytes: vec![0; MAX_FILE_BYTES as usize + 1],
+        }],
+    )
+    .unwrap_err();
+    assert_eq!(error.public_code(), "SESSION_TOO_LARGE");
+    let error = SessionPackage::build(
+        source(),
+        vec![
+            PackageFile {
+                path: "a".into(),
+                bytes: vec![0; MAX_PACKAGE_BYTES as usize / 2 + 1],
+            },
+            PackageFile {
+                path: "b".into(),
+                bytes: vec![0; MAX_PACKAGE_BYTES as usize / 2],
+            },
+        ],
+    )
+    .unwrap_err();
+    assert_eq!(error.public_code(), "SESSION_TOO_LARGE");
+    for paths in [["a", "a"], ["a", "a/b"]] {
+        assert!(
+            SessionPackage::build(
+                source(),
+                paths
+                    .into_iter()
+                    .map(|path| PackageFile {
+                        path: path.into(),
+                        bytes: vec![]
+                    })
+                    .collect()
+            )
+            .is_err()
+        );
+    }
+    let package = SessionPackage::build(
+        source(),
+        vec![
+            PackageFile {
+                path: "z".into(),
+                bytes: vec![1],
+            },
+            PackageFile {
+                path: "a".into(),
+                bytes: vec![2],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(package.files()[0].path, "a");
+    assert!(SessionPackage::from_parts(&package.manifest_json(), vec![]).is_err());
+    let mut manifest: serde_json::Value = serde_json::from_slice(&package.manifest_json()).unwrap();
+    manifest["files"][0]["bytes"] = serde_json::json!(MAX_FILE_BYTES + 1);
+    assert_eq!(
+        SessionPackage::from_parts(
+            &serde_json::to_vec(&manifest).unwrap(),
+            package.files().to_vec()
+        )
+        .unwrap_err()
+        .public_code(),
+        "SESSION_TOO_LARGE"
+    );
+    manifest["files"][0]["bytes"] = serde_json::json!(1);
+    manifest["schema"] = serde_json::json!(2);
+    assert!(
+        SessionPackage::from_parts(
+            &serde_json::to_vec(&manifest).unwrap(),
+            package.files().to_vec()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn synthetic_homes_and_capture_doubles_are_read_only() {
+    use std::{sync::Mutex, time::SystemTime};
+    let home = FakeAgentHome::new();
+    let path = home.claude(ID, "/synthetic", "1.2.3", 2);
+    let codex = home.codex(ID, "/synthetic", "0.160.0", 2);
+    assert_eq!(read_complete_lines(&path, MAX_FILE_BYTES).unwrap().len(), 4);
+    assert_eq!(
+        read_complete_lines(&codex, MAX_FILE_BYTES).unwrap().len(),
+        3
+    );
+    let before = std::fs::read(&path).unwrap();
+    let package = SessionPackage::build(
+        source(),
+        vec![PackageFile {
+            path: CLAUDE_MAIN_FILE.into(),
+            bytes: before.clone(),
+        }],
+    )
+    .unwrap();
+    let fake = FakeCapture {
+        agent: SessionAgent::Claude,
+        source: path.clone(),
+        package,
+        calls: Mutex::new(Vec::new()),
+    };
+    let scrubber = Scrubber::new(vec![]);
+    let cx = CaptureContext {
+        project_root: home.home(),
+        home: home.home(),
+        scrubber: &scrubber,
+        now: SystemTime::UNIX_EPOCH,
+    };
+    assert_eq!(
+        fake.discover(&"claude".parse().unwrap(), &cx).unwrap(),
+        path
+    );
+    assert_eq!(fake.capture(&path, &cx).unwrap().source_path, path);
+    assert_eq!(fake.calls.lock().unwrap().len(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        capture_for(SessionAgent::Claude)
+            .capture(&path, &cx)
+            .err()
+            .unwrap()
+            .public_code(),
+        "SESSION_IMPORT_UNSUPPORTED"
+    );
 }

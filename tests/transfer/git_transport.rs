@@ -129,6 +129,42 @@ fn git_in(path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn session_push_facades_refuse_before_spawning_git() {
+    use mac_worker::test_support::transfer::git::SessionRefPush;
+    let runner = RecordingRunner::returning_success();
+    let oid = "a".repeat(40);
+    let error = GitTransport::new(&runner)
+        .push_base(
+            &worker(),
+            &transfer_identity(),
+            PROJECT_ID,
+            task_id(),
+            &base_oid(),
+            Path::new("/synthetic"),
+            Some(SessionRefPush { package_oid: &oid }),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SESSION_PLACEMENT_FAILED");
+    let error = GitTransport::new(&runner)
+        .push_controller_source(
+            "ssh",
+            "mac1",
+            "~/.local/bin/worker",
+            "synthetic",
+            "synthetic",
+            &fingerprint(),
+            PROJECT_ID,
+            &"b".repeat(64),
+            &base_oid(),
+            Path::new("/synthetic"),
+            Some(SessionRefPush { package_oid: &oid }),
+        )
+        .unwrap_err();
+    assert_eq!(error.public_code(), "SESSION_PLACEMENT_FAILED");
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
 fn push_base_runs_in_transfer_repo_with_pinned_ssh_and_hidden_receive_pack() {
     let runner = RecordingRunner::returning_success();
     let transfer = tempfile::tempdir().unwrap();

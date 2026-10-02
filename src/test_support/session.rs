@@ -1,4 +1,5 @@
 //! Explicit integration-test access for session-transfer contracts.
+pub use crate::features::{CONTROLLER_FEATURE_SESSION_IMPORT, HOST_FEATURE_SESSION_IMPORT};
 pub use crate::session_transfer::capture::{capture_for, read_complete_lines, relative_inside};
 pub use crate::session_transfer::claude_dir::claude_project_dir;
 pub use crate::session_transfer::contracts::*;
