@@ -66,6 +66,7 @@ pub(super) fn runtime(root: &Path) -> PublicRuntime {
 }
 pub(super) fn seed_task(store: &ClientStateStore, seed: u128, worker: &str) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(uuid::Uuid::from_u128(seed)),
         run_id: None,
         project_id: "a".repeat(64),

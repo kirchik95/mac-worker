@@ -310,7 +310,8 @@ fn agent_exit_kind(code: &str) -> ExitKind {
 fn task_exit_kind(code: &str) -> ExitKind {
     match code {
         "RUNNER_HANDOFF_FAILED" => ExitKind::Io,
-        "WAIT_TIMEOUT" | "WAIT_BLOCKED" => ExitKind::Infrastructure,
+        "SESSION_AGENT_TOO_OLD" => ExitKind::Capacity,
+        "SESSION_PLACEMENT_FAILED" | "WAIT_TIMEOUT" | "WAIT_BLOCKED" => ExitKind::Infrastructure,
         _ => ExitKind::Usage,
     }
 }
@@ -337,6 +338,56 @@ pub struct PublicDiagnostic {
 const CONFIG_MISSING_HINT: &str = "connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path)";
 
 static CATALOG: &[PublicDiagnostic] = &[
+    PublicDiagnostic {
+        code: "SESSION_NOT_FOUND",
+        exit: 64,
+        hint: Some("check the session id, or omit it to pick the newest session of this project"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_UNREADABLE",
+        exit: 64,
+        hint: Some("the session is not valid JSONL; pick another session"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_TOO_LARGE",
+        exit: 64,
+        hint: Some("the session exceeds 64 MiB; use the handoff-note recipe instead"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_OUTSIDE_PROJECT",
+        exit: 64,
+        hint: Some("run the command from the project the session was started in"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_NEEDS_WIP",
+        exit: 64,
+        hint: Some("add --wip so the pool sees the uncommitted state the session assumes"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_REQUIRES_SNAPSHOT",
+        exit: 64,
+        hint: Some("origin-sourced tasks cannot carry a session; submit from the laptop snapshot"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_AGENT_MISMATCH",
+        exit: 64,
+        hint: Some("drop --agent or make it match the session's agent"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_IMPORT_UNSUPPORTED",
+        exit: 64,
+        hint: Some("only claude and codex sessions can be continued; use the handoff-note recipe"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_AGENT_TOO_OLD",
+        exit: 75,
+        hint: Some("update the agent on the worker to at least the session's version"),
+    },
+    PublicDiagnostic {
+        code: "SESSION_PLACEMENT_FAILED",
+        exit: 70,
+        hint: Some("the worker could not install the session; check the worker and retry"),
+    },
     PublicDiagnostic {
         code: "CONFIG_MISSING",
         exit: 64,
@@ -556,7 +607,17 @@ fn catalog_error(code: &str) -> Option<WorkerError> {
 fn build_catalog_error(code: &'static str) -> WorkerError {
     match code {
         "CONFIG" | "CONFIG_MISSING" => WorkerError::Config(format!("{code}: configuration error")),
-        "TASK_BUSY"
+        "SESSION_NOT_FOUND"
+        | "SESSION_UNREADABLE"
+        | "SESSION_TOO_LARGE"
+        | "SESSION_OUTSIDE_PROJECT"
+        | "SESSION_NEEDS_WIP"
+        | "SESSION_REQUIRES_SNAPSHOT"
+        | "SESSION_AGENT_MISMATCH"
+        | "SESSION_IMPORT_UNSUPPORTED"
+        | "SESSION_AGENT_TOO_OLD"
+        | "SESSION_PLACEMENT_FAILED"
+        | "TASK_BUSY"
         | "TASK_CLOSED"
         | "TASK_NOT_FOUND"
         | "TASK_CONFIG_INVALID"

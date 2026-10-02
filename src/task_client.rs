@@ -297,6 +297,7 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
+    pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
     pub agent: AgentKind,
     pub model: Option<String>,
@@ -1243,6 +1244,7 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let request = TaskSubmitRequest {
+            session_import: prepared.session_import.clone(),
             questions: prepared.questions,
             agent: prepared.agent,
             model: prepared.model.clone(),
@@ -1739,6 +1741,7 @@ impl<'a> TaskClient<'a> {
                     None => QuestionsPolicy::default(),
                 };
                 let meta = TaskMeta::new(TaskMetaInput {
+                    session_import: request.session_import.clone(),
                     task_id,
                     run_id: request.run_id,
                     project_id: context.project_id.clone(),
@@ -2118,6 +2121,7 @@ impl<'a> TaskClient<'a> {
             || existing.meta().worktree_id() != worktree_id
             || existing.meta().run_id() != request.run_id
             || existing.meta().agent() != request.agent
+            || existing.meta().session_import() != request.session_import.as_ref()
             || existing.preference() != request.preference
             || existing.meta().source() != source
             || existing.meta().publish() != publish
@@ -6701,6 +6705,7 @@ pub(crate) fn request_from_frozen_node(
 ) -> Result<TaskSubmitRequest, WorkerError> {
     let spec = &node.frozen;
     Ok(TaskSubmitRequest {
+        session_import: None,
         questions: spec.questions,
         agent: parse_agent(&spec.agent)?,
         model: spec.model.clone(),
@@ -6818,6 +6823,7 @@ pub(crate) fn resolve_batch_task_without_local_workers(
             .unwrap_or(default_limits.max_followups),
     )?;
     let request = TaskSubmitRequest {
+        session_import: None,
         questions: task.questions.or(defaults.questions).or(settings.questions),
         agent,
         model: task.model.clone().or_else(|| defaults.model.clone()),
@@ -7333,6 +7339,7 @@ mod tests {
         let finished = TurnId::generate();
         let base: BaseOid = "a".repeat(40).parse().unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),
@@ -7679,6 +7686,7 @@ mod tests {
         let task_id = TaskId::generate();
         let turn_n = TurnId::generate();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

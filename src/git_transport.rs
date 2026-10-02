@@ -69,6 +69,10 @@ impl PushReceipt {
 
 pub type FetchReceipt = ImportReceipt;
 
+pub struct SessionRefPush<'a> {
+    pub package_oid: &'a str,
+}
+
 pub struct GitTransport<'a> {
     runner: &'a dyn ProcessRunner,
 }
@@ -78,6 +82,7 @@ impl<'a> GitTransport<'a> {
         Self { runner }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_base(
         &self,
         worker: &WorkerEntry,
@@ -86,7 +91,14 @@ impl<'a> GitTransport<'a> {
         task_id: TaskId,
         base: &BaseOid,
         transfer_repo: &Path,
+        session: Option<SessionRefPush<'_>>,
     ) -> Result<PushReceipt, WorkerError> {
+        if session.is_some() {
+            return Err(crate::session_transfer::session_error(
+                "SESSION_PLACEMENT_FAILED",
+                "not implemented yet",
+            ));
+        }
         validate_worker(worker)?;
         validate_project_id(project_id)?;
         let ssh = SshTransport::new(self.runner).git_ssh_command(worker)?;
@@ -474,7 +486,14 @@ impl<'a> GitTransport<'a> {
         worktree_id: &str,
         oid: &BaseOid,
         transfer_repo: &Path,
+        session: Option<SessionRefPush<'_>>,
     ) -> Result<PushReceipt, WorkerError> {
+        if session.is_some() {
+            return Err(crate::session_transfer::session_error(
+                "SESSION_PLACEMENT_FAILED",
+                "not implemented yet",
+            ));
+        }
         validate_ssh_destination(ssh_destination)?;
         validate_project_id(project_id)?;
         validate_worktree_id(worktree_id)?;

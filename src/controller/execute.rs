@@ -326,6 +326,7 @@ impl TaskSubmitHandler<'_> {
             &self.paths.cache,
             self.runner,
             SourceSubmitBind {
+                session_oid: None,
                 request_id: record.request_id(),
                 fingerprint: &fingerprint,
                 project_id: &body.project_id,
@@ -1195,6 +1196,7 @@ mod tests {
 
     fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
         FrozenSubmitBody {
+            session_import: None,
             questions: None,
             task_id: TaskId::generate(),
             turn_id: TurnId::generate(),
@@ -1746,6 +1748,7 @@ mod tests {
 
     fn task_meta(project_id: &str, worktree_id: &str, oid: &BaseOid) -> TaskMeta {
         TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: TaskId::generate(),
             run_id: None,
             project_id: project_id.to_owned(),

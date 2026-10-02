@@ -57,6 +57,7 @@ fn task_record_with_ids(
 ) -> LocalTaskRecord {
     let base = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(number)),
         run_id: None,
         project_id,
@@ -505,6 +506,7 @@ fn submit_persists_private_context_before_handoff_and_retires_it_on_rollback() {
         )
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,

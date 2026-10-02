@@ -99,6 +99,7 @@ impl Fixture {
     ) -> QueueEntry {
         let base = "a".repeat(40).parse().unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task(number),
             run_id: run.as_ref().map(|r| r.run_id().as_str().parse().unwrap()),
             project_id: "a".repeat(64),

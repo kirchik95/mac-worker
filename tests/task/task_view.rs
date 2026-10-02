@@ -73,6 +73,7 @@ fn task_meta(task: TaskId, title: &str, created_at_millis: u64) -> TaskMeta {
 
 fn meta_fields(task: TaskId, title: &str, created_at_millis: u64) -> TaskMetaInput {
     TaskMetaInput {
+        session_import: None,
         task_id: task,
         run_id: Some(run_id()),
         project_id: PROJECT_ID.into(),

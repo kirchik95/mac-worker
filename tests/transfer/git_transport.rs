@@ -141,6 +141,7 @@ fn push_base_runs_in_transfer_repo_with_pinned_ssh_and_hidden_receive_pack() {
             task_id(),
             &base_oid(),
             transfer.path(),
+            None,
         )
         .unwrap();
     let request = runner.single_request();
@@ -770,6 +771,7 @@ fn controller_source_push_rejects_invalid_token_and_worktree_before_git() {
                 &worktree_id(),
                 &oid,
                 transfer.path(),
+                None,
             )
             .unwrap_err();
         assert_eq!(error.public_code(), "INVALID_COMPONENT", "{token:?}");
@@ -787,6 +789,7 @@ fn controller_source_push_rejects_invalid_token_and_worktree_before_git() {
             &poisoned_worktree,
             &oid,
             transfer.path(),
+            None,
         )
         .unwrap_err();
     assert_eq!(error.public_code(), "INVALID_COMPONENT");

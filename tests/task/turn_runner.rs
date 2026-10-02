@@ -1414,6 +1414,7 @@ fn submit_request(
     wait_for_capacity: bool,
 ) -> TaskSubmitRequest {
     TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,
@@ -4250,6 +4251,7 @@ fn submit_pool_task(
     )
     .submit(
         TaskSubmitRequest {
+            session_import: None,
             questions: None,
             agent: AgentKind::Codex,
             model: None,
@@ -5172,6 +5174,7 @@ fn result_fetch_failure_finishes_the_turn_and_leaves_the_task_closable() {
     let report = client
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -5624,6 +5627,7 @@ fn close_succeeds_immediately_after_wait_returns() {
     let report = client
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -5736,6 +5740,7 @@ fn assert_submit_rolls_back_post_create_state(
     let error = client
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -6080,6 +6085,7 @@ fn reconciliation_excludes_retired_pending_rollback_turn_before_dead_owner_adopt
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -6215,6 +6221,7 @@ fn rollback_retry_does_not_release_a_later_tasks_reacquired_run_publish_branch()
     // This fixture's synthetic origin capability must stay cached across both submits.
     let state = state.with_admission_clock(Arc::new(move || Ok(admission_now)));
     let request = || TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,
@@ -6302,6 +6309,7 @@ fn submit_never_rolls_back_a_parked_row_after_another_runner_adopts_it() {
     let executor = InlineRunnerExecutor;
     plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,
@@ -6394,6 +6402,7 @@ fn reconciliation_does_not_rollback_a_submission_that_cleared_its_intent_while_w
     let executor = InlineRunnerExecutor;
     plant_bound_mini1_ready(&state, vec!["darwin-arm64".into(), "agent:codex".into()]);
     let request = || TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,
@@ -6501,6 +6510,7 @@ fn intent_clear_fsync_failure_does_not_restore_a_stale_submission_snapshot_after
     );
 
     let request = || TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,
@@ -6608,6 +6618,7 @@ fn reconciliation_keeps_pending_submission_intent_out_of_runner_startup_until_re
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -6717,6 +6728,7 @@ fn restart_recovers_prompt_failure_when_every_rollback_marker_write_fails() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -6800,6 +6812,7 @@ fn submit_preserves_state_when_detached_child_adopts_before_handoff_failure() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,
@@ -6881,6 +6894,7 @@ fn runner_that_exits_early_writes_one_diagnostic_line_and_no_secret() {
         .unwrap()
         .as_millis() as u64;
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -8539,6 +8553,7 @@ fn a_pinned_submit_for_a_missing_agent_prints_the_capability_reason() {
     let error = TaskClient::new(&runner, &config, &paths, &state, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Cursor,
                 model: None,

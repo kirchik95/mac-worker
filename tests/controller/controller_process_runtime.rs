@@ -136,6 +136,7 @@ fn plumbing_lease_token() -> LeaseToken {
 
 fn plumbing_task_meta(base_oid: BaseOid) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: plumbing_task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),

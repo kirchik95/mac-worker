@@ -542,6 +542,7 @@ impl TaskHarness {
         )
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: self.runner.agent,
                 model: None,

@@ -501,6 +501,17 @@ fn transfer_refs_are_collectable(refs: &[String]) -> bool {
 }
 
 impl TransferRepo {
+    pub fn write_session_package(
+        &self,
+        _runner: &dyn ProcessRunner,
+        _task_id: TaskId,
+        _package: &crate::session_transfer::SessionPackage,
+    ) -> Result<String, WorkerError> {
+        Err(crate::session_transfer::session_error(
+            "SESSION_IMPORT_UNSUPPORTED",
+            "not implemented yet",
+        ))
+    }
     pub fn resolve_base_oid(
         runner: &dyn ProcessRunner,
         context: &ProjectContext,

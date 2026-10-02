@@ -957,6 +957,7 @@ mod tests {
 
     fn record(number: u128, state: TaskState, outcome: TaskOutcome) -> LocalTaskRecord {
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: id(number),
             run_id: None,
             project_id: "a".repeat(64),

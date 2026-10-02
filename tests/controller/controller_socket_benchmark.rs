@@ -614,6 +614,7 @@ fn seed_task(paths: &PathLayout) {
     let (task, turn) = ids();
     let store = ClientStateStore::open(&paths.state).unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task,
         run_id: None,
         project_id: "a".repeat(64),

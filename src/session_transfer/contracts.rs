@@ -70,10 +70,10 @@ impl FromStr for SessionSelector {
                 ));
             }
         };
-        if let Some(id) = id {
-            if !valid_uuid(id) {
-                return Err(session_error("TASK_CONFIG_INVALID", "invalid session id"));
-            }
+        if let Some(id) = id
+            && !valid_uuid(id)
+        {
+            return Err(session_error("TASK_CONFIG_INVALID", "invalid session id"));
         }
         Ok(Self {
             agent,
@@ -256,13 +256,34 @@ impl SessionPackage {
         serde_json::to_vec(&self.manifest).expect("session manifest serializes")
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SessionImportMetaWire")]
 pub struct SessionImportMeta {
     agent: SessionAgent,
     format: SessionFormat,
     package_oid: String,
     source_agent_version: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionImportMetaWire {
+    agent: SessionAgent,
+    format: SessionFormat,
+    package_oid: String,
+    source_agent_version: String,
+}
+impl TryFrom<SessionImportMetaWire> for SessionImportMeta {
+    type Error = WorkerError;
+    fn try_from(wire: SessionImportMetaWire) -> Result<Self, Self::Error> {
+        let meta = Self {
+            agent: wire.agent,
+            format: wire.format,
+            package_oid: wire.package_oid,
+            source_agent_version: wire.source_agent_version,
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
 }
 impl SessionImportMeta {
     pub fn new(
@@ -270,15 +291,26 @@ impl SessionImportMeta {
         package_oid: impl Into<String>,
         source_agent_version: impl Into<String>,
     ) -> Result<Self, WorkerError> {
-        let package_oid = package_oid.into();
-        let source_agent_version = source_agent_version.into();
-        if ![40, 64].contains(&package_oid.len())
-            || !package_oid
+        let meta = Self {
+            agent,
+            format: agent.format(),
+            package_oid: package_oid.into(),
+            source_agent_version: source_agent_version.into(),
+        };
+        meta.validate()?;
+        Ok(meta)
+    }
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.format != self.agent.format()
+            || ![40, 64].contains(&self.package_oid.len())
+            || !self
+                .package_oid
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || source_agent_version.is_empty()
-            || source_agent_version.len() > 64
-            || !source_agent_version
+            || self.source_agent_version.is_empty()
+            || self.source_agent_version.len() > 64
+            || !self
+                .source_agent_version
                 .bytes()
                 .all(|b| (33..=126).contains(&b))
         {
@@ -287,12 +319,7 @@ impl SessionImportMeta {
                 "invalid session import metadata",
             ));
         }
-        Ok(Self {
-            agent,
-            format: agent.format(),
-            package_oid,
-            source_agent_version,
-        })
+        Ok(())
     }
     pub fn agent(&self) -> SessionAgent {
         self.agent
@@ -307,24 +334,28 @@ impl SessionImportMeta {
         &self.source_agent_version
     }
 }
-impl<'de> Deserialize<'de> for SessionImportMeta {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            agent: SessionAgent,
-            format: SessionFormat,
-            package_oid: String,
-            source_agent_version: String,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        let meta = Self::new(wire.agent, wire.package_oid, wire.source_agent_version)
-            .map_err(serde::de::Error::custom)?;
-        if wire.format != meta.format {
-            return Err(serde::de::Error::custom("session agent/format mismatch"));
-        }
-        Ok(meta)
+pub const AGENT_MIN_REQUIREMENT_PREFIX: &str = "agent-min:";
+pub fn agent_min_requirement(agent: SessionAgent, version: &str) -> String {
+    format!("{AGENT_MIN_REQUIREMENT_PREFIX}{}@{version}", agent.as_str())
+}
+pub fn parse_agent_min_requirement(requirement: &str) -> Option<(SessionAgent, String)> {
+    let (agent, version) = requirement
+        .strip_prefix(AGENT_MIN_REQUIREMENT_PREFIX)?
+        .split_once('@')?;
+    let agent = match agent {
+        "claude" => SessionAgent::Claude,
+        "codex" => SessionAgent::Codex,
+        _ => return None,
+    };
+    if version.is_empty()
+        || version.len() > 64
+        || !version
+            .bytes()
+            .all(|b| (33..=126).contains(&b) && b != b'@')
+    {
+        return None;
     }
+    Some((agent, version.to_owned()))
 }
 pub fn session_error(code: &'static str, message: impl Into<Cow<'static, str>>) -> WorkerError {
     WorkerError::Task {
@@ -361,10 +392,11 @@ pub struct PlaceContext<'a> {
     pub workspace: &'a Path,
     pub store: &'a StoreWriter,
     pub session_id: &'a str,
-    pub now_millis: u64,
+    pub placed_at_millis: u64,
 }
 pub struct PlacedSession {
-    pub primary_file: PathBuf,
+    pub primary_relative: String,
+    pub files: Vec<String>,
 }
 pub trait SessionPlace {
     fn agent(&self) -> SessionAgent;

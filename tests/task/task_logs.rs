@@ -56,6 +56,7 @@ impl Fixture {
         let store = ClientStateStore::open(&paths.state).unwrap();
         let task_id = TaskId::generate();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),
@@ -807,6 +808,7 @@ fn task_status_json_includes_stage_and_residual() {
     let store = ClientStateStore::open(&paths.state).unwrap();
     let task_id = TaskId::generate();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: "a".repeat(64),

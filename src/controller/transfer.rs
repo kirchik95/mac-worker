@@ -115,6 +115,7 @@ struct ResultRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSubmitBind<'a> {
+    pub session_oid: Option<&'a str>,
     pub request_id: &'a str,
     pub fingerprint: &'a RequestFingerprint,
     pub project_id: &'a str,

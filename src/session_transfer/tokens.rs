@@ -43,6 +43,11 @@ fn replace(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     }
     output
 }
+fn json_safe_path(path: &str) -> bool {
+    !path
+        .bytes()
+        .any(|b| b == b'"' || b == b'\\' || b.is_ascii_control())
+}
 pub fn normalize(text: &[u8], roots: &[&str], session_id: &str) -> Result<Vec<u8>, WorkerError> {
     if [WORKSPACE_TOKEN, SESSION_TOKEN]
         .iter()
@@ -51,6 +56,12 @@ pub fn normalize(text: &[u8], roots: &[&str], session_id: &str) -> Result<Vec<u8
         return Err(session_error(
             "SESSION_UNREADABLE",
             "session contains a reserved token",
+        ));
+    }
+    if roots.iter().any(|root| !json_safe_path(root)) {
+        return Err(session_error(
+            "SESSION_UNREADABLE",
+            "session path is not JSON-safe",
         ));
     }
     let mut roots = roots.to_vec();
@@ -65,10 +76,16 @@ pub fn normalize(text: &[u8], roots: &[&str], session_id: &str) -> Result<Vec<u8
         SESSION_TOKEN.as_bytes(),
     ))
 }
-pub fn materialize(text: &[u8], workspace: &str, session_id: &str) -> Vec<u8> {
-    replace(
+pub fn materialize(text: &[u8], workspace: &str, session_id: &str) -> Result<Vec<u8>, WorkerError> {
+    if !json_safe_path(workspace) {
+        return Err(session_error(
+            "SESSION_PLACEMENT_FAILED",
+            "workspace path is not JSON-safe",
+        ));
+    }
+    Ok(replace(
         &replace(text, WORKSPACE_TOKEN.as_bytes(), workspace.as_bytes()),
         SESSION_TOKEN.as_bytes(),
         session_id.as_bytes(),
-    )
+    ))
 }

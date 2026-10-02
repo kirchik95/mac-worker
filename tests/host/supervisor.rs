@@ -214,6 +214,7 @@ fn task_turn_request_with_identity(
     );
     request.validate().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: PROJECT_ID.into(),

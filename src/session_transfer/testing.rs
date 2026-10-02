@@ -136,7 +136,8 @@ pub struct PlaceCall {
 }
 pub struct FakePlace {
     pub agent: SessionAgent,
-    pub primary_file: PathBuf,
+    pub primary_relative: String,
+    pub files: Vec<String>,
     pub calls: Mutex<Vec<PlaceCall>>,
 }
 impl SessionPlace for FakePlace {
@@ -154,7 +155,8 @@ impl SessionPlace for FakePlace {
             session_id: cx.session_id.to_owned(),
         });
         Ok(PlacedSession {
-            primary_file: self.primary_file.clone(),
+            primary_relative: self.primary_relative.clone(),
+            files: self.files.clone(),
         })
     }
 }

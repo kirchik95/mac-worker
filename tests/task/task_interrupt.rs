@@ -457,6 +457,7 @@ fn task_record(
 ) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: project_id.to_owned(),

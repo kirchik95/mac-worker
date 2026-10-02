@@ -1369,6 +1369,7 @@ fn task_record(
     .unwrap();
     LocalTaskRecord::new(
         TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: Some(run_id),
             project_id: PROJECT_ID.into(),

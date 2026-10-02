@@ -128,6 +128,7 @@ fn task_limits() -> TaskLimits {
 
 fn fields_with_prompt(prompt: String) -> TaskMetaInput {
     TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: Some(run_id()),
         project_id: PROJECT_ID.to_owned(),
@@ -314,6 +315,82 @@ fn task_meta_bounds_prompt_and_summary_hides_it() {
     let json = serde_json::to_value(meta.summary()).unwrap();
     assert_eq!(json["title"], "Fix the flaky login spec");
     assert!(json.get("prompt").is_none() && json.get("session_ref").is_none());
+}
+
+#[test]
+fn session_import_meta_preserves_main_bytes_and_round_trips() {
+    // Captured from the unchanged main-era serializer before adding session_import.
+    let baseline = r#"{"task_id":"00000000000000000000000000000001","run_id":"00000000000000000000000000000002","project_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","agent":"codex","model":"gpt-5","policy":"workspace","source":{"kind":"local","wip":false},"publish":["fetch"],"publish_branch":null,"base_oid":"0123456789abcdef0123456789abcdef01234567","limits":{"turn":{"timeout_millis":1800000,"max_turns":null,"max_budget_usd_cents":null},"max_followups":10},"close_policy":"done","env_profile":null,"git_identity":{"name":"Ada Lovelace","email":"ada@example.test"},"title":"Fix the flaky login spec","created_at_millis":1700000000000}"#;
+    let meta = sample_meta();
+    assert_eq!(serde_json::to_vec(&meta).unwrap(), baseline.as_bytes());
+    assert!(meta.session_import().is_none());
+    assert_eq!(serde_json::from_str::<TaskMeta>(baseline).unwrap(), meta);
+    let mut fields = fields_with_prompt("Synthetic session task".into());
+    fields.session_import = Some(
+        mac_worker::test_support::session::SessionImportMeta::new(
+            mac_worker::test_support::session::SessionAgent::Codex,
+            "a".repeat(40),
+            "0.160.0",
+        )
+        .unwrap(),
+    );
+    let meta = TaskMeta::new(fields).unwrap();
+    let restored: TaskMeta = serde_json::from_slice(&serde_json::to_vec(&meta).unwrap()).unwrap();
+    assert_eq!(restored, meta);
+    assert!(restored.session_import().is_some());
+
+    let request = mac_worker::test_support::task::store::TaskPrepareRequest::new(
+        meta.clone(),
+        turn_id(),
+        "mini-1",
+    );
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let parsed = <mac_worker::test_support::task::store::TaskPrepareRequest as serde::Deserialize>::deserialize(&mut deserializer).unwrap();
+    deserializer.end().unwrap();
+    // Exact canonical equality used by the private host task endpoint in src/lib.rs.
+    assert_eq!(serde_json::to_vec(&parsed).unwrap(), bytes);
+    assert_eq!(parsed.meta().session_import(), meta.session_import());
+    let record = LocalTaskRecord::new(
+        meta,
+        sample_status(),
+        None,
+        None,
+        None,
+        REPO_ID.to_owned(),
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    let bytes = record.canonical_bytes().unwrap();
+    let restored: LocalTaskRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(restored.canonical_bytes().unwrap(), bytes);
+    assert!(restored.meta().session_import().is_some());
+
+    let mut value = serde_json::to_value(restored.meta()).unwrap();
+    value["source"] =
+        serde_json::json!({"kind":"origin", "url":"https://github.com/example/repo.git"});
+    assert!(
+        serde_json::from_value::<TaskMeta>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("SESSION_REQUIRES_SNAPSHOT")
+    );
+    let mut value = serde_json::to_value(restored.meta()).unwrap();
+    value["agent"] = serde_json::json!("claude");
+    assert!(
+        serde_json::from_value::<TaskMeta>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("SESSION_AGENT_MISMATCH")
+    );
+    let mut value = serde_json::to_value(restored.meta()).unwrap();
+    value["session_import"]["package_oid"] = serde_json::json!("bad");
+    assert!(serde_json::from_value::<TaskMeta>(value).is_err());
+    let mut value = serde_json::to_value(restored.meta()).unwrap();
+    value["future_unknown_field"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<TaskMeta>(value).is_err());
 }
 
 #[test]

@@ -23,7 +23,7 @@ fn tokens_obey_boundaries_and_round_trip() {
         format!("{WORKSPACE_TOKEN}/a {WORKSPACE_TOKEN}/b {SESSION_TOKEN}").as_bytes()
     );
     assert_eq!(
-        materialize(&normalize(b"/w/a", &["/w"], ID).unwrap(), "/w", ID),
+        materialize(&normalize(b"/w/a", &["/w"], ID).unwrap(), "/w", ID).unwrap(),
         b"/w/a"
     );
     for token in [WORKSPACE_TOKEN, SESSION_TOKEN] {
@@ -169,7 +169,7 @@ fn complete_lines_relative_paths_and_store_roots() {
     let other = tempfile::tempdir().unwrap();
     assert!(relative_inside(temp.path(), other.path()).is_err());
     assert_eq!(
-        store_root(SessionAgent::Claude, temp.path(), &[]),
+        store_root(SessionAgent::Claude, temp.path(), &[]).unwrap(),
         temp.path().join(".claude")
     );
     assert_eq!(
@@ -177,7 +177,151 @@ fn complete_lines_relative_paths_and_store_roots() {
             SessionAgent::Codex,
             temp.path(),
             &[("CODEX_HOME".into(), "/custom".into())]
-        ),
+        )
+        .unwrap(),
         std::path::PathBuf::from("/custom")
     );
+}
+
+#[test]
+fn amended_json_safe_paths_and_store_overrides() {
+    for path in ["/a\"b", "/a\\b", "/a\nb", "/a\u{7f}b"] {
+        assert_eq!(
+            normalize(b"{}", &[path], ID).unwrap_err().public_code(),
+            "SESSION_UNREADABLE"
+        );
+        assert_eq!(
+            materialize(WORKSPACE_TOKEN.as_bytes(), path, ID)
+                .unwrap_err()
+                .public_code(),
+            "SESSION_PLACEMENT_FAILED"
+        );
+    }
+    let path = "/проект/日本語";
+    assert_eq!(
+        materialize(&normalize(path.as_bytes(), &[path], ID).unwrap(), path, ID).unwrap(),
+        path.as_bytes()
+    );
+    for path in ["", "relative", "~/store"] {
+        assert!(
+            store_root(
+                SessionAgent::Claude,
+                std::path::Path::new("/home"),
+                &[("CLAUDE_CONFIG_DIR".into(), path.into())]
+            )
+            .is_err()
+        );
+    }
+    let overrides = vec![
+        ("CODEX_HOME".into(), "relative".into()),
+        ("CODEX_HOME".into(), "/last".into()),
+    ];
+    assert_eq!(
+        store_root(
+            SessionAgent::Codex,
+            std::path::Path::new("/home"),
+            &overrides
+        )
+        .unwrap(),
+        std::path::PathBuf::from("/last")
+    );
+}
+
+#[test]
+fn import_metadata_deserialization_validates_every_rule() {
+    let meta = SessionImportMeta::new(SessionAgent::Claude, "a".repeat(40), "1.2.3").unwrap();
+    let value = serde_json::to_value(&meta).unwrap();
+    for (key, bad) in [
+        ("format", serde_json::json!("codex-rollout-v1")),
+        ("package_oid", serde_json::json!("A".repeat(40))),
+        ("package_oid", serde_json::json!("a".repeat(39))),
+        ("package_oid", serde_json::json!("g".repeat(64))),
+        ("source_agent_version", serde_json::json!("")),
+        ("source_agent_version", serde_json::json!("a".repeat(65))),
+        ("source_agent_version", serde_json::json!("a b")),
+        ("source_agent_version", serde_json::json!("a\nb")),
+        ("source_agent_version", serde_json::json!("非ASCII")),
+        ("unknown", serde_json::json!(true)),
+    ] {
+        let mut invalid = value.clone();
+        invalid[key] = bad;
+        assert!(
+            serde_json::from_value::<SessionImportMeta>(invalid).is_err(),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_value::<SessionImportMeta>(value).unwrap(),
+        meta
+    );
+    assert!(SessionImportMeta::new(SessionAgent::Codex, "0".repeat(64), "v1").is_ok());
+}
+
+#[test]
+fn minimum_version_requirements_round_trip() {
+    for agent in [SessionAgent::Claude, SessionAgent::Codex] {
+        let requirement = agent_min_requirement(agent, "0.160.0");
+        assert_eq!(
+            parse_agent_min_requirement(&requirement),
+            Some((agent, "0.160.0".into()))
+        );
+    }
+    for bad in [
+        "codex@1",
+        "agent-min:cursor@1",
+        "agent-min:codex@",
+        "agent-min:codex@1 2",
+    ] {
+        assert!(parse_agent_min_requirement(bad).is_none());
+    }
+}
+
+#[test]
+fn session_error_codes_have_spec_exits_and_hints() {
+    use mac_worker::test_support::core::error::hint_for;
+    for (code, exit) in [
+        ("SESSION_NOT_FOUND", 64),
+        ("SESSION_UNREADABLE", 64),
+        ("SESSION_TOO_LARGE", 64),
+        ("SESSION_OUTSIDE_PROJECT", 64),
+        ("SESSION_NEEDS_WIP", 64),
+        ("SESSION_REQUIRES_SNAPSHOT", 64),
+        ("SESSION_AGENT_MISMATCH", 64),
+        ("SESSION_IMPORT_UNSUPPORTED", 64),
+        ("SESSION_AGENT_TOO_OLD", 75),
+        ("SESSION_PLACEMENT_FAILED", 70),
+    ] {
+        assert_eq!(session_error(code, "synthetic").exit_code(), exit, "{code}");
+        assert!(hint_for(code).is_some(), "{code}");
+    }
+}
+
+#[test]
+fn frozen_submit_is_additive_and_propagates_import_metadata() {
+    use mac_worker::test_support::task::prepared_submit::FrozenSubmitBody;
+    let old = serde_json::json!({
+        "task_id": "00000000000000000000000000000001",
+        "turn_id": "00000000000000000000000000000002",
+        "created_at_millis": 1, "prompt": "Synthetic prompt", "agent": "codex",
+        "source": "local", "publish": ["fetch"], "close_on": "never", "wip": false,
+        "project_id": "a".repeat(64), "worktree_id": "b".repeat(64), "base_oid": "a".repeat(40),
+        "timeout_millis": 1000, "max_followups": 10, "permissions": "workspace",
+        "requires": [], "include_untracked": [], "include_empty_dirs": [], "allow_sensitive": [],
+        "cli_includes": [], "wait_for_capacity": true
+    });
+    let mut body: FrozenSubmitBody = serde_json::from_value(old.clone()).unwrap();
+    assert!(body.session_import.is_none());
+    assert_eq!(serde_json::to_value(&body).unwrap(), old);
+    body.session_import =
+        Some(SessionImportMeta::new(SessionAgent::Codex, "a".repeat(40), "0.160.0").unwrap());
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let restored: FrozenSubmitBody = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(restored, body);
+    assert_eq!(
+        restored.prepared().unwrap().session_import,
+        body.session_import
+    );
+    let mut bad = old;
+    bad["unknown"] = true.into();
+    assert!(serde_json::from_value::<FrozenSubmitBody>(bad).is_err());
 }
