@@ -274,6 +274,34 @@ struct BootstrapReceipt {
     corrupt: Vec<String>,
 }
 
+/// Keep the original read error's classification before `op_io` drops errno.
+enum BootstrapReadError {
+    Corrupt(WorkerError),
+    Retryable(WorkerError),
+}
+
+impl BootstrapReadError {
+    fn from_io(op: &'static str, name: &str, error: io::Error) -> Self {
+        let corrupt = matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied
+                | io::ErrorKind::CrossesDevices
+                | io::ErrorKind::InvalidInput
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::IsADirectory
+                | io::ErrorKind::InvalidData
+        ) || error.raw_os_error() == Some(libc::ELOOP)
+            // Naming FilesystemLoop is still unstable on this toolchain.
+            || error.kind() == io::Error::from_raw_os_error(libc::ELOOP).kind();
+        let error = op_io(op, name, error);
+        if corrupt {
+            Self::Corrupt(error)
+        } else {
+            Self::Retryable(error)
+        }
+    }
+}
+
 /// Bounded tick configuration for the independent leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveResumeConfig {
@@ -690,68 +718,60 @@ impl ControllerStore {
     /// Guarded by a durable receipt; corrupt rows are reported, never hidden.
     /// A healthy pre-existing receipt is read-back-validated and counts as
     /// rebuilt, never as corrupt. A transient read or index-write failure for a
-    /// VALID row aborts without persisting the completed marker, so a later
-    /// bootstrap can finish; only genuine row corruption is reported.
+    /// VALID row leaves bootstrap incomplete after indexing its neighbors,
+    /// so a later bootstrap can finish; only genuine corruption is reported.
     pub fn bootstrap_active_index(&self) -> Result<ActiveBootstrapReport, WorkerError> {
         self.bootstrap_active_index_with_hook(|| {})
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bootstrap_active_index_with_read_hook(
+        &self,
+        before_read: impl FnMut(&str) -> io::Result<()>,
+    ) -> Result<ActiveBootstrapReport, WorkerError> {
+        self.bootstrap_active_index_with_hooks(|| {}, before_read)
+    }
+
     fn bootstrap_active_index_with_hook(
         &self,
+        after_open: impl FnMut(),
+    ) -> Result<ActiveBootstrapReport, WorkerError> {
+        self.bootstrap_active_index_with_hooks(after_open, |_| Ok(()))
+    }
+
+    fn bootstrap_active_index_with_hooks(
+        &self,
         mut after_open: impl FnMut(),
+        mut before_read: impl FnMut(&str) -> io::Result<()>,
     ) -> Result<ActiveBootstrapReport, WorkerError> {
         if self
             .root
             .entry_exists(BOOTSTRAP_RECEIPT)
             .map_err(|error| op_io("probe-bootstrap", BOOTSTRAP_RECEIPT, error))?
         {
-            return self.read_bootstrap_receipt();
+            return self.read_bootstrap_receipt(&mut before_read);
         }
         let mut rebuilt = Vec::new();
         let mut corrupt = Vec::new();
+        let mut first_retryable = None;
         for name in self.request_names()? {
-            match self.read_bootstrap_row(&name, &mut after_open) {
-                Ok(Some(record)) => {
-                    if record.phase == RequestPhase::Published {
-                        let receipt = PendingReceipt {
-                            request_id: record.request_id.clone(),
-                            payload_sha256: record.payload_sha256.clone(),
-                            command: record.command.clone(),
-                            created_at_millis: record.created_at_millis,
-                        };
-                        match self.write_pending_receipt(&receipt) {
-                            Ok(()) => rebuilt.push(record.request_id.clone()),
-                            // Healthy pre-existing receipt (normal restart or
-                            // overlap with a live handle): read back and
-                            // validate identity; a match counts as rebuilt.
-                            Err(error) if is_already_exists(&error) => {
-                                match self.read_pending_for_bootstrap(&receipt) {
-                                    Ok(()) => rebuilt.push(record.request_id.clone()),
-                                    Err(WorkerError::Io(error))
-                                        if error.kind() != io::ErrorKind::InvalidData =>
-                                    {
-                                        return Err(WorkerError::Io(error));
-                                    }
-                                    Err(recheck) => {
-                                        corrupt.push(format!("{name}: {}", display_error(&recheck)))
-                                    }
-                                }
-                            }
-                            // Transient index-write failure for a VALID row:
-                            // not corruption. Propagate retryable I/O without
-                            // persisting the completed marker.
-                            Err(error) => return Err(error),
-                        }
+            match self.rebuild_bootstrap_row(&name, &mut after_open, &mut before_read) {
+                Ok(Some(request_id)) => rebuilt.push(request_id),
+                Ok(None) => {}
+                Err(BootstrapReadError::Corrupt(error)) => {
+                    corrupt.push(format!("{name}: {}", display_error(&error)));
+                }
+                Err(BootstrapReadError::Retryable(error)) => {
+                    if first_retryable.is_none() {
+                        first_retryable = Some(error);
                     }
                 }
-                Ok(None) => {}
-                // InvalidData is the rooted reader's size check; other I/O
-                // failures must never become permanent corruption evidence.
-                Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
-                    return Err(WorkerError::Io(error));
-                }
-                Err(error) => corrupt.push(format!("{name}: {}", display_error(&error))),
             }
+        }
+        // Healthy neighbors stay discoverable, but no completed marker may
+        // hide a row whose read or index write needs another tick.
+        if let Some(error) = first_retryable {
+            return Err(error);
         }
         rebuilt.sort();
         corrupt.sort();
@@ -776,7 +796,7 @@ impl ControllerStore {
             // Lost the marker race: return the WINNER's validated arrays,
             // never this process's partial ones. Invalid winner fails closed.
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                self.read_bootstrap_receipt()
+                self.read_bootstrap_receipt(&mut before_read)
             }
             Err(error) => Err(op_io("write-bootstrap", BOOTSTRAP_RECEIPT, error)),
         }
@@ -786,7 +806,10 @@ impl ControllerStore {
     /// entry path and the marker-race loser path. Invalid marker fails
     /// closed; it is never treated as success. Recheck only saved corrupt
     /// entries, leaving the winner's marker and rebuilt array untouched.
-    fn read_bootstrap_receipt(&self) -> Result<ActiveBootstrapReport, WorkerError> {
+    fn read_bootstrap_receipt(
+        &self,
+        before_read: &mut impl FnMut(&str) -> io::Result<()>,
+    ) -> Result<ActiveBootstrapReport, WorkerError> {
         let bytes = self
             .root
             .read_private_regular(BOOTSTRAP_RECEIPT, MAX_STORED_REQUEST_BYTES as u64)
@@ -801,7 +824,7 @@ impl ControllerStore {
         }
         let mut corrupt = Vec::new();
         for entry in receipt.corrupt {
-            if self.bootstrap_corruption_persists(&entry)? {
+            if self.bootstrap_corruption_persists(&entry, before_read) {
                 corrupt.push(entry);
             }
         }
@@ -818,58 +841,67 @@ impl ControllerStore {
         &self,
         name: &str,
         mut after_open: impl FnMut(),
-    ) -> Result<Option<DurableRequest>, WorkerError> {
+        mut before_read: impl FnMut(&str) -> io::Result<()>,
+    ) -> Result<Option<DurableRequest>, BootstrapReadError> {
         let mut attempts = 0;
         loop {
-            match self.read_record_with_hook(name, &mut after_open) {
-                Ok(record) => return Ok(Some(record)),
-                Err(WorkerError::Io(error))
+            let bytes = before_read(name).and_then(|()| {
+                self.root.read_private_regular_with_hook(
+                    name,
+                    MAX_STORED_REQUEST_BYTES as u64,
+                    &mut after_open,
+                )
+            });
+            match bytes {
+                Ok(bytes) => {
+                    ensure_stored_size(&bytes).map_err(BootstrapReadError::Corrupt)?;
+                    let record: DurableRequest = serde_json::from_slice(&bytes).map_err(|_| {
+                        BootstrapReadError::Corrupt(WorkerError::Protocol(
+                            "CONTROLLER_TRANSPORT: durable request is invalid".into(),
+                        ))
+                    })?;
+                    validate_record(name, &record).map_err(BootstrapReadError::Corrupt)?;
+                    return Ok(Some(record));
+                }
+                Err(error)
                     if error.kind() == io::ErrorKind::StaleNetworkFileHandle && attempts < 3 =>
                 {
                     self.root
                         .verify_bound()
-                        .map_err(|error| op_io("verify-root", name, error))?;
+                        .map_err(|error| BootstrapReadError::from_io("verify-root", name, error))?;
                     attempts += 1;
                     if !self
                         .root
                         .entry_exists(name)
-                        .map_err(|error| op_io("probe-row", name, error))?
+                        .map_err(|error| BootstrapReadError::from_io("probe-row", name, error))?
                     {
                         return Ok(None);
                     }
                 }
-                Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     // A missing row is harmless; a missing/replaced root is
                     // not. Verify the bound object before skipping the row.
                     self.root
                         .verify_bound()
-                        .map_err(|error| op_io("verify-root", name, error))?;
+                        .map_err(|error| BootstrapReadError::from_io("verify-root", name, error))?;
                     return Ok(None);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(BootstrapReadError::from_io("read-row", name, error)),
             }
         }
     }
 
-    fn bootstrap_corruption_persists(&self, entry: &str) -> Result<bool, WorkerError> {
-        let Some((name, _)) = entry.split_once(": ") else {
-            return Ok(true);
-        };
-        // Legacy evidence is text, not authority to read arbitrary paths.
-        // Unrecognized entries remain reported without following them.
-        if !name.starts_with("req-") || !name.ends_with(".json") || name.contains(['/', '\0']) {
-            return Ok(true);
-        }
-        let record = match self.read_bootstrap_row(name, || {}) {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(false),
-            Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
-                return Err(WorkerError::Io(error));
-            }
-            Err(_) => return Ok(true),
+    fn rebuild_bootstrap_row(
+        &self,
+        name: &str,
+        after_open: &mut impl FnMut(),
+        before_read: &mut impl FnMut(&str) -> io::Result<()>,
+    ) -> Result<Option<String>, BootstrapReadError> {
+        let Some(record) = self.read_bootstrap_row(name, after_open, &mut *before_read)? else {
+            return Ok(None);
         };
         if record.phase != RequestPhase::Published {
-            return Ok(false);
+            return Ok(None);
         }
         let receipt = PendingReceipt {
             request_id: record.request_id.clone(),
@@ -877,30 +909,64 @@ impl ControllerStore {
             command: record.command.clone(),
             created_at_millis: record.created_at_millis,
         };
-        // A repaired legacy row still needs discoverability. Never hide a
-        // pending receipt mismatch just because its request row validates.
         match self.write_pending_receipt(&receipt) {
-            Ok(()) => Ok(false),
+            Ok(()) => {}
+            // A matching pre-existing receipt is rebuilt, never overwritten.
             Err(error) if is_already_exists(&error) => {
-                match self.read_pending_for_bootstrap(&receipt) {
-                    Ok(()) => Ok(false),
-                    Err(WorkerError::Io(error)) if error.kind() != io::ErrorKind::InvalidData => {
-                        Err(WorkerError::Io(error))
-                    }
-                    Err(_) => Ok(true),
-                }
+                self.read_pending_for_bootstrap(&receipt, before_read)?;
             }
-            Err(error) => Err(error),
+            // A failed index write for a valid row stays retryable as before.
+            Err(error) => return Err(BootstrapReadError::Retryable(error)),
         }
+        Ok(Some(record.request_id))
+    }
+
+    fn bootstrap_corruption_persists(
+        &self,
+        entry: &str,
+        before_read: &mut impl FnMut(&str) -> io::Result<()>,
+    ) -> bool {
+        let Some((name, _)) = entry.split_once(": ") else {
+            return true;
+        };
+        // Legacy evidence is text, not authority to read arbitrary paths.
+        // Unrecognized entries remain reported without following them.
+        if !name.starts_with("req-") || !name.ends_with(".json") || name.contains(['/', '\0']) {
+            return true;
+        }
+        // Failed re-verification is still evidence, never a whole-report
+        // failure. Healthy repaired published rows regain discoverability.
+        self.rebuild_bootstrap_row(name, &mut || {}, before_read)
+            .is_err()
     }
 
     /// Read-back validation for a pre-existing pending receipt during
     /// bootstrap: the stored identity must match the row being indexed.
     /// A mismatch/malformed receipt is honestly rejected, never overwritten
     /// or silently accepted.
-    fn read_pending_for_bootstrap(&self, expected: &PendingReceipt) -> Result<(), WorkerError> {
-        let name = active_file_name(&expected.request_id)?;
-        let existing = self.read_pending(&name)?;
+    fn read_pending_for_bootstrap(
+        &self,
+        expected: &PendingReceipt,
+        before_read: &mut impl FnMut(&str) -> io::Result<()>,
+    ) -> Result<(), BootstrapReadError> {
+        let name = active_file_name(&expected.request_id).map_err(BootstrapReadError::Corrupt)?;
+        let bytes = before_read(&format!("{ACTIVE_DIR}/{name}"))
+            .and_then(|()| {
+                self.active
+                    .read_private_regular(&name, MAX_STORED_REQUEST_BYTES as u64)
+            })
+            .map_err(|error| BootstrapReadError::from_io("read-receipt", &name, error))?;
+        ensure_stored_size(&bytes).map_err(BootstrapReadError::Corrupt)?;
+        let existing: PendingReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+            BootstrapReadError::Corrupt(WorkerError::Protocol(
+                "CONTROLLER_TRANSPORT: pending receipt is invalid".into(),
+            ))
+        })?;
+        if active_file_name(&existing.request_id).map_err(BootstrapReadError::Corrupt)? != name {
+            return Err(BootstrapReadError::Corrupt(WorkerError::Protocol(
+                "CONTROLLER_TRANSPORT: pending receipt id does not match its filename".into(),
+            )));
+        }
         check_replay_by_parts(
             &existing.request_id,
             &existing.payload_sha256,
@@ -909,6 +975,7 @@ impl ControllerStore {
             &expected.payload_sha256,
             &expected.command,
         )
+        .map_err(BootstrapReadError::Corrupt)
     }
 
     /// Legacy full-history resume. Kept for compat/tests; the leader tick
@@ -1846,6 +1913,51 @@ mod tests {
         assert!(!retry.already_bootstrapped);
         assert!(retry.corrupt.is_empty());
         assert_eq!(retry.rebuilt, vec![request.request_id().to_owned()]);
+    }
+
+    #[test]
+    fn bootstrap_classifies_original_io_errors_before_wrapping() {
+        for raw_errno in [true, false] {
+            for (errno, corruption) in [
+                (libc::EACCES, true),
+                (libc::EPERM, true),
+                (libc::EXDEV, true),
+                (libc::EINVAL, true),
+                (libc::ELOOP, true),
+                (libc::ENOTDIR, true),
+                (libc::EISDIR, true),
+                (libc::ESTALE, false),
+                (libc::EINTR, false),
+                (libc::EAGAIN, false),
+                (libc::ETIMEDOUT, false),
+                (libc::EBUSY, false),
+                (libc::ENOSPC, false),
+                (libc::ENOMEM, false),
+                (libc::EIO, false),
+                (libc::EMFILE, false),
+                (libc::ENFILE, false),
+                (32767, false),
+            ] {
+                let (_temp, store, _request, _bytes) = bootstrap_row_fixture();
+                let result = store.bootstrap_active_index_with_read_hook(|_| {
+                    let error = io::Error::from_raw_os_error(errno);
+                    Err(if raw_errno {
+                        error
+                    } else {
+                        io::Error::new(error.kind(), "injected read error")
+                    })
+                });
+                if corruption {
+                    let report = result.unwrap_or_else(|error| panic!("errno {errno}: {error}"));
+                    assert_eq!(report.corrupt.len(), 1, "errno {errno}");
+                    assert!(report.corrupt[0].contains(": IO: I/O error:"));
+                    assert!(store.root.entry_exists(BOOTSTRAP_RECEIPT).unwrap());
+                } else {
+                    assert_eq!(result.unwrap_err().public_code(), "IO", "errno {errno}");
+                    assert!(!store.root.entry_exists(BOOTSTRAP_RECEIPT).unwrap());
+                }
+            }
+        }
     }
 
     #[test]

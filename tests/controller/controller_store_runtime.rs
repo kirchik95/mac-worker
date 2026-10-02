@@ -606,13 +606,6 @@ fn idle_tick_never_reads_poisoned_retired_history() {
     // A history-scanning tick would choke; the index tick must stay idle-clean.
     std::fs::write(state.join(format!("req-{ID_A}.json")), b"{broken").unwrap();
     std::fs::write(state.join("req-deadbeef.json"), b"{broken").unwrap();
-    // Keep the garbage row private so bootstrap observes its bad JSON,
-    // rather than an unrelated retryable permission failure.
-    std::fs::set_permissions(
-        state.join("req-deadbeef.json"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
     let store = ControllerStore::open(&state).unwrap();
     let bootstrap = store.bootstrap_active_index().unwrap();
     assert!(!bootstrap.already_bootstrapped);
@@ -1091,14 +1084,15 @@ fn bootstrap_row_io_error_leaves_no_marker_for_retry() {
             ControllerFault::StopAfterPublish,
         )
         .unwrap();
-    let row = state.join(format!("req-{ID_A}.json"));
-    std::fs::set_permissions(&row, std::fs::Permissions::from_mode(0o640)).unwrap();
-
-    let error = store.bootstrap_active_index().unwrap_err();
+    let error = store
+        .bootstrap_active_index_with_read_hook(|name| {
+            assert_eq!(name, format!("req-{ID_A}.json"));
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        })
+        .unwrap_err();
     assert!(matches!(error, WorkerError::Io(error)
-        if error.kind() == std::io::ErrorKind::PermissionDenied));
+        if error.kind() == std::io::ErrorKind::Interrupted));
     assert!(!state.join("active-index-bootstrap-v1.json").exists());
-    std::fs::set_permissions(&row, std::fs::Permissions::from_mode(0o600)).unwrap();
     let retry = store.bootstrap_active_index().unwrap();
     assert!(!retry.already_bootstrapped);
     assert!(retry.corrupt.is_empty());
@@ -1117,19 +1111,177 @@ fn bootstrap_pending_receipt_io_error_leaves_no_marker_for_retry() {
             ControllerFault::StopAfterPublish,
         )
         .unwrap();
-    let pending = state.join("active").join(format!("{ID_A}.json"));
-    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o640)).unwrap();
-
-    assert!(matches!(
-        store.bootstrap_active_index().unwrap_err(),
-        WorkerError::Io(_)
-    ));
+    store
+        .handle_with(
+            &checkpoint_request(ID_B),
+            &executor,
+            ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    let neighbor = state.join("active").join(format!("{ID_B}.json"));
+    std::fs::remove_file(&neighbor).unwrap();
+    let error = store
+        .bootstrap_active_index_with_read_hook(|name| {
+            if name == format!("active/{ID_A}.json") {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(error, WorkerError::Io(_)));
     assert!(!state.join("active-index-bootstrap-v1.json").exists());
-    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        neighbor.exists(),
+        "a pending read failure must not starve later rows"
+    );
     let retry = store.bootstrap_active_index().unwrap();
     assert!(!retry.already_bootstrapped);
     assert!(retry.corrupt.is_empty());
-    assert_eq!(retry.rebuilt, vec![ID_A.to_owned()]);
+    assert_eq!(retry.rebuilt, vec![ID_A.to_owned(), ID_B.to_owned()]);
+}
+
+#[test]
+fn bootstrap_unsafe_rows_are_corrupt_and_later_work_is_rebuilt() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state, store) = open_store(&temp);
+    let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+    for id in [ID_A, ID_B, ID_C] {
+        store
+            .handle_with(
+                &checkpoint_request(id),
+                &executor,
+                ControllerFault::StopAfterPublish,
+            )
+            .unwrap();
+        std::fs::remove_file(state.join("active").join(format!("{id}.json"))).unwrap();
+    }
+    std::fs::set_permissions(
+        state.join(format!("req-{ID_A}.json")),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    let symlink_row = state.join(format!("req-{ID_B}.json"));
+    let target = temp.path().join("symlink-target.json");
+    std::fs::rename(&symlink_row, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &symlink_row).unwrap();
+
+    let first = store.bootstrap_active_index().unwrap();
+    assert_eq!(first.rebuilt, vec![ID_C.to_owned()]);
+    assert_eq!(first.corrupt.len(), 2);
+    assert!(first.corrupt[0].starts_with(&format!("req-{ID_A}.json: IO: ")));
+    assert!(first.corrupt[1].starts_with(&format!("req-{ID_B}.json: IO: ")));
+    assert!(state.join("active-index-bootstrap-v1.json").exists());
+    assert!(state.join("active").join(format!("{ID_C}.json")).exists());
+    assert_eq!(
+        store.bootstrap_active_index().unwrap().corrupt,
+        first.corrupt
+    );
+    let mut health = ControllerHealth::new(
+        ProcessIdentity::new(crate::fixture_pid::fixture_pid(42), 1).unwrap(),
+        100,
+    );
+    let report = finish_bootstrap_health_tick(&store, &executor, &mut health, 200);
+    assert_eq!(report.requests.bootstrap.unwrap().corrupt, first.corrupt);
+    assert_eq!(health.last_tick_failures["CONTROLLER_TRANSPORT"].count, 2);
+    assert_eq!(report.requests.resume.unwrap().completed.len(), 1);
+    assert_eq!(executor.calls_for(ID_A), 0);
+    assert_eq!(executor.calls_for(ID_B), 0);
+    assert_eq!(executor.calls_for(ID_C), 1);
+}
+
+#[test]
+fn bootstrap_transient_row_error_rebuilds_neighbors_before_retry() {
+    for second_fault in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+        for id in [ID_A, ID_B, ID_C] {
+            store
+                .handle_with(
+                    &checkpoint_request(id),
+                    &executor,
+                    ControllerFault::StopAfterPublish,
+                )
+                .unwrap();
+            std::fs::remove_file(state.join("active").join(format!("{id}.json"))).unwrap();
+        }
+        let error = store
+            .bootstrap_active_index_with_read_hook(|name| {
+                if name == format!("req-{ID_A}.json") {
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                } else if second_fault && name == format!("req-{ID_B}.json") {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error, WorkerError::Io(error)
+        if error.kind() == std::io::Error::from_raw_os_error(libc::EIO).kind()));
+        assert!(!state.join("active-index-bootstrap-v1.json").exists());
+        assert!(!state.join("active").join(format!("{ID_A}.json")).exists());
+        for id in [ID_B, ID_C] {
+            assert_eq!(
+                state.join("active").join(format!("{id}.json")).exists(),
+                id == ID_C || !second_fault,
+            );
+        }
+
+        let retry = store.bootstrap_active_index().unwrap();
+        assert!(!retry.already_bootstrapped);
+        assert_eq!(
+            retry.rebuilt,
+            vec![ID_A.to_owned(), ID_B.to_owned(), ID_C.to_owned()]
+        );
+        assert!(retry.corrupt.is_empty());
+        assert!(state.join("active-index-bootstrap-v1.json").exists());
+    }
+}
+
+#[test]
+fn bootstrap_reverification_error_keeps_evidence_and_rechecks_neighbors() {
+    for failing_read in [format!("req-{ID_A}.json"), format!("active/{ID_A}.json")] {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, store) = open_store(&temp);
+        let executor = KernelTestExecutor::checkpoint(json!({"n": 1}));
+        let mut healthy = Vec::new();
+        for id in [ID_A, ID_B] {
+            store
+                .handle_with(
+                    &checkpoint_request(id),
+                    &executor,
+                    ControllerFault::StopAfterPublish,
+                )
+                .unwrap();
+            let row = state.join(format!("req-{id}.json"));
+            healthy.push((row.clone(), std::fs::read(&row).unwrap()));
+            std::fs::write(&row, b"{broken").unwrap();
+        }
+        std::fs::remove_file(state.join("active").join(format!("{ID_B}.json"))).unwrap();
+        let first = store.bootstrap_active_index().unwrap();
+        assert_eq!(first.corrupt.len(), 2);
+        let marker = state.join("active-index-bootstrap-v1.json");
+        let evidence = std::fs::read(&marker).unwrap();
+        for (row, bytes) in healthy {
+            std::fs::write(row, bytes).unwrap();
+        }
+
+        let report = store
+            .bootstrap_active_index_with_read_hook(|name| {
+                if name == failing_read {
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert!(report.already_bootstrapped);
+        assert_eq!(report.corrupt, vec![first.corrupt[0].clone()]);
+        assert!(state.join("active").join(format!("{ID_B}.json")).exists());
+        assert_eq!(std::fs::read(marker).unwrap(), evidence);
+        assert!(store.bootstrap_active_index().unwrap().corrupt.is_empty());
+    }
 }
 
 fn finish_bootstrap_health_tick(
