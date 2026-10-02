@@ -15,4 +15,7 @@ mod legacy_archive;
 mod process_runner;
 mod redaction;
 mod rooted_fs;
+mod session_place_claude;
+mod session_place_codex;
+mod session_prepare;
 mod supervisor;

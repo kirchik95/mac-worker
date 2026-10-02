@@ -49,6 +49,7 @@ mod controller_retry;
 mod controller_say_interrupt;
 mod controller_say_wait_exit;
 mod controller_service;
+mod controller_session_transfer;
 mod controller_socket_benchmark;
 mod controller_socket_client;
 mod controller_socket_codec;
