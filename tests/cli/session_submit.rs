@@ -486,20 +486,37 @@ fn session_submit_help_explains_selector() {
 #[test]
 fn batch_and_project_defaults_reject_session_keys() {
     for key in ["from_session", "session_import"] {
-        for section in [
-            "",
-            "[defaults]\n",
-            "[[tasks]]\nname = 'one'\nprompt = 'continue'\n",
+        for (prefix, suffix) in [
+            (
+                "version = 1\n",
+                "[[tasks]]\nid = 'one'\nprompt = 'continue'\n",
+            ),
+            (
+                "version = 1\n[defaults]\n",
+                "[[tasks]]\nid = 'one'\nprompt = 'continue'\n",
+            ),
+            (
+                "version = 1\n[[tasks]]\nid = 'one'\nprompt = 'continue'\n",
+                "",
+            ),
         ] {
-            let text = format!("version = 1\n{section}{key} = 'claude'\n");
-            assert!(toml::from_str::<BatchFile>(&text).is_err(), "{text}");
+            let control = format!("{prefix}{suffix}");
+            toml::from_str::<BatchFile>(&control).expect("sessionless control must be valid");
+            let text = format!("{prefix}{key} = 'claude'\n{suffix}");
+            let error = toml::from_str::<BatchFile>(&text).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
         }
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join(".worker.toml"),
-            format!("[task]\n{key} = 'claude'\n"),
-        )
-        .unwrap();
-        assert!(ProjectSettings::load(temp.path(), &[]).is_err());
+        let path = temp.path().join(".worker.toml");
+        std::fs::write(&path, "[task]\n").unwrap();
+        ProjectSettings::load(temp.path(), &[]).expect("sessionless project control must be valid");
+        std::fs::write(&path, format!("[task]\n{key} = 'claude'\n")).unwrap();
+        let error = ProjectSettings::load(temp.path(), &[]).unwrap_err();
+        assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
     }
 }
