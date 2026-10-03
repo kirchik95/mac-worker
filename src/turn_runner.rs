@@ -659,15 +659,22 @@ impl<'a> TurnRunner<'a> {
                 coordinator,
                 task_id,
             )?;
-        } else if result.is_ok() {
-            crate::integration::runner::recover_selected(
+        } else if result.is_ok()
+            && let Err(error) = crate::integration::runner::recover_selected(
                 self.runner,
                 self.config,
                 self.paths,
                 self.client_state,
                 self.executor,
                 &[task_id],
-            )?;
+            )
+        {
+            // The ordinary result is already imported and retired. Deferred
+            // integration recovery must not rewrite its successful exit.
+            eprintln!(
+                "warning: integration recovery deferred [{}]",
+                error.public_code()
+            );
         }
         result
     }
