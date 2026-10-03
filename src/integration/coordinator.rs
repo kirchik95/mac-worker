@@ -277,6 +277,24 @@ impl<'a> IntegrationCoordinator<'a> {
         }
         Ok(())
     }
+    fn release_failed_phase(
+        &self,
+        task: TaskId,
+        reservation: &TargetReservation,
+    ) -> Result<(), WorkerError> {
+        self.state.release(reservation)?;
+        // An application can fail after changing its local copy or losing CAS.
+        // Clear only our durable ownership; never publish that partial copy.
+        if let Some(mut current) = self.state.load(task)?
+            && current.snapshot.integration_id == reservation.integration_id
+            && current.snapshot.epoch == reservation.epoch
+            && current.actor == Some(reservation.actor)
+        {
+            current.actor = None;
+            self.save(&mut current)?;
+        }
+        Ok(())
+    }
     fn park(
         &self,
         record: &mut IntegrationRecord,
@@ -756,36 +774,43 @@ impl<'a> IntegrationCoordinator<'a> {
         }
         let response = self.host.execute(&request);
         // Reservation remains durable on a process crash, and only confirmed absence reclaims it.
-        match response {
-            Ok(response) => {
-                response.validate_for(&request)?;
-                if step == IntegrationStep::Fetch {
-                    self.runtime.reach(IntegrationHook::AfterFetchBeforePin);
+        let applied = (|| {
+            match response {
+                Ok(response) => {
+                    response.validate_for(&request)?;
+                    if step == IntegrationStep::Fetch {
+                        self.runtime.reach(IntegrationHook::AfterFetchBeforePin);
+                    }
+                    if step == IntegrationStep::Build {
+                        self.runtime.reach(IntegrationHook::AfterCommitBeforePin);
+                    }
+                    if step == IntegrationStep::Push {
+                        self.runtime.reach(IntegrationHook::AfterPushBeforeReceipt);
+                    }
+                    self.apply_response(&mut record, step, response)?;
                 }
-                if step == IntegrationStep::Build {
-                    self.runtime.reach(IntegrationHook::AfterCommitBeforePin);
+                Err(error) => {
+                    let code = match error.public_code().as_str() {
+                        "INTEGRATION_UNAVAILABLE" => IntegrationCode::IntegrationUnavailable,
+                        "INTEGRATION_WORKER_OFFLINE" => IntegrationCode::IntegrationWorkerOffline,
+                        "INTEGRATION_NETWORK" => IntegrationCode::IntegrationNetwork,
+                        _ => IntegrationCode::IntegrationStateInvalid,
+                    };
+                    // Consult effective pause evidence before retry/timeout spending.
+                    if let IntegrationDriveAdmission::Park(pause) =
+                        self.runtime.begin_phase(&self.key(&record, phase))?
+                    {
+                        self.park(&mut record, pause)?;
+                    } else {
+                        self.retry(&mut record, phase, code)?;
+                    }
                 }
-                if step == IntegrationStep::Push {
-                    self.runtime.reach(IntegrationHook::AfterPushBeforeReceipt);
-                }
-                self.apply_response(&mut record, step, response)?;
             }
-            Err(error) => {
-                let code = match error.public_code().as_str() {
-                    "INTEGRATION_UNAVAILABLE" => IntegrationCode::IntegrationUnavailable,
-                    "INTEGRATION_WORKER_OFFLINE" => IntegrationCode::IntegrationWorkerOffline,
-                    "INTEGRATION_NETWORK" => IntegrationCode::IntegrationNetwork,
-                    _ => IntegrationCode::IntegrationStateInvalid,
-                };
-                // Consult effective pause evidence before retry/timeout spending.
-                if let IntegrationDriveAdmission::Park(pause) =
-                    self.runtime.begin_phase(&self.key(&record, phase))?
-                {
-                    self.park(&mut record, pause)?;
-                } else {
-                    self.retry(&mut record, phase, code)?;
-                }
-            }
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            self.release_failed_phase(record.task_id, &reservation)?;
+            return Err(error);
         }
         if record.actor.is_some() {
             self.release(&mut record)?;
@@ -811,11 +836,15 @@ impl<'a> IntegrationCoordinator<'a> {
     ) -> Result<(), WorkerError> {
         if candidate.source_head != record.snapshot.source_head
             || candidate.identity != record.git_identity
-            || candidate.id.attempt != record.snapshot.attempts
+            || candidate.id.integration_id != record.snapshot.integration_id
+            || candidate.id.epoch != record.snapshot.epoch
         {
             return Err(IntegrationCode::IntegrationStateInvalid.error());
         }
         if let Some(old) = record.candidates.iter_mut().find(|c| c.id == candidate.id) {
+            if candidate.id.attempt != record.snapshot.attempts {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
             let mut completed = old.clone();
             if completed.tree_oid.is_none() {
                 completed.tree_oid = candidate.tree_oid.clone();
@@ -828,13 +857,35 @@ impl<'a> IntegrationCoordinator<'a> {
             }
             *old = candidate;
         } else {
+            if candidate.id.attempt < record.snapshot.attempts
+                || record
+                    .candidates
+                    .iter()
+                    .any(|old| old.id.attempt >= candidate.id.attempt)
+            {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
             if record.candidates.len() >= MAX_CANDIDATES {
                 return Err(IntegrationCode::IntegrationTargetMovedExhausted.error());
+            }
+            if candidate.id.attempt > record.snapshot.attempts {
+                Self::invalidate_candidate(record, candidate.id.attempt);
             }
             record.candidates.push(candidate);
         }
         self.runtime.reach(IntegrationHook::AfterTargetPin);
         Ok(())
+    }
+    fn invalidate_candidate(record: &mut IntegrationRecord, attempt: u8) {
+        record.snapshot.attempts = attempt;
+        record.snapshot.state = IntegrationStatus::Fetching;
+        record.snapshot.merge_oid = None;
+        record.snapshot.observed_target_oid = None;
+        record.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
+        record.phase_retries.clear();
+        record.push_intent = None;
+        record.admission_deadline_millis = None;
+        record.remaining_admission_millis = None;
     }
     fn apply_response(
         &self,
@@ -891,15 +942,7 @@ impl<'a> IntegrationCoordinator<'a> {
                 if record.snapshot.attempts as usize >= MAX_CANDIDATES {
                     return self.block(record, IntegrationCode::IntegrationTargetMovedExhausted);
                 }
-                record.snapshot.attempts += 1;
-                record.snapshot.state = IntegrationStatus::Fetching;
-                record.snapshot.merge_oid = None;
-                record.snapshot.observed_target_oid = None;
-                record.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
-                record.phase_retries.clear();
-                record.push_intent = None;
-                record.admission_deadline_millis = None;
-                record.remaining_admission_millis = None;
+                Self::invalidate_candidate(record, record.snapshot.attempts + 1);
                 self.save(record)?;
             }
             HostIntegrationResponse::Integrated { receipt, .. } => {

@@ -1,5 +1,338 @@
 use mac_worker::test_support::integration::*;
 
+pub(crate) mod native_owner {
+    use super::*;
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::process::SystemProcessRunner,
+        task::{model::LocalTaskRecord, store::TaskStore},
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    pub fn observed(f: &GitIntegrationFixture) -> IntegrationTaskFacts {
+        let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+        let ordinary = LocalTaskRecord::new(
+            tasks
+                .load_meta(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            tasks
+                .load_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            Some(1001),
+            None,
+            Some(f.record.snapshot.source_head.clone()),
+            "c".repeat(64),
+            Some("fixture-worker".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        IntegrationTaskFacts::from_record(&ordinary, false)
+    }
+
+    pub fn state(f: &GitIntegrationFixture) -> MemoryIntegrationState {
+        let state = MemoryIntegrationState::default();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        state
+    }
+
+    pub struct Host<'a> {
+        service: HostIntegrationService<'a>,
+        lost_fetches: AtomicUsize,
+        pub calls: Mutex<Vec<IntegrationStep>>,
+    }
+    impl<'a> Host<'a> {
+        pub fn new(f: &'a GitIntegrationFixture, lost_fetches: usize) -> Self {
+            Self {
+                service: HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime),
+                lost_fetches: AtomicUsize::new(lost_fetches),
+                calls: Mutex::new(vec![]),
+            }
+        }
+    }
+    impl IntegrationHost for Host<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            if let HostIntegrationAction::Step { step, .. } = request.action {
+                self.calls.lock().unwrap().push(step);
+            }
+            let response = self.service.execute(request)?;
+            if matches!(
+                request.action,
+                HostIntegrationAction::Step {
+                    step: IntegrationStep::Fetch,
+                    ..
+                }
+            ) && self
+                .lost_fetches
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(IntegrationCode::IntegrationNetwork.error());
+            }
+            Ok(response)
+        }
+    }
+
+    pub fn assert_released(f: &GitIntegrationFixture, state: &MemoryIntegrationState) {
+        let record = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(record.actor, None);
+        let other = IntegrationId::derive(
+            mac_worker::test_support::task::model::TaskId::generate(),
+            record.snapshot.source_turn_id,
+            &record.snapshot.source_head,
+            &record.target_key,
+        )
+        .unwrap();
+        let reservation = state
+            .reserve(
+                &record.target_key,
+                other,
+                0,
+                ProcessIdentity::new(5_001_000, 999).unwrap(),
+            )
+            .unwrap();
+        let reservation = reservation
+            .expect("an error must leave the target available to a different integration");
+        state.release(&reservation).unwrap();
+    }
+
+    pub fn queued(
+        coordinator: &IntegrationCoordinator<'_>,
+        state: &MemoryIntegrationState,
+        task: mac_worker::test_support::task::model::TaskId,
+    ) -> mac_worker::test_support::task::model::TurnId {
+        for _ in 0..8 {
+            coordinator.drive_once(task).unwrap();
+            let record = state.load(task).unwrap().unwrap();
+            assert!(
+                !matches!(
+                    record.snapshot.state,
+                    IntegrationStatus::Blocked | IntegrationStatus::Integrated
+                ),
+                "{:?}",
+                record.snapshot
+            );
+            if let Some(auxiliary) = record.auxiliaries.last()
+                && auxiliary.queue_position.is_some()
+                && !auxiliary.completed
+            {
+                return auxiliary.turn_id;
+            }
+        }
+        panic!("native host did not request an auxiliary");
+    }
+
+    pub fn complete(
+        f: &GitIntegrationFixture,
+        state: &MemoryIntegrationState,
+        turns: &FakeIntegrationTurns,
+        observer: &FakeIntegrationObserver,
+        turn: mac_worker::test_support::task::model::TurnId,
+    ) {
+        use mac_worker::test_support::task::model::{
+            TaskOutcome, TaskStatus, TurnSummary, TurnTerminal,
+        };
+        let prepared = state
+            .load_prepared(f.record.task_id, turn)
+            .unwrap()
+            .unwrap();
+        // Simulate the completed agent handoff inside this disposable host task.
+        // Use the owner's exact payload, not a separately prepared host fixture.
+        use std::os::unix::fs::PermissionsExt;
+        let task = f.workspace().parent().unwrap();
+        let preparation = task.join("integration").join(format!("turn-{turn}.json"));
+        std::fs::write(&preparation, encode_prepared_turn(&prepared).unwrap()).unwrap();
+        std::fs::set_permissions(&preparation, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut facts = observed(f);
+        let mut wire = serde_json::to_value(facts.ordinary.status()).unwrap();
+        wire["turns"].as_array_mut().unwrap().push(
+            serde_json::to_value(TurnSummary::new(
+                prepared.followup.turn_number(),
+                turn,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(false),
+                false,
+                Some(1002),
+                Some(1003),
+            ))
+            .unwrap(),
+        );
+        let status: TaskStatus = serde_json::from_value(wire).unwrap();
+        std::fs::write(
+            task.join("status.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        facts.ordinary = facts.ordinary.with_status(status).unwrap();
+        facts.auxiliary_purpose = Some(prepared.purpose);
+        observer.insert(facts);
+        turns
+            .set_observation(IntegrationTurnObservation {
+                turn_id: turn,
+                queue_position: turns.queue_position(turn),
+                accepted: true,
+                completed: true,
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn review_native_lost_fetch_and_target_move_accept_the_new_candidate() {
+    use native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 1);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        coordinator.drive_once(f.record.task_id).unwrap().state,
+        IntegrationStatus::RetryWait
+    );
+    let target = f.advance_target();
+    f.runtime.advance(std::time::Duration::from_secs(2));
+    let snapshot = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(snapshot.attempts, 2);
+    assert_eq!(snapshot.state, IntegrationStatus::CommitReady);
+    let record = state.load(f.record.task_id).unwrap().unwrap();
+    assert_eq!(record.candidates.len(), 1);
+    assert_eq!(record.candidates[0].target_head, target);
+    assert_eq!(record.candidates[0].id.attempt, 2);
+    assert_released(&f, &state);
+    let completed = IntegrationRunner::new(coordinator)
+        .run(f.record.task_id)
+        .unwrap();
+    assert_eq!(completed.state, IntegrationStatus::Integrated);
+    assert_eq!(turns.imports(f.record.task_id).len(), 1);
+}
+
+#[test]
+fn review_native_two_lost_candidates_spend_the_three_candidate_cap() {
+    use native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 2);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        coordinator.drive_once(f.record.task_id).unwrap().state,
+        IntegrationStatus::RetryWait
+    );
+    f.advance_target_with("target.txt", b"second\n");
+    f.runtime.advance(std::time::Duration::from_secs(2));
+    assert_eq!(
+        coordinator.drive_once(f.record.task_id).unwrap().state,
+        IntegrationStatus::RetryWait
+    );
+    f.advance_target_with("target.txt", b"third\n");
+    f.runtime.advance(std::time::Duration::from_secs(10));
+    assert_eq!(
+        coordinator.drive_once(f.record.task_id).unwrap().attempts,
+        3
+    );
+    let target = f.advance_target_with("target.txt", b"fourth\n");
+    let snapshot = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(snapshot.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        snapshot.blocked_code,
+        Some(IntegrationCode::IntegrationTargetMovedExhausted)
+    );
+    assert_eq!(snapshot.attempts, 3);
+    assert_eq!(f.origin_tip(), target);
+    assert_released(&f, &state);
+}
+
+#[test]
+fn review_native_invalid_replies_release_the_target_on_validation_and_application_errors() {
+    use mac_worker::test_support::core::error::WorkerError;
+    use native_owner::*;
+    struct Corrupt<'a> {
+        host: Host<'a>,
+    }
+    impl IntegrationHost for Corrupt<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            let mut response = self.host.execute(request)?;
+            match &mut response {
+                HostIntegrationResponse::CandidateReady { candidate, .. } => {
+                    candidate.identity = mac_worker::test_support::task::model::GitIdentity::new(
+                        "different identity",
+                        candidate.identity.email(),
+                    )
+                    .unwrap()
+                }
+                HostIntegrationResponse::NeedTurn { candidate, .. } => {
+                    candidate.identity = mac_worker::test_support::task::model::GitIdentity::new(
+                        "different identity",
+                        candidate.identity.email(),
+                    )
+                    .unwrap()
+                }
+                _ => panic!("expected native candidate"),
+            }
+            Ok(response)
+        }
+    }
+    for conflict in [false, true] {
+        let mut f = GitIntegrationFixture::new();
+        f.write("payload.txt", b"base\n");
+        f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        f.commit_task();
+        if conflict {
+            f.advance_target_with("payload.txt", b"theirs\n");
+        }
+        let state = state(&f);
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(observed(&f));
+        let turns = FakeIntegrationTurns::default();
+        let host = Corrupt {
+            host: Host::new(&f, 0),
+        };
+        let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+        assert_eq!(
+            coordinator
+                .drive_once(f.record.task_id)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        assert_released(&f, &state);
+        assert!(
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+}
+
 #[test]
 fn fixture_keeps_imported_result_through_partial_close_replay() {
     let f = IntegrationFixture::new();
