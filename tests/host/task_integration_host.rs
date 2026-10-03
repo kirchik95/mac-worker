@@ -252,7 +252,7 @@ fn closed_uncertain_fixture(
     let oid = match target {
         "merge" => Some(merge.as_str()),
         "source" => Some(f.record.snapshot.source_head.as_str()),
-        "neither" => None,
+        "neither" | "missing" => None,
         _ => panic!("unknown fixture target"),
     };
     if let Some(oid) = oid {
@@ -267,6 +267,19 @@ fn closed_uncertain_fixture(
             "push",
             &f.record.policy.origin,
             &format!("{oid}:refs/heads/main"),
+        ]);
+    } else if target == "missing" {
+        let mirror = f
+            .store
+            .mirror_if_present(&f.record.policy.project_id)
+            .unwrap()
+            .unwrap();
+        f.git(&[
+            "-C",
+            mirror.path().to_str().unwrap(),
+            "push",
+            &f.record.policy.origin,
+            ":refs/heads/main",
         ]);
     }
     f.record.snapshot.state = IntegrationStatus::Pushing;
@@ -375,17 +388,21 @@ fn closed_repair_settles_only_the_source_with_an_already_integrated_receipt() {
 
 #[test]
 fn closed_repair_blocks_when_neither_retained_merge_nor_source_is_on_origin() {
-    let (f, _) = closed_uncertain_fixture("neither");
-    let before = f.origin_tip();
-    assert!(matches!(
-        closed_repair(&f, &RecoveryRunner::default()).unwrap(),
-        HostIntegrationResponse::Blocked {
-            code: IntegrationCode::IntegrationWorkspaceMissing,
-            ..
+    for target in ["neither", "missing"] {
+        let (f, _) = closed_uncertain_fixture(target);
+        let before = (target == "neither").then(|| f.origin_tip());
+        assert!(matches!(
+            closed_repair(&f, &RecoveryRunner::default()).unwrap(),
+            HostIntegrationResponse::Blocked {
+                code: IntegrationCode::IntegrationWorkspaceMissing,
+                ..
+            }
+        ));
+        assert!(host_record(&f).receipt.is_none());
+        if let Some(before) = before {
+            assert_eq!(f.origin_tip(), before);
         }
-    ));
-    assert!(host_record(&f).receipt.is_none());
-    assert_eq!(f.origin_tip(), before);
+    }
 }
 
 #[test]

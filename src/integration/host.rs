@@ -568,7 +568,17 @@ impl<'a> HostIntegrationService<'a> {
                     }
                     IntegrationStep::Repair => {
                         if next.receipt.is_none() {
-                            next.receipt = git.settle(&next)?;
+                            next.receipt = match git.settle(&next) {
+                                Err(error)
+                                    if status.state() == TaskState::Closed
+                                        && error.public_code()
+                                            == IntegrationCode::IntegrationTargetMissing
+                                                .as_str() =>
+                                {
+                                    None
+                                }
+                                result => result?,
+                            };
                         }
                         if next.receipt.is_none() && status.state() == TaskState::Closed {
                             next.snapshot.state = IntegrationStatus::Blocked;
