@@ -629,6 +629,11 @@ impl<'a> HostGc<'a> {
         live_lease_jobs: &HashSet<JobId>,
         now_millis: u64,
     ) -> Result<bool, WorkerError> {
+        if crate::integration::host_store::HostIntegrationStore::new(self.store)
+            .retains(project, meta.task_id())?
+        {
+            return Ok(true);
+        }
         for turn in status.turns() {
             if turn.terminal().is_none() {
                 return Ok(true);

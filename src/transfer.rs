@@ -734,6 +734,61 @@ impl<'a> RemoteJobClient<'a> {
         )
     }
 
+    pub fn task_integration(
+        &self,
+        worker: &WorkerEntry,
+        request: &crate::integration::contracts::HostIntegrationRequest,
+    ) -> Result<crate::integration::contracts::HostIntegrationResponse, WorkerError> {
+        use crate::integration::contracts::*;
+        encode_host_request(request)?;
+        let mut policy = control_policy(HOST_DEADLINE);
+        policy.stdout_limit = MAX_INTEGRATION_RPC_BYTES;
+        let response: HostIntegrationResponse =
+            self.transport
+                .request(worker, HostOperation::TaskIntegration, request, policy)?;
+        response.validate_for(request)?;
+        Ok(response)
+    }
+
+    #[allow(dead_code)] // T6 wires the integration transport operation.
+    pub fn submit_integration_turn(
+        &self,
+        worker: &WorkerEntry,
+        prepared: &crate::integration::contracts::PreparedIntegrationTurn,
+        request: &TaskTurnRequest,
+    ) -> Result<TaskTurnResponse, WorkerError> {
+        use crate::integration::contracts::*;
+        prepared.validate()?;
+        request.validate()?;
+        if request.turn().task_id() != prepared.followup.task_id()
+            || request.submit().material().job_id() != prepared.followup.turn_id()
+            || request.submit().material().worker_name() != worker.name
+            || request.turn().limits() != &prepared.approved_turn_limits
+        {
+            return Err(crate::integration::host_store::invalid());
+        }
+        let wire = crate::integration::remote::IntegrationTurnRequest {
+            prepared: prepared.clone(),
+            request: request.clone(),
+        };
+        encode_bounded(&wire, MAX_INTEGRATION_RPC_BYTES)?;
+        let mut policy = control_policy(HOST_DEADLINE);
+        policy.stdout_limit = MAX_INTEGRATION_RPC_BYTES;
+        let response: TaskTurnResponse =
+            self.transport
+                .request(worker, HostOperation::TaskIntegrationTurn, &wire, policy)?;
+        if matches!(response.submit(), crate::job::SubmitResponse::Accepted { meta, .. }
+            if meta.job_id() != prepared.followup.turn_id() || meta.request_fingerprint() != request.submit().request_fingerprint())
+            || !response.task().turns().iter().any(|turn| {
+                turn.turn_id() == prepared.followup.turn_id()
+                    && turn.turn_number() == prepared.followup.turn_number()
+            })
+        {
+            return Err(crate::integration::host_store::invalid());
+        }
+        Ok(response)
+    }
+
     pub fn cancel(
         &self,
         worker: &WorkerEntry,

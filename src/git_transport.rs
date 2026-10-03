@@ -40,7 +40,7 @@ const OBJECT_STORE_RECEIPT_LIMIT: u64 = 1024 * 1024;
 #[cfg(test)]
 const ORIGIN_GIT_SSH_COMMAND: &str = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o ClearAllForwardings=yes";
 
-fn origin_git_ssh_command() -> Result<String, WorkerError> {
+pub(crate) fn origin_git_ssh_command() -> Result<String, WorkerError> {
     crate::transport::git_ssh_command_line(
         crate::transport::SshTarget::Origin,
         &crate::transport::ssh_program()?,
@@ -236,7 +236,7 @@ impl<'a> GitTransport<'a> {
 
     /// Global credential-helper settings for one HTTPS origin. Empty for
     /// SSH/file URLs. Never loads the global config into the hermetic push.
-    fn origin_credential_config(&self, origin: &str) -> Vec<(String, String)> {
+    pub(crate) fn origin_credential_config(&self, origin: &str) -> Vec<(String, String)> {
         let Some((scheme, host)) = http_origin_parts(origin) else {
             return Vec::new();
         };
@@ -1006,7 +1006,7 @@ fn origin_push_error(stderr: &[u8]) -> WorkerError {
     }
 }
 
-fn origin_auth_failed(stderr: &[u8]) -> bool {
+pub(crate) fn origin_auth_failed(stderr: &[u8]) -> bool {
     let stderr = String::from_utf8_lossy(stderr);
     // Match Git's own messages, never bare status digits: repository paths,
     // object ids and hook output routinely contain "401" or "403".
