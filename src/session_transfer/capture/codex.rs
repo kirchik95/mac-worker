@@ -104,9 +104,9 @@ impl SessionCapture for CodexCapture {
             text.extend_from_slice(&line.bytes);
             text.push(b'\n');
         }
-        let text = tokens::normalize(&text, &roots, id)?;
-        // Derive display text from the scrubbed, normalized copy, never the source.
+        // Keep native paths and IDs in display text, but never expose unscrubbed input.
         let first_prompt_preview = first_prompt_preview(&text)?;
+        let text = tokens::normalize(&text, &roots, id)?;
         let package = SessionPackage::build(
             PackageSource {
                 agent: SessionAgent::Codex,

@@ -444,6 +444,35 @@ fn preview_prefers_first_user_event_and_never_exposes_secrets() {
 }
 
 #[test]
+fn preview_preserves_checkout_path_and_session_id_while_scrubbing_secrets() {
+    let fixture = Fixture::new();
+    let project = tempfile::tempdir_in("/tmp").unwrap();
+    let root = project.path().to_str().unwrap();
+    let prompt = format!("Inspect {root} for {ID}: {SECRET}");
+    let expected = format!("Inspect {root} for {ID}: {SCRUBBED}");
+    for line in [
+        json!({"type":"event_msg", "payload":{"type":"user_message", "message":prompt}}),
+        json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":prompt}]}}),
+    ] {
+        let source = fixture.home.codex(ID, root, "0.160.0", 0);
+        append(&source, line);
+        let mut cx = fixture.cx();
+        cx.project_root = project.path();
+        let captured = capture_for(SessionAgent::Codex)
+            .capture(&source, &cx)
+            .unwrap();
+        let preview = captured.first_prompt_preview.as_deref().unwrap();
+        assert_eq!(preview, expected);
+        assert!(preview.contains(root));
+        assert!(!preview.contains(WORKSPACE_TOKEN));
+        assert!(!preview.contains(SESSION_TOKEN));
+        assert!(!preview.contains(SECRET));
+        assert!(package_text(&captured).contains(WORKSPACE_TOKEN));
+        assert!(package_text(&captured).contains(SESSION_TOKEN));
+    }
+}
+
+#[test]
 fn preview_falls_back_to_user_input_skips_wrappers_and_truncates_unicode() {
     let fixture = Fixture::new();
     let source = fixture
