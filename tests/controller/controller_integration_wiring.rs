@@ -12,6 +12,19 @@ use mac_worker::test_support::{
 };
 use serde_json::json;
 
+struct NoProcesses;
+impl mac_worker::test_support::host::process::ProcessRunner for NoProcesses {
+    fn run(
+        &self,
+        _: &mac_worker::test_support::host::process::ProcessRequest,
+    ) -> Result<
+        mac_worker::test_support::host::process::ProcessResult,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
+        panic!("frozen cycle retry must not execute a process")
+    }
+}
+
 fn isolated_paths(root: &std::path::Path) -> PathLayout {
     PathLayout {
         config: root.join("config.toml"),
@@ -68,6 +81,146 @@ fn fixture_config(paths: &PathLayout) -> mac_worker::test_support::core::config:
     )
     .unwrap();
     mac_worker::test_support::core::config::Config::load(&paths.config).unwrap()
+}
+
+#[test]
+fn durable_cancel_retry_accepts_its_own_revoked_stop_progress() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::*,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = parse_request(&serde_json::to_vec(&json!({"protocol_version": 7, "request_id": "00000000000000000000000000000061", "command": "task.cancel", "body": {"task_id": fixture_task()}})).unwrap()).unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    // The initial stop persists its tombstone; retirement then changes the
+    // same turn's ordinary record before the controller retries its saved body.
+    let status = TaskStatus::new(
+        TaskState::Open,
+        Some(TaskOutcome::Cancelled),
+        Some("fixture-worker".into()),
+        true,
+        ordinary.status().head_oid().cloned(),
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![TurnSummary::new(
+            1,
+            fixture_source(),
+            Some(TurnTerminal::Cancelled),
+            Some(TaskOutcome::Cancelled),
+            Some(true),
+            false,
+            Some(1000),
+            Some(1002),
+        )],
+        1002,
+    )
+    .unwrap();
+    assert!(
+        tasks
+            .update_task_if_current(&ordinary, ordinary.with_status(status).unwrap())
+            .unwrap()
+    );
+    let expected = integration.snapshot.revision;
+    integration.snapshot.revision = IntegrationRevision(2);
+    integration.snapshot.state = IntegrationStatus::Revoked;
+    integration.tombstone = Some(IntegrationTombstone {
+        epoch: 0,
+        revision: IntegrationRevision(2),
+        requested_at_millis: 1002,
+        acknowledged: true,
+    });
+    state
+        .replace(fixture_task(), expected, &integration)
+        .unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap();
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    assert_eq!(
+        tasks
+            .load_task(fixture_task())
+            .unwrap()
+            .status()
+            .last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+}
+
+#[test]
+fn durable_cancel_retry_cannot_retarget_a_newer_integration_epoch() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = parse_request(&serde_json::to_vec(&json!({"protocol_version": 7, "request_id": "00000000000000000000000000000062", "command": "task.cancel", "body": {"task_id": fixture_task()}})).unwrap()).unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let expected = integration.snapshot.revision;
+    integration.snapshot.revision = IntegrationRevision(2);
+    integration.snapshot.epoch = 1;
+    state
+        .replace(fixture_task(), expected, &integration)
+        .unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_REVISION_CONFLICT");
+    assert_eq!(tasks.load_task(fixture_task()).unwrap(), ordinary);
+    assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
 }
 
 #[test]

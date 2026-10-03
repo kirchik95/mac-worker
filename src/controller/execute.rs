@@ -39,7 +39,8 @@ use crate::{
         },
         stream_rpc::{is_transfer_command, serve_transfer_command},
         task_mutations::{
-            PreparedTaskMutation, execute_task_mutation, mutation_task_id, prepare_task_mutation,
+            PreparedTaskMutation, decode_prepared_mutation, encode_prepared_mutation,
+            execute_task_mutation, mutation_task_id, prepare_task_mutation,
         },
         transfer::{ControllerTransfer, SourceSubmitBind, request_session_ref},
     },
@@ -213,11 +214,7 @@ impl TaskSubmitHandler<'_> {
         request: &ControllerRequest,
     ) -> Result<OperationMeta, WorkerError> {
         let prepared = prepare_task_mutation(request, self.client_state, now_millis()?)?;
-        let encoded = serde_json::to_value(&prepared).map_err(|_| {
-            WorkerError::Protocol(
-                "CONTROLLER_TRANSPORT: prepared mutation could not be encoded".into(),
-            )
-        })?;
+        let encoded = encode_prepared_mutation(self.paths, &prepared)?;
         Ok(OperationMeta {
             task_id: Some(prepared.task_id().to_string()),
             turn_id: prepared.turn_id().map(|id| id.to_string()),
@@ -254,10 +251,7 @@ impl TaskSubmitHandler<'_> {
         &self,
         record: &crate::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
-        let prepared: PreparedTaskMutation = serde_json::from_value(record.prepared().clone())
-            .map_err(|_| {
-                WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared mutation is invalid".into())
-            })?;
+        let prepared = decode_prepared_mutation(self.paths, self.client_state, record.prepared())?;
         if let PreparedTaskMutation::Close { expected, .. } = &prepared {
             let current = self.client_state.load_task(expected.meta().task_id())?;
             if let Err(error) = validate_close_target(&current, expected) {
