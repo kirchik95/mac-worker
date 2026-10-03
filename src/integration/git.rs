@@ -549,9 +549,18 @@ impl<'a> IntegrationGit<'a> {
         candidate: &mut IntegrationCandidate,
     ) -> Result<(), WorkerError> {
         let mirror = self.mirror(&record.policy)?;
+        self.commit_in(record, candidate, &mirror)
+    }
+    pub(crate) fn commit_in(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &mut IntegrationCandidate,
+        repo: &RootedDir,
+    ) -> Result<(), WorkerError> {
+        let mirror = self.mirror(&record.policy)?;
         let tree = candidate.tree_oid.as_ref().ok_or_else(invalid)?;
         let mut request = self.request(
-            &mirror,
+            repo,
             Some(&candidate.attribute_source),
             &[
                 "commit-tree".into(),
@@ -591,12 +600,114 @@ impl<'a> IntegrationGit<'a> {
             .parse()
             .map_err(|_| invalid())?;
         self.runtime.reach(IntegrationHook::AfterCommitBeforePin);
+        if repo.path() != mirror.path() {
+            self.query(
+                &mirror,
+                Some(&candidate.attribute_source),
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    repo.path().to_str().ok_or_else(invalid)?,
+                    oid.as_str(),
+                ],
+            )?;
+        }
         let pin = candidate_pin(candidate);
         self.query(&mirror, None, &["update-ref", &pin, oid.as_str()])?;
         mirror.sync_root()?;
         candidate.merge_oid = Some(oid);
         self.runtime.reach(IntegrationHook::AfterMergePin);
         Ok(())
+    }
+    pub(crate) fn accept_workspace(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &mut IntegrationCandidate,
+        purpose: IntegrationTurnPurpose,
+    ) -> Result<(), WorkerError> {
+        let workspace = self.workspace(record)?;
+        self.assert_workspace(&workspace, candidate, true)?;
+        if purpose == IntegrationTurnPurpose::Verify {
+            self.verify_tree(&workspace, candidate)?;
+            let bytes = HostIntegrationStore::new(self.store)
+                .read(
+                    &record.policy.project_id,
+                    record.task_id,
+                    "workspace.json",
+                    MAX_PRIVATE_RECORD_BYTES,
+                )?
+                .ok_or_else(invalid)?;
+            let expected: WorkspaceState = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if self.workspace_state(&workspace, candidate)? != expected {
+                return Err(IntegrationCode::IntegrationVerifyChangedTree.error());
+            }
+        }
+        self.query(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &["add", "-A"],
+        )?;
+        let unmerged = self.query(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &["ls-files", "--unmerged", "-z"],
+        )?;
+        if !unmerged.is_empty() {
+            return Err(IntegrationCode::IntegrationResolutionIncomplete.error());
+        }
+        if purpose == IntegrationTurnPurpose::Verify {
+            self.verify_tree(&workspace, candidate)?;
+        }
+        let diff = self.run(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=0",
+                candidate.source_head.as_str(),
+                "--",
+            ],
+        )?;
+        if !diff.status.success() {
+            return Err(invalid());
+        }
+        if diff
+            .stdout
+            .split(|b| *b == b'\n')
+            .any(|line| line.starts_with(b"+") && marker(&line[1..]))
+        {
+            return Err(IntegrationCode::IntegrationResolutionIncomplete.error());
+        }
+        for path in &candidate.conflict_paths {
+            let content = self.run(
+                &workspace,
+                Some(&candidate.attribute_source),
+                &["show", &format!(":{path}")],
+            )?;
+            // A resolved deletion has no index blob. Symlinks/binaries are native Git data.
+            if content.status.success()
+                && !content.stdout.contains(&0)
+                && content.stdout.split(|b| *b == b'\n').any(marker)
+            {
+                return Err(IntegrationCode::IntegrationResolutionIncomplete.error());
+            }
+        }
+        if purpose == IntegrationTurnPurpose::Resolve {
+            candidate.tree_oid = Some(
+                self.query(
+                    &workspace,
+                    Some(&candidate.attribute_source),
+                    &["write-tree"],
+                )?
+                .parse()
+                .map_err(|_| invalid())?,
+            );
+        }
+        self.commit_in(record, candidate, &workspace)
     }
     pub(crate) fn push(
         &self,
@@ -714,6 +825,185 @@ impl<'a> IntegrationGit<'a> {
         }
         Ok(None)
     }
+    pub(crate) fn settle(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &IntegrationCandidate,
+    ) -> Result<Option<IntegrationReceipt>, WorkerError> {
+        let mirror = self.mirror(&record.policy)?;
+        let credentials =
+            GitTransport::new(self.runner).origin_credential_config(&record.policy.origin);
+        let target = self
+            .observe(record, &mirror, &credentials)?
+            .ok_or_else(|| IntegrationCode::IntegrationTargetMissing.error())?;
+        if let Some(merge) = &candidate.merge_oid
+            && self.is_ancestor(&mirror, merge, &target)?
+        {
+            return Ok(Some(self.receipt(
+                record,
+                candidate,
+                target,
+                IntegrationDisposition::Merged,
+            )));
+        }
+        if self.is_ancestor(&mirror, &record.snapshot.source_head, &target)? {
+            return Ok(Some(self.receipt(
+                record,
+                candidate,
+                target,
+                IntegrationDisposition::AlreadyIntegrated,
+            )));
+        }
+        Ok(None)
+    }
+    pub(crate) fn restore_source(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &IntegrationCandidate,
+    ) -> Result<(), WorkerError> {
+        if self
+            .store
+            .task_status(&record.policy.project_id, record.task_id)?
+            .state()
+            .is_terminal()
+        {
+            return Ok(());
+        }
+        let workspace = self.workspace(record)?;
+        self.assert_workspace(&workspace, candidate, false)?;
+        let before = self.untracked(&workspace, &candidate.attribute_source)?;
+        let merge_head = self.run(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &["rev-parse", "--verify", "MERGE_HEAD"],
+        )?;
+        if merge_head.status.success() {
+            if std::str::from_utf8(&merge_head.stdout)
+                .map_err(|_| invalid())?
+                .trim()
+                != candidate.target_head.as_str()
+            {
+                return Err(invalid());
+            }
+            self.query(
+                &workspace,
+                Some(&candidate.attribute_source),
+                &["merge", "--abort"],
+            )?;
+        }
+        let created: Vec<_> = self
+            .untracked(&workspace, &candidate.attribute_source)?
+            .into_iter()
+            .filter(|path| {
+                before.contains(path) && !candidate.clean_h.untracked_files.contains(path)
+            })
+            .collect();
+        if !created.is_empty() {
+            // Native staging/reset removes only inventoried auxiliary files, including symlinks and ignored files.
+            let mut args = vec!["--literal-pathspecs", "add", "-f", "--"];
+            args.extend(created.iter().map(String::as_str));
+            self.query(&workspace, Some(&candidate.attribute_source), &args)?;
+        }
+        self.query(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &["reset", "--hard", candidate.source_head.as_str()],
+        )?;
+        workspace.sync_root()?;
+        Ok(())
+    }
+    pub(crate) fn repair(
+        &self,
+        record: &IntegrationRecord,
+        receipt: &IntegrationReceipt,
+    ) -> Result<(), WorkerError> {
+        let result = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+        let mirror = self.mirror(&record.policy)?;
+        let reference = format!("refs/heads/task/{}", record.task_id);
+        let current = self.query(&mirror, None, &["rev-parse", &reference])?;
+        if current == record.snapshot.source_head.as_str() {
+            self.query(
+                &mirror,
+                Some(result),
+                &[
+                    "update-ref",
+                    &reference,
+                    result.as_str(),
+                    record.snapshot.source_head.as_str(),
+                ],
+            )?;
+        } else if current != result.as_str() {
+            return Err(invalid());
+        }
+        let status = self
+            .store
+            .task_status(&record.policy.project_id, record.task_id)?;
+        if !status.state().is_terminal() {
+            let workspace = self.workspace(record)?;
+            if self.query(
+                &workspace,
+                Some(result),
+                &["symbolic-ref", "--short", "HEAD"],
+            )? != crate::task::BranchName::for_task(record.task_id).as_str()
+            {
+                return Err(invalid());
+            }
+            let head = self.query(&workspace, Some(result), &["rev-parse", "HEAD"])?;
+            if head != record.snapshot.source_head.as_str() && head != result.as_str() {
+                return Err(invalid());
+            }
+            self.query(
+                &workspace,
+                Some(result),
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    mirror.path().to_str().ok_or_else(invalid)?,
+                    result.as_str(),
+                ],
+            )?;
+            if head != result.as_str() {
+                self.query(
+                    &workspace,
+                    Some(result),
+                    &["update-ref", &reference, result.as_str(), &head],
+                )?;
+            }
+            self.query(
+                &workspace,
+                Some(result),
+                &["reset", "--hard", result.as_str()],
+            )?;
+        }
+        crate::task_store::TaskStore::new(self.store, self.runner).replace_status_after(
+            &record.policy.project_id,
+            record.task_id,
+            |current| {
+                if current.head_oid() != Some(&record.snapshot.source_head)
+                    && current.head_oid() != Some(result)
+                {
+                    return Err(invalid());
+                }
+                crate::task::TaskStatus::new(
+                    current.state(),
+                    current.last_outcome().cloned(),
+                    current.worker().map(str::to_owned),
+                    current.session_present(),
+                    Some(result.clone()),
+                    current.summary().map(str::to_owned),
+                    current.questions().to_vec(),
+                    current.files_changed().to_vec(),
+                    current.diff_stat().map(str::to_owned),
+                    current.turns().to_vec(),
+                    self.runtime.now_millis(),
+                )?
+                .copying_reported_checks(&current)
+            },
+        )?;
+        mirror.sync_root()?;
+        Ok(())
+    }
     pub(crate) fn receipt(
         &self,
         record: &IntegrationRecord,
@@ -756,6 +1046,12 @@ pub(crate) fn paths(bytes: &[u8]) -> Result<Vec<String>, WorkerError> {
         .collect::<Result<_, WorkerError>>()?;
     validate_conflict_paths(&paths)?;
     Ok(paths)
+}
+fn marker(line: &[u8]) -> bool {
+    line.starts_with(b"<<<<<<<")
+        || line.starts_with(b">>>>>>>")
+        || line.starts_with(b"|||||||")
+        || line == b"======="
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
@@ -931,6 +1227,13 @@ pub mod testing {
             &self,
             step: IntegrationStep,
         ) -> Result<HostIntegrationResponse, WorkerError> {
+            self.execute_with(step, &SystemProcessRunner)
+        }
+        pub fn execute_with(
+            &self,
+            step: IntegrationStep,
+            runner: &dyn ProcessRunner,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
             let request = HostIntegrationRequest {
                 protocol_version: 7,
                 task_id: self.record.task_id,
@@ -942,9 +1245,8 @@ pub mod testing {
                     record: Box::new(self.record.clone()),
                 },
             };
-            let response =
-                HostIntegrationService::new(&self.store, &SystemProcessRunner, &self.runtime)
-                    .execute(&request)?;
+            let response = HostIntegrationService::new(&self.store, runner, &self.runtime)
+                .execute(&request)?;
             response.validate_for(&request)?;
             Ok(response)
         }
@@ -1029,6 +1331,121 @@ pub mod testing {
             let head = git(&peer, &["rev-parse", "HEAD"]).parse().unwrap();
             git(&peer, &["push", "origin", "HEAD:refs/heads/main"]);
             head
+        }
+        pub fn prepared(&self, purpose: IntegrationTurnPurpose) -> PreparedIntegrationTurn {
+            use crate::{prepared_followup::PreparedFollowup, task::LocalTaskRecord};
+            let record = HostIntegrationStore::new(&self.store)
+                .load(&self.record.policy.project_id, self.record.task_id)
+                .unwrap()
+                .unwrap();
+            let candidate = record.candidates.last().unwrap();
+            let task_store = crate::task_store::TaskStore::new(&self.store, &SystemProcessRunner);
+            let ordinary = LocalTaskRecord::new(
+                task_store
+                    .load_meta(&record.policy.project_id, record.task_id)
+                    .unwrap(),
+                task_store
+                    .load_status(&record.policy.project_id, record.task_id)
+                    .unwrap(),
+                Some(1001),
+                None,
+                Some(record.snapshot.source_head.clone()),
+                "c".repeat(64),
+                Some("fixture-worker".into()),
+                true,
+                None,
+            )
+            .unwrap();
+            let turn = auxiliary_turn_id(
+                record.snapshot.integration_id,
+                record.snapshot.epoch,
+                candidate.id.attempt,
+                purpose,
+                1,
+            )
+            .unwrap();
+            let prepared = PreparedIntegrationTurn {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                attempt: candidate.id.attempt,
+                purpose,
+                ordinal: 1,
+                followup: PreparedFollowup::prepare(
+                    &ordinary,
+                    "Repair or verify the candidate".into(),
+                    turn,
+                    1002,
+                )
+                .unwrap(),
+                workspace_binding: IntegrationWorkspaceBinding {
+                    task_id: record.task_id,
+                    candidate: candidate.id,
+                    branch: candidate.clean_h.branch.clone(),
+                    head: candidate.source_head.clone(),
+                    merge_head: candidate.target_head.clone(),
+                    attribute_source: candidate.attribute_source.clone(),
+                    ours: candidate.ours.clone(),
+                    theirs: candidate.theirs.clone(),
+                    pinned_tree: candidate.tree_oid.clone(),
+                    clean_h: candidate.clean_h.clone(),
+                },
+                approved_turn_limits: crate::agent::TurnLimits::new(600_000, None, None).unwrap(),
+            };
+            prepared.validate_for(&record).unwrap();
+            prepared
+        }
+        pub fn complete_auxiliary(
+            &mut self,
+            purpose: IntegrationTurnPurpose,
+        ) -> PreparedIntegrationTurn {
+            let prepared = self.prepared(purpose);
+            self.record = HostIntegrationStore::new(&self.store)
+                .load(&self.record.policy.project_id, self.record.task_id)
+                .unwrap()
+                .unwrap();
+            let mut intent = prepared.intent().unwrap();
+            intent.accepted = true;
+            intent.completed = true;
+            self.record.auxiliaries.push(intent);
+            let sidecars = HostIntegrationStore::new(&self.store);
+            sidecars.save(&self.record).unwrap();
+            sidecars
+                .write(
+                    &self.record.policy.project_id,
+                    self.record.task_id,
+                    &format!("turn-{}.json", prepared.followup.turn_id()),
+                    &encode_prepared_turn(&prepared).unwrap(),
+                )
+                .unwrap();
+            let task = self
+                .store
+                .open_task_directory(&self.record.policy.project_id, self.record.task_id, false)
+                .unwrap();
+            let current = task
+                .read_private_regular("status.json", 1024 * 1024)
+                .unwrap();
+            let mut wire: serde_json::Value = serde_json::from_slice(&current).unwrap();
+            wire["turns"].as_array_mut().unwrap().push(
+                serde_json::to_value(crate::task::TurnSummary::new(
+                    prepared.followup.turn_number(),
+                    prepared.followup.turn_id(),
+                    Some(crate::task::TurnTerminal::Succeeded),
+                    Some(crate::task::TaskOutcome::Done),
+                    Some(false),
+                    false,
+                    Some(1002),
+                    Some(1003),
+                ))
+                .unwrap(),
+            );
+            let status: crate::task::TaskStatus = serde_json::from_value(wire).unwrap();
+            task.rewrite_private_regular_exact(
+                "status.json",
+                &current,
+                &serde_json::to_vec(&status).unwrap(),
+            )
+            .unwrap();
+            prepared
         }
         pub fn origin(&self) -> &Path {
             &self.origin

@@ -76,6 +76,78 @@ impl<'a> HostIntegrationStore<'a> {
             &encode_bounded(policy, MAX_PRIVATE_RECORD_BYTES)?,
         )
     }
+    pub(crate) fn find_project(&self, task: TaskId) -> Result<String, WorkerError> {
+        let tasks = self.store.open_directory("tasks", false)?;
+        let mut found = None;
+        for raw in tasks.list_names()? {
+            let Ok(project) = std::str::from_utf8(&raw) else {
+                continue;
+            };
+            if project.len() != 64
+                || !project
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                continue;
+            }
+            let dir = tasks.open_child_directory(&relative(project)?, false)?;
+            if dir.entry_exists(&task.to_string())? && found.replace(project.to_owned()).is_some() {
+                return Err(invalid());
+            }
+        }
+        found.ok_or_else(invalid)
+    }
+    pub(crate) fn retains(&self, project: &str, task: TaskId) -> Result<bool, WorkerError> {
+        if let Some(record) = self.load(project, task)? {
+            return Ok(!((record.snapshot.state == IntegrationStatus::Revoked
+                && record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record.push_intent.as_ref().is_none_or(|p| !p.uncertain))
+                || (record.snapshot.state == IntegrationStatus::Integrated
+                    && record.receipt.as_ref().is_some_and(|r| r.imported))));
+        }
+        Ok(self.policy(project, task)?.is_some()
+            && !self.store.task_status(project, task)?.state().is_terminal())
+    }
+    pub(crate) fn prepared(
+        &self,
+        project: &str,
+        task: TaskId,
+        turn: crate::task::TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        self.read(
+            project,
+            task,
+            &format!("turn-{turn}.json"),
+            MAX_PREPARED_TURN_BYTES,
+        )?
+        .map(|bytes| decode_prepared_turn(&bytes))
+        .transpose()
+    }
+    pub(crate) fn persist_prepared(
+        &self,
+        project: &str,
+        prepared: &PreparedIntegrationTurn,
+    ) -> Result<(), WorkerError> {
+        let task = prepared.followup.task_id();
+        let record = self.load(project, task)?.ok_or_else(invalid)?;
+        prepared.validate_for(&record)?;
+        prepared.followup.validate_self_consistency()?;
+        if record.tombstone.is_some() {
+            return Err(invalid());
+        }
+        if let Some(existing) = self.prepared(project, task, prepared.followup.turn_id())? {
+            if existing != *prepared {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
+        self.write(
+            project,
+            task,
+            &format!("turn-{}.json", prepared.followup.turn_id()),
+            &encode_prepared_turn(prepared)?,
+        )
+    }
     pub(crate) fn lock(&self, project: &str, task: TaskId) -> Result<File, WorkerError> {
         let file = self
             .directory(project, task, true)?
