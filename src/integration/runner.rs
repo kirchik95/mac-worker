@@ -420,7 +420,48 @@ impl<'a> OwnerIntegration<'a> {
                 task,
             )?;
         }
+        self.settle_parked_auxiliary(task)?;
         self.schedule(task)
+    }
+    fn settle_parked_auxiliary(&self, task: TaskId) -> Result<(), WorkerError> {
+        let Some(entry) = self.ports.client.queue_entry_for_task_turn(task)? else {
+            return Ok(());
+        };
+        let Some(record) = self.state.load(task)? else {
+            return Ok(());
+        };
+        if !matches!(entry.state(), crate::job::QueueState::Parked)
+            || !record
+                .auxiliaries
+                .iter()
+                .any(|aux| aux.turn_id == entry.job_id())
+        {
+            return Ok(());
+        }
+        if record.tombstone.is_none() && record.snapshot.state != IntegrationStatus::Blocked {
+            let admission =
+                auxiliary_launch_permit(self.ports.paths, self.ports.client, task, entry.job_id());
+            if let Err(error) = admission {
+                let latest = self.state.load(task)?.ok_or_else(invalid)?;
+                if latest.tombstone.is_none() && latest.snapshot.state != IntegrationStatus::Blocked
+                {
+                    return Err(error);
+                }
+            }
+        }
+        let latest = self.state.load(task)?.ok_or_else(invalid)?;
+        if latest.tombstone.is_some() || latest.snapshot.state == IntegrationStatus::Blocked {
+            record_position(
+                self.ports.paths,
+                task,
+                entry.job_id(),
+                entry.queue_id().value(),
+            )?;
+            // Only this owner's auxiliary is settled. Accepted work still
+            // needs remote cancellation/completion proof before retirement.
+            self.ports.client().settle_integration_stop(task)?;
+        }
+        Ok(())
     }
     pub(crate) fn redrive(
         &self,
@@ -776,6 +817,40 @@ fn read_position(
 pub(crate) struct AuxiliaryLaunchPermit {
     _phase: Option<IntegrationPhasePermit>,
 }
+/// Donor scans must not initialize deadlines, resume records or acquire phase
+/// ownership for another task. The claimed row gets the full mutating valve.
+pub(crate) fn auxiliary_queue_eligible(
+    paths: &PathLayout,
+    client: &ClientStateStore,
+    task: TaskId,
+    turn: TurnId,
+) -> Result<bool, WorkerError> {
+    let Some(prepared) = super::store::RootedIntegrationState::read_auxiliary(paths, task, turn)?
+    else {
+        return Ok(true);
+    };
+    let (_, record) = super::store::RootedIntegrationState::read_task(paths, task)?;
+    let record = record.ok_or_else(invalid)?;
+    prepared.validate_for(&record)?;
+    if record.tombstone.is_some()
+        || !matches!(
+            record.snapshot.state,
+            IntegrationStatus::Resolving | IntegrationStatus::Verifying
+        ) && !(record.snapshot.state == IntegrationStatus::Parked
+            && matches!(
+                record.snapshot.resume_state,
+                Some(IntegrationStatus::Resolving | IntegrationStatus::Verifying)
+            ))
+    {
+        return Ok(false);
+    }
+    Ok(crate::controller::drain::integration_admission(
+        &paths.controller_state_root(),
+        client.wait_deadline(),
+        client.admission_time(crate::controller::leader::now_millis)?,
+    )?
+    .is_ok())
+}
 pub(crate) fn auxiliary_launch_permit(
     paths: &PathLayout,
     client: &ClientStateStore,
@@ -918,7 +993,7 @@ impl<'a> IntegrationRunner<'a> {
 }
 
 #[cfg(test)]
-mod native_launch_tests {
+pub(crate) mod native_launch_tests {
     use super::*;
     use crate::{
         integration::testing::*,
@@ -1303,7 +1378,7 @@ mod native_launch_tests {
         assert_eq!(again, metadata, "repeated drain renewed its effective time");
     }
 
-    fn queued_auxiliary(
+    pub(crate) fn queued_auxiliary(
         paths: &PathLayout,
         client: &ClientStateStore,
         deadline: u64,

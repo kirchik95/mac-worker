@@ -159,6 +159,82 @@ impl ClientStateStore {
         )))
     }
 
+    /// Roll back only the unaccepted recipient claim still owned by this
+    /// donor. Queue identities, cancellation flags and reservations survive.
+    pub(crate) fn release_waiting_runner_reassignment(
+        &self,
+        source_task: TaskId,
+        source: &QueueEntry,
+        recipient_task: TaskId,
+        claim: &QueueClaim,
+        owner: ProcessIdentity,
+    ) -> Result<(), WorkerError> {
+        let _lock = self.acquire_queue_lock()?;
+        let (mut snapshot, identity) = read_queue_snapshot(self.inner.queue.as_raw_fd())?;
+        require_queue_client(&snapshot, self.inner.client_id)?;
+        let source_index = snapshot
+            .entries
+            .iter()
+            .position(|entry| entry.job_id() == source.job_id())
+            .ok_or_else(|| {
+                queue_error(
+                    "TASK_QUEUE_MISSING",
+                    "donor row disappeared during reassignment",
+                )
+            })?;
+        let recipient_index = snapshot
+            .entries
+            .iter()
+            .position(|entry| entry.job_id() == claim.entry().job_id())
+            .ok_or_else(|| {
+                queue_error(
+                    "TASK_QUEUE_MISSING",
+                    "recipient row disappeared during reassignment",
+                )
+            })?;
+        if source_index == recipient_index
+            || !matches!(snapshot.entries[source_index].state(), QueueState::Parked)
+            || snapshot.entries[source_index].slot_reservation().is_some()
+            || snapshot.entries[recipient_index].state() != claim.entry().state()
+            || snapshot.entries[recipient_index].owner_opt() != Some(&owner)
+            || source.owner_opt() != Some(&owner)
+        {
+            return Err(queue_error(
+                "QUEUE_OWNER_MISMATCH",
+                "runner reassignment changed before release",
+            ));
+        }
+        let source_record = self.load_task_locked(source_task)?;
+        let recipient = self.load_task_locked(recipient_task)?;
+        if source_record.runner().is_some()
+            || recipient
+                .runner()
+                .is_none_or(|runner| runner.process_identity() != owner)
+        {
+            return Err(queue_error(
+                "QUEUE_OWNER_MISMATCH",
+                "task runner changed before reassignment release",
+            ));
+        }
+        let previous = self.event_sink.as_ref().map(|_| snapshot.clone());
+        snapshot.entries[recipient_index].park()?;
+        snapshot.entries[source_index].unpark(owner)?;
+        snapshot.entries[source_index].set_slot_reservation(source.slot_reservation())?;
+        snapshot.validate()?;
+        publish_queue_snapshot(self, &snapshot, previous.as_ref(), identity)?;
+        self.update_task_locked_before_final_sync(
+            recipient.with_runner(None)?,
+            || Ok(()),
+            IdenticalTaskWrite::Replace,
+        )?;
+        self.update_task_locked_before_final_sync(
+            source_record.with_runner(Some(RunnerIdentity::new(owner)))?,
+            || Ok(()),
+            IdenticalTaskWrite::Replace,
+        )?;
+        Ok(())
+    }
+
     /// Builds the private task/turn mapping once while StateLock is held.
     /// Unrelated historical turn directories do not participate in dispatch.
     pub(super) fn queued_task_records_locked(

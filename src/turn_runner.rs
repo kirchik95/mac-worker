@@ -1109,33 +1109,56 @@ impl<'a> TurnRunner<'a> {
             return Ok(None);
         };
         let mut eligible = std::collections::HashSet::new();
-        let mut auxiliary_permits = Vec::new();
         for entry in self.client_state.queue_snapshot()?.entries() {
             if !matches!(entry.state(), QueueState::Parked) {
                 continue;
             }
-            let recipient = self
-                .client_state
-                .task_id_for_turn(entry.job_id())?
-                .ok_or_else(|| task_error("TASK_INCONSISTENT", "parked turn has no task"))?;
-            if let Some(permit) = crate::integration::runner::auxiliary_launch_permit(
+            let Ok(Some(recipient)) = self.client_state.task_id_for_turn(entry.job_id()) else {
+                continue;
+            };
+            if crate::integration::runner::auxiliary_queue_eligible(
                 self.paths,
                 self.client_state,
                 recipient,
                 entry.job_id(),
-            )? {
-                auxiliary_permits.push(permit);
+            )
+            .unwrap_or(false)
+            {
                 eligible.insert(entry.job_id());
             }
         }
-        self.client_state.claim_parked_filtered_for_waiting_runner(
-            task_id,
-            turn_id,
-            owner,
-            observations,
-            now_millis()?,
-            Some(&eligible),
-        )
+        while !eligible.is_empty() {
+            let source = self
+                .client_state
+                .queue_entry(turn_id)?
+                .ok_or_else(|| task_error("TASK_QUEUE_MISSING", "waiting runner has no row"))?;
+            let Some((recipient, claim)) =
+                self.client_state.claim_parked_filtered_for_waiting_runner(
+                    task_id,
+                    turn_id,
+                    owner,
+                    observations,
+                    now_millis()?,
+                    Some(&eligible),
+                )?
+            else {
+                return Ok(None);
+            };
+            if let Ok(Some(_permit)) = crate::integration::runner::auxiliary_launch_permit(
+                self.paths,
+                self.client_state,
+                recipient,
+                claim.entry().job_id(),
+            ) {
+                return Ok(Some((recipient, claim)));
+            }
+            // A recipient's refusal belongs to that row. Restore the donor's
+            // ownership before trying another candidate; never adopt its code.
+            self.client_state
+                .release_waiting_runner_reassignment(task_id, &source, recipient, &claim, owner)?;
+            eligible.remove(&claim.entry().job_id());
+        }
+        Ok(None)
     }
 
     fn require_runner_entry(
@@ -4371,6 +4394,187 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         .expect("drain must defer reassignment before attempting a new queue claim");
         assert!(result.is_none());
         assert_eq!(store.queue_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn ordinary_donor_ignores_another_auxiliary_refusal_and_owner_retires_its_row() {
+        use crate::integration::{contracts::*, testing::*};
+        use crate::job::{CommandSummary, QueueEntry, QueueEntryKind};
+        use crate::scheduler::WorkerPreference;
+        struct NoProcesses;
+        impl crate::process::ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                request: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, crate::error::WorkerError> {
+                panic!("local queue refusal must not launch a process: {request:?}");
+            }
+        }
+        for refusal in ["tombstone", "blocked", "expired", "claimed_expired"] {
+            let (_root, paths) = isolated_handoff_paths();
+            let store = crate::client_state::ClientStateStore::open(&paths.state)
+                .unwrap()
+                .with_admission_clock(std::sync::Arc::new(|| Ok(10000)));
+            let (state, mut record, _, entry) =
+                crate::integration::runner::native_launch_tests::queued_auxiliary(
+                    &paths,
+                    &store,
+                    if refusal.ends_with("expired") {
+                        9999
+                    } else {
+                        600000
+                    },
+                );
+            if refusal == "blocked" {
+                record.snapshot.state = IntegrationStatus::Blocked;
+                record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
+            } else if refusal == "tombstone" {
+                record.snapshot.state = IntegrationStatus::Revoked;
+                record.tombstone = Some(IntegrationTombstone {
+                    epoch: record.snapshot.epoch,
+                    revision: record.snapshot.revision,
+                    requested_at_millis: 1001,
+                    acknowledged: true,
+                });
+            }
+            let previous = state.load(record.task_id).unwrap().unwrap();
+            record.snapshot.revision = previous.snapshot.revision.next().unwrap();
+            state
+                .replace(record.task_id, previous.snapshot.revision, &record)
+                .unwrap();
+            store.park_row(entry.job_id()).unwrap();
+            let donor = crate::task::TaskId::generate();
+            let turn = crate::task::TurnId::generate();
+            let owner = current_process_identity().unwrap();
+            let ordinary = sample_ordinary(donor, turn);
+            let status = crate::task::TaskStatus::new(
+                crate::task::TaskState::Queued,
+                None,
+                Some("fixture-worker".into()),
+                true,
+                ordinary.status().head_oid().cloned(),
+                None,
+                vec![],
+                vec![],
+                None,
+                vec![crate::task::TurnSummary::new(
+                    1, turn, None, None, None, false, None, None,
+                )],
+                1001,
+            )
+            .unwrap();
+            let ordinary = ordinary
+                .with_status(status)
+                .unwrap()
+                .with_runner(Some(crate::task::RunnerIdentity::new(owner)))
+                .unwrap();
+            store.create_task(ordinary.clone()).unwrap();
+            store
+                .write_task_project_path(&ordinary, _root.path())
+                .unwrap();
+            store
+                .write_turn_prompt(donor, turn, "ordinary donor")
+                .unwrap();
+            store
+                .enqueue(
+                    QueueEntry::new(
+                        turn,
+                        store.client_id(),
+                        ordinary.meta().project_id().into(),
+                        ordinary.meta().worktree_id().into(),
+                        CommandSummary::argv(1).unwrap(),
+                        vec![],
+                        WorkerPreference::Pinned {
+                            worker: "unavailable-donor-worker".into(),
+                        },
+                        QueueEntryKind::TaskTurn,
+                        None,
+                        owner,
+                        1001,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let config = crate::config::Config::parse(
+                "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n"
+            ).unwrap();
+            let before_queue = store.queue_snapshot().unwrap();
+            let observations = if refusal == "claimed_expired" {
+                let now = super::now_millis().unwrap();
+                let slot = crate::scheduler::CandidateSlot::Idle;
+                store
+                    .admission_observation("fixture-worker", now, || {
+                        Ok(crate::job::AdmissionObservation::new(
+                            "fixture-worker".into(),
+                            true,
+                            slot,
+                            vec!["agent:codex".into()],
+                            Some(16 << 30),
+                            64 << 30,
+                            now,
+                        )
+                        .unwrap())
+                    })
+                    .unwrap();
+                vec![
+                    crate::scheduler::CandidateObservation::new(
+                        "fixture-worker".into(),
+                        true,
+                        slot,
+                        vec!["agent:codex".into()],
+                        Some(16 << 30),
+                        64 << 30,
+                    )
+                    .unwrap(),
+                ]
+            } else {
+                vec![]
+            };
+            let result = super::TurnRunner::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &super::InlineRunnerExecutor,
+            )
+            .claim_parked_if_admitted(donor, turn, owner, &observations);
+            assert!(
+                result.is_ok(),
+                "{refusal} escaped into the unrelated donor: {}",
+                result.err().unwrap()
+            );
+            assert_eq!(store.load_task(donor).unwrap(), ordinary);
+            assert_eq!(store.queue_snapshot().unwrap(), before_queue);
+            let after = state.load(record.task_id).unwrap().unwrap();
+            if refusal == "claimed_expired" {
+                assert_eq!(after.snapshot.state, IntegrationStatus::Blocked);
+                assert_eq!(
+                    after.snapshot.blocked_code,
+                    Some(IntegrationCode::IntegrationTurnQueueTimeout)
+                );
+                assert!(
+                    store.load_task(record.task_id).unwrap().runner().is_none(),
+                    "refused claim retained recipient ownership"
+                );
+            } else {
+                assert_eq!(after, record, "scan mutated another task's budget/state");
+            }
+            crate::integration::runner::OwnerIntegration::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &super::InlineRunnerExecutor,
+            )
+            .unwrap()
+            .stage(record.task_id)
+            .unwrap();
+            assert!(
+                store.queue_entry(entry.job_id()).unwrap().is_none(),
+                "owner left a refused Parked auxiliary row"
+            );
+            assert_eq!(store.load_task(donor).unwrap(), ordinary);
+        }
     }
 
     fn plant_reserved_turn(
