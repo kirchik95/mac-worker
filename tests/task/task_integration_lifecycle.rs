@@ -44,6 +44,17 @@ pub(crate) mod native_owner {
         state
     }
 
+    pub fn retention_close(f: &GitIntegrationFixture) {
+        use mac_worker::test_support::task::model::TaskStatus;
+        let path = f.workspace().parent().unwrap().join("status.json");
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        wire["state"] = "closed".into();
+        let closed: TaskStatus = serde_json::from_value(wire).unwrap();
+        std::fs::write(path, serde_json::to_vec(&closed).unwrap()).unwrap();
+        std::fs::remove_dir_all(f.workspace()).unwrap();
+    }
+
     pub struct Host<'a> {
         service: HostIntegrationService<'a>,
         lost_fetches: AtomicUsize,
@@ -382,6 +393,187 @@ fn review_native_authentication_error_retains_its_catalog_code() {
     assert_eq!(f.origin_tip(), target);
     assert!(turns.imports(f.record.task_id).is_empty());
     assert_released(&f, &state);
+}
+
+#[test]
+fn review_native_closed_lost_push_imports_the_retained_merge_without_reopening() {
+    use mac_worker::test_support::task::model::TaskState;
+    use native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    f.push();
+    f.record.snapshot.state = IntegrationStatus::Pushing;
+    let candidate = f.record.candidates.last().unwrap();
+    f.record.push_intent = Some(IntegrationPushIntent {
+        candidate: candidate.id,
+        expected_target: candidate.target_head.clone(),
+        merge_oid: merge.clone(),
+        started_at_millis: 1000,
+        uncertain: true,
+    });
+    assert!(f.record.receipt.is_none()); // The owner's push reply never arrived.
+    retention_close(&f);
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 0);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let settled = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(settled.state, IntegrationStatus::Integrated);
+    assert_eq!(settled.merge_oid, Some(merge.clone()));
+    assert_eq!(settled.disposition, Some(IntegrationDisposition::Merged));
+    assert_eq!(turns.accepted_head(f.record.task_id), Some(merge.clone()));
+    assert_eq!(turns.imports(f.record.task_id).len(), 1);
+    assert!(turns.closes(f.record.task_id).is_empty());
+    assert_eq!(f.origin_tip(), merge);
+    assert_eq!(observed(&f).ordinary.status().state(), TaskState::Closed);
+    assert!(!f.workspace().exists());
+    assert!(
+        host.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|step| *step == IntegrationStep::Repair)
+    );
+}
+
+#[test]
+fn review_native_closed_unpublished_candidate_blocks_without_recreating_the_workspace() {
+    native_closed_missing(false);
+}
+
+#[test]
+fn review_native_closed_without_a_candidate_blocks_without_recreating_the_workspace() {
+    native_closed_missing(true);
+}
+
+fn native_closed_missing(no_candidate: bool) {
+    use mac_worker::test_support::task::model::TaskState;
+    use native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    if !no_candidate {
+        f.prepare();
+    }
+    retention_close(&f);
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 0);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let settled = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(settled.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        settled.blocked_code,
+        Some(IntegrationCode::IntegrationWorkspaceMissing)
+    );
+    assert_eq!(
+        state
+            .load(f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .candidates
+            .len(),
+        usize::from(!no_candidate)
+    );
+    assert!(turns.imports(f.record.task_id).is_empty());
+    assert!(turns.observations().is_empty());
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(observed(&f).ordinary.status().state(), TaskState::Closed);
+    assert!(!f.workspace().exists());
+    assert_eq!(*host.calls.lock().unwrap(), vec![IntegrationStep::Repair]);
+}
+
+#[test]
+fn review_native_closed_reachable_source_without_a_candidate_imports_the_observed_target() {
+    use mac_worker::test_support::task::model::TaskState;
+    use native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    let head = f.commit_task();
+    f.git(&["push", &f.record.policy.origin, "HEAD:refs/heads/main"]);
+    retention_close(&f);
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 0);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let settled = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(settled.state, IntegrationStatus::Integrated);
+    assert_eq!(
+        settled.disposition,
+        Some(IntegrationDisposition::AlreadyIntegrated)
+    );
+    assert_eq!(settled.merge_oid, None);
+    assert_eq!(settled.observed_target_oid, Some(head.clone()));
+    assert_eq!(turns.accepted_head(f.record.task_id), Some(head));
+    assert!(
+        state
+            .load(f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+    assert_eq!(observed(&f).ordinary.status().state(), TaskState::Closed);
+    assert!(!f.workspace().exists());
+    assert!(
+        host.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|step| *step == IntegrationStep::Repair)
+    );
+}
+
+#[test]
+fn review_native_closed_observation_keeps_network_uncertainty_and_the_repair_retry() {
+    use mac_worker::test_support::{
+        core::error::{ProcessError, WorkerError},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    };
+    use native_owner::*;
+    struct Offline;
+    impl ProcessRunner for Offline {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == "ls-remote") {
+                return Err(ProcessError::Cancelled.into());
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    retention_close(&f);
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = HostIntegrationService::new(&f.store, &Offline, &f.runtime);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let uncertain = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(uncertain.state, IntegrationStatus::RetryWait);
+    assert_eq!(
+        uncertain.blocked_code,
+        Some(IntegrationCode::IntegrationNetwork)
+    );
+    let record = state.load(f.record.task_id).unwrap().unwrap();
+    assert_eq!(record.phase_retries[0].phase, IntegrationPhase::Repair);
+    assert_eq!(
+        record.phase_retries[0].code,
+        IntegrationCode::IntegrationNetwork
+    );
+    assert!(record.receipt.is_none());
+    assert!(turns.imports(f.record.task_id).is_empty());
+    assert!(!f.workspace().exists());
 }
 
 #[test]
@@ -1121,7 +1313,7 @@ fn legacy_closed_only_observes_and_settles_retained_ancestry() {
         assert!(rig.host.calls.lock().unwrap().iter().all(|r| matches!(
             r.action,
             HostIntegrationAction::Step {
-                step: IntegrationStep::Fetch | IntegrationStep::Repair,
+                step: IntegrationStep::Repair,
                 ..
             }
         )));
@@ -2087,7 +2279,7 @@ fn legacy_closed_recovery_does_not_reclaim_an_unconfirmed_actor_and_backs_off_fa
     assert!(rig.host.calls.lock().unwrap().iter().all(|r| matches!(
         r.action,
         HostIntegrationAction::Step {
-            step: IntegrationStep::Fetch,
+            step: IntegrationStep::Repair,
             ..
         }
     )));

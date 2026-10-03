@@ -1322,10 +1322,21 @@ impl<'a> IntegrationCoordinator<'a> {
         match self.host.execute(&request) {
             Ok(response) => {
                 response.validate_for(&request)?;
-                Ok(Some(response))
+                if let HostIntegrationResponse::Blocked {
+                    code,
+                    retry_exhausted,
+                    ..
+                } = response
+                {
+                    record.snapshot.retry_exhausted = retry_exhausted;
+                    self.retry(record, phase, code)?;
+                    Ok(None)
+                } else {
+                    Ok(Some(response))
+                }
             }
-            Err(_) => {
-                self.retry(record, phase, IntegrationCode::IntegrationWorkerOffline)?;
+            Err(error) => {
+                self.retry(record, phase, Self::host_error_code(&error))?;
                 Ok(None)
             }
         }
@@ -1337,7 +1348,7 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.receipt.is_some() {
             return self.finish_receipt(record, true);
         }
-        if let Some(response) = self.closed_observation(&mut record, IntegrationStep::Fetch)? {
+        if let Some(response) = self.closed_observation(&mut record, IntegrationStep::Repair)? {
             if let HostIntegrationResponse::Integrated { receipt, .. } = response {
                 self.validate_receipt(&record, &receipt)?;
                 record.snapshot.merge_oid = receipt.merge_oid.clone();
