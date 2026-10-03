@@ -1448,6 +1448,26 @@ impl<'a> TurnRunner<'a> {
                                 initial_record.meta().agent(),
                             )?;
                         }
+                        if let Some(policy) =
+                            crate::integration::store::RootedIntegrationState::read_task(
+                                self.paths, task_id,
+                            )?
+                            .0
+                        {
+                            use crate::integration::contracts::{
+                                HostIntegrationAction, HostIntegrationRequest, IntegrationHost,
+                                IntegrationRevision,
+                            };
+                            crate::integration::remote::RemoteIntegrationHost::new(&remote, worker)
+                                .execute(&HostIntegrationRequest {
+                                    protocol_version: crate::protocol::PROTOCOL_VERSION,
+                                    task_id,
+                                    integration_id: None,
+                                    epoch: 0,
+                                    revision: IntegrationRevision(0),
+                                    action: HostIntegrationAction::Arm { policy },
+                                })?;
+                        }
                         remote.task_status(
                             worker,
                             &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -3151,7 +3171,7 @@ fn now_millis() -> Result<u64, WorkerError> {
         .map_err(|_| WorkerError::Io(std::io::Error::other("system clock is out of range")))
 }
 
-fn current_process_identity() -> Result<ProcessIdentity, WorkerError> {
+pub(crate) fn current_process_identity() -> Result<ProcessIdentity, WorkerError> {
     let pid = std::process::id();
     SystemProcessInspector
         .identity_for_pid(pid)

@@ -1651,6 +1651,9 @@ pub mod testing {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("target/integration-git-fixtures")
                 .join(uuid::Uuid::new_v4().to_string());
+            Self::at(root)
+        }
+        pub fn at(root: PathBuf) -> Self {
             fs::create_dir_all(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let store = HostStore::open(&root.join("host")).unwrap();

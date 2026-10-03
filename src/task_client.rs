@@ -1512,6 +1512,7 @@ impl<'a> TaskClient<'a> {
         validate_preference(self.config, &request.preference)?;
 
         let identity = GitIdentity::new(DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL)?;
+        let mut direct_integration = None;
         let (
             context,
             limits,
@@ -1735,7 +1736,17 @@ impl<'a> TaskClient<'a> {
                 let initial =
                     ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
                 let settings = &initial.settings.task;
-                crate::integration::config::reject_unrouted_integration(settings, &request)?;
+                let integrating = crate::integration::config::resolve_integration_settings(
+                    &settings.into(),
+                    None,
+                    &request.integrate,
+                    request.verify_merge,
+                )?;
+                if integrating.is_some() && request.wip {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationWipBase.error(),
+                    );
+                }
                 let limits = effective_task_limits(&request.limits, settings)?;
                 let env_profile = request
                     .env_profile
@@ -1754,7 +1765,9 @@ impl<'a> TaskClient<'a> {
                         &initial.context,
                     )?;
                 }
-                let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
+                let needs_origin = integrating.is_some()
+                    || source_name == "origin"
+                    || publish.contains(&PublishMode::Push);
                 let origin_url = if needs_origin {
                     initial.origin.clone().ok_or_else(|| {
                         task_error("INVALID_ORIGIN", "project origin is not configured")
@@ -1776,13 +1789,33 @@ impl<'a> TaskClient<'a> {
                         "publish push requires a committed base",
                     ));
                 }
-                let requirements = task_requirements(
+                let mut requirements = task_requirements(
                     &initial.requirements,
                     request.agent,
                     env_profile.as_deref(),
                     source.origin_requirement()?.as_deref(),
                 );
                 let observations = self.observe_admission(&request.preference)?;
+                if integrating.is_some() {
+                    let requirement =
+                        format!("feature:{}", crate::features::HOST_FEATURE_INTEGRATION);
+                    if !observations
+                        .iter()
+                        .any(|o| o.capabilities().contains(&requirement))
+                    {
+                        return Err(crate::integration::contracts::integration_unavailable());
+                    }
+                    requirements.push(requirement);
+                    let host = if crate::project::canonical_file_origin(&origin_url)?.is_some() {
+                        "file".to_owned()
+                    } else {
+                        crate::project::origin_host(&origin_url)?
+                    };
+                    let token = format!("origin:{host}");
+                    if !requirements.contains(&token) {
+                        requirements.push(token);
+                    }
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
@@ -1813,7 +1846,39 @@ impl<'a> TaskClient<'a> {
 
                 let task_id = task_id_override.unwrap_or_else(TaskId::generate);
                 let turn_id = turn_id_override.unwrap_or_else(TurnId::generate);
-                let prepared_base = if let TaskSource::Origin { url } = &source {
+                let frozen_policy = crate::integration::config::freeze_source_policy(
+                    self.runner,
+                    &initial,
+                    &request.integrate,
+                    request.verify_merge,
+                    request.close_policy,
+                    integrating
+                        .as_ref()
+                        .map(|_| {
+                            TransferRepo::resolve_base_oid(
+                                self.runner,
+                                &initial.context,
+                                &request.base,
+                            )
+                        })
+                        .transpose()?,
+                    None,
+                )?;
+                if let Some(policy) = &frozen_policy {
+                    if publish_branch.as_ref() == Some(&policy.target) {
+                        return Err(crate::integration::contracts::IntegrationCode::IntegrationPublishTargetCollision.error());
+                    }
+                    request.close_policy = crate::task::ClosePolicy::Never;
+                }
+                let prepared_base = if let Some(policy) = &frozen_policy {
+                    PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_pinned(
+                        policy
+                            .base_oid
+                            .clone()
+                            .ok_or_else(crate::integration::contracts::integration_unavailable)?,
+                        false,
+                    ))
+                } else if let TaskSource::Origin { url } = &source {
                     let oid = TransferRepo::resolve_base_oid(
                         self.runner,
                         &initial.context,
@@ -1827,6 +1892,7 @@ impl<'a> TaskClient<'a> {
                         request_base: request.base.clone(),
                     }
                 };
+                direct_integration = frozen_policy;
                 let policy = permission_policy(settings, request.agent);
                 (
                     initial.context,
@@ -1908,6 +1974,11 @@ impl<'a> TaskClient<'a> {
         } else {
             None
         };
+        if let Some(policy) = &direct_integration {
+            crate::integration::store::RootedIntegrationState::publish_task_policy(
+                self.paths, task_id, policy,
+            )?;
+        }
         if let Some(import) = &request.session_import {
             add_session_requirements(&mut requirements, import);
             let observations = self.observe_admission(&request.preference)?;

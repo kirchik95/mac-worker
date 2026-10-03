@@ -114,6 +114,14 @@ fn reference(p: &PreparedIntegrationTurn, record: &IntegrationRecord) -> Result<
     Ok(())
 }
 impl RootedIntegrationState {
+    pub(crate) fn publish_task_policy(
+        paths: &PathLayout,
+        task: TaskId,
+        policy: &FrozenIntegrationPolicy,
+    ) -> Result<(), WorkerError> {
+        let state = Self::open(paths, Arc::new(super::host::HostIntegrationRuntime::new()?))?;
+        state.publish_policy(task, policy)
+    }
     pub fn open(
         paths: &PathLayout,
         runtime: Arc<dyn IntegrationRuntime>,

@@ -276,3 +276,130 @@ fn disabled_submit_and_dag_remain_accepted_by_copied_baseline_decoders() {
     wrapped["integration"] = serde_json::to_value(sample_policy("main")).unwrap();
     assert!(serde_json::from_value::<baseline::FrozenSubmitBody>(wrapped).is_err());
 }
+
+fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
+    let f = super::session_import_e2e::Fixture::new();
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    f.project
+        .git(&["clone", "--bare", ".", origin.to_str().unwrap()]);
+    f.project.git(&[
+        "remote",
+        "add",
+        "origin",
+        &format!("file://{}", origin.display()),
+    ]);
+    let mut config = std::fs::read_to_string(&f.config).unwrap();
+    config.push_str("capabilities = ['origin:file']\n");
+    std::fs::write(&f.config, config).unwrap();
+    if capable {
+        let ssh = std::fs::read_to_string(&f.ssh).unwrap().replace(
+            "probe.update(memory_pressure",
+            "probe['features'].append('task.integration')\n    probe.update(memory_pressure",
+        );
+        std::fs::write(&f.ssh, ssh).unwrap();
+    }
+    f
+}
+
+#[test]
+fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
+    use mac_worker::test_support::session::SessionAgent;
+    let f = integration_fixture(true);
+    let source = f.capture_fixture(SessionAgent::Codex);
+    let before = std::fs::read(&source).unwrap();
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent).unwrap();
+    let check = "find \"$HOME/.local/share/mac-worker/host/tasks\" -name policy.json > \"$HOME/armed-policies\"\n[ -s \"$HOME/armed-policies\" ] || exit 94\n";
+    std::fs::write(
+        &agent,
+        script.replace(
+            "printf '%s\\n' \"$@\" > \"$HOME/argv\"",
+            &format!("{check}printf '%s\\n' \"$@\" > \"$HOME/argv\""),
+        ),
+    )
+    .unwrap();
+    let output = f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "continue safely",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]);
+    assert!(
+        output.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|v| v.get("session_import").is_some())
+        .unwrap();
+    let task: TaskId = report["task_id"].as_str().unwrap().parse().unwrap();
+    let owner_policy = f
+        .laptop
+        .join(".local/state/mac-worker/integrations/tasks")
+        .join(task.to_string())
+        .join("policy.json");
+    let policy: FrozenIntegrationPolicy =
+        serde_json::from_slice(&std::fs::read(owner_policy).unwrap()).unwrap();
+    assert_eq!(policy.requested_close, ClosePolicy::Never);
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    let prepare = journal.find("host task-prepare").unwrap();
+    let arm = journal.find("host task-integration\n").unwrap();
+    let launch = journal.find("host task-turn").unwrap();
+    assert!(prepare < arm && arm < launch, "{journal}");
+    let store = mac_worker::test_support::host::store::HostStore::open(&f.host_root()).unwrap();
+    let task_dir = store.task_dir(&policy.project_id, task).unwrap();
+    let receipt: Value =
+        serde_json::from_slice(&std::fs::read(task_dir.join("session-import.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["stage"], "complete");
+    assert_eq!(
+        std::fs::read(source).unwrap(),
+        before,
+        "integration recaptured the source transcript"
+    );
+}
+
+#[test]
+fn direct_missing_helper_feature_refuses_before_pins_and_admission() {
+    let f = integration_fixture(false);
+    let output = f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--prompt",
+        "work",
+        "--integrate",
+        "main",
+        "--worker",
+        "fixture",
+        "--no-wait",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("INTEGRATION_UNAVAILABLE"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let tasks = mac_worker::test_support::client_state::ClientStateStore::open(
+        &f.laptop.join(".local/state/mac-worker"),
+    )
+    .unwrap();
+    assert!(tasks.list_tasks().unwrap().is_empty());
+    assert!(!f.laptop.join(".cache/mac-worker/transfer").exists());
+    assert!(!f.host.join("argv").exists());
+}

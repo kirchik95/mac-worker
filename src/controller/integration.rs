@@ -14,7 +14,7 @@ fn invalid() -> WorkerError {
     IntegrationCode::IntegrationStateInvalid.error()
 }
 
-fn add_requirements(
+pub(crate) fn add_requirements(
     requires: &mut Vec<String>,
     policy: &FrozenIntegrationPolicy,
 ) -> Result<(), WorkerError> {

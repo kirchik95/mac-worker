@@ -197,6 +197,80 @@ fn fetch_only_integrating_batch_freezes_own_origin_before_any_task_effect() {
 }
 
 #[test]
+fn host_command_arms_the_prepared_task_without_running_a_merge() {
+    use mac_worker::test_support::{
+        cli::{Command, HostCommand, from_parts},
+        runtime::{RuntimeContext, run_with_stdio_in_context},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut f = GitIntegrationFixture::at(root.join("data/mac-worker"));
+    f.commit_base();
+    f.commit_task();
+    let origin_before = f.origin_tip();
+    let runtime = RuntimeContext::isolated(
+        [("XDG_DATA_HOME".into(), root.join("data").into_os_string())].into(),
+        root.join("home"),
+        root.clone(),
+    );
+    let request = HostIntegrationRequest {
+        protocol_version: 7,
+        task_id: f.record.task_id,
+        integration_id: None,
+        epoch: 0,
+        revision: IntegrationRevision(0),
+        action: HostIntegrationAction::Arm {
+            policy: f.record.policy.clone(),
+        },
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_with_stdio_in_context(
+        from_parts(
+            None,
+            true,
+            Command::Host {
+                command: HostCommand::TaskIntegration,
+            },
+        ),
+        &SystemProcessRunner,
+        &runtime,
+        &mut std::io::Cursor::new(encode_host_request(&request).unwrap()),
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(
+        code,
+        0,
+        "out={} err={}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    let response: HostIntegrationResponse = serde_json::from_slice(&out).unwrap();
+    response.validate_for(&request).unwrap();
+    assert!(matches!(
+        response,
+        HostIntegrationResponse::Progress { snapshot: None, .. }
+    ));
+    let path = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .join("integration/policy.json");
+    let policy: FrozenIntegrationPolicy =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(policy, f.record.policy);
+    assert_eq!(f.origin_tip(), origin_before);
+    assert!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state()
+            == mac_worker::test_support::task::model::TaskState::Open
+    );
+}
+
+#[test]
 fn controller_companion_read_contract_is_separate_strict_and_bounded() {
     let result = IntegrationReadResult {
         schema_version: 1,

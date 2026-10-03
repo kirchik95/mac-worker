@@ -16,6 +16,47 @@ pub struct HostIntegrationService<'a> {
     runner: &'a dyn ProcessRunner,
     runtime: &'a dyn IntegrationRuntime,
 }
+/// Native helper runtime. Owner phase/drain admission is supplied separately
+/// by the detached owner driver, never by this host endpoint.
+pub(crate) struct HostIntegrationRuntime(crate::job::ProcessIdentity);
+impl HostIntegrationRuntime {
+    pub(crate) fn new() -> Result<Self, WorkerError> {
+        Ok(Self(crate::turn_runner::current_process_identity()?))
+    }
+}
+impl IntegrationRuntime for HostIntegrationRuntime {
+    fn now_millis(&self) -> u64 {
+        crate::controller::leader::now_millis().unwrap_or(0)
+    }
+    fn actor(&self) -> crate::job::ProcessIdentity {
+        self.0
+    }
+    fn actor_verdict(
+        &self,
+        actor: crate::job::ProcessIdentity,
+    ) -> crate::client_state::RunnerLivenessVerdict {
+        use crate::client_state::RunnerLivenessVerdict;
+        use crate::supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector};
+        match SystemProcessInspector.observe(actor) {
+            ProcessObservation::Matching { .. } => RunnerLivenessVerdict::Live,
+            ProcessObservation::Reused => RunnerLivenessVerdict::Exited,
+            ProcessObservation::Absent => match SystemProcessInspector.observe(actor) {
+                ProcessObservation::Absent | ProcessObservation::Reused => {
+                    RunnerLivenessVerdict::Exited
+                }
+                _ => RunnerLivenessVerdict::Unverifiable,
+            },
+            ProcessObservation::Ambiguous => RunnerLivenessVerdict::Unverifiable,
+        }
+    }
+    fn begin_phase(
+        &self,
+        _key: &IntegrationPhaseKey,
+    ) -> Result<IntegrationDriveAdmission, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn reach(&self, _point: IntegrationHook) {}
+}
 impl<'a> HostIntegrationService<'a> {
     pub fn new(
         store: &'a HostStore,

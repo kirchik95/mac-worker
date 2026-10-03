@@ -2837,6 +2837,25 @@ fn run_command_with_stdio_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::TaskIntegration
+        }
+    ) {
+        return run_host_task_control_endpoint(
+            cli.config,
+            runtime,
+            runner,
+            stdin,
+            stdout,
+            |request: crate::integration::contracts::HostIntegrationRequest, store, runner| {
+                let native = crate::integration::host::HostIntegrationRuntime::new()?;
+                crate::integration::host::HostIntegrationService::new(store, runner, &native)
+                    .execute(&request)
+            },
+        );
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::TaskStatus
         }
     ) {
