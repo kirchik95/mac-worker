@@ -967,6 +967,8 @@ pub trait JournalProvider: Send + Sync {
 /// Validated state facts, separate from the title-free journal envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub state: String,
@@ -986,6 +988,8 @@ pub struct TaskFacts {
 /// Tolerant wire facts; all required identity/proof fields remain required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskFactsWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub state: String,
@@ -1030,6 +1034,9 @@ impl TaskFacts {
         }
     }
     pub fn validate(&self) -> Result<(), WorkerError> {
+        if let Some(annotation) = &self.integration {
+            crate::integration::contracts::ValidateIntegration::validate(annotation)?;
+        }
         if self.state.is_empty()
             || self.state.len() > 32
             || !self
@@ -1383,6 +1390,7 @@ impl TryFrom<TaskFactsWire> for TaskFacts {
         });
         let unknown_outcome = wire.outcome.is_some() && outcome.is_none();
         let mut facts = Self {
+            integration: wire.integration,
             task_id: wire.task_id,
             run_id: wire.run_id,
             state: wire.state,

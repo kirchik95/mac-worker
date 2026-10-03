@@ -1005,6 +1005,7 @@ impl TaskFacts {
         quiescent: bool,
     ) -> Self {
         let mut facts = Self {
+            integration: None,
             task_id,
             run_id: None,
             state: "open".into(),
@@ -1425,6 +1426,7 @@ mod tests {
     #[test]
     fn review_completed_proof_never_upgrades_unknown_outcome() {
         let wire = TaskFactsWire {
+            integration: None,
             task_id: id(2),
             run_id: None,
             state: "abandoned".into(),

@@ -87,6 +87,7 @@ mod herdr_reporter;
 mod host_store;
 mod inputs;
 mod install;
+mod integration;
 mod job;
 mod job_service;
 mod keychain;

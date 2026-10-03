@@ -348,6 +348,7 @@ mod policy {
         outcome: Option<SafeOutcome>,
     ) -> TaskFacts {
         TaskFacts {
+            integration: None,
             task_id,
             run_id: None,
             state: state.to_owned(),

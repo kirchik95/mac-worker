@@ -823,6 +823,7 @@ pub fn record_facts(
         TaskState::Lost => "lost",
     };
     let facts = TaskFacts::try_new(TaskFactsWire {
+        integration: None,
         task_id: record.meta().task_id(),
         run_id: record.meta().run_id(),
         state: state.into(),

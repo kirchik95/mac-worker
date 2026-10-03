@@ -1,3 +1,4 @@
+mod controller_integration_contracts;
 #[path = "../support/mod.rs"]
 mod support;
 

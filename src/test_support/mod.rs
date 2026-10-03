@@ -9,6 +9,7 @@ pub mod core;
 pub mod dashboard;
 pub mod events;
 pub mod host;
+pub mod integration;
 pub mod runtime;
 pub mod session;
 pub mod task;
