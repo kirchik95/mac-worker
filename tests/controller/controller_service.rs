@@ -45,6 +45,48 @@ const TARGET: &str = "gui/501/com.mac-worker.controller";
 const PLIST: &str = "Library/LaunchAgents/com.mac-worker.controller.plist";
 const LOG: &str = "Library/Logs/mac-worker/controller.log";
 
+#[test]
+fn uninstall_persists_the_integration_gate_before_unloading_the_service() {
+    struct GateChecked<'a> {
+        base: Launchctl,
+        root: &'a Path,
+    }
+    impl ProcessRunner for GateChecked<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.first().is_some_and(|arg| arg == "bootout") {
+                assert!(
+                    mac_worker::test_support::controller::drain::is_drained(self.root).unwrap(),
+                    "service unloaded before the admission valve closed"
+                );
+                let gate: serde_json::Value = serde_json::from_slice(
+                    &fs::read(self.root.join("integration-gate.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(gate["windows"][0]["reason"], "controller_disabled");
+            }
+            self.base.run(request)
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+        None,
+        &Default::default(),
+        &home,
+    )
+    .unwrap();
+    let root = paths.controller_state_root();
+    let runner = GateChecked {
+        base: Launchctl::loaded(),
+        root: &root,
+    };
+    manage(&home, 501, &runner, ServiceAction::Uninstall).unwrap();
+    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    // A service/owner reopen never clears the operator's persisted valve.
+    mac_worker::test_support::controller::ControllerStore::open(&root).unwrap();
+    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+}
+
 #[derive(Default)]
 struct Launchctl {
     loaded: Mutex<bool>,

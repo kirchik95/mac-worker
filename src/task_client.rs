@@ -1247,7 +1247,6 @@ impl<'a> TaskClient<'a> {
     }
 
     /// T6 injects the owner ports; disabled callers retain the ordinary path.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(mut self, coordinator: &'a IntegrationCoordinator<'a>) -> Self {
         self.integration = Some(coordinator);
         self
@@ -1291,20 +1290,26 @@ impl<'a> TaskClient<'a> {
         if !self.integration_enabled(task)? {
             return Ok(record.clone());
         }
-        let native;
-        let coordinator;
         let coordinator = match self.integration {
             Some(coordinator) => coordinator,
             None => {
-                native = crate::integration::runner::OwnerIntegration::new(
+                let native = crate::integration::runner::OwnerIntegration::new(
                     self.runner,
                     self.config,
                     self.paths,
                     self.client_state,
                     self.executor,
                 )?;
-                coordinator = native.coordinator();
-                &coordinator
+                let coordinator = native.coordinator();
+                return TaskClient::new(
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    self.client_state,
+                    self.executor,
+                )
+                .with_integration(&coordinator)
+                .before_integration_mutation(record, operation);
             }
         };
         let Some(snapshot) = coordinator.snapshot(task)? else {
@@ -4266,6 +4271,15 @@ impl<'a> TaskClient<'a> {
             ));
         }
         prepared.validate_self_consistency()?;
+        let Some(auxiliary_permit) = crate::integration::runner::auxiliary_launch_permit(
+            self.paths,
+            self.client_state,
+            task_id,
+            turn_id,
+        )?
+        else {
+            return self.report_from_record(&self.client_state.load_task(task_id)?);
+        };
         let current = self.client_state.load_task(task_id)?;
         // Auxiliary admission has its own authoritative, persisted wrapper.
         if let Some(auxiliary) =
@@ -4296,6 +4310,7 @@ impl<'a> TaskClient<'a> {
             )?;
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
+            drop(auxiliary_permit);
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
         let current = self.resolve_followup_intent(prepared, current)?;
@@ -4395,13 +4410,16 @@ impl<'a> TaskClient<'a> {
                     .client_state
                     .update_task_if_current(&current, rebased.clone())?
                 {
+                    drop(auxiliary_permit);
                     return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
                 }
                 rebased
             } else {
+                drop(auxiliary_permit);
                 return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
             }
         };
+        drop(auxiliary_permit);
         let entry = match self.client_state.queue_entry_for_task_turn(task_id)? {
             Some(existing) if existing.job_id() == turn_id => existing,
             Some(_) => {
@@ -4466,7 +4484,9 @@ impl<'a> TaskClient<'a> {
         if record.tombstone.is_some()
             || !matches!(
                 record.snapshot.state,
-                IntegrationStatus::Resolving | IntegrationStatus::Verifying
+                IntegrationStatus::Resolving
+                    | IntegrationStatus::Verifying
+                    | IntegrationStatus::Parked
             )
         {
             return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
@@ -6024,6 +6044,7 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
+        let task_id = record.meta().task_id();
         let project = self.load_project_for_record(record)?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
@@ -6038,13 +6059,30 @@ impl<'a> TaskClient<'a> {
                     .and_then(|job_run_id| QueueRunReference::new(job_run_id, run.max_parallel()))
             })
             .transpose()?;
+        let mut requirements = task_meta_requirements(&project.requirements, record.meta());
+        if RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?.is_some() {
+            let (policy, _) = RootedIntegrationState::read_task(self.paths, task_id)?;
+            let policy = policy.ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+            crate::controller::integration::add_requirements(&mut requirements, &policy)?;
+            requirements.sort();
+            requirements.dedup();
+        }
+        let Some(_permit) = crate::integration::runner::auxiliary_launch_permit(
+            self.paths,
+            self.client_state,
+            task_id,
+            turn_id,
+        )?
+        else {
+            return Err(IntegrationCode::IntegrationUnavailable.error());
+        };
         self.client_state.enqueue(QueueEntry::new(
             turn_id,
             self.client_state.client_id(),
             record.meta().project_id().to_owned(),
             record.meta().worktree_id().to_owned(),
             command.summary()?,
-            task_meta_requirements(&project.requirements, record.meta()),
+            requirements,
             preference,
             QueueEntryKind::TaskTurn,
             run,

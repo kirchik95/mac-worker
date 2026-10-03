@@ -932,6 +932,26 @@ impl<'a> TurnRunner<'a> {
                 QueueState::Dispatching { dispatch_owner, .. }
                     if *dispatch_owner == runner_owner =>
                 {
+                    let Some(_auxiliary_permit) =
+                        crate::integration::runner::auxiliary_launch_permit(
+                            self.paths,
+                            self.client_state,
+                            task_id,
+                            turn_id,
+                        )?
+                    else {
+                        std::thread::sleep(WAIT_POLL);
+                        continue;
+                    };
+                    let Some(_permit) = crate::controller::drain::launch_permit(
+                        &self.paths.controller_state_root(),
+                        self.client_state.wait_deadline(),
+                    )?
+                    else {
+                        drop(_auxiliary_permit);
+                        std::thread::sleep(WAIT_POLL);
+                        continue;
+                    };
                     return Ok((task_id, turn_id, *dispatch_owner));
                 }
                 QueueState::Dispatching { .. } => {
@@ -978,13 +998,36 @@ impl<'a> TurnRunner<'a> {
                             })
                             .map(|candidate| candidate.worker_name().to_owned())
                             .collect::<Vec<_>>();
-                    if let Some(claim) = self.client_state.claim_task_turn_with_slot_ceilings(
-                        runner_owner,
-                        turn_id,
-                        &ranked,
-                        now_millis()?,
-                        &self.config.worker_slot_ceilings(),
-                    )? {
+                    let claim = {
+                        let Some(auxiliary_permit) =
+                            crate::integration::runner::auxiliary_launch_permit(
+                                self.paths,
+                                self.client_state,
+                                task_id,
+                                turn_id,
+                            )?
+                        else {
+                            std::thread::sleep(WAIT_POLL);
+                            continue;
+                        };
+                        let Some(_permit) = crate::controller::drain::launch_permit(
+                            &self.paths.controller_state_root(),
+                            self.client_state.wait_deadline(),
+                        )?
+                        else {
+                            drop(auxiliary_permit);
+                            std::thread::sleep(WAIT_POLL);
+                            continue;
+                        };
+                        self.client_state.claim_task_turn_with_slot_ceilings(
+                            runner_owner,
+                            turn_id,
+                            &ranked,
+                            now_millis()?,
+                            &self.config.worker_slot_ceilings(),
+                        )?
+                    };
+                    if let Some(claim) = claim {
                         return match claim.entry().state() {
                             QueueState::Dispatching { dispatch_owner, .. } => {
                                 Ok((task_id, turn_id, *dispatch_owner))
@@ -1061,12 +1104,33 @@ impl<'a> TurnRunner<'a> {
         else {
             return Ok(None);
         };
-        self.client_state.claim_parked_for_waiting_runner(
+        let mut eligible = std::collections::HashSet::new();
+        let mut auxiliary_permits = Vec::new();
+        for entry in self.client_state.queue_snapshot()?.entries() {
+            if !matches!(entry.state(), QueueState::Parked) {
+                continue;
+            }
+            let recipient = self
+                .client_state
+                .task_id_for_turn(entry.job_id())?
+                .ok_or_else(|| task_error("TASK_INCONSISTENT", "parked turn has no task"))?;
+            if let Some(permit) = crate::integration::runner::auxiliary_launch_permit(
+                self.paths,
+                self.client_state,
+                recipient,
+                entry.job_id(),
+            )? {
+                auxiliary_permits.push(permit);
+                eligible.insert(entry.job_id());
+            }
+        }
+        self.client_state.claim_parked_filtered_for_waiting_runner(
             task_id,
             turn_id,
             owner,
             observations,
             now_millis()?,
+            Some(&eligible),
         )
     }
 
@@ -2684,6 +2748,11 @@ pub fn start_runner_with_reservation(
     exclude_reserver: bool,
 ) -> Result<RunnerStart, WorkerError> {
     let _hints = client_state.event_scope();
+    let Some(_auxiliary_permit) =
+        crate::integration::runner::auxiliary_launch_permit(paths, client_state, task_id, turn_id)?
+    else {
+        return Ok(RunnerStart::Drained);
+    };
     let Some(_drain_permit) = crate::controller::drain::launch_permit(
         &paths.controller_state_root(),
         client_state.wait_deadline(),

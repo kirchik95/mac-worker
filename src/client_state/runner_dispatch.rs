@@ -12,6 +12,25 @@ impl ClientStateStore {
         observations: &[CandidateObservation],
         now_millis: u64,
     ) -> Result<Option<(TaskId, QueueClaim)>, WorkerError> {
+        self.claim_parked_filtered_for_waiting_runner(
+            task_id,
+            turn_id,
+            owner,
+            observations,
+            now_millis,
+            None,
+        )
+    }
+
+    pub(crate) fn claim_parked_filtered_for_waiting_runner(
+        &self,
+        task_id: TaskId,
+        turn_id: TurnId,
+        owner: ProcessIdentity,
+        observations: &[CandidateObservation],
+        now_millis: u64,
+        eligible: Option<&std::collections::HashSet<TurnId>>,
+    ) -> Result<Option<(TaskId, QueueClaim)>, WorkerError> {
         owner.validate()?;
         if now_millis == 0 {
             return Err(queue_error(
@@ -75,6 +94,7 @@ impl ClientStateStore {
         let mut selected = None;
         for (index, entry) in snapshot.entries.iter().enumerate() {
             if !matches!(entry.state(), QueueState::Parked)
+                || eligible.is_some_and(|ids| !ids.contains(&entry.job_id()))
                 || !self.task_turn_is_runnable(entry, &tasks)?
                 || !self.task_context_available_from(entry, source, &tasks)?
             {

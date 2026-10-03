@@ -75,17 +75,15 @@ impl IntegrationRuntime for OwnerRuntime {
                 effective_at_millis: self.now_millis(),
             }));
         }
-        match crate::controller::drain::integration_permit(
+        match crate::controller::drain::integration_admission(
             &self.paths.controller_state_root(),
             self.client.wait_deadline(),
+            self.now_millis(),
         )? {
-            Some(permit) => Ok(IntegrationDriveAdmission::Permit(
+            Ok(permit) => Ok(IntegrationDriveAdmission::Permit(
                 IntegrationPhasePermit::with_guard(key.clone(), Box::new(permit)),
             )),
-            None => Ok(IntegrationDriveAdmission::Park(IntegrationPauseEvidence {
-                reason: IntegrationPauseReason::ControllerDrained,
-                effective_at_millis: self.now_millis(),
-            })),
+            Err(pause) => Ok(IntegrationDriveAdmission::Park(pause)),
         }
     }
     fn reach(&self, _: IntegrationHook) {}
@@ -378,6 +376,7 @@ impl<'a> OwnerIntegration<'a> {
             self.runtime.as_ref(),
             &self.ports,
         )
+        .with_owner_gate(self.ports.paths)
     }
     pub(crate) fn stage(&self, task: TaskId) -> Result<(), WorkerError> {
         if !self.coordinator().configured(task)? {
@@ -611,6 +610,88 @@ fn read_position(
     }
 }
 
+/// The guard spans only local purpose/budget ownership and queue handoff.
+/// Ordinary turns retain their existing valve and wire behavior.
+pub(crate) struct AuxiliaryLaunchPermit {
+    _phase: Option<IntegrationPhasePermit>,
+}
+pub(crate) fn auxiliary_launch_permit(
+    paths: &PathLayout,
+    client: &ClientStateStore,
+    task: TaskId,
+    turn: TurnId,
+) -> Result<Option<AuxiliaryLaunchPermit>, WorkerError> {
+    let Some(prepared) = super::store::RootedIntegrationState::read_auxiliary(paths, task, turn)?
+    else {
+        return Ok(Some(AuxiliaryLaunchPermit { _phase: None }));
+    };
+    let runtime = Arc::new(OwnerRuntime::new(paths, client)?);
+    let state = super::store::RootedIntegrationState::open(paths, runtime.clone())?;
+    let mut record = state.load(task)?.ok_or_else(invalid)?;
+    prepared.validate_for(&record)?;
+    if record.tombstone.is_some() {
+        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+    }
+    if record.snapshot.state == IntegrationStatus::Blocked {
+        return Err(record
+            .snapshot
+            .blocked_code
+            .unwrap_or(IntegrationCode::IntegrationStateInvalid)
+            .error());
+    }
+    let key = IntegrationPhaseKey {
+        task,
+        intent: record.snapshot.integration_id,
+        epoch: record.snapshot.epoch,
+        revision: record.snapshot.revision,
+        phase: IntegrationPhase::AuxiliaryAdmission,
+    };
+    let permit = match runtime.begin_phase(&key)? {
+        IntegrationDriveAdmission::Permit(p) => p,
+        IntegrationDriveAdmission::Park(pause) => {
+            super::coordinator::park_record(
+                &state,
+                runtime.as_ref(),
+                Some(paths),
+                &mut record,
+                pause,
+            )?;
+            return Ok(None);
+        }
+    };
+    super::coordinator::extend_elapsed_pauses(&state, runtime.as_ref(), paths, &mut record)?;
+    if record.snapshot.state == IntegrationStatus::Parked {
+        super::coordinator::resume_record(&state, runtime.as_ref(), Some(paths), &mut record)?;
+    }
+    if !matches!(
+        record.snapshot.state,
+        IntegrationStatus::Resolving | IntegrationStatus::Verifying
+    ) {
+        return Err(invalid());
+    }
+    let accepted =
+        crate::runner_log::snapshot(&paths.state, task, turn)?.is_some_and(|s| s.accepted);
+    if !accepted {
+        let now = runtime.now_millis();
+        let deadline = *record
+            .admission_deadline_millis
+            .get_or_insert(now.saturating_add(AUXILIARY_ADMISSION_MILLIS));
+        if deadline <= now {
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationTurnQueueTimeout);
+            record.snapshot.resume_state = None;
+            record.admission_deadline_millis = None;
+            record.remaining_admission_millis = None;
+            super::coordinator::persist_record(&state, runtime.as_ref(), &mut record)?;
+            return Err(IntegrationCode::IntegrationTurnQueueTimeout.error());
+        }
+        super::coordinator::persist_record(&state, runtime.as_ref(), &mut record)?;
+    }
+    Ok(Some(AuxiliaryLaunchPermit {
+        _phase: Some(permit),
+    }))
+}
+
 pub(crate) fn recover_selected(
     runner: &dyn ProcessRunner,
     config: &Config,
@@ -672,5 +753,398 @@ impl<'a> IntegrationRunner<'a> {
             }
         }
         Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod native_launch_tests {
+    use super::*;
+    use crate::{
+        integration::testing::*,
+        job::{CommandSpec, QueueEntry, QueueEntryKind},
+        scheduler::WorkerPreference,
+        task::RunnerIdentity,
+    };
+    use std::sync::atomic::AtomicU64;
+
+    struct NeverSpawn;
+    impl RunnerExecutor for NeverSpawn {
+        fn start(
+            &self,
+            _: &PathLayout,
+            _: TaskId,
+            _: TurnId,
+        ) -> Result<RunnerIdentity, WorkerError> {
+            panic!("expired auxiliary reached the executor")
+        }
+    }
+    fn paths(base: &std::path::Path) -> PathLayout {
+        PathLayout {
+            config: base.join("config"),
+            state: base.join("state"),
+            data: base.join("data"),
+            cache: base.join("cache"),
+        }
+    }
+
+    #[test]
+    fn late_native_phase_observes_the_persisted_pause_time() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        crate::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.controller_state_root().join("integration-gate.json")).unwrap(),
+        )
+        .unwrap();
+        let effective = metadata["windows"][0]["effective_at_millis"]
+            .as_u64()
+            .unwrap();
+        let client = client.with_admission_clock(Arc::new(move || Ok(effective + 900_000)));
+        let runtime = OwnerRuntime::new(&paths, &client).unwrap();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        let key = IntegrationPhaseKey {
+            task: record.task_id,
+            intent: record.snapshot.integration_id,
+            epoch: 0,
+            revision: record.snapshot.revision,
+            phase: IntegrationPhase::Fetch,
+        };
+        match runtime.begin_phase(&key).unwrap() {
+            IntegrationDriveAdmission::Park(pause) => {
+                assert_eq!(pause.effective_at_millis, effective)
+            }
+            _ => panic!("drained phase admitted"),
+        }
+        crate::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+        let again: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.controller_state_root().join("integration-gate.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again, metadata, "repeated drain renewed its effective time");
+    }
+
+    fn queued_auxiliary(
+        paths: &PathLayout,
+        client: &ClientStateStore,
+        deadline: u64,
+    ) -> (
+        super::super::store::RootedIntegrationState,
+        IntegrationRecord,
+        PreparedIntegrationTurn,
+        QueueEntry,
+    ) {
+        let runtime = Arc::new(OwnerRuntime::new(paths, client).unwrap());
+        let state = super::super::store::RootedIntegrationState::open(paths, runtime).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        client.create_task(ordinary.clone()).unwrap();
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = IntegrationStatus::Resolving;
+        record.snapshot.attempts = 1;
+        record.candidates.push(sample_candidate(&record));
+        let prepared = PreparedIntegrationTurn::prepare(
+            &ordinary,
+            &record,
+            IntegrationTurnPurpose::Resolve,
+            1,
+            1,
+        )
+        .unwrap();
+        record.auxiliaries.push(prepared.intent().unwrap());
+        record.followups_spent = 1;
+        record.snapshot.resolve_turns = 1;
+        record.admission_deadline_millis = Some(deadline);
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        state.publish_prepared(record.task_id, &prepared).unwrap();
+        state
+            .replace(record.task_id, IntegrationRevision(0), &record)
+            .unwrap();
+        let pending = crate::task::TurnSummary::new(
+            2,
+            prepared.followup.turn_id(),
+            None,
+            None,
+            None,
+            false,
+            Some(1001),
+            None,
+        );
+        let status = crate::task::TaskStatus::new(
+            TaskState::Active,
+            ordinary.status().last_outcome().cloned(),
+            Some("fixture-worker".into()),
+            true,
+            Some(prepared.followup.base_oid().clone()),
+            None,
+            vec![],
+            vec![],
+            None,
+            ordinary
+                .status()
+                .turns()
+                .iter()
+                .cloned()
+                .chain([pending])
+                .collect(),
+            1001,
+        )
+        .unwrap();
+        client
+            .update_task_if_current(&ordinary, ordinary.with_status(status).unwrap())
+            .unwrap();
+        client
+            .write_turn_prompt(
+                record.task_id,
+                prepared.followup.turn_id(),
+                prepared.followup.composed_prompt(),
+            )
+            .unwrap();
+        client
+            .write_turn_prepared_binding(
+                record.task_id,
+                prepared.followup.turn_id(),
+                &prepared.followup.binding(),
+            )
+            .unwrap();
+        let entry = client
+            .enqueue(
+                QueueEntry::new(
+                    prepared.followup.turn_id(),
+                    client.client_id(),
+                    ordinary.meta().project_id().into(),
+                    ordinary.meta().worktree_id().into(),
+                    CommandSpec::argv(vec!["task".into()])
+                        .unwrap()
+                        .summary()
+                        .unwrap(),
+                    vec![],
+                    WorkerPreference::Pinned {
+                        worker: "fixture-worker".into(),
+                    },
+                    QueueEntryKind::TaskTurn,
+                    None,
+                    crate::turn_runner::current_process_identity().unwrap(),
+                    1001,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        (state, record, prepared, entry)
+    }
+
+    #[test]
+    fn expired_auxiliary_is_refused_at_the_real_runner_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let clock = Arc::new(AtomicU64::new(700_001));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, _, entry) = queued_auxiliary(&paths, &client, 600_001);
+        assert_eq!(
+            crate::turn_runner::start_runner_with_reservation(
+                &client,
+                &NeverSpawn,
+                &paths,
+                record.task_id,
+                entry.job_id(),
+                1,
+                false
+            )
+            .unwrap_err()
+            .public_code(),
+            "INTEGRATION_TURN_QUEUE_TIMEOUT"
+        );
+        assert_eq!(
+            state.load(record.task_id).unwrap().unwrap().snapshot.state,
+            IntegrationStatus::Blocked
+        );
+        assert_eq!(
+            client
+                .queue_entry(entry.job_id())
+                .unwrap()
+                .unwrap()
+                .queue_id(),
+            entry.queue_id()
+        );
+    }
+
+    #[test]
+    fn queued_auxiliary_keeps_eight_active_minutes_and_its_position_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let clock = Arc::new(AtomicU64::new(1001));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, 601001);
+        let gate = paths.controller_state_root();
+        crate::controller::drain::set_drained_at(&gate, true, 121001).unwrap();
+        clock.store(1_500_001, Ordering::SeqCst);
+        assert_eq!(
+            crate::turn_runner::start_runner_with_reservation(
+                &client,
+                &NeverSpawn,
+                &paths,
+                record.task_id,
+                entry.job_id(),
+                1,
+                false
+            )
+            .unwrap(),
+            crate::turn_runner::RunnerStart::Drained
+        );
+        let parked = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(parked.pause.as_ref().unwrap().effective_at_millis, 121001);
+        assert_eq!(parked.remaining_admission_millis, Some(480000));
+        assert_eq!(parked.snapshot.state, IntegrationStatus::Parked);
+        let reopened = client.reopen_until(None).unwrap();
+        clock.store(1_900_001, Ordering::SeqCst);
+        crate::controller::drain::set_drained_at(&gate, false, 1_900_001).unwrap();
+        assert!(matches!(
+            crate::turn_runner::start_runner_with_reservation(
+                &reopened,
+                &crate::turn_runner::InlineRunnerExecutor,
+                &paths,
+                record.task_id,
+                entry.job_id(),
+                1,
+                false
+            )
+            .unwrap(),
+            crate::turn_runner::RunnerStart::Started(_)
+        ));
+        let resumed = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(resumed.admission_deadline_millis, Some(2_380_001));
+        assert_eq!(
+            resumed.snapshot.integration_id,
+            parked.snapshot.integration_id
+        );
+        assert_eq!(resumed.auxiliaries, parked.auxiliaries);
+        assert_eq!(resumed.followups_spent, 1);
+        assert_eq!(
+            state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+            Some(prepared)
+        );
+        assert_eq!(reopened.queue_snapshot().unwrap().entries().len(), 1);
+        assert_eq!(
+            reopened
+                .queue_entry(entry.job_id())
+                .unwrap()
+                .unwrap()
+                .queue_id(),
+            entry.queue_id()
+        );
+        clock.store(2_380_000, Ordering::SeqCst);
+        assert!(matches!(
+            crate::turn_runner::start_runner_with_reservation(
+                &reopened,
+                &NeverSpawn,
+                &paths,
+                record.task_id,
+                entry.job_id(),
+                1,
+                false
+            )
+            .unwrap(),
+            crate::turn_runner::RunnerStart::Pending
+        ));
+        clock.store(2_380_001, Ordering::SeqCst);
+        assert_eq!(
+            crate::turn_runner::start_runner_with_reservation(
+                &reopened,
+                &NeverSpawn,
+                &paths,
+                record.task_id,
+                entry.job_id(),
+                1,
+                false
+            )
+            .unwrap_err()
+            .public_code(),
+            "INTEGRATION_TURN_QUEUE_TIMEOUT"
+        );
+    }
+
+    #[test]
+    fn a_completed_pause_is_accounted_once_even_when_no_owner_observed_the_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let clock = Arc::new(AtomicU64::new(1001));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, _, entry) = queued_auxiliary(&paths, &client, 601001);
+        let gate = paths.controller_state_root();
+        crate::controller::drain::set_drained_at(&gate, true, 121001).unwrap();
+        crate::controller::drain::set_drained_at(&gate, false, 1_900_001).unwrap();
+        clock.store(1_923_001, Ordering::SeqCst);
+        let permit = auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(
+            state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .admission_deadline_millis,
+            Some(2_380_001)
+        );
+        drop(auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id()).unwrap());
+        assert_eq!(
+            state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .admission_deadline_millis,
+            Some(2_380_001)
+        );
+    }
+
+    #[test]
+    fn late_auxiliary_observation_preserves_a_completed_pause_before_updating_its_revision() {
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("auxiliary observation started a process")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let clock = Arc::new(AtomicU64::new(1001));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, _, entry) = queued_auxiliary(&paths, &client, 601001);
+        let gate = paths.controller_state_root();
+        crate::controller::drain::set_drained_at(&gate, true, 121001).unwrap();
+        crate::controller::drain::set_drained_at(&gate, false, 1_900_001).unwrap();
+        clock.store(1_923_001, Ordering::SeqCst);
+        let config = Config::parse(
+            "version=1\n[[workers]]\nname='fixture-worker'\nssh='never-connect'\nslots=1\n",
+        )
+        .unwrap();
+        let owner =
+            OwnerIntegration::new(&NoProcesses, &config, &paths, &client, &NeverSpawn).unwrap();
+        owner
+            .coordinator()
+            .on_terminal(record.task_id, entry.job_id())
+            .unwrap();
+        let observed = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(
+            observed.auxiliaries[0].queue_position,
+            Some(entry.queue_id().value())
+        );
+        assert_eq!(observed.admission_deadline_millis, Some(2_380_001));
     }
 }

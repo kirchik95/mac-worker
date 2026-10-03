@@ -1469,6 +1469,7 @@ fn run_controller_command(
             )
         };
         let mut first_tick = true;
+        let mut shutdown_gate = Ok(());
         let result = crate::controller::runtime::run_tick_loop_with_shutdown(
             &async_runtime,
             &shutdown,
@@ -1514,6 +1515,11 @@ fn run_controller_command(
                 Ok(())
             },
             async {
+                shutdown_gate = crate::controller::drain::set_drained_with_event_sink(
+                    &paths.controller_state_root(),
+                    true,
+                    None,
+                );
                 channel.shutdown().await;
             },
         );
@@ -1521,6 +1527,7 @@ fn run_controller_command(
         health.stopped_at_millis = Some(now_millis()?);
         let final_write = health_store.write(&health);
         result?;
+        shutdown_gate?;
         final_write?;
         Ok(())
     })();
