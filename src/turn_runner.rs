@@ -655,6 +655,15 @@ impl<'a> TurnRunner<'a> {
                 coordinator,
                 task_id,
             )?;
+        } else if result.is_ok() {
+            crate::integration::runner::recover_selected(
+                self.runner,
+                self.config,
+                self.paths,
+                self.client_state,
+                self.executor,
+                &[task_id],
+            )?;
         }
         result
     }
@@ -1298,6 +1307,12 @@ impl<'a> TurnRunner<'a> {
             transfer.path(),
             initial_record.meta().base_oid(),
         )?)?;
+        crate::integration::runner::record_source_base(
+            self.paths,
+            task_id,
+            turn_id,
+            turn.base_oid(),
+        )?;
         let params = TurnParams {
             kind: turn.agent(),
             model: turn.model().map(str::to_owned),
@@ -2666,6 +2681,14 @@ pub fn start_runner_with_reservation(
     else {
         return Ok(RunnerStart::Drained);
     };
+    if let Some(entry) = client_state.queue_entry(turn_id)? {
+        crate::integration::runner::record_position(
+            paths,
+            task_id,
+            turn_id,
+            entry.queue_id().value(),
+        )?;
+    }
     let reserver = current_process_identity()?;
     match client_state.reserve_runner_slot(turn_id, reserver, slot_limit, exclude_reserver)? {
         RunnerSlotDecision::Saturated => Ok(RunnerStart::Saturated),

@@ -653,7 +653,10 @@ pub(crate) fn run_with_stdio_in_context(
             stderr,
         );
     }
-    if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
+    if matches!(
+        &cli.command,
+        Command::Task { .. } | Command::Runner { .. } | Command::IntegrationRunner { .. }
+    ) {
         return run_task_command(cli, runner, runtime, stdout, stderr);
     }
     if let Command::Controller { command } = cli.command {
@@ -1646,7 +1649,7 @@ fn run_task_command(
             }
             return Ok(if report.has_config_errors() { 1 } else { 0 });
         }
-        if config.controller.enabled {
+        if config.controller.enabled && matches!(&cli.command, Command::Task { .. }) {
             return run_enabled_controller_task(
                 cli.command,
                 runner,
@@ -1681,6 +1684,19 @@ fn run_task_command(
             .with_json_events(json);
 
         match command {
+            Command::IntegrationRunner { task_id } => {
+                let snapshot = crate::integration::runner::run_native_child(
+                    runner,
+                    &config,
+                    &paths,
+                    &client_state,
+                    task_id,
+                )?;
+                if json {
+                    write_json_line(stdout, &snapshot)?;
+                }
+                Ok(0)
+            }
             Command::Runner {
                 task_id,
                 turn_id,

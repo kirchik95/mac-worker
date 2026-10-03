@@ -3031,6 +3031,38 @@ impl<'a> TaskClient<'a> {
         let record = self.before_integration_mutation(&record, IntegrationMutation::Close)?;
         let barrier_expected = record.clone();
         let expected = if enabled { &barrier_expected } else { expected };
+        self.close_settled(record, expected, discard)
+    }
+
+    pub(crate) fn close_imported_integration(
+        &self,
+        task: TaskId,
+        receipt: &crate::integration::contracts::IntegrationReceipt,
+    ) -> Result<TaskReport, WorkerError> {
+        let (_, integration) = RootedIntegrationState::read_task(self.paths, task)?;
+        if !receipt.imported
+            || integration
+                .as_ref()
+                .and_then(|record| record.receipt.as_ref())
+                != Some(receipt)
+        {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+        let record = self.client_state.load_task(task)?;
+        let accepted = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+        if record.fetched_head() != Some(accepted) || record.status().head_oid() != Some(accepted) {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+        self.close_settled(record.clone(), &record, false)
+    }
+
+    fn close_settled(
+        &self,
+        record: LocalTaskRecord,
+        expected: &LocalTaskRecord,
+        discard: bool,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = expected.meta().task_id();
         let record = if record.auto_continue_intent().is_some() {
             self.clear_auto_continue_for_human(expected)?;
             let current = self.client_state.load_task(task_id)?;
@@ -3196,7 +3228,20 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(false, ReconcileScope::All, ReconcileAutomatic::Materialize)
+        let report = self.reconcile_runners_inner(
+            false,
+            ReconcileScope::All,
+            ReconcileAutomatic::Materialize,
+        )?;
+        self.recover_integrations(
+            &self
+                .client_state
+                .list_tasks()?
+                .iter()
+                .map(|record| record.meta().task_id())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(report)
     }
 
     /// Operator-driven `worker task reconcile`: clears the restart budget and
@@ -3209,7 +3254,20 @@ impl<'a> TaskClient<'a> {
     /// invocation sees an unconfirmed `Absent`, it waits the confirmation
     /// window so a second look in the same pass can prove `Exited`.
     pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(true, ReconcileScope::All, ReconcileAutomatic::Materialize)
+        let report = self.reconcile_runners_inner(
+            true,
+            ReconcileScope::All,
+            ReconcileAutomatic::Materialize,
+        )?;
+        self.recover_integrations(
+            &self
+                .client_state
+                .list_tasks()?
+                .iter()
+                .map(|record| record.meta().task_id())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(report)
     }
 
     pub fn reconcile_selected(&self, ids: &[TaskId]) -> Result<ReconcileReport, WorkerError> {
@@ -3218,6 +3276,11 @@ impl<'a> TaskClient<'a> {
             ReconcileScope::Selected(ids),
             ReconcileAutomatic::Materialize,
         )?;
+        self.recover_integrations(ids)?;
+        Ok(report)
+    }
+
+    fn recover_integrations(&self, ids: &[TaskId]) -> Result<(), WorkerError> {
         if let Some(coordinator) = self.integration {
             for task in ids {
                 if let Some(record) = self.client_state.load_task_optional(*task)?
@@ -3227,8 +3290,17 @@ impl<'a> TaskClient<'a> {
                     stamp_integration_run_position(self.client_state, coordinator, *task)?;
                 }
             }
+        } else {
+            crate::integration::runner::recover_selected(
+                self.runner,
+                self.config,
+                self.paths,
+                self.client_state,
+                self.executor,
+                ids,
+            )?;
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Retire completed dead owners before a human mutation, preserving any
@@ -6761,7 +6833,7 @@ impl<'a> TaskClient<'a> {
         std::env::current_dir().map_err(WorkerError::Io)
     }
 
-    fn load_project_for_record(
+    pub(crate) fn load_project_for_record(
         &self,
         record: &LocalTaskRecord,
     ) -> Result<ProjectState, WorkerError> {
@@ -6801,6 +6873,33 @@ impl<'a> TaskClient<'a> {
 
     fn tasks_are_quiescent(&self, records: &[LocalTaskRecord]) -> Result<bool, WorkerError> {
         for record in records {
+            if let Some(integration) =
+                RootedIntegrationState::read_task(self.paths, record.meta().task_id())?.1
+            {
+                let mut latest = None;
+                for turn in record.status().turns().iter().rev() {
+                    if RootedIntegrationState::read_auxiliary(
+                        self.paths,
+                        record.meta().task_id(),
+                        turn.turn_id(),
+                    )?
+                    .is_none()
+                    {
+                        latest = Some(turn);
+                        break;
+                    }
+                }
+                if latest.is_some_and(|turn| turn.turn_id() == integration.snapshot.source_turn_id)
+                    && !matches!(
+                        integration.snapshot.state,
+                        IntegrationStatus::Integrated
+                            | IntegrationStatus::Blocked
+                            | IntegrationStatus::Revoked
+                    )
+                {
+                    return Ok(false);
+                }
+            }
             if !is_wait_terminal(record.status().state())
                 || self
                     .operator_busy_reason(record.meta().task_id(), record)?

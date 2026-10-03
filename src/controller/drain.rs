@@ -119,28 +119,34 @@ pub(crate) fn launch_permit(
     deadline: crate::client_state::WaitDeadline,
 ) -> Result<Option<DrainLaunchPermit>, WorkerError> {
     let hints = crate::client_state::events::DeferredHints::fence();
+    Ok(
+        integration_permit(state_root, deadline)?.map(|permit| DrainLaunchPermit {
+            _lock: permit.0,
+            _hints: hints,
+        }),
+    )
+}
+
+/// Only the file guard crosses the Send integration phase contract. Queue
+/// launchers retain their existing thread-local deferred-hint fence above.
+pub(crate) struct IntegrationDrainPermit(Option<File>);
+pub(crate) fn integration_permit(
+    state_root: &Path,
+    deadline: crate::client_state::WaitDeadline,
+) -> Result<Option<IntegrationDrainPermit>, WorkerError> {
     deadline.remaining()?;
     let Some(root) = open_existing_controller_root(state_root)? else {
-        return Ok(Some(DrainLaunchPermit {
-            _lock: None,
-            _hints: hints,
-        }));
+        return Ok(Some(IntegrationDrainPermit(None)));
     };
     let Some(lock) = existing_lock(&root)? else {
-        return Ok(Some(DrainLaunchPermit {
-            _lock: None,
-            _hints: hints,
-        }));
+        return Ok(Some(IntegrationDrainPermit(None)));
     };
     deadline.lock(lock.as_raw_fd(), libc::LOCK_SH)?;
     validate_lock(&root, &lock)?;
     if read_state(&root)?.1.drained {
         return Ok(None);
     }
-    Ok(Some(DrainLaunchPermit {
-        _lock: Some(lock),
-        _hints: hints,
-    }))
+    Ok(Some(IntegrationDrainPermit(Some(lock))))
 }
 
 fn existing_lock(root: &RootedDir) -> Result<Option<File>, WorkerError> {

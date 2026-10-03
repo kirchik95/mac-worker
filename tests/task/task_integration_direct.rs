@@ -301,6 +301,147 @@ fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
     f
 }
 
+fn owner_paths(
+    f: &super::session_import_e2e::Fixture,
+) -> mac_worker::test_support::core::paths::PathLayout {
+    mac_worker::test_support::core::paths::PathLayout {
+        config: f.config.clone(),
+        state: f.laptop.join(".local/state/mac-worker"),
+        cache: f.laptop.join(".cache/mac-worker"),
+        data: f.laptop.join(".local/share/mac-worker"),
+    }
+}
+
+fn submitted_task(output: &std::process::Output) -> TaskId {
+    assert!(
+        output.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|v| v.get("session_import").is_some())
+        .unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        host::{process::SystemProcessRunner, store::HostStore},
+        session::SessionAgent,
+        task::store::TaskStore,
+    };
+    let f = integration_fixture(true);
+    f.capture_fixture(SessionAgent::Codex);
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent).unwrap().replace(
+        "printf '%s\\n' \"$@\" > \"$HOME/argv\"",
+        "printf 'ordinary result\\n' > T6-result\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
+    );
+    std::fs::write(agent, script).unwrap();
+    let output = f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce work",
+        "--integrate",
+        "main",
+        "--close-on",
+        "done",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]);
+    let task = submitted_task(&output);
+    let wait = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "60s",
+    ]);
+    assert!(
+        wait.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&wait.stdout),
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    let paths = owner_paths(&f);
+    let owner = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let record = owner
+        .load(task)
+        .unwrap()
+        .expect("terminal runner must stage an integration cycle");
+    assert_eq!(record.snapshot.state, IntegrationStatus::Integrated);
+    let receipt = record.receipt.as_ref().unwrap();
+    assert!(receipt.imported);
+    let merge = receipt
+        .merge_oid
+        .as_ref()
+        .expect("ordinary output needs one merge");
+    assert_ne!(merge, &receipt.source_head);
+    let local = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(local.status().state(), TaskState::Closed);
+    assert_eq!(local.status().head_oid(), Some(merge));
+    assert_eq!(local.fetched_head(), Some(merge));
+    let host = HostStore::open(&f.host_root()).unwrap();
+    let retained = HostIntegrationStore::new(&host)
+        .load(&record.policy.project_id, task)
+        .unwrap()
+        .unwrap();
+    assert!(
+        retained.receipt.unwrap().imported,
+        "host must receive the import acknowledgement before close"
+    );
+    assert_eq!(
+        TaskStore::new(&host, &SystemProcessRunner)
+            .load_status(&record.policy.project_id, task)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
+    assert_eq!(
+        f.project
+            .git(&["show", &format!("{merge}:T6-result")])
+            .stdout,
+        b"ordinary result\n"
+    );
+    let driver: Value = serde_json::from_slice(
+        &std::fs::read(
+            paths
+                .state
+                .join(format!("integrations/tasks/{task}/driver.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        driver["actor"]["pid"].as_u64(),
+        Some(std::process::id() as u64)
+    );
+}
+
 #[test]
 fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
     use mac_worker::test_support::session::SessionAgent;

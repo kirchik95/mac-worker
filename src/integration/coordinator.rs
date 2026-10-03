@@ -111,6 +111,21 @@ impl<'a> IntegrationCoordinator<'a> {
             .head_oid()
             .cloned()
             .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        // Import/repair changes the public head to M/T, while the ordinary
+        // source turn stays the same. A repeated terminal wake is that cycle's
+        // recovery, never a new source derived from the accepted merge.
+        if let Some(old) = &old
+            && old.snapshot.source_turn_id == source
+        {
+            if head != old.snapshot.source_head
+                && !old.receipt.as_ref().is_some_and(|receipt| {
+                    &head == receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head)
+                })
+            {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+            return Ok(());
+        }
         let target_key = policy.target_key()?;
         let id = IntegrationId::derive(task, source, &head, &target_key)?;
         if let Some(old) = &old {
@@ -460,6 +475,14 @@ impl<'a> IntegrationCoordinator<'a> {
     }
     pub fn configured(&self, task: TaskId) -> Result<bool, WorkerError> {
         Ok(self.state.load_policy(task)?.is_some())
+    }
+    pub(crate) fn park_for_runtime(
+        &self,
+        task: TaskId,
+        pause: IntegrationPauseEvidence,
+    ) -> Result<(), WorkerError> {
+        let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        self.park(&mut record, pause)
     }
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
