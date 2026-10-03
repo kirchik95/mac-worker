@@ -2820,6 +2820,7 @@ impl<'a> TaskClient<'a> {
         }
         if let Some(reason) = self.operator_busy_reason(task_id, &record)?
             && !(record.close_intent().is_some() && reason == CLOSE_IN_PROGRESS)
+            && !self.first_turn_is_waiting(&record)?
         {
             return Err(task_error("TASK_BUSY", reason));
         }
@@ -4418,6 +4419,69 @@ impl<'a> TaskClient<'a> {
         }
     }
 
+    /// The live runner of a queued task only waits for capacity. Close cancels
+    /// its waiting row under the runner journal instead of reporting the
+    /// runner as busy until some worker can take the turn.
+    fn first_turn_is_waiting(&self, record: &LocalTaskRecord) -> Result<bool, WorkerError> {
+        if record.status().state() != TaskState::Queued || record.close_intent().is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .client_state
+            .queue_entry_for_task_turn(record.meta().task_id())?
+            .is_some_and(|entry| {
+                matches!(
+                    entry.state(),
+                    QueueState::Waiting { .. } | QueueState::Parked
+                )
+            }))
+    }
+
+    /// Submit records a queued task without a turn summary: until dispatch its
+    /// first turn is only a prompt, a waiting queue row and a runner. Cancel
+    /// that row the way a waiting follow-up is cancelled; otherwise a task
+    /// that no worker can take waits for capacity forever.
+    fn cancel_unrecorded_first_turn(
+        &self,
+        expected: &LocalTaskRecord,
+        current: &LocalTaskRecord,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = current.meta().task_id();
+        if current.status().state() != TaskState::Queued {
+            return self.report_from_record(current);
+        }
+        if !operator_revision_matches(current, expected) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        let Some(entry) = self.client_state.queue_entry_for_task_turn(task_id)? else {
+            return self.report_from_record(current);
+        };
+        match self
+            .client_state
+            .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
+        {
+            Some(retained) if !matches!(retained.state(), QueueState::Dispatching { .. }) => {
+                // A parked row past its replacement budget keeps the durable
+                // request for reconciliation, as in the recorded-turn path.
+                if !retained
+                    .replacement_failure()
+                    .is_some_and(|budget| budget.should_park())
+                {
+                    self.finish_waiting_cancellation(current, &retained)?;
+                }
+                self.report_for(task_id)
+            }
+            Some(_) => Err(task_error("TASK_BUSY", "task turn is being dispatched")),
+            None => Err(task_error(
+                "TASK_INCONSISTENT",
+                "task queue turn disappeared",
+            )),
+        }
+    }
+
     fn report_fenced_turn(
         &self,
         task_id: TaskId,
@@ -4528,7 +4592,7 @@ impl<'a> TaskClient<'a> {
         let Some(expected_last) = expected.status().turns().last() else {
             let current = self.client_state.load_task(task_id)?;
             if current.status().turns().is_empty() {
-                return self.report_from_record(&current);
+                return self.cancel_unrecorded_first_turn(expected, &current);
             }
             return Err(task_error(
                 "TASK_REVISION_CONFLICT",
