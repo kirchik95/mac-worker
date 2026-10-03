@@ -32,6 +32,12 @@ pub const MAX_TASK_LOG_LIMIT: u32 = 65_536;
 
 /// Owner/controller adapter. Reads return durable snapshots; redrive publishes intent.
 pub trait DashboardIntegrationSource: Send + Sync + 'static {
+    fn requested_close(
+        &self,
+        _task: TaskId,
+    ) -> Result<Option<crate::task::ClosePolicy>, WorkerError> {
+        Ok(None)
+    }
     /// Read durable preparation identity; never infer auxiliary work from time.
     fn is_auxiliary_turn(&self, _task: TaskId, _turn: TurnId) -> Result<bool, WorkerError> {
         Ok(false)
@@ -55,7 +61,7 @@ pub trait DashboardIntegrationSource: Send + Sync + 'static {
 
 /// Adapter over T1's owner/controller boundary. Redrive publishes the durable epoch;
 /// phase execution belongs to the owner runner, never the HTTP handler.
-#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+#[cfg(any(test, feature = "test-support"))]
 pub struct OwnerDashboardIntegrations {
     pub state: Arc<dyn crate::integration::contracts::IntegrationState>,
     pub host: Arc<dyn crate::integration::contracts::IntegrationHost>,
@@ -63,7 +69,16 @@ pub struct OwnerDashboardIntegrations {
     pub runtime: Arc<dyn crate::integration::contracts::IntegrationRuntime>,
     pub observer: Arc<dyn crate::integration::contracts::IntegrationObserver>,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl DashboardIntegrationSource for OwnerDashboardIntegrations {
+    fn requested_close(
+        &self,
+        task: TaskId,
+    ) -> Result<Option<crate::task::ClosePolicy>, WorkerError> {
+        self.state
+            .load_policy(task)
+            .map(|policy| policy.map(|policy| policy.requested_close))
+    }
     fn is_auxiliary_turn(&self, task: TaskId, turn: TurnId) -> Result<bool, WorkerError> {
         self.state
             .load_prepared(task, turn)
@@ -112,6 +127,59 @@ impl DashboardIntegrationSource for OwnerDashboardIntegrations {
     }
 }
 
+/// The normal HTTP composition reads sidecars without opening a writer and
+/// publishes mutations through the same native owner as CLI/RPC recovery.
+pub(crate) struct NativeDashboardIntegrations {
+    pub config: Arc<Config>,
+    pub paths: PathLayout,
+    pub client: Arc<ClientStateStore>,
+    pub runner: Arc<dyn ProcessRunner>,
+}
+impl NativeDashboardIntegrations {
+    fn owner(&self) -> Result<crate::integration::runner::OwnerIntegration<'_>, WorkerError> {
+        crate::integration::runner::OwnerIntegration::new(
+            self.runner.as_ref(),
+            &self.config,
+            &self.paths,
+            &self.client,
+            &DetachedRunnerExecutor,
+        )
+    }
+}
+impl DashboardIntegrationSource for NativeDashboardIntegrations {
+    fn requested_close(
+        &self,
+        task: TaskId,
+    ) -> Result<Option<crate::task::ClosePolicy>, WorkerError> {
+        crate::integration::store::RootedIntegrationState::read_task(&self.paths, task)
+            .map(|(policy, _)| policy.map(|policy| policy.requested_close))
+    }
+    fn is_auxiliary_turn(&self, task: TaskId, turn: TurnId) -> Result<bool, WorkerError> {
+        crate::integration::store::RootedIntegrationState::read_auxiliary(&self.paths, task, turn)
+            .map(|prepared| prepared.is_some())
+    }
+    fn snapshot(
+        &self,
+        task: TaskId,
+    ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError> {
+        crate::integration::store::RootedIntegrationState::read_task(&self.paths, task)
+            .map(|(_, record)| record.map(|record| record.snapshot))
+    }
+    fn redrive(
+        &self,
+        request: &crate::integration::contracts::IntegrationRedriveRequest,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        self.owner()?.redrive(request)
+    }
+    fn revoke(
+        &self,
+        task: TaskId,
+        expected: crate::integration::contracts::IntegrationRevision,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        self.owner()?.coordinator().revoke(task, expected)
+    }
+}
+
 fn attach_detail_integration(
     detail: TaskDetailProjection,
     record: &LocalTaskRecord,
@@ -135,9 +203,17 @@ fn attach_detail_integration(
         .transpose()
         .map_err(map_mutation_error)?
         .unwrap_or(false);
-    detail
+    let mut detail = detail
         .with_current_integration(snapshot.as_ref(), &facts, current)
-        .map_err(map_mutation_error)
+        .map_err(map_mutation_error)?;
+    if let Some(close) = source
+        .requested_close(record.meta().task_id())
+        .map_err(map_mutation_error)?
+    {
+        detail.close_policy = close;
+        detail.task.close_policy = close;
+    }
+    Ok(detail)
 }
 
 fn attach_list_integrations(
@@ -174,6 +250,12 @@ fn attach_list_integrations(
             .clone()
             .with_current_integration(snapshot.as_ref(), &facts, current)
             .map_err(map_local_error)?;
+        if let Some(close) = source
+            .requested_close(row.task_id)
+            .map_err(map_local_error)?
+        {
+            row.close_policy = close;
+        }
     }
     Ok(())
 }
@@ -211,8 +293,6 @@ impl MacWorkerTaskSource {
         }
     }
 
-    // The serial T6 entry-point wiring installs this adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
         self.integrations = Some(source);
         self
@@ -538,8 +618,6 @@ impl MacWorkerTaskMutationSource {
         }
     }
 
-    // The serial T6 entry-point wiring installs this adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
         self.integrations = Some(source);
         self

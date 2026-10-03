@@ -18,7 +18,7 @@ use crate::{
         },
         task::{
             DashboardTaskMutationSource, DashboardTaskSource, MacWorkerTaskMutationSource,
-            MacWorkerTaskSource,
+            MacWorkerTaskSource, NativeDashboardIntegrations,
         },
         web::{DashboardHttpServer, DashboardHttpState},
     },
@@ -89,24 +89,36 @@ impl SystemDashboardLauncher {
         let settings_source: Arc<dyn DashboardSettingsSource> = Arc::new(
             SystemDashboardSettingsSource::new(Arc::clone(&config), Arc::clone(&runner)),
         );
+        let integrations: Arc<dyn crate::dashboard::task::DashboardIntegrationSource> =
+            Arc::new(NativeDashboardIntegrations {
+                config: config.clone(),
+                paths: paths.clone(),
+                client: local_jobs.clone(),
+                runner: runner.clone(),
+            });
         let mut source = MacWorkerDashboardSource::new(
             Arc::clone(&config),
             workers,
             Arc::clone(&local_jobs),
             Arc::clone(&remote),
-        );
+        )
+        .with_integrations(integrations.clone());
         if let Some(settings) =
             launch_directory.and_then(|directory| ProjectSettings::load(directory, &[]).ok())
         {
             source = source.with_project_settings(settings);
         }
-        let task_source: Arc<dyn DashboardTaskSource> = Arc::new(MacWorkerTaskSource::new(
-            Arc::clone(&config),
-            Arc::clone(&local_jobs),
-            Arc::clone(&remote),
-        ));
+        let task_source: Arc<dyn DashboardTaskSource> = Arc::new(
+            MacWorkerTaskSource::new(
+                Arc::clone(&config),
+                Arc::clone(&local_jobs),
+                Arc::clone(&remote),
+            )
+            .with_integrations(integrations.clone()),
+        );
         let mutation_source: Arc<dyn DashboardTaskMutationSource> = Arc::new(
-            MacWorkerTaskMutationSource::new(Arc::clone(&config), Arc::clone(&local_jobs), paths),
+            MacWorkerTaskMutationSource::new(Arc::clone(&config), Arc::clone(&local_jobs), paths)
+                .with_integrations(integrations),
         );
         Self {
             events: None,

@@ -384,7 +384,8 @@ impl<'a> OwnerIntegration<'a> {
         executor: &'a dyn RunnerExecutor,
     ) -> Result<Self, WorkerError> {
         let runtime = Arc::new(OwnerRuntime::new(paths, client)?);
-        let state = super::store::RootedIntegrationState::open(paths, runtime.clone())?;
+        let state = super::store::RootedIntegrationState::open(paths, runtime.clone())?
+            .with_event_sink(client.event_sink());
         Ok(Self {
             state,
             runtime: runtime.clone(),
@@ -409,6 +410,7 @@ impl<'a> OwnerIntegration<'a> {
         .with_owner_gate(self.ports.paths)
     }
     pub(crate) fn stage(&self, task: TaskId) -> Result<(), WorkerError> {
+        let _hints = self.ports.client.event_scope();
         if !self.coordinator().configured(task)? {
             return Ok(());
         }
@@ -467,6 +469,7 @@ impl<'a> OwnerIntegration<'a> {
         &self,
         request: &IntegrationRedriveRequest,
     ) -> Result<IntegrationSnapshot, WorkerError> {
+        let _hints = self.ports.client.event_scope();
         request.validate()?;
         let task = request.task_id;
         let root = task_root(self.ports.paths, task)?;
@@ -591,6 +594,7 @@ impl<'a> OwnerIntegration<'a> {
         Ok(result)
     }
     fn schedule(&self, task: TaskId) -> Result<(), WorkerError> {
+        let _hints = self.ports.client.event_scope();
         let Some(record) = self.state.load(task)? else {
             return Ok(());
         };
@@ -682,6 +686,7 @@ impl<'a> OwnerIntegration<'a> {
         Ok(())
     }
     pub(crate) fn run_child(&self, task: TaskId) -> Result<IntegrationSnapshot, WorkerError> {
+        let _hints = self.ports.client.event_scope();
         let root = task_root(self.ports.paths, task)?;
         let _driver = driver_lock(&root, false)?.ok_or_else(invalid)?;
         if let Some(bytes) = read(&root, "driver.json")? {
@@ -892,7 +897,8 @@ pub(crate) fn auxiliary_launch_permit(
         return Ok(Some(AuxiliaryLaunchPermit { _phase: None }));
     };
     let runtime = Arc::new(OwnerRuntime::new(paths, client)?);
-    let state = super::store::RootedIntegrationState::open(paths, runtime.clone())?;
+    let state = super::store::RootedIntegrationState::open(paths, runtime.clone())?
+        .with_event_sink(client.event_sink());
     let mut record = state.load(task)?.ok_or_else(invalid)?;
     prepared.validate_for(&record)?;
     if record.tombstone.is_some() {
@@ -1088,6 +1094,50 @@ pub(crate) mod native_launch_tests {
         ) -> Result<crate::process::ProcessResult, WorkerError> {
             panic!("a saved redrive result must not contact Git or the helper")
         }
+    }
+
+    #[test]
+    fn native_owner_releases_companion_hints_after_the_outer_state_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let sink = Arc::new(crate::controller::events::testing::RecordingSink::new());
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_event_sink(sink.clone());
+        let config = Config::parse("version = 1\n").unwrap();
+        let owner =
+            OwnerIntegration::new(&NoProcesses, &config, &paths, &client, &NeverSpawn).unwrap();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        owner
+            .state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        let scope = client.event_scope();
+        let fence = crate::controller::drain::integration_admission(
+            &paths.controller_state_root(),
+            client.wait_deadline(),
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            owner
+                .state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        assert!(sink.batches().is_empty());
+        drop(fence);
+        drop(scope);
+        let batches = sink.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].events(),
+            &[crate::controller::events::NewEvent::IntegrationChanged {
+                task_id: record.task_id,
+                integration: record.snapshot.annotation().unwrap(),
+            }]
+        );
     }
 
     #[test]

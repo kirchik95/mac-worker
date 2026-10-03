@@ -1608,6 +1608,7 @@ fn run_host_controller_rpc(
             stdout,
             crate::controller::ControllerFault::None,
             crate::controller::RpcExecution {
+                integration_features: None,
                 executor,
                 home: runtime.home(),
             },
@@ -2442,6 +2443,7 @@ fn write_task_report_with_interrupt(
         if let Some(summary) = &report.session_submission {
             response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?;
         }
+        insert_integration_view(&mut response, report.integration_view());
         write_json_line(stdout, &response)
     } else {
         if let Some(summary) = &report.session_submission {
@@ -2462,6 +2464,9 @@ fn write_task_report_with_interrupt(
             task_state_name(report.status().state())
         )?;
         write_turn_diagnostics(stdout, report.status())?;
+        if let Some(view) = report.integration_view() {
+            write_integration_line(stdout, view.integration.as_ref())?;
+        }
         writeln!(
             stdout,
             "questions policy: {}",
@@ -2574,9 +2579,69 @@ pub(crate) fn write_task_list_report(
                 writeln!(stdout, "{line}")?;
             }
         }
+        for task in report.tasks() {
+            write_integration_line(stdout, task.integration.as_ref())?;
+        }
         stdout.flush()?;
         Ok(())
     }
+}
+
+fn insert_integration_view(
+    value: &mut serde_json::Value,
+    view: Option<&crate::integration::contracts::IntegrationView>,
+) {
+    if let Some(view) = view {
+        if let Some(snapshot) = &view.integration {
+            value["integration"] = serde_json::json!(snapshot);
+        }
+        if let Some(workflow) = view.workflow_state {
+            value["workflow_state"] = serde_json::json!(workflow);
+        }
+        value["requested_close"] = serde_json::json!(view.requested_close);
+        value["review_state"] = serde_json::json!(view.review_state);
+    }
+}
+fn write_integration_line(
+    stdout: &mut dyn Write,
+    snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+) -> Result<(), WorkerError> {
+    if let Some(snapshot) = snapshot {
+        let state = serde_json::to_value(snapshot.state).map_err(io::Error::other)?;
+        write!(
+            stdout,
+            "integration: {} target={} attempts={}",
+            state.as_str().unwrap_or("unavailable"),
+            snapshot.target,
+            snapshot.attempts
+        )?;
+        if let Some(code) = snapshot.blocked_code {
+            write!(stdout, " code={}", code.as_str())?;
+        }
+        if let Some(reason) = snapshot.pause_reason {
+            let reason = serde_json::to_value(reason).map_err(io::Error::other)?;
+            write!(
+                stdout,
+                " reason={}",
+                reason.as_str().unwrap_or("unavailable")
+            )?;
+        }
+        if let Some(resume) = snapshot.resume_state {
+            let resume = serde_json::to_value(resume).map_err(io::Error::other)?;
+            write!(
+                stdout,
+                " resume={}",
+                resume.as_str().unwrap_or("unavailable")
+            )?;
+        }
+        if let Some(merge) = &snapshot.merge_oid {
+            write!(stdout, " merge={merge}")?;
+        } else if let Some(target) = &snapshot.observed_target_oid {
+            write!(stdout, " observed={target}")?;
+        }
+        writeln!(stdout)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_task_result_report(
@@ -2608,6 +2673,7 @@ pub(crate) fn write_task_result_report(
         if !report.warnings().is_empty() {
             value["warnings"] = serde_json::json!(report.warnings());
         }
+        insert_integration_view(&mut value, report.integration_view());
         write_json_line(stdout, &value)
     } else {
         writeln!(
@@ -2617,6 +2683,9 @@ pub(crate) fn write_task_result_report(
             task_state_name(report.status().state())
         )?;
         write_turn_diagnostics(stdout, report.status())?;
+        if let Some(view) = report.integration_view() {
+            write_integration_line(stdout, view.integration.as_ref())?;
+        }
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }
@@ -6674,9 +6743,11 @@ fn controller_task_result(
     // Status already carries warnings in the legacy protocol. Fetch it only
     // for result rendering, after the result reply's identity was verified.
     let status = controller_task_status(runner, config, task_id)?;
-    Ok(reply
+    let mut report = reply
         .into_result()
-        .into_report_with_warnings(status.warnings().to_vec()))
+        .into_report_with_warnings(status.warnings().to_vec());
+    report.integration_view = status.integration_view().cloned();
+    Ok(report)
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {

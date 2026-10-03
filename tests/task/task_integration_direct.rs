@@ -489,6 +489,202 @@ fn parked_source_fixture() -> (super::session_import_e2e::Fixture, TaskId) {
 }
 
 #[test]
+fn native_read_surfaces_expose_the_same_parked_companion_without_driving_git() {
+    let (f, task) = parked_source_fixture();
+    let state = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let saved = state.load(task).unwrap().unwrap();
+    let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
+    for command in ["status", "result", "list"] {
+        let mut args = vec!["--json", "task", command];
+        let id = task.to_string();
+        if command != "list" {
+            args.push(&id);
+        }
+        let output = f.worker(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let row = if command == "list" {
+            &value["tasks"][0]
+        } else {
+            &value
+        };
+        assert_eq!(row["integration"], json!(saved.snapshot), "{command}");
+        assert_eq!(row["workflow_state"], "integrating", "{command}");
+        if command != "list" {
+            let _: baseline::TaskStatus = serde_json::from_value(value["status"].clone()).unwrap();
+        }
+        let text = if command == "list" {
+            f.worker(&["task", command])
+        } else {
+            f.worker(&["task", command, &id])
+        };
+        assert!(String::from_utf8_lossy(&text.stdout).contains("integration: parked"));
+        assert_eq!(state.load(task).unwrap().unwrap(), saved);
+    }
+    assert_eq!(
+        f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
+        target
+    );
+}
+
+struct RunningDashboard(std::process::Child);
+impl Drop for RunningDashboard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn dashboard_request(address: &str, method: &str, path: &str, body: Option<Value>) -> Value {
+    use std::io::{BufRead, Read, Write};
+    let body = body.map(|body| body.to_string()).unwrap_or_default();
+    loop {
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(crate::support::HANDSHAKE_TIMEOUT))
+            .unwrap();
+        write!(socket, "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nx-mac-worker-task: 1\r\nOrigin: http://{address}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut reader = std::io::BufReader::new(socket);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut response = vec![0; length.expect("bounded JSON response")];
+        reader.read_exact(&mut response).unwrap();
+        if status.contains("503")
+            && String::from_utf8_lossy(&response).contains("DASHBOARD_SNAPSHOT_PENDING")
+        {
+            std::thread::yield_now();
+            continue;
+        }
+        assert!(
+            status.contains("200"),
+            "{status} {}",
+            String::from_utf8_lossy(&response)
+        );
+        return serde_json::from_slice(&response).unwrap();
+    }
+}
+
+#[test]
+fn normally_launched_direct_and_controller_dashboards_read_and_redrive_the_owner() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+        sync::{Arc, mpsc},
+        thread,
+    };
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    for viewer in [false, true] {
+        let mut record = state.load(task).unwrap().unwrap();
+        let expected = record.snapshot.revision;
+        record.snapshot.revision = expected.next().unwrap();
+        record.snapshot.state = IntegrationStatus::Blocked;
+        record.snapshot.pause_reason = None;
+        record.snapshot.resume_state = None;
+        record.pause = None;
+        record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        assert!(state.replace(task, expected, &record).unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+        command
+            .env_clear()
+            .env("HOME", &f.laptop)
+            .env("PATH", "/usr/bin:/bin")
+            .env("MAC_WORKER_TEST_SSH", &f.ssh)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(f.project.root())
+            .args([
+                "--config",
+                f.config.to_str().unwrap(),
+                "dashboard",
+                "--no-open",
+                "--no-facts-refresh",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if viewer {
+            command.arg("--controller-viewer");
+        }
+        let mut process = RunningDashboard(command.spawn().unwrap());
+        let stdout = process.0.stdout.take().unwrap();
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            let mut url = String::new();
+            std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+            let _ = send.send(url);
+        });
+        let url = receive
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(url.starts_with("http://"), "dashboard URL: {url:?}");
+        let address = url
+            .trim()
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        let collection = dashboard_request(address, "GET", "/api/v1/snapshot", None);
+        assert_eq!(
+            collection["tasks"][0]["integration"],
+            json!(record.snapshot)
+        );
+        assert_eq!(collection["tasks"][0]["workflow_state"], "needs_you");
+        let detail = dashboard_request(address, "GET", &format!("/api/v1/tasks/{task}"), None);
+        assert_eq!(detail["integration"], json!(record.snapshot));
+        let ordinary = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .load_task(task)
+            .unwrap();
+        let response = dashboard_request(
+            address,
+            "POST",
+            &format!("/api/v1/tasks/{task}/integrate"),
+            Some(json!({
+                "expected": {"expected_task_id":task, "expected_turn_id":ordinary.status().turns().last().unwrap().turn_id(),
+                    "expected_turn_count":ordinary.status().turns().len(), "expected_head_oid":ordinary.status().head_oid(),
+                    "expected_updated_at_millis":ordinary.status().updated_at_millis(), "expected_state":"open"},
+                "expected_integration_id":record.snapshot.integration_id,
+                "integration": {"task_id":task,"expected":record.snapshot.revision,"request_id":uuid::Uuid::new_v4().simple().to_string()}
+            })),
+        );
+        assert_eq!(
+            response["integration"]["integration_id"],
+            json!(record.snapshot.integration_id)
+        );
+        assert!(
+            response["integration"]["epoch"].as_u64().unwrap() > u64::from(record.snapshot.epoch)
+        );
+        assert_eq!(
+            state.load(task).unwrap().unwrap().snapshot.state,
+            IntegrationStatus::Parked
+        );
+    }
+}
+
+#[test]
 fn native_recovery_reclaims_a_confirmed_dead_phase_actor_before_reexecuting_the_driver() {
     use mac_worker::test_support::{
         client_state::RunnerLivenessVerdict, host::supervisor::SystemProcessInspector,

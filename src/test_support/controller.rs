@@ -44,7 +44,8 @@ pub use crate::controller::envelope::{
     OperationEnvelope, OperationOutcome, load_operation_envelope, persist_operation_envelope,
 };
 pub use crate::controller::execute::{
-    TaskSubmitHandler, serve_rpc_with_runtime, tick_controller_leader,
+    TaskSubmitHandler, serve_rpc_with_integration_features, serve_rpc_with_runtime,
+    tick_controller_leader,
 };
 pub use crate::controller::leader::ControllerLeader;
 pub use crate::controller::lifecycle::{ControllerWaitSelector, wait_via_controller};

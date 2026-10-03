@@ -27,7 +27,9 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     integration::{
-        contracts::{FrozenIntegratingBatch, IntegrationCode, IntegrationStatus},
+        contracts::{
+            FrozenIntegratingBatch, IntegrationCode, IntegrationStatus, IntegrationTaskFacts,
+        },
         coordinator::IntegrationCoordinator,
         store::RootedIntegrationState,
     },
@@ -407,6 +409,7 @@ impl PublishRetryReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
+    pub(crate) integration_view: Option<crate::integration::contracts::IntegrationView>,
     pub(crate) session_submission: Option<SessionSubmission>,
     task_id: TaskId,
     questions_policy: QuestionsPolicy,
@@ -424,6 +427,11 @@ pub struct TaskReport {
 }
 
 impl TaskReport {
+    pub(crate) fn integration_view(
+        &self,
+    ) -> Option<&crate::integration::contracts::IntegrationView> {
+        self.integration_view.as_ref()
+    }
     pub fn questions_policy(&self) -> QuestionsPolicy {
         self.questions_policy
     }
@@ -477,6 +485,12 @@ impl TaskReport {
     }
 
     pub(crate) fn from_controller(projection: ControllerTaskProjection) -> Self {
+        let integration_view = projection
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "integration")
+            .and_then(|event| serde_json::from_value(event["view"].clone()).ok());
         let questions_policy = projection
             .events
             .iter()
@@ -493,6 +507,7 @@ impl TaskReport {
             .unwrap_or_default();
         Self {
             session_submission: None,
+            integration_view,
             questions_policy,
             task_id: projection.task_id,
             run_id: projection.run_id,
@@ -560,6 +575,7 @@ impl TaskListReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResultReport {
+    pub(crate) integration_view: Option<crate::integration::contracts::IntegrationView>,
     task_id: TaskId,
     status: TaskStatus,
     branch: String,
@@ -572,6 +588,11 @@ pub struct TaskResultReport {
 }
 
 impl TaskResultReport {
+    pub(crate) fn integration_view(
+        &self,
+    ) -> Option<&crate::integration::contracts::IntegrationView> {
+        self.integration_view.as_ref()
+    }
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -625,6 +646,7 @@ impl TaskResultReport {
             task_id,
             status,
             branch,
+            integration_view: None,
             fetch_instruction,
             failure_receipt,
             deliveries,
@@ -2717,6 +2739,26 @@ impl<'a> TaskClient<'a> {
             &blocking_codes,
         )
         .map_err(task_view_error)?;
+        for row in &mut projection.tasks {
+            if let Some(record) = projected
+                .iter()
+                .find(|record| record.meta().task_id() == row.task_id)
+                && let Some(view) = crate::integration::view::read_owner_view(
+                    self.paths,
+                    record,
+                    row.runner.is_some(),
+                )?
+            {
+                let facts = IntegrationTaskFacts::from_record(record, row.runner.is_some());
+                let snapshot = view.integration.as_ref();
+                *row = row.clone().with_current_integration(
+                    snapshot,
+                    &facts,
+                    view.workflow_state.is_some(),
+                )?;
+                row.close_policy = view.requested_close;
+            }
+        }
         for dag in self.client_state.list_run_dags()? {
             if filter.run_id.is_none_or(|run_id| dag.run_id == run_id) {
                 merge_pending_into_projection(
@@ -3015,6 +3057,11 @@ impl<'a> TaskClient<'a> {
         let record = self.client_state.load_task(task_id)?;
         let observed = self.observe_task(&record)?;
         Ok(TaskResultReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &observed.record,
+                self.client_state.runner_liveness(task_id)?.is_some(),
+            )?,
             task_id,
             status: observed.record.status().clone(),
             branch: format!("task/{task_id}"),
@@ -5108,6 +5155,13 @@ impl<'a> TaskClient<'a> {
 
     fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                record,
+                self.client_state
+                    .runner_liveness(record.meta().task_id())?
+                    .is_some(),
+            )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
             task_id: record.meta().task_id(),
@@ -6763,6 +6817,13 @@ impl<'a> TaskClient<'a> {
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &record,
+                self.client_state
+                    .runner_liveness(record.meta().task_id())?
+                    .is_some(),
+            )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
             task_id,
@@ -6783,6 +6844,13 @@ impl<'a> TaskClient<'a> {
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let observed = self.observe_task(record)?;
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &observed.record,
+                self.client_state
+                    .runner_liveness(record.meta().task_id())?
+                    .is_some(),
+            )?,
             session_submission: None,
             questions_policy: observed.record.questions_policy(),
             task_id: observed.record.meta().task_id(),

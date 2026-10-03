@@ -142,6 +142,10 @@ impl ControllerTaskStatusResult {
         // The v7 DTO denies unknown top-level fields. Carry coordinator-only
         // annotations in its existing extensible event list for older laptops.
         let mut events = report.events().to_vec();
+        events.retain(|event| event["type"] != "integration");
+        if let Some(view) = report.integration_view() {
+            events.push(serde_json::json!({"type":"integration", "view":view}));
+        }
         events.retain(|event| event["type"] != "questions_policy");
         events.push(serde_json::json!({
             "type": "questions_policy", "policy": report.questions_policy(),
@@ -204,6 +208,16 @@ impl ControllerTaskStatusResult {
 
 impl ControllerReadIdentity for ControllerTaskStatusResult {
     fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
+        use crate::integration::contracts::{IntegrationView, ValidateIntegration};
+        for event in self
+            .events
+            .iter()
+            .filter(|event| event["type"] == "integration")
+        {
+            let view: IntegrationView = serde_json::from_value(event["view"].clone())
+                .map_err(|_| invalid_controller_reply())?;
+            view.validate().map_err(|_| invalid_controller_reply())?;
+        }
         require_matching_task_id(request, self.task_id)
     }
 }

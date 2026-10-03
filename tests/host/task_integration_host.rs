@@ -27,24 +27,71 @@ fn execute(
     HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime).execute(request)
 }
 fn legacy_close(f: &GitIntegrationFixture) {
-    let task = f
-        .store
-        .task_dir(&f.record.policy.project_id, f.record.task_id)
+    use mac_worker::test_support::host::{gc::apply_baseline_retention_close, lease::LeaseService};
+    let project = &f.record.policy.project_id;
+    let task = f.record.task_id;
+    let before = f.store.task_status(project, task).unwrap();
+    assert_eq!(before.state(), TaskState::Open);
+    assert!(
+        !LeaseService::new(&f.store)
+            .task_scope_is_live(project, task)
+            .unwrap()
+    );
+    let mirror = f.store.mirror_if_present(project).unwrap().unwrap();
+    let refs = integration_git(
+        mirror.path(),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/task",
+            "refs/mac-worker/bases",
+        ],
+    );
+    let expiry = before.updated_at_millis() + TASK_RETENTION_MILLIS;
+    assert!(
+        !apply_baseline_retention_close(&f.store, &SystemProcessRunner, project, task, expiry - 1)
+            .unwrap()
+    );
+    assert!(f.workspace().exists());
+    assert!(
+        apply_baseline_retention_close(&f.store, &SystemProcessRunner, project, task, expiry + 1)
+            .unwrap()
+    );
+    let after = f.store.task_status(project, task).unwrap();
+    assert_eq!(after.state(), TaskState::Closed);
+    assert_eq!(after.head_oid(), before.head_oid());
+    assert_eq!(after.turns(), before.turns());
+    assert_eq!(after.updated_at_millis(), expiry + 1);
+    assert!(!f.workspace().exists());
+    assert_eq!(
+        integration_git(
+            mirror.path(),
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/task",
+                "refs/mac-worker/bases"
+            ]
+        ),
+        refs
+    );
+}
+
+fn integration_git(path: &std::path::Path, args: &[&str]) -> String {
+    let result = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
         .unwrap();
-    let mut wire = serde_json::to_value(
-        f.store
-            .task_status(&f.record.policy.project_id, f.record.task_id)
-            .unwrap(),
-    )
-    .unwrap();
-    wire["state"] = serde_json::json!("closed");
-    let status: TaskStatus = serde_json::from_value(wire).unwrap();
-    std::fs::write(
-        task.join("status.json"),
-        serde_json::to_vec(&status).unwrap(),
-    )
-    .unwrap();
-    std::fs::remove_dir_all(f.workspace()).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
 }
 
 fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {

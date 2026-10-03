@@ -183,6 +183,33 @@ fn validate_read(query: &ReadQuery, result: &EventReadResult) -> Result<(), Work
     Ok(())
 }
 impl EventSource for ControllerEventClient {
+    fn integrations(
+        &self,
+        task_ids: &[crate::task::TaskId],
+        deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        use crate::integration::contracts::{ValidateIntegration, integration_unavailable};
+        // Discovery and execution consume one absolute budget. A disappeared
+        // capability is unavailable, rather than a disabled integration policy.
+        let read = || {
+            let deadline = self.budget(deadline)?;
+            let request = request_body(serde_json::json!({"integration":{"task_ids":task_ids}}))?;
+            crate::controller::integration::integration_selector_ids(&request)?;
+            let health_request = request_body(serde_json::json!({"controller_health":true}))?;
+            let health: crate::controller::health_read::ControllerHealthStatus =
+                self.exchange(&health_request, deadline)?;
+            health.verify_payload(&health_request)?;
+            crate::controller::integration::require_controller_integration(
+                health.features.as_deref().unwrap_or_default(),
+            )?;
+            let result: crate::integration::contracts::IntegrationReadResult =
+                self.exchange(&request, deadline)?;
+            result.validate()?;
+            result.verify_payload(&request)?;
+            Ok(result)
+        };
+        read().map_err(|_: WorkerError| integration_unavailable())
+    }
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
         let deadline = self.budget(deadline)?;
         let request = request_body(serde_json::json!({"controller_health":true}))?;

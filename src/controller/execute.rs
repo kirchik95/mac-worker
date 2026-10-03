@@ -913,6 +913,7 @@ pub fn serve_rpc_with_runtime(
         RpcExecution {
             executor: &DETACHED_EXECUTOR,
             home: &home,
+            integration_features: None,
         },
     )
 }
@@ -920,6 +921,31 @@ pub fn serve_rpc_with_runtime(
 pub struct RpcExecution<'a> {
     pub executor: &'a dyn RunnerExecutor,
     pub home: &'a Path,
+    pub integration_features: Option<&'a [String]>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn serve_rpc_with_integration_features(
+    paths: &PathLayout,
+    config: &Config,
+    runner: &dyn ProcessRunner,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    features: &[String],
+) -> Result<(), WorkerError> {
+    serve_rpc_with_execution(
+        paths,
+        config,
+        runner,
+        stdin,
+        stdout,
+        ControllerFault::None,
+        RpcExecution {
+            executor: &DETACHED_EXECUTOR,
+            home: &paths.state,
+            integration_features: Some(features),
+        },
+    )
 }
 
 pub fn serve_rpc_with_execution(
@@ -942,10 +968,18 @@ pub fn serve_rpc_with_execution(
             .iter()
             .map(|s| (*s).to_owned())
             .collect::<Vec<_>>();
-        super::integration::require_controller_integration(&features)?;
-        // Full durable companion reads are attached at checkpoint (c).
+        super::integration::require_controller_integration(
+            execution.integration_features.unwrap_or(&features),
+        )?;
         if super::integration::is_integration_selector(&request) {
-            return Err(crate::integration::contracts::integration_unavailable());
+            let state = crate::integration::store::ExistingIntegrationState::new(paths);
+            let frame = super::integration::serve_integration_selector(
+                &request,
+                execution.integration_features.unwrap_or(&features),
+                &state,
+            )?;
+            stdout.write_all(&frame).map_err(WorkerError::Io)?;
+            return stdout.flush().map_err(WorkerError::Io);
         }
     }
     let mut _events = None;
@@ -976,7 +1010,11 @@ pub fn serve_rpc_with_execution(
         let runtime: std::sync::Arc<dyn EventRuntime> = std::sync::Arc::new(RpcEventRuntime);
         let deadline = runtime.now().saturating_add(RPC_BUDGET);
         let journal = ExistingJournalProvider::new(paths.clone(), runtime.clone());
-        let tasks = ExistingTaskProjectionProvider::new(paths.clone(), runtime);
+        let tasks = ExistingTaskProjectionProvider::new(paths.clone(), runtime).with_integrations(
+            std::sync::Arc::new(crate::integration::store::ExistingIntegrationState::new(
+                paths,
+            )),
+        );
         serve_selector_with(&request, &journal, &tasks, deadline)?
     } else if crate::controller::health_read::is_health_read(&request) {
         crate::controller::health_read::serve_health_read_with_paths(

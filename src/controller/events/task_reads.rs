@@ -127,8 +127,6 @@ pub struct ExistingTaskProjectionProvider {
 }
 
 impl ExistingTaskProjectionProvider {
-    // The serial T6 entry-point wiring installs this adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(
         mut self,
         state: Arc<dyn crate::integration::contracts::IntegrationState>,
@@ -916,7 +914,7 @@ pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError>
 
 impl TaskFacts {
     /// Add only the compact companion annotation and bind its revision to the digest.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_integration(
         self,
         record: &LocalTaskRecord,

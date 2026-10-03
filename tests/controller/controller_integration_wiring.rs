@@ -13,6 +13,188 @@ use mac_worker::test_support::{
 use serde_json::json;
 
 struct NoProcesses;
+
+struct CompanionPeer {
+    paths: PathLayout,
+    config: mac_worker::test_support::core::config::Config,
+    discovery: bool,
+    execution: bool,
+    calls: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+impl mac_worker::test_support::host::process::ProcessRunner for CompanionPeer {
+    fn run(
+        &self,
+        process: &mac_worker::test_support::host::process::ProcessRequest,
+    ) -> Result<
+        mac_worker::test_support::host::process::ProcessResult,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
+        use mac_worker::test_support::controller::{
+            decode_frame, encode_json_frame, serve_rpc_with_integration_features,
+        };
+        use std::os::unix::process::ExitStatusExt;
+        let bytes = process.stdin.as_ref().unwrap();
+        let request: serde_json::Value = serde_json::from_slice(decode_frame(bytes)?).unwrap();
+        self.calls.lock().unwrap().push(request["body"].clone());
+        let features = if self.execution {
+            vec![CONTROLLER_FEATURE_INTEGRATION.into()]
+        } else {
+            vec![]
+        };
+        let mut out = Vec::new();
+        let result = serve_rpc_with_integration_features(
+            &self.paths,
+            &self.config,
+            &NoProcesses,
+            &mut std::io::Cursor::new(bytes),
+            &mut out,
+            &features,
+        );
+        let status = match result {
+            Ok(()) => {
+                if request["body"].get("controller_health").is_some() {
+                    let mut reply: serde_json::Value =
+                        serde_json::from_slice(decode_frame(&out)?).unwrap();
+                    reply["result"]["features"] = if self.discovery {
+                        json!(["controller.events", CONTROLLER_FEATURE_INTEGRATION])
+                    } else {
+                        json!(["controller.events"])
+                    };
+                    out = encode_json_frame(&reply)?;
+                }
+                0
+            }
+            Err(error) => {
+                out = encode_json_frame(
+                    &mac_worker::test_support::host::job::HostControlError::new(
+                        error.public_code(),
+                        error.public_message(),
+                    )
+                    .unwrap(),
+                )?;
+                1 << 8
+            }
+        };
+        Ok(mac_worker::test_support::host::process::ProcessResult {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: out,
+            stderr: vec![],
+        })
+    }
+}
+
+#[test]
+fn concrete_event_client_companion_matrix_refuses_old_and_rolled_back_execution_without_mutation() {
+    use mac_worker::test_support::events::{
+        EventSource, client::ControllerEventClient, testing::ManualEventRuntime,
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    for (discovery, execution) in [(false, false), (true, false), (true, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+        let config = fixture_config(&paths);
+        let peer = Arc::new(CompanionPeer {
+            paths: paths.clone(),
+            config: config.clone(),
+            discovery,
+            execution,
+            calls: Mutex::new(vec![]),
+        });
+        let mut controller = config.controller;
+        controller.ssh = "fixture.invalid".into();
+        controller.enabled = true;
+        let client = ControllerEventClient::new(
+            peer.clone(),
+            controller,
+            Arc::new(ManualEventRuntime::new()),
+        );
+        let result = client.integrations(&[fixture_task()], Duration::from_secs(3));
+        if discovery && execution {
+            assert_eq!(
+                result.unwrap().integrations.get(&fixture_task()),
+                Some(&None)
+            );
+        } else {
+            assert_eq!(result.unwrap_err().public_code(), "INTEGRATION_UNAVAILABLE");
+        }
+        let calls = peer.calls.lock().unwrap();
+        assert_eq!(calls[0], json!({"controller_health":true}));
+        assert_eq!(calls.len(), if discovery { 2 } else { 1 });
+        if discovery {
+            assert_eq!(
+                calls[1],
+                json!({"integration":{"task_ids":[fixture_task()]}})
+            );
+        }
+        assert!(!paths.controller_state_root().join("requests").exists());
+        assert!(!paths.state.join("integrations").exists());
+    }
+}
+
+#[test]
+fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_processes() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    ClientStateStore::open(&paths.state)
+        .unwrap()
+        .create_task(ordinary)
+        .unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+    state
+        .publish_policy(record.task_id, &record.policy)
+        .unwrap();
+    state
+        .replace(record.task_id, IntegrationRevision(0), &record)
+        .unwrap();
+    for body in [
+        json!({"integration": {"task_ids": [record.task_id]}}),
+        json!({"controller_events": {"op":"tasks", "task_ids":[record.task_id], "include_titles":false}}),
+    ] {
+        let payload = json!({"protocol_version":7,"request_id":"00000000000000000000000000000043",
+            "command":"task.list", "body":body});
+        let mut out = Vec::new();
+        serve_rpc_with_integration_features(
+            &paths,
+            &config,
+            &NoProcesses,
+            &mut std::io::Cursor::new(encode_json_frame(&payload).unwrap()),
+            &mut out,
+            &[CONTROLLER_FEATURE_INTEGRATION.into()],
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(decode_frame(&out).unwrap()).unwrap();
+        if body.get("integration").is_some() {
+            assert_eq!(
+                value["result"]["integrations"][record.task_id.to_string()],
+                json!(record.snapshot)
+            );
+        } else {
+            assert_eq!(
+                value["result"]["rows"][0]["integration"],
+                json!(record.snapshot.annotation().unwrap())
+            );
+            assert_eq!(value["result"]["rows"][0]["outcome"], "blocked");
+        }
+        assert!(!paths.controller_state_root().exists());
+        assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+    }
+}
 impl mac_worker::test_support::host::process::ProcessRunner for NoProcesses {
     fn run(
         &self,
