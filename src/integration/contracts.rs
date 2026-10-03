@@ -699,6 +699,7 @@ pub enum WorkflowState {
     Done,
 }
 contract!(IntegrationView {
+    /// Only the cycle covering the latest ordinary turn appears in this overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     integration: Option<IntegrationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

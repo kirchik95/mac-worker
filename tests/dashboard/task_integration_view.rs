@@ -1,5 +1,5 @@
 use mac_worker::test_support::integration::*;
-use mac_worker::test_support::task::model::{TaskState, TaskStatus};
+use mac_worker::test_support::task::model::{TaskOutcome, TaskState, TaskStatus};
 
 fn facts() -> IntegrationTaskFacts {
     IntegrationTaskFacts {
@@ -24,6 +24,78 @@ fn disabled_projection_preserves_review_and_omits_extension_fields() {
     assert_eq!(json["attention"], true);
     assert!(json.get("integration").is_none());
     assert!(json.get("workflow_state").is_none());
+}
+
+#[test]
+fn newer_ordinary_running_question_failure_and_cancellation_use_ordinary_projection() {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/src/lib/integration.fixtures.json"
+    )))
+    .unwrap();
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Integrated;
+    snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+    snapshot.disposition = Some(IntegrationDisposition::Merged);
+    for outcome in [
+        None,
+        Some(TaskOutcome::NeedsInput),
+        Some(TaskOutcome::failed("follow-up failed")),
+        Some(TaskOutcome::Cancelled),
+    ] {
+        let ordinary = sample_ordinary_followup(fixture_task(), fixture_source(), outcome.clone());
+        let facts = IntegrationTaskFacts::from_record(&ordinary, outcome.is_none());
+        let baseline = project_integration(None, &facts).unwrap();
+        let projected = project_integration(Some(&snapshot), &facts).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&projected).unwrap(),
+            serde_json::to_vec(&baseline).unwrap(),
+            "{outcome:?}"
+        );
+        assert_eq!(projected.attention, outcome.is_some());
+        let name = outcome.as_ref().map_or("running", TaskOutcome::kind);
+        let shared = fixtures["followups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(serde_json::to_value(projected).unwrap(), shared["view"]);
+    }
+}
+
+#[test]
+fn newer_ordinary_details_retain_receipt_history_without_changing_the_row_or_questions() {
+    use mac_worker::test_support::task::view::{TaskFreshness, project_task_detail};
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Integrated;
+    snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+    snapshot.disposition = Some(IntegrationDisposition::Merged);
+    for outcome in [
+        None,
+        Some(TaskOutcome::NeedsInput),
+        Some(TaskOutcome::failed("follow-up failed")),
+        Some(TaskOutcome::Cancelled),
+    ] {
+        let ordinary = sample_ordinary_followup(fixture_task(), fixture_source(), outcome.clone());
+        let facts = IntegrationTaskFacts::from_record(&ordinary, outcome.is_none());
+        let baseline =
+            project_task_detail(&ordinary, ordinary.status(), None, TaskFreshness::Current)
+                .unwrap();
+        let detail = baseline
+            .clone()
+            .with_integration(Some(&snapshot), &facts)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&detail.task).unwrap(),
+            serde_json::to_value(&baseline.task).unwrap(),
+            "{outcome:?}"
+        );
+        assert_eq!(detail.workflow_state, None);
+        assert_eq!(detail.review_state, baseline.review_state);
+        assert_eq!(detail.questions, baseline.questions);
+        assert_eq!(detail.integration, Some(snapshot.clone()));
+    }
 }
 
 #[test]
@@ -415,8 +487,8 @@ mod owner_adapter {
             source::DashboardRemoteReader,
             task::{
                 DashboardIntegrationSource, DashboardTaskMutationSource, DashboardTaskSource,
-                MacWorkerTaskMutationSource, MacWorkerTaskSource, TaskIntegrationRequest,
-                TaskMutationRequest,
+                MacWorkerTaskMutationSource, MacWorkerTaskSource, OwnerDashboardIntegrations,
+                TaskIntegrationRequest, TaskMutationRequest,
             },
         },
         host::job::{LogChunk, LogStream},
@@ -482,6 +554,95 @@ mod owner_adapter {
             Ok(snapshot.clone())
         }
     }
+    #[test]
+    fn rooted_dashboard_receipt_is_history_for_new_work_and_current_for_prior_epoch_auxiliaries() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: base.join("config"),
+            state: base.join("state"),
+            cache: base.join("cache"),
+            data: base.join("data"),
+        };
+        let ordinary_state = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+        let integration_state = Arc::new(
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap(),
+        );
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Verify, 1, 1);
+        integration_state
+            .publish_prepared(record.task_id, &prepared)
+            .unwrap();
+        record.snapshot.epoch = 1;
+        record.snapshot.state = IntegrationStatus::Integrated;
+        record.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        record.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        integration_state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            integration_state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        let adapter = Arc::new(OwnerDashboardIntegrations {
+            state: integration_state,
+            host: Arc::new(FakeIntegrationHost::default()),
+            turns: Arc::new(FakeIntegrationTurns::default()),
+            runtime: Arc::new(ManualIntegrationRuntime::default()),
+            observer: Arc::new(FakeIntegrationObserver::default()),
+        });
+        let config = Arc::new(Config::parse("version = 1\n[[workers]]\nname = \"fixture-worker\"\nssh = \"fixture\"\nslots = 1\n").unwrap());
+        let reader = MacWorkerTaskSource::new(config, ordinary_state.clone(), Arc::new(NoRemote))
+            .with_integrations(adapter);
+        for outcome in [
+            None,
+            Some(TaskOutcome::NeedsInput),
+            Some(TaskOutcome::failed("follow-up failed")),
+            Some(TaskOutcome::Cancelled),
+        ] {
+            let ordinary =
+                sample_ordinary_followup(record.task_id, fixture_source(), outcome.clone());
+            let file = paths
+                .state
+                .join("tasks")
+                .join(format!("{}.json", record.task_id));
+            // Create through the ordinary store, then replace only this private fixture.
+            if !file.exists() {
+                ordinary_state.create_task(ordinary.clone()).unwrap();
+            } else {
+                std::fs::write(&file, ordinary.canonical_bytes().unwrap()).unwrap();
+            }
+            let detail = reader.task_detail(record.task_id).unwrap();
+            assert_eq!(detail.task.integration, None, "{outcome:?}");
+            assert_eq!(detail.workflow_state, None);
+            assert_eq!(detail.integration, Some(record.snapshot.clone()));
+            assert_eq!(
+                detail.task.last_outcome,
+                ordinary.status().last_outcome().cloned()
+            );
+            assert_eq!(detail.questions, ordinary.status().questions());
+        }
+        let ordinary =
+            sample_ordinary_followup(record.task_id, fixture_source(), Some(TaskOutcome::Done));
+        let mut wire = serde_json::to_value(&ordinary).unwrap();
+        wire["status"]["turns"][1]["turn_id"] = serde_json::json!(prepared.followup.turn_id());
+        let ordinary: mac_worker::test_support::task::model::LocalTaskRecord =
+            serde_json::from_value(wire).unwrap();
+        std::fs::write(
+            paths
+                .state
+                .join("tasks")
+                .join(format!("{}.json", record.task_id)),
+            ordinary.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let detail = reader.task_detail(record.task_id).unwrap();
+        assert_eq!(detail.task.integration, Some(record.snapshot.clone()));
+        assert_eq!(detail.workflow_state, Some(WorkflowState::Done));
+    }
+
     #[test]
     fn dashboard_reads_and_mutations_use_durable_companion_and_reject_changed_identity() {
         let root = tempfile::tempdir().unwrap();

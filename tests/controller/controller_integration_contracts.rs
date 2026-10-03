@@ -979,7 +979,7 @@ fn rust_loads_the_same_public_views_codes_and_annotation_boundaries_as_typescrip
     )))
     .unwrap();
     let rows = fixtures["cases"].as_array().unwrap();
-    assert_eq!(rows.len(), 37);
+    assert_eq!(rows.len(), 41);
     for row in rows {
         let view: IntegrationView = serde_json::from_value(row["view"].clone())
             .unwrap_or_else(|error| panic!("{}: {error}", row["name"]));

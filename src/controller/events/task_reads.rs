@@ -193,7 +193,16 @@ impl TaskEventReadStore {
                 if integration.task_id != id {
                     return Err(invalid_state());
                 }
-                facts.with_integration(record, &integration.snapshot)
+                let current = crate::integration::view::snapshot_covers_latest_work(
+                    &integration.snapshot,
+                    record,
+                    |turn| {
+                        state
+                            .load_prepared(id, turn)
+                            .map(|prepared| prepared.is_some())
+                    },
+                )?;
+                facts.with_current_integration(record, &integration.snapshot, current)
             }
             None if state.load_policy(id)?.is_some() => {
                 Err(crate::integration::contracts::integration_unavailable())
@@ -907,16 +916,30 @@ pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError>
 
 impl TaskFacts {
     /// Add only the compact companion annotation and bind its revision to the digest.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(
+        self,
+        record: &LocalTaskRecord,
+        snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    ) -> Result<Self, WorkerError> {
+        let current =
+            crate::integration::view::snapshot_covers_current_epoch_work(snapshot, record)?;
+        self.with_current_integration(record, snapshot, current)
+    }
+    fn with_current_integration(
         mut self,
         record: &LocalTaskRecord,
         snapshot: &crate::integration::contracts::IntegrationSnapshot,
+        current: bool,
     ) -> Result<Self, WorkerError> {
         use crate::integration::contracts::IntegrationStatus;
         if self.task_id != record.meta().task_id() {
             return Err(invalid_state());
         }
         let annotation = snapshot.annotation()?;
+        if !current {
+            return Ok(self);
+        }
         let mut hash = Sha256::new();
         hash.update(b"mac-worker/integration-facts/v1\0");
         let ordinary = record.canonical_bytes().map_err(|_| invalid_state())?;
@@ -1303,6 +1326,118 @@ mod tests {
         bytes.push(b'\n');
         fs::write(paths.state.join("queue/state.json"), bytes).unwrap();
         jobs
+    }
+
+    #[test]
+    fn addressed_facts_restore_all_newer_ordinary_outcomes_with_a_rooted_receipt() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = fixture_task();
+        let state = Arc::new(
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap(),
+        );
+        let mut integration = sample_record(task, fixture_source(), "main");
+        integration.snapshot.state = IntegrationStatus::Integrated;
+        integration.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        integration.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        state.publish_policy(task, &integration.policy).unwrap();
+        assert!(
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        private_directory(&paths.state.join("turns").join(task.to_string()));
+        let baseline_reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_integrations(state);
+        for outcome in [
+            None,
+            Some(TaskOutcome::NeedsInput),
+            Some(TaskOutcome::failed("follow-up failed")),
+            Some(TaskOutcome::Cancelled),
+        ] {
+            let ordinary = sample_ordinary_followup(task, fixture_source(), outcome.clone());
+            write_record(&paths, &ordinary);
+            let actual = reader
+                .addressed_measured(&[task], false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+                .remove(0);
+            let expected = baseline_reader
+                .addressed_measured(&[task], false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+                .remove(0);
+            assert_eq!(actual, expected, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn addressed_facts_identify_prior_epoch_auxiliaries_from_rooted_preparations() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = fixture_task();
+        let state = Arc::new(
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap(),
+        );
+        let mut integration = sample_record(task, fixture_source(), "main");
+        let prepared = sample_prepared_turn(&integration, IntegrationTurnPurpose::Resolve, 1, 1);
+        state.publish_prepared(task, &prepared).unwrap();
+        integration.snapshot.epoch = 1;
+        integration.snapshot.state = IntegrationStatus::Integrated;
+        integration.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        integration.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        state.publish_policy(task, &integration.policy).unwrap();
+        assert!(
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        private_directory(&paths.state.join("turns").join(task.to_string()));
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_integrations(state);
+        let mut wire = serde_json::to_value(sample_ordinary_followup(
+            task,
+            fixture_source(),
+            Some(TaskOutcome::Done),
+        ))
+        .unwrap();
+        wire["status"]["turns"][1]["turn_id"] = serde_json::json!(prepared.followup.turn_id());
+        let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+        write_record(&paths, &ordinary);
+        let actual = reader
+            .addressed_measured(&[task], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows
+            .remove(0);
+        assert_eq!(
+            actual.integration,
+            Some(integration.snapshot.annotation().unwrap())
+        );
+        let mut wire = serde_json::to_value(&ordinary).unwrap();
+        let mut next = wire["status"]["turns"][1].clone();
+        next["turn_number"] = serde_json::json!(3);
+        next["turn_id"] = serde_json::json!(TurnId::new(uuid::Uuid::from_u128(9)));
+        next["outcome"] = serde_json::json!({"kind":"needs_input"});
+        wire["status"]["turns"].as_array_mut().unwrap().push(next);
+        wire["status"]["last_outcome"] = serde_json::json!({"kind":"needs_input"});
+        let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+        write_record(&paths, &ordinary);
+        let actual = reader
+            .addressed_measured(&[task], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows
+            .remove(0);
+        assert_eq!(actual.integration, None);
+        assert_eq!(actual.outcome, Some(SafeOutcome::NeedsInput));
     }
 
     #[test]

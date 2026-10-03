@@ -112,6 +112,59 @@ pub fn sample_ordinary(task: TaskId, source: TurnId) -> LocalTaskRecord {
     )
     .expect("fixture ordinary record")
 }
+/// New ordinary work after an integrated Open/Never cycle; None is running.
+pub fn sample_ordinary_followup(
+    task: TaskId,
+    source: TurnId,
+    outcome: Option<TaskOutcome>,
+) -> LocalTaskRecord {
+    let prior = sample_ordinary(task, source);
+    let terminal = outcome.as_ref().map(|outcome| match outcome {
+        TaskOutcome::Cancelled => TurnTerminal::Cancelled,
+        TaskOutcome::Failed { .. } => TurnTerminal::Failed,
+        _ => TurnTerminal::Succeeded,
+    });
+    let mut turns = prior.status().turns().to_vec();
+    turns.push(TurnSummary::new(
+        2,
+        TurnId::new(uuid::Uuid::from_u128(8)),
+        terminal,
+        outcome.clone(),
+        terminal.map(|_| false),
+        false,
+        Some(1002),
+        terminal.map(|_| 1003),
+    ));
+    let questions = if outcome == Some(TaskOutcome::NeedsInput) {
+        vec!["Which follow-up option?".into()]
+    } else {
+        vec![]
+    };
+    let head = "e".repeat(40).parse().expect("fixture integrated head");
+    let status = TaskStatus::new(
+        if outcome.is_none() {
+            TaskState::Active
+        } else {
+            TaskState::Open
+        },
+        outcome,
+        Some("fixture-worker".into()),
+        true,
+        Some(head),
+        Some("New ordinary follow-up".into()),
+        questions,
+        vec![],
+        None,
+        turns,
+        1003,
+    )
+    .expect("fixture follow-up status");
+    prior
+        .with_status(status)
+        .unwrap()
+        .with_fetched_head(Some("e".repeat(40).parse().unwrap()))
+        .unwrap()
+}
 pub fn sample_record(task: TaskId, source: TurnId, branch: &str) -> IntegrationRecord {
     let policy = sample_policy(branch);
     let target_key = policy.target_key().expect("fixture target");
