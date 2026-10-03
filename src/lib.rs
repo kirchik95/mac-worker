@@ -1620,6 +1620,21 @@ fn run_task_command(
                 if report.setup.present {
                     writeln!(stdout, "setup recipe present")?;
                 }
+                for task in &report.tasks {
+                    if let Some(integration) = &task.integration {
+                        let verify = match integration.verify {
+                            crate::integration::contracts::VerifyPolicy::Never => "never",
+                            crate::integration::contracts::VerifyPolicy::MovedTarget => {
+                                "moved-target"
+                            }
+                        };
+                        writeln!(
+                            stdout,
+                            "task {}: integrate={} verify={verify}",
+                            task.id, integration.target
+                        )?;
+                    }
+                }
                 for issue in &report.issues {
                     writeln!(
                         stdout,

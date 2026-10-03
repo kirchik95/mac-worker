@@ -1134,6 +1134,8 @@ pub struct SetupPreview {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TaskPreview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::config::IntegrationPreview>,
     pub index: usize,
     pub id: String,
     pub title: Option<String>,
@@ -4920,7 +4922,19 @@ pub fn preview_batch_plan(
                 Err(error) => issues.push(preview_issue_from_error(index, &error)),
             }
         }
+        let integration = match crate::integration::config::batch_integration_preview(
+            &state.settings.task,
+            &batch.defaults,
+            task,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                issues.push(preview_issue_from_error(index, &error));
+                None
+            }
+        };
         tasks.push(TaskPreview {
+            integration,
             index,
             id: task_preview_id(task, index),
             title: task.title.clone(),
@@ -4999,6 +5013,7 @@ impl<'a> TaskClient<'a> {
             .settings
             .task;
         for (request, _) in &requests {
+            crate::integration::config::reject_unrouted_integration(&settings, request)?;
             validate_prompt(&request.prompt)?;
             validate_preference(self.config, &request.preference)?;
             let _ = effective_task_limits(&request.limits, &settings)?;
@@ -7129,13 +7144,11 @@ pub(crate) fn resolve_batch_task_without_local_workers(
             .or(defaults.max_followups)
             .unwrap_or(default_limits.max_followups),
     )?;
+    let integration =
+        crate::integration::config::batch_integration_inputs(settings, defaults, task)?;
     let request = TaskSubmitRequest {
-        integrate: if task.integrate.is_inherit() {
-            defaults.integrate.clone()
-        } else {
-            task.integrate.clone()
-        },
-        verify_merge: task.verify_merge.or(defaults.verify_merge),
+        integrate: integration.integrate,
+        verify_merge: integration.verify_merge,
         session_import: None,
         questions: task.questions.or(defaults.questions).or(settings.questions),
         agent,

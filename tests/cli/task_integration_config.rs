@@ -360,6 +360,105 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
 }
 
 #[test]
+fn real_git_preflight_proves_ancestry_not_tracking_ref_or_equality() {
+    use mac_worker::test_support::host::{process::SystemProcessRunner, rooted_fs::RootedDir};
+    let repo = crate::support::GitRepo::init();
+    repo.write("base", b"base");
+    repo.commit_all("base");
+    let base = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    repo.write("target", b"target");
+    repo.commit_all("target descendant");
+    let path = std::fs::canonicalize(repo.root()).unwrap();
+    let origin = url::Url::from_file_path(&path).unwrap().to_string();
+    let root = RootedDir::open(&path).unwrap();
+    let branch = validate_integration_target("main").unwrap();
+    assert_eq!(
+        preflight_integration_base(&SystemProcessRunner, &origin, &branch, Some(&base), &root)
+            .unwrap(),
+        IntegrationBasePreflight::Pass
+    );
+    assert_eq!(
+        preflight_integration_base(
+            &SystemProcessRunner,
+            &origin,
+            &validate_integration_target("absent").unwrap(),
+            Some(&base),
+            &root
+        )
+        .unwrap_err()
+        .public_code(),
+        "INTEGRATION_TARGET_MISSING"
+    );
+    assert!(
+        repo.git(&["checkout", "--orphan", "unpublished"])
+            .status
+            .success()
+    );
+    assert!(repo.git(&["rm", "-rf", "."]).status.success());
+    repo.write("private", b"private");
+    repo.commit_all("unpublished input");
+    let private = String::from_utf8(repo.git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        preflight_integration_base(
+            &SystemProcessRunner,
+            &origin,
+            &branch,
+            Some(&private),
+            &root
+        )
+        .unwrap_err()
+        .public_code(),
+        "INTEGRATION_BASE_NOT_ON_TARGET"
+    );
+}
+
+#[test]
+fn preview_prints_effective_per_task_target_verify_and_disable() {
+    use mac_worker::test_support::{
+        core::config::Config, host::process::SystemProcessRunner, task::client::preview_batch_plan,
+    };
+    let repo = crate::support::GitRepo::init();
+    repo.write("base", b"base");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&["remote", "add", "origin", "https://example.test/repo.git"])
+            .status
+            .success()
+    );
+    repo.write(
+        ".worker.toml",
+        b"[task]\nintegrate = 'project'\nverify_merge = 'moved-target'\n",
+    );
+    repo.write("batch.toml", b"integrate = 'batch'\n[[tasks]]\nprompt = 'inherit'\n[[tasks]]\nprompt = 'override'\nintegrate = 'task'\nverify_merge = 'never'\n[[tasks]]\nprompt = 'disabled'\nintegrate = false\n");
+    let config: Config = toml::from_str("version = 1").unwrap();
+    let preview = preview_batch_plan(
+        &SystemProcessRunner,
+        &config,
+        &repo.root().join("batch.toml"),
+        repo.root(),
+    )
+    .unwrap();
+    let wire = serde_json::to_value(preview).unwrap();
+    assert_eq!(
+        wire["tasks"][0]["integration"],
+        serde_json::json!({"target":"batch","verify":"moved-target"})
+    );
+    assert_eq!(
+        wire["tasks"][1]["integration"],
+        serde_json::json!({"target":"task","verify":"never"})
+    );
+    assert!(wire["tasks"][2].get("integration").is_none());
+}
+
+#[test]
 fn authoritative_target_accepts_255_bytes_and_rejects_256() {
     assert!(validate_integration_target(&"a".repeat(255)).is_ok());
     assert!(validate_integration_target(&"a".repeat(256)).is_err());

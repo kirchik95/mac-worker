@@ -112,6 +112,55 @@ impl From<&crate::task_client::BatchDefaults> for IntegrationPolicySettings {
     }
 }
 
+/// Resolve batch inputs without dropping their task/default/project provenance.
+/// Disabled results carry no inherited verify override.
+pub fn batch_integration_inputs(
+    project: &crate::project_config::TaskSettings,
+    defaults: &crate::task_client::BatchDefaults,
+    task: &crate::task_client::BatchTask,
+) -> Result<IntegrationPolicySettings, WorkerError> {
+    let effective = resolve_integration_settings(
+        &project.into(),
+        Some(&defaults.into()),
+        &task.integrate,
+        task.verify_merge,
+    )?;
+    Ok(match effective {
+        Some((branch, verify)) => IntegrationPolicySettings {
+            integrate: IntegrationOverride::Target(branch),
+            verify_merge: Some(verify),
+        },
+        None => IntegrationPolicySettings {
+            integrate: IntegrationOverride::Disabled,
+            verify_merge: None,
+        },
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationPreview {
+    pub target: String,
+    pub verify: VerifyPolicy,
+}
+
+pub fn batch_integration_preview(
+    project: &crate::project_config::TaskSettings,
+    defaults: &crate::task_client::BatchDefaults,
+    task: &crate::task_client::BatchTask,
+) -> Result<Option<IntegrationPreview>, WorkerError> {
+    let effective = batch_integration_inputs(project, defaults, task)?;
+    Ok(match effective.integrate {
+        IntegrationOverride::Target(branch) => Some(IntegrationPreview {
+            target: public_target_display(
+                branch.as_str(),
+                &crate::redaction::RedactionBoundary::from_env(),
+            ),
+            verify: effective.verify_merge.unwrap_or_default(),
+        }),
+        _ => None,
+    })
+}
+
 /// Temporary fail-closed boundary until T6 routes enabled inputs to wrappers.
 /// Ordinary submission must never parse opt-in and then silently ignore it.
 pub(crate) fn reject_unrouted_integration(
@@ -235,5 +284,41 @@ pub fn preflight_integration_base(
         Some(0) => Ok(Pass),
         Some(1) => Err(IntegrationCode::IntegrationBaseNotOnTarget.error()),
         _ => Ok(Unknown),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn batch_inputs_survive_resolution_and_refuse_unrouted_enabled_submits() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = crate::project_config::ProjectSettings::load(root.path(), &[])
+            .unwrap()
+            .task;
+        let batch: crate::task_client::BatchFile = toml::from_str("integrate = 'main'\nverify_merge = 'moved-target'\n[[tasks]]\nprompt = 'work'\n[[tasks]]\nprompt = 'disabled'\nintegrate = false").unwrap();
+        for (index, task) in batch.tasks.iter().enumerate() {
+            let request = crate::task_client::resolve_batch_task_without_local_workers(
+                &batch.defaults,
+                task,
+                root.path(),
+                root.path(),
+                &settings,
+            )
+            .unwrap();
+            if index == 0 {
+                assert!(matches!(request.integrate, IntegrationOverride::Target(_)));
+                assert_eq!(request.verify_merge, Some(VerifyPolicy::MovedTarget));
+                assert_eq!(
+                    reject_unrouted_integration(&settings, &request)
+                        .unwrap_err()
+                        .public_code(),
+                    "INTEGRATION_UNAVAILABLE"
+                );
+            } else {
+                assert_eq!(request.integrate, IntegrationOverride::Disabled);
+                assert!(reject_unrouted_integration(&settings, &request).is_ok());
+            }
+        }
     }
 }
