@@ -54,6 +54,359 @@ fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
         .unwrap()
 }
 
+fn observed(f: &GitIntegrationFixture) -> IntegrationTaskFacts {
+    use mac_worker::test_support::task::model::LocalTaskRecord;
+    let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+    let ordinary = LocalTaskRecord::new(
+        tasks
+            .load_meta(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        tasks
+            .load_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        Some(1001),
+        None,
+        Some(f.record.snapshot.source_head.clone()),
+        "c".repeat(64),
+        Some("fixture-worker".into()),
+        true,
+        None,
+    )
+    .unwrap();
+    IntegrationTaskFacts::from_record(&ordinary, false)
+}
+
+#[test]
+fn lost_push_reply_keeps_the_merged_receipt_through_real_owner_fetch_repair_and_import() {
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct CountPush(AtomicUsize);
+    impl ProcessRunner for CountPush {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == "push") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    struct LoseReply<'a> {
+        service: HostIntegrationService<'a>,
+        lose: AtomicBool,
+        steps: Mutex<Vec<IntegrationStep>>,
+    }
+    impl IntegrationHost for LoseReply<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            let response = self.service.execute(request)?;
+            if let HostIntegrationAction::Step { step, .. } = request.action {
+                self.steps.lock().unwrap().push(step);
+                if step == IntegrationStep::Push && self.lose.swap(false, Ordering::SeqCst) {
+                    return Err(IntegrationCode::IntegrationNetwork.error());
+                }
+            }
+            Ok(response)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    f.record.snapshot.state = IntegrationStatus::CommitReady;
+    let state = MemoryIntegrationState::default();
+    state
+        .publish_policy(f.record.task_id, &f.record.policy)
+        .unwrap();
+    assert!(
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap()
+    );
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let runner = CountPush(AtomicUsize::new(0));
+    let host = LoseReply {
+        service: HostIntegrationService::new(&f.store, &runner, &f.runtime),
+        lose: AtomicBool::new(true),
+        steps: Mutex::new(vec![]),
+    };
+    let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        owner.drive_once(f.record.task_id).unwrap().state,
+        IntegrationStatus::RetryWait
+    );
+    let durable = host_record(&f).receipt.unwrap();
+    assert_eq!(durable.disposition, IntegrationDisposition::Merged);
+    assert_eq!(durable.merge_oid, Some(merge.clone()));
+    assert_eq!(f.origin_tip(), merge);
+    f.runtime.advance(std::time::Duration::from_secs(2));
+    let fetched = owner.drive_once(f.record.task_id).unwrap();
+    assert_eq!(fetched.state, IntegrationStatus::Published);
+    assert_eq!(fetched.disposition, Some(IntegrationDisposition::Merged));
+    assert_eq!(fetched.merge_oid, Some(merge.clone()));
+    assert_eq!(
+        state.load(f.record.task_id).unwrap().unwrap().receipt,
+        Some(durable.clone())
+    );
+    let repaired = owner.drive_once(f.record.task_id).unwrap();
+    assert_eq!(repaired.state, IntegrationStatus::Integrated);
+    assert_eq!(repaired.disposition, Some(IntegrationDisposition::Merged));
+    assert_eq!(repaired.merge_oid, Some(merge.clone()));
+    let mut imported = durable;
+    imported.imported = true;
+    assert_eq!(turns.imports(f.record.task_id), vec![imported.clone()]);
+    assert_eq!(
+        state.load(f.record.task_id).unwrap().unwrap().receipt,
+        Some(imported)
+    );
+    assert_eq!(
+        *host.steps.lock().unwrap(),
+        vec![
+            IntegrationStep::Push,
+            IntegrationStep::Fetch,
+            IntegrationStep::Repair
+        ]
+    );
+    assert_eq!(runner.0.load(Ordering::SeqCst), 1);
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), merge.as_str());
+}
+
+#[test]
+fn uncertain_observations_settle_the_retained_merge_before_the_source_head() {
+    for step in [
+        Some(IntegrationStep::Fetch),
+        None,
+        Some(IntegrationStep::Repair),
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        let merge = f.prepare();
+        f.runtime.crash_at(IntegrationHook::AfterPushBeforeReceipt);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.push())).is_err());
+        f.runtime.restart();
+        assert!(host_record(&f).receipt.is_none());
+        let action = step.map_or(HostIntegrationAction::Read, |step| {
+            HostIntegrationAction::Step {
+                step,
+                record: Box::new(f.record.clone()),
+            }
+        });
+        let HostIntegrationResponse::Integrated { receipt, .. } =
+            execute(&f, &request(&f, action)).unwrap()
+        else {
+            panic!("uncertain observation must report its settled receipt")
+        };
+        assert_eq!(receipt.disposition, IntegrationDisposition::Merged);
+        assert_eq!(receipt.merge_oid, Some(merge.clone()));
+        let record = host_record(&f);
+        assert_eq!(record.receipt, Some(receipt));
+        assert_eq!(record.snapshot.merge_oid, Some(merge.clone()));
+        assert_eq!(
+            record.snapshot.disposition,
+            Some(IntegrationDisposition::Merged)
+        );
+        assert!(!record.push_intent.unwrap().uncertain);
+        assert_eq!(f.origin_tip(), merge);
+    }
+}
+
+#[derive(Default)]
+struct RecoveryRunner {
+    fail_observation: bool,
+    requests: std::sync::Mutex<Vec<mac_worker::test_support::host::process::ProcessRequest>>,
+}
+impl mac_worker::test_support::host::process::ProcessRunner for RecoveryRunner {
+    fn run(
+        &self,
+        request: &mac_worker::test_support::host::process::ProcessRequest,
+    ) -> Result<
+        mac_worker::test_support::host::process::ProcessResult,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
+        self.requests.lock().unwrap().push(request.clone());
+        if self.fail_observation && request.args.iter().any(|arg| arg == "ls-remote") {
+            return Err(IntegrationCode::IntegrationNetwork.error());
+        }
+        SystemProcessRunner.run(request)
+    }
+}
+fn closed_uncertain_fixture(
+    target: &str,
+) -> (
+    GitIntegrationFixture,
+    mac_worker::test_support::task::model::BaseOid,
+) {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    let oid = match target {
+        "merge" => Some(merge.as_str()),
+        "source" => Some(f.record.snapshot.source_head.as_str()),
+        "neither" => None,
+        _ => panic!("unknown fixture target"),
+    };
+    if let Some(oid) = oid {
+        let mirror = f
+            .store
+            .mirror_if_present(&f.record.policy.project_id)
+            .unwrap()
+            .unwrap();
+        f.git(&[
+            "-C",
+            mirror.path().to_str().unwrap(),
+            "push",
+            &f.record.policy.origin,
+            &format!("{oid}:refs/heads/main"),
+        ]);
+    }
+    f.record.snapshot.state = IntegrationStatus::Pushing;
+    f.record.snapshot.merge_oid = Some(merge.clone());
+    f.record.push_intent = Some(IntegrationPushIntent {
+        candidate: f.record.candidates.last().unwrap().id,
+        expected_target: f.record.candidates.last().unwrap().target_head.clone(),
+        merge_oid: merge.clone(),
+        started_at_millis: 1000,
+        uncertain: true,
+    });
+    let task = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    std::fs::write(
+        task.join("integration/record.json"),
+        encode_bounded(&f.record, MAX_PRIVATE_RECORD_BYTES).unwrap(),
+    )
+    .unwrap();
+    legacy_close(&f);
+    (f, merge)
+}
+fn closed_repair(
+    f: &GitIntegrationFixture,
+    runner: &RecoveryRunner,
+) -> Result<HostIntegrationResponse, mac_worker::test_support::core::error::WorkerError> {
+    let result = HostIntegrationService::new(&f.store, runner, &f.runtime).execute(&request(
+        f,
+        HostIntegrationAction::Step {
+            step: IntegrationStep::Repair,
+            record: Box::new(f.record.clone()),
+        },
+    ));
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
+    assert!(!f.workspace().exists());
+    assert_eq!(host_record(f).candidates, f.record.candidates);
+    assert!(
+        runner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !request.args.iter().any(|arg| matches!(
+                arg.to_str(),
+                Some("push" | "merge" | "merge-tree" | "commit-tree" | "add" | "reset")
+            )))
+    );
+    result
+}
+
+#[test]
+fn closed_repair_settles_a_retained_merge_without_workspace_or_push_authority() {
+    let (f, merge) = closed_uncertain_fixture("merge");
+    let runner = RecoveryRunner::default();
+    let HostIntegrationResponse::Integrated { receipt, .. } = closed_repair(&f, &runner).unwrap()
+    else {
+        panic!("expected merged receipt")
+    };
+    assert_eq!(receipt.disposition, IntegrationDisposition::Merged);
+    assert_eq!(receipt.merge_oid, Some(merge.clone()));
+    assert_eq!(host_record(&f).snapshot.merge_oid, Some(merge.clone()));
+    assert!(!host_record(&f).push_intent.unwrap().uncertain);
+    assert_eq!(f.origin_tip(), merge);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .head_oid(),
+        Some(&merge)
+    );
+    assert_eq!(
+        f.execute(IntegrationStep::Fetch).unwrap_err().public_code(),
+        IntegrationCode::IntegrationWorkspaceMissing.as_str()
+    );
+}
+
+#[test]
+fn closed_repair_settles_only_the_source_with_an_already_integrated_receipt() {
+    let (f, _) = closed_uncertain_fixture("source");
+    let runner = RecoveryRunner::default();
+    let HostIntegrationResponse::Integrated { receipt, .. } = closed_repair(&f, &runner).unwrap()
+    else {
+        panic!("expected source receipt")
+    };
+    assert_eq!(
+        receipt.disposition,
+        IntegrationDisposition::AlreadyIntegrated
+    );
+    assert!(receipt.merge_oid.is_none());
+    let record = host_record(&f);
+    assert!(record.snapshot.merge_oid.is_none());
+    assert_eq!(
+        record.snapshot.disposition,
+        Some(IntegrationDisposition::AlreadyIntegrated)
+    );
+    assert!(!record.push_intent.unwrap().uncertain);
+    assert_eq!(receipt.target_head, f.origin_tip());
+}
+
+#[test]
+fn closed_repair_blocks_when_neither_retained_merge_nor_source_is_on_origin() {
+    let (f, _) = closed_uncertain_fixture("neither");
+    let before = f.origin_tip();
+    assert!(matches!(
+        closed_repair(&f, &RecoveryRunner::default()).unwrap(),
+        HostIntegrationResponse::Blocked {
+            code: IntegrationCode::IntegrationWorkspaceMissing,
+            ..
+        }
+    ));
+    assert!(host_record(&f).receipt.is_none());
+    assert_eq!(f.origin_tip(), before);
+}
+
+#[test]
+fn closed_repair_failed_observation_retains_uncertainty_and_retries_safely() {
+    let (f, merge) = closed_uncertain_fixture("merge");
+    let runner = RecoveryRunner {
+        fail_observation: true,
+        ..RecoveryRunner::default()
+    };
+    assert_eq!(
+        closed_repair(&f, &runner).unwrap_err().public_code(),
+        IntegrationCode::IntegrationNetwork.as_str()
+    );
+    let record = host_record(&f);
+    assert!(record.receipt.is_none());
+    assert!(record.push_intent.unwrap().uncertain);
+    assert!(
+        matches!(closed_repair(&f, &RecoveryRunner::default()).unwrap(), HostIntegrationResponse::Integrated { receipt, .. } if receipt.merge_oid == Some(merge))
+    );
+}
+
 #[test]
 fn auxiliary_checks_follow_the_frozen_source_requirement() {
     use mac_worker::test_support::agents::agent::{ReportedCheck, ReportedCheckStatus::*};

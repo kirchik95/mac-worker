@@ -1176,15 +1176,23 @@ impl<'a> IntegrationGit<'a> {
     pub(crate) fn settle(
         &self,
         record: &IntegrationRecord,
-        candidate: &IntegrationCandidate,
     ) -> Result<Option<IntegrationReceipt>, WorkerError> {
         let mirror = self.mirror(&record.policy)?;
         let credentials = self.credentials(&record.policy.origin);
         let target = self
             .observe(record, &mirror, &credentials)?
             .ok_or_else(|| IntegrationCode::IntegrationTargetMissing.error())?;
-        if let Some(merge) = &candidate.merge_oid
-            && self.is_ancestor(&mirror, merge, &target)?
+        self.settle_target(record, &mirror, target)
+    }
+    pub(crate) fn settle_target(
+        &self,
+        record: &IntegrationRecord,
+        mirror: &RootedDir,
+        target: BaseOid,
+    ) -> Result<Option<IntegrationReceipt>, WorkerError> {
+        if let Some(candidate) = record.candidates.last()
+            && let Some(merge) = &candidate.merge_oid
+            && self.is_ancestor(mirror, merge, &target)?
         {
             return Ok(Some(self.receipt(
                 record,
@@ -1193,13 +1201,18 @@ impl<'a> IntegrationGit<'a> {
                 IntegrationDisposition::Merged,
             )));
         }
-        if self.is_ancestor(&mirror, &record.snapshot.source_head, &target)? {
-            return Ok(Some(self.receipt(
-                record,
-                candidate,
-                target,
-                IntegrationDisposition::AlreadyIntegrated,
-            )));
+        if self.is_ancestor(mirror, &record.snapshot.source_head, &target)? {
+            return Ok(Some(IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                source_turn_id: record.snapshot.source_turn_id,
+                source_head: record.snapshot.source_head.clone(),
+                target_head: target,
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: false,
+                recorded_at_millis: self.now_millis(),
+            }));
         }
         Ok(None)
     }

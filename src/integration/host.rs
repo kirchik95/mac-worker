@@ -84,19 +84,35 @@ impl<'a> HostIntegrationService<'a> {
         let identity = IntegrationResponseIdentity::for_request(request);
         let response = match &request.action {
             HostIntegrationAction::Read => {
-                let mut snapshot = sidecars
-                    .load(&policy.project_id, request.task_id)?
-                    .map(|record| record.snapshot);
-                if let Some(snapshot) = &mut snapshot {
-                    if Some(snapshot.integration_id) != request.integration_id
-                        || snapshot.epoch != request.epoch
-                        || snapshot.revision.0 > request.revision.0
+                let mut record = sidecars.load(&policy.project_id, request.task_id)?;
+                if let Some(record) = &mut record {
+                    if Some(record.snapshot.integration_id) != request.integration_id
+                        || record.snapshot.epoch != request.epoch
+                        || record.snapshot.revision.0 > request.revision.0
                     {
                         return Err(invalid());
                     }
-                    snapshot.revision = request.revision;
+                    record.snapshot.revision = request.revision;
+                    if record.receipt.is_none()
+                        && record
+                            .push_intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.uncertain)
+                    {
+                        record.receipt = git.settle(record)?;
+                    }
+                    if let Some(receipt) = record.receipt.clone() {
+                        project_receipt(record);
+                        sidecars.save(record)?;
+                        let response = HostIntegrationResponse::Integrated { identity, receipt };
+                        response.validate_for(request)?;
+                        return Ok(response);
+                    }
                 }
-                HostIntegrationResponse::Progress { identity, snapshot }
+                HostIntegrationResponse::Progress {
+                    identity,
+                    snapshot: record.map(|record| record.snapshot),
+                }
             }
             HostIntegrationAction::Revoke { tombstone } => {
                 let mut record = sidecars
@@ -122,12 +138,12 @@ impl<'a> HostIntegrationService<'a> {
                     return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
                 }
                 if record.receipt.is_none() && record.push_intent.is_some() {
-                    let candidate = record.candidates.last().ok_or_else(invalid)?;
                     record.receipt = git
-                        .settle(&record, candidate)
+                        .settle(&record)
                         .map_err(|_| IntegrationCode::IntegrationStopUnconfirmed.error())?;
                 }
                 if let Some(receipt) = record.receipt.clone() {
+                    project_receipt(&mut record);
                     sidecars.save(&record)?;
                     HostIntegrationResponse::Integrated { identity, receipt }
                 } else {
@@ -274,11 +290,19 @@ impl<'a> HostIntegrationService<'a> {
                     .candidates
                     .last()
                     .and_then(|candidate| candidate.merge_oid.clone());
+                project_receipt(&mut next);
                 if *step != IntegrationStep::Repair {
                     validate_source_checks(&next.source_checks)?;
                 }
                 sidecars.save(&next)?;
                 self.runtime.reach(IntegrationHook::AfterIntent);
+                if *step != IntegrationStep::Repair
+                    && let Some(receipt) = next.receipt.clone()
+                {
+                    let response = HostIntegrationResponse::Integrated { identity, receipt };
+                    response.validate_for(request)?;
+                    return Ok(response);
+                }
                 match step {
                     IntegrationStep::Fetch | IntegrationStep::Prepare => {
                         let target = git.fetch_target(&next)?;
@@ -286,19 +310,9 @@ impl<'a> HostIntegrationService<'a> {
                         if !git.is_ancestor(&mirror, &next.cycle_base, &target)? {
                             return Err(IntegrationCode::IntegrationBaseNotOnTarget.error());
                         }
-                        if git.is_ancestor(&mirror, &next.snapshot.source_head, &target)? {
-                            let receipt = IntegrationReceipt {
-                                integration_id: next.snapshot.integration_id,
-                                epoch: next.snapshot.epoch,
-                                source_turn_id: next.snapshot.source_turn_id,
-                                source_head: next.snapshot.source_head.clone(),
-                                target_head: target,
-                                merge_oid: None,
-                                disposition: IntegrationDisposition::AlreadyIntegrated,
-                                imported: false,
-                                recorded_at_millis: self.runtime.now_millis(),
-                            };
+                        if let Some(receipt) = git.settle_target(&next, &mirror, target.clone())? {
                             next.receipt = Some(receipt.clone());
+                            project_receipt(&mut next);
                             sidecars.save(&next)?;
                             HostIntegrationResponse::Integrated { identity, receipt }
                         } else {
@@ -456,12 +470,7 @@ impl<'a> HostIntegrationService<'a> {
                         match git.push(&next, &candidate)? {
                             PushOutcome::Integrated(receipt) => {
                                 next.receipt = Some(receipt.clone());
-                                next.push_intent.as_mut().ok_or_else(invalid)?.uncertain = false;
-                                next.snapshot.state = IntegrationStatus::Published;
-                                next.snapshot.merge_oid = receipt.merge_oid.clone();
-                                next.snapshot.observed_target_oid =
-                                    Some(receipt.target_head.clone());
-                                next.snapshot.disposition = Some(receipt.disposition);
+                                project_receipt(&mut next);
                                 sidecars.save(&next)?;
                                 self.runtime.reach(IntegrationHook::AfterReceipt);
                                 HostIntegrationResponse::Integrated { identity, receipt }
@@ -557,23 +566,33 @@ impl<'a> HostIntegrationService<'a> {
                     }
                     IntegrationStep::Repair => {
                         if next.receipt.is_none() {
-                            let candidate = next.candidates.last().ok_or_else(invalid)?;
-                            next.receipt = git.settle(&next, candidate)?;
+                            next.receipt = git.settle(&next)?;
+                        }
+                        if next.receipt.is_none() && status.state() == TaskState::Closed {
+                            next.snapshot.state = IntegrationStatus::Blocked;
+                            next.snapshot.blocked_code =
+                                Some(IntegrationCode::IntegrationWorkspaceMissing);
+                            next.snapshot.resume_state = None;
+                            next.snapshot.pause_reason = None;
+                            next.snapshot.retry_at_millis = None;
+                            next.pause = None;
+                            sidecars.save(&next)?;
+                            let response = HostIntegrationResponse::Blocked {
+                                identity,
+                                code: IntegrationCode::IntegrationWorkspaceMissing,
+                                retry_exhausted: false,
+                            };
+                            response.validate_for(request)?;
+                            return Ok(response);
                         }
                         let receipt = next
                             .receipt
                             .clone()
                             .ok_or_else(|| IntegrationCode::IntegrationWorkspaceMissing.error())?;
+                        project_receipt(&mut next);
                         sidecars.save(&next)?;
                         self.runtime.reach(IntegrationHook::AfterReceipt);
                         git.repair(&next, &receipt)?;
-                        next.snapshot.state = if receipt.imported {
-                            IntegrationStatus::Integrated
-                        } else {
-                            IntegrationStatus::Published
-                        };
-                        next.snapshot.disposition = Some(receipt.disposition);
-                        next.snapshot.observed_target_oid = Some(receipt.target_head.clone());
                         sidecars.save(&next)?;
                         HostIntegrationResponse::Integrated { identity, receipt }
                     }
@@ -582,6 +601,28 @@ impl<'a> HostIntegrationService<'a> {
         };
         response.validate_for(request)?;
         Ok(response)
+    }
+}
+fn project_receipt(record: &mut IntegrationRecord) {
+    let Some(receipt) = &record.receipt else {
+        return;
+    };
+    record.snapshot.state = if receipt.imported {
+        IntegrationStatus::Integrated
+    } else {
+        IntegrationStatus::Published
+    };
+    record.snapshot.merge_oid = receipt.merge_oid.clone();
+    record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
+    record.snapshot.disposition = Some(receipt.disposition);
+    record.snapshot.resume_state = None;
+    record.snapshot.pause_reason = None;
+    record.snapshot.retry_at_millis = None;
+    record.snapshot.blocked_code = None;
+    record.snapshot.retry_exhausted = false;
+    record.pause = None;
+    if let Some(intent) = &mut record.push_intent {
+        intent.uncertain = false;
     }
 }
 fn same_frozen_source(old: &IntegrationRecord, next: &IntegrationRecord) -> bool {
