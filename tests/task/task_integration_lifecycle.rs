@@ -341,6 +341,7 @@ pub(crate) mod driver_fixture {
     pub struct Host {
         pub mode: Mutex<Mode>,
         pub calls: Mutex<Vec<HostIntegrationRequest>>,
+        published: Mutex<Option<IntegrationReceipt>>,
     }
     impl IntegrationHost for Host {
         fn execute(
@@ -353,6 +354,29 @@ pub(crate) mod driver_fixture {
             let mode = *self.mode.lock().unwrap();
             if matches!(mode, Mode::Offline) {
                 return Err(IntegrationCode::IntegrationWorkerOffline.error());
+            }
+            if let Some(receipt) = self.published.lock().unwrap().clone()
+                && matches!(
+                    request.action,
+                    HostIntegrationAction::Revoke { .. }
+                        | HostIntegrationAction::Step {
+                            step: IntegrationStep::Fetch | IntegrationStep::Repair,
+                            ..
+                        }
+                )
+            {
+                if matches!(mode, Mode::RepairOffline)
+                    && matches!(
+                        request.action,
+                        HostIntegrationAction::Step {
+                            step: IntegrationStep::Repair,
+                            ..
+                        }
+                    )
+                {
+                    return Err(IntegrationCode::IntegrationWorkerOffline.error());
+                }
+                return Ok(HostIntegrationResponse::Integrated { identity, receipt });
             }
             if matches!(
                 request.action,
@@ -372,38 +396,44 @@ pub(crate) mod driver_fixture {
                     observed_target: record.cycle_base.clone(),
                 });
             }
-            let mut candidate = record.candidates.last().cloned().unwrap_or_else(|| {
-                let mut c = sample_candidate(record);
-                c.id.attempt = record.snapshot.attempts.max(1);
-                c.timestamp_millis = record.snapshot.updated_at_millis;
-                c.merge_oid = None;
-                if matches!(mode, Mode::Resolve) {
-                    c.tree_oid = None;
-                    c.conflict_paths = vec!["conflict.txt".into()];
-                }
-                c
-            });
+            let mut candidate = record
+                .candidates
+                .last()
+                .filter(|c| c.id.attempt == record.snapshot.attempts)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut c = sample_candidate(record);
+                    c.id.attempt = record.snapshot.attempts.max(1);
+                    c.timestamp_millis = record.snapshot.updated_at_millis;
+                    c.merge_oid = None;
+                    if matches!(mode, Mode::Resolve) {
+                        c.tree_oid = None;
+                        c.conflict_paths = vec!["conflict.txt".into()];
+                    }
+                    c
+                });
             if matches!(step, IntegrationStep::Push | IntegrationStep::Repair)
                 || matches!(mode, Mode::Reachable)
             {
-                return Ok(HostIntegrationResponse::Integrated {
-                    identity,
-                    receipt: IntegrationReceipt {
-                        integration_id: record.snapshot.integration_id,
-                        epoch: record.snapshot.epoch,
-                        source_turn_id: record.snapshot.source_turn_id,
-                        source_head: record.snapshot.source_head.clone(),
-                        target_head: candidate.target_head,
-                        merge_oid: candidate.merge_oid.clone(),
-                        disposition: if candidate.merge_oid.is_some() {
-                            IntegrationDisposition::Merged
-                        } else {
-                            IntegrationDisposition::AlreadyIntegrated
-                        },
-                        imported: false,
-                        recorded_at_millis: 1000,
+                let receipt = IntegrationReceipt {
+                    integration_id: record.snapshot.integration_id,
+                    epoch: record.snapshot.epoch,
+                    source_turn_id: record.snapshot.source_turn_id,
+                    source_head: record.snapshot.source_head.clone(),
+                    target_head: candidate.target_head,
+                    merge_oid: candidate.merge_oid.clone(),
+                    disposition: if candidate.merge_oid.is_some() {
+                        IntegrationDisposition::Merged
+                    } else {
+                        IntegrationDisposition::AlreadyIntegrated
                     },
-                });
+                    imported: false,
+                    recorded_at_millis: 1000,
+                };
+                if *step == IntegrationStep::Push {
+                    *self.published.lock().unwrap() = Some(receipt.clone());
+                }
+                return Ok(HostIntegrationResponse::Integrated { identity, receipt });
             }
             if matches!(mode, Mode::Resolve | Mode::Verify)
                 && matches!(step, IntegrationStep::Fetch | IntegrationStep::Prepare)
@@ -448,6 +478,7 @@ pub(crate) mod driver_fixture {
                 host: Host {
                     mode: Mutex::new(mode),
                     calls: Mutex::new(vec![]),
+                    published: Mutex::new(None),
                 },
                 turns: FakeIntegrationTurns::default(),
                 runtime: ManualIntegrationRuntime::default(),
@@ -1052,4 +1083,121 @@ fn configured_dag_parent_requires_imported_current_receipt_and_block_is_reversib
         ParentGate::Ready
     );
     assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn selected_terminal_recovery_stages_once_after_all_ordinary_fences_are_dropped() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+    };
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    store.create_task(ordinary.clone()).unwrap();
+    f.enable(fixture_task(), "main").unwrap();
+    let mut facts = f.observer().facts(fixture_task()).unwrap();
+    facts.ordinary = ordinary;
+    facts.result_imported = true;
+    f.observer().insert(facts);
+    let coordinator = f.coordinator();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+        .with_integration(&coordinator);
+    client.reconcile_selected(&[fixture_task()]).unwrap();
+    let staged = f.load(fixture_task()).unwrap().unwrap();
+    client.reconcile_selected(&[fixture_task()]).unwrap();
+    assert_eq!(f.load(fixture_task()).unwrap(), Some(staged));
+    assert!(runner.requests().is_empty());
+    assert!(f.host_calls().is_empty());
+}
+
+#[test]
+fn integrating_from_child_requires_an_enabled_parent_on_the_same_target_before_submission() {
+    use mac_worker::test_support::task::{
+        client::TaskClient,
+        model::{RunId, TaskId, TurnId},
+    };
+    use std::collections::BTreeMap;
+    let parent_task = fixture_task();
+    let child_task = TaskId::generate();
+    let frozen: DagFrozenSpec = serde_json::from_value(serde_json::json!({
+        "prompt":"work", "agent":"codex", "source":"local", "publish":["fetch"],
+        "close_on":"never", "wip":false, "project_path":"/fixture/project",
+        "project_id":"a".repeat(64), "worktree_id":"b".repeat(64),
+        "timeout_millis":2700000, "max_followups":10, "permissions":"workspace", "requires":[],
+        "include_untracked":[], "include_empty_dirs":[], "allow_sensitive":[], "cli_includes":[]
+    }))
+    .unwrap();
+    let node = |task: TaskId, base: DagBase| DagNode {
+        batch_id: task.to_string(),
+        task_id: task,
+        turn_id: TurnId::generate(),
+        depends_on: vec![],
+        base,
+        frozen: frozen.clone(),
+        state: DagNodeState::Waiting,
+        bound_oid: None,
+        bound_turn_id: None,
+        pin_ref: None,
+        blocked_by: None,
+        claimed_by: None,
+        claimed_at_millis: None,
+    };
+    let mut child = sample_policy("main");
+    child.base_kind = IntegrationBaseKind::FromTask;
+    child.base_oid = None;
+    child.base_task = Some(parent_task);
+    child.base_preflight = IntegrationBasePreflight::Unknown;
+    let parent = node(
+        parent_task,
+        DagBase::Frozen {
+            oid: fixture_head(),
+            pin_ref: "refs/worker/dag/fixture".into(),
+            wip: false,
+        },
+    );
+    let child_node = node(
+        child_task,
+        DagBase::From {
+            parent: "parent".into(),
+        },
+    );
+    let mut batch = FrozenIntegratingBatch {
+        batch: FrozenBatchBody {
+            kind: BatchKind::Dag,
+            run_id: RunId::generate(),
+            max_parallel: None,
+            name: None,
+            created_at_millis: 1000,
+            nodes: BTreeMap::from([("parent".into(), parent), ("child".into(), child_node)]),
+            sources: vec![],
+        },
+        integrations: BTreeMap::from([(parent_task, None), (child_task, Some(child))]),
+    };
+    assert_eq!(
+        TaskClient::validate_integration_batch(&batch)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+    );
+    batch
+        .integrations
+        .insert(parent_task, Some(sample_policy("other")));
+    assert_eq!(
+        TaskClient::validate_integration_batch(&batch)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+    );
+    batch
+        .integrations
+        .insert(parent_task, Some(sample_policy("main")));
+    TaskClient::validate_integration_batch(&batch).unwrap();
+    batch.integrations.insert(child_task, None);
+    batch.integrations.insert(parent_task, None);
+    TaskClient::validate_integration_batch(&batch).unwrap();
 }

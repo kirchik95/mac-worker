@@ -33,6 +33,39 @@ impl<'a> IntegrationCoordinator<'a> {
         let Some(policy) = self.state.load_policy(task)? else {
             return Ok(());
         };
+        let old = self.state.load(task)?;
+        if let Some(mut record) = old.clone()
+            && let Some(index) = record.auxiliaries.iter().position(|a| a.turn_id == source)
+        {
+            let observation = self.turns.observe(source)?;
+            observation.validate()?;
+            let auxiliary = &mut record.auxiliaries[index];
+            if observation.turn_id != source
+                || auxiliary
+                    .queue_position
+                    .is_some_and(|p| observation.queue_position != Some(p))
+                || (auxiliary.accepted && !observation.accepted)
+                || (auxiliary.completed && !observation.completed)
+            {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+            if auxiliary.completed == observation.completed
+                && auxiliary.accepted == observation.accepted
+                && auxiliary.queue_position == observation.queue_position
+            {
+                return Ok(());
+            }
+            auxiliary.queue_position = observation.queue_position;
+            auxiliary.accepted = observation.accepted;
+            auxiliary.completed = observation.completed;
+            if observation.accepted {
+                record.admission_deadline_millis = None;
+                record.remaining_admission_millis = None;
+            }
+            record.ready_at_millis = self.runtime.now_millis();
+            self.save(&mut record)?;
+            return Ok(());
+        }
         let facts = self.observer.facts(task)?;
         let ordinary = &facts.ordinary;
         let status = ordinary.status();
@@ -67,7 +100,6 @@ impl<'a> IntegrationCoordinator<'a> {
             .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
         let target_key = policy.target_key()?;
         let id = IntegrationId::derive(task, source, &head, &target_key)?;
-        let old = self.state.load(task)?;
         if let Some(old) = &old {
             if old.snapshot.integration_id == id {
                 return Ok(());
@@ -79,7 +111,18 @@ impl<'a> IntegrationCoordinator<'a> {
                 return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
             }
         }
-        let cycle_base = if let Some(parent) = policy.base_task {
+        let cycle_base = if let Some(receipt) = old
+            .as_ref()
+            .filter(|r| r.snapshot.state == IntegrationStatus::Integrated)
+            .and_then(|r| r.receipt.as_ref())
+            .filter(|r| r.imported)
+        {
+            receipt
+                .merge_oid
+                .as_ref()
+                .unwrap_or(&receipt.target_head)
+                .clone()
+        } else if let Some(parent) = policy.base_task {
             let parent = self
                 .state
                 .load(parent)?
@@ -739,6 +782,8 @@ impl<'a> IntegrationCoordinator<'a> {
                 record.snapshot.state = IntegrationStatus::Fetching;
                 record.snapshot.merge_oid = None;
                 record.snapshot.observed_target_oid = None;
+                record.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
+                record.phase_retries.clear();
                 record.push_intent = None;
                 record.admission_deadline_millis = None;
                 record.remaining_admission_millis = None;

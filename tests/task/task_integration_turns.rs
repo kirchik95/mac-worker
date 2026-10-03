@@ -372,3 +372,182 @@ fn opt_in_verifier_uses_its_pinned_tree_and_returns_to_fetch() {
         IntegrationVerification::VerifyAgentReport
     );
 }
+
+#[test]
+fn real_owner_auxiliary_admission_requires_the_authoritative_sidecar_and_replays_one_row() {
+    use crate::support::{GitRepo, task_harness::paths};
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::drain::set_drained,
+        host::process::SystemProcessRunner,
+        task::{
+            client::TaskClient, model::LocalTaskRecord, project_state::ProjectState,
+            turn_runner::InlineRunnerExecutor,
+        },
+    };
+    use std::sync::Arc;
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let repo = GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&["remote", "add", "origin", "https://example.test/repo.git"])
+            .status
+            .success()
+    );
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let mut ordinary =
+        serde_json::to_value(sample_ordinary(fixture_task(), fixture_source())).unwrap();
+    ordinary["meta"]["project_id"] = project.context.project_id.clone().into();
+    ordinary["meta"]["worktree_id"] = project.context.worktree_id.clone().into();
+    let ordinary: LocalTaskRecord = serde_json::from_value(ordinary).unwrap();
+    store.create_task(ordinary.clone()).unwrap();
+    store
+        .write_task_project_path(&ordinary, repo.root())
+        .unwrap();
+    let runtime = Arc::new(ManualIntegrationRuntime::default());
+    let state = RootedIntegrationState::open(&paths, runtime).unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    record.policy.project_id = project.context.project_id;
+    record.snapshot.attempts = 1;
+    record.snapshot.state = IntegrationStatus::Resolving;
+    record.candidates.push(sample_candidate(&record));
+    let prepared =
+        PreparedIntegrationTurn::prepare(&ordinary, &record, IntegrationTurnPurpose::Resolve, 1, 1)
+            .unwrap();
+    let config: mac_worker::test_support::core::config::Config = toml::from_str(
+        "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'unused'\nslots = 1\nremote_binary = 'worker'\n").unwrap();
+    let client = TaskClient::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &store,
+        &InlineRunnerExecutor,
+    );
+    assert_eq!(
+        client
+            .say_integration_prepared(&prepared)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+    assert!(
+        store
+            .queue_entry(prepared.followup.turn_id())
+            .unwrap()
+            .is_none()
+    );
+    state
+        .publish_policy(fixture_task(), &record.policy)
+        .unwrap();
+    state.publish_prepared(fixture_task(), &prepared).unwrap();
+    record.snapshot.resolve_turns = 1;
+    record.followups_spent = 1;
+    record.auxiliaries.push(prepared.intent().unwrap());
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &record)
+        .unwrap();
+    set_drained(&paths.controller_state_root(), true).unwrap();
+    client.say_integration_prepared(&prepared).unwrap();
+    let first = store
+        .queue_entry(prepared.followup.turn_id())
+        .unwrap()
+        .unwrap();
+    client.say_integration_prepared(&prepared).unwrap();
+    assert_eq!(
+        store.queue_entry(prepared.followup.turn_id()).unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        store
+            .load_task(fixture_task())
+            .unwrap()
+            .status()
+            .turns()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .read_turn_prompt(fixture_task(), prepared.followup.turn_id())
+            .unwrap(),
+        prepared.followup.composed_prompt()
+    );
+    assert_eq!(
+        state
+            .load_prepared(fixture_task(), prepared.followup.turn_id())
+            .unwrap(),
+        Some(prepared.clone())
+    );
+    let mut rebound = prepared;
+    rebound.workspace_binding.pinned_tree = Some("f".repeat(40).parse().unwrap());
+    assert_eq!(
+        client
+            .say_integration_prepared(&rebound)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+}
+
+#[test]
+fn moved_target_invalidates_auxiliary_evidence_and_allocates_one_new_attempt() {
+    use super::task_integration_lifecycle::driver_fixture::*;
+    use mac_worker::test_support::task::model::{ClosePolicy, TaskOutcome};
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let first = rig.queued();
+    rig.complete(first, TaskOutcome::Done, vec![]);
+    *rig.host.mode.lock().unwrap() = Mode::Missing;
+    assert_eq!(rig.drive().attempts, 2);
+    assert_eq!(
+        rig.record().snapshot.verification,
+        IntegrationVerification::SourceAgentReportOnly
+    );
+    *rig.host.mode.lock().unwrap() = Mode::Resolve;
+    for _ in 0..8 {
+        rig.drive();
+        if rig
+            .record()
+            .auxiliaries
+            .last()
+            .is_some_and(|a| a.attempt == 2 && a.queue_position.is_some())
+        {
+            break;
+        }
+    }
+    let record = rig.record();
+    let next = record.auxiliaries.last().unwrap();
+    assert_eq!(next.attempt, 2);
+    assert_ne!(next.turn_id, first);
+    assert_eq!(record.snapshot.resolve_turns, 2);
+    assert_eq!(record.followups_spent, 2);
+    assert_eq!(rig.turns.enqueue_count(first), 1);
+    assert_eq!(rig.turns.enqueue_count(next.turn_id), 1);
+    assert_eq!(record.source_summary, "Fixture work completed");
+}
+
+#[test]
+fn auxiliary_terminal_wakes_its_existing_cycle_without_replacing_source_facts() {
+    use super::task_integration_lifecycle::driver_fixture::*;
+    use mac_worker::test_support::task::model::{ClosePolicy, TaskOutcome};
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let turn = rig.queued();
+    let before = rig.record();
+    rig.complete(turn, TaskOutcome::Done, vec![]);
+    rig.coordinator().on_terminal(fixture_task(), turn).unwrap();
+    let after = rig.record();
+    assert!(after.auxiliaries.last().unwrap().completed);
+    assert_eq!(
+        after.snapshot.integration_id,
+        before.snapshot.integration_id
+    );
+    assert_eq!(after.snapshot.source_turn_id, fixture_source());
+    assert_eq!(after.snapshot.resolve_turns, 1);
+    assert_eq!(after.source_checks, before.source_checks);
+    assert_eq!(after.source_summary, before.source_summary);
+    assert_eq!(after.cycle_base, before.cycle_base);
+    assert!(after.snapshot.revision > before.snapshot.revision);
+}

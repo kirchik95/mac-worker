@@ -1223,6 +1223,13 @@ impl<'a> TaskClient<'a> {
         self.integration = Some(coordinator);
         self
     }
+    pub(crate) fn with_optional_integration(
+        mut self,
+        coordinator: Option<&'a IntegrationCoordinator<'a>>,
+    ) -> Self {
+        self.integration = coordinator;
+        self
+    }
 
     pub fn integration_parent_gate(
         &self,
@@ -2257,6 +2264,7 @@ impl<'a> TaskClient<'a> {
                 self.executor,
             )
             .with_notifier(self.herdr_notifier.clone())
+            .with_optional_integration(self.integration)
             .run(task_id, turn_id, Some(&mut follow))?;
             self.finish_attached_report(&mut report, turn_id, outcome)?;
         }
@@ -3071,11 +3079,21 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_selected(&self, ids: &[TaskId]) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(
+        let report = self.reconcile_runners_inner(
             false,
             ReconcileScope::Selected(ids),
             ReconcileAutomatic::Materialize,
-        )
+        )?;
+        if let Some(coordinator) = self.integration {
+            for task in ids {
+                if let Some(record) = self.client_state.load_task_optional(*task)?
+                    && let Some(last) = record.status().turns().last()
+                {
+                    coordinator.on_terminal(*task, last.turn_id())?;
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Retire completed dead owners before a human mutation, preserving any
@@ -3910,6 +3928,9 @@ impl<'a> TaskClient<'a> {
         task_id: TaskId,
         finished: TurnId,
     ) -> Result<(), WorkerError> {
+        if RootedIntegrationState::read_auxiliary(self.paths, task_id, finished)?.is_some() {
+            return Ok(());
+        }
         let expected = self.client_state.load_task(task_id)?;
         if expected.status().turns().last().map(TurnSummary::turn_id) != Some(finished) {
             return Ok(());
@@ -4024,7 +4045,13 @@ impl<'a> TaskClient<'a> {
         prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
         // Auxiliary admission has its own authoritative, persisted wrapper.
-        if RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?.is_none() {
+        if let Some(auxiliary) =
+            RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?
+        {
+            if &auxiliary.followup != prepared {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+        } else {
             self.before_integration_mutation(&current, IntegrationMutation::Say)?;
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
@@ -4173,10 +4200,41 @@ impl<'a> TaskClient<'a> {
                 self.executor,
             )
             .with_notifier(self.herdr_notifier.clone())
+            .with_optional_integration(self.integration)
             .run(task_id, entry.job_id(), Some(stdout))?;
             self.finish_attached_report(&mut report, entry.job_id(), outcome)?;
         }
         Ok(report)
+    }
+
+    /// Admit the already frozen auxiliary through the ordinary queue and allowance.
+    pub fn say_integration_prepared(
+        &self,
+        prepared: &crate::integration::contracts::PreparedIntegrationTurn,
+    ) -> Result<TaskReport, WorkerError> {
+        let task = prepared.followup.task_id();
+        let authoritative =
+            RootedIntegrationState::read_auxiliary(self.paths, task, prepared.followup.turn_id())?
+                .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        if &authoritative != prepared {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+        let (_, record) = RootedIntegrationState::read_task(self.paths, task)?;
+        let record = record.ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        if record.tombstone.is_some()
+            || !matches!(
+                record.snapshot.state,
+                IntegrationStatus::Resolving | IntegrationStatus::Verifying
+            )
+        {
+            return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+        }
+        self.say_prepared(
+            &prepared.followup,
+            false,
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
     }
 
     fn resume_prepared_followup(
@@ -4276,6 +4334,7 @@ impl<'a> TaskClient<'a> {
                 self.executor,
             )
             .with_notifier(self.herdr_notifier.clone())
+            .with_optional_integration(self.integration)
             .run(task_id, entry.job_id(), Some(stdout))?;
             self.finish_attached_report(&mut report, entry.job_id(), outcome)?;
         }

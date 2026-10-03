@@ -486,9 +486,31 @@ pub struct TurnRunner<'a> {
     adoption_wait: Duration,
     slot_token: Option<Uuid>,
     follow_clock: &'a dyn FollowClock,
+    integration: Option<&'a crate::integration::coordinator::IntegrationCoordinator<'a>>,
 }
 
 impl<'a> TurnRunner<'a> {
+    pub fn approved_turn_limits(
+        &self,
+        record: &LocalTaskRecord,
+        turn: TurnId,
+    ) -> Result<crate::agent::TurnLimits, WorkerError> {
+        if let Some(prepared) = crate::integration::store::RootedIntegrationState::read_auxiliary(
+            self.paths,
+            record.meta().task_id(),
+            turn,
+        )? {
+            if prepared.followup.expected().meta() != record.meta()
+                || record.status().worker() != Some(prepared.followup.worker())
+            {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error(),
+                );
+            }
+            return Ok(prepared.approved_turn_limits);
+        }
+        Ok(record.meta().limits().turn.clone())
+    }
     /// Runs a detached queue worker, which may serve another eligible turn.
     pub fn run_detached(
         &self,
@@ -515,7 +537,23 @@ impl<'a> TurnRunner<'a> {
             adoption_wait: ADOPTION_WAIT,
             slot_token: None,
             follow_clock: &SYSTEM_FOLLOW_CLOCK,
+            integration: None,
         }
+    }
+
+    pub fn with_integration(
+        mut self,
+        coordinator: &'a crate::integration::coordinator::IntegrationCoordinator<'a>,
+    ) -> Self {
+        self.integration = Some(coordinator);
+        self
+    }
+    pub(crate) fn with_optional_integration(
+        mut self,
+        coordinator: Option<&'a crate::integration::coordinator::IntegrationCoordinator<'a>>,
+    ) -> Self {
+        self.integration = coordinator;
+        self
     }
 
     /// Clock for [`Self::follow_remote`] idle waits. Production sleeps.
@@ -604,6 +642,12 @@ impl<'a> TurnRunner<'a> {
             let _ =
                 self.client_state
                     .record_replacement_failure(turn_id, &error.public_code(), now);
+        }
+        if result.is_ok()
+            && let Some(coordinator) = self.integration
+        {
+            // execute's journal, queue and transfer fences have all retired here.
+            coordinator.on_terminal(task_id, turn_id)?;
         }
         result
     }
@@ -1219,7 +1263,7 @@ impl<'a> TurnRunner<'a> {
             (1, None) => TurnStart::Fresh,
             _ => TurnStart::FollowUp,
         };
-        let turn_limits = initial_record.meta().limits().turn.clone();
+        let turn_limits = self.approved_turn_limits(&initial_record, turn_id)?;
         let turn = TurnMaterial::from_prompt(
             task_id,
             turn_number,
@@ -1642,38 +1686,21 @@ impl<'a> TurnRunner<'a> {
         log: &mut LogWriter,
         follow: &mut Option<&mut dyn Write>,
     ) -> Result<TurnOutcomeReport, WorkerError> {
+        let auxiliary = crate::integration::store::RootedIntegrationState::read_auxiliary(
+            self.paths, task_id, turn_id,
+        )?
+        .is_some();
         self.persist_status(task_id, terminal.clone())?;
-        let fetched = if matches!(terminal.state(), TaskState::Open | TaskState::Closed) {
-            let import = transfer.result_import(task_id)?;
-            if let Err(error) = GitTransport::new(self.runner).fetch_result(
-                worker,
-                self.client_state.client_id(),
-                initial_record.meta().project_id(),
-                task_id,
-                transfer.path(),
-            ) {
-                if error.public_code() == "RESULT_REF_BUSY" {
-                    return Err(error);
-                }
-                drop(import);
-                return self.finish_publication_failure(
+        let fetched =
+            if !auxiliary && matches!(terminal.state(), TaskState::Open | TaskState::Closed) {
+                let import = transfer.result_import(task_id)?;
+                if let Err(error) = GitTransport::new(self.runner).fetch_result(
+                    worker,
+                    self.client_state.client_id(),
+                    initial_record.meta().project_id(),
                     task_id,
-                    turn_id,
-                    owner,
-                    terminal,
-                    transfer,
-                    "RESULT_FETCH_FAILED",
-                    log,
-                    follow,
-                );
-            }
-            match import.import_result(
-                self.runner,
-                &project.context.common_dir,
-                worker.name.as_str(),
-            ) {
-                Ok(receipt) => Some(receipt.head().clone()),
-                Err(error) => {
+                    transfer.path(),
+                ) {
                     if error.public_code() == "RESULT_REF_BUSY" {
                         return Err(error);
                     }
@@ -1684,22 +1711,46 @@ impl<'a> TurnRunner<'a> {
                         owner,
                         terminal,
                         transfer,
-                        "PUBLISH_FAILED",
+                        "RESULT_FETCH_FAILED",
                         log,
                         follow,
                     );
                 }
-            }
-        } else {
-            None
-        };
+                match import.import_result(
+                    self.runner,
+                    &project.context.common_dir,
+                    worker.name.as_str(),
+                ) {
+                    Ok(receipt) => Some(receipt.head().clone()),
+                    Err(error) => {
+                        if error.public_code() == "RESULT_REF_BUSY" {
+                            return Err(error);
+                        }
+                        drop(import);
+                        return self.finish_publication_failure(
+                            task_id,
+                            turn_id,
+                            owner,
+                            terminal,
+                            transfer,
+                            "PUBLISH_FAILED",
+                            log,
+                            follow,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
         if let Some(head) = fetched {
             self.client_state
                 .mutate_task(task_id, Some(turn_id), |current| {
                     current.with_fetched_head(Some(head))
                 })?;
         }
-        self.persist_host_auto_close(worker, task_id)?;
+        if !auxiliary {
+            self.persist_host_auto_close(worker, task_id)?;
+        }
         let outcome = terminal
             .last_outcome()
             .cloned()
@@ -1713,7 +1764,9 @@ impl<'a> TurnRunner<'a> {
             "outcome": outcome,
         });
         append_event(log, follow, event.clone())?;
-        transfer.release_task_refs(self.runner, task_id)?;
+        if !auxiliary {
+            transfer.release_task_refs(self.runner, task_id)?;
+        }
         drop(transfer);
         retire_completed_turn(self.client_state, self.paths, turn_id, owner, task_id)?;
         self.auto_continue_after_terminal(task_id, turn_id, follow);
@@ -2288,6 +2341,7 @@ impl<'a> TurnRunner<'a> {
             self.executor,
         )
         .with_herdr_notifier(self.notifier.clone())
+        .with_optional_integration(self.integration)
         .auto_continue_after_terminal(task_id, turn_id);
         if result.is_err() {
             // Completed journals are immutable. Emit only a fixed code to
@@ -2365,6 +2419,24 @@ pub(crate) fn finalize_completed_turn(
     completion: &Completion,
 ) -> Result<TaskStatus, WorkerError> {
     let record = client_state.load_task(task_id)?;
+    if crate::integration::store::RootedIntegrationState::read_auxiliary(paths, task_id, turn_id)?
+        .is_some()
+    {
+        if completion.is_undrainable() && !record.retains_log_drain_unavailable() {
+            let status = undrainable_failure_status(record.status(), turn_id, now_millis()?)?;
+            let next = record
+                .with_status(status)?
+                .with_abandon_code(Some("LOG_DRAIN_UNAVAILABLE".into()))?;
+            if !client_state.update_task_if_current(&record, next)? {
+                return Err(task_error(
+                    "TASK_BUSY",
+                    "task changed during auxiliary finalization",
+                ));
+            }
+        }
+        retire_completed_turn(client_state, paths, turn_id, owner, task_id)?;
+        return Ok(client_state.load_task(task_id)?.status().clone());
+    }
     let (project, transfer) = transfer_for_completed_turn(client_state, runner, paths, &record)?;
     if completion.is_undrainable() {
         let imported = try_import_completed_result(
@@ -2478,8 +2550,10 @@ fn retire_completed_turn(
     owner: ProcessIdentity,
     task_id: TaskId,
 ) -> Result<(), WorkerError> {
-    if crate::task_client::stage_auto_continue_before_retirement(client_state, task_id, turn_id)
-        .is_err()
+    if crate::integration::store::RootedIntegrationState::read_auxiliary(paths, task_id, turn_id)?
+        .is_none()
+        && crate::task_client::stage_auto_continue_before_retirement(client_state, task_id, turn_id)
+            .is_err()
     {
         // Preparing a continuation must never undo the completed turn.
         let _ = writeln!(std::io::stderr().lock(), "AUTO_CONTINUE_FAILED");
@@ -3487,6 +3561,117 @@ mod tests {
         open_handoff_journal_for_spawn, turn_exit_code,
     };
     use crate::task::TaskOutcome;
+
+    #[test]
+    fn integration_auxiliary_finalizer_keeps_source_refs_and_never_auto_continues() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        use crate::{
+            client_state::ClientStateStore,
+            config::Config,
+            paths::PathLayout,
+            task::{TaskState, TaskStatus, TurnSummary, TurnTerminal},
+        };
+        let f = IntegrationFixture::new();
+        let paths = PathLayout {
+            config: f.root().join("config"),
+            state: f.root().join("state"),
+            cache: f.root().join("cache"),
+            data: f.root().join("data"),
+        };
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let state = RootedIntegrationState::open(
+            &paths,
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let mut record = sample_record(f.task(), f.source(), "main");
+        record.candidates.push(sample_candidate(&record));
+        record.snapshot.attempts = 1;
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let turn = prepared.followup.turn_id();
+        record.auxiliaries.push(prepared.intent().unwrap());
+        record.snapshot.resolve_turns = 1;
+        record.followups_spent = 1;
+        state.publish_policy(f.task(), &record.policy).unwrap();
+        state.publish_prepared(f.task(), &prepared).unwrap();
+        state
+            .replace(f.task(), IntegrationRevision(0), &record)
+            .unwrap();
+        let ordinary = sample_ordinary(f.task(), f.source());
+        let old = ordinary.status();
+        let status = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::NeedsInput),
+            old.worker().map(str::to_owned),
+            true,
+            old.head_oid().cloned(),
+            Some("auxiliary blocked".into()),
+            vec!["resolve this".into()],
+            vec![],
+            None,
+            old.turns()
+                .iter()
+                .cloned()
+                .chain([TurnSummary::new(
+                    2,
+                    turn,
+                    Some(TurnTerminal::Succeeded),
+                    Some(TaskOutcome::NeedsInput),
+                    Some(false),
+                    false,
+                    Some(1001),
+                    Some(1002),
+                )])
+                .collect(),
+            1002,
+        )
+        .unwrap();
+        let ordinary = ordinary
+            .with_status(status)
+            .unwrap()
+            .with_questions_policy(crate::task::QuestionsPolicy::Decide);
+        store.create_task(ordinary.clone()).unwrap();
+        store
+            .write_turn_prompt(f.task(), turn, prepared.followup.composed_prompt())
+            .unwrap();
+        let config = Config {
+            version: 1,
+            notifications: Default::default(),
+            controller: Default::default(),
+            ssh: Default::default(),
+            workers: vec![],
+        };
+        // This runner accepts only task-session reads. Any ordinary Git publication panics.
+        let runner = ImportedSessionRunner(None);
+        let approved = super::TurnRunner::new(
+            &runner,
+            &config,
+            &paths,
+            &store,
+            &super::InlineRunnerExecutor,
+        )
+        .approved_turn_limits(&ordinary, turn)
+        .unwrap();
+        assert_eq!(approved.timeout_millis, 600000);
+        super::finalize_completed_turn(
+            &store,
+            &runner,
+            &config,
+            &paths,
+            f.task(),
+            turn,
+            f.runtime().actor(),
+            &crate::runner_log::Completion {
+                outcome: TaskOutcome::NeedsInput,
+                drained: true,
+            },
+        )
+        .unwrap();
+        let finalized = store.load_task(f.task()).unwrap();
+        assert_eq!(finalized.fetched_head(), ordinary.fetched_head());
+        assert!(finalized.auto_continue_intent().is_none());
+        assert_eq!(state.load(f.task()).unwrap(), Some(record));
+    }
 
     struct ImportedSessionRunner(Option<crate::task_store::SessionBinding>);
 
