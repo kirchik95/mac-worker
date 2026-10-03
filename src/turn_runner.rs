@@ -18,7 +18,7 @@ use crate::{
     client_state::{ClientStateStore, ReservedSlotTakeover, RunnerSlotDecision},
     config::{Config, WorkerEntry},
     error::WorkerError,
-    git_transport::GitTransport,
+    git_transport::{GitTransport, SessionRefPush},
     job::{
         CommandSpec, ExecutionScope, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
         LeaseToken, LogCursor, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
@@ -29,6 +29,7 @@ use crate::{
     project_state::ProjectState,
     runner_log::{Completion, RunnerLog as LogWriter},
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
+    session_transfer::imported_session_id,
     supervisor::SystemProcessInspector,
     task::{
         ClosePolicy, LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus,
@@ -42,6 +43,13 @@ use crate::{
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TurnMaterial},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnStart {
+    Fresh,
+    Imported,
+    FollowUp,
+}
 
 const LOG_CHUNK_LIMIT: u32 = 64 * 1024;
 const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
@@ -1204,8 +1212,13 @@ impl<'a> TurnRunner<'a> {
         // A first turn may already have bound its agent session before a
         // crash leaves the local prompt in place. Turn number, rather than
         // the mutable session-present projection, is the durable distinction
-        // between first launch and a follow-up launch.
-        let resume = turn_number > 1;
+        // between first launch and a follow-up launch. Immutable import meta
+        // distinguishes a fresh first launch from an imported first resume.
+        let start = match (turn_number, initial_record.meta().session_import()) {
+            (1, Some(_)) => TurnStart::Imported,
+            (1, None) => TurnStart::Fresh,
+            _ => TurnStart::FollowUp,
+        };
         let turn_limits = initial_record.meta().limits().turn.clone();
         let turn = TurnMaterial::from_prompt(
             task_id,
@@ -1223,7 +1236,7 @@ impl<'a> TurnRunner<'a> {
             &prompt,
             initial_record.meta().env_profile().map(str::to_owned),
             turn_id.as_uuid(),
-            resume,
+            start != TurnStart::Fresh,
         )?;
         let turn = match initial_record.meta().effective_policy() {
             Some(effective) => turn.with_effective_policy(effective)?,
@@ -1248,7 +1261,7 @@ impl<'a> TurnRunner<'a> {
             self.recorded_agent_version(worker, turn.agent()).as_deref(),
         );
         let remote = RemoteJobClient::new(self.runner);
-        let prebound = if !turn.resume() && adapter.prebind_session().is_some() {
+        let prebound = if start == TurnStart::Fresh && adapter.prebind_session().is_some() {
             Some(
                 remote
                     .task_prebind(
@@ -1267,8 +1280,9 @@ impl<'a> TurnRunner<'a> {
         } else {
             None
         };
-        let session_ref = if turn.resume() {
-            Some(
+        let session_ref = match start {
+            TurnStart::Imported => Some(imported_session_id(&task_id)),
+            TurnStart::FollowUp => Some(
                 remote
                     .task_session(
                         worker,
@@ -1277,9 +1291,8 @@ impl<'a> TurnRunner<'a> {
                     .binding()
                     .session_ref()
                     .to_owned(),
-            )
-        } else {
-            prebound.clone()
+            ),
+            TurnStart::Fresh => prebound.clone(),
         };
         let launch = if let Some(ref session) = session_ref {
             adapter
@@ -1342,7 +1355,7 @@ impl<'a> TurnRunner<'a> {
                         "task turn was cancelled before host acceptance",
                     ));
                 }
-                let prepared = if turn.resume() {
+                let prepared = if start == TurnStart::FollowUp {
                     remote.task_status(
                         worker,
                         &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -1360,7 +1373,11 @@ impl<'a> TurnRunner<'a> {
                                 task_id,
                                 turn.base_oid(),
                                 transfer.path(),
-                                None,
+                                initial_record.meta().session_import().map(|import| {
+                                    SessionRefPush {
+                                        package_oid: import.package_oid(),
+                                    }
+                                }),
                             )?;
                         }
                         remote.task_prepare(
@@ -1371,6 +1388,15 @@ impl<'a> TurnRunner<'a> {
                                 worker.name.clone(),
                             ),
                         )?;
+                        if start == TurnStart::Imported {
+                            verify_imported_session(
+                                &remote,
+                                worker,
+                                initial_record.meta().project_id(),
+                                task_id,
+                                initial_record.meta().agent(),
+                            )?;
+                        }
                         remote.task_status(
                             worker,
                             &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -1410,7 +1436,7 @@ impl<'a> TurnRunner<'a> {
                         "task turn was cancelled before host acceptance",
                     ));
                 }
-                if !turn.resume() {
+                if start != TurnStart::FollowUp {
                     if let Some(ref session) = prebound {
                         remote.task_prebind(
                             worker,
@@ -1426,7 +1452,8 @@ impl<'a> TurnRunner<'a> {
                     self.persist_status(task_id, prepared.status().clone())?;
                 }
                 if prepared.status().state().is_terminal()
-                    || (!turn.resume() && matches!(prepared.status().state(), TaskState::Open))
+                    || (start != TurnStart::FollowUp
+                        && matches!(prepared.status().state(), TaskState::Open))
                 {
                     prepared.status().clone()
                 } else {
@@ -2987,6 +3014,36 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
     )
 }
 
+fn verify_imported_session(
+    remote: &RemoteJobClient<'_>,
+    worker: &WorkerEntry,
+    project_id: &str,
+    task_id: TaskId,
+    agent: AgentKind,
+) -> Result<(), WorkerError> {
+    let session = remote
+        .task_session(worker, &TaskSessionRequest::new(project_id, task_id))
+        .map_err(|error| {
+            if error.public_code() == "SESSION_UNBOUND" {
+                task_error(
+                    "SESSION_PLACEMENT_FAILED",
+                    "prepared import has no session binding",
+                )
+            } else {
+                error
+            }
+        })?;
+    if session.binding().agent() != agent
+        || session.binding().session_ref() != imported_session_id(&task_id)
+    {
+        return Err(task_error(
+            "SESSION_PLACEMENT_FAILED",
+            "prepared import has a different agent session binding",
+        ));
+    }
+    Ok(())
+}
+
 fn task_error(
     code: &'static str,
     message: impl Into<std::borrow::Cow<'static, str>>,
@@ -3032,6 +3089,108 @@ mod tests {
         open_handoff_journal_for_spawn, turn_exit_code,
     };
     use crate::task::TaskOutcome;
+
+    struct ImportedSessionRunner(Option<crate::task_store::SessionBinding>);
+
+    impl crate::process::ProcessRunner for ImportedSessionRunner {
+        fn run(
+            &self,
+            request: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, crate::error::WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                request
+                    .args
+                    .iter()
+                    .any(|arg| arg == crate::transfer::HostOperation::TaskSession.command())
+            );
+            let (status, mut stdout) = match &self.0 {
+                Some(binding) => (
+                    0,
+                    serde_json::to_vec(&crate::task_store::TaskSessionResponse::new(
+                        binding.clone(),
+                    ))
+                    .unwrap(),
+                ),
+                None => (
+                    1 << 8,
+                    serde_json::to_vec(
+                        &crate::job::HostControlError::new(
+                            "SESSION_UNBOUND",
+                            "fixture has no session",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            };
+            stdout.push(b'\n');
+            Ok(crate::process::ProcessResult {
+                status: std::process::ExitStatus::from_raw(status),
+                stdout,
+                stderr: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn imported_post_prepare_session_verification_requires_exact_agent_and_ref() {
+        use crate::{
+            agent::AgentKind, config::Config, session_transfer::imported_session_id, task::TaskId,
+            task_store::SessionBinding, transfer::RemoteJobClient,
+        };
+        let task_id = TaskId::generate();
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let worker = config.worker("mini-1").unwrap();
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            for (bound_agent, reference, valid) in [
+                (agent, imported_session_id(&task_id), true),
+                (agent, uuid::Uuid::new_v4().to_string(), false),
+                (AgentKind::Cursor, imported_session_id(&task_id), false),
+            ] {
+                let runner = ImportedSessionRunner(Some(
+                    SessionBinding::new(bound_agent, reference, 1).unwrap(),
+                ));
+                let result = super::verify_imported_session(
+                    &RemoteJobClient::new(&runner),
+                    worker,
+                    &"a".repeat(64),
+                    task_id,
+                    agent,
+                );
+                if valid {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().public_code(),
+                        "SESSION_PLACEMENT_FAILED"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_post_prepare_missing_session_is_a_placement_failure() {
+        use crate::{agent::AgentKind, config::Config, task::TaskId, transfer::RemoteJobClient};
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let runner = ImportedSessionRunner(None);
+        let error = super::verify_imported_session(
+            &RemoteJobClient::new(&runner),
+            config.worker("mini-1").unwrap(),
+            &"a".repeat(64),
+            TaskId::generate(),
+            AgentKind::Claude,
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "SESSION_PLACEMENT_FAILED");
+    }
 
     #[test]
     fn handoff_spawn_permit_rejects_cancelled_adopted_bound_foreign_or_missing_rows() {
