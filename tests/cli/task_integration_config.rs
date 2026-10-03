@@ -273,12 +273,15 @@ impl mac_worker::test_support::host::process::ProcessRunner for PreflightRunner 
     > {
         use std::os::unix::process::ExitStatusExt;
         self.requests.lock().unwrap().push(request.clone());
-        let (code, stdout) = self
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("unexpected command");
+        let (code, stdout) = if request.args.iter().any(|arg| arg == "config") {
+            (0, b"filter.fixture.clean\0filter.fixture.smudge\0filter.fixture.process\0filter.fixture.required\0merge.fixture.driver\0merge.fixture.recursive\0merge.union.driver\0".to_vec())
+        } else {
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected command")
+        };
         Ok(mac_worker::test_support::host::process::ProcessResult {
             status: std::process::ExitStatus::from_raw(code << 8),
             stdout,
@@ -356,6 +359,67 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
         assert_eq!(remote[0].policy.stdout_limit, 8 * 1024 * 1024);
         assert_eq!(remote[0].policy.stderr_limit, 64 * 1024);
         for request in requests.iter() {
+            for option in [
+                "gc.auto=0",
+                "core.hooksPath=/dev/null",
+                "core.fsmonitor=false",
+                "commit.gpgSign=false",
+                "submodule.recurse=false",
+                "merge.autoStash=false",
+                "merge.verifySignatures=false",
+                "fetch.recurseSubmodules=false",
+                "push.followTags=false",
+                "push.recurseSubmodules=no",
+                "core.attributesFile=/dev/null",
+                "core.logAllRefUpdates=false",
+                "core.fsync=objects,derived-metadata,reference",
+                "core.fsyncMethod=fsync",
+            ] {
+                assert!(
+                    request
+                        .args
+                        .windows(2)
+                        .any(|pair| pair[0] == "-c" && pair[1] == option),
+                    "missing integration hardening override {option}"
+                );
+            }
+            if !request.args.iter().any(|arg| arg == "config") {
+                for option in [
+                    "filter.fixture.clean=",
+                    "filter.fixture.smudge=",
+                    "filter.fixture.process=",
+                    "filter.fixture.required=false",
+                    "merge.fixture.driver=/usr/bin/git merge-file %A %O %B",
+                    "merge.fixture.recursive=text",
+                    "merge.union.driver=/usr/bin/git merge-file --union %A %O %B",
+                    "merge.union.recursive=union",
+                ] {
+                    assert!(
+                        request
+                            .args
+                            .windows(2)
+                            .any(|pair| pair[0] == "-c" && pair[1] == option),
+                        "missing integration driver override {option}"
+                    );
+                }
+            }
+            for (key, value) in [
+                ("GIT_ATTR_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_NO_LAZY_FETCH", "1"),
+                ("GIT_NO_REPLACE_OBJECTS", "1"),
+                ("GIT_GRAFT_FILE", "/dev/null"),
+            ] {
+                assert!(
+                    request
+                        .environment
+                        .iter()
+                        .any(|(name, configured)| name == key && configured == value),
+                    "missing integration environment {key}"
+                );
+            }
             assert!(
                 request
                     .environment_remove
@@ -385,7 +449,7 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
         .unwrap(),
         IntegrationBasePreflight::Unknown
     );
-    assert_eq!(runner.requests.lock().unwrap().len(), 1);
+    assert_eq!(runner.requests.lock().unwrap().len(), 2); // One local driver read and one advertisement.
 }
 
 #[test]

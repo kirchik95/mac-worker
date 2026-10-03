@@ -32,6 +32,10 @@ pub const MAX_TASK_LOG_LIMIT: u32 = 65_536;
 
 /// Owner/controller adapter. Reads return durable snapshots; redrive publishes intent.
 pub trait DashboardIntegrationSource: Send + Sync + 'static {
+    /// Read durable preparation identity; never infer auxiliary work from time.
+    fn is_auxiliary_turn(&self, _task: TaskId, _turn: TurnId) -> Result<bool, WorkerError> {
+        Ok(false)
+    }
     fn revoke(
         &self,
         _task_id: TaskId,
@@ -60,6 +64,11 @@ pub struct OwnerDashboardIntegrations {
     pub observer: Arc<dyn crate::integration::contracts::IntegrationObserver>,
 }
 impl DashboardIntegrationSource for OwnerDashboardIntegrations {
+    fn is_auxiliary_turn(&self, task: TaskId, turn: TurnId) -> Result<bool, WorkerError> {
+        self.state
+            .load_prepared(task, turn)
+            .map(|prepared| prepared.is_some())
+    }
     fn revoke(
         &self,
         task_id: TaskId,
@@ -116,8 +125,18 @@ fn attach_detail_integration(
         .snapshot(record.meta().task_id())
         .map_err(map_mutation_error)?;
     let facts = crate::integration::contracts::IntegrationTaskFacts::from_record(record, runner);
+    let current = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            crate::integration::view::snapshot_covers_latest_work(snapshot, record, |turn| {
+                source.is_auxiliary_turn(record.meta().task_id(), turn)
+            })
+        })
+        .transpose()
+        .map_err(map_mutation_error)?
+        .unwrap_or(false);
     detail
-        .with_integration(snapshot.as_ref(), &facts)
+        .with_current_integration(snapshot.as_ref(), &facts, current)
         .map_err(map_mutation_error)
 }
 
@@ -141,9 +160,19 @@ fn attach_list_integrations(
             record,
             row.runner.is_some(),
         );
+        let current = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::integration::view::snapshot_covers_latest_work(snapshot, record, |turn| {
+                    source.is_auxiliary_turn(record.meta().task_id(), turn)
+                })
+            })
+            .transpose()
+            .map_err(map_local_error)?
+            .unwrap_or(false);
         *row = row
             .clone()
-            .with_integration(snapshot.as_ref(), &facts)
+            .with_current_integration(snapshot.as_ref(), &facts, current)
             .map_err(map_local_error)?;
     }
     Ok(())

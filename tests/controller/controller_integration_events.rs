@@ -1,8 +1,35 @@
 use mac_worker::test_support::{
     events::{SafeOutcome, TaskFacts},
     integration::*,
-    task::model::{RunId, TaskId, TurnId},
+    task::model::{RunId, TaskId, TaskOutcome, TurnId},
 };
+
+#[test]
+fn newer_ordinary_running_question_failure_and_cancellation_keep_their_exact_facts() {
+    use mac_worker::test_support::events::rpc::task_reads::record_facts;
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Integrated;
+    snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+    snapshot.disposition = Some(IntegrationDisposition::Merged);
+    for outcome in [
+        None,
+        Some(TaskOutcome::NeedsInput),
+        Some(TaskOutcome::failed("follow-up failed")),
+        Some(TaskOutcome::Cancelled),
+    ] {
+        let ordinary = sample_ordinary_followup(fixture_task(), fixture_source(), outcome.clone());
+        let baseline = record_facts(&ordinary, Some(false), true).unwrap();
+        let annotated = baseline
+            .clone()
+            .with_integration(&ordinary, &snapshot)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&annotated).unwrap(),
+            serde_json::to_vec(&baseline).unwrap(),
+            "{outcome:?}"
+        );
+    }
+}
 
 #[test]
 fn integration_hints_are_bounded_title_free_and_unknown_kinds_remain_readable() {

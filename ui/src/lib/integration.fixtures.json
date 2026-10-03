@@ -1197,6 +1197,42 @@
         "attention": true,
         "requested_close": "never"
       }
+    },
+    {
+      "name": "followup_running",
+      "ordinary_state": "active",
+      "view": {
+        "review_state": "not_reviewable",
+        "attention": false,
+        "requested_close": "never"
+      }
+    },
+    {
+      "name": "followup_needs_input",
+      "ordinary_state": "open",
+      "view": {
+        "review_state": "waiting_on_you",
+        "attention": true,
+        "requested_close": "never"
+      }
+    },
+    {
+      "name": "followup_failed",
+      "ordinary_state": "open",
+      "view": {
+        "review_state": "ready_for_follow_up",
+        "attention": true,
+        "requested_close": "never"
+      }
+    },
+    {
+      "name": "followup_cancelled",
+      "ordinary_state": "open",
+      "view": {
+        "review_state": "ready_for_follow_up",
+        "attention": true,
+        "requested_close": "never"
+      }
     }
   ],
   "codes": [
@@ -1294,5 +1330,150 @@
     "multibyte_256": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
     "display_source": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
     "display_expected": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé…"
-  }
+  },
+  "followups": [
+    {
+      "name": "running",
+      "ordinary_state": "active",
+      "last_outcome": null,
+      "label": "Running",
+      "view": {
+        "review_state": "not_reviewable",
+        "attention": false,
+        "requested_close": "never"
+      },
+      "history": {
+        "schema_version": 1,
+        "integration_id": "df525afd-647b-82bb-884e-d5eb88429385",
+        "epoch": 0,
+        "revision": 1,
+        "target": "main",
+        "state": "integrated",
+        "resume_state": null,
+        "pause_reason": null,
+        "source_turn_id": "00000000000000000000000000000003",
+        "source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "merge_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "observed_target_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "disposition": "merged",
+        "attempts": 1,
+        "resolve_turns": 0,
+        "verify_turns": 0,
+        "blocked_code": null,
+        "retry_exhausted": false,
+        "retry_at_millis": null,
+        "verification": "source_agent_report_only",
+        "updated_at_millis": 1001
+      }
+    },
+    {
+      "name": "needs_input",
+      "ordinary_state": "open",
+      "last_outcome": {
+        "kind": "needs_input"
+      },
+      "label": "Needs answer",
+      "view": {
+        "review_state": "waiting_on_you",
+        "attention": true,
+        "requested_close": "never"
+      },
+      "history": {
+        "schema_version": 1,
+        "integration_id": "df525afd-647b-82bb-884e-d5eb88429385",
+        "epoch": 0,
+        "revision": 1,
+        "target": "main",
+        "state": "integrated",
+        "resume_state": null,
+        "pause_reason": null,
+        "source_turn_id": "00000000000000000000000000000003",
+        "source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "merge_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "observed_target_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "disposition": "merged",
+        "attempts": 1,
+        "resolve_turns": 0,
+        "verify_turns": 0,
+        "blocked_code": null,
+        "retry_exhausted": false,
+        "retry_at_millis": null,
+        "verification": "source_agent_report_only",
+        "updated_at_millis": 1001
+      }
+    },
+    {
+      "name": "failed",
+      "ordinary_state": "open",
+      "last_outcome": {
+        "kind": "failed",
+        "reason": "follow-up failed"
+      },
+      "label": "Needs follow-up",
+      "view": {
+        "review_state": "ready_for_follow_up",
+        "attention": true,
+        "requested_close": "never"
+      },
+      "history": {
+        "schema_version": 1,
+        "integration_id": "df525afd-647b-82bb-884e-d5eb88429385",
+        "epoch": 0,
+        "revision": 1,
+        "target": "main",
+        "state": "integrated",
+        "resume_state": null,
+        "pause_reason": null,
+        "source_turn_id": "00000000000000000000000000000003",
+        "source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "merge_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "observed_target_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "disposition": "merged",
+        "attempts": 1,
+        "resolve_turns": 0,
+        "verify_turns": 0,
+        "blocked_code": null,
+        "retry_exhausted": false,
+        "retry_at_millis": null,
+        "verification": "source_agent_report_only",
+        "updated_at_millis": 1001
+      }
+    },
+    {
+      "name": "cancelled",
+      "ordinary_state": "open",
+      "last_outcome": {
+        "kind": "cancelled"
+      },
+      "label": "Open",
+      "view": {
+        "review_state": "ready_for_follow_up",
+        "attention": true,
+        "requested_close": "never"
+      },
+      "history": {
+        "schema_version": 1,
+        "integration_id": "df525afd-647b-82bb-884e-d5eb88429385",
+        "epoch": 0,
+        "revision": 1,
+        "target": "main",
+        "state": "integrated",
+        "resume_state": null,
+        "pause_reason": null,
+        "source_turn_id": "00000000000000000000000000000003",
+        "source_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "merge_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "observed_target_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "disposition": "merged",
+        "attempts": 1,
+        "resolve_turns": 0,
+        "verify_turns": 0,
+        "blocked_code": null,
+        "retry_exhausted": false,
+        "retry_at_millis": null,
+        "verification": "source_agent_report_only",
+        "updated_at_millis": 1001
+      }
+    }
+  ]
 }

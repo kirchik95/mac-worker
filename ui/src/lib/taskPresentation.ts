@@ -1,9 +1,14 @@
 import type { TaskRow } from '@/lib/api'
-export const blockedIntegration = (task: TaskRow) => task.integration?.state === 'blocked'
+/** An overlay has a workflow; a detail receipt without one is history. */
+export const currentIntegration = (task: TaskRow) => task.workflow_state == null ? undefined : task.integration
+export const blockedIntegration = (task: TaskRow) => currentIntegration(task)?.state === 'blocked'
 export const integrationDependencyFailure = (task: TaskRow) =>
-  task.integration != null && task.workflow_state === 'needs_you' &&
+  currentIntegration(task) != null && task.workflow_state === 'needs_you' &&
   task.blocking_code === 'INTEGRATION_DEPENDENCY_NOT_INTEGRATED'
-const ordinaryActions = (task: TaskRow) => !task.integration || ['armed', 'revoked'].includes(task.integration.state)
+const ordinaryActions = (task: TaskRow) => {
+  const integration = currentIntegration(task)
+  return !integration || ['armed', 'revoked'].includes(integration.state)
+}
 export type TaskTone = 'neutral' | 'warning' | 'success' | 'error'
 export const needsAnswer = (task: TaskRow) =>
   ordinaryActions(task) && task.state === 'open' &&
@@ -16,13 +21,14 @@ export function taskPresentation(task: TaskRow): {
   kind: string
   action: string
 } {
-  if (task.integration?.state === 'integrated')
+  const integration = currentIntegration(task)
+  if (integration?.state === 'integrated')
     return { label: 'Integrated', tone: 'success', kind: 'closed', action: 'Open task' }
   if (blockedIntegration(task))
     return { label: 'Integration blocked', tone: 'error', kind: 'error', action: 'Recover integration' }
   if (integrationDependencyFailure(task))
     return { label: 'Dependency not integrated', tone: 'error', kind: 'error', action: 'Open task' }
-  if (task.integration?.state === 'parked')
+  if (integration?.state === 'parked')
     return { label: 'Integration paused', tone: 'neutral', kind: 'running', action: 'Open task' }
   if (task.workflow_state === 'integrating')
     return { label: 'Integrating', tone: 'neutral', kind: 'running', action: 'Open task' }
@@ -49,9 +55,11 @@ export function taskPresentation(task: TaskRow): {
     return { label: 'Needs follow-up', tone: 'error', kind: 'error', action: 'Open task' }
   return { label: 'Open', tone: 'neutral', kind: 'review', action: 'Open task' }
 }
-export const taskEventKey = (task: TaskRow) =>
-  [task.task_id, task.state, task.review_state, task.turn_count, task.updated_at_millis,
-    ...(task.integration ? [task.integration.integration_id, task.integration.epoch, task.integration.revision, task.integration.state] : [])].join(':')
+export const taskEventKey = (task: TaskRow) => {
+  const integration = currentIntegration(task)
+  return [task.task_id, task.state, task.review_state, task.turn_count, task.updated_at_millis,
+    ...(integration ? [integration.integration_id, integration.epoch, integration.revision, integration.state] : [])].join(':')
+}
 
 /** Both admitted and parked task rows can report missing capabilities. */
 export function setupAgent(task: TaskRow): string | null {
@@ -66,7 +74,7 @@ export function setupAgent(task: TaskRow): string | null {
   return agents.includes(task.agent) ? task.agent : (agents[0] ?? null)
 }
 export function waitingReason(task: TaskRow): string {
-  const integration = task.integration
+  const integration = currentIntegration(task)
   if (integration?.state === 'parked') return `Integration paused: ${integration.pause_reason}; resume ${integration.resume_state}`
   if (integration && !['armed', 'revoked'].includes(integration.state)) return integration.blocked_code ?? `Integration ${integration.state} into ${integration.target}`
   const code = task.blocking_code
