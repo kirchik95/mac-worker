@@ -334,6 +334,57 @@ fn review_native_invalid_replies_release_the_target_on_validation_and_applicatio
 }
 
 #[test]
+fn review_native_authentication_error_retains_its_catalog_code() {
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+    };
+    use native_owner::*;
+    use std::{
+        os::unix::process::ExitStatusExt,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct RejectPush(AtomicUsize);
+    impl ProcessRunner for RejectPush {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == "push") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                return Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(256),
+                    stdout: vec![],
+                    stderr: b"fatal: Authentication failed for fixture".to_vec(),
+                });
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let runner = RejectPush(AtomicUsize::new(0));
+    let host = HostIntegrationService::new(&f.store, &runner, &f.runtime);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        coordinator.drive_once(f.record.task_id).unwrap().state,
+        IntegrationStatus::CommitReady
+    );
+    let blocked = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(runner.0.load(Ordering::SeqCst), 1);
+    assert_eq!(blocked.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        blocked.blocked_code,
+        Some(IntegrationCode::IntegrationAuthFailed)
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert!(turns.imports(f.record.task_id).is_empty());
+    assert_released(&f, &state);
+}
+
+#[test]
 fn fixture_keeps_imported_result_through_partial_close_replay() {
     let f = IntegrationFixture::new();
     let record = sample_record(f.task(), f.source(), "main");

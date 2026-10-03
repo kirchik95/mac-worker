@@ -790,20 +790,15 @@ impl<'a> IntegrationCoordinator<'a> {
                     self.apply_response(&mut record, step, response)?;
                 }
                 Err(error) => {
-                    let code = match error.public_code().as_str() {
-                        "INTEGRATION_UNAVAILABLE" => IntegrationCode::IntegrationUnavailable,
-                        "INTEGRATION_WORKER_OFFLINE" => IntegrationCode::IntegrationWorkerOffline,
-                        "INTEGRATION_NETWORK" => IntegrationCode::IntegrationNetwork,
-                        _ => IntegrationCode::IntegrationStateInvalid,
-                    };
-                    // Consult effective pause evidence before retry/timeout spending.
-                    if let IntegrationDriveAdmission::Park(pause) =
-                        self.runtime.begin_phase(&self.key(&record, phase))?
-                    {
-                        self.park(&mut record, pause)?;
-                    } else {
-                        self.retry(&mut record, phase, code)?;
-                    }
+                    self.apply_response(
+                        &mut record,
+                        step,
+                        HostIntegrationResponse::Blocked {
+                            identity: IntegrationResponseIdentity::for_request(&request),
+                            code: Self::host_error_code(&error),
+                            retry_exhausted: false,
+                        },
+                    )?;
                 }
             }
             Ok(())
@@ -828,6 +823,14 @@ impl<'a> IntegrationCoordinator<'a> {
             self.park(&mut record, pause)?;
         }
         Ok(record.snapshot)
+    }
+    fn host_error_code(error: &WorkerError) -> IntegrationCode {
+        let code = error.public_code();
+        IntegrationCode::ALL
+            .iter()
+            .copied()
+            .find(|known| known.as_str() == code)
+            .unwrap_or(IntegrationCode::IntegrationStateInvalid)
     }
     fn record_candidate(
         &self,
@@ -967,6 +970,20 @@ impl<'a> IntegrationCoordinator<'a> {
                 retry_exhausted,
                 ..
             } => {
+                let phase = match step {
+                    IntegrationStep::Fetch => IntegrationPhase::Fetch,
+                    IntegrationStep::Prepare => IntegrationPhase::Prepare,
+                    IntegrationStep::AcceptTurn => IntegrationPhase::AcceptTurn,
+                    IntegrationStep::Build => IntegrationPhase::Build,
+                    IntegrationStep::Push => IntegrationPhase::Push,
+                    IntegrationStep::Repair => IntegrationPhase::Repair,
+                };
+                // Err and typed Blocked share pause, retry and resolver budgets.
+                if let IntegrationDriveAdmission::Park(pause) =
+                    self.runtime.begin_phase(&self.key(record, phase))?
+                {
+                    return self.park(record, pause);
+                }
                 if code == IntegrationCode::IntegrationResolutionIncomplete
                     && record.snapshot.resolve_turns < MAX_RESOLVE_TURNS
                 {
@@ -975,14 +992,7 @@ impl<'a> IntegrationCoordinator<'a> {
                     record.snapshot.retry_exhausted = retry_exhausted;
                     self.retry(
                         record,
-                        match step {
-                            IntegrationStep::Fetch => IntegrationPhase::Fetch,
-                            IntegrationStep::Prepare => IntegrationPhase::Prepare,
-                            IntegrationStep::AcceptTurn => IntegrationPhase::AcceptTurn,
-                            IntegrationStep::Build => IntegrationPhase::Build,
-                            IntegrationStep::Push => IntegrationPhase::Push,
-                            IntegrationStep::Repair => IntegrationPhase::Repair,
-                        },
+                        phase,
                         if code == IntegrationCode::IntegrationResolutionIncomplete {
                             IntegrationCode::IntegrationConflictBudgetExhausted
                         } else {
