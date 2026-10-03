@@ -19,10 +19,18 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
+    session_transfer::{
+        MAX_FILE_BYTES, MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES, PACKAGE_MANIFEST_PATH, PackageFile,
+        PlaceContext, SESSION_REF_PREFIX, SessionAgent, SessionImportMeta, SessionPackage,
+        SessionPlace, imported_session_id,
+        place::{fs::StoreWriter, place_for},
+        store_root::store_root,
+    },
     task::{
         BaseOid, HerdrTurnReport, OriginDelivery, TaskId, TaskMeta, TaskOutcome, TaskSource,
         TaskState, TaskStatus, TurnSummary, TurnTerminal,
     },
+    turn::EnvProfile,
 };
 
 const GIT_PROGRAM: &str = "/usr/bin/git";
@@ -33,6 +41,7 @@ const MAX_TASK_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_CLOSE_WARNINGS: usize = 8;
 const MAX_CLOSE_WARNING_BYTES: usize = 256;
 const NATIVE_SESSION_DELETE_WARNING: &str = "native agent session deletion failed";
+const SESSION_IMPORT_RECEIPT: &str = "session-import.json";
 const GIT_CONFIG_GLOBAL: &str = "GIT_CONFIG_GLOBAL";
 const GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
 const GIT_TERMINAL_PROMPT: &str = "GIT_TERMINAL_PROMPT";
@@ -725,6 +734,27 @@ impl<'a> TaskStore<'a> {
         request: &TaskPrepareRequest,
         guard: &TransferGuard,
     ) -> Result<TaskPrepareResponse, WorkerError> {
+        self.prepare_with_placement(request, guard, None)
+    }
+
+    /// Test seam: exercise the prepare transaction with deterministic placement,
+    /// while retaining the production package reader and real StoreWriter.
+    #[cfg(feature = "test-support")]
+    pub fn prepare_with_session_place(
+        &self,
+        request: &TaskPrepareRequest,
+        guard: &TransferGuard,
+        place: &dyn SessionPlace,
+    ) -> Result<TaskPrepareResponse, WorkerError> {
+        self.prepare_with_placement(request, guard, Some(place))
+    }
+
+    fn prepare_with_placement(
+        &self,
+        request: &TaskPrepareRequest,
+        guard: &TransferGuard,
+        place: Option<&dyn SessionPlace>,
+    ) -> Result<TaskPrepareResponse, WorkerError> {
         request.validate()?;
         guard.validate()?;
         if guard.job_id() != request.job_id() {
@@ -772,10 +802,286 @@ impl<'a> TaskStore<'a> {
             .open_task_directory(meta.project_id(), task_id, true)?;
         self.ensure_meta(&task, meta)?;
 
-        let (reused, _workspace) = self.prepare_workspace(&task, &mirror, meta)?;
+        let (reused, workspace) = self.prepare_workspace(&task, &mirror, meta)?;
         self.ensure_active_status(&task, meta, request.worker(), request.job_id())?;
+        if meta.session_import().is_some() {
+            self.import_session(&task, &mirror, &workspace, meta, place)
+                .map_err(|_| session_placement_failed())?;
+        }
         task.sync_root()?;
         Ok(TaskPrepareResponse::new(meta.base_oid().clone(), reused))
+    }
+
+    fn import_session(
+        &self,
+        task: &RootedDir,
+        mirror: &RootedDir,
+        workspace: &RootedDir,
+        meta: &TaskMeta,
+        place: Option<&dyn SessionPlace>,
+    ) -> Result<(), WorkerError> {
+        let import = meta.session_import().ok_or_else(session_placement_failed)?;
+        let session_id = imported_session_id(&meta.task_id());
+        let reference = format!("{SESSION_REF_PREFIX}{}", meta.task_id());
+        let existing: Option<SessionImportReceipt> = if task.entry_exists(SESSION_IMPORT_RECEIPT)? {
+            let receipt: SessionImportReceipt = read_record(task, SESSION_IMPORT_RECEIPT)?;
+            receipt.validate()?;
+            if receipt.package_oid != import.package_oid()
+                || receipt.session_id != session_id
+                || receipt.agent != import.agent()
+            {
+                return Err(session_placement_failed());
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+        // Completed imports may have been appended by the agent. Do not even
+        // open the native store or reload a changed env profile on this path.
+        if let Some(receipt) = &existing
+            && receipt.stage == SessionImportStage::Complete
+        {
+            self.bind_session(
+                meta.project_id(),
+                meta.task_id(),
+                SessionBinding::new(import.agent().agent_kind(), &session_id, now_millis()?)?,
+            )?;
+            return self.delete_session_ref(mirror, &reference, import.package_oid());
+        }
+
+        let (home, profile) = task_account_profile(meta)?;
+        let root = physical_store_root(&store_root(
+            import.agent(),
+            &home,
+            &profile_strings(&profile),
+        )?)?;
+        let root_text = root.to_str().ok_or_else(session_placement_failed)?;
+        let planned = match existing {
+            Some(receipt) if receipt.store_root == root_text => receipt,
+            Some(_) => return Err(session_placement_failed()),
+            None => {
+                let receipt = SessionImportReceipt {
+                    schema: 1,
+                    stage: SessionImportStage::Planned,
+                    package_oid: import.package_oid().to_owned(),
+                    session_id: session_id.clone(),
+                    agent: import.agent(),
+                    placed_at_millis: now_millis()?,
+                    store_root: root_text.to_owned(),
+                    primary_relative: String::new(),
+                    files: Vec::new(),
+                };
+                receipt.validate()?;
+                write_record_once(task, SESSION_IMPORT_RECEIPT, &receipt)?;
+                receipt
+            }
+        };
+        let package = self.read_session_package(mirror, &reference, import)?;
+        // Native stores may not exist yet (in particular Claude on fresh pool
+        // accounts). Rooted creation makes new components private, without
+        // relaxing StoreWriter's no-follow traversal below the store root.
+        match fs::symlink_metadata(&root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let created = RootedDir::create(&root)?;
+                created.sync_root()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let store = StoreWriter::open(&root)?;
+        let adapter;
+        let place = match place {
+            Some(place) => place,
+            None => {
+                adapter = place_for(import.agent());
+                adapter.as_ref()
+            }
+        };
+        if place.agent() != import.agent() {
+            return Err(session_placement_failed());
+        }
+        let physical_workspace = workspace.path().canonicalize()?;
+        let placed = place.place(
+            &package,
+            &PlaceContext {
+                workspace: &physical_workspace,
+                store: &store,
+                session_id: &session_id,
+                placed_at_millis: planned.placed_at_millis,
+            },
+        )?;
+        self.bind_session(
+            meta.project_id(),
+            meta.task_id(),
+            SessionBinding::new(import.agent().agent_kind(), &session_id, now_millis()?)?,
+        )?;
+        let complete = SessionImportReceipt {
+            stage: SessionImportStage::Complete,
+            primary_relative: placed.primary_relative,
+            files: placed.files,
+            ..planned.clone()
+        };
+        complete.validate()?;
+        let old_bytes = serde_json::to_vec(&planned).map_err(|_| session_placement_failed())?;
+        let new_bytes = serde_json::to_vec(&complete).map_err(|_| session_placement_failed())?;
+        if new_bytes.len() as u64 > MAX_TASK_RECORD_BYTES {
+            return Err(session_placement_failed());
+        }
+        task.replace_private_regular_exact(SESSION_IMPORT_RECEIPT, &old_bytes, &new_bytes)?;
+        task.sync_root()?;
+        self.delete_session_ref(mirror, &reference, import.package_oid())
+    }
+
+    fn session_git(
+        &self,
+        mirror: &RootedDir,
+        args: &[&str],
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, WorkerError> {
+        mirror.verify_bound()?;
+        let mut argv = vec![
+            OsString::from("--git-dir"),
+            mirror.path().as_os_str().to_owned(),
+        ];
+        argv.extend(args.iter().map(OsString::from));
+        let mut request = git_request(argv, None);
+        request.policy.stdout_limit = stdout_limit;
+        let result = self.runner.run(&request)?;
+        mirror.verify_bound()?;
+        if !result.status.success() {
+            return Err(session_placement_failed());
+        }
+        Ok(result.stdout)
+    }
+
+    fn read_session_package(
+        &self,
+        mirror: &RootedDir,
+        reference: &str,
+        import: &SessionImportMeta,
+    ) -> Result<SessionPackage, WorkerError> {
+        let oid = self.session_git(
+            mirror,
+            &["rev-parse", "--verify", "--end-of-options", reference],
+            128,
+        )?;
+        if std::str::from_utf8(&oid).ok().map(str::trim) != Some(import.package_oid()) {
+            return Err(session_placement_failed());
+        }
+        let kind = self.session_git(mirror, &["cat-file", "-t", import.package_oid()], 32)?;
+        if kind != b"commit\n" {
+            return Err(session_placement_failed());
+        }
+        let tree = self.session_git(
+            mirror,
+            &["ls-tree", "-r", "-z", "-l", import.package_oid()],
+            GIT_STDOUT_LIMIT,
+        )?;
+        let mut entries = Vec::new();
+        let mut total = 0u64;
+        let mut manifest_seen = false;
+        if tree.last() != Some(&0) {
+            return Err(session_placement_failed());
+        }
+        for entry in tree
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let text = std::str::from_utf8(entry).map_err(|_| session_placement_failed())?;
+            let (header, path) = text.split_once('\t').ok_or_else(session_placement_failed)?;
+            let columns: Vec<_> = header.split_ascii_whitespace().collect();
+            if columns.len() != 4
+                || !matches!(columns[0], "100644" | "100755")
+                || columns[1] != "blob"
+            {
+                return Err(session_placement_failed());
+            }
+            // Validate blob OIDs before ever passing them as git arguments.
+            SessionImportMeta::new(import.agent(), columns[2], "1")?;
+            let size = columns[3]
+                .parse::<u64>()
+                .map_err(|_| session_placement_failed())?;
+            total = total
+                .checked_add(size)
+                .ok_or_else(session_placement_failed)?;
+            if size > MAX_FILE_BYTES
+                || total > MAX_PACKAGE_BYTES
+                || entries.len() > MAX_PACKAGE_FILES
+            {
+                return Err(session_placement_failed());
+            }
+            if path == PACKAGE_MANIFEST_PATH && !manifest_seen {
+                manifest_seen = true;
+            } else if !path
+                .strip_prefix("session/")
+                .is_some_and(valid_session_relative)
+            {
+                return Err(session_placement_failed());
+            }
+            entries.push((path.to_owned(), columns[2].to_owned(), size));
+        }
+        if !manifest_seen {
+            return Err(session_placement_failed());
+        }
+        // All sizes and names have now passed admission. Only now read blobs,
+        // bounded to their advertised sizes even if git output is malicious.
+        let mut manifest = Vec::new();
+        let mut files = Vec::new();
+        for (path, oid, size) in entries {
+            let bytes = self.session_git(mirror, &["cat-file", "blob", &oid], size as usize + 1)?;
+            if bytes.len() as u64 != size {
+                return Err(session_placement_failed());
+            }
+            if path == PACKAGE_MANIFEST_PATH {
+                manifest = bytes;
+            } else {
+                files.push(PackageFile {
+                    path: path["session/".len()..].to_owned(),
+                    bytes,
+                });
+            }
+        }
+        let package = SessionPackage::from_parts(&manifest, files)?;
+        if package.manifest().agent != import.agent()
+            || package.manifest().source_agent_version != import.source_agent_version()
+        {
+            return Err(session_placement_failed());
+        }
+        Ok(package)
+    }
+
+    fn delete_session_ref(
+        &self,
+        mirror: &RootedDir,
+        reference: &str,
+        expected: &str,
+    ) -> Result<(), WorkerError> {
+        mirror.verify_bound()?;
+        let mut request = git_request(
+            vec![
+                "--git-dir".into(),
+                mirror.path().as_os_str().to_owned(),
+                "rev-parse".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                "--end-of-options".into(),
+                reference.into(),
+            ],
+            None,
+        );
+        request.policy.stdout_limit = 128;
+        let result = self.runner.run(&request)?;
+        mirror.verify_bound()?;
+        if result.status.code() == Some(1) {
+            return Ok(());
+        }
+        if !result.status.success()
+            || std::str::from_utf8(&result.stdout).ok().map(str::trim) != Some(expected)
+        {
+            return Err(session_placement_failed());
+        }
+        self.session_git(mirror, &["update-ref", "-d", reference, expected], 128)?;
+        Ok(())
     }
 
     pub fn status(&self, request: &TaskStatusRequest) -> Result<TaskStatusResponse, WorkerError> {
@@ -1655,16 +1961,21 @@ impl<'a> TaskStore<'a> {
         if self.session_referenced_elsewhere(project_id, task_id, &binding)? {
             return Ok(());
         }
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
+        let task = self.open_existing_task(project_id, task_id)?;
+        let meta = self.read_meta(&task)?;
+        let (home, profile) = task_account_profile(&meta)?;
+        if let Some(agent) = SessionAgent::from_agent_kind(binding.agent()) {
+            // Apply the same override validation as placement, not a relative
+            // directory interpreted from the endpoint's working directory.
+            let _ = store_root(agent, &home, &profile_strings(&profile))?;
+        }
         // An agent with dialects deletes in the form of the generation
         // installed now: OpenCode 2 needs `--standalone` to stay out of its
         // background service, and the session may be older than an upgrade.
         let argv = crate::agent::identity::installed_adapter(binding.agent(), self.runner, &home)
             .delete_session(binding.session_ref())
             .unwrap_or(argv);
-        let request = crate::agent::prebind_login_request(&argv, &home, &[])?;
+        let request = crate::agent::prebind_login_request(&argv, &home, profile.entries())?;
         let result = self.runner.run(&request)?;
         if !result.status.success() {
             return Err(WorkerError::Agent {
@@ -2158,6 +2469,119 @@ impl<'a> TaskStore<'a> {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionImportStage {
+    Planned,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionImportReceipt {
+    schema: u32,
+    stage: SessionImportStage,
+    package_oid: String,
+    session_id: String,
+    agent: SessionAgent,
+    placed_at_millis: u64,
+    store_root: String,
+    primary_relative: String,
+    files: Vec<String>,
+}
+impl SessionImportReceipt {
+    fn validate(&self) -> Result<(), WorkerError> {
+        SessionImportMeta::new(self.agent, &self.package_oid, "1")?;
+        let id = uuid::Uuid::parse_str(&self.session_id).map_err(|_| session_placement_failed())?;
+        if self.schema != 1
+            || id.hyphenated().to_string() != self.session_id
+            || self.placed_at_millis == 0
+            || !Path::new(&self.store_root).is_absolute()
+            || self.store_root.chars().any(char::is_control)
+            || self.files.len() > MAX_PACKAGE_FILES
+            || self.files.iter().any(|path| !valid_session_relative(path))
+            || self.files.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(session_placement_failed());
+        }
+        match self.stage {
+            SessionImportStage::Planned
+                if self.primary_relative.is_empty() && self.files.is_empty() =>
+            {
+                Ok(())
+            }
+            SessionImportStage::Complete
+                if valid_session_relative(&self.primary_relative)
+                    && self.files.contains(&self.primary_relative) =>
+            {
+                Ok(())
+            }
+            _ => Err(session_placement_failed()),
+        }
+    }
+}
+fn valid_session_relative(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+fn session_placement_failed() -> WorkerError {
+    task_error("SESSION_PLACEMENT_FAILED", "session import failed")
+}
+
+// Keep this resolution identical to the supervisor's launch path: account
+// HOME, not host data/XDG roots, and EnvProfile's full permission validation.
+fn task_account_profile(meta: &TaskMeta) -> Result<(PathBuf, EnvProfile), WorkerError> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(session_placement_failed)?;
+    let profile = match meta.env_profile() {
+        Some(name) => EnvProfile::load_for_home(
+            &home
+                .join(".config/mac-worker/env")
+                .join(format!("{name}.env")),
+            &home,
+        )?,
+        None => EnvProfile::empty(),
+    };
+    Ok((home, profile))
+}
+// Persist the physical root identity, including when the native root has not
+// yet been created. A planned retry must not follow a retargeted root symlink
+// into a second native store. RootedDir later creates any missing suffix.
+fn physical_store_root(root: &Path) -> Result<PathBuf, WorkerError> {
+    match root.canonicalize() {
+        Ok(physical) => Ok(physical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A dangling root symlink is not a missing directory to create.
+            if fs::symlink_metadata(root).is_ok() {
+                return Err(session_placement_failed());
+            }
+            let parent = root.parent().ok_or_else(session_placement_failed)?;
+            let name = root.file_name().ok_or_else(session_placement_failed)?;
+            Ok(physical_store_root(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+fn profile_strings(profile: &EnvProfile) -> Vec<(String, String)> {
+    // EnvProfile was decoded from UTF-8 text; these entries cannot be lossy.
+    profile
+        .entries()
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
 }
 
 fn now_millis() -> Result<u64, WorkerError> {
