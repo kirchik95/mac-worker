@@ -444,6 +444,43 @@ fn preview_prefers_first_user_event_and_never_exposes_secrets() {
 }
 
 #[test]
+fn preview_reads_completed_user_message_items_and_skips_injected_agents_md() {
+    let fixture = Fixture::new();
+    let agents_md = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>\nhouse rules\n</INSTRUCTIONS>"}]}});
+    let typed = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Fix the flaky test"}]}});
+    let source = fixture
+        .home
+        .codex(ID, fixture.project.to_str().unwrap(), "0.160.0", 0);
+    append(&source, agents_md.clone());
+    append(&source, typed.clone());
+    append(
+        &source,
+        json!({"type":"event_msg", "payload":{"type":"item_completed", "item":{"type":"UserMessage", "content":[{"type":"image"}, {"type":"text", "text":format!("Fix the flaky test {SECRET}")}]}}}),
+    );
+    assert_eq!(
+        fixture
+            .capture(&source)
+            .unwrap()
+            .first_prompt_preview
+            .as_deref(),
+        Some("Fix the flaky test [scrubbed]")
+    );
+    let source = fixture
+        .home
+        .codex(ID, fixture.project.to_str().unwrap(), "0.160.0", 0);
+    append(&source, agents_md);
+    append(&source, typed);
+    assert_eq!(
+        fixture
+            .capture(&source)
+            .unwrap()
+            .first_prompt_preview
+            .as_deref(),
+        Some("Fix the flaky test")
+    );
+}
+
+#[test]
 fn preview_preserves_checkout_path_and_session_id_while_scrubbing_secrets() {
     let fixture = Fixture::new();
     let project = tempfile::tempdir_in("/tmp").unwrap();
