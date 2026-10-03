@@ -520,3 +520,44 @@ fn batch_and_project_defaults_reject_session_keys() {
         assert_eq!(error.public_code(), "TASK_CONFIG_INVALID");
     }
 }
+
+#[test]
+fn sec_fix_controller_envelope_must_not_contain_scrubbed_version_token() {
+    let fixture = CliFixture::new(true);
+    let token = format!("sk-{}", "a".repeat(20));
+    let version = format!("0.160.0-{token}");
+    fixture.home.codex(
+        "018f0f4a-6b5c-7d8e-9f00-112233445566",
+        fixture.repo.root().to_str().unwrap(),
+        &version,
+        1,
+    );
+    let remote = ControllerMock::new(true);
+    let (exit, stdout, stderr) = fixture.run(
+        &remote,
+        &[
+            "--json",
+            "task",
+            "submit",
+            "--prompt",
+            "continue",
+            "--from-session",
+            "codex",
+        ],
+    );
+    assert_eq!(exit, 64, "{stdout} {stderr}");
+    assert!(stdout.contains("SESSION_UNREADABLE"), "{stdout} {stderr}");
+    assert!(!stdout.contains(&token) && !stderr.contains(&token));
+    assert!(remote.bodies.lock().unwrap().is_empty());
+    let has_envelope = match std::fs::read_dir(fixture.paths.controller_cache_root()) {
+        Ok(entries) => entries
+            .map(Result::unwrap)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("op-")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("cannot inspect isolated controller cache: {error}"),
+    };
+    assert!(
+        !has_envelope,
+        "unsafe metadata was frozen into a durable operation envelope"
+    );
+}

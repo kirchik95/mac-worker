@@ -1,5 +1,7 @@
 use super::super::{claude_dir::claude_project_dir, contracts::*, scrub::Scrubber, tokens};
-use super::{complete_lines, open_session_file, read_session_bytes, relative_inside};
+use super::{
+    RootedSessionFile, complete_lines, read_session_bytes, relative_inside, unsupported_version,
+};
 use crate::{error::WorkerError, rooted_fs::RootedDir};
 use serde_json::Value;
 use std::{
@@ -62,7 +64,7 @@ impl SessionCapture for ClaudeCapture {
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .is_some_and(lowercase_uuid)
-                        && first_cwd(&path)
+                        && first_cwd(&projects, &path)
                             .is_some_and(|cwd| relative_inside(cx.project_root, &cwd).is_ok())
                     {
                         add_candidate(&mut candidates, entry, false)?;
@@ -89,13 +91,13 @@ impl SessionCapture for ClaudeCapture {
             .and_then(|s| s.to_str())
             .filter(|id| lowercase_uuid(id))
             .ok_or_else(unreadable)?;
-        let main_file = open_session_file(source)?;
-        let metadata = main_file.metadata().map_err(|_| unreadable())?;
+        let main_file = RootedSessionFile::open(&cx.home.join(".claude/projects"), source)?;
+        let metadata = main_file.metadata()?;
         let mut caps = RawCaps::default();
         caps.add_file(metadata.len())?;
         let sidecar_root = source.parent().ok_or_else(unreadable)?.join(id);
         let sidecars = collect_sidecars(&sidecar_root, &mut caps)?;
-        let raw = read_session_bytes(main_file, MAX_FILE_BYTES)?;
+        let raw = main_file.read_bytes(MAX_FILE_BYTES)?;
         caps.observe(metadata.len(), raw.len() as u64)?;
         let lines = complete_lines(&raw)?;
         drop(raw);
@@ -107,6 +109,7 @@ impl SessionCapture for ClaudeCapture {
                 cwd = value.get("cwd").and_then(Value::as_str).map(PathBuf::from);
             }
             if let Some(candidate) = value.get("version").and_then(Value::as_str)
+                && supported_agent_version(candidate, cx.scrubber)
                 && version
                     .as_deref()
                     .is_none_or(|current| compare_versions(candidate, current).is_gt())
@@ -114,8 +117,8 @@ impl SessionCapture for ClaudeCapture {
                 version = Some(candidate.to_owned());
             }
         }
+        let version = version.ok_or_else(unsupported_version)?;
         let relative = relative_inside(cx.project_root, &cwd.ok_or_else(unreadable)?)?;
-        let version = version.ok_or_else(unreadable)?;
         let canonical = cx.project_root.canonicalize().map_err(|_| unreadable())?;
         let mut roots = vec![path_text(cx.project_root)?, path_text(&canonical)?];
         roots.sort_unstable();
@@ -175,10 +178,17 @@ impl SessionCapture for ClaudeCapture {
 
 // Native project-directory encoding is only a lookup hint: distinct checkout
 // names can collide. Inspect complete first lines before ranking by mtime.
-fn first_cwd(path: &Path) -> Option<PathBuf> {
+fn first_cwd(store_root: &Path, path: &Path) -> Option<PathBuf> {
+    RootedSessionFile::open(store_root, path)
+        .ok()?
+        .with_file(|file| Ok(first_cwd_in(file)))
+        .ok()
+        .flatten()
+}
+
+fn first_cwd_in(file: &File) -> Option<PathBuf> {
     const MAX_DISCOVERY_BYTES: u64 = 1 << 20;
     const MAX_DISCOVERY_LINES: usize = 64;
-    let file = open_session_file(path).ok()?;
     let mut reader = BufReader::new(file.take(MAX_DISCOVERY_BYTES + 1));
     let mut line = Vec::new();
     let mut bytes = 0;
@@ -309,7 +319,7 @@ fn read_bounded(sidecar: &SidecarFile) -> Result<Vec<u8>, WorkerError> {
     if (metadata.dev(), metadata.ino()) != (sidecar.device, sidecar.inode) {
         return Err(unreadable());
     }
-    let bytes = read_session_bytes(file, MAX_FILE_BYTES)?;
+    let bytes = read_session_bytes(&file, MAX_FILE_BYTES)?;
     sidecar.root.verify_bound().map_err(|_| unreadable())?;
     Ok(bytes)
 }
@@ -659,11 +669,28 @@ mod review_fix_tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("main.jsonl");
         fs::write(&source, b"{}\n").unwrap();
-        let file = open_session_file(&source).unwrap();
+        let file = super::super::open_session_file(&source).unwrap();
         let private = temp.path().join("unrelated-private");
         fs::write(&private, b"synthetic private bytes").unwrap();
         fs::remove_file(&source).unwrap();
         symlink(&private, &source).unwrap();
-        assert_eq!(read_session_bytes(file, MAX_FILE_BYTES).unwrap(), b"{}\n");
+        assert_eq!(read_session_bytes(&file, MAX_FILE_BYTES).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn sec_fix_first_cwd_refuses_substituted_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("projects");
+        let project = store.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let source = project.join("main.jsonl");
+        fs::write(&source, b"{\"cwd\":\"/synthetic/project\"}\n").unwrap();
+        assert_eq!(
+            first_cwd(&store, &source),
+            Some(PathBuf::from("/synthetic/project"))
+        );
+        fs::rename(&project, temp.path().join("original")).unwrap();
+        symlink(temp.path().join("original"), &project).unwrap();
+        assert!(first_cwd(&store, &source).is_none());
     }
 }

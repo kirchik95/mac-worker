@@ -285,7 +285,7 @@ fn import_metadata_deserialization_validates_every_rule() {
         serde_json::from_value::<SessionImportMeta>(value).unwrap(),
         meta
     );
-    assert!(SessionImportMeta::new(SessionAgent::Codex, "0".repeat(64), "v1").is_ok());
+    assert!(SessionImportMeta::new(SessionAgent::Codex, "0".repeat(64), "1.0").is_ok());
 }
 
 #[test]
