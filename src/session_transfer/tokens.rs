@@ -3,8 +3,27 @@ use crate::error::WorkerError;
 pub const WORKSPACE_TOKEN: &str = "@@MW_WORKSPACE@@";
 pub const SESSION_TOKEN: &str = "@@MW_SESSION@@";
 fn boundary(byte: u8) -> bool {
-    !(byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    byte.is_ascii() && !(byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
 }
+fn left_boundary(text: &[u8], index: usize) -> bool {
+    if index == 0 || boundary(text[index - 1]) {
+        return true;
+    }
+    if !b"nrtbf\"/".contains(&text[index - 1]) {
+        return false;
+    }
+    let backslashes = text[..index - 1]
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count();
+    backslashes % 2 == 1
+}
+/// Rewrite roots only at path boundaries. ASCII alphanumerics, `_`, `.`, `-`
+/// and all non-ASCII bytes are name characters on both sides. On the left,
+/// JSON escapes (`n`, `r`, `t`, `b`, `f`, `"`, `/`) after an odd run of
+/// backslashes also delimit paths; an escaped backslash plus literal `n`
+/// does not. A following backslash and the start/end of text are boundaries.
 pub fn rewrite_root(text: &[u8], from: &str, to: &str) -> Vec<u8> {
     let from = from.as_bytes();
     if from.is_empty() {
@@ -14,7 +33,7 @@ pub fn rewrite_root(text: &[u8], from: &str, to: &str) -> Vec<u8> {
     let mut i = 0;
     while i < text.len() {
         if text[i..].starts_with(from)
-            && (i == 0 || boundary(text[i - 1]))
+            && left_boundary(text, i)
             && (i + from.len() == text.len() || boundary(text[i + from.len()]))
         {
             output.extend_from_slice(to.as_bytes());

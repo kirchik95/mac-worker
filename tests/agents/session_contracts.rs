@@ -3,6 +3,40 @@ use mac_worker::test_support::session::*;
 const ID: &str = "abcdefab-1234-5678-90ab-abcdefabcdef";
 
 #[test]
+fn tokens_json_escapes_and_string_edges_are_boundaries() {
+    for escape in ["n", "r", "t", "b", "f", "\"", "/"] {
+        let input = format!("files:\\{escape}/w/feat/a");
+        let expected = format!("files:\\{escape}T/a");
+        assert_eq!(
+            rewrite_root(input.as_bytes(), "/w/feat", "T"),
+            expected.as_bytes()
+        );
+    }
+    for (input, expected) in [
+        (r"x\\n/w/feat", r"x\\n/w/feat"),
+        (r"x\\\n/w/feat", r"x\\\nT"),
+        (r"\r\n/w/feat", r"\r\nT"),
+        (r"/w/feat\n", r"T\n"),
+        ("/w/feat", "T"),
+        ("/w/feat/a /w/feat", "T/a T"),
+    ] {
+        assert_eq!(
+            rewrite_root(input.as_bytes(), "/w/feat", "T"),
+            expected.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn tokens_non_ascii_neighbours_are_name_characters_on_both_sides() {
+    let input = "é/w/feat 日本/w/feat /w/featé /w/feat日本 /w/feat/a";
+    assert_eq!(
+        rewrite_root(input.as_bytes(), "/w/feat", "T"),
+        "é/w/feat 日本/w/feat /w/featé /w/feat日本 T/a".as_bytes()
+    );
+}
+
+#[test]
 fn tokens_obey_boundaries_and_round_trip() {
     assert_eq!(
         rewrite_root(

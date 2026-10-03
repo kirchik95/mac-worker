@@ -1,6 +1,7 @@
 use mac_worker::test_support::{
     agents::agent_facts::{AgentAuth, AgentFacts, AgentProbe, FACTS_TTL},
     client_state::{
+        ClientStateStore,
         scheduler::{
             AffinityHints, CandidateRejection, SchedulerPolicy, Selection, WorkerPreference,
             rejection_code_for_missing,
@@ -11,7 +12,10 @@ use mac_worker::test_support::{
         config::{Config, WorkerEntry},
         protocol::{HealthStatus, MemoryPressure, PROTOCOL_VERSION, ProbeResponse, WorkerHealth},
     },
-    host::lease::SlotState,
+    host::{
+        job::{AdmissionObservation, CommandSummary, ProcessIdentity, QueueEntry, QueueEntryKind},
+        lease::SlotState,
+    },
     session::{SessionAgent, agent_min_requirement},
 };
 
@@ -322,6 +326,100 @@ fn mixed_requirements_keep_exact_capabilities_and_version_checks() {
         select(old_without_feature, &requirements),
         &[requirements[1].clone(), requirements[3].clone()],
     );
+}
+
+#[test]
+fn advisory_queue_preserves_fresh_versions_and_rejects_stale_or_old_cache_facts() {
+    use mac_worker::test_support::client_state::scheduler::{CandidateSlot, QueueBlockingReason};
+    use std::{
+        collections::BTreeMap,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    for preference in [
+        WorkerPreference::Automatic,
+        WorkerPreference::Pinned {
+            worker: "mini-1".into(),
+        },
+    ] {
+        for (version, age, eligible) in [
+            (Some("0.159.3"), Some(0), true),
+            (Some("0.158.9"), Some(0), false),
+            (Some("0.159.3"), Some(FACTS_TTL + 1), false),
+            (Some("0.159.3"), None, false),
+            (None, Some(0), false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store =
+                ClientStateStore::open(&temp.path().canonicalize().unwrap().join("state")).unwrap();
+            let config = config();
+            let worker = &config.workers[0];
+            let now = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap();
+            let versions = version
+                .map(|version| BTreeMap::from([("codex".into(), version.into())]))
+                .unwrap_or_default();
+            let observation = AdmissionObservation::new(
+                worker.name.clone(),
+                true,
+                CandidateSlot::Idle,
+                vec!["node".into(), "agent:codex".into()],
+                Some(12),
+                500,
+                now,
+            )
+            .unwrap()
+            .with_agent_versions(versions)
+            .with_local_binding(
+                worker.ssh.clone(),
+                worker.remote_binary.clone(),
+                worker.capabilities.clone(),
+                worker.slots,
+                age,
+                now,
+            );
+            store.publish_admission_observation(observation).unwrap();
+            let requirement = agent_min_requirement(SessionAgent::Codex, "0.160.0");
+            let entry = QueueEntry::new(
+                "00000000000000000000000000000001".parse().unwrap(),
+                store.client_id(),
+                "a".repeat(64),
+                "b".repeat(64),
+                CommandSummary::argv(1).unwrap(),
+                vec![requirement.clone()],
+                preference.clone(),
+                QueueEntryKind::Batch,
+                None,
+                ProcessIdentity::new(crate::fixture_pid::fixture_pid(101), 1_000_001).unwrap(),
+                now,
+            )
+            .unwrap();
+            store.enqueue(entry).unwrap();
+            let before = store.queue_snapshot().unwrap();
+            let rows = store.queue_rows_with_blocking_reasons(&config).unwrap();
+            assert_eq!(rows.len(), 1);
+            if eligible {
+                assert_eq!(rows[0].blocking_reason(), None);
+            } else {
+                assert_eq!(
+                    rows[0].blocking_reason(),
+                    Some(&QueueBlockingReason::CapabilityMissing {
+                        missing: vec![requirement],
+                    })
+                );
+            }
+            assert_eq!(
+                store.queue_snapshot().unwrap(),
+                before,
+                "advisory read must not mutate queue"
+            );
+        }
+    }
 }
 
 #[test]
