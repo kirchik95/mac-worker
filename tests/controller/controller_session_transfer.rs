@@ -324,6 +324,69 @@ fn assert_failed(output: Output) {
 }
 
 #[test]
+fn review_r5_controller_pre_record_failure_retires_task_pin() {
+    let mut f = Fixture::new(true);
+    // A laptop may freeze a pinned name that no longer exists on the controller.
+    f.body.worker = Some("removed-worker".into());
+    f.request = submit_request(&f.body);
+    let identity = f.prepare(Some(f.package.as_str()));
+    assert!(
+        f.push(&identity, &f.specs(Some(&f.package)))
+            .status
+            .success()
+    );
+    f.finish(&identity, Some(f.package.as_str()));
+    assert!(f.submit().is_err());
+    let state = ClientStateStore::open(&f.paths.state).unwrap();
+    assert!(state.load_task_optional(f.body.task_id).unwrap().is_none());
+    assert_eq!(
+        ref_oid(
+            f.cache().path(),
+            &format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}")
+        ),
+        Some(f.package.to_string()),
+        "frozen request remains replayable"
+    );
+    assert!(
+        ref_oid(
+            f.cache().path(),
+            &format!("{SESSION_REF_PREFIX}{}", f.body.task_id)
+        )
+        .is_none(),
+        "unpublished task pin leaked after submit rejection"
+    );
+}
+
+#[test]
+fn pre_record_rejection_preserves_a_preexisting_task_session_pin() {
+    for same_package in [false, true] {
+        let mut f = Fixture::new(true);
+        f.body.worker = Some("removed-worker".into());
+        f.request = submit_request(&f.body);
+        let identity = f.prepare(Some(f.package.as_str()));
+        assert!(
+            f.push(&identity, &f.specs(Some(&f.package)))
+                .status
+                .success()
+        );
+        f.finish(&identity, Some(f.package.as_str()));
+        let reference = format!("{SESSION_REF_PREFIX}{}", f.body.task_id);
+        let oid = if same_package { &f.package } else { &f.base };
+        assert!(
+            git(
+                f.cache().path(),
+                &["update-ref".into(), reference.clone(), oid.to_string()],
+                None
+            )
+            .status
+            .success()
+        );
+        assert!(f.submit().is_err());
+        assert_eq!(ref_oid(f.cache().path(), &reference), Some(oid.to_string()));
+    }
+}
+
+#[test]
 fn package_stream_verifies_both_refs_and_repins_for_real_submit() {
     let f = Fixture::new(true);
     let identity = f.prepare(Some(f.package.as_str()));

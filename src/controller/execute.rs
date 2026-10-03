@@ -351,13 +351,11 @@ impl TaskSubmitHandler<'_> {
                 "CONTROLLER_REQUEST_CONFLICT: source receipt does not match the frozen base".into(),
             ));
         }
+        // Bind ownership before creating a task pin. A conflicting request must
+        // never borrow (and then clean up) another submit's task-owned ref.
+        let _pins = ControllerSubmitPinGuard::new(self, record, &body)?;
         let checkout =
             materialize_frozen_checkout(self.runner, self.paths, record.request_id(), &body)?;
-        ProjectRegistry::open(&self.paths.controller_state_root())?.bind_task_request(
-            body.task_id,
-            record.request_id(),
-            record.payload_sha256(),
-        )?;
         let prepared = body.prepared()?;
         let client = TaskClient::new(
             self.runner,
@@ -370,6 +368,81 @@ impl TaskSubmitHandler<'_> {
         let mut stderr = io::sink();
         client.submit_prepared(&prepared, &checkout, true, true, &mut stdout, &mut stderr)?;
         Ok(())
+    }
+}
+
+/// The request pin remains replayable regardless of submit failure. Only a
+/// newly created task pin may be retired, and only with proven non-adoption.
+/// The per-task lock and immutable registry bind exclude competing controller
+/// requests through materialization and the complete submit transaction.
+struct ControllerSubmitPinGuard<'a> {
+    handler: &'a TaskSubmitHandler<'a>,
+    transfer: Option<TransferRepo>,
+    task_id: TaskId,
+    _lock: std::fs::File,
+}
+
+impl<'a> ControllerSubmitPinGuard<'a> {
+    fn new(
+        handler: &'a TaskSubmitHandler<'a>,
+        record: &crate::controller::DurableRequest,
+        body: &FrozenSubmitBody,
+    ) -> Result<Self, WorkerError> {
+        let root = crate::rooted_fs::RootedDir::create(
+            &handler
+                .paths
+                .controller_state_root()
+                .join("submit-pin-guards"),
+        )?;
+        let lock = root.open_private_lock(&format!("{}.lock", body.task_id))?;
+        crate::controller::leader::lock_exclusive(&lock)?;
+        ProjectRegistry::open(&handler.paths.controller_state_root())?.bind_task_request(
+            body.task_id,
+            record.request_id(),
+            record.payload_sha256(),
+        )?;
+        let transfer = if body.session_import.is_some() {
+            let transfer = TransferRepo::open_controller_cache(
+                &handler.paths.cache,
+                &body.project_id,
+                &body.worktree_id,
+            )?;
+            let unpublished = handler
+                .client_state
+                .load_task_optional(body.task_id)?
+                .is_none()
+                && handler
+                    .client_state
+                    .queue_entry_for_task_turn(body.task_id)?
+                    .is_none()
+                && transfer
+                    .read_ref_oid(
+                        handler.runner,
+                        &format!("{SESSION_REF_PREFIX}{}", body.task_id),
+                    )?
+                    .is_none();
+            unpublished.then_some(transfer)
+        } else {
+            None
+        };
+        Ok(Self {
+            handler,
+            transfer,
+            task_id: body.task_id,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for ControllerSubmitPinGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(transfer) = &self.transfer
+            // Read errors or a published record/row are uncertainty, not absence.
+            && matches!(self.handler.client_state.load_task_optional(self.task_id), Ok(None))
+            && matches!(self.handler.client_state.queue_entry_for_task_turn(self.task_id), Ok(None))
+        {
+            let _ = transfer.release_session(self.handler.runner, self.task_id);
+        }
     }
 }
 
