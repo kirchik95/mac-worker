@@ -52,6 +52,203 @@ fn wrapped_request(
     .unwrap()
 }
 
+fn valid_wrapper() -> mac_worker::test_support::controller::ControllerRequest {
+    let invalid = wrapped_request(&"b".repeat(40), &"d".repeat(40));
+    let submit: FrozenSubmitBody =
+        serde_json::from_value(invalid.body()["submit"].clone()).unwrap();
+    let wrapper = prepare_integrating_submit(submit, sample_policy("main")).unwrap();
+    parse_request(&serde_json::to_vec(&json!({ "protocol_version": 7,
+        "request_id": invalid.request_id(), "command": "task.submit-integrating", "body": wrapper })).unwrap()).unwrap()
+}
+
+fn fixture_config(paths: &PathLayout) -> mac_worker::test_support::core::config::Config {
+    std::fs::write(
+        &paths.config,
+        "version = 1\n[[workers]]\nname = 'fixture'\nssh = 'fixture.invalid'\nslots = 1\n",
+    )
+    .unwrap();
+    mac_worker::test_support::core::config::Config::load(&paths.config).unwrap()
+}
+
+#[test]
+fn capable_controller_publishes_the_policy_before_ordinary_preparation() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerCommandHandler, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let handler = TaskSubmitHandler::new(&SystemProcessRunner, &config, &paths, &tasks)
+        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let request = valid_wrapper();
+    let prepared = handler.prepare(&request).unwrap();
+    assert_eq!(prepared.task_id, Some(fixture_task().to_string()));
+    let bytes = std::fs::read(
+        paths
+            .state
+            .join(format!("integrations/tasks/{}/policy.json", fixture_task())),
+    )
+    .unwrap();
+    let policy: FrozenIntegrationPolicy = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(policy, sample_policy("main"));
+    assert!(tasks.list_tasks().unwrap().is_empty());
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    use mac_worker::test_support::controller::{ControllerFault, ControllerStore};
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let durable = store.load(request.request_id()).unwrap().unwrap();
+    assert_eq!(durable.body(), request.body());
+    assert_eq!(durable.payload_sha256(), request.payload_sha256());
+    assert_eq!(durable.command(), "task.submit-integrating");
+}
+
+#[test]
+fn old_controller_rejects_wrappers_and_companion_selectors_without_mutation_rows() {
+    use mac_worker::test_support::controller::{
+        ControllerFault, encode_json_frame, serve_rpc_with_runtime,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let submit = valid_wrapper();
+    let selector = parse_request(
+        &serde_json::to_vec(&json!({ "protocol_version": 7,
+        "request_id": "00000000000000000000000000000042", "command": "task.list",
+        "body": {"integration": {"task_ids": [fixture_task()]}} }))
+        .unwrap(),
+    )
+    .unwrap();
+    for request in [submit, selector] {
+        let mut out = Vec::new();
+        let payload = json!({"protocol_version": 7, "request_id": request.request_id(),
+            "command": request.command(), "body": request.body()});
+        let error = serve_rpc_with_runtime(
+            &paths,
+            &config,
+            &SystemProcessRunner,
+            &mut std::io::Cursor::new(encode_json_frame(&payload).unwrap()),
+            &mut out,
+            ControllerFault::None,
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE");
+        assert!(!paths.controller_state_root().exists());
+    }
+}
+
+#[test]
+fn verified_nested_source_keeps_request_pins_and_retires_the_unadopted_task_pin() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+        core::{config::Config, error::WorkerError},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    };
+    struct GitOnly;
+    impl ProcessRunner for GitOnly {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == std::ffi::OsStr::new("/usr/bin/git") {
+                SystemProcessRunner.run(request)
+            } else {
+                assert_eq!(request.program, std::ffi::OsStr::new("/usr/bin/ssh"));
+                Err(WorkerError::Unavailable(
+                    "isolated helper is unavailable".into(),
+                ))
+            }
+        }
+    }
+    let mut f = super::controller_session_transfer::Fixture::new(true);
+    f.body.wip = false;
+    let mut policy = sample_policy("main");
+    policy.base_oid = Some(f.base.clone());
+    f.body.origin_url = Some(policy.origin.clone());
+    let wrapper = prepare_integrating_submit(f.body.clone(), policy.clone()).unwrap();
+    f.request = parse_request(
+        &serde_json::to_vec(&json!({ "protocol_version": 7,
+        "request_id": f.request.request_id(), "command": "task.submit-integrating",
+        "body": wrapper }))
+        .unwrap(),
+    )
+    .unwrap();
+    let identity = f.prepare(Some(f.package.as_str()));
+    assert!(
+        f.push(&identity, &f.specs(Some(&f.package)))
+            .status
+            .success()
+    );
+    f.finish(&identity, Some(f.package.as_str()));
+    let tasks = ClientStateStore::open(&f.paths.state).unwrap();
+    let config = Config::parse(
+        "version = 1\n[[workers]]\nname = 'fixture'\nssh = 'fixture.invalid'\nslots = 1\n",
+    )
+    .unwrap();
+    let handler = TaskSubmitHandler::new(&GitOnly, &config, &f.paths, &tasks)
+        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let store = ControllerStore::open(&f.paths.controller_state_root()).unwrap();
+    let error = store
+        .handle_with(&f.request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE");
+    assert!(tasks.list_tasks().unwrap().is_empty());
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    let saved: FrozenIntegrationPolicy = serde_json::from_slice(
+        &std::fs::read(
+            f.paths
+                .state
+                .join(format!("integrations/tasks/{}/policy.json", f.body.task_id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, policy);
+    let cache = f.cache();
+    let read_ref = |name: &str| {
+        std::process::Command::new("/usr/bin/git")
+            .arg("--git-dir")
+            .arg(cache.path())
+            .args(["rev-parse", "--verify", name])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap()
+    };
+    for (reference, oid) in [
+        (
+            format!("refs/mac-worker/requests/{}", f.request.request_id()),
+            &f.base,
+        ),
+        (
+            format!(
+                "refs/mac-worker/request-sessions/{}",
+                f.request.request_id()
+            ),
+            &f.package,
+        ),
+    ] {
+        let output = read_ref(&reference);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            oid.as_str()
+        );
+    }
+    assert!(
+        !read_ref(&format!("refs/mac-worker/sessions/{}", f.body.task_id))
+            .status
+            .success()
+    );
+    let durable = store.load(f.request.request_id()).unwrap().unwrap();
+    assert_eq!(durable.body(), f.request.body());
+    assert_eq!(durable.payload_sha256(), f.request.payload_sha256());
+}
+
 #[test]
 fn nested_import_retry_requires_the_original_wrapper_source_finish() {
     let temp = tempfile::tempdir().unwrap();

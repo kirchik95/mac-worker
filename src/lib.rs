@@ -5244,6 +5244,11 @@ fn run_enabled_controller_task(
                 unreachable!("batch --preview is handled before enabled controller routing");
             }
             let project = runtime.current_dir()?;
+            let settings = crate::project_state::ProjectState::load(runner, &project, &[])?.settings.task;
+            let batch = crate::task_client::load_batch_file(&file)?;
+            if crate::integration::config::batch_is_integrating(&settings, &batch)? {
+                require_controller_integration_peer(runner, config)?;
+            }
             let frozen = crate::controller::freeze_laptop_batch(
                 runner,
                 config,
@@ -5253,12 +5258,7 @@ fn run_enabled_controller_task(
                 name,
                 max_parallel,
             )?;
-            let body = serde_json::to_value(frozen.body()).map_err(|_| {
-                WorkerError::Protocol(
-                    "CONTROLLER_TRANSPORT: frozen batch could not be encoded".into(),
-                )
-            })?;
-            let request = controller_read_request("task.batch", body)?;
+            let request = controller_read_request(frozen.command(), frozen.operation_body()?)?;
             crate::controller::persist_operation_envelope(
                 &paths.controller_cache_root(),
                 &request,
@@ -5475,6 +5475,17 @@ struct ControllerSubmitFields {
     wait_for_capacity: bool,
 }
 
+fn require_controller_integration_peer(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+) -> Result<(), WorkerError> {
+    let health =
+        crate::controller::health_read::fetch_controller_health(runner, &config.controller);
+    crate::controller::integration::require_controller_integration(
+        &health.features.unwrap_or_default(),
+    )
+}
+
 fn freeze_and_submit_via_controller(
     runner: &dyn ProcessRunner,
     paths: &PathLayout,
@@ -5513,12 +5524,24 @@ fn freeze_and_submit_via_controller(
         wait_for_capacity,
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
-    crate::integration::config::reject_unrouted_settings(
+    let integrating = crate::integration::config::resolve_integration_settings(
         &(&probed.settings.task).into(),
+        None,
         &integrate,
         verify_merge,
-        wip,
     )?;
+    if integrating.is_some() {
+        if wip {
+            return Err(crate::integration::contracts::IntegrationCode::IntegrationWipBase.error());
+        }
+        if probed.origin.is_none() {
+            return Err(WorkerError::task(
+                "INVALID_ORIGIN",
+                "integration requires own origin",
+            ));
+        }
+        require_controller_integration_peer(runner, config)?;
+    }
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
     let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
     if let Some(selector) = &from_session {
@@ -5557,6 +5580,15 @@ fn freeze_and_submit_via_controller(
     } else {
         transfer.resolve_base(runner, &probed.context, &base)?
     };
+    let integration = crate::integration::config::freeze_source_policy(
+        runner,
+        &probed,
+        &integrate,
+        verify_merge,
+        close_on,
+        integrating.map(|_| captured.oid().clone()),
+        None,
+    )?;
     let agent_name = match agent {
         crate::agent::AgentKind::Codex => "codex",
         crate::agent::AgentKind::Claude => "claude",
@@ -5646,11 +5678,24 @@ fn freeze_and_submit_via_controller(
         branch: probed.context.branch.clone(),
         wait_for_capacity,
     };
+    let (command, operation_body) = match integration {
+        Some(policy) => (
+            "task.submit-integrating",
+            serde_json::to_value(crate::controller::integration::prepare_integrating_submit(
+                body.clone(),
+                policy,
+            )?),
+        ),
+        None => ("task.submit", serde_json::to_value(&body)),
+    };
+    let operation_body = operation_body.map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
+    })?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
-        "command": "task.submit",
-        "body": body,
+        "command": command,
+        "body": operation_body,
     }))
     .map_err(|_| {
         WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())

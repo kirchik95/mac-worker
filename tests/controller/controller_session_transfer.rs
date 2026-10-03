@@ -35,20 +35,20 @@ const WORKTREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const REQUEST: &str = "00000000000000000000000000000011";
 const RUNNER: SystemProcessRunner = SystemProcessRunner;
 
-struct Fixture {
+pub(super) struct Fixture {
     _temp: TempDir,
     environment: BTreeMap<OsString, OsString>,
-    paths: PathLayout,
+    pub(super) paths: PathLayout,
     ssh: PathBuf,
     repo: GitRepo,
-    base: BaseOid,
-    package: BaseOid,
-    body: FrozenSubmitBody,
-    request: mac_worker::test_support::controller::ControllerRequest,
+    pub(super) base: BaseOid,
+    pub(super) package: BaseOid,
+    pub(super) body: FrozenSubmitBody,
+    pub(super) request: mac_worker::test_support::controller::ControllerRequest,
 }
 
 impl Fixture {
-    fn new(session: bool) -> Self {
+    pub(super) fn new(session: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let home = root.join("home");
@@ -192,7 +192,7 @@ impl Fixture {
         body
     }
 
-    fn prepare(&self, session: Option<&str>) -> Value {
+    pub(super) fn prepare(&self, session: Option<&str>) -> Value {
         self.rpc(
             "controller.transfer.source.prepare",
             self.source_body(session),
@@ -206,7 +206,7 @@ impl Fixture {
         self.rpc_output("controller.transfer.source.finish", body)
     }
 
-    fn finish(&self, identity: &Value, session: Option<&str>) -> Value {
+    pub(super) fn finish(&self, identity: &Value, session: Option<&str>) -> Value {
         let output = self.finish_output(identity, session);
         assert!(
             output.status.success(),
@@ -217,7 +217,7 @@ impl Fixture {
             .clone()
     }
 
-    fn push(&self, identity: &Value, refspecs: &[String]) -> Output {
+    pub(super) fn push(&self, identity: &Value, refspecs: &[String]) -> Output {
         git(self.repo.root(), &[
             "push".into(), "--atomic".into(), "--porcelain".into(), "--no-verify".into(),
             format!("--receive-pack=~/.local/bin/worker host controller-receive-pack {} {REQUEST} {} {PROJECT} {WORKTREE} {}", identity["token"].as_str().unwrap(), self.request.payload_sha256(), identity["expected_oid"].as_str().unwrap()),
@@ -225,7 +225,7 @@ impl Fixture {
         ].into_iter().chain(refspecs.iter().cloned()).collect::<Vec<_>>(), Some(&self.ssh))
     }
 
-    fn specs(&self, session: Option<&BaseOid>) -> Vec<String> {
+    pub(super) fn specs(&self, session: Option<&BaseOid>) -> Vec<String> {
         let mut specs = vec![format!("{}:refs/mac-worker/requests/{REQUEST}", self.base)];
         if let Some(oid) = session {
             specs.push(format!("{oid}:{REQUEST_SESSION_REF_PREFIX}{REQUEST}"));
@@ -233,7 +233,7 @@ impl Fixture {
         specs
     }
 
-    fn cache(&self) -> TransferRepo {
+    pub(super) fn cache(&self) -> TransferRepo {
         TransferRepo::open_or_create_controller_cache(&self.paths.cache, PROJECT, WORKTREE).unwrap()
     }
 

@@ -307,9 +307,26 @@ fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
     let f = integration_fixture(true);
     let source = f.capture_fixture(SessionAgent::Codex);
     let before = std::fs::read(&source).unwrap();
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let origin_refs = f
+        .project
+        .git(&[
+            "--git-dir",
+            origin.to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+        ])
+        .stdout;
     f.install_agent(SessionAgent::Codex);
     let agent = f.host.join("bin/codex");
-    let script = std::fs::read_to_string(&agent).unwrap();
+    let script = std::fs::read_to_string(&agent).unwrap().replace(
+        "done < \"$HOME/placed-files\"\n",
+        r#"done < "$HOME/placed-files"
+while IFS= read -r file; do
+  printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"T6 native tail"}}' >> "$file"
+done < "$HOME/placed-files"
+"#,
+    );
     let check = "find \"$HOME/.local/share/mac-worker/host/tasks\" -name policy.json > \"$HOME/armed-policies\"\n[ -s \"$HOME/armed-policies\" ] || exit 94\n";
     std::fs::write(
         &agent,
@@ -330,7 +347,7 @@ fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
         "--integrate",
         "main",
         "--close-on",
-        "never",
+        "done",
         "--worker",
         "fixture",
         "--no-wait",
@@ -355,18 +372,39 @@ fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
         .join("policy.json");
     let policy: FrozenIntegrationPolicy =
         serde_json::from_slice(&std::fs::read(owner_policy).unwrap()).unwrap();
-    assert_eq!(policy.requested_close, ClosePolicy::Never);
+    assert_eq!(policy.requested_close, ClosePolicy::Done);
     let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
     let prepare = journal.find("host task-prepare").unwrap();
     let arm = journal.find("host task-integration\n").unwrap();
     let launch = journal.find("host task-turn").unwrap();
     assert!(prepare < arm && arm < launch, "{journal}");
     let store = mac_worker::test_support::host::store::HostStore::open(&f.host_root()).unwrap();
+    let meta = mac_worker::test_support::task::store::TaskStore::new(
+        &store,
+        &mac_worker::test_support::host::process::SystemProcessRunner,
+    )
+    .load_meta(&policy.project_id, task)
+    .unwrap();
+    assert_eq!(meta.close_policy(), ClosePolicy::Never);
     let task_dir = store.task_dir(&policy.project_id, task).unwrap();
     let receipt: Value =
         serde_json::from_slice(&std::fs::read(task_dir.join("session-import.json")).unwrap())
             .unwrap();
     assert_eq!(receipt["stage"], "complete");
+    let placed = std::fs::read_to_string(f.host.join("placed-files")).unwrap();
+    let native = std::fs::read_to_string(placed.lines().next().unwrap()).unwrap();
+    assert!(native.contains("T6 native tail"));
+    assert_eq!(
+        f.project
+            .git(&[
+                "--git-dir",
+                origin.to_str().unwrap(),
+                "for-each-ref",
+                "--format=%(refname) %(objectname)"
+            ])
+            .stdout,
+        origin_refs
+    );
     assert_eq!(
         std::fs::read(source).unwrap(),
         before,
@@ -401,5 +439,65 @@ fn direct_missing_helper_feature_refuses_before_pins_and_admission() {
     .unwrap();
     assert!(tasks.list_tasks().unwrap().is_empty());
     assert!(!f.laptop.join(".cache/mac-worker/transfer").exists());
+    assert!(!f.host.join("argv").exists());
+}
+
+#[test]
+fn direct_integrating_batch_publishes_policies_and_requirements_before_drained_launch() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore, controller::drain::set_drained, core::paths::PathLayout,
+    };
+    let f = integration_fixture(true);
+    std::fs::write(
+        f.project.root().join(".worker.toml"),
+        "[task]\nintegrate = 'main'\n",
+    )
+    .unwrap();
+    let batch = f.project.root().join("tasks.toml");
+    std::fs::write(&batch, "[[tasks]]\nid = 'enabled'\nprompt = 'work'\n[[tasks]]\nid = 'ordinary'\nprompt = 'work'\nintegrate = false\n").unwrap();
+    let paths = PathLayout {
+        config: f.config.clone(),
+        state: f.laptop.join(".local/state/mac-worker"),
+        cache: f.laptop.join(".cache/mac-worker"),
+        data: f.laptop.join(".local/share/mac-worker"),
+    };
+    set_drained(&paths.controller_state_root(), true).unwrap();
+    let output = f.worker(&["--json", "task", "batch", batch.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let rows = tasks.list_tasks().unwrap();
+    assert_eq!(rows.len(), 2);
+    let mut configured = 0;
+    for row in &rows {
+        let policy = paths.state.join(format!(
+            "integrations/tasks/{}/policy.json",
+            row.meta().task_id()
+        ));
+        if policy.exists() {
+            let policy: FrozenIntegrationPolicy =
+                serde_json::from_slice(&std::fs::read(policy).unwrap()).unwrap();
+            assert_eq!(policy.requested_close, ClosePolicy::Done);
+            assert_eq!(row.meta().close_policy(), ClosePolicy::Never);
+            let entry = tasks
+                .queue_entry_for_task_turn(row.meta().task_id())
+                .unwrap()
+                .unwrap();
+            assert!(
+                entry
+                    .requirements()
+                    .contains(&"feature:task.integration".to_owned())
+            );
+            assert!(entry.requirements().contains(&"origin:file".to_owned()));
+            configured += 1;
+        } else {
+            assert_eq!(row.meta().close_policy(), ClosePolicy::Done);
+        }
+    }
+    assert_eq!(configured, 1);
     assert!(!f.host.join("argv").exists());
 }

@@ -1583,6 +1583,15 @@ impl<'a> TaskClient<'a> {
                 let requirements = spec.requires.clone();
                 let policy = spec.permission_policy()?;
                 let observations = self.observe_admission(&request.preference)?;
+                if crate::integration::store::RootedIntegrationState::read_task(
+                    self.paths,
+                    node.task_id,
+                )?
+                .0
+                .is_some()
+                {
+                    require_integration_helper(&observations)?;
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&context.project_id, &context.worktree_id)?;
@@ -1679,6 +1688,15 @@ impl<'a> TaskClient<'a> {
                 let requirements = prepared.requires.clone();
                 let policy = prepared.policy;
                 let observations = self.observe_admission(&request.preference)?;
+                if crate::integration::store::RootedIntegrationState::read_task(
+                    self.paths,
+                    prepared.task_id,
+                )?
+                .0
+                .is_some()
+                {
+                    require_integration_helper(&observations)?;
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&context.project_id, &context.worktree_id)?;
@@ -1799,12 +1817,7 @@ impl<'a> TaskClient<'a> {
                 if integrating.is_some() {
                     let requirement =
                         format!("feature:{}", crate::features::HOST_FEATURE_INTEGRATION);
-                    if !observations
-                        .iter()
-                        .any(|o| o.capabilities().contains(&requirement))
-                    {
-                        return Err(crate::integration::contracts::integration_unavailable());
-                    }
+                    require_integration_helper(&observations)?;
                     requirements.push(requirement);
                     let host = if crate::project::canonical_file_origin(&origin_url)?.is_some() {
                         "file".to_owned()
@@ -1871,13 +1884,14 @@ impl<'a> TaskClient<'a> {
                     request.close_policy = crate::task::ClosePolicy::Never;
                 }
                 let prepared_base = if let Some(policy) = &frozen_policy {
-                    PreparedSubmitBase::Ready(crate::transfer_repo::BaseCommit::from_pinned(
-                        policy
+                    PreparedSubmitBase::Resolve {
+                        wip: false,
+                        request_base: policy
                             .base_oid
-                            .clone()
-                            .ok_or_else(crate::integration::contracts::integration_unavailable)?,
-                        false,
-                    ))
+                            .as_ref()
+                            .ok_or_else(crate::integration::contracts::integration_unavailable)?
+                            .to_string(),
+                    }
                 } else if let TaskSource::Origin { url } = &source {
                     let oid = TransferRepo::resolve_base_oid(
                         self.runner,
@@ -5163,6 +5177,20 @@ impl<'a> TaskClient<'a> {
     }
 }
 
+fn require_integration_helper(
+    observations: &[crate::scheduler::CandidateObservation],
+) -> Result<(), WorkerError> {
+    let requirement = format!("feature:{}", crate::features::HOST_FEATURE_INTEGRATION);
+    if observations
+        .iter()
+        .any(|o| o.capabilities().contains(&requirement))
+    {
+        Ok(())
+    } else {
+        Err(crate::integration::contracts::integration_unavailable())
+    }
+}
+
 /// Resolves a batch file the same way submit does, without opening client
 /// state or talking to workers.
 pub fn preview_batch_plan(
@@ -5366,6 +5394,17 @@ impl<'a> TaskClient<'a> {
         if batch.tasks.is_empty() {
             return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
         }
+        let project = self.current_project(None)?;
+        let project_state = ProjectState::load(self.runner, &project, &[])?;
+        if crate::integration::config::batch_is_integrating(&project_state.settings.task, &batch)? {
+            return self.submit_integrating_batch(
+                file,
+                &batch,
+                &project_state,
+                run_name,
+                max_parallel,
+            );
+        }
         self.reconcile_runners()?;
         if batch_has_dag_edges(&batch.defaults, &batch.tasks) {
             return self.submit_dependent_batch(file, &batch, run_name, max_parallel);
@@ -5387,7 +5426,6 @@ impl<'a> TaskClient<'a> {
             .settings
             .task;
         for (request, _) in &requests {
-            crate::integration::config::reject_unrouted_integration(&settings, request)?;
             validate_prompt(&request.prompt)?;
             validate_preference(self.config, &request.preference)?;
             let _ = effective_task_limits(&request.limits, &settings)?;
@@ -5412,6 +5450,128 @@ impl<'a> TaskClient<'a> {
             )?;
         }
         Ok(RunReport { run_id, task_ids })
+    }
+
+    fn submit_integrating_batch(
+        &self,
+        file: &Path,
+        batch: &BatchFile,
+        project: &ProjectState,
+        name: Option<String>,
+        max_parallel: Option<u32>,
+    ) -> Result<RunReport, WorkerError> {
+        let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
+        // Refuse unsupported helpers before frozen DAG/source pins or run rows.
+        for task in &batch.tasks {
+            let request = resolve_batch_task(
+                self.config,
+                &batch.defaults,
+                task,
+                batch_dir,
+                &project.context.root,
+                &project.settings.task,
+            )?;
+            validate_preference(self.config, &request.preference)?;
+            if crate::integration::config::resolve_integration_settings(
+                &(&project.settings.task).into(),
+                None,
+                &request.integrate,
+                request.verify_merge,
+            )?
+            .is_some()
+            {
+                if request.wip {
+                    return Err(IntegrationCode::IntegrationWipBase.error());
+                }
+                require_integration_helper(&self.observe_admission(&request.preference)?)?;
+            }
+        }
+        let frozen = crate::controller::batch_freeze::freeze_laptop_batch(
+            self.runner,
+            self.config,
+            self.paths,
+            &project.context.root,
+            file,
+            name,
+            max_parallel,
+        )?;
+        let transfer =
+            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        let body = frozen.body();
+        let result = (|| {
+            let wrapper = frozen
+                .integrating()
+                .ok_or_else(crate::integration::contracts::integration_unavailable)?;
+            let state = crate::integration::store::RootedIntegrationState::open(
+                self.paths,
+                std::sync::Arc::new(crate::integration::host::HostIntegrationRuntime::new()?),
+            )?;
+            crate::controller::integration::publish_integrating_batch(&state, wrapper)?;
+            let parallel = resolve_batch_max_parallel(
+                body.max_parallel,
+                self.config.configured_runner_slots(),
+            )?;
+            let task_ids = body.nodes.values().map(|n| n.task_id).collect::<Vec<_>>();
+            if body.kind == crate::controller::batch::BatchKind::Dag {
+                let dag = DagRecord::new(
+                    body.run_id,
+                    body.nodes.clone(),
+                    parallel,
+                    body.name.clone(),
+                    body.created_at_millis,
+                )?;
+                let run = RunRecord::new(
+                    body.run_id,
+                    body.name.clone(),
+                    Vec::new(),
+                    parallel,
+                    body.created_at_millis,
+                )?;
+                self.client_state.create_run_with_dag(run, dag)?;
+                self.advance_pending_dags()?;
+                let run = self.client_state.load_run(body.run_id)?;
+                Ok(RunReport::from_parts(body.run_id, run.task_ids().to_vec()))
+            } else {
+                let run = RunRecord::new(
+                    body.run_id,
+                    body.name.clone(),
+                    task_ids.clone(),
+                    parallel,
+                    body.created_at_millis,
+                )?;
+                self.client_state.create_run(run)?;
+                for node in body.nodes.values() {
+                    self.submit_with_ids(
+                        request_from_frozen_node(node, Some(body.run_id))?,
+                        Some(node.task_id),
+                        Some(node.turn_id),
+                        node.frozen.title.clone(),
+                        &mut io::sink(),
+                        &mut io::sink(),
+                        true,
+                        Some(FrozenSubmit::Dag(node)),
+                        Some(body.created_at_millis),
+                    )?;
+                }
+                Ok(RunReport::from_parts(body.run_id, task_ids))
+            }
+        })();
+        // Source-stream pins belong only to the laptop transport; local run
+        // recovery uses the frozen DAG pins. Uncertain publication retains them.
+        for source in frozen.sources() {
+            transfer.unpin_object(self.runner, source.pin_ref())?;
+        }
+        if result.is_err()
+            && matches!(self.client_state.load_run(body.run_id), Err(WorkerError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound)
+            && matches!(self.client_state.load_run_dag(body.run_id), Ok(None))
+        {
+            for node in body.nodes.values() {
+                if let DagBase::Frozen { pin_ref, .. } = &node.base {
+                    transfer.unpin_object(self.runner, pin_ref)?;
+                }
+            }
+        }
+        result
     }
 
     fn batch_request(

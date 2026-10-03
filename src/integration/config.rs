@@ -161,34 +161,17 @@ pub fn batch_integration_preview(
     })
 }
 
-/// Temporary fail-closed boundary until T6 routes enabled inputs to wrappers.
-/// Ordinary submission must never parse opt-in and then silently ignore it.
-pub(crate) fn reject_unrouted_integration(
+pub(crate) fn batch_is_integrating(
     settings: &crate::project_config::TaskSettings,
-    request: &crate::task_client::TaskSubmitRequest,
-) -> Result<(), WorkerError> {
-    reject_unrouted_settings(
-        &settings.into(),
-        &request.integrate,
-        request.verify_merge,
-        request.wip,
-    )
+    batch: &crate::task_client::BatchFile,
+) -> Result<bool, WorkerError> {
+    let mut enabled = false;
+    for task in &batch.tasks {
+        enabled |= batch_integration_preview(settings, &batch.defaults, task)?.is_some();
+    }
+    Ok(enabled)
 }
 
-pub(crate) fn reject_unrouted_settings(
-    settings: &IntegrationPolicySettings,
-    integrate: &IntegrationOverride,
-    verify: Option<VerifyPolicy>,
-    wip: bool,
-) -> Result<(), WorkerError> {
-    if resolve_integration_settings(settings, None, integrate, verify)?.is_some() {
-        if wip {
-            return Err(IntegrationCode::IntegrationWipBase.error());
-        }
-        return Err(IntegrationCode::IntegrationUnavailable.error());
-    }
-    Ok(())
-}
 pub fn preflight_integration_base(
     runner: &dyn ProcessRunner,
     origin: &str,
@@ -342,7 +325,7 @@ pub(crate) fn freeze_source_policy(
 mod tests {
     use super::*;
     #[test]
-    fn batch_inputs_survive_resolution_and_refuse_unrouted_enabled_submits() {
+    fn batch_inputs_survive_resolution_including_disabled_override() {
         let root = tempfile::tempdir().unwrap();
         let settings = crate::project_config::ProjectSettings::load(root.path(), &[])
             .unwrap()
@@ -360,15 +343,28 @@ mod tests {
             if index == 0 {
                 assert!(matches!(request.integrate, IntegrationOverride::Target(_)));
                 assert_eq!(request.verify_merge, Some(VerifyPolicy::MovedTarget));
-                assert_eq!(
-                    reject_unrouted_integration(&settings, &request)
-                        .unwrap_err()
-                        .public_code(),
-                    "INTEGRATION_UNAVAILABLE"
-                );
+                let (target, verify) = resolve_integration_settings(
+                    &(&settings).into(),
+                    None,
+                    &request.integrate,
+                    request.verify_merge,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(target.as_str(), "main");
+                assert_eq!(verify, VerifyPolicy::MovedTarget);
             } else {
                 assert_eq!(request.integrate, IntegrationOverride::Disabled);
-                assert!(reject_unrouted_integration(&settings, &request).is_ok());
+                assert!(
+                    resolve_integration_settings(
+                        &(&settings).into(),
+                        None,
+                        &request.integrate,
+                        request.verify_merge
+                    )
+                    .unwrap()
+                    .is_none()
+                );
             }
         }
     }

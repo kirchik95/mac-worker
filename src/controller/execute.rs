@@ -83,6 +83,7 @@ pub struct TaskSubmitHandler<'a> {
     config: &'a Config,
     paths: &'a PathLayout,
     client_state: &'a ClientStateStore,
+    features: Vec<String>,
 }
 
 impl<'a> TaskSubmitHandler<'a> {
@@ -97,13 +98,42 @@ impl<'a> TaskSubmitHandler<'a> {
             config,
             paths,
             client_state,
+            features: crate::features::CONTROLLER_FEATURES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_integration_features(mut self, features: Vec<String>) -> Self {
+        self.features = features;
+        self
     }
 }
 
 impl ControllerCommandHandler for TaskSubmitHandler<'_> {
     fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
         match request.command() {
+            "task.submit-integrating" => {
+                let wrapper =
+                    super::integration::parse_integrating_submit(request, &self.features)?;
+                if wrapper.submit.run_id.is_some() {
+                    return Err(WorkerError::task(
+                        "TASK_CONFIG_INVALID",
+                        "ordinary controller submit must not carry a run_id",
+                    ));
+                }
+                super::integration::publish_integrating_submit(
+                    &self.integration_state()?,
+                    &wrapper,
+                )?;
+                Ok(OperationMeta {
+                    task_id: Some(wrapper.submit.task_id.to_string()),
+                    turn_id: Some(wrapper.submit.turn_id.to_string()),
+                    created_at_millis: wrapper.submit.created_at_millis,
+                    prepared: Value::Null,
+                })
+            }
             "checkpoint.submit" | "task.submit" => {
                 crate::controller::default_prepare_operation(request)
             }
@@ -114,15 +144,37 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
                 self.prepare_frozen_mutation(request)
             }
             "task.cancel" => self.prepare_frozen_mutation(request),
-            "task.batch" => {
+            "task.batch" | "task.batch-integrating" => {
+                let wrapper = if request.command() == "task.batch-integrating" {
+                    let wrapper =
+                        super::integration::parse_integrating_batch(request, &self.features)?;
+                    super::integration::publish_integrating_batch(
+                        &self.integration_state()?,
+                        &wrapper,
+                    )?;
+                    Some(wrapper)
+                } else {
+                    None
+                };
                 let transfer = ControllerTransfer::open(&self.paths.controller_state_root())?;
-                let prepared = prepare_task_batch(
-                    request,
-                    &transfer,
-                    &self.paths.cache,
-                    self.runner,
-                    self.config,
-                )?;
+                let prepared = if let Some(wrapper) = wrapper {
+                    super::batch::prepare_task_batch_body(
+                        request,
+                        wrapper.batch,
+                        &transfer,
+                        &self.paths.cache,
+                        self.runner,
+                        self.config,
+                    )?
+                } else {
+                    prepare_task_batch(
+                        request,
+                        &transfer,
+                        &self.paths.cache,
+                        self.runner,
+                        self.config,
+                    )?
+                };
                 let encoded = serde_json::to_value(&prepared).map_err(|_| {
                     WorkerError::Protocol(
                         "CONTROLLER_TRANSPORT: prepared batch could not be encoded".into(),
@@ -147,6 +199,14 @@ impl ControllerCommandHandler for TaskSubmitHandler<'_> {
 }
 
 impl TaskSubmitHandler<'_> {
+    fn integration_state(
+        &self,
+    ) -> Result<crate::integration::store::RootedIntegrationState, WorkerError> {
+        crate::integration::store::RootedIntegrationState::open(
+            self.paths,
+            std::sync::Arc::new(crate::integration::host::HostIntegrationRuntime::new()?),
+        )
+    }
     // Pure encode of prepare_task_mutation; no recapture.
     fn prepare_frozen_mutation(
         &self,
@@ -175,7 +235,7 @@ impl TaskSubmitHandler<'_> {
                 "task_id": record.task_id(),
                 "turn_id": record.turn_id(),
             })),
-            "task.submit" => {
+            "task.submit" | "task.submit-integrating" => {
                 self.submit_task(record)?;
                 Ok(json!({
                     "task_id": record.task_id(),
@@ -183,7 +243,7 @@ impl TaskSubmitHandler<'_> {
                 }))
             }
             "task.say" | "task.cancel" | "task.close" => self.execute_prepared_mutation(record),
-            "task.batch" => self.execute_prepared_batch(record),
+            "task.batch" | "task.batch-integrating" => self.execute_prepared_batch(record),
             other => Err(WorkerError::Protocol(format!(
                 "CONTROLLER_TRANSPORT: unsupported controller command {other}"
             ))),
@@ -247,6 +307,19 @@ impl TaskSubmitHandler<'_> {
             .map_err(|_| {
                 WorkerError::Protocol("CONTROLLER_TRANSPORT: prepared batch is invalid".into())
             })?;
+        if record.command() == "task.batch-integrating" {
+            super::integration::require_controller_integration(&self.features)?;
+            let wrapper: crate::integration::contracts::FrozenIntegratingBatch =
+                serde_json::from_value(record.body().clone()).map_err(|_| {
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
+                })?;
+            super::integration::publish_integrating_batch(&self.integration_state()?, &wrapper)?;
+            if &wrapper.batch.nodes != prepared.nodes() {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error(),
+                );
+            }
+        }
         let registry = ProjectRegistry::open(&self.paths.controller_state_root())?;
         bind_prepared_batch_nodes(
             &registry,
@@ -302,12 +375,21 @@ impl TaskSubmitHandler<'_> {
     }
 
     fn submit_task(&self, record: &crate::controller::DurableRequest) -> Result<(), WorkerError> {
-        let body: FrozenSubmitBody =
+        let body: FrozenSubmitBody = if record.command() == "task.submit-integrating" {
+            super::integration::require_controller_integration(&self.features)?;
+            let wrapper: crate::integration::contracts::FrozenIntegratingSubmit =
+                serde_json::from_value(record.body().clone()).map_err(|_| {
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
+                })?;
+            super::integration::publish_integrating_submit(&self.integration_state()?, &wrapper)?;
+            wrapper.submit
+        } else {
             serde_json::from_value(record.body().clone()).map_err(|_| {
                 WorkerError::Protocol(
                     "CONTROLLER_TRANSPORT: task.submit body is not a frozen submit".into(),
                 )
-            })?;
+            })?
+        };
         let expected_task = body.task_id.to_string();
         let expected_turn = body.turn_id.to_string();
         if record.task_id() != Some(expected_task.as_str())
@@ -762,6 +844,21 @@ pub fn serve_rpc_with_execution(
 ) -> Result<(), WorkerError> {
     let payload = crate::controller::protocol::read_frame(stdin)?;
     let request = crate::controller::protocol::parse_request(&payload)?;
+    if matches!(
+        request.command(),
+        "task.submit-integrating" | "task.batch-integrating"
+    ) || super::integration::is_integration_selector(&request)
+    {
+        let features = crate::features::CONTROLLER_FEATURES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        super::integration::require_controller_integration(&features)?;
+        // Full durable companion reads are attached at checkpoint (c).
+        if super::integration::is_integration_selector(&request) {
+            return Err(crate::integration::contracts::integration_unavailable());
+        }
+    }
     let mut _events = None;
     let frame = if crate::controller::channel::identity::is_socket_selector(&request) {
         use crate::controller::channel::{
