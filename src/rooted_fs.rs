@@ -753,7 +753,7 @@ pub struct EntryInspection {
     pub inode: u64,
     pub modified_seconds: i64,
     pub modified_nanoseconds: i64,
-    file: Option<File>,
+    pub(crate) file: Option<File>,
 }
 
 impl EntryInspection {

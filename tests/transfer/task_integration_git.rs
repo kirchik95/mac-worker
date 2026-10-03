@@ -501,6 +501,185 @@ fn built_in_minus_merge_conflicts_in_bare_and_workspace() {
 }
 
 #[test]
+fn native_workspace_preserves_untracked_symlinks_and_nul_delimited_conflict_names() {
+    use std::os::unix::fs::symlink;
+    let mut f = GitIntegrationFixture::new();
+    let name = "odd 'name ; [x].txt";
+    f.write(name, b"base\n");
+    f.commit_base();
+    f.write(name, b"ours\n");
+    let head = f.commit_task();
+    symlink("base.txt", f.workspace().join("keep-link")).unwrap();
+    f.advance_target_with(name, b"theirs\n");
+    let response = f.execute(IntegrationStep::Prepare).unwrap();
+    assert!(
+        matches!(response,HostIntegrationResponse::NeedTurn { candidate,.. } if candidate.conflict_paths == vec![name])
+    );
+    f.write(name, b"resolved\n");
+    f.write("new/during.txt", b"auxiliary\n");
+    let revoke = HostIntegrationRequest {
+        protocol_version: 7,
+        task_id: f.record.task_id,
+        integration_id: Some(f.record.snapshot.integration_id),
+        epoch: f.record.snapshot.epoch,
+        revision: f.record.snapshot.revision,
+        action: HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: f.record.snapshot.epoch,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1005,
+                acknowledged: false,
+            },
+        },
+    };
+    HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime)
+        .execute(&revoke)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(f.workspace().join("keep-link")).unwrap(),
+        std::path::Path::new("base.txt")
+    );
+    assert!(!f.workspace().join("new/during.txt").exists());
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+    assert_eq!(std::fs::read(f.workspace().join(name)).unwrap(), b"ours\n");
+}
+
+#[test]
+fn native_resolution_stages_modes_links_binary_renames_and_deletions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.write("binary.bin", b"\0base\n");
+    f.write("run.sh", b"exit 0\n");
+    f.write("old.txt", b"rename\n");
+    f.write("delete.txt", b"delete\n");
+    symlink("base.txt", f.workspace().join("link")).unwrap();
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    let head = f.commit_task();
+    let target = f.advance_target_with("payload.txt", b"theirs\n");
+    f.execute(IntegrationStep::Prepare).unwrap();
+    f.write("payload.txt", b"resolved\n");
+    f.write("binary.bin", b"\0resolved\n");
+    std::fs::set_permissions(
+        f.workspace().join("run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::remove_file(f.workspace().join("link")).unwrap();
+    symlink("payload.txt", f.workspace().join("link")).unwrap();
+    symlink("binary.bin", f.workspace().join("extra-link")).unwrap();
+    std::fs::rename(
+        f.workspace().join("old.txt"),
+        f.workspace().join("renamed.txt"),
+    )
+    .unwrap();
+    std::fs::remove_file(f.workspace().join("delete.txt")).unwrap();
+    f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+    let HostIntegrationResponse::CandidateReady { candidate, .. } =
+        f.execute(IntegrationStep::AcceptTurn).unwrap()
+    else {
+        panic!("candidate missing")
+    };
+    let merge = candidate.merge_oid.unwrap();
+    assert_eq!(f.parents(&merge), vec![target, head]);
+    let tree = f.git(&["ls-tree", merge.as_str()]);
+    assert!(tree.contains("100755 blob") && tree.contains("120000 blob"));
+    assert!(
+        tree.contains("renamed.txt") && !tree.contains("old.txt") && !tree.contains("delete.txt")
+    );
+    assert_eq!(f.git(&["show", &format!("{merge}:link")]), "payload.txt");
+    assert_eq!(
+        f.git(&["show", &format!("{merge}:binary.bin")]),
+        "\0resolved"
+    );
+}
+
+#[test]
+fn multiple_merge_bases_use_native_recursive_merging() {
+    let mut f = GitIntegrationFixture::new();
+    let base = f.commit_base();
+    f.write("left.txt", b"left\n");
+    let left = f.commit("left");
+    f.git(&["checkout", "--detach", base.as_str()]);
+    f.write("right.txt", b"right\n");
+    let right = f.commit("right");
+    f.git(&["merge", "--no-ff", left.as_str(), "-m", "right merge"]);
+    let target = f.git(&["rev-parse", "HEAD"]);
+    f.git(&["checkout", "--detach", left.as_str()]);
+    f.git(&["merge", "--no-ff", right.as_str(), "-m", "left merge"]);
+    let branch = format!("task/{}", f.record.task_id);
+    f.git(&["branch", "-f", &branch, "HEAD"]);
+    f.git(&["checkout", &branch]);
+    let head = f.commit_task();
+    f.git(&[
+        "push",
+        &f.record.policy.origin,
+        &format!("{target}:refs/heads/main"),
+    ]);
+    let bases = f.git(&["merge-base", "--all", head.as_str(), &target]);
+    assert_eq!(bases.lines().count(), 2);
+    let merge = f.prepare();
+    assert_eq!(f.parents(&merge), vec![target.parse().unwrap(), head]);
+    f.push();
+    f.execute(IntegrationStep::Repair).unwrap();
+    assert_eq!(f.git(&["show", &format!("{merge}:left.txt")]), "left");
+    assert_eq!(f.git(&["show", &format!("{merge}:right.txt")]), "right");
+}
+
+#[test]
+fn native_control_names_fail_closed_at_the_frozen_contract_bound() {
+    let mut f = GitIntegrationFixture::new();
+    let name = "odd\nname.txt";
+    f.write(name, b"base\n");
+    f.commit_base();
+    f.write(name, b"ours\n");
+    f.commit_task();
+    f.advance_target_with(name, b"theirs\n");
+    assert_eq!(
+        f.execute(IntegrationStep::Prepare)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationConflictListTooLarge.as_str()
+    );
+    assert_eq!(std::fs::read(f.workspace().join(name)).unwrap(), b"ours\n");
+}
+
+#[test]
+fn markers_are_rejected_only_in_conflicted_or_newly_changed_text() {
+    for introduced in [false, true] {
+        let mut f = GitIntegrationFixture::new();
+        f.write("payload.txt", b"base\n");
+        f.write(
+            "unchanged.md",
+            b"<<<<<<< literal documentation\n=======\n>>>>>>> literal\n",
+        );
+        f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        f.commit_task();
+        f.advance_target_with("payload.txt", b"theirs\n");
+        f.execute(IntegrationStep::Prepare).unwrap();
+        f.write("payload.txt", b"resolved\n");
+        if introduced {
+            f.write("new.md", b"<<<<<<< unresolved\n");
+        }
+        f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+        let result = f.execute(IntegrationStep::AcceptTurn);
+        if introduced {
+            assert_eq!(
+                result.unwrap_err().public_code(),
+                IntegrationCode::IntegrationResolutionIncomplete.as_str()
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                HostIntegrationResponse::CandidateReady { .. }
+            ));
+        }
+    }
+}
+
+#[test]
 fn union_uses_h_as_ours_in_mirror_and_pinned_verify_workspace() {
     let mut f = GitIntegrationFixture::new();
     f.write(".gitattributes", b"payload.txt merge=union\n");
@@ -594,6 +773,29 @@ fn verifier_worktree_edits_have_a_distinct_failure_code() {
     f.complete_auxiliary(IntegrationTurnPurpose::Verify);
     let error = f.execute(IntegrationStep::AcceptTurn).unwrap_err();
     assert_eq!(error.public_code(), "INTEGRATION_VERIFY_CHANGED_TREE");
+}
+
+#[test]
+fn verifier_rejects_raw_edits_even_when_git_normalizes_the_same_tree() {
+    let mut f = GitIntegrationFixture::new();
+    f.write(".gitattributes", b"*.txt text\n");
+    f.commit_base();
+    f.commit_task();
+    f.advance_target();
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    f.execute(IntegrationStep::Prepare).unwrap();
+    f.write("base.txt", b"base\r\n");
+    assert!(
+        f.git(&["diff", "--no-ext-diff", "--no-textconv"])
+            .is_empty()
+    );
+    f.complete_auxiliary(IntegrationTurnPurpose::Verify);
+    assert_eq!(
+        f.execute(IntegrationStep::AcceptTurn)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationVerifyChangedTree.as_str()
+    );
 }
 
 fn step_request(step: IntegrationStep, record: IntegrationRecord) -> HostIntegrationRequest {

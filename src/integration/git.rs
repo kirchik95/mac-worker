@@ -23,6 +23,8 @@ const HARDENING: &[(&str, &str)] = &[
     ("push.recurseSubmodules", "no"),
     ("core.attributesFile", "/dev/null"),
     ("core.logAllRefUpdates", "false"),
+    ("core.fsync", "objects,derived-metadata,reference"),
+    ("core.fsyncMethod", "fsync"),
 ];
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -125,9 +127,17 @@ impl<'a> IntegrationGit<'a> {
         &self,
         policy: &FrozenIntegrationPolicy,
     ) -> Result<RootedDir, WorkerError> {
-        self.store
-            .mirror_if_present(&policy.project_id)?
-            .ok_or_else(invalid)
+        policy.validate()?;
+        // The ordinary mirror accessor repairs config with its own Git runner.
+        // Integration opens the existing rooted mirror without those commands;
+        // all Git here goes through the hardened, bounded factory below.
+        Ok(self
+            .store
+            .open_directory("repos", false)?
+            .open_child_directory(
+                &super::host_store::relative(&format!("{}.git", policy.project_id))?,
+                false,
+            )?)
     }
     fn request(
         &self,
@@ -225,15 +235,8 @@ impl<'a> IntegrationGit<'a> {
         }
         // Git-created files need not be owner-only; opening still forbids links and traversal.
         if info.entry_exists("attributes")? {
-            let bytes = info
-                .read_snapshot_regular(
-                    "attributes",
-                    GIT_OUTPUT_BYTES as u64,
-                    crate::rooted_fs::SnapshotProjection::Workspace,
-                )
-                .map_err(|_| invalid())?
-                .bytes;
-            if !bytes.is_empty() {
+            let (_, _, size) = native_regular_digest(&info, "attributes", GIT_OUTPUT_BYTES as u64)?;
+            if size != 0 {
                 return Err(invalid());
             }
         }
@@ -475,9 +478,30 @@ impl<'a> IntegrationGit<'a> {
         if !index.status.success() || !diff.status.success() {
             return Err(invalid());
         }
+        let tracked = self.run(
+            workspace,
+            Some(&candidate.attribute_source),
+            &["ls-files", "--cached", "-z"],
+        )?;
+        if !tracked.status.success() {
+            return Err(invalid());
+        }
+        let mut files: BTreeSet<String> = self
+            .untracked(workspace, &candidate.attribute_source)?
+            .into_iter()
+            .collect();
+        for path in tracked
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = std::str::from_utf8(path).map_err(|_| invalid())?;
+            validate_relative_path(path)?;
+            files.insert(path.to_owned());
+        }
         let mut worktree = Sha256::new();
         worktree.update(diff.stdout);
-        for path in self.untracked(workspace, &candidate.attribute_source)? {
+        for path in files {
             validate_relative_path(&path)?;
             worktree.update((path.len() as u64).to_be_bytes());
             worktree.update(path.as_bytes());
@@ -485,20 +509,42 @@ impl<'a> IntegrationGit<'a> {
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty());
             let dir = match parent {
-                Some(parent) => RootedDir::open(&workspace.path().join(parent))?,
+                Some(parent) => match RootedDir::open(&workspace.path().join(parent)) {
+                    Ok(dir) => dir,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        worktree.update([0]);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                },
                 None => workspace.reopen()?,
             };
             let name = std::path::Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(invalid)?;
-            let bytes = dir.read_snapshot_regular(
-                name,
-                GIT_OUTPUT_BYTES as u64,
-                crate::rooted_fs::SnapshotProjection::Workspace,
-            )?;
-            worktree.update(bytes.mode.to_be_bytes());
-            worktree.update(bytes.bytes);
+            if !dir.entry_exists(name)? {
+                worktree.update([0]);
+                continue;
+            }
+            let relative = super::host_store::relative(name)?;
+            let entry = dir.inspect(&relative)?;
+            match entry.kind {
+                crate::rooted_fs::EntryKind::RegularFile => {
+                    let (mode, digest, _) = native_regular_digest(&dir, name, 64 * 1024 * 1024)?;
+                    worktree.update([1]);
+                    worktree.update(mode.to_be_bytes());
+                    worktree.update(digest);
+                }
+                crate::rooted_fs::EntryKind::Symlink => {
+                    let target = dir.read_symlink(&relative)?;
+                    if dir.inspect(&relative)?.metadata() != entry.metadata() {
+                        return Err(invalid());
+                    }
+                    worktree.update([2]);
+                    worktree.update(Sha256::digest(target.as_bytes()));
+                }
+            }
         }
         workspace.verify_bound()?;
         Ok(WorkspaceState {
@@ -1093,6 +1139,64 @@ pub(crate) fn paths(bytes: &[u8]) -> Result<Vec<String>, WorkerError> {
     validate_conflict_paths(&paths)?;
     Ok(paths)
 }
+// Read native Git files through rooted_fs's already-open, no-follow descriptor.
+// Snapshot projections intentionally require different modes and cannot be used
+// for a checkout's 0644/0755 files. Keep ownership/link/stability checks here.
+fn native_regular_digest(
+    dir: &RootedDir,
+    name: &str,
+    limit: u64,
+) -> Result<(u32, [u8; 32], u64), WorkerError> {
+    use sha2::{Digest, Sha256};
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let relative = super::host_store::relative(name)?;
+    let mut entry = dir.inspect(&relative)?;
+    let before = entry.metadata();
+    let metadata = entry.file.as_ref().ok_or_else(invalid)?.metadata()?;
+    let root = dir.root_metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+        || metadata.dev() != root.st_dev as u64
+        || root.st_uid != unsafe { libc::geteuid() }
+        || root.st_mode & 0o022 != 0
+        || metadata.len() > limit
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe native Git file",
+        )
+        .into());
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 16384];
+    loop {
+        let count = entry.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > limit {
+            return Err(invalid());
+        }
+        digest.update(&buffer[..count]);
+    }
+    let after = entry.file.as_ref().ok_or_else(invalid)?.metadata()?;
+    if entry.restat()? != before
+        || dir.inspect(&relative)?.metadata() != before
+        || after.uid() != metadata.uid()
+        || after.nlink() != 1
+        || after.ctime() != metadata.ctime()
+        || after.ctime_nsec() != metadata.ctime_nsec()
+        || total != before.size
+    {
+        return Err(invalid());
+    }
+    dir.verify_bound()?;
+    Ok((before.mode, digest.finalize().into(), total))
+}
+
 fn marker(line: &[u8]) -> bool {
     line.starts_with(b"<<<<<<<")
         || line.starts_with(b">>>>>>>")
