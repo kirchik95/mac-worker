@@ -110,16 +110,16 @@ If a worker job or its logs vanish after acceptance, the task outcome is `failed
 
 ### Continue a laptop session in the pool
 
-Use `--from-session claude[:<uuid>]` or `--from-session codex[:<uuid>]` on `task submit` to continue an existing conversation. A next-step prompt (`-p "<what to do next>"`) is still required; it becomes the next user message, not a replacement for the conversation.
+Use `--from-session claude[:<uuid>]` or `--from-session codex[:<uuid>]` on `task submit` to continue an existing conversation. A next-step prompt (`--prompt "<what to do next>"`) is still required; it becomes the next user message, not a replacement for the conversation.
 
 ```bash
 # Latest session for this project
-worker task submit --from-session claude -p "Add regression tests for the change we discussed."
-worker task submit --from-session codex --wip -p "Finish the current implementation and run its tests."
+worker task submit --from-session claude --prompt "Add regression tests for the change we discussed."
+worker task submit --from-session codex --wip --prompt "Finish the current implementation and run its tests."
 
 # A specific session (replace <uuid> with its full session id)
-worker task submit --from-session claude:<uuid> -p "<what to do next>"
-worker task submit --from-session codex:<uuid> -p "<what to do next>"
+worker task submit --from-session claude:<uuid> --prompt "<what to do next>"
+worker task submit --from-session codex:<uuid> --prompt "<what to do next>"
 ```
 
 Run submit from the project, and start the laptop session in this project's root. In v1 the pool resumes at the worker workspace root, not a subdirectory. Without an id, **latest** means the most recently modified matching session for this project, not the latest conversation anywhere on the laptop: Claude scans the project's encoded directory under `~/.claude/projects`; Codex checks the newest 200 rollouts under `~/.codex/sessions` against their recorded working directory. Submit shows the selected session and a first-prompt preview so you can check the choice. Use an explicit UUID if you want another one.

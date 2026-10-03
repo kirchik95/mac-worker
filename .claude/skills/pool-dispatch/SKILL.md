@@ -60,7 +60,7 @@ Keep the returned run identifier and all task identifiers.
 
 ### Choose The Context
 
-- **Native session:** use `worker task submit --from-session claude[:<uuid>]` or `codex[:<uuid>]` to continue an interactive conversation with lots of useful context. Start it in this project's root; omit the id for the latest matching session. Still supply `-p "<what to do next>"`; add `--wip` for a dirty checkout. The laptop original stays usable; the pool continues a copy under pool policy. Confirm the user is comfortable copying it: secret scrubbing is incomplete. Only snapshot-sourced `task submit` supports this, not batches or DAG children.
+- **Native session:** use `worker task submit --from-session claude[:<uuid>]` or `codex[:<uuid>]` to continue an interactive conversation with lots of useful context. Start it in this project's root; omit the id for the latest matching session. Still supply `--prompt "<what to do next>"`; add `--wip` for a dirty checkout. The laptop original stays usable; the pool continues a copy under pool policy. Confirm the user is comfortable copying it: secret scrubbing is incomplete. Only snapshot-sourced `task submit` supports this, not batches or DAG children.
 - **Handoff note:** for Cursor, OpenCode, unsupported worker versions, or a different target agent, ask: “Write `.worker/handoff.md` with the goal, what is done, current state including uncommitted changes, decisions and constraints, open questions, and exact next steps. Do not include secrets.” Review it, then submit a fresh conversation:
 
   ```text
