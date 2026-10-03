@@ -256,11 +256,27 @@ impl<'a> IntegrationGit<'a> {
                 }
                 config.push((format!("{driver}.required"), "false".into()));
             } else {
+                // Built-in union keeps its directional merge semantics even
+                // when the repository has configured a command under that name.
+                // A configured binary replacement is unsupported and fails closed.
+                if driver == "merge.binary" {
+                    return Err(invalid());
+                }
+                let command = if driver == "merge.union" {
+                    "/usr/bin/git merge-file --union %A %O %B"
+                } else {
+                    "/usr/bin/git merge-file %A %O %B"
+                };
+                config.push((format!("{driver}.driver"), command.into()));
                 config.push((
-                    format!("{driver}.driver"),
-                    "/usr/bin/git merge-file %A %O %B".into(),
+                    format!("{driver}.recursive"),
+                    if driver == "merge.union" {
+                        "union"
+                    } else {
+                        "text"
+                    }
+                    .into(),
                 ));
-                config.push((format!("{driver}.recursive"), "text".into()));
             }
         }
         let mut args = Vec::new();
@@ -295,7 +311,8 @@ impl<'a> IntegrationGit<'a> {
         }
         // Git-created files need not be owner-only; opening still forbids links and traversal.
         if info.entry_exists("attributes")? {
-            let (_, _, size) = native_regular_digest(&info, "attributes", GIT_OUTPUT_BYTES as u64)?;
+            let (_, _, size, _) =
+                native_regular_digest(&info, "attributes", GIT_OUTPUT_BYTES as u64)?;
             if size != 0 {
                 return Err(invalid());
             }
@@ -518,6 +535,57 @@ impl<'a> IntegrationGit<'a> {
         }
         paths(&result.stdout)
     }
+    pub(crate) fn require_clean_source(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &IntegrationCandidate,
+    ) -> Result<(), WorkerError> {
+        let workspace = self.workspace(record)?;
+        self.assert_workspace(&workspace, candidate, false)?;
+        if !self
+            .query(
+                &workspace,
+                Some(&candidate.attribute_source),
+                &["status", "--porcelain=v1", "--untracked-files=no"],
+            )?
+            .is_empty()
+        {
+            return Err(invalid());
+        }
+        let untracked = self.untracked(&workspace, &candidate.attribute_source)?;
+        if let Some(tree) = &candidate.tree_oid
+            && !untracked.is_empty()
+        {
+            let files = self.run(
+                &self.mirror(&record.policy)?,
+                None,
+                &["ls-tree", "-r", "--name-only", "-z", tree.as_str()],
+            )?;
+            if !files.status.success() {
+                return Err(invalid());
+            }
+            for raw in files
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                let path = std::str::from_utf8(raw).map_err(|_| invalid())?;
+                validate_relative_path(path)?;
+                if untracked.iter().any(|file| {
+                    file == path
+                        || file
+                            .strip_prefix(path)
+                            .is_some_and(|tail| tail.starts_with('/'))
+                        || path
+                            .strip_prefix(file)
+                            .is_some_and(|tail| tail.starts_with('/'))
+                }) {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn workspace_state(
         &self,
         workspace: &RootedDir,
@@ -590,7 +658,7 @@ impl<'a> IntegrationGit<'a> {
             let entry = dir.inspect(&relative)?;
             match entry.kind {
                 crate::rooted_fs::EntryKind::RegularFile => {
-                    let (mode, digest, _) = native_regular_digest(&dir, name, 64 * 1024 * 1024)?;
+                    let (mode, digest, _, _) = native_regular_digest(&dir, name, 64 * 1024 * 1024)?;
                     worktree.update([1]);
                     worktree.update(mode.to_be_bytes());
                     worktree.update(digest);
@@ -895,6 +963,10 @@ impl<'a> IntegrationGit<'a> {
                 "--cached",
                 "--no-ext-diff",
                 "--no-textconv",
+                "--no-color",
+                "--output-indicator-new=+",
+                "--output-indicator-old=-",
+                "--output-indicator-context= ",
                 "--unified=0",
                 candidate.source_head.as_str(),
                 "--",
@@ -903,14 +975,30 @@ impl<'a> IntegrationGit<'a> {
         if !diff.status.success() {
             return Err(invalid());
         }
-        if diff
-            .stdout
-            .split(|b| *b == b'\n')
-            .any(|line| line.starts_with(b"+") && marker(&line[1..]))
-        {
+        if added_text_markers(&diff.stdout) {
             return Err(IntegrationCode::IntegrationResolutionIncomplete.error());
         }
         for path in &candidate.conflict_paths {
+            let index = self.query(
+                &workspace,
+                Some(&candidate.attribute_source),
+                &[
+                    "--literal-pathspecs",
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                    "--",
+                    path,
+                ],
+            )?;
+            // Native index modes distinguish symlink/gitlink data and deletions.
+            if index.is_empty() || index.starts_with("120000 ") || index.starts_with("160000 ") {
+                continue;
+            }
+            let (_, _, _, binary) = native_regular_digest(&workspace, path, 64 * 1024 * 1024)?;
+            if binary {
+                continue;
+            }
             let content = self.run(
                 &workspace,
                 Some(&candidate.attribute_source),
@@ -957,6 +1045,7 @@ impl<'a> IntegrationGit<'a> {
         candidate: &IntegrationCandidate,
     ) -> Result<PushOutcome, WorkerError> {
         candidate.validate()?;
+        self.assert_workspace(&self.workspace(record)?, candidate, false)?;
         let mirror = self.mirror(&record.policy)?;
         let merge = candidate.merge_oid.as_ref().ok_or_else(invalid)?;
         let parents = self.query(
@@ -980,6 +1069,9 @@ impl<'a> IntegrationGit<'a> {
         }
         if !self.is_ancestor(&mirror, &record.cycle_base, &candidate.target_head)? {
             return Err(IntegrationCode::IntegrationBaseNotOnTarget.error());
+        }
+        if record.snapshot.verification == IntegrationVerification::SourceAgentReportOnly {
+            self.require_clean_source(record, candidate)?;
         }
         self.reach(IntegrationHook::BeforePush);
         let status = self
@@ -1132,6 +1224,32 @@ impl<'a> IntegrationGit<'a> {
             Some(&candidate.attribute_source),
             &["rev-parse", "--verify", "MERGE_HEAD"],
         )?;
+        if !merge_head.status.success()
+            && candidate.conflict_paths.is_empty()
+            && !record
+                .auxiliaries
+                .iter()
+                .any(|aux| aux.attempt == candidate.id.attempt)
+        {
+            let verify_workspace = if record.policy.verify == VerifyPolicy::MovedTarget
+                && candidate.target_head != record.cycle_base
+            {
+                if let Some(tree) = &candidate.tree_oid {
+                    self.query(
+                        &self.mirror(&record.policy)?,
+                        None,
+                        &["rev-parse", &format!("{}^{{tree}}", candidate.source_head)],
+                    )? != tree.as_str()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !verify_workspace {
+                return Ok(());
+            }
+        }
         if merge_head.status.success() {
             if std::str::from_utf8(&merge_head.stdout)
                 .map_err(|_| invalid())?
@@ -1309,7 +1427,7 @@ fn native_regular_digest(
     dir: &RootedDir,
     name: &str,
     limit: u64,
-) -> Result<(u32, [u8; 32], u64), WorkerError> {
+) -> Result<(u32, [u8; 32], u64, bool), WorkerError> {
     use sha2::{Digest, Sha256};
     use std::{io::Read, os::unix::fs::MetadataExt};
     let relative = super::host_store::relative(name)?;
@@ -1333,6 +1451,7 @@ fn native_regular_digest(
     }
     let mut digest = Sha256::new();
     let mut total = 0u64;
+    let mut binary = false;
     let mut buffer = [0u8; 16384];
     loop {
         let count = entry.read(&mut buffer)?;
@@ -1344,6 +1463,7 @@ fn native_regular_digest(
             return Err(invalid());
         }
         digest.update(&buffer[..count]);
+        binary |= buffer[..count].contains(&0);
     }
     let after = entry.file.as_ref().ok_or_else(invalid)?.metadata()?;
     if entry.restat()? != before
@@ -1357,7 +1477,26 @@ fn native_regular_digest(
         return Err(invalid());
     }
     dir.verify_bound()?;
-    Ok((before.mode, digest.finalize().into(), total))
+    Ok((before.mode, digest.finalize().into(), total, binary))
+}
+
+fn added_text_markers(diff: &[u8]) -> bool {
+    let mut symlink = false;
+    let mut added_marker = false;
+    for line in diff.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"diff --git ") {
+            if added_marker && !symlink {
+                return true;
+            }
+            symlink = false;
+            added_marker = false;
+        }
+        symlink |= line == b"new file mode 120000"
+            || line == b"new mode 120000"
+            || (line.starts_with(b"index ") && line.ends_with(b" 120000"));
+        added_marker |= line.starts_with(b"+") && marker(&line[1..]);
+    }
+    added_marker && !symlink
 }
 
 fn marker(line: &[u8]) -> bool {
@@ -1365,6 +1504,119 @@ fn marker(line: &[u8]) -> bool {
         || line.starts_with(b">>>>>>>")
         || line.starts_with(b"|||||||")
         || line == b"======="
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::unix::process::ExitStatusExt, sync::Mutex};
+    #[derive(Default)]
+    struct FakeCredentials {
+        calls: Mutex<Vec<ProcessRequest>>,
+    }
+    impl ProcessRunner for FakeCredentials {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.calls.lock().unwrap().push(request.clone());
+            let stdout = if request.args.iter().any(|arg| arg == "--global") {
+                match request.args.last().unwrap().to_str().unwrap() {
+                    "credential.helper" => b"fixture-helper\n\n".to_vec(),
+                    "credential.https://github.com.helper" => b"fixture-url-helper\n".to_vec(),
+                    "credential.useHttpPath" => b"true\n".to_vec(),
+                    _ => panic!("unexpected credential query"),
+                }
+            } else {
+                vec![]
+            };
+            Ok(ProcessResult {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: vec![],
+            })
+        }
+    }
+    #[test]
+    fn ssh_and_https_requests_preserve_only_explicit_credentials_in_the_hardened_factory() {
+        let mut fixture = testing::GitIntegrationFixture::new();
+        fixture.commit_base();
+        fixture.commit_task();
+        for origin in [
+            "git@github.com:fixture/repo.git",
+            "https://github.com/fixture/repo.git",
+        ] {
+            let runner = FakeCredentials::default();
+            let git = IntegrationGit::new(&fixture.store, &runner, &fixture.runtime);
+            let credentials = git.credentials(origin);
+            let request = git
+                .request(
+                    &git.mirror(&fixture.record.policy).unwrap(),
+                    None,
+                    &["ls-remote".into(), origin.into(), "refs/heads/main".into()],
+                    &credentials,
+                )
+                .unwrap();
+            let env = |name: &str| {
+                request
+                    .environment
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .unwrap()
+                    .1
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            assert_eq!(env("GIT_CONFIG_GLOBAL"), "/dev/null");
+            assert_eq!(env("GIT_CONFIG_NOSYSTEM"), "1");
+            assert_eq!(env("GIT_ATTR_NOSYSTEM"), "1");
+            assert!(
+                request
+                    .environment_remove
+                    .iter()
+                    .any(|key| key == "GIT_ATTR_SOURCE")
+            );
+            let ssh = env("GIT_SSH_COMMAND");
+            for flag in [
+                "BatchMode=yes",
+                "ForwardAgent=no",
+                "ClearAllForwardings=yes",
+                "ConnectTimeout=5",
+            ] {
+                assert!(ssh.contains(flag));
+            }
+            for (key, value) in HARDENING {
+                assert!(
+                    request
+                        .args
+                        .iter()
+                        .any(|arg| arg == format!("{key}={value}").as_str())
+                );
+            }
+            assert_eq!(request.policy.deadline, GIT_DEADLINE);
+            assert_eq!(request.policy.stdout_limit, GIT_OUTPUT_BYTES);
+            let calls = runner.calls.lock().unwrap();
+            let helper_reads: Vec<_> = calls
+                .iter()
+                .filter(|request| request.args.iter().any(|arg| arg == "--global"))
+                .collect();
+            if origin.starts_with("https:") {
+                assert_eq!(helper_reads.len(), 3);
+                assert!(
+                    helper_reads
+                        .iter()
+                        .all(|request| request.policy.deadline == HELPER_LOOKUP_DEADLINE)
+                );
+                for value in [
+                    "credential.helper=fixture-helper",
+                    "credential.helper=",
+                    "credential.https://github.com.helper=fixture-url-helper",
+                    "credential.useHttpPath=true",
+                ] {
+                    assert!(request.args.iter().any(|arg| arg == value));
+                }
+            } else {
+                assert!(credentials.is_empty());
+                assert!(helper_reads.is_empty());
+            }
+        }
+    }
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {

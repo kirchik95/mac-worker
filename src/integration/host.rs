@@ -33,6 +33,7 @@ impl<'a> HostIntegrationService<'a> {
         request: &HostIntegrationRequest,
     ) -> Result<HostIntegrationResponse, WorkerError> {
         request.validate()?;
+        let git = IntegrationGit::new(self.store, self.runner, self.runtime);
         let capacity = self.store.capacity_lock()?;
         let session = self.store.session_lock()?;
         let sidecars = HostIntegrationStore::new(self.store);
@@ -120,7 +121,6 @@ impl<'a> HostIntegrationService<'a> {
                 {
                     return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
                 }
-                let git = IntegrationGit::new(self.store, self.runner, self.runtime);
                 if record.receipt.is_none() && record.push_intent.is_some() {
                     let candidate = record.candidates.last().ok_or_else(invalid)?;
                     record.receipt = git
@@ -185,6 +185,11 @@ impl<'a> HostIntegrationService<'a> {
                     if old.snapshot.integration_id != next.snapshot.integration_id
                         || old.snapshot.epoch != next.snapshot.epoch
                     {
+                        if old.snapshot.integration_id == next.snapshot.integration_id
+                            && !same_frozen_source(&old, &next)
+                        {
+                            return Err(invalid());
+                        }
                         let stopped = old.tombstone.as_ref().is_some_and(|t| t.acknowledged)
                             && old.push_intent.as_ref().is_none_or(|p| !p.uncertain);
                         let imported = old.receipt.as_ref().is_some_and(|r| r.imported);
@@ -210,13 +215,7 @@ impl<'a> HostIntegrationService<'a> {
                         }
                         next.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
                     } else {
-                        if old.snapshot.source_head != next.snapshot.source_head
-                            || old.snapshot.source_turn_id != next.snapshot.source_turn_id
-                            || old.source_revision != next.source_revision
-                            || old.cycle_base != next.cycle_base
-                            || old.source_checks != next.source_checks
-                            || old.source_summary != next.source_summary
-                            || old.git_identity != next.git_identity
+                        if !same_frozen_source(&old, &next)
                             || (old.tombstone.is_some() && *step != IntegrationStep::Repair)
                         {
                             return Err(invalid());
@@ -280,7 +279,6 @@ impl<'a> HostIntegrationService<'a> {
                 }
                 sidecars.save(&next)?;
                 self.runtime.reach(IntegrationHook::AfterIntent);
-                let git = IntegrationGit::new(self.store, self.runner, self.runtime);
                 match step {
                     IntegrationStep::Fetch | IntegrationStep::Prepare => {
                         let target = git.fetch_target(&next)?;
@@ -351,12 +349,14 @@ impl<'a> HostIntegrationService<'a> {
                                     },
                                     conflict_paths: vec![],
                                 };
+                                git.require_clean_source(&next, &candidate)?;
                                 next.candidates.push(candidate);
                                 next.snapshot.attempts = next.candidates.len() as u8;
                                 sidecars.save(&next)?;
                                 self.runtime.reach(IntegrationHook::AfterWorkspaceManifest);
                             }
                             let mut candidate = next.candidates.last().ok_or_else(invalid)?.clone();
+                            git.assert_workspace(&git.workspace(&next)?, &candidate, false)?;
                             if candidate.merge_oid.is_none() {
                                 git.merge(&next, &mut candidate)?;
                             }
@@ -397,6 +397,11 @@ impl<'a> HostIntegrationService<'a> {
                                     purpose,
                                 }
                             } else {
+                                if next.snapshot.verification
+                                    == IntegrationVerification::SourceAgentReportOnly
+                                {
+                                    git.require_clean_source(&next, &candidate)?;
+                                }
                                 sidecars.save(&next)?;
                                 HostIntegrationResponse::CandidateReady {
                                     identity,
@@ -578,6 +583,15 @@ impl<'a> HostIntegrationService<'a> {
         response.validate_for(request)?;
         Ok(response)
     }
+}
+fn same_frozen_source(old: &IntegrationRecord, next: &IntegrationRecord) -> bool {
+    old.snapshot.source_head == next.snapshot.source_head
+        && old.snapshot.source_turn_id == next.snapshot.source_turn_id
+        && old.source_revision == next.source_revision
+        && old.cycle_base == next.cycle_base
+        && old.source_checks == next.source_checks
+        && old.source_summary == next.source_summary
+        && old.git_identity == next.git_identity
 }
 fn integration_message(title: &str, record: &IntegrationRecord) -> String {
     let boundary = crate::redaction::RedactionBoundary::from_env();

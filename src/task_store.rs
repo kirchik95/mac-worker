@@ -1553,6 +1553,7 @@ impl<'a> TaskStore<'a> {
     /// recreating it from the original base. The caller must already hold
     /// the exact task-turn lease; this method is the host-side durable
     /// transition from Open back to Active.
+    #[allow(dead_code)] // T6 wires the purpose-bound resume facade.
     pub fn prepare_integration_resume(
         &self,
         prepared: &crate::integration::contracts::PreparedIntegrationTurn,

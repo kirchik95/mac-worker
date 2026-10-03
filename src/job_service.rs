@@ -758,6 +758,7 @@ impl<'a> JobService<'a> {
         ))
     }
 
+    #[allow(dead_code)] // T6 wires the integration entry point.
     pub fn submit_integration_turn(
         &self,
         prepared: &crate::integration::contracts::PreparedIntegrationTurn,

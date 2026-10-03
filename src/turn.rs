@@ -859,6 +859,7 @@ impl TaskTurnResponse {
         Self { submit, task }
     }
 
+    #[allow(dead_code)] // T6 consumes this in the integration reply adapter.
     pub fn submit(&self) -> &SubmitResponse {
         &self.submit
     }

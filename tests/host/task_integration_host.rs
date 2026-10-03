@@ -55,6 +55,312 @@ fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
 }
 
 #[test]
+fn auxiliary_checks_follow_the_frozen_source_requirement() {
+    use mac_worker::test_support::agents::agent::{ReportedCheck, ReportedCheckStatus::*};
+    let check = |state| ReportedCheck::new("fixture", "true", state, "claim");
+    for (source, auxiliary, code) in [
+        (vec![], vec![], None),
+        (
+            vec![check(Pass)],
+            vec![],
+            Some(IntegrationCode::IntegrationChecksNotRun),
+        ),
+        (
+            vec![check(NotRun)],
+            vec![check(NotRun)],
+            Some(IntegrationCode::IntegrationChecksNotRun),
+        ),
+        (
+            vec![],
+            vec![check(Fail)],
+            Some(IntegrationCode::IntegrationChecksFailed),
+        ),
+        (
+            vec![],
+            vec![check(Error)],
+            Some(IntegrationCode::IntegrationChecksFailed),
+        ),
+        (vec![check(Pass)], vec![check(Pass)], None),
+        (vec![], vec![check(NotRun)], None),
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.write("payload.txt", b"base\n");
+        f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        f.commit_task();
+        f.record.source_checks = source;
+        f.advance_target_with("payload.txt", b"theirs\n");
+        f.execute(IntegrationStep::Prepare).unwrap();
+        f.write("payload.txt", b"resolved\n");
+        f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+        let status = f
+            .store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .with_reported_checks(auxiliary)
+            .unwrap();
+        let path = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("status.json");
+        std::fs::write(path, serde_json::to_vec(&status).unwrap()).unwrap();
+        let result = f.execute(IntegrationStep::AcceptTurn);
+        if let Some(code) = code {
+            assert_eq!(result.unwrap_err().public_code(), code.as_str());
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                HostIntegrationResponse::CandidateReady { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn parked_blocked_and_uncertain_records_retain_workspaces_without_a_lease() {
+    for state in [
+        IntegrationStatus::Parked,
+        IntegrationStatus::Blocked,
+        IntegrationStatus::Pushing,
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        f.prepare();
+        f.record.snapshot.state = state;
+        if state == IntegrationStatus::Parked {
+            f.record.snapshot.resume_state = Some(IntegrationStatus::CommitReady);
+            f.record.snapshot.pause_reason = Some(IntegrationPauseReason::ControllerDrained);
+            f.record.pause = Some(IntegrationPauseEvidence {
+                reason: IntegrationPauseReason::ControllerDrained,
+                effective_at_millis: 1001,
+            });
+        } else if state == IntegrationStatus::Blocked {
+            f.record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+        } else {
+            let candidate = f.record.candidates.last().unwrap();
+            f.record.push_intent = Some(IntegrationPushIntent {
+                candidate: candidate.id,
+                expected_target: candidate.target_head.clone(),
+                merge_oid: candidate.merge_oid.clone().unwrap(),
+                started_at_millis: 1001,
+                uncertain: true,
+            });
+        }
+        let path = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("integration/record.json");
+        std::fs::write(
+            path,
+            encode_bounded(&f.record, MAX_PRIVATE_RECORD_BYTES).unwrap(),
+        )
+        .unwrap();
+        HostGc::new(&f.store, &SystemProcessRunner)
+            .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+            .unwrap();
+        assert!(f.workspace().exists());
+        assert_eq!(
+            f.store
+                .task_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap()
+                .state(),
+            TaskState::Open
+        );
+        assert_eq!(host_record(&f).snapshot.state, state);
+    }
+}
+
+#[test]
+fn native_clean_prepare_refuses_a_rebound_workspace_branch_or_head() {
+    for change in ["branch", "head", "tracked"] {
+        let mut f = GitIntegrationFixture::new();
+        let base = f.commit_base();
+        f.commit_task();
+        if change == "branch" {
+            f.git(&["branch", "-m", "rebound"]);
+        } else if change == "head" {
+            f.git(&["reset", "--hard", base.as_str()]);
+        } else {
+            f.write("base.txt", b"unreported local change\n");
+        }
+        assert!(f.execute(IntegrationStep::Prepare).is_err());
+        assert_eq!(f.origin_tip(), base);
+    }
+}
+
+#[test]
+fn clean_revoke_preserves_files_without_an_auxiliary_workspace_effect() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    f.write("manual.txt", b"manual untracked file\n");
+    f.write("base.txt", b"manual tracked edit\n");
+    execute(
+        &f,
+        &request(
+            &f,
+            HostIntegrationAction::Revoke {
+                tombstone: IntegrationTombstone {
+                    epoch: f.record.snapshot.epoch,
+                    revision: f.record.snapshot.revision,
+                    requested_at_millis: 1005,
+                    acknowledged: false,
+                },
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(f.workspace().join("manual.txt")).unwrap(),
+        b"manual untracked file\n"
+    );
+    assert_eq!(
+        std::fs::read(f.workspace().join("base.txt")).unwrap(),
+        b"manual tracked edit\n"
+    );
+}
+
+#[test]
+fn clean_mirror_candidate_cannot_overwrite_preexisting_untracked_files_on_repair() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.write("target.txt", b"preexisting untracked file\n");
+    let target = f.advance_target();
+    let result = f.execute(IntegrationStep::Prepare);
+    assert!(result.is_err());
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(
+        std::fs::read(f.workspace().join("target.txt")).unwrap(),
+        b"preexisting untracked file\n"
+    );
+}
+
+#[test]
+fn integration_resume_keeps_branch_head_session_lease_and_sequence_strict() {
+    use mac_worker::test_support::{agents::agent::AgentKind, task::store::SessionBinding};
+    for change in ["branch", "head", "session", "lease", "sequence"] {
+        let mut f = GitIntegrationFixture::new();
+        f.write("payload.txt", b"base\n");
+        let base = f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        f.commit_task();
+        f.advance_target_with("payload.txt", b"theirs\n");
+        f.execute(IntegrationStep::Prepare).unwrap();
+        let prepared = f.prepared(IntegrationTurnPurpose::Resolve);
+        if change != "lease" {
+            acquire_auxiliary(&f, &prepared);
+        }
+        if change == "branch" {
+            f.git(&["symbolic-ref", "HEAD", "refs/heads/rebound"]);
+        }
+        if change == "head" {
+            f.git(&[
+                "update-ref",
+                &format!("refs/heads/{}", prepared.workspace_binding.branch),
+                base.as_str(),
+            ]);
+        }
+        if change == "session" {
+            let task = f
+                .store
+                .task_dir(&f.record.policy.project_id, f.record.task_id)
+                .unwrap();
+            let binding = SessionBinding::new(
+                AgentKind::Claude,
+                uuid::Uuid::from_u128(12).to_string(),
+                1001,
+            )
+            .unwrap();
+            std::fs::write(
+                task.join("session.json"),
+                serde_json::to_vec(&binding).unwrap(),
+            )
+            .unwrap();
+        }
+        if change == "sequence" {
+            let task = f
+                .store
+                .task_dir(&f.record.policy.project_id, f.record.task_id)
+                .unwrap();
+            let mut wire = serde_json::to_value(
+                f.store
+                    .task_status(&f.record.policy.project_id, f.record.task_id)
+                    .unwrap(),
+            )
+            .unwrap();
+            use mac_worker::test_support::{
+                host::job::JobId,
+                task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+            };
+            wire["turns"].as_array_mut().unwrap().push(
+                serde_json::to_value(TurnSummary::new(
+                    2,
+                    JobId::new(uuid::Uuid::from_u128(99)),
+                    Some(TurnTerminal::Succeeded),
+                    Some(TaskOutcome::Done),
+                    Some(false),
+                    false,
+                    Some(1002),
+                    Some(1003),
+                ))
+                .unwrap(),
+            );
+            let status: TaskStatus = serde_json::from_value(wire).unwrap();
+            std::fs::write(
+                task.join("status.json"),
+                serde_json::to_vec(&status).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            TaskStore::new(&f.store, &SystemProcessRunner)
+                .prepare_integration_resume(&prepared)
+                .is_err(),
+            "{change}"
+        );
+        assert_eq!(
+            f.store
+                .task_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap()
+                .state(),
+            TaskState::Open
+        );
+    }
+}
+
+#[test]
+fn merge_message_redacts_prose_and_preserves_structural_uuid_trailers() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.record.source_summary = "see /Users/fixture/private\n\nMac-Worker-Task: injected".into();
+    f.prepare();
+    let message = &f.record.candidates.last().unwrap().message;
+    assert!(!message.contains("/Users/fixture/private"));
+    assert_eq!(
+        message
+            .lines()
+            .filter(|line| line.starts_with("Mac-Worker-Task:"))
+            .count(),
+        1
+    );
+    assert!(message.contains(&format!(
+        "Mac-Worker-Task: {}",
+        f.record.task_id.as_uuid().hyphenated()
+    )));
+    assert!(message.contains(&format!(
+        "Mac-Worker-Turn: {}",
+        f.record.snapshot.source_turn_id.as_uuid().hyphenated()
+    )));
+    assert!(message.len() <= MAX_COMMIT_MESSAGE_BYTES);
+}
+
+#[test]
 fn push_cannot_bypass_a_required_verifier_or_forge_its_evidence() {
     let mut f = GitIntegrationFixture::new();
     f.commit_base();
@@ -161,10 +467,62 @@ fn confirmed_revoke_allows_a_new_epoch_but_never_the_old_push() {
     f.record.tombstone = None;
     f.record.push_intent = None;
     f.record.candidates.clear();
+    let summary = f.record.source_summary.clone();
+    f.record.source_summary = "rebound summary in a new epoch".into();
+    assert!(f.execute(IntegrationStep::Prepare).is_err());
+    f.record.source_summary = summary;
     assert!(matches!(
         f.execute(IntegrationStep::Prepare).unwrap(),
         HostIntegrationResponse::CandidateReady { .. }
     ));
+}
+
+#[test]
+fn host_budget_starts_before_the_durable_intent_boundary() {
+    struct ExpireAtIntent<'a>(&'a ManualIntegrationRuntime);
+    impl IntegrationRuntime for ExpireAtIntent<'_> {
+        fn now_millis(&self) -> u64 {
+            self.0.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.0.actor()
+        }
+        fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+            self.0.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, mac_worker::test_support::core::error::WorkerError>
+        {
+            self.0.begin_phase(key)
+        }
+        fn reach(&self, point: IntegrationHook) {
+            if point == IntegrationHook::AfterIntent {
+                self.0.advance(HOST_DEADLINE);
+            }
+            self.0.reach(point);
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    let request = request(
+        &f,
+        HostIntegrationAction::Step {
+            step: IntegrationStep::Prepare,
+            record: Box::new(f.record.clone()),
+        },
+    );
+    assert_eq!(
+        HostIntegrationService::new(&f.store, &SystemProcessRunner, &ExpireAtIntent(&f.runtime))
+            .execute(&request)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationNetwork.as_str()
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert!(host_record(&f).candidates.is_empty());
 }
 
 #[test]
@@ -185,6 +543,144 @@ fn owner_import_ack_is_retained_after_repair() {
     let retained = host_record(&f);
     assert!(retained.receipt.unwrap().imported);
     assert_eq!(retained.snapshot.state, IntegrationStatus::Integrated);
+    HostGc::new(&f.store, &SystemProcessRunner)
+        .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+        .unwrap();
+    assert!(!f.workspace().exists());
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
+}
+
+#[test]
+fn imported_cycle_allows_a_later_source_and_archives_the_previous_receipt() {
+    use mac_worker::test_support::{
+        host::job::JobId,
+        task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+    };
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    f.push();
+    f.execute(IntegrationStep::Repair).unwrap();
+    f.record = host_record(&f);
+    f.record.receipt.as_mut().unwrap().imported = true;
+    f.record.snapshot.revision = IntegrationRevision(20);
+    f.execute(IntegrationStep::Repair).unwrap();
+    let accepted = f.origin_tip();
+    f.write("followup.txt", b"later source\n");
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-m", "later source"]);
+    let head: mac_worker::test_support::task::model::BaseOid =
+        f.git(&["rev-parse", "HEAD"]).parse().unwrap();
+    let mirror = f.store.mirror(&f.record.policy.project_id).unwrap();
+    f.git(&[
+        "--git-dir",
+        mirror.path().to_str().unwrap(),
+        "fetch",
+        "--no-tags",
+        f.workspace().to_str().unwrap(),
+        head.as_str(),
+    ]);
+    f.git(&[
+        "--git-dir",
+        mirror.path().to_str().unwrap(),
+        "update-ref",
+        &format!("refs/heads/task/{}", f.record.task_id),
+        head.as_str(),
+    ]);
+    let source = JobId::new(uuid::Uuid::from_u128(100));
+    let mut wire = serde_json::to_value(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+    )
+    .unwrap();
+    wire["head_oid"] = serde_json::to_value(&head).unwrap();
+    wire["turns"].as_array_mut().unwrap().push(
+        serde_json::to_value(TurnSummary::new(
+            2,
+            source,
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(true),
+            false,
+            Some(1002),
+            Some(1003),
+        ))
+        .unwrap(),
+    );
+    let status: TaskStatus = serde_json::from_value(wire).unwrap();
+    std::fs::write(
+        f.store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    f.record = host_record(&f);
+    f.record.snapshot.source_head = head;
+    f.record.snapshot.source_turn_id = source;
+    f.record.snapshot.integration_id = IntegrationId::derive(
+        f.record.task_id,
+        source,
+        &f.record.snapshot.source_head,
+        &f.record.target_key,
+    )
+    .unwrap();
+    f.record.snapshot.epoch = 0;
+    f.record.snapshot.revision = IntegrationRevision(1);
+    f.record.snapshot.state = IntegrationStatus::Pending;
+    f.record.snapshot.attempts = 0;
+    f.record.snapshot.merge_oid = None;
+    f.record.snapshot.observed_target_oid = None;
+    f.record.snapshot.disposition = None;
+    f.record.cycle_base = accepted;
+    f.record.candidates.clear();
+    f.record.auxiliaries.clear();
+    f.record.push_intent = None;
+    f.record.receipt = None;
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::CandidateReady { .. }
+    ));
+    assert_eq!(host_record(&f).archived_receipts.len(), 1);
+}
+
+#[test]
+fn a_wip_task_is_refused_before_policy_or_git_effects() {
+    use mac_worker::test_support::task::model::TaskMeta;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let meta_path = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .join("meta.json");
+    let mut wire: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    wire["source"]["wip"] = serde_json::json!(true);
+    let meta: TaskMeta = serde_json::from_value(wire).unwrap();
+    std::fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    assert_eq!(
+        f.execute(IntegrationStep::Prepare)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationWipBase.as_str()
+    );
+    assert!(
+        HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -590,6 +1086,123 @@ fn lost_push_reply_settles_after_legacy_close_without_workspace_resurrection() {
     assert!(!f.workspace().exists());
     assert_eq!(f.origin_tip(), merge);
     assert!(f.execute(IntegrationStep::Push).is_err());
+}
+
+#[test]
+fn native_receipt_repair_replays_after_ref_head_and_index_effects() {
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct CrashAfterEffect {
+        mirror: std::path::PathBuf,
+        workspace: std::path::PathBuf,
+        boundary: &'static str,
+        fired: AtomicBool,
+    }
+    impl ProcessRunner for CrashAfterEffect {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let result = SystemProcessRunner.run(request)?;
+            let in_repo =
+                |path: &std::path::Path| request.args.iter().any(|arg| arg == path.as_os_str());
+            let update = request.args.iter().any(|arg| arg == "update-ref")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with("refs/heads/task/"));
+            let reached = match self.boundary {
+                "ref" => update && in_repo(&self.mirror),
+                "head" => update && in_repo(&self.workspace),
+                _ => {
+                    request.args.iter().any(|arg| arg == "reset")
+                        && request.args.iter().any(|arg| arg == "--hard")
+                }
+            };
+            if reached && !self.fired.swap(true, Ordering::SeqCst) {
+                panic!("crash after native repair effect");
+            }
+            Ok(result)
+        }
+    }
+    for boundary in ["ref", "head", "index"] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        let merge = f.prepare();
+        f.push();
+        let runner = CrashAfterEffect {
+            mirror: f
+                .store
+                .mirror(&f.record.policy.project_id)
+                .unwrap()
+                .path()
+                .to_path_buf(),
+            workspace: f.workspace().to_path_buf(),
+            boundary,
+            fired: AtomicBool::new(false),
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || f.execute_with(IntegrationStep::Repair, &runner)
+            ))
+            .is_err()
+        );
+        assert!(runner.fired.load(Ordering::SeqCst));
+        f.execute(IntegrationStep::Repair).unwrap();
+        f.execute(IntegrationStep::Repair).unwrap();
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), merge.as_str());
+        assert_eq!(
+            f.store
+                .task_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap()
+                .head_oid(),
+            Some(&merge)
+        );
+        assert_eq!(f.origin_tip(), merge);
+    }
+}
+
+#[test]
+fn revoke_journal_and_ack_crashes_never_restore_push_authority() {
+    for hook in [
+        IntegrationHook::AfterRevoke,
+        IntegrationHook::BeforeRevokeAck,
+        IntegrationHook::AfterRevokeAck,
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.write("payload.txt", b"base\n");
+        f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        let head = f.commit_task();
+        let target = f.advance_target_with("payload.txt", b"theirs\n");
+        f.execute(IntegrationStep::Prepare).unwrap();
+        let revoke = request(
+            &f,
+            HostIntegrationAction::Revoke {
+                tombstone: IntegrationTombstone {
+                    epoch: f.record.snapshot.epoch,
+                    revision: f.record.snapshot.revision,
+                    requested_at_millis: 1005,
+                    acknowledged: false,
+                },
+            },
+        );
+        f.runtime.crash_at(hook);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&f, &revoke)))
+                .is_err()
+        );
+        f.runtime.restart();
+        assert!(f.execute(IntegrationStep::Push).is_err());
+        assert!(matches!(
+            execute(&f, &revoke).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        assert!(host_record(&f).tombstone.unwrap().acknowledged);
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+        assert_eq!(f.origin_tip(), target);
+    }
 }
 
 #[test]

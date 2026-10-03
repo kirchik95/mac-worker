@@ -239,6 +239,369 @@ fn is_push(request: &ProcessRequest) -> bool {
     request.args.iter().any(|arg| arg == "push")
 }
 
+#[test]
+fn every_failed_push_reobserves_before_auth_network_missing_or_unknown_classification() {
+    use std::os::unix::process::ExitStatusExt;
+    struct Failure {
+        kind: &'static str,
+        pushed: AtomicUsize,
+        calls: Mutex<Vec<ProcessRequest>>,
+    }
+    impl ProcessRunner for Failure {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.calls.lock().unwrap().push(request.clone());
+            if is_push(request) {
+                self.pushed.fetch_add(1, Ordering::SeqCst);
+                return Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(256),
+                    stdout: vec![],
+                    stderr: if self.kind == "auth" {
+                        b"fatal: Authentication failed for fixture".to_vec()
+                    } else {
+                        b"network unavailable".to_vec()
+                    },
+                });
+            }
+            if self.pushed.load(Ordering::SeqCst) > 0
+                && request.args.iter().any(|arg| arg == "ls-remote")
+            {
+                if self.kind == "unknown" {
+                    return Err(ProcessError::Cancelled.into());
+                }
+                if self.kind == "missing" {
+                    return Ok(ProcessResult {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: vec![],
+                        stderr: vec![],
+                    });
+                }
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    for (kind, code) in [
+        ("auth", IntegrationCode::IntegrationAuthFailed),
+        ("network", IntegrationCode::IntegrationNetwork),
+        ("missing", IntegrationCode::IntegrationTargetMissing),
+        ("unknown", IntegrationCode::IntegrationNetwork),
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        f.commit_task();
+        f.prepare();
+        let runner = Failure {
+            kind,
+            pushed: AtomicUsize::new(0),
+            calls: Mutex::new(vec![]),
+        };
+        assert_eq!(
+            f.execute_with(IntegrationStep::Push, &runner)
+                .unwrap_err()
+                .public_code(),
+            code.as_str()
+        );
+        assert_eq!(f.origin_tip(), target);
+        let calls = runner.calls.lock().unwrap();
+        let push = calls.iter().position(is_push).unwrap();
+        let observations: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| request.args.iter().any(|arg| arg == "ls-remote"))
+            .collect();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0].0 < push && observations[1].0 > push);
+        assert_eq!(observations[0].1.environment, observations[1].1.environment);
+        assert_eq!(observations[0].1.args, observations[1].1.args);
+        assert_eq!(runner.pushed.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn failed_push_with_source_already_reachable_settles_without_pushing_a_second_merge() {
+    use std::os::unix::process::ExitStatusExt;
+    struct PublishSource<'a>(&'a GitIntegrationFixture, AtomicUsize);
+    impl ProcessRunner for PublishSource<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if is_push(request) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                self.0
+                    .git(&["push", &self.0.record.policy.origin, "HEAD:refs/heads/main"]);
+                return Ok(ProcessResult {
+                    status: std::process::ExitStatus::from_raw(256),
+                    stdout: b"!\tfixture\t[remote rejected]\n".to_vec(),
+                    stderr: vec![],
+                });
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    let source = f.commit_task();
+    f.prepare();
+    let runner = PublishSource(&f, AtomicUsize::new(0));
+    assert!(
+        matches!(f.execute_with(IntegrationStep::Push, &runner).unwrap(),
+        HostIntegrationResponse::Integrated { receipt, .. }
+            if receipt.disposition == IntegrationDisposition::AlreadyIntegrated && receipt.merge_oid.is_none())
+    );
+    assert_eq!(f.origin_tip(), source);
+    assert_eq!(runner.1.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn missing_target_and_base_not_on_target_fail_before_a_candidate_or_push() {
+    for missing in [true, false] {
+        let mut f = GitIntegrationFixture::new();
+        let base = f.commit_base();
+        let head = f.commit_task();
+        let code = if missing {
+            f.record.policy.target = validate_integration_target("absent").unwrap();
+            f.record.target_key = f.record.policy.target_key().unwrap();
+            f.record.snapshot.integration_id = IntegrationId::derive(
+                f.record.task_id,
+                f.record.snapshot.source_turn_id,
+                &head,
+                &f.record.target_key,
+            )
+            .unwrap();
+            IntegrationCode::IntegrationTargetMissing
+        } else {
+            f.record.cycle_base = head;
+            IntegrationCode::IntegrationBaseNotOnTarget
+        };
+        assert_eq!(
+            f.execute(IntegrationStep::Prepare)
+                .unwrap_err()
+                .public_code(),
+            code.as_str()
+        );
+        assert_eq!(f.origin_tip(), base);
+        assert!(
+            HostIntegrationStore::new(&f.store)
+                .load(&f.record.policy.project_id, f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn unsafe_private_records_fail_structurally_before_any_git_command() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for kind in ["mode", "hardlink", "symlink"] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        f.prepare();
+        let record = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("integration/record.json");
+        match kind {
+            "mode" => {
+                std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "hardlink" => std::fs::hard_link(&record, record.with_extension("linked")).unwrap(),
+            _ => {
+                let saved = record.with_extension("saved");
+                std::fs::rename(&record, &saved).unwrap();
+                symlink(saved, &record).unwrap();
+            }
+        }
+        let runner = NativeRecordingRunner::default();
+        let error = f.execute_with(IntegrationStep::Push, &runner).unwrap_err();
+        assert!(
+            matches!(error, WorkerError::Io(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error:?}"
+        );
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn bounded_push_fence_refuses_a_concurrent_stop_without_acknowledging_it() {
+    struct StopDuringPush<'a> {
+        fixture: &'a GitIntegrationFixture,
+        observed: Mutex<Option<String>>,
+    }
+    impl ProcessRunner for StopDuringPush<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if is_push(request) {
+                let f = self.fixture;
+                let revoke = HostIntegrationRequest {
+                    protocol_version: 7,
+                    task_id: f.record.task_id,
+                    integration_id: Some(f.record.snapshot.integration_id),
+                    epoch: f.record.snapshot.epoch,
+                    revision: f.record.snapshot.revision,
+                    action: HostIntegrationAction::Revoke {
+                        tombstone: IntegrationTombstone {
+                            epoch: f.record.snapshot.epoch,
+                            revision: f.record.snapshot.revision,
+                            requested_at_millis: 1001,
+                            acknowledged: false,
+                        },
+                    },
+                };
+                let error = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime)
+                    .execute(&revoke)
+                    .unwrap_err();
+                *self.observed.lock().unwrap() = Some(error.public_code());
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    let runner = StopDuringPush {
+        fixture: &f,
+        observed: Mutex::new(None),
+    };
+    f.execute_with(IntegrationStep::Push, &runner).unwrap();
+    assert_eq!(
+        runner.observed.lock().unwrap().as_deref(),
+        Some(IntegrationCode::IntegrationStopUnconfirmed.as_str())
+    );
+    assert_eq!(f.origin_tip(), merge);
+    assert!(
+        HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .tombstone
+            .is_none()
+    );
+}
+
+#[test]
+fn candidate_attempts_are_bounded_and_a_conflicting_pin_is_never_replaced() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    for number in 2..=3 {
+        f.advance_target_with(&format!("target-{number}.txt"), b"advance\n");
+        assert!(
+            matches!(f.execute(IntegrationStep::Prepare).unwrap(), HostIntegrationResponse::CandidateReady { candidate, .. } if candidate.id.attempt == number)
+        );
+    }
+    let target = f.advance_target_with("target-4.txt", b"advance\n");
+    assert_eq!(
+        f.execute(IntegrationStep::Prepare)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationTargetMovedExhausted.as_str()
+    );
+    assert_eq!(f.origin_tip(), target);
+
+    let mut f = GitIntegrationFixture::new();
+    let base = f.commit_base();
+    let source = f.commit_task();
+    f.runtime.crash_at(IntegrationHook::AfterMergePin);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || f.execute(IntegrationStep::Prepare)
+        ))
+        .is_err()
+    );
+    f.runtime.restart();
+    let mirror = f.store.mirror(&f.record.policy.project_id).unwrap();
+    let pin = format!(
+        "refs/mac-worker/integration/{}/{}/1/merge",
+        f.record.snapshot.integration_id, f.record.snapshot.epoch
+    );
+    f.git(&[
+        "--git-dir",
+        mirror.path().to_str().unwrap(),
+        "update-ref",
+        &pin,
+        source.as_str(),
+    ]);
+    assert!(f.execute(IntegrationStep::Prepare).is_err());
+    assert_eq!(
+        f.git(&[
+            "--git-dir",
+            mirror.path().to_str().unwrap(),
+            "rev-parse",
+            &pin
+        ]),
+        source.as_str()
+    );
+    assert_eq!(f.origin_tip(), base);
+}
+
+#[test]
+fn info_attributes_must_be_absent_or_empty_in_both_native_repositories() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let mirror = f
+        .store
+        .mirror(&f.record.policy.project_id)
+        .unwrap()
+        .path()
+        .to_path_buf();
+    let info = f.workspace().join(".git/info/attributes");
+    let bare_info = mirror.join("info/attributes");
+    std::fs::write(&info, b"").unwrap();
+    std::fs::write(&bare_info, b"").unwrap();
+    f.prepare();
+    for path in [info, bare_info] {
+        std::fs::write(&path, b"* merge=union\n").unwrap();
+        assert_eq!(
+            f.execute(IntegrationStep::Prepare)
+                .unwrap_err()
+                .public_code(),
+            IntegrationCode::IntegrationStateInvalid.as_str()
+        );
+        std::fs::write(path, b"").unwrap();
+    }
+}
+
+#[test]
+fn configured_union_driver_keeps_builtin_union_semantics_without_project_execution() {
+    let mut f = GitIntegrationFixture::new();
+    f.write(".gitattributes", b"payload.txt merge=union\n");
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    f.commit_task();
+    f.advance_target_with("payload.txt", b"theirs\n");
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    let mirror = f.store.mirror(&f.record.policy.project_id).unwrap();
+    f.git(&["config", "merge.union.driver", "exit 77"]);
+    f.git(&[
+        "--git-dir",
+        mirror.path().to_str().unwrap(),
+        "config",
+        "merge.union.driver",
+        "exit 77",
+    ]);
+    let response = f.execute(IntegrationStep::Prepare).unwrap();
+    let HostIntegrationResponse::NeedTurn {
+        candidate,
+        purpose: IntegrationTurnPurpose::Verify,
+        ..
+    } = response
+    else {
+        panic!("union became a conflict")
+    };
+    assert_eq!(
+        f.git(&["write-tree"]),
+        candidate.tree_oid.as_ref().unwrap().as_str()
+    );
+    assert_eq!(
+        std::fs::read(f.workspace().join("payload.txt")).unwrap(),
+        b"ours\ntheirs\n"
+    );
+}
+
 // The test receiver forwards the native advertisement before advancing origin, then
 // lets native receive-pack perform its old-OID transaction. No production argv changes.
 struct NativeReceiver {
@@ -734,6 +1097,81 @@ fn native_resolution_stages_modes_links_binary_renames_and_deletions() {
 }
 
 #[test]
+fn large_binary_resolution_does_not_exceed_the_git_marker_output_cap() {
+    let mut f = GitIntegrationFixture::new();
+    let bytes = |value| {
+        let mut bytes = vec![value; 100_000];
+        bytes[0] = 0;
+        bytes
+    };
+    f.write("payload.bin", &bytes(1));
+    f.commit_base();
+    f.write("payload.bin", &bytes(2));
+    f.commit_task();
+    f.advance_target_with("payload.bin", &bytes(3));
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::NeedTurn {
+            purpose: IntegrationTurnPurpose::Resolve,
+            ..
+        }
+    ));
+    f.write("payload.bin", &bytes(4));
+    f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+    assert!(matches!(
+        f.execute(IntegrationStep::AcceptTurn).unwrap(),
+        HostIntegrationResponse::CandidateReady { .. }
+    ));
+}
+
+#[test]
+fn symlink_resolution_targets_are_not_conflict_marker_text() {
+    use std::os::unix::fs::symlink;
+    let mut f = GitIntegrationFixture::new();
+    symlink("base-target", f.workspace().join("link")).unwrap();
+    f.commit_base();
+    std::fs::remove_file(f.workspace().join("link")).unwrap();
+    symlink("ours-target", f.workspace().join("link")).unwrap();
+    f.commit_task();
+    f.advance_target();
+    let peer = f.origin().parent().unwrap().join("link-writer");
+    f.git(&[
+        "-C",
+        f.origin().parent().unwrap().to_str().unwrap(),
+        "clone",
+        "-b",
+        "main",
+        f.origin().to_str().unwrap(),
+        peer.to_str().unwrap(),
+    ]);
+    std::fs::remove_file(peer.join("link")).unwrap();
+    symlink("theirs-target", peer.join("link")).unwrap();
+    f.git(&["-C", peer.to_str().unwrap(), "add", "-A"]);
+    f.git(&["-C", peer.to_str().unwrap(), "commit", "-m", "move link"]);
+    f.git(&[
+        "-C",
+        peer.to_str().unwrap(),
+        "push",
+        "origin",
+        "HEAD:refs/heads/main",
+    ]);
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::NeedTurn {
+            purpose: IntegrationTurnPurpose::Resolve,
+            ..
+        }
+    ));
+    std::fs::remove_file(f.workspace().join("link")).unwrap();
+    symlink("<<<<<<<literal-target", f.workspace().join("link")).unwrap();
+    f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+    assert!(matches!(
+        f.execute(IntegrationStep::AcceptTurn).unwrap(),
+        HostIntegrationResponse::CandidateReady { .. }
+    ));
+}
+
+#[test]
 fn multiple_merge_bases_use_native_recursive_merging() {
     let mut f = GitIntegrationFixture::new();
     let base = f.commit_base();
@@ -800,6 +1238,8 @@ fn markers_are_rejected_only_in_conflicted_or_newly_changed_text() {
         f.write("payload.txt", b"resolved\n");
         if introduced {
             f.write("new.md", b"<<<<<<< unresolved\n");
+            f.git(&["config", "diff.outputIndicatorNew", "."]);
+            f.git(&["config", "color.ui", "always"]);
         }
         f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
         let result = f.execute(IntegrationStep::AcceptTurn);
