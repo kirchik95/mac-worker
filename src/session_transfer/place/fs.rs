@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, CString},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::fs::PermissionsExt,
@@ -70,8 +70,17 @@ impl StoreWriter {
             self.directory.verify_bound()?;
             let parent = self.parent(&components, true)?;
             let name = components.last().expect("validated nonempty path");
-            if let Some(existing) = read_at(parent.as_raw_fd(), name, bytes.len() as u64)? {
-                return compare(&existing, bytes);
+            if let Some(mut existing) = read_at(parent.as_raw_fd(), name, bytes.len() as u64)? {
+                compare(&existing.bytes, bytes)?;
+                #[cfg(test)]
+                tests::before_unchanged();
+                return self.finish_write(
+                    &parent,
+                    &components,
+                    &mut existing.file,
+                    bytes,
+                    WriteOutcome::Unchanged,
+                );
             }
             let temporary =
                 CString::new(format!(".session-transfer-{}", uuid::Uuid::new_v4())).unwrap();
@@ -80,7 +89,7 @@ impl StoreWriter {
                 libc::openat(
                     parent.as_raw_fd(),
                     temporary.as_ptr(),
-                    libc::O_WRONLY
+                    libc::O_RDWR
                         | libc::O_CREAT
                         | libc::O_EXCL
                         | libc::O_NOFOLLOW
@@ -93,26 +102,72 @@ impl StoreWriter {
             let _staged = StagedFile {
                 parent: parent.as_raw_fd(),
                 name: &temporary,
+                descriptor: file.as_raw_fd(),
             };
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            self.directory.verify_bound()?;
+            #[cfg(test)]
+            tests::before_rename();
+            // A pathname rename must not publish a replacement staging inode.
+            verify_file_at(parent.as_raw_fd(), &temporary, file.as_raw_fd())?;
+            parent.verify_bound(&self.directory, &components)?;
             match rename_no_replace(parent.as_raw_fd(), &temporary, name) {
                 Ok(()) => {
-                    sync_fd(parent.as_raw_fd())?;
-                    self.directory.verify_bound()?;
-                    Ok(WriteOutcome::Created)
+                    #[cfg(test)]
+                    tests::after_rename();
+                    parent.verify_bound(&self.directory, &components)?;
+                    verify_file_at(parent.as_raw_fd(), name, file.as_raw_fd())?;
+                    self.finish_write(
+                        &parent,
+                        &components,
+                        &mut file,
+                        bytes,
+                        WriteOutcome::Created,
+                    )
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let existing = read_at(parent.as_raw_fd(), name, bytes.len() as u64)?
+                    let mut existing = read_at(parent.as_raw_fd(), name, bytes.len() as u64)?
                         .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
-                    compare(&existing, bytes)
+                    compare(&existing.bytes, bytes)?;
+                    #[cfg(test)]
+                    tests::before_unchanged();
+                    self.finish_write(
+                        &parent,
+                        &components,
+                        &mut existing.file,
+                        bytes,
+                        WriteOutcome::Unchanged,
+                    )
                 }
                 Err(error) => Err(error),
             }
         })();
         result.map_err(placement_error)
+    }
+
+    // Both outcomes are durability barriers, including retries of a rename or
+    // directory creation whose fsync failed in an earlier call.
+    fn finish_write(
+        &self,
+        parent: &ParentChain,
+        components: &[CString],
+        file: &mut File,
+        bytes: &[u8],
+        outcome: WriteOutcome,
+    ) -> io::Result<WriteOutcome> {
+        let name = components.last().unwrap();
+        parent.verify_bound(&self.directory, components)?;
+        verify_file_at(parent.as_raw_fd(), name, file.as_raw_fd())?;
+        compare(&read_bytes(file, bytes.len() as u64)?, bytes)?;
+        sync_fd(file.as_raw_fd())?;
+        parent.sync_all()?;
+        // Same-account writers may also mutate the inode in place. Recheck
+        // content and all bindings after syncing, not just the earlier read.
+        compare(&read_bytes(file, bytes.len() as u64)?, bytes)?;
+        verify_file_at(parent.as_raw_fd(), name, file.as_raw_fd())?;
+        parent.verify_bound(&self.directory, components)?;
+        Ok(outcome)
     }
 
     pub fn read_file(
@@ -128,9 +183,15 @@ impl StoreWriter {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let bytes = read_at(parent.as_raw_fd(), components.last().unwrap(), max_bytes)?;
-            self.directory.verify_bound()?;
-            Ok(bytes)
+            let name = components.last().unwrap();
+            let existing = read_at(parent.as_raw_fd(), name, max_bytes)?;
+            parent.verify_bound(&self.directory, &components)?;
+            if let Some(existing) = existing {
+                verify_file_at(parent.as_raw_fd(), name, existing.file.as_raw_fd())?;
+                Ok(Some(existing.bytes))
+            } else {
+                Ok(None)
+            }
         })();
         result.map_err(placement_error)
     }
@@ -138,34 +199,73 @@ impl StoreWriter {
     // rooted_fs's child and read helpers require private modes on *existing*
     // directories/files. Native agent stores need not have those modes, and
     // this contract preserves them. Keep that less restrictive traversal local.
-    fn parent(&self, components: &[CString], create: bool) -> io::Result<OwnedFd> {
-        let mut current = open_directory_at(self.directory.raw_directory_fd(), c".")?;
+    fn parent(&self, components: &[CString], create: bool) -> io::Result<ParentChain> {
+        let mut chain = ParentChain {
+            directories: vec![open_directory_at(self.directory.raw_directory_fd(), c".")?],
+        };
         for component in &components[..components.len() - 1] {
-            current = match open_directory_at(current.as_raw_fd(), component) {
+            let current = chain.as_raw_fd();
+            let child = match open_directory_at(current, component) {
                 Ok(child) => child,
                 Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                     // SAFETY: the directory fd is live and component is a plain name.
-                    let created =
-                        unsafe { libc::mkdirat(current.as_raw_fd(), component.as_ptr(), 0o700) };
+                    let created = unsafe { libc::mkdirat(current, component.as_ptr(), 0o700) };
                     if created < 0 {
                         let error = io::Error::last_os_error();
                         if error.kind() != io::ErrorKind::AlreadyExists {
                             return Err(error);
                         }
                     }
-                    let child = open_directory_at(current.as_raw_fd(), component)?;
+                    let child = open_directory_at(current, component)?;
                     if created == 0 {
                         // SAFETY: child is the newly opened directory descriptor.
                         cvt(unsafe { libc::fchmod(child.as_raw_fd(), 0o700) })?;
                         sync_fd(child.as_raw_fd())?;
-                        sync_fd(current.as_raw_fd())?;
+                        sync_fd(current)?;
                     }
                     child
                 }
                 Err(error) => return Err(error),
             };
+            chain.directories.push(child);
         }
-        Ok(current)
+        Ok(chain)
+    }
+}
+
+struct ParentChain {
+    // Retain every walked inode, including the root, until the call finishes.
+    directories: Vec<OwnedFd>,
+}
+
+impl AsRawFd for ParentChain {
+    fn as_raw_fd(&self) -> RawFd {
+        self.directories.last().unwrap().as_raw_fd()
+    }
+}
+
+impl ParentChain {
+    fn verify_bound(&self, root: &StoreRoot, components: &[CString]) -> io::Result<()> {
+        root.verify_bound()?;
+        let mut current = open_directory_at(root.raw_directory_fd(), c".")?;
+        verify_directory_identity(current.as_raw_fd(), self.directories[0].as_raw_fd())?;
+        for (component, retained) in components[..components.len() - 1]
+            .iter()
+            .zip(&self.directories[1..])
+        {
+            // Rewalk by name from the root, never from a possibly displaced fd.
+            current = open_directory_at(current.as_raw_fd(), component)?;
+            verify_directory_identity(current.as_raw_fd(), retained.as_raw_fd())?;
+        }
+        root.verify_bound()
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        // Bottom-up: each entry is durable before syncing its parent's entry.
+        for directory in self.directories.iter().rev() {
+            sync_fd(directory.as_raw_fd())?;
+        }
+        Ok(())
     }
 }
 
@@ -236,32 +336,83 @@ fn open_directory_at(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
 }
 
 fn sync_fd(descriptor: RawFd) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let is_directory = tests::record_sync(descriptor);
+        if is_directory && tests::FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+    }
     // SAFETY: caller retains descriptor throughout fsync.
     cvt(unsafe { libc::fsync(descriptor) })
 }
 
-fn read_at(parent: RawFd, name: &CStr, maximum: u64) -> io::Result<Option<Vec<u8>>> {
-    // lstat first distinguishes dangling symlinks from absent files.
+fn stat_fd(descriptor: RawFd) -> io::Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: descriptor is live and metadata is writable.
+    cvt(unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) })?;
+    // SAFETY: fstat succeeded and initialized metadata.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn stat_at(parent: RawFd, name: &CStr) -> io::Result<libc::stat> {
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: metadata is writable, parent is live, name is NUL-terminated.
-    let result = unsafe {
+    cvt(unsafe {
         libc::fstatat(
             parent,
             name.as_ptr(),
             metadata.as_mut_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
         )
-    };
-    if result < 0 {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
+    })?;
     // SAFETY: fstatat succeeded and initialized metadata.
-    let metadata = unsafe { metadata.assume_init() };
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn same_inode(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn verify_directory_identity(current: RawFd, retained: RawFd) -> io::Result<()> {
+    if same_inode(&stat_fd(current)?, &stat_fd(retained)?) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session store parent directory inode changed",
+        ))
+    }
+}
+
+fn verify_file_at(parent: RawFd, name: &CStr, descriptor: RawFd) -> io::Result<()> {
+    let target = stat_at(parent, name)?;
+    let written = stat_fd(descriptor)?;
+    if target.st_mode & libc::S_IFMT == libc::S_IFREG
+        && written.st_mode & libc::S_IFMT == libc::S_IFREG
+        && same_inode(&target, &written)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session store publication inode or type changed",
+        ))
+    }
+}
+
+struct ReadFile {
+    file: File,
+    bytes: Vec<u8>,
+}
+
+fn read_at(parent: RawFd, name: &CStr, maximum: u64) -> io::Result<Option<ReadFile>> {
+    // lstat first distinguishes dangling symlinks from absent files.
+    let metadata = match stat_at(parent, name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -277,6 +428,12 @@ fn read_at(parent: RawFd, name: &CStr, maximum: u64) -> io::Result<Option<Vec<u8
         )
     })?;
     let mut file = File::from(descriptor);
+    let bytes = read_bytes(&mut file, maximum)?;
+    verify_file_at(parent, name, file.as_raw_fd())?;
+    Ok(Some(ReadFile { file, bytes }))
+}
+
+fn read_bytes(file: &mut File, maximum: u64) -> io::Result<Vec<u8>> {
     let opened = file.metadata()?;
     if !opened.is_file() {
         return Err(io::Error::new(
@@ -290,8 +447,9 @@ fn read_at(parent: RawFd, name: &CStr, maximum: u64) -> io::Result<Option<Vec<u8
             "session store file exceeds limit",
         ));
     }
+    file.rewind()?;
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
+    Read::by_ref(file)
         .take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > maximum {
@@ -300,18 +458,22 @@ fn read_at(parent: RawFd, name: &CStr, maximum: u64) -> io::Result<Option<Vec<u8
             "session store file exceeds limit",
         ));
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 struct StagedFile<'a> {
     parent: RawFd,
     name: &'a CStr,
+    descriptor: RawFd,
 }
 impl Drop for StagedFile<'_> {
     fn drop(&mut self) {
-        // SAFETY: the guard is dropped before its parent descriptor and name.
-        unsafe {
-            libc::unlinkat(self.parent, self.name.as_ptr(), 0);
+        // Never deliberately remove an unknown replacement staging inode.
+        if verify_file_at(self.parent, self.name, self.descriptor).is_ok() {
+            // SAFETY: the guard is dropped before its descriptors and name.
+            unsafe {
+                libc::unlinkat(self.parent, self.name.as_ptr(), 0);
+            }
         }
     }
 }
@@ -360,6 +522,335 @@ mod tests {
         },
     };
     use tempfile::tempdir;
+
+    thread_local! {
+        pub(super) static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static AFTER_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static BEFORE_UNCHANGED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static SYNC_LOG: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn before_rename() {
+        if let Some(hook) = BEFORE_RENAME.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(super) fn after_rename() {
+        if let Some(hook) = AFTER_RENAME.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(super) fn before_unchanged() {
+        if let Some(hook) = BEFORE_UNCHANGED.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    pub(super) fn record_sync(descriptor: RawFd) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        SYNC_COUNT.with(|count| count.set(count.get() + 1));
+        // SAFETY: the sync caller holds descriptor live; dup returns a fresh fd.
+        let file = File::from(owned_fd(unsafe { libc::dup(descriptor) }).unwrap());
+        let metadata = file.metadata().unwrap();
+        SYNC_LOG.with(|log| log.borrow_mut().push((metadata.dev(), metadata.ino())));
+        metadata.is_dir()
+    }
+
+    fn assert_synced(paths: &[PathBuf]) {
+        use std::os::unix::fs::MetadataExt;
+        for path in paths {
+            let metadata = fs::metadata(path).unwrap();
+            assert!(
+                SYNC_LOG.with(|log| log.borrow().contains(&(metadata.dev(), metadata.ino()))),
+                "publication did not sync {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_b_rejects_parent_moved_outside_store_before_rename() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("store");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(root.join("projects/project")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let store = StoreWriter::open(&root).unwrap();
+        let original = root.join("projects/project");
+        let moved = outside.join("moved-project");
+        let moved_for_hook = moved.clone();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&original, &moved_for_hook).unwrap();
+                fs::create_dir(&original).unwrap();
+            }));
+        });
+        let result = store.write_file("projects/project/session.jsonl", b"{}\n");
+        assert!(
+            !moved.join("session.jsonl").exists(),
+            "session bytes escaped the store; write returned {result:?}"
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn review_b_rejects_replaced_staging_file_before_rename() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("store");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        let store = StoreWriter::open(&root).unwrap();
+        let hook_root = root.clone();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let staged = fs::read_dir(&hook_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(".session-transfer-")
+                    })
+                    .unwrap();
+                fs::remove_file(&staged).unwrap();
+                symlink(&outside, &staged).unwrap();
+            }));
+        });
+        let result = store.write_file("session.jsonl", b"{}\n");
+        assert!(
+            !root
+                .join("session.jsonl")
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+            "published an attacker-replaced symlink; write returned {result:?}"
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn review_b_retry_syncs_a_previously_unsynced_publication() {
+        let temp = tempdir().unwrap();
+        let store = StoreWriter::open(temp.path()).unwrap();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
+            }));
+        });
+        assert!(store.write_file("session.jsonl", b"{}\n").is_err());
+        assert_eq!(
+            fs::read(temp.path().join("session.jsonl")).unwrap(),
+            b"{}\n"
+        );
+        SYNC_COUNT.with(|count| count.set(0));
+        assert_eq!(
+            store.write_file("session.jsonl", b"{}\n").unwrap(),
+            WriteOutcome::Unchanged
+        );
+        assert!(
+            SYNC_COUNT.with(|count| count.get()) > 0,
+            "successful retry did not sync the failed publication's directory"
+        );
+    }
+
+    #[test]
+    fn replaced_staging_regular_file_is_refused() {
+        let temp = tempdir().unwrap();
+        let store = StoreWriter::open(temp.path()).unwrap();
+        let root = temp.path().to_path_buf();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let staged = fs::read_dir(&root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with(".session-transfer-")
+                    })
+                    .unwrap();
+                fs::remove_file(&staged).unwrap();
+                fs::write(&staged, b"replacement").unwrap();
+            }));
+        });
+        placement_error(store.write_file("session.jsonl", b"{}\n"));
+    }
+
+    #[test]
+    fn unchanged_syncs_file_and_every_existing_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/session"), b"data").unwrap();
+        let store = StoreWriter::open(root).unwrap();
+        assert_eq!(
+            store.write_file("a/b/session", b"data").unwrap(),
+            WriteOutcome::Unchanged
+        );
+        assert_synced(&[
+            root.to_path_buf(),
+            root.join("a"),
+            root.join("a/b"),
+            root.join("a/b/session"),
+        ]);
+    }
+
+    #[test]
+    fn concurrent_unchanged_syncs_file_and_every_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        let target = root.join("a/b/session");
+        let store = StoreWriter::open(&root).unwrap();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(target, b"data").unwrap()));
+        });
+        assert_eq!(
+            store.write_file("a/b/session", b"data").unwrap(),
+            WriteOutcome::Unchanged
+        );
+        assert_synced(&[
+            root.clone(),
+            root.join("a"),
+            root.join("a/b"),
+            root.join("a/b/session"),
+        ]);
+    }
+
+    #[test]
+    fn concurrent_unchanged_refuses_sync_failure() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("session");
+        let store = StoreWriter::open(temp.path()).unwrap();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(target, b"data").unwrap();
+                FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
+            }));
+        });
+        placement_error(store.write_file("session", b"data"));
+    }
+
+    #[test]
+    fn unchanged_refuses_rebound_parent_in_both_equality_branches() {
+        for concurrent in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("store");
+            let original = root.join("a/b");
+            let moved = temp.path().join("moved");
+            fs::create_dir_all(&original).unwrap();
+            let target = original.join("session");
+            let store = StoreWriter::open(&root).unwrap();
+            if concurrent {
+                BEFORE_RENAME.with(|hook| {
+                    *hook.borrow_mut() =
+                        Some(Box::new(move || fs::write(target, b"data").unwrap()));
+                });
+            } else {
+                fs::write(target, b"data").unwrap();
+            }
+            BEFORE_UNCHANGED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&original, &moved).unwrap();
+                    fs::create_dir(&original).unwrap();
+                }));
+            });
+            placement_error(store.write_file("a/b/session", b"data"));
+        }
+    }
+
+    #[test]
+    fn created_refuses_ancestor_rebound_after_rename() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("store");
+        let original = root.join("a");
+        let moved = temp.path().join("moved");
+        fs::create_dir_all(original.join("b")).unwrap();
+        let store = StoreWriter::open(&root).unwrap();
+        AFTER_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&original, &moved).unwrap();
+                fs::create_dir_all(original.join("b")).unwrap();
+            }));
+        });
+        placement_error(store.write_file("a/b/session", b"data"));
+        assert!(!root.join("a/b/session").exists());
+    }
+
+    #[test]
+    fn created_refuses_replaced_target_without_deleting_it() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("session");
+        let hook_target = target.clone();
+        let original = temp.path().join("original");
+        let store = StoreWriter::open(temp.path()).unwrap();
+        AFTER_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_target, original).unwrap();
+                fs::write(hook_target, b"replacement").unwrap();
+            }));
+        });
+        let result = store.write_file("session", b"data");
+        let Err(WorkerError::Task { code, message }) = result else {
+            panic!("replaced target was not refused: {result:?}");
+        };
+        assert_eq!(code, "SESSION_PLACEMENT_FAILED");
+        assert!(message.contains("inode"));
+        assert!(!message.contains(temp.path().to_str().unwrap()));
+        assert_eq!(fs::read(target).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn unchanged_refuses_replaced_target_in_both_equality_branches() {
+        for concurrent in [false, true] {
+            let temp = tempdir().unwrap();
+            let target = temp.path().join("session");
+            let hook_target = target.clone();
+            let original = temp.path().join("original");
+            let store = StoreWriter::open(temp.path()).unwrap();
+            if concurrent {
+                let target = target.clone();
+                BEFORE_RENAME.with(|hook| {
+                    *hook.borrow_mut() =
+                        Some(Box::new(move || fs::write(target, b"data").unwrap()));
+                });
+            } else {
+                fs::write(&target, b"data").unwrap();
+            }
+            BEFORE_UNCHANGED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&hook_target, original).unwrap();
+                    fs::write(hook_target, b"replacement").unwrap();
+                }));
+            });
+            placement_error(store.write_file("session", b"data"));
+            assert_eq!(fs::read(target).unwrap(), b"replacement");
+        }
+    }
+
+    #[test]
+    fn created_refuses_in_place_staging_mutation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = StoreWriter::open(&root).unwrap();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let staged = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+                fs::write(staged, b"other").unwrap();
+            }));
+        });
+        placement_error(store.write_file("session", b"data"));
+    }
 
     fn placement_error<T>(result: Result<T, WorkerError>) {
         assert!(matches!(
