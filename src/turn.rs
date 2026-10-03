@@ -1021,6 +1021,9 @@ impl TurnTerminalHook {
             Ok((result, meta)) => {
                 if meta.close_policy() == ClosePolicy::Done
                     && result.outcome() == &TaskOutcome::Done
+                    && crate::integration::host_store::HostIntegrationStore::new(store)
+                        .prepared(meta.project_id(), meta.task_id(), job_meta.job_id())?
+                        .is_none()
                 {
                     TaskStore::new(store, &runner).close_after_own_terminal_turn(
                         &TaskCloseRequest::new(meta.project_id(), meta.task_id(), false),
@@ -1159,6 +1162,27 @@ impl<'a> TurnPublisher<'a> {
             .last()
             .map(|turn| turn.turn_id())
             .ok_or_else(|| turn_error("PUBLISH_FAILED", "task has no turn history"))?;
+        let sidecars = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        let integration = sidecars.prepared(meta.project_id(), meta.task_id(), turn_id)?;
+        let _integration_fence = integration
+            .as_ref()
+            .map(|_| sidecars.lock(meta.project_id(), meta.task_id()))
+            .transpose()?;
+        if let Some(prepared) = &integration {
+            let record = sidecars
+                .load(meta.project_id(), meta.task_id())?
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            prepared.validate_for(&record)?;
+            prepared.followup.validate_self_consistency()?;
+            let candidate = record
+                .candidates
+                .last()
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            prepared.workspace_binding.validate_for(candidate)?;
+            let git =
+                crate::integration::git::IntegrationGit::for_workspace(self.store, self.runner);
+            git.assert_workspace(&git.workspace(&record)?, candidate, true)?;
+        }
         let tail = read_optional_text(turn_dir, "tail.log", LOG_TAIL_BYTES as u64)?;
         // The agent writes its last message itself (Codex `-o`), with the
         // account's umask rather than owner-only mode. The turn directory is
@@ -1239,15 +1263,23 @@ impl<'a> TurnPublisher<'a> {
             persist_parse_reason(turn_dir, parse_reason)?;
         }
 
-        let (agent_committed, head_oid, diff_stat, files_changed) = if self
-            .store
-            .task_workspace_if_present(meta.project_id(), meta.task_id())?
-            .is_some()
-        {
-            self.publish_workspace(meta, turn_id)?
-        } else {
-            (true, task.status().head_oid().cloned(), None, Vec::new())
-        };
+        let (agent_committed, head_oid, diff_stat, files_changed) =
+            if let Some(prepared) = &integration {
+                (
+                    false,
+                    Some(prepared.workspace_binding.head.clone()),
+                    None,
+                    Vec::new(),
+                )
+            } else if self
+                .store
+                .task_workspace_if_present(meta.project_id(), meta.task_id())?
+                .is_some()
+            {
+                self.publish_workspace(meta, turn_id)?
+            } else {
+                (true, task.status().head_oid().cloned(), None, Vec::new())
+            };
 
         let agent_outcome = adapter.classify(exit_code, structured.status());
         // Scan bounded raw stdout/stderr tails, not protocol result candidates
@@ -1285,7 +1317,7 @@ impl<'a> TurnPublisher<'a> {
             }
             outcome
         };
-        if meta.publish().contains(&PublishMode::Push) {
+        if integration.is_none() && meta.publish().contains(&PublishMode::Push) {
             let expected_origin = meta.push_origin_url().ok_or_else(|| {
                 turn_error("PUBLISH_FAILED", "push publication has no origin target")
             })?;
@@ -1344,6 +1376,19 @@ impl<'a> TurnPublisher<'a> {
             reported_checks,
             false,
         )?;
+        if let Some(prepared) = &integration {
+            let mut record = sidecars
+                .load(meta.project_id(), meta.task_id())?
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            let aux = record
+                .auxiliaries
+                .iter_mut()
+                .find(|aux| aux.turn_id == prepared.followup.turn_id())
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            aux.accepted = true;
+            aux.completed = true;
+            sidecars.save(&record)?;
+        }
         let _ = session;
         Ok(TurnResult {
             outcome,

@@ -38,7 +38,7 @@ pub(crate) enum PushOutcome {
 pub struct IntegrationGit<'a> {
     store: &'a HostStore,
     runner: &'a dyn ProcessRunner,
-    runtime: &'a dyn IntegrationRuntime,
+    runtime: Option<&'a dyn IntegrationRuntime>,
 }
 impl<'a> IntegrationGit<'a> {
     pub fn new(
@@ -49,8 +49,54 @@ impl<'a> IntegrationGit<'a> {
         Self {
             store,
             runner,
-            runtime,
+            runtime: Some(runtime),
         }
+    }
+    pub(crate) fn for_workspace(store: &'a HostStore, runner: &'a dyn ProcessRunner) -> Self {
+        Self {
+            store,
+            runner,
+            runtime: None,
+        }
+    }
+    fn reach(&self, hook: IntegrationHook) {
+        if let Some(runtime) = self.runtime {
+            runtime.reach(hook);
+        }
+    }
+    fn now_millis(&self) -> u64 {
+        self.runtime.map_or(0, IntegrationRuntime::now_millis)
+    }
+    pub(crate) fn validate_prepared_workspace(
+        &self,
+        record: &IntegrationRecord,
+        prepared: &PreparedIntegrationTurn,
+    ) -> Result<(), WorkerError> {
+        prepared.validate_for(record)?;
+        prepared.followup.validate_self_consistency()?;
+        if record.tombstone.is_some() {
+            return Err(invalid());
+        }
+        let candidate = record.candidates.last().ok_or_else(invalid)?;
+        prepared.workspace_binding.validate_for(candidate)?;
+        let workspace = self.workspace(record)?;
+        self.assert_workspace(&workspace, candidate, true)?;
+        if prepared.purpose == IntegrationTurnPurpose::Verify {
+            self.verify_tree(&workspace, candidate)?;
+        }
+        let bytes = HostIntegrationStore::new(self.store)
+            .read(
+                &record.policy.project_id,
+                record.task_id,
+                "workspace.json",
+                MAX_PRIVATE_RECORD_BYTES,
+            )?
+            .ok_or_else(invalid)?;
+        let state: WorkspaceState = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if state != self.workspace_state(&workspace, candidate)? {
+            return Err(invalid());
+        }
+        Ok(())
     }
     pub fn push_candidate(
         &self,
@@ -313,10 +359,10 @@ impl<'a> IntegrationGit<'a> {
         if !result.status.success() {
             return Err(IntegrationCode::IntegrationNetwork.error());
         }
-        self.runtime.reach(IntegrationHook::AfterFetchBeforePin);
+        self.reach(IntegrationHook::AfterFetchBeforePin);
         self.query(mirror, None, &["update-ref", &pin, oid.as_str()])?;
         mirror.sync_root()?;
-        self.runtime.reach(IntegrationHook::AfterTargetPin);
+        self.reach(IntegrationHook::AfterTargetPin);
         Ok(Some(oid))
     }
     pub(crate) fn merge(
@@ -517,7 +563,7 @@ impl<'a> IntegrationGit<'a> {
                 candidate.target_head.as_str(),
             ],
         )?;
-        self.runtime.reach(IntegrationHook::DuringWorkspacePrepare);
+        self.reach(IntegrationHook::DuringWorkspacePrepare);
         let result = self.run(
             &workspace,
             Some(&candidate.attribute_source),
@@ -599,7 +645,7 @@ impl<'a> IntegrationGit<'a> {
             .trim()
             .parse()
             .map_err(|_| invalid())?;
-        self.runtime.reach(IntegrationHook::AfterCommitBeforePin);
+        self.reach(IntegrationHook::AfterCommitBeforePin);
         if repo.path() != mirror.path() {
             self.query(
                 &mirror,
@@ -617,7 +663,7 @@ impl<'a> IntegrationGit<'a> {
         self.query(&mirror, None, &["update-ref", &pin, oid.as_str()])?;
         mirror.sync_root()?;
         candidate.merge_oid = Some(oid);
-        self.runtime.reach(IntegrationHook::AfterMergePin);
+        self.reach(IntegrationHook::AfterMergePin);
         Ok(())
     }
     pub(crate) fn accept_workspace(
@@ -740,7 +786,7 @@ impl<'a> IntegrationGit<'a> {
         if !self.is_ancestor(&mirror, &record.cycle_base, &candidate.target_head)? {
             return Err(IntegrationCode::IntegrationBaseNotOnTarget.error());
         }
-        self.runtime.reach(IntegrationHook::BeforePush);
+        self.reach(IntegrationHook::BeforePush);
         let request = self.request(
             &mirror,
             None,
@@ -762,7 +808,7 @@ impl<'a> IntegrationGit<'a> {
         if let Ok(result) = &result
             && result.status.success()
         {
-            self.runtime.reach(IntegrationHook::AfterPushBeforeReceipt);
+            self.reach(IntegrationHook::AfterPushBeforeReceipt);
             return Ok(PushOutcome::Integrated(self.receipt(
                 record,
                 candidate,
@@ -996,7 +1042,7 @@ impl<'a> IntegrationGit<'a> {
                     current.files_changed().to_vec(),
                     current.diff_stat().map(str::to_owned),
                     current.turns().to_vec(),
-                    self.runtime.now_millis(),
+                    self.now_millis(),
                 )?
                 .copying_reported_checks(&current)
             },
@@ -1022,7 +1068,7 @@ impl<'a> IntegrationGit<'a> {
                 .flatten(),
             disposition,
             imported: false,
-            recorded_at_millis: self.runtime.now_millis(),
+            recorded_at_millis: self.now_millis(),
         }
     }
 }

@@ -47,6 +47,232 @@ fn legacy_close(f: &GitIntegrationFixture) {
     std::fs::remove_dir_all(f.workspace()).unwrap();
 }
 
+fn acquire_auxiliary(
+    f: &GitIntegrationFixture,
+    prepared: &PreparedIntegrationTurn,
+) -> mac_worker::test_support::task::turn::TaskTurnRequest {
+    use mac_worker::test_support::{
+        core::protocol::MemoryPressure,
+        host::{
+            job::*,
+            lease::{AdmissionFacts, LeaseService},
+        },
+        task::store::SessionBinding,
+    };
+    use uuid::Uuid;
+    let meta = prepared.followup.expected().meta();
+    use mac_worker::test_support::task::turn::{TaskTurnRequest, TurnMaterial};
+    let turn = TurnMaterial::from_prompt(
+        meta.task_id(),
+        prepared.followup.turn_number(),
+        meta.agent(),
+        meta.model().map(str::to_owned),
+        meta.effort().map(str::to_owned),
+        meta.policy(),
+        prepared.approved_turn_limits.clone(),
+        prepared.followup.base_oid().clone(),
+        prepared.followup.composed_prompt(),
+        meta.env_profile().map(str::to_owned),
+        prepared.followup.turn_id().as_uuid(),
+        true,
+    )
+    .unwrap();
+    TaskStore::new(&f.store, &SystemProcessRunner)
+        .bind_session(
+            meta.project_id(),
+            meta.task_id(),
+            SessionBinding::new(meta.agent(), Uuid::from_u128(12).to_string(), 1001).unwrap(),
+        )
+        .unwrap();
+    let material = RequestFingerprintMaterial::new(
+        prepared.followup.turn_id(),
+        ClientId::new(Uuid::from_u128(20)),
+        LeaseToken::new(Uuid::from_u128(21)),
+        1002,
+        prepared.followup.worker().into(),
+        meta.project_id().into(),
+        meta.worktree_id().into(),
+        turn.digest(),
+        String::new(),
+        prepared.approved_turn_limits.timeout_millis,
+        "heavy".into(),
+        CommandSpec::shell("true".into()).unwrap(),
+    )
+    .unwrap();
+    let request = TaskTurnRequest::new(
+        SubmitRequest::new(material.clone())
+            .with_execution_scope(ExecutionScope::task(meta.task_id())),
+        turn,
+        prepared.followup.composed_prompt(),
+    );
+    let acquire = LeaseAcquireRequest::new(material)
+        .with_execution_scope(ExecutionScope::task(meta.task_id()));
+    let healthy = AdmissionFacts {
+        free_disk_bytes: 100 * 1024 * 1024 * 1024,
+        total_disk_bytes: 200 * 1024 * 1024 * 1024,
+        memory_pressure: MemoryPressure::Normal,
+        swap_used_bytes: Some(0),
+    };
+    assert!(matches!(
+        LeaseService::new(&f.store)
+            .acquire(&acquire, &healthy, 1002)
+            .unwrap(),
+        LeaseAcquireResponse::Acquired { .. }
+    ));
+    request
+}
+
+#[test]
+fn auxiliary_publication_records_done_and_leaves_git_for_host_staging() {
+    use mac_worker::test_support::{
+        host::rooted_fs::RootedDir,
+        task::turn::{PreparedTask, TurnPublisher},
+    };
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    let head = f.commit_task();
+    let target = f.advance_target_with("payload.txt", b"theirs\n");
+    f.execute(IntegrationStep::Prepare).unwrap();
+    let prepared = f.prepared(IntegrationTurnPurpose::Resolve);
+    acquire_auxiliary(&f, &prepared);
+    let (meta, status) = TaskStore::new(&f.store, &SystemProcessRunner)
+        .prepare_integration_resume(&prepared)
+        .unwrap();
+    f.write("payload.txt", b"resolved\n");
+    let dir = RootedDir::create(&f.workspace().parent().unwrap().join("aux-output")).unwrap();
+    std::fs::write(dir.path().join("last.md"), br#"{"status":"done","summary":"Resolved","questions":[],"files_changed":["payload.txt"],"checks":[]}"#).unwrap();
+    let result = TurnPublisher::new(&f.store, &SystemProcessRunner)
+        .publish(&PreparedTask::new(meta, status), &dir, Some(0))
+        .unwrap();
+    assert_eq!(result.head_oid(), Some(&head));
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+    assert_eq!(f.git(&["rev-parse", "MERGE_HEAD"]), target.as_str());
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(
+        std::fs::read(f.workspace().join("payload.txt")).unwrap(),
+        b"resolved\n"
+    );
+}
+
+#[test]
+fn auxiliary_admission_persists_purpose_before_accepting_reduced_limits() {
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::{
+            job::JobId,
+            job_service::{JobService, LaunchCandidate, SupervisorLauncher},
+            store::SupervisorGuard,
+        },
+    };
+    struct DoNotLaunch;
+    impl SupervisorLauncher for DoNotLaunch {
+        fn launch(
+            &self,
+            _job: JobId,
+            _guard: SupervisorGuard,
+        ) -> Result<LaunchCandidate, WorkerError> {
+            Err(WorkerError::Unavailable(
+                "fixture does not execute an agent".into(),
+            ))
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.advance_target();
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    f.execute(IntegrationStep::Prepare).unwrap();
+    let prepared = f.prepared(IntegrationTurnPurpose::Verify);
+    let turn = acquire_auxiliary(&f, &prepared);
+    let jobs = JobService::new(&f.store, &DoNotLaunch);
+    assert!(jobs.submit_turn(turn.clone()).is_err());
+    let _ = jobs.submit_integration_turn(&prepared, turn);
+    assert!(
+        f.store
+            .job(
+                prepared.followup.expected().meta().project_id(),
+                prepared.followup.expected().meta().worktree_id(),
+                prepared.followup.turn_id()
+            )
+            .unwrap()
+            .join("meta.json")
+            .is_file()
+    );
+    let task = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    assert!(
+        task.join("integration")
+            .join(format!("turn-{}.json", prepared.followup.turn_id()))
+            .is_file()
+    );
+}
+
+#[test]
+fn candidate_bound_resume_accepts_conflicts_but_ordinary_resume_stays_strict() {
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    let head = f.commit_task();
+    f.advance_target_with("payload.txt", b"theirs\n");
+    f.execute(IntegrationStep::Prepare).unwrap();
+    let prepared = f.prepared(IntegrationTurnPurpose::Resolve);
+    acquire_auxiliary(&f, &prepared);
+    let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+    assert!(
+        tasks
+            .prepare_resume(
+                &f.record.policy.project_id,
+                f.record.task_id,
+                prepared.followup.turn_id(),
+                prepared.followup.turn_number(),
+                prepared.followup.worker(),
+                &head
+            )
+            .is_err()
+    );
+    let (_, status) = tasks.prepare_integration_resume(&prepared).unwrap();
+    assert_eq!(status.state(), TaskState::Active);
+    assert_eq!(status.head_oid(), Some(&head));
+    assert_eq!(
+        status.turns().last().unwrap().turn_id(),
+        prepared.followup.turn_id()
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+}
+
+#[test]
+fn verifier_launch_refuses_an_index_tree_outside_the_pinned_candidate() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.advance_target();
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    f.execute(IntegrationStep::Prepare).unwrap();
+    let prepared = f.prepared(IntegrationTurnPurpose::Verify);
+    acquire_auxiliary(&f, &prepared);
+    f.write("tampered.txt", b"tampered\n");
+    f.git(&["add", "tampered.txt"]);
+    let error = TaskStore::new(&f.store, &SystemProcessRunner)
+        .prepare_integration_resume(&prepared)
+        .unwrap_err();
+    assert_eq!(
+        error.public_code(),
+        IntegrationCode::IntegrationVerifyTreeMismatch.as_str()
+    );
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Open
+    );
+}
+
 #[test]
 fn armed_policy_reads_without_an_intent_and_survives_idle_gc() {
     let mut f = GitIntegrationFixture::new();
