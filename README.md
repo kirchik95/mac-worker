@@ -6,7 +6,7 @@
 
 **Send a coding task to another Mac. Get a Git branch back.**
 
-Run Codex, Cursor, OpenCode or Claude Code on your spare Macs over SSH. Each task gets its own Git worktree; you review and merge the result on your laptop.
+Run Codex, Cursor, OpenCode or Claude Code on your spare Macs over SSH. Each task gets its own Git worktree. Opt in to automatic integration into a branch on origin, or fetch the result for manual review with integration disabled.
 
 https://github.com/user-attachments/assets/42c5a94c-e1ba-4ecb-a30b-c94fe3417efa
 
@@ -53,7 +53,7 @@ Open your project, a Git repository with at least one commit:
 
 ```bash
 cd /path/to/your/project
-worker task submit --agent codex --wait \
+worker task submit --agent codex --no-integrate --wait \
   --prompt "Create SETUP_CHECK.md containing: mac-worker works."
 ```
 
@@ -65,7 +65,33 @@ worker task diff <task-id> --stat
 worker task fetch <task-id>
 ```
 
-`result` prints the outcome and summary. `diff --stat` compares the task's base commit with its published result. A successful turn uses the default close policy and removes the worker workspace; `diff` still works from the base and result commits kept in that worker's project mirror. If collection has already dropped those commits, `diff` fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`. `fetch` prints the Git ref to review. Your current working tree stays unchanged; you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
+`result` prints the outcome and summary. `diff --stat` compares the task's base commit with its published result. With integration disabled here, a successful turn uses the default close policy and removes the worker workspace; `diff` still works from the base and result commits kept in that worker's project mirror. If collection has already dropped those commits, `diff` fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`. `fetch` prints the Git ref to review. Your current working tree stays unchanged. In this manual flow, you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
+
+## Automatic integration
+
+Integration is opt-in and disabled by default. Add this to the project's `.worker.toml` to target its own origin:
+
+```toml
+[task]
+integrate = "main"
+verify_merge = "never"
+```
+
+<!-- Part 2: reconcile T6 lifecycle and notification wiring. -->
+Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. The notifier reports `Task integrated into main`. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
+
+Task overrides take precedence over batch defaults, then project settings. Submit `--no-integrate` disables inherited integration. Verification defaults to `never`; resolve and verify turns share the task's `max_followups` allowance. Integration requires a committed base already reachable from the target; `--wip` cannot integrate.
+
+<!-- Part 2: reconcile T6 drain, disable, rollback and resume. -->
+Use `worker controller drain` to pause new integration phases and auxiliary admissions; an admitted step or running turn finishes before parking. Resume explicitly with `worker controller drain --off`. Controller disable and helper rollback also stop new integration work; restore compatible support and the owner gate before resuming retained Open tasks.
+
+<!-- Part 2: reconcile T6 legacy retention settlement. -->
+rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations
+
+<!-- Part 2: reconcile T6 legacy retention settlement. -->
+GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs; compatible restore observes any uncertain push while keeping a host-closed task Closed.
+
+When integration is disabled, blocked, or given up, you can still inspect and fetch the retained result for manual review. Manual `task close` keeps the result and gives up unfinished integration; it never authorizes a merge. [Integration settings, checks, safety limits and recovery](docs/usage.md#automatic-integration).
 
 ## Daily use
 

@@ -29,7 +29,8 @@ Default laptop queue: without `--wait`, `submit`, `batch`, and `say` return as s
 
 Enabled remote controller: without `--wait`, those commands return on a durable `host controller-rpc` ACK. That ACK means the request is persisted on the controller store. It does not mean a runner has started, or that the agent is running — enabled submit can stay queued (`park_only`) until the leader starts a runner. Keep `worker controller run` for autonomous progress. With `--wait` the CLI waits until the selected task or run is quiescent. Logs remain a separate command (`worker task logs`).
 
-`list`, `status`, `result`, `diff`, and `logs` are read-only; `submit`, `batch`, `say`, `cancel`, `close`, `wait`, and `reconcile` perform runner recovery first.
+<!-- Part 2: reconcile T6 stop ordering at public entry points. -->
+`list`, `status`, `result`, `diff`, and `logs` are read-only. `submit`, `batch`, `say`, `wait`, and `reconcile` drive ordinary recovery. Configured close/cancel/interrupt records its stop authority before integration recovery can start more work; do not run a separate reconcile before a requested stop.
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events. Serialized log chunks use standard padded base64 in the `data` field.
 
@@ -60,16 +61,31 @@ Keep the returned run identifier and all task identifiers.
 
 ### Choose The Context
 
-- **Native session:** use `worker task submit --from-session claude[:<uuid>]` or `codex[:<uuid>]` to continue an interactive conversation with lots of useful context. Start it in this project's root; omit the id for the latest matching session. Still supply `--prompt "<what to do next>"`; add `--wip` for a dirty checkout. The laptop original stays usable; the pool continues a copy under pool policy. Confirm the user is comfortable copying it: secret scrubbing is incomplete. Only snapshot-sourced `task submit` supports this, not batches or DAG children.
+- **Native session:** use `worker task submit --from-session claude[:<uuid>]` or `codex[:<uuid>]` to continue an interactive conversation with lots of useful context. Start it in this project's root; omit the id for the latest matching session. Still supply `--prompt "<what to do next>"`. A dirty checkout needs `--wip`, which is incompatible with integration (`INTEGRATION_WIP_BASE`): commit the intended base before integrating, or use `--no-integrate` when the user wants a manual result. The laptop original stays usable; the pool continues a copy under pool policy. Confirm the user is comfortable copying it: secret scrubbing is incomplete. Only snapshot-sourced `task submit` supports this, not batches or DAG children.
 - **Handoff note:** for Cursor, OpenCode, unsupported worker versions, or a different target agent, ask: “Write `.worker/handoff.md` with the goal, what is done, current state including uncommitted changes, decisions and constraints, open questions, and exact next steps. Do not include secrets.” Review it, then submit a fresh conversation:
 
   ```text
-  worker task submit --wip --include .worker/handoff.md --prompt "Read .worker/handoff.md and continue the work it describes."
+  worker task submit --no-integrate --wip --include .worker/handoff.md --prompt "Read .worker/handoff.md and continue the work it describes."
   ```
 
 - **Fresh brief:** for independent work that does not need the old conversation, use `pool-task-authoring` and the normal prompt-file submit above.
 
 Check the installed grammar before using these forms. Details and failure hints: repository `docs/usage.md`, “Continue a laptop session in the pool”.
+
+<!-- Part 2: reconcile T6 nested source and paired-pin retry wiring. -->
+For an integrating session submit, retry the same frozen controller envelope only after the source stream is complete. Keep its paired base/session pins until acknowledgement or request retirement; do not capture the live laptop conversation again. Pre-record failure or submission rollback releases paired task pins idempotently. Auxiliary repair resumes the imported worker session without importing or replacing it again. Integration never sends session packages or transport refs to origin.
+
+## Automatic Integration
+
+Use the project's configured automatic integration policy. It is opt-in and disabled by default. Do not enable it, pick another target, or disable an inherited policy merely to bypass a refusal. Submit/task overrides win over batch defaults, then `.worker.toml` `[task]` settings. The target is a short branch on the project's own canonical origin. An unavailable helper/controller refuses enabled work with `INTEGRATION_UNAVAILABLE`; there is no ordinary fallback.
+
+<!-- Part 2: reconcile T6 integration reads, finalization and re-drive wiring. -->
+Follow the `integration` snapshot and `workflow_state`, not ordinary `done` alone. Pending/parked work is still automatic; integrated success needs no accept or manual close. Conflicts use the same worker, agent and session. If integration is blocked, read its stable code, result and logs, repair the cause within the user's scope, then use the installed `worker task integrate <id>` grammar to re-drive the same source and target. If repair needs code changes, use a normal `say` with guidance after the stop barrier; its next Done result starts a new cycle.
+
+Verification defaults to `never`. Resolve and verify turns consume the ordinary `max_followups` allowance; re-drive cannot replenish it. A source with checks requires a nonempty all-pass recovery report; a source with no checks may have an empty recovery report. Any `fail` or `error` blocks. The host does not run project checks, and agent claims are not independent verification.
+
+<!-- Part 2: reconcile T6 pause, rollback and explicit resume. -->
+Controller drain, disable and helper rollback stop new integration phases and auxiliary admissions. Admitted steps and running turns finish before parking. Respect the operator's pause; resume requires compatible support and an explicitly reopened owner gate. Parking preserves remaining active admission time, auxiliary ID, queue position and spent follow-ups. A running auxiliary keeps its execution timeout. A pre-feature helper can lose the repair workspace after seven idle host-status days; see [the operator warning and settlement limits](../../../docs/usage.md#pause-stop-and-rollback).
 
 ## Follow
 
@@ -114,15 +130,15 @@ worker task say <id> --message-file <file> --wait
 
 Do not send a message to an active turn. `say` is for the next turn. A `say` while a turn is running is `TASK_BUSY`.
 
-When a task reports `done`, fetch its result:
+With integration disabled, an ordinary `done` result is ready for manual review. Fetch it:
 
 ```text
 worker task fetch <id>
 ```
 
-Report the remote-tracking ref returned by `fetch`.
+Report the remote-tracking ref returned by `fetch`. For configured integration, report its target/state and merge or observed OID; fetch remains available for inspection after settlement. Do not close a pending or parked integration just because its source turn said `done`.
 
-When a task reports `blocked`, or its turn fails, inspect both the structured result and the logs:
+When an ordinary turn reports `blocked` or fails, inspect both the structured result and the logs below. An integration-blocked task follows the re-drive loop above instead of automatic discard:
 
 ```text
 worker task result <id> --json
@@ -135,13 +151,14 @@ Then either write guidance and use `say`, or discard the task:
 worker task close <id> --discard
 ```
 
-Close every finished task:
+For a settled manual result, close only when keeping the result or giving up integration is the intended decision:
 
 ```text
 worker task close <id>
 ```
 
-`worker task reconcile` re-owns dead runners and re-enqueues orphaned tasks. It does not submit work.
+<!-- Part 2: reconcile T6 direct driver recovery. -->
+`worker task reconcile` re-owns dead runners, re-enqueues orphaned tasks and recovers retained integration intents; it does not submit new work. In direct mode a dead integration child needs laptop `wait` or `reconcile`; a powered-off laptop provides no unattended recovery. Controller tasks remain with their controller owner after disable.
 
 ## Liveness And Settlement
 
@@ -157,18 +174,21 @@ worker workers --refresh
 
 and act on each row's blocking code. `worker task reconcile` is the operator's reset for a parked turn; run it after reading the worker, not instead of reading it.
 
-A finished task owes exactly one decision after `fetch`: a follow-up with `say` (the same agent session continues), keeping it open for inspection, or `close` (`--discard` also deletes the session on the worker). `close` is post-settlement cleanup, never a cancellation; use `cancel` for a running turn.
+A settled manual task needs a decision: follow up with `say`, keep it Open for inspection, or close while keeping the result (`--discard` also deletes the session and retained result on the worker). Automatic integrated success needs no accept. Manual close gives up unfinished integration or keeps its result; it is never permission to merge. Use `cancel` for a running ordinary turn.
+
+<!-- Part 2: reconcile T6 stop uncertainty and mutation acknowledgement. -->
+If an integration stop cannot be confirmed, `INTEGRATION_STOP_UNCONFIRMED` leaves the task nonterminal with the mutation pending. Restore connectivity and observe again; do not report close/cancel/discard as complete. A committed target update is retained, never undone by this skill. `INTEGRATION_ALREADY_COMMITTED` means integration won before cancellation.
 
 ## Rules
 
-- Never merge, check out, or push from this skill.
+- Use configured automatic integration through the task CLI. Never run this skill's own laptop Git merge, checkout, or push.
 - Never read environment profiles.
 - Never pick workers. The pool does. `--worker` is a diagnostic pin, never an SSH destination.
 - Keep task identifiers and the run identifier; do not infer them from display order.
 - Keep tasks independent. Do not use one task's workspace as another task's workspace.
 - Never write a message into a running agent. Conversation is `say` between turns only.
-- Never ask an agent to commit, switch branches, or push. The publisher commits the worktree changes after the turn; on Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
-- A task with the default `--close-on done` closes itself after a `done` turn and the worker deletes the task workspace. `worker task diff` then reads the retained base and result commits in the worker project mirror. `close --discard` also deletes the agent's session on the worker and drops those commits.
+- Never ask an agent to commit, switch branches, or push. The publisher commits ordinary turn changes; the integration helper commits accepted resolution. On Codex the sandbox keeps `.git` read-only and a commit attempt ends the turn `blocked`.
+- With integration disabled, default `--close-on done` closes after a `done` turn and removes the workspace. Configured tasks settle integration and result import first; requested `never` keeps the Open session. `diff` after close reads retained mirror commits. Discard follows confirmed integration stop, deletes the worker session and drops retained task commits; it never rewinds origin.
 - Read the durable task outcome as well as the process exit status. A zero exit with status `blocked` is a failed turn.
 - Never restart, resubmit, or repair a turn on an unverifiable observation. Restart only on positive proof the runner or the worker job exited; otherwise keep waiting or inspect.
 - Verify the installed grammar before every dispatch: `worker skills get pool-dispatch --grammar-only` and `worker task submit --help` are the source of truth, not this file.
