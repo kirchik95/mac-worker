@@ -247,8 +247,7 @@ fn first_prompt_preview(text: &[u8]) -> Result<Option<String>, WorkerError> {
         let line: Value = serde_json::from_slice(line).map_err(|_| unreadable_meta())?;
         let payload = &line["payload"];
         if line["type"] == "event_msg"
-            && payload["type"] == "user_message"
-            && let Some(message) = payload["message"].as_str().and_then(preview)
+            && let Some(message) = typed_prompt(payload).and_then(preview)
         {
             return Ok(Some(message));
         }
@@ -259,12 +258,33 @@ fn first_prompt_preview(text: &[u8]) -> Result<Option<String>, WorkerError> {
             && let Some(content) = payload["content"].as_array()
             && let Some(input) = content.iter().find(|item| item["type"] == "input_text")
             && let Some(text) = input["text"].as_str()
-            && !text.trim_start().starts_with('<')
+            && !injected_context(text)
         {
             fallback = preview(text);
         }
     }
     Ok(fallback)
+}
+
+/// The prompt the user typed: older Codex writes `user_message` events,
+/// newer releases write completed `UserMessage` items.
+fn typed_prompt(payload: &Value) -> Option<&str> {
+    match payload["type"].as_str()? {
+        "user_message" => payload["message"].as_str(),
+        "item_completed" if payload["item"]["type"] == "UserMessage" => payload["item"]["content"]
+            .as_array()?
+            .iter()
+            .find(|item| item["type"] == "text")?["text"]
+            .as_str(),
+        _ => None,
+    }
+}
+
+/// Codex also records the context it injects as user messages: tagged
+/// wrappers such as `<environment_context>` and the AGENTS.md instructions.
+fn injected_context(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('<') || text.starts_with("# AGENTS.md instructions")
 }
 
 fn preview(text: &str) -> Option<String> {
