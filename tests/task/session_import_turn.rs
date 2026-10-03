@@ -457,7 +457,6 @@ fn crashed_imported_first_turn_replays_with_the_same_lease_fingerprint() {
 }
 
 #[test]
-#[ignore = "wave-2 baseline rejects SessionRefPush; run after W6 integration"]
 fn imported_first_turn_pushes_prepares_verifies_then_submits() {
     let fixture = RunnerFixture::new(AgentKind::Codex, true, false, false);
     let error = fixture.run();
@@ -488,7 +487,6 @@ fn imported_first_turn_pushes_prepares_verifies_then_submits() {
 }
 
 #[test]
-#[ignore = "wave-2 baseline rejects SessionRefPush; run after W6 integration"]
 fn imported_prepare_binding_mismatch_fails_before_submission() {
     let fixture = RunnerFixture::new(AgentKind::Claude, true, false, true);
     assert_eq!(fixture.run().public_code(), "SESSION_PLACEMENT_FAILED");
