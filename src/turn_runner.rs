@@ -1551,7 +1551,17 @@ impl<'a> TurnRunner<'a> {
                         turn_origin_url(initial_record.meta()),
                     )?
                     .with_herdr_reporter(worker.herdr);
-                    let response = match remote.submit_turn(worker, &request) {
+                    let auxiliary =
+                        crate::integration::store::RootedIntegrationState::read_auxiliary(
+                            self.paths, task_id, turn_id,
+                        )?;
+                    let submitted = match auxiliary {
+                        Some(auxiliary) => {
+                            remote.submit_integration_turn(worker, &auxiliary, &request)
+                        }
+                        None => remote.submit_turn(worker, &request),
+                    };
+                    let response = match submitted {
                         Ok(response) => response,
                         Err(error) => {
                             let resolve = ResolveOrAbandonRequest::from_submit_request(

@@ -1291,9 +1291,22 @@ impl<'a> TaskClient<'a> {
         if !self.integration_enabled(task)? {
             return Ok(record.clone());
         }
-        let coordinator = self
-            .integration
-            .ok_or_else(|| IntegrationCode::IntegrationUnavailable.error())?;
+        let native;
+        let coordinator;
+        let coordinator = match self.integration {
+            Some(coordinator) => coordinator,
+            None => {
+                native = crate::integration::runner::OwnerIntegration::new(
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    self.client_state,
+                    self.executor,
+                )?;
+                coordinator = native.coordinator();
+                &coordinator
+            }
+        };
         let Some(snapshot) = coordinator.snapshot(task)? else {
             return Ok(record.clone());
         };
@@ -4437,7 +4450,6 @@ impl<'a> TaskClient<'a> {
 
     /// Admit the already frozen auxiliary through the ordinary queue and allowance.
     /// T6 supplies the production IntegrationTurns adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn say_integration_prepared(
         &self,
         prepared: &crate::integration::contracts::PreparedIntegrationTurn,

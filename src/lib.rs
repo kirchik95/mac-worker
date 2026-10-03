@@ -2872,6 +2872,24 @@ fn run_command_with_stdio_in_context(
     if matches!(
         &cli.command,
         Command::Host {
+            command: HostCommand::TaskIntegrationTurn
+        }
+    ) {
+        return run_host_control_endpoint(
+            cli.config,
+            runtime,
+            stdin,
+            stdout,
+            |request: crate::integration::remote::IntegrationTurnRequest, store, launcher| {
+                crate::integration::contracts::ValidateIntegration::validate(&request)?;
+                JobService::new(store, launcher)
+                    .submit_integration_turn(&request.prepared, request.request)
+            },
+        );
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
             command: HostCommand::TaskStatus
         }
     ) {

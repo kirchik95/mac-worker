@@ -750,7 +750,6 @@ impl<'a> RemoteJobClient<'a> {
         Ok(response)
     }
 
-    #[allow(dead_code)] // T6 wires the integration transport operation.
     pub fn submit_integration_turn(
         &self,
         worker: &WorkerEntry,

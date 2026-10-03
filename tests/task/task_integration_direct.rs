@@ -442,6 +442,209 @@ fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
     );
 }
 
+fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> IntegrationRecord {
+    let wait = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "60s",
+    ]);
+    assert!(
+        wait.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&wait.stdout),
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    let owner = RootedIntegrationState::open(
+        &owner_paths(f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let record = owner.load(task).unwrap().unwrap();
+    assert_eq!(
+        record.snapshot.state,
+        IntegrationStatus::Integrated,
+        "{:?}",
+        record.snapshot
+    );
+    record
+}
+
+#[test]
+fn never_receipt_is_idempotent_and_the_next_say_uses_its_accepted_head() {
+    use mac_worker::test_support::{client_state::ClientStateStore, session::SessionAgent};
+    let f = integration_fixture(true);
+    let source = f.capture_fixture(SessionAgent::Codex);
+    let original = std::fs::read(&source).unwrap();
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent).unwrap().replace(
+        "printf '%s\\n' \"$@\" > \"$HOME/argv\"",
+        "count=0; [ ! -f \"$HOME/turn-count\" ] || count=$(cat \"$HOME/turn-count\")\ncount=$((count + 1)); printf '%s' \"$count\" > \"$HOME/turn-count\"\nprintf 'ordinary %s\\n' \"$count\" > T6-result\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
+    );
+    std::fs::write(agent, script).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce work",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]));
+    let first = wait_integrated(&f, task);
+    let accepted = first.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
+    let reconcile = f.worker(&["--json", "task", "reconcile"]);
+    assert!(
+        reconcile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconcile.stdout)
+    );
+    let owner = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        owner.load(task).unwrap().unwrap().snapshot.integration_id,
+        first.snapshot.integration_id
+    );
+    let say = f.worker(&[
+        "--json",
+        "task",
+        "say",
+        &task.to_string(),
+        "--message",
+        "produce later work",
+        "--wait",
+    ]);
+    assert!(
+        say.status.success(),
+        "out={} err={}",
+        String::from_utf8_lossy(&say.stdout),
+        String::from_utf8_lossy(&say.stderr)
+    );
+    let next = wait_integrated(&f, task);
+    assert_ne!(next.snapshot.integration_id, first.snapshot.integration_id);
+    assert_eq!(&next.cycle_base, accepted);
+    assert_eq!(next.archived_receipts, vec![first.receipt.unwrap()]);
+    let local = ClientStateStore::open(&owner_paths(&f).state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(local.status().state(), TaskState::Open);
+    assert_eq!(local.status().turns().len(), 2);
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(journal.matches("host task-prepare\n").count(), 1);
+}
+
+#[test]
+fn conflict_auxiliary_resumes_the_imported_session_without_ordinary_publication() {
+    use mac_worker::test_support::{client_state::ClientStateStore, session::SessionAgent};
+    let f = integration_fixture(true);
+    let source = f.capture_fixture(SessionAgent::Codex);
+    let original = std::fs::read(&source).unwrap();
+    f.install_agent(SessionAgent::Codex);
+    let target = f.laptop.parent().unwrap().join("outside");
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    f.project
+        .git(&["clone", origin.to_str().unwrap(), target.to_str().unwrap()]);
+    f.project.git(&[
+        "-C",
+        target.to_str().unwrap(),
+        "config",
+        "user.email",
+        "fixture@example.test",
+    ]);
+    f.project.git(&[
+        "-C",
+        target.to_str().unwrap(),
+        "config",
+        "user.name",
+        "Fixture",
+    ]);
+    let agent = f.host.join("bin/codex");
+    let work = format!(
+        r#"count=0; [ ! -f "$HOME/turn-count" ] || count=$(cat "$HOME/turn-count")
+count=$((count + 1)); printf '%s' "$count" > "$HOME/turn-count"
+if [ "$count" = 1 ]; then
+  printf 'ordinary\n' > README
+  (cd '{}' && printf 'outside\n' > README && /usr/bin/git add README && /usr/bin/git commit -m outside && /usr/bin/git push origin main) >/dev/null 2>&1 || exit 95
+else
+  /usr/bin/git rev-parse MERGE_HEAD > "$HOME/aux-target" || exit 96
+  /usr/bin/git rev-parse HEAD > "$HOME/aux-head"
+  printf 'resolved\n' > README
+fi
+printf '%s\n' "$@" > "$HOME/argv""#,
+        target.display()
+    );
+    let script = std::fs::read_to_string(&agent).unwrap().replace("printf '%s\\n' \"$@\" > \"$HOME/argv\"", &work)
+        .replace("done < \"$HOME/placed-files\"\n", "done < \"$HOME/placed-files\"\nwhile IFS= read -r file; do printf '%s\\n' '{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"native append\"}}' >> \"$file\"; done < \"$HOME/placed-files\"\n");
+    std::fs::write(agent, script).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce conflict",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]));
+    let record = wait_integrated(&f, task);
+    assert_eq!(record.snapshot.resolve_turns, 1);
+    assert_eq!(
+        record.snapshot.verification,
+        IntegrationVerification::ResolveAgentReport
+    );
+    let auxiliary = &record.auxiliaries[0];
+    assert!(auxiliary.accepted && auxiliary.completed);
+    assert!(auxiliary.queue_position.is_some());
+    let local = ClientStateStore::open(&owner_paths(&f).state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(local.status().turns().len(), 2);
+    assert_eq!(local.status().turns()[1].turn_id(), auxiliary.turn_id);
+    let merge = record.receipt.unwrap().merge_oid.unwrap();
+    assert_eq!(
+        f.project.git(&["show", &format!("{merge}:README")]).stdout,
+        b"resolved\n"
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    let placed = std::fs::read_to_string(f.host.join("placed-files")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(placed.lines().next().unwrap())
+            .unwrap()
+            .matches("native append")
+            .count(),
+        2
+    );
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(journal.matches("host task-prepare\n").count(), 1);
+    assert_eq!(journal.matches("host task-turn\n").count(), 1);
+    assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+}
+
 #[test]
 fn direct_import_is_complete_and_host_is_armed_before_the_first_launch() {
     use mac_worker::test_support::session::SessionAgent;

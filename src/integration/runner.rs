@@ -44,7 +44,7 @@ impl OwnerRuntime {
     pub(crate) fn new(paths: &PathLayout, client: &ClientStateStore) -> Result<Self, WorkerError> {
         Ok(Self {
             paths: paths.clone(),
-            client: client.reopen_until(None)?,
+            client: client.with_wait_deadline(client.wait_deadline()),
             actor: crate::turn_runner::current_process_identity()?,
             helper_unavailable: AtomicBool::new(false),
         })
