@@ -93,6 +93,109 @@ fn policies() -> BTreeMap<TaskId, Option<FrozenIntegrationPolicy>> {
 }
 
 #[test]
+fn noncanonical_origins_are_rejected_before_real_owner_and_host_policy_persistence() {
+    use mac_worker::test_support::{core::paths::PathLayout, host::process::SystemProcessRunner};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::Arc;
+    for origin in [
+        "https://review-user@example.invalid/repo.git",
+        "https://review-user:invented-password@example.invalid/repo.git",
+        "https://example.invalid/repo.git?token=invented-token",
+        "https://example.invalid/repo.git#invented-fragment",
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        let paths = PathLayout {
+            state: f.workspace().join("owner-state"),
+            data: f.workspace().join("owner-data"),
+            cache: f.workspace().join("owner-cache"),
+            config: f.workspace().join("owner-config"),
+        };
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        let mut policy = f.record.policy.clone();
+        policy.origin = origin.into();
+        // Give the host a matching task for this invented canonical remote. Arm
+        // does no Git/network I/O; an unrelated project mismatch must not mask
+        // the policy persistence defect.
+        let old_task = f
+            .store
+            .task_dir(&policy.project_id, f.record.task_id)
+            .unwrap();
+        policy.project_id = format!(
+            "{:x}",
+            Sha256::digest(b"origin\0https://example.invalid/repo.git")
+        );
+        let task_root = f
+            .store
+            .task_dir(&policy.project_id, f.record.task_id)
+            .unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&task_root)
+            .unwrap();
+        for name in ["meta.json", "status.json"] {
+            std::fs::copy(old_task.join(name), task_root.join(name)).unwrap();
+        }
+        let meta_path = task_root.join("meta.json");
+        let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta["project_id"] = json!(policy.project_id);
+        let meta: mac_worker::test_support::task::model::TaskMeta =
+            serde_json::from_value(meta).unwrap();
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let request = HostIntegrationRequest {
+            protocol_version: 7,
+            task_id: f.record.task_id,
+            integration_id: None,
+            epoch: 0,
+            revision: IntegrationRevision(0),
+            action: HostIntegrationAction::Arm {
+                policy: policy.clone(),
+            },
+        };
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        assert_eq!(
+            host.execute(&request).unwrap_err().public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        assert!(!task_root.join("integration/policy.json").exists());
+        assert_eq!(
+            state
+                .publish_policy(f.record.task_id, &policy)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        assert_eq!(state.load_policy(f.record.task_id).unwrap(), None);
+        assert!(
+            serde_json::from_value::<FrozenIntegrationPolicy>(
+                serde_json::to_value(&policy).unwrap()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn canonical_file_and_remote_policies_remain_valid_on_the_strict_wire() {
+    let f = GitIntegrationFixture::new();
+    for policy in [f.record.policy.clone(), sample_policy("main")] {
+        policy.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<FrozenIntegrationPolicy>(
+                serde_json::to_value(&policy).unwrap()
+            )
+            .unwrap(),
+            policy
+        );
+    }
+}
+
+#[test]
 fn integrating_submit_freezes_effective_never_and_refuses_unsafe_bindings() {
     let mut policy = sample_policy("main");
     policy.requested_close = ClosePolicy::Done;

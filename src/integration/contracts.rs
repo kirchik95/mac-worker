@@ -269,7 +269,9 @@ impl ValidateIntegration for FrozenIntegrationPolicy {
         {
             return Err(invalid());
         }
-        canonical_origin(&self.origin)?;
+        if canonical_origin(&self.origin)? != self.origin {
+            return Err(invalid());
+        }
         validate_integration_target(self.target.as_str())?;
         check_size(self, MAX_PRIVATE_RECORD_BYTES)
     }
