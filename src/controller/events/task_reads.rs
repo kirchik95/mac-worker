@@ -76,6 +76,7 @@ pub struct TaskReadResult<T> {
 }
 
 pub struct TaskEventReadStore {
+    integrations: Option<Arc<dyn crate::integration::contracts::IntegrationState>>,
     root: RootedDir,
     tasks: RootedDir,
     queue: RootedDir,
@@ -120,13 +121,25 @@ impl TaskProjectionReader for TaskEventReadStore {
 }
 
 pub struct ExistingTaskProjectionProvider {
+    integrations: Option<Arc<dyn crate::integration::contracts::IntegrationState>>,
     paths: PathLayout,
     runtime: Arc<dyn EventRuntime>,
 }
 
 impl ExistingTaskProjectionProvider {
+    pub fn with_integrations(
+        mut self,
+        state: Arc<dyn crate::integration::contracts::IntegrationState>,
+    ) -> Self {
+        self.integrations = Some(state);
+        self
+    }
     pub fn new(paths: PathLayout, runtime: Arc<dyn EventRuntime>) -> Self {
-        Self { paths, runtime }
+        Self {
+            paths,
+            runtime,
+            integrations: None,
+        }
     }
 }
 
@@ -143,13 +156,47 @@ impl TaskProjectionProvider for ExistingTaskProjectionProvider {
         if self.runtime.now() >= deadline {
             return Err(invalid_state());
         }
-        let store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
+        let mut store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
+        store.integrations = self.integrations.clone();
         store.check_deadline(deadline)?;
         Ok(Arc::new(store))
     }
 }
 
 impl TaskEventReadStore {
+    pub fn with_integrations(
+        mut self,
+        state: Arc<dyn crate::integration::contracts::IntegrationState>,
+    ) -> Self {
+        self.integrations = Some(state);
+        self
+    }
+    fn facts(
+        &self,
+        record: &LocalTaskRecord,
+        dispatching: Option<bool>,
+        include_titles: bool,
+    ) -> Result<TaskFacts, WorkerError> {
+        use crate::integration::contracts::ValidateIntegration;
+        let facts = record_facts(record, dispatching, include_titles)?;
+        let Some(state) = &self.integrations else {
+            return Ok(facts);
+        };
+        let id = record.meta().task_id();
+        match state.load(id)? {
+            Some(integration) => {
+                integration.validate()?;
+                if integration.task_id != id {
+                    return Err(invalid_state());
+                }
+                facts.with_integration(record, &integration.snapshot)
+            }
+            None if state.load_policy(id)?.is_some() => {
+                Err(crate::integration::contracts::integration_unavailable())
+            }
+            None => Ok(facts),
+        }
+    }
     pub fn open_existing(
         paths: &PathLayout,
         runtime: Arc<dyn EventRuntime>,
@@ -163,6 +210,7 @@ impl TaskEventReadStore {
         let turns = open_directory(&root, "turns")?;
         let client_id = read_client_id(&root)?;
         Ok(Self {
+            integrations: None,
             root,
             tasks,
             queue,
@@ -217,7 +265,7 @@ impl TaskEventReadStore {
                 result.missing.push(id);
                 continue;
             };
-            let facts = record_facts(&record, None, include_titles)?;
+            let facts = self.facts(&record, None, include_titles)?;
             let known_busy = facts.busy == Some(true);
             let namespace = if known_busy {
                 None
@@ -458,7 +506,7 @@ impl TaskEventReadStore {
                     } else {
                         self.dispatching(id, &queue, deadline, stats)?
                     };
-                rows.push(record_facts(&record, dispatching, false)?);
+                rows.push(self.facts(&record, dispatching, false)?);
             }
             processed += 1;
         }
@@ -851,6 +899,63 @@ pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError>
         return Err(invalid_state());
     }
     Ok(())
+}
+
+impl TaskFacts {
+    /// Add only the compact companion annotation and bind its revision to the digest.
+    pub fn with_integration(
+        mut self,
+        record: &LocalTaskRecord,
+        snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    ) -> Result<Self, WorkerError> {
+        use crate::integration::contracts::IntegrationStatus;
+        if self.task_id != record.meta().task_id() {
+            return Err(invalid_state());
+        }
+        let annotation = snapshot.annotation()?;
+        let mut hash = Sha256::new();
+        hash.update(b"mac-worker/integration-facts/v1\0");
+        let ordinary = record.canonical_bytes().map_err(|_| invalid_state())?;
+        hash.update((ordinary.len() as u64).to_be_bytes());
+        hash.update(ordinary);
+        hash.update(serde_json::to_vec(&annotation).map_err(|_| invalid_state())?);
+        self.fact_digest = format!("{:x}", hash.finalize());
+        match snapshot.state {
+            IntegrationStatus::Blocked => {
+                self.outcome = Some(crate::controller::events::SafeOutcome::Blocked);
+                self.code = annotation.code.map(|code| {
+                    crate::controller::events::SafeCode::from_public_code(code.as_str())
+                });
+            }
+            IntegrationStatus::Integrated => {
+                self.outcome = Some(crate::controller::events::SafeOutcome::Done);
+                self.code = None;
+            }
+            IntegrationStatus::Revoked => {}
+            _ => {
+                self.busy = Some(true);
+                self.quiescent = Some(false);
+            }
+        }
+        self.integration_confirmation = None;
+        self.integration = Some(annotation);
+        // Optional display text is the only field that may yield its byte budget.
+        loop {
+            let bytes = serde_json::to_vec(&self).map_err(|_| invalid_state())?;
+            if bytes.len() <= crate::controller::events::MAX_TASK_FACT_BYTES {
+                break;
+            }
+            let Some(title) = self.title.as_mut() else {
+                return Err(invalid_state());
+            };
+            if title.pop().is_none() {
+                self.title = None;
+            }
+        }
+        self.validate()?;
+        ensure_produced_task_facts_bytes(&serde_json::to_vec(&self).map_err(|_| invalid_state())?)?;
+        Ok(self)
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {

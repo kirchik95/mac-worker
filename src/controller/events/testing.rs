@@ -406,11 +406,18 @@ pub struct ScriptedEventSource {
     discovery: Script<EventSupport>,
     reads: Script<EventReadResult>,
     tasks: Script<TaskFactsBatch>,
+    integrations: Script<crate::integration::contracts::IntegrationReadResult>,
     repair: Script<TaskRepairPage>,
     requests: Mutex<Vec<CapturedEventRequest>>,
     discovery_deadlines: Mutex<Vec<Duration>>,
 }
 impl ScriptedEventSource {
+    pub fn queue_integrations(
+        &self,
+        result: Result<crate::integration::contracts::IntegrationReadResult, WorkerError>,
+    ) -> Result<(), WorkerError> {
+        self.integrations.push(result)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -449,6 +456,13 @@ impl ScriptedEventSource {
     }
 }
 impl EventSource for ScriptedEventSource {
+    fn integrations(
+        &self,
+        _task_ids: &[TaskId],
+        _deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        self.integrations.pop()
+    }
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
         let mut deadlines = self.discovery_deadlines.lock().unwrap();
         if deadlines.len() == MAX_RECONCILIATION_ROWS {
@@ -1005,6 +1019,7 @@ impl TaskFacts {
         quiescent: bool,
     ) -> Self {
         let mut facts = Self {
+            integration_confirmation: None,
             integration: None,
             task_id,
             run_id: None,

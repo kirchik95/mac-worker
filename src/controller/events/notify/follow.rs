@@ -256,6 +256,12 @@ impl NotifyLoop<'_> {
                 }
             };
             result.validate()?;
+            if !confirm_integrations(self.source, &mut result, deadline) {
+                writeln!(
+                    diagnostics,
+                    "integration confirmation unavailable or changed; notification deferred"
+                )?;
+            }
             retry = 0;
             if *staged.journal_available.lock().unwrap() == Some(false) {
                 result.consumed_after = None;
@@ -320,6 +326,82 @@ impl NotifyLoop<'_> {
             }
         }
     }
+}
+
+fn confirm_integrations(
+    source: &dyn EventSource,
+    result: &mut crate::controller::events::Reconciliation,
+    deadline: Duration,
+) -> bool {
+    use crate::integration::contracts::{IntegrationStatus, MAX_READ_TASKS, ValidateIntegration};
+    let ids: std::collections::BTreeSet<_> = result
+        .confirmed
+        .iter()
+        .chain(
+            result
+                .changes
+                .iter()
+                .filter_map(|change| change.current.as_ref()),
+        )
+        .filter(|facts| {
+            facts.integration.as_ref().is_some_and(|annotation| {
+                matches!(
+                    annotation.state,
+                    IntegrationStatus::Integrated | IntegrationStatus::Blocked
+                )
+            })
+        })
+        .map(|facts| facts.task_id)
+        .collect();
+    if ids.is_empty() {
+        return true;
+    }
+    let mut snapshots = std::collections::BTreeMap::new();
+    for chunk in ids.into_iter().collect::<Vec<_>>().chunks(MAX_READ_TASKS) {
+        if let Ok(read) = source.integrations(chunk, deadline)
+            && read.validate().is_ok()
+            && read.integrations.keys().copied().collect::<Vec<_>>() == chunk
+        {
+            snapshots.extend(read.integrations);
+        }
+    }
+    let mut complete = true;
+    for facts in result.confirmed.iter_mut().chain(
+        result
+            .changes
+            .iter_mut()
+            .filter_map(|change| change.current.as_mut()),
+    ) {
+        if facts.integration.is_none() {
+            continue;
+        }
+        facts.integration_confirmation = None;
+        if !facts.integration.as_ref().is_some_and(|annotation| {
+            matches!(
+                annotation.state,
+                IntegrationStatus::Integrated | IntegrationStatus::Blocked
+            )
+        }) {
+            continue;
+        }
+        let confirmed = snapshots
+            .get(&facts.task_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|snapshot| facts.confirm_integration(snapshot));
+        if !confirmed {
+            complete = false;
+            if result.pending_ids.len() < NOTIFY_PENDING_CAPACITY
+                && !result.pending_ids.contains(&facts.task_id)
+            {
+                result.pending_ids.push(facts.task_id);
+            }
+        }
+    }
+    if !complete {
+        result.repair_needed = true;
+        result.attention = None;
+    }
+    complete
 }
 
 fn load_baseline(
@@ -417,6 +499,13 @@ impl StagingSource<'_> {
     }
 }
 impl EventSource for StagingSource<'_> {
+    fn integrations(
+        &self,
+        task_ids: &[crate::task::TaskId],
+        deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        self.inner.integrations(task_ids, deadline)
+    }
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
         self.inner.discover(deadline)
     }
@@ -739,6 +828,111 @@ mod tests {
             .unwrap();
             (exit, String::from_utf8(diagnostics).unwrap())
         }
+    }
+
+    #[test]
+    fn integration_lost_hints_confirm_through_companion_and_restart_without_replay() {
+        use crate::integration::{contracts::*, testing::*};
+        for state in [IntegrationStatus::Integrated, IntegrationStatus::Blocked] {
+            let mut h = Fixture::new();
+            let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+            snapshot.state = state;
+            snapshot.epoch = 1;
+            let outcome = if state == IntegrationStatus::Integrated {
+                snapshot.disposition = Some(IntegrationDisposition::Merged);
+                snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+                SafeOutcome::Done
+            } else {
+                snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+                SafeOutcome::Blocked
+            };
+            let mut current = facts(outcome);
+            current.integration = Some(snapshot.annotation().unwrap());
+            current.code = snapshot
+                .blocked_code
+                .map(|code| crate::controller::events::SafeCode::from_public_code(code.as_str()));
+            let mut result = fresh();
+            result.changes[0].current = Some(current.clone());
+            result.changes[0].cause = ChangeCause::RepairDifference;
+            result.confirmed = vec![current.clone()];
+            result.repair = RepairProgress::Complete;
+            h.supported();
+            h.source
+                .queue_integrations(Ok(IntegrationReadResult {
+                    schema_version: 1,
+                    integrations: [(current.task_id, Some(snapshot.clone()))].into(),
+                }))
+                .unwrap();
+            h.reconciler.queue(Ok(result)).unwrap();
+            assert_eq!(
+                h.run(NotifyOptions::default(), None).0,
+                NotifyExit::Complete
+            );
+            assert_eq!(h.channel.records().len(), 1, "{state:?}");
+            assert!(
+                h.source.requests().is_empty(),
+                "lost hint is repaired from facts, with no journal read"
+            );
+            h.supported();
+            h.source
+                .queue_integrations(Ok(IntegrationReadResult {
+                    schema_version: 1,
+                    integrations: [(current.task_id, Some(snapshot))].into(),
+                }))
+                .unwrap();
+            h.reconciler
+                .queue(Ok(Reconciliation::test_cold(
+                    Some(cursor(6)),
+                    vec![current],
+                )))
+                .unwrap();
+            assert_eq!(
+                h.run(NotifyOptions::default(), None).0,
+                NotifyExit::Complete
+            );
+            assert_eq!(h.channel.records().len(), 1);
+        }
+    }
+
+    #[test]
+    fn integration_changed_companion_defers_notice_and_keeps_durable_candidate() {
+        use crate::integration::{contracts::*, testing::*};
+        let mut h = Fixture::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        let mut current = facts(SafeOutcome::Blocked);
+        current.integration = Some(snapshot.annotation().unwrap());
+        current.code = Some(crate::controller::events::SafeCode::from_public_code(
+            "INTEGRATION_CHECKS_FAILED",
+        ));
+        let mut result = fresh();
+        result.changes[0].current = Some(current.clone());
+        result.changes[0].cause = ChangeCause::RepairDifference;
+        result.confirmed = vec![current.clone()];
+        result.repair = RepairProgress::Complete;
+        snapshot.revision = snapshot.revision.next().unwrap();
+        h.supported();
+        h.source
+            .queue_integrations(Ok(IntegrationReadResult {
+                schema_version: 1,
+                integrations: [(current.task_id, Some(snapshot))].into(),
+            }))
+            .unwrap();
+        h.reconciler.queue(Ok(result)).unwrap();
+        let (exit, diagnostics) = h.run(NotifyOptions::default(), Some(Duration::from_secs(1)));
+        assert_eq!(exit, NotifyExit::Incomplete);
+        assert!(diagnostics.contains("confirmation unavailable or changed"));
+        assert!(h.channel.records().is_empty());
+        assert!(
+            h.cache
+                .load()
+                .unwrap()
+                .pending
+                .iter()
+                .any(|candidate| candidate.task_id == current.task_id)
+        );
+        assert!(h.cache.load().unwrap().decisions.is_empty());
     }
 
     #[test]
