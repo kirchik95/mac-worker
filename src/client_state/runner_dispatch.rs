@@ -58,7 +58,15 @@ impl ClientStateStore {
         // lock because another process may have released capacity since its
         // previous claim attempt.
         if self
-            .worker_for_reassignment(&snapshot, source_index, source, owner, observations, &tasks)?
+            .worker_for_reassignment(
+                &snapshot,
+                source_index,
+                source,
+                owner,
+                observations,
+                &tasks,
+                now_millis,
+            )?
             .is_some()
         {
             return Ok(None);
@@ -72,9 +80,15 @@ impl ClientStateStore {
             {
                 continue;
             }
-            if let Some(worker) =
-                self.worker_for_reassignment(&snapshot, index, source, owner, observations, &tasks)?
-            {
+            if let Some(worker) = self.worker_for_reassignment(
+                &snapshot,
+                index,
+                source,
+                owner,
+                observations,
+                &tasks,
+                now_millis,
+            )? {
                 selected = Some((index, worker));
                 break;
             }
@@ -223,12 +237,13 @@ impl ClientStateStore {
         runner_entry: &QueueEntry,
         worker: &str,
         capabilities: Option<&[String]>,
+        agent_versions: &BTreeMap<String, String>,
         caller: ProcessIdentity,
         tasks: &HashMap<TurnId, LocalTaskRecord>,
     ) -> Result<bool, WorkerError> {
         if older.kind() != QueueEntryKind::TaskTurn
             || older.is_cancel_requested()
-            || !older.eligible_for(worker, capabilities)
+            || !older.eligible_for(worker, capabilities, agent_versions)
             || !self.run_has_capacity(snapshot, older)?
         {
             return Ok(false);
@@ -250,6 +265,7 @@ impl ClientStateStore {
         owner: ProcessIdentity,
         observations: &[CandidateObservation],
         tasks: &HashMap<TurnId, LocalTaskRecord>,
+        now_millis: u64,
     ) -> Result<Option<String>, WorkerError> {
         let entry = &snapshot.entries[index];
         if !self.run_has_capacity(snapshot, entry)? {
@@ -258,11 +274,17 @@ impl ClientStateStore {
         let affinity = self.affinity_hints_locked(entry.project_id(), entry.worktree_id())?;
         for candidate in SchedulerPolicy::rank(observations, entry.requirements(), &affinity) {
             let worker = candidate.worker_name();
-            let capabilities = observations
-                .iter()
-                .find(|observation| observation.worker_name() == worker)
+            let observation =
+                read_observation_optional(self.inner.observations.as_raw_fd(), worker)?;
+            let capabilities = observation
+                .as_ref()
                 .map(|observation| observation.capabilities());
-            if !entry.eligible_for(worker, capabilities)
+            let empty_versions = BTreeMap::new();
+            let agent_versions = observation
+                .as_ref()
+                .filter(|observation| observation.facts_fresh_at(now_millis))
+                .map_or(&empty_versions, AdmissionObservation::agent_versions);
+            if !entry.eligible_for(worker, capabilities, agent_versions)
                 || snapshot.entries.iter().any(|other| other.kind() == QueueEntryKind::TaskTurn && matches!(other.state(), QueueState::Dispatching { selected_worker, .. } if selected_worker == worker))
             { continue; }
             let mut blocked = false;
@@ -273,6 +295,7 @@ impl ClientStateStore {
                     runner_entry,
                     worker,
                     capabilities,
+                    agent_versions,
                     owner,
                     tasks,
                 )? {

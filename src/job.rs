@@ -1808,7 +1808,12 @@ impl QueueEntry {
         self.validate()
     }
 
-    pub(crate) fn eligible_for(&self, worker: &str, capabilities: Option<&[String]>) -> bool {
+    pub(crate) fn eligible_for(
+        &self,
+        worker: &str,
+        capabilities: Option<&[String]>,
+        agent_versions: &BTreeMap<String, String>,
+    ) -> bool {
         let preference_matches = match &self.preference {
             WorkerPreference::Automatic => true,
             WorkerPreference::Pinned { worker: pinned } => pinned == worker,
@@ -1816,9 +1821,13 @@ impl QueueEntry {
         preference_matches
             && (self.requirements.is_empty()
                 || capabilities.is_some_and(|capabilities| {
-                    self.requirements
-                        .iter()
-                        .all(|required| capabilities.contains(required))
+                    self.requirements.iter().all(|required| {
+                        crate::scheduler::requirement_satisfied(
+                            capabilities,
+                            agent_versions,
+                            required,
+                        )
+                    })
                 }))
     }
 }

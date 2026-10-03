@@ -78,18 +78,7 @@ impl CandidateObservation {
     }
 
     fn satisfies(&self, requirement: &str) -> bool {
-        if requirement.starts_with(AGENT_MIN_REQUIREMENT_PREFIX) {
-            let Some((agent, minimum)) = parse_agent_min_requirement(requirement) else {
-                return false;
-            };
-            self.agent_versions()
-                .get(agent.as_str())
-                .is_some_and(|observed| version_satisfies(observed, &minimum) == Some(true))
-        } else {
-            self.capabilities
-                .iter()
-                .any(|capability| capability == requirement)
-        }
+        requirement_satisfied(&self.capabilities, &self.agent_versions, requirement)
     }
 
     pub fn with_interactive_agents(mut self, interactive_agents: Option<u32>) -> Self {
@@ -123,6 +112,27 @@ impl CandidateObservation {
 
     pub fn interactive_agents(&self) -> Option<u32> {
         self.interactive_agents
+    }
+}
+
+/// Shared by ranking and the durable under-lock queue claim recheck.
+/// Callers supply only versions whose inner facts are still fresh.
+pub(crate) fn requirement_satisfied(
+    capabilities: &[String],
+    agent_versions: &BTreeMap<String, String>,
+    requirement: &str,
+) -> bool {
+    if requirement.starts_with(AGENT_MIN_REQUIREMENT_PREFIX) {
+        let Some((agent, minimum)) = parse_agent_min_requirement(requirement) else {
+            return false;
+        };
+        agent_versions
+            .get(agent.as_str())
+            .is_some_and(|observed| version_satisfies(observed, &minimum) == Some(true))
+    } else {
+        capabilities
+            .iter()
+            .any(|capability| capability == requirement)
     }
 }
 
