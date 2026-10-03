@@ -33,6 +33,8 @@ impl<'a> HostIntegrationService<'a> {
         request: &HostIntegrationRequest,
     ) -> Result<HostIntegrationResponse, WorkerError> {
         request.validate()?;
+        let capacity = self.store.capacity_lock()?;
+        let session = self.store.session_lock()?;
         let sidecars = HostIntegrationStore::new(self.store);
         let stored_policy;
         let policy = match &request.action {
@@ -66,6 +68,18 @@ impl<'a> HostIntegrationService<'a> {
             return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
         }
         sidecars.arm(&policy.project_id, request.task_id, policy)?;
+        if matches!(request.action, HostIntegrationAction::Arm { .. })
+            && task_store
+                .load_status(&policy.project_id, request.task_id)?
+                .state()
+                .is_terminal()
+        {
+            return Err(IntegrationCode::IntegrationWorkspaceMissing.error());
+        }
+        // Policy retention is durable before releasing installation/session guards.
+        // Only the per-task integration fence spans bounded Git effects.
+        drop(session);
+        drop(capacity);
         let identity = IntegrationResponseIdentity::for_request(request);
         let response = match &request.action {
             HostIntegrationAction::Read => {
@@ -97,6 +111,15 @@ impl<'a> HostIntegrationService<'a> {
                 record.tombstone = Some(tombstone.clone());
                 sidecars.save(&record)?;
                 self.runtime.reach(IntegrationHook::AfterRevoke);
+                if task_store
+                    .load_status(&policy.project_id, request.task_id)?
+                    .state()
+                    == TaskState::Active
+                    || crate::lease::LeaseService::new(self.store)
+                        .task_scope_is_live(&policy.project_id, request.task_id)?
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
                 let git = IntegrationGit::new(self.store, self.runner, self.runtime);
                 if record.receipt.is_none() && record.push_intent.is_some() {
                     let candidate = record.candidates.last().ok_or_else(invalid)?;
@@ -158,6 +181,31 @@ impl<'a> HostIntegrationService<'a> {
                         return Err(invalid());
                     }
                     next.candidates = old.candidates;
+                    next.snapshot.verification = old.snapshot.verification;
+                    for auxiliary in old.auxiliaries {
+                        if let Some(incoming) = next
+                            .auxiliaries
+                            .iter_mut()
+                            .find(|aux| aux.turn_id == auxiliary.turn_id)
+                        {
+                            if incoming.prepared_binding != auxiliary.prepared_binding {
+                                return Err(invalid());
+                            }
+                            if incoming.queue_position.is_some()
+                                && auxiliary.queue_position.is_some()
+                                && incoming.queue_position != auxiliary.queue_position
+                            {
+                                return Err(invalid());
+                            }
+                            if incoming.queue_position.is_none() {
+                                incoming.queue_position = auxiliary.queue_position;
+                            }
+                            incoming.accepted |= auxiliary.accepted;
+                            incoming.completed |= auxiliary.completed;
+                        } else {
+                            next.auxiliaries.push(auxiliary);
+                        }
+                    }
                     next.push_intent = old.push_intent;
                     next.receipt = old.receipt;
                     next.tombstone = old.tombstone;
@@ -253,9 +301,15 @@ impl<'a> HostIntegrationService<'a> {
                             next.snapshot.observed_target_oid = Some(candidate.target_head.clone());
                             next.snapshot.merge_oid = candidate.merge_oid.clone();
                             next.snapshot.state = IntegrationStatus::CommitReady;
-                            let purpose = if !candidate.conflict_paths.is_empty() {
+                            let purpose = if !candidate.conflict_paths.is_empty()
+                                && candidate.merge_oid.is_none()
+                            {
                                 Some(IntegrationTurnPurpose::Resolve)
                             } else if next.policy.verify == VerifyPolicy::MovedTarget
+                                && next.snapshot.verification
+                                    != IntegrationVerification::VerifyAgentReport
+                                && next.snapshot.verification
+                                    != IntegrationVerification::ResolveAgentReport
                                 && candidate.target_head != next.cycle_base
                                 && git.query(
                                     &mirror,
@@ -281,9 +335,9 @@ impl<'a> HostIntegrationService<'a> {
                                 }
                             } else {
                                 sidecars.save(&next)?;
-                                HostIntegrationResponse::Progress {
+                                HostIntegrationResponse::CandidateReady {
                                     identity,
-                                    snapshot: Some(next.snapshot),
+                                    candidate: Box::new(candidate),
                                 }
                             }
                         }
@@ -318,6 +372,23 @@ impl<'a> HostIntegrationService<'a> {
                     }
                     IntegrationStep::AcceptTurn | IntegrationStep::Build => {
                         let mut candidate = next.candidates.last().ok_or_else(invalid)?.clone();
+                        if *step == IntegrationStep::Build
+                            && candidate.merge_oid.is_some()
+                            && (next.snapshot.verification
+                                == IntegrationVerification::VerifyAgentReport
+                                || next.snapshot.verification
+                                    == IntegrationVerification::ResolveAgentReport
+                                || (candidate.conflict_paths.is_empty()
+                                    && (next.policy.verify == VerifyPolicy::Never
+                                        || candidate.target_head == next.cycle_base)))
+                        {
+                            let response = HostIntegrationResponse::CandidateReady {
+                                identity,
+                                candidate: Box::new(candidate),
+                            };
+                            response.validate_for(request)?;
+                            return Ok(response);
+                        }
                         let auxiliary = next
                             .auxiliaries
                             .iter()
@@ -363,9 +434,9 @@ impl<'a> HostIntegrationService<'a> {
                         };
                         sidecars.save(&next)?;
                         self.runtime.reach(IntegrationHook::AfterAuxCompleted);
-                        HostIntegrationResponse::Progress {
+                        HostIntegrationResponse::CandidateReady {
                             identity,
-                            snapshot: Some(next.snapshot),
+                            candidate: Box::new(candidate),
                         }
                     }
                     IntegrationStep::Repair => {

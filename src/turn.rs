@@ -859,7 +859,6 @@ impl TaskTurnResponse {
         Self { submit, task }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn submit(&self) -> &SubmitResponse {
         &self.submit
     }
@@ -1376,19 +1375,6 @@ impl<'a> TurnPublisher<'a> {
             reported_checks,
             false,
         )?;
-        if let Some(prepared) = &integration {
-            let mut record = sidecars
-                .load(meta.project_id(), meta.task_id())?
-                .ok_or_else(crate::integration::host_store::invalid)?;
-            let aux = record
-                .auxiliaries
-                .iter_mut()
-                .find(|aux| aux.turn_id == prepared.followup.turn_id())
-                .ok_or_else(crate::integration::host_store::invalid)?;
-            aux.accepted = true;
-            aux.completed = true;
-            sidecars.save(&record)?;
-        }
         let _ = session;
         Ok(TurnResult {
             outcome,

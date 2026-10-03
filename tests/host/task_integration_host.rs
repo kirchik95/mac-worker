@@ -313,6 +313,35 @@ fn armed_policy_reads_without_an_intent_and_survives_idle_gc() {
 }
 
 #[test]
+fn native_prepare_and_build_reply_with_the_same_full_candidate() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    let head = f.commit_task();
+    let prepared = f.execute(IntegrationStep::Prepare).unwrap();
+    let HostIntegrationResponse::CandidateReady { candidate, .. } = prepared else {
+        panic!("missing full candidate");
+    };
+    assert!(candidate.tree_oid.is_some());
+    assert!(candidate.merge_oid.is_some());
+    assert_eq!(
+        f.parents(candidate.merge_oid.as_ref().unwrap()),
+        vec![target.clone(), head.clone()]
+    );
+    let stored = HostIntegrationStore::new(&f.store)
+        .load(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.candidates.last(), Some(candidate.as_ref()));
+    f.record = stored;
+    let built = f.execute(IntegrationStep::Build).unwrap();
+    assert!(
+        matches!(built, HostIntegrationResponse::CandidateReady { candidate: replay, .. } if replay == candidate)
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+}
+
+#[test]
 fn published_receipt_repairs_open_ref_workspace_and_status_idempotently() {
     let mut f = GitIntegrationFixture::new();
     f.commit_base();
@@ -391,6 +420,71 @@ fn lost_push_reply_settles_after_legacy_close_without_workspace_resurrection() {
     assert!(!f.workspace().exists());
     assert_eq!(f.origin_tip(), merge);
     assert!(f.execute(IntegrationStep::Push).is_err());
+}
+
+#[test]
+fn ordinary_close_waits_for_confirmed_integration_revoke() {
+    use mac_worker::test_support::task::store::TaskCloseRequest;
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+    let close = TaskCloseRequest::new(&f.record.policy.project_id, f.record.task_id, false);
+    assert_eq!(
+        tasks.close(&close).unwrap_err().public_code(),
+        IntegrationCode::IntegrationStopUnconfirmed.as_str()
+    );
+    assert!(f.workspace().exists());
+    let revoke = request(
+        &f,
+        HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: f.record.snapshot.epoch,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1005,
+                acknowledged: false,
+            },
+        },
+    );
+    execute(&f, &revoke).unwrap();
+    tasks.close(&close).unwrap();
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
+}
+
+#[test]
+fn legacy_closed_clean_candidate_cannot_push_or_recreate_workspace() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    f.prepare();
+    legacy_close(&f);
+    for step in [
+        IntegrationStep::Prepare,
+        IntegrationStep::Build,
+        IntegrationStep::Push,
+        IntegrationStep::Repair,
+    ] {
+        assert_eq!(
+            f.execute(step).unwrap_err().public_code(),
+            IntegrationCode::IntegrationWorkspaceMissing.as_str()
+        );
+    }
+    assert!(!f.workspace().exists());
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
 }
 
 fn step_request(step: IntegrationStep, record: IntegrationRecord) -> HostIntegrationRequest {

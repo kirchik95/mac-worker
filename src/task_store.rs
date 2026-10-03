@@ -1326,6 +1326,32 @@ impl<'a> TaskStore<'a> {
     ) -> Result<(TaskCloseResponse, Option<TaskId>), WorkerError> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
+        let integration = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        let retained = integration.load(request.project_id(), request.task_id())?;
+        // Last in the installation/session lock order, and nonblocking. A sender
+        // owns this fence until its bounded observation/push has settled.
+        let _integration_fence = retained
+            .as_ref()
+            .map(|_| integration.lock(request.project_id(), request.task_id()))
+            .transpose()?;
+        if let Some(record) = retained {
+            let revoked = record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record
+                    .push_intent
+                    .as_ref()
+                    .is_none_or(|push| !push.uncertain);
+            let settled = record.receipt.as_ref().is_some_and(|receipt| {
+                status.head_oid()
+                    == Some(receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head))
+                    && (!request.discard() || receipt.imported)
+            });
+            if !revoked && !settled {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                        .error(),
+                );
+            }
+        }
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }

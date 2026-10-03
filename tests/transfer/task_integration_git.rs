@@ -12,6 +12,85 @@ use std::sync::{
 struct NativeRecordingRunner {
     calls: Mutex<Vec<ProcessRequest>>,
 }
+
+#[test]
+fn remote_host_uses_bounded_typed_transport_and_rejects_rebound_replies() {
+    use mac_worker::test_support::{core::config::WorkerEntry, transfer::RemoteJobClient};
+    use std::os::unix::process::ExitStatusExt;
+    struct Reply {
+        bytes: Vec<u8>,
+        calls: Mutex<Vec<ProcessRequest>>,
+    }
+    impl ProcessRunner for Reply {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.calls.lock().unwrap().push(request.clone());
+            Ok(ProcessResult {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: self.bytes.clone(),
+                stderr: vec![],
+            })
+        }
+    }
+    let record = sample_record(fixture_task(), fixture_source(), "main");
+    let request = step_request(IntegrationStep::Build, record.clone());
+    let response = HostIntegrationResponse::CandidateReady {
+        identity: IntegrationResponseIdentity::for_request(&request),
+        candidate: Box::new(sample_candidate(&record)),
+    };
+    let worker = WorkerEntry {
+        name: "fixture-worker".into(),
+        ssh: "fixture-ssh".into(),
+        slots: 1,
+        capabilities: vec![],
+        remote_binary: "~/.local/bin/worker".into(),
+        herdr: false,
+    };
+    let runner = Reply {
+        bytes: encode_host_response(&response).unwrap(),
+        calls: Mutex::new(vec![]),
+    };
+    let client = RemoteJobClient::new(&runner);
+    assert_eq!(
+        RemoteIntegrationHost::new(&client, &worker)
+            .execute(&request)
+            .unwrap(),
+        response
+    );
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].policy.deadline, HOST_DEADLINE);
+    assert_eq!(calls[0].policy.stdout_limit, MAX_INTEGRATION_RPC_BYTES);
+    assert_eq!(
+        calls[0].stdin.as_deref(),
+        Some(encode_host_request(&request).unwrap().as_slice())
+    );
+    assert!(
+        calls[0]
+            .args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("host task-integration"))
+    );
+    drop(calls);
+    let mut identity = IntegrationResponseIdentity::for_request(&request);
+    identity.revision = identity.revision.next().unwrap();
+    let rebound = HostIntegrationResponse::Blocked {
+        identity,
+        code: IntegrationCode::IntegrationNetwork,
+        retry_exhausted: false,
+    };
+    let runner = Reply {
+        bytes: encode_host_response(&rebound).unwrap(),
+        calls: Mutex::new(vec![]),
+    };
+    let client = RemoteJobClient::new(&runner);
+    assert_eq!(
+        RemoteIntegrationHost::new(&client, &worker)
+            .execute(&request)
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationStateInvalid.as_str()
+    );
+}
 impl ProcessRunner for NativeRecordingRunner {
     fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
         self.calls.lock().unwrap().push(request.clone());
@@ -20,6 +99,251 @@ impl ProcessRunner for NativeRecordingRunner {
 }
 fn is_push(request: &ProcessRequest) -> bool {
     request.args.iter().any(|arg| arg == "push")
+}
+
+// The test receiver forwards the native advertisement before advancing origin, then
+// lets native receive-pack perform its old-OID transaction. No production argv changes.
+struct NativeReceiver {
+    shim: std::path::PathBuf,
+    replies: Mutex<Vec<ProcessResult>>,
+}
+impl NativeReceiver {
+    fn new(f: &GitIntegrationFixture, move_oid: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = f.workspace().parent().unwrap().join("receive-barrier.py");
+        let config = serde_json::json!({"workspace":f.workspace(), "origin":f.record.policy.origin, "move_oid":move_oid});
+        let script = format!("#!/usr/bin/env python3\nCONFIG = {config}\n")
+            + r#"
+import os, subprocess, sys, threading
+env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_CONFIG_')}
+env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
+receiver = subprocess.Popen(['/usr/bin/git', 'receive-pack', sys.argv[1]],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+while True:
+    header = receiver.stdout.read(4)
+    if len(header) != 4: raise RuntimeError('missing native advertisement')
+    sys.stdout.buffer.write(header)
+    size = int(header, 16)
+    if size == 0: break
+    sys.stdout.buffer.write(receiver.stdout.read(size - 4))
+sys.stdout.buffer.flush()
+if CONFIG['move_oid']:
+    subprocess.run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-C', CONFIG['workspace'],
+        'push', CONFIG['origin'], CONFIG['move_oid'] + ':refs/heads/main'],
+        env=env, stdout=sys.stderr, stderr=sys.stderr, check=True)
+def send_commands():
+    try:
+        while True:
+            data = sys.stdin.buffer.read1(65536)
+            if not data: break
+            receiver.stdin.write(data)
+            receiver.stdin.flush()
+        receiver.stdin.close()
+    except BrokenPipeError: pass
+threading.Thread(target=send_commands, daemon=True).start()
+while True:
+    data = receiver.stdout.read1(65536)
+    if not data: break
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+sys.exit(receiver.wait())
+"#;
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            shim,
+            replies: Mutex::new(vec![]),
+        }
+    }
+}
+impl ProcessRunner for NativeReceiver {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let mut native = request.clone();
+        if let Some(at) = native.args.iter().position(|arg| arg == "push") {
+            native.args.insert(
+                at + 1,
+                format!("--receive-pack={}", self.shim.display()).into(),
+            );
+        }
+        let result = SystemProcessRunner.run(&native)?;
+        if is_push(request) {
+            self.replies.lock().unwrap().push(ProcessResult {
+                status: result.status,
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+            });
+        }
+        Ok(result)
+    }
+}
+
+#[test]
+fn server_cas_after_advertisement_is_movement_and_rebuilds() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.write("intermediate.txt", b"intermediate\n");
+    let ancestor = f.commit("intermediate");
+    let head = f.commit_task();
+    f.prepare();
+    let runner = NativeReceiver::new(&f, ancestor.as_str());
+    assert!(
+        matches!(f.execute_with(IntegrationStep::Push, &runner).unwrap(), HostIntegrationResponse::TargetMoved { observed_target, .. } if observed_target == ancestor)
+    );
+    let replies = runner.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert!(String::from_utf8_lossy(&replies[0].stdout).contains("[remote rejected]"));
+    assert!(!replies[0].status.success());
+    drop(replies);
+    assert_eq!(f.origin_tip(), ancestor);
+    let rebuilt = f.prepare();
+    assert_eq!(f.parents(&rebuilt), vec![ancestor, head]);
+    f.push();
+    assert_eq!(f.origin_tip(), rebuilt);
+}
+
+#[test]
+fn unchanged_target_native_policy_rejection_is_not_movement() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    f.prepare();
+    f.install_policy_rejection();
+    let runner = NativeReceiver::new(&f, "");
+    let error = f.execute_with(IntegrationStep::Push, &runner).unwrap_err();
+    assert_eq!(
+        error.public_code(),
+        IntegrationCode::IntegrationPolicyRejected.as_str()
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(runner.replies.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn host_merge_stage_abort_and_reset_never_execute_planted_project_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    for revoke in [false, true] {
+        let mut f = GitIntegrationFixture::new();
+        f.write(
+            ".gitattributes",
+            b"payload.txt filter=evil merge=evil diff=evil\n",
+        );
+        f.write("payload.txt", b"base\n");
+        f.write("check.sh", b"exit 77\n");
+        f.write("setup.sh", b"exit 77\n");
+        f.commit_base();
+        f.write("payload.txt", b"ours\n");
+        f.commit_task();
+        f.advance_target_with("payload.txt", b"theirs\n");
+        let sentinel = f.workspace().parent().unwrap().join("project-ran");
+        let script = f.workspace().parent().unwrap().join("project-command");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\nexit 77\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mirror = f
+            .store
+            .mirror(&f.record.policy.project_id)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        for repo in [f.workspace(), mirror.as_path()] {
+            for key in [
+                "core.fsmonitor",
+                "filter.evil.clean",
+                "filter.evil.smudge",
+                "filter.evil.process",
+                "merge.evil.driver",
+                "diff.evil.command",
+                "diff.evil.textconv",
+                "gpg.program",
+            ] {
+                let output = std::process::Command::new("/usr/bin/git")
+                    .args([
+                        "-C",
+                        repo.to_str().unwrap(),
+                        "config",
+                        key,
+                        script.to_str().unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            for (key, value) in [("filter.evil.required", "true"), ("commit.gpgSign", "true")] {
+                assert!(
+                    std::process::Command::new("/usr/bin/git")
+                        .args(["-C", repo.to_str().unwrap(), "config", key, value])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let hooks = if repo == f.workspace() {
+                repo.join(".git/hooks")
+            } else {
+                repo.join("hooks")
+            };
+            for hook in [
+                "pre-commit",
+                "commit-msg",
+                "post-commit",
+                "pre-push",
+                "pre-merge-commit",
+                "post-merge",
+                "post-checkout",
+                "post-rewrite",
+                "reference-transaction",
+            ] {
+                std::fs::copy(&script, hooks.join(hook)).unwrap();
+            }
+        }
+        assert!(matches!(
+            f.execute(IntegrationStep::Prepare).unwrap(),
+            HostIntegrationResponse::NeedTurn {
+                purpose: IntegrationTurnPurpose::Resolve,
+                ..
+            }
+        ));
+        if revoke {
+            let request = HostIntegrationRequest {
+                protocol_version: 7,
+                task_id: f.record.task_id,
+                integration_id: Some(f.record.snapshot.integration_id),
+                epoch: f.record.snapshot.epoch,
+                revision: f.record.snapshot.revision,
+                action: HostIntegrationAction::Revoke {
+                    tombstone: IntegrationTombstone {
+                        epoch: f.record.snapshot.epoch,
+                        revision: f.record.snapshot.revision,
+                        requested_at_millis: 1005,
+                        acknowledged: false,
+                    },
+                },
+            };
+            HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime)
+                .execute(&request)
+                .unwrap();
+        } else {
+            f.write("payload.txt", b"resolved\n");
+            f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+            f.execute(IntegrationStep::AcceptTurn).unwrap();
+            f.push();
+            f.execute(IntegrationStep::Repair).unwrap();
+        }
+        assert!(
+            !sentinel.exists(),
+            "project command executed (revoke={revoke})"
+        );
+    }
 }
 
 #[test]

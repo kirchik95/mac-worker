@@ -40,25 +40,6 @@ use crate::host_store::HostStoreWritePoint;
 
 /// Import metadata is immutable, so publication, interrupted publication and
 /// accepted replay all enforce the same first-turn resume/binding contract.
-fn mark_integration_accepted(
-    sidecars: &crate::integration::host_store::HostIntegrationStore<'_>,
-    prepared: Option<&crate::integration::contracts::PreparedIntegrationTurn>,
-) -> Result<(), WorkerError> {
-    if let Some(prepared) = prepared {
-        let project = prepared.followup.expected().meta().project_id();
-        let mut record = sidecars
-            .load(project, prepared.followup.task_id())?
-            .ok_or_else(crate::integration::host_store::invalid)?;
-        let aux = record
-            .auxiliaries
-            .iter_mut()
-            .find(|aux| aux.turn_id == prepared.followup.turn_id())
-            .ok_or_else(crate::integration::host_store::invalid)?;
-        aux.accepted = true;
-        sidecars.save(&record)?;
-    }
-    Ok(())
-}
 fn validate_imported_first_turn(
     task_store: &TaskStore<'_>,
     meta: &crate::task::TaskMeta,
@@ -673,7 +654,6 @@ impl<'a> JobService<'a> {
                 self.store
                     .supervisor_lock_after(published.admission_guard(), job_id, false)?;
             drop(published);
-            mark_integration_accepted(&sidecars, integration)?;
             drop(integration_fence.take());
             let submit_response = match supervisor {
                 Some(guard) => {
@@ -750,7 +730,6 @@ impl<'a> JobService<'a> {
             self.store
                 .supervisor_lock_after(published.admission_guard(), job_id, false)?;
         drop(published);
-        mark_integration_accepted(&sidecars, integration)?;
         drop(integration_fence.take());
         let submit_response = match supervisor {
             Some(guard) => {

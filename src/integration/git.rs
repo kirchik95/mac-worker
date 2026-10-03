@@ -1450,6 +1450,7 @@ pub mod testing {
                 .unwrap()
                 .unwrap();
             let mut intent = prepared.intent().unwrap();
+            intent.queue_position = Some(0);
             intent.accepted = true;
             intent.completed = true;
             self.record.auxiliaries.push(intent);
@@ -1495,6 +1496,11 @@ pub mod testing {
         }
         pub fn origin(&self) -> &Path {
             &self.origin
+        }
+        pub fn install_policy_rejection(&self) {
+            let hook = self.origin.join("hooks/pre-receive");
+            fs::write(&hook, b"#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
         }
         pub fn git(&self, args: &[&str]) -> String {
             git(&self.workspace, args)
