@@ -219,6 +219,10 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])
 case "$1" in
   --version) printf '{version}\n'; exit 0 ;;
   auth|login) printf '{{"loggedIn":true}}\n'; exit 0 ;;
+  delete)
+    printf '%s\n' "$@" > "$HOME/delete-argv"
+    find "$HOME/.codex/sessions" -type f -name "*$3.jsonl" -delete
+    exit 0 ;;
 esac
 printf '%s\n' "$@" > "$HOME/argv"
 # The runner must resume, and prepare must have already materialized both tokens.
@@ -366,8 +370,7 @@ fn import_round_trip(agent: SessionAgent) {
     }
 }
 
-#[test]
-fn codex_controller_submit_streams_places_and_resumes_native_session() {
+fn controller_import_round_trip(review_laptop_pins: bool, review_followups: bool) {
     let controller = controller_process::ProcessFixture::new();
     let mut fixture = Fixture::new();
     fixture.laptop = controller.laptop_home.clone();
@@ -490,7 +493,267 @@ fn codex_controller_submit_streams_places_and_resumes_native_session() {
         String::from_utf8(result.stdout).unwrap().trim(),
         report["session_import"]["package_oid"].as_str().unwrap()
     );
+    if review_followups {
+        let native = fs::read_to_string(fixture.host.join("placed-files"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let (status, stdout, stderr) = controller.run_laptop(
+            &[
+                "--json",
+                "task",
+                "say",
+                &task.to_string(),
+                "--message",
+                "continue again",
+                "--wait",
+            ],
+            Some(fixture.project.root()),
+        );
+        assert!(
+            status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            fs::read_to_string(fixture.host.join("argv"))
+                .unwrap()
+                .contains(&imported)
+        );
+        let (status, stdout, stderr) = controller.run_laptop(
+            &["--json", "task", "close", &task.to_string(), "--discard"],
+            Some(fixture.project.root()),
+        );
+        assert!(
+            status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!Path::new(&native).exists());
+        assert!(
+            fs::read_to_string(fixture.host.join("delete-argv"))
+                .unwrap()
+                .contains(&format!("delete\n--force\n{imported}\n"))
+        );
+    }
     leader.terminate_and_reap();
+    if review_laptop_pins {
+        use mac_worker::test_support::transfer::repo::{TransferGc, TransferRepo};
+        let cache = controller.laptop_xdg_cache.join("mac-worker");
+        let transfer = TransferRepo::open_or_create(&cache, &context.common_dir).unwrap();
+        let repo_id = transfer.repo_id().to_owned();
+        let reference = format!("refs/mac-worker/sessions/{task}");
+        assert!(
+            !transfer.has_ref(&reference),
+            "verified source finish and controller ACK must retire the laptop pin"
+        );
+        // Model the seven-day envelope prune; no local task owns this controller-mode pin.
+        for envelope in controller.envelope_paths() {
+            fs::remove_file(envelope).unwrap();
+        }
+        drop(transfer);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let preview = TransferGc::new(&cache, &SystemProcessRunner)
+            .preview_at(now + 90 * 24 * 60 * 60 * 1000)
+            .unwrap();
+        let eligible_before = preview
+            .candidates()
+            .iter()
+            .any(|candidate| candidate.identifier() == repo_id);
+        let transfer = TransferRepo::open_or_create(&cache, &context.common_dir).unwrap();
+        transfer
+            .release_task_refs(&SystemProcessRunner, task)
+            .unwrap();
+        drop(transfer);
+        let control = TransferGc::new(&cache, &SystemProcessRunner)
+            .preview_at(now + 90 * 24 * 60 * 60 * 1000)
+            .unwrap();
+        assert!(
+            control
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.identifier() == repo_id),
+            "control must be collectible once the orphan pin is removed: {:?}",
+            control
+        );
+        assert!(
+            eligible_before,
+            "settled/pruned controller submit still permanently protects laptop package from GC: {:?}",
+            preview
+        );
+    }
+}
+
+#[test]
+fn codex_controller_submit_streams_places_and_resumes_native_session() {
+    controller_import_round_trip(false, false);
+}
+#[test]
+fn review_r5_controller_say_and_discard() {
+    controller_import_round_trip(false, true);
+}
+#[test]
+fn review_r5_controller_laptop_pin_eventually_retires() {
+    controller_import_round_trip(true, false);
+}
+
+fn review_r5_direct_followup_and_close(agent: SessionAgent, discard: bool) {
+    let fixture = Fixture::new();
+    let source = fixture.capture_fixture(agent);
+    let original = fs::read(&source).unwrap();
+    fixture.install_agent(agent);
+    let first = fixture.submit(agent);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = String::from_utf8_lossy(&first.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|value| value.get("session_import").is_some())
+        .unwrap();
+    let task: TaskId = report["task_id"].as_str().unwrap().parse().unwrap();
+    let imported = imported_session_id(&task);
+    let native = fs::read_to_string(fixture.host.join("placed-files"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let follow = fixture.worker(&[
+        "--json",
+        "task",
+        "say",
+        &task.to_string(),
+        "--message",
+        "continue again",
+        "--wait",
+    ]);
+    assert!(
+        follow.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&follow.stdout),
+        String::from_utf8_lossy(&follow.stderr)
+    );
+    assert!(
+        fs::read_to_string(fixture.host.join("argv"))
+            .unwrap()
+            .contains(&imported)
+    );
+    let mut args = vec!["--json", "task", "close"];
+    let task_text = task.to_string();
+    args.push(&task_text);
+    if discard {
+        args.push("--discard");
+    }
+    let closed = fixture.worker(&args);
+    assert!(
+        closed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&closed.stdout),
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    if agent == SessionAgent::Codex && discard {
+        assert!(!Path::new(&native).exists());
+        assert!(
+            fs::read_to_string(fixture.host.join("delete-argv"))
+                .unwrap()
+                .contains(&format!("delete\n--force\n{imported}\n"))
+        );
+    } else {
+        assert!(Path::new(&native).exists());
+    }
+    assert_eq!(fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn review_r5_codex_followup_refuses_too_old_worker() {
+    let fixture = Fixture::new();
+    fixture.capture_fixture(SessionAgent::Codex);
+    fixture.install_agent(SessionAgent::Codex);
+    let first = fixture.submit(SessionAgent::Codex);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = String::from_utf8_lossy(&first.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|value| value.get("session_import").is_some())
+        .unwrap();
+    let task = report["task_id"].as_str().unwrap();
+    let facts_path = fixture.host_root().join("facts.json");
+    let mut facts: AgentFacts = serde_json::from_slice(&fs::read(&facts_path).unwrap()).unwrap();
+    for agent in &mut facts.agents {
+        if agent.name == "codex" {
+            agent.version = Some("0.158.9".into());
+        }
+    }
+    fs::write(facts_path, serde_json::to_vec(&facts).unwrap()).unwrap();
+    let agent_path = fixture.host.join("bin/codex");
+    let old_agent = fs::read_to_string(&agent_path)
+        .unwrap()
+        .replace("0.160.0", "0.158.9");
+    executable(&agent_path, &old_agent);
+    // Invalidate only this throwaway laptop's cache so the refreshed version is observed.
+    fs::remove_dir_all(fixture.laptop.join(".local/state/mac-worker/observations")).unwrap();
+    fs::remove_file(fixture.host.join("argv")).unwrap();
+    let follow = fixture.worker(&[
+        "--json",
+        "task",
+        "say",
+        task,
+        "--message",
+        "continue again",
+        "--wait",
+    ]);
+    if !follow.status.success() {
+        for entry in fs::read_dir(fixture.laptop.join(".local/state/mac-worker/observations"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                eprintln!("observation={}", fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+        eprintln!(
+            "journal={}",
+            fs::read_to_string(fixture.host.join("ssh-journal")).unwrap()
+        );
+    }
+    assert!(
+        !follow.status.success()
+            && (String::from_utf8_lossy(&follow.stdout).contains("SESSION_AGENT_TOO_OLD")
+                || String::from_utf8_lossy(&follow.stdout).contains("CAPACITY_BUSY"))
+            && !fixture.host.join("argv").exists(),
+        "expected version refusal for 0.158.9 vs imported 0.160.0: stdout={} stderr={} launched={}",
+        String::from_utf8_lossy(&follow.stdout),
+        String::from_utf8_lossy(&follow.stderr),
+        fixture.host.join("argv").exists()
+    );
+}
+
+#[test]
+fn review_r5_codex_say_and_close() {
+    review_r5_direct_followup_and_close(SessionAgent::Codex, false);
+}
+#[test]
+fn review_r5_codex_say_and_discard() {
+    review_r5_direct_followup_and_close(SessionAgent::Codex, true);
+}
+#[test]
+fn review_r5_claude_say_and_close() {
+    review_r5_direct_followup_and_close(SessionAgent::Claude, false);
 }
 
 #[test]

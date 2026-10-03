@@ -222,6 +222,44 @@ fn active_worker_card_maps_turn_identity_to_task_title_and_agent() {
 }
 
 #[test]
+fn review_r5_import_metadata_does_not_break_or_expand_dashboard_or_list() {
+    let harness = DashboardTaskHarness::active_local_task();
+    let before = harness.state.load_task(harness.task_id).unwrap();
+    let mut value = serde_json::to_value(&before).unwrap();
+    value["meta"]["session_import"] = serde_json::to_value(
+        mac_worker::test_support::session::SessionImportMeta::new(
+            mac_worker::test_support::session::SessionAgent::Codex,
+            "a".repeat(40),
+            "0.160.0",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let after = serde_json::from_value(value).unwrap();
+    assert!(
+        harness
+            .state
+            .update_task_if_current(&before, after)
+            .unwrap()
+    );
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.task_view.tasks.len(), 1);
+    let cli = serde_json::to_value(TaskListJson::new(
+        PROTOCOL_VERSION,
+        snapshot.task_view.clone(),
+    ))
+    .unwrap();
+    let snapshot_json = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(cli["tasks"], snapshot_json["tasks"]);
+    for value in [cli, snapshot_json] {
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(!encoded.contains("session_import"));
+        assert!(!encoded.contains("package_oid"));
+        assert!(!encoded.contains("source_agent_version"));
+    }
+}
+
+#[test]
 fn task_projection_exposes_only_bounded_recorded_execution_settings() {
     let snapshot = DashboardTaskHarness::active_local_task()
         .snapshot()

@@ -1888,6 +1888,11 @@ impl<'a> TaskClient<'a> {
                 // may compensate only while this marker remains present.
                 .with_submission_intent_turn_id(turn_id)?
             };
+        // Frozen sessionless requirements retain their historical bytes. Imports
+        // use the same immutable-meta builder as follow-up and recovery rows.
+        if record_for_rollback.meta().session_import().is_some() {
+            requirements = task_meta_requirements(&requirements, record_for_rollback.meta());
+        }
         let composed_prompt = {
             let branch = match frozen {
                 Some(FrozenSubmit::Dag(node)) => node.frozen.branch.as_deref(),
@@ -5354,12 +5359,7 @@ impl<'a> TaskClient<'a> {
             record.meta().project_id().to_owned(),
             record.meta().worktree_id().to_owned(),
             command.summary()?,
-            task_requirements(
-                &project.requirements,
-                record.meta().agent(),
-                record.meta().env_profile(),
-                task_origin_requirement(record.meta()).as_deref(),
-            ),
+            task_meta_requirements(&project.requirements, record.meta()),
             preference,
             QueueEntryKind::TaskTurn,
             run,
@@ -5601,12 +5601,7 @@ impl<'a> TaskClient<'a> {
                 record.meta().project_id().to_owned(),
                 record.meta().worktree_id().to_owned(),
                 command.summary()?,
-                task_requirements(
-                    &project.requirements,
-                    record.meta().agent(),
-                    record.meta().env_profile(),
-                    task_origin_requirement(record.meta()).as_deref(),
-                ),
+                task_meta_requirements(&project.requirements, record.meta()),
                 preference,
                 QueueEntryKind::TaskTurn,
                 run,
@@ -6749,6 +6744,19 @@ impl Drop for UnpublishedTaskPins<'_> {
     }
 }
 
+fn task_meta_requirements(project: &[String], meta: &TaskMeta) -> Vec<String> {
+    let mut requirements = task_requirements(
+        project,
+        meta.agent(),
+        meta.env_profile(),
+        task_origin_requirement(meta).as_deref(),
+    );
+    if let Some(import) = meta.session_import() {
+        add_session_requirements(&mut requirements, import);
+    }
+    requirements
+}
+
 pub(crate) fn task_requirements(
     project: &[String],
     agent: AgentKind,
@@ -7663,6 +7671,118 @@ mod session_submission_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn review_r5_followup_preserves_import_version_gate() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let client = fixture.client(&state);
+        client
+            .submit_with_ids(
+                fixture.request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let record = state.load_task(fixture.task).unwrap();
+        let entry = client
+            .enqueue_followup(&record, TurnId::generate(), "fixture".into())
+            .unwrap();
+        for required in ["feature:task.session-import", "agent-min:codex@0.160.0"] {
+            assert!(
+                entry
+                    .requirements()
+                    .iter()
+                    .any(|requirement| requirement == required),
+                "follow-up lost import gate: {:?}",
+                entry.requirements()
+            );
+        }
+    }
+
+    #[test]
+    fn review_r5_missing_queue_recovery_preserves_import_gates() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let client = fixture.client(&state);
+        client
+            .submit_with_ids(
+                fixture.request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let record = state.load_task(fixture.task).unwrap();
+        let original = state.queue_entry(fixture.turn).unwrap().unwrap();
+        assert!(
+            original
+                .requirements()
+                .iter()
+                .any(|requirement| requirement == "agent-min:codex@0.160.0")
+        );
+        state
+            .remove_task_turn_for_submission_rollback(fixture.turn)
+            .unwrap();
+        let recovered = client
+            .enqueue_missing_turn(&record, current_process_identity().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.requirements(),
+            original.requirements(),
+            "queue recovery lost immutable import gates"
+        );
+    }
+
+    #[test]
+    fn sessionless_queue_requirements_preserve_canonical_bytes() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        fixture
+            .client(&state)
+            .submit_with_ids(
+                fixture.request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut wire = serde_json::to_value(state.load_task(fixture.task).unwrap().meta()).unwrap();
+        wire.as_object_mut().unwrap().remove("session_import");
+        let meta: TaskMeta = serde_json::from_value(wire).unwrap();
+        let project = vec![
+            "custom:fixture".into(),
+            "agent:codex".into(),
+            "custom:fixture".into(),
+        ];
+        let legacy = task_requirements(
+            &project,
+            meta.agent(),
+            meta.env_profile(),
+            task_origin_requirement(&meta).as_deref(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&task_meta_requirements(&project, &meta)).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
     }
 
     #[test]
