@@ -7695,14 +7695,16 @@ mod session_submission_tests {
         let entry = client
             .enqueue_followup(&record, TurnId::generate(), "fixture".into())
             .unwrap();
-        assert!(
-            entry
-                .requirements()
-                .iter()
-                .any(|requirement| requirement == "agent-min:codex@0.160.0"),
-            "follow-up lost import version gate: {:?}",
-            entry.requirements()
-        );
+        for required in ["feature:task.session-import", "agent-min:codex@0.160.0"] {
+            assert!(
+                entry
+                    .requirements()
+                    .iter()
+                    .any(|requirement| requirement == required),
+                "follow-up lost import gate: {:?}",
+                entry.requirements()
+            );
+        }
     }
 
     #[test]
@@ -7742,6 +7744,44 @@ mod session_submission_tests {
             recovered.requirements(),
             original.requirements(),
             "queue recovery lost immutable import gates"
+        );
+    }
+
+    #[test]
+    fn sessionless_queue_requirements_preserve_canonical_bytes() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        fixture
+            .client(&state)
+            .submit_with_ids(
+                fixture.request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut wire = serde_json::to_value(state.load_task(fixture.task).unwrap().meta()).unwrap();
+        wire.as_object_mut().unwrap().remove("session_import");
+        let meta: TaskMeta = serde_json::from_value(wire).unwrap();
+        let project = vec![
+            "custom:fixture".into(),
+            "agent:codex".into(),
+            "custom:fixture".into(),
+        ];
+        let legacy = task_requirements(
+            &project,
+            meta.agent(),
+            meta.env_profile(),
+            task_origin_requirement(&meta).as_deref(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&task_meta_requirements(&project, &meta)).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
         );
     }
 
