@@ -643,3 +643,62 @@ fn capture_enforces_file_count_including_main_transcript() {
     fs::write(sidecar.join("one-too-many.txt"), b"small").unwrap();
     assert_code(capture(&fixture, &root, &source), "SESSION_TOO_LARGE");
 }
+
+#[test]
+fn capture_refuses_reserved_tokens_before_main_scrubbing_can_hide_them() {
+    let fixture = Fixture::new();
+    let root = fixture.root();
+    let source = fixture.session(ID, &root);
+    for token in [WORKSPACE_TOKEN, SESSION_TOKEN] {
+        let line = serde_json::json!({
+            "cwd": root, "version": "2.1.288",
+            "text": format!("-----BEGIN PRIVATE KEY-----\n{token}\n-----END PRIVATE KEY-----")
+        });
+        assert_eq!(
+            fixture
+                .scrubber
+                .scrub_line(&serde_json::to_vec(&line).unwrap())
+                .unwrap()
+                .replacements,
+            1
+        );
+        fs::write(&source, jsonl(&[line])).unwrap();
+        assert_code(capture(&fixture, &root, &source), "SESSION_UNREADABLE");
+    }
+}
+
+#[test]
+fn capture_refuses_reserved_tokens_before_sidecar_scrubbing_can_hide_them() {
+    let fixture = Fixture::new();
+    let root = fixture.root();
+    let source = fixture.session(ID, &root);
+    let sidecar = source.parent().unwrap().join(ID);
+    fs::create_dir(&sidecar).unwrap();
+    for name in ["token.json", "token.jsonl"] {
+        let path = sidecar.join(name);
+        fs::write(&path, jsonl(&[serde_json::json!({
+            "text": format!("-----BEGIN PRIVATE KEY-----\n{SESSION_TOKEN}\n-----END PRIVATE KEY-----")
+        })])).unwrap();
+        assert_code(capture(&fixture, &root, &source), "SESSION_UNREADABLE");
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn capture_rejects_json_unsafe_roots_and_preserves_non_ascii_roots() {
+    let fixture = Fixture::new();
+    for name in ["quote-\"", "backslash-\\", "control-\n"] {
+        let root = fixture.root().join(name);
+        fs::create_dir(&root).unwrap();
+        let source = fixture.session(ID, &root);
+        assert_code(capture(&fixture, &root, &source), "SESSION_UNREADABLE");
+    }
+    let root = fixture.root().join("проект-é");
+    fs::create_dir(&root).unwrap();
+    let source = fixture.session(ID, &root);
+    let captured = capture(&fixture, &root, &source).unwrap();
+    assert_eq!(
+        materialize(main_bytes(&captured), root.to_str().unwrap(), ID).unwrap(),
+        fs::read(&source).unwrap()
+    );
+}

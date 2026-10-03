@@ -131,6 +131,7 @@ impl SessionCapture for ClaudeCapture {
                 Some("json") => {
                     let raw = read_bounded(&sidecar.source)?;
                     let raw_bytes = raw.len() as u64;
+                    reject_reserved_tokens(&raw)?;
                     let result = cx.scrubber.scrub_line(&raw)?;
                     (result.bytes, result.replacements, raw_bytes)
                 }
@@ -273,6 +274,7 @@ fn scrub_jsonl(
     let mut bytes = Vec::new();
     let mut replacements = 0u32;
     for line in lines {
+        reject_reserved_tokens(&line)?;
         let result = scrubber.scrub_line(&line)?;
         replacements = replacements
             .checked_add(result.replacements)
@@ -287,6 +289,25 @@ fn scrub_jsonl(
         bytes.push(b'\n');
     }
     Ok((bytes, replacements))
+}
+
+fn reject_reserved_tokens(bytes: &[u8]) -> Result<(), WorkerError> {
+    // Check the source, not just scrubbed output: a PEM/exact-secret match may
+    // remove a token, but input with reserved tokens must still be refused.
+    if [tokens::WORKSPACE_TOKEN, tokens::SESSION_TOKEN]
+        .iter()
+        .any(|token| {
+            bytes
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        })
+    {
+        return Err(session_error(
+            "SESSION_UNREADABLE",
+            "session contains a reserved token",
+        ));
+    }
+    Ok(())
 }
 
 fn prompt_preview(value: &Value) -> Option<String> {
