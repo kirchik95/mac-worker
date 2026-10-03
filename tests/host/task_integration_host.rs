@@ -54,6 +54,63 @@ fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
         .unwrap()
 }
 
+#[test]
+fn owner_can_revoke_an_armed_cycle_before_the_first_host_phase_and_fence_late_fetch() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    let source = f.commit_task();
+    let mut arm = request(
+        &f,
+        HostIntegrationAction::Arm {
+            policy: f.record.policy.clone(),
+        },
+    );
+    arm.integration_id = None;
+    arm.revision = IntegrationRevision(0);
+    execute(&f, &arm).unwrap();
+    assert!(
+        HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let state = MemoryIntegrationState::default();
+    state
+        .publish_policy(f.record.task_id, &f.record.policy)
+        .unwrap();
+    state
+        .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+        .unwrap();
+    let turns = FakeIntegrationTurns::default();
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+    let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        owner
+            .revoke(f.record.task_id, f.record.snapshot.revision)
+            .unwrap()
+            .state,
+        IntegrationStatus::Revoked
+    );
+    assert!(
+        state
+            .load(f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .tombstone
+            .unwrap()
+            .acknowledged
+    );
+    assert_eq!(
+        f.execute(IntegrationStep::Fetch).unwrap_err().public_code(),
+        IntegrationCode::IntegrationStopUnconfirmed.as_str()
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), source.as_str());
+    assert!(f.git(&["status", "--porcelain=v1"]).is_empty());
+}
+
 fn observed(f: &GitIntegrationFixture) -> IntegrationTaskFacts {
     use mac_worker::test_support::task::model::LocalTaskRecord;
     let tasks = TaskStore::new(&f.store, &SystemProcessRunner);

@@ -1327,13 +1327,24 @@ impl<'a> TaskStore<'a> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
         let integration = crate::integration::host_store::HostIntegrationStore::new(self.store);
-        let retained = integration.load(request.project_id(), request.task_id())?;
         // Last in the installation/session lock order, and nonblocking. A sender
         // owns this fence until its bounded observation/push has settled.
-        let _integration_fence = retained
-            .as_ref()
-            .map(|_| integration.lock(request.project_id(), request.task_id()))
-            .transpose()?;
+        let _integration_fence = if integration
+            .load(request.project_id(), request.task_id())?
+            .is_some()
+            || integration
+                .policy(request.project_id(), request.task_id())?
+                .is_some()
+        {
+            Some(integration.lock(request.project_id(), request.task_id())?)
+        } else {
+            None
+        };
+        // The sender can update sidecars without the installation locks.
+        // Read settlement only after acquiring its per-task fence.
+        let retained = integration.load(request.project_id(), request.task_id())?;
+        let stopped_before_phase =
+            integration.revoke_proved_at(request.project_id(), request.task_id(), &status)?;
         if let Some(record) = retained {
             let revoked = record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
                 && record
@@ -1345,7 +1356,7 @@ impl<'a> TaskStore<'a> {
                     == Some(receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head))
                     && (!request.discard() || receipt.imported)
             });
-            if !revoked && !settled {
+            if !revoked && !settled && !stopped_before_phase {
                 return Err(
                     crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
                         .error(),

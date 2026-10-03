@@ -442,6 +442,166 @@ fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
     );
 }
 
+fn parked_source_fixture() -> (super::session_import_e2e::Fixture, TaskId) {
+    use mac_worker::test_support::session::SessionAgent;
+    let f = integration_fixture(true);
+    f.capture_fixture(SessionAgent::Codex);
+    f.install_agent(SessionAgent::Codex);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+    let drain = format!(
+        "printf 'ordinary result\\n' > T6-result\n/usr/bin/env HOME={} {} --config {} controller drain >/dev/null || exit 94\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
+        quote(f.laptop.to_str().unwrap()),
+        quote(env!("CARGO_BIN_EXE_worker")),
+        quote(f.config.to_str().unwrap())
+    );
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("printf '%s\\n' \"$@\" > \"$HOME/argv\"", &drain);
+    std::fs::write(agent, script).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce work",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]));
+    let owner = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        owner.load(task).unwrap().unwrap().snapshot.state,
+        IntegrationStatus::Parked
+    );
+    (f, task)
+}
+
+#[test]
+fn native_recovery_reclaims_a_confirmed_dead_phase_actor_before_reexecuting_the_driver() {
+    use mac_worker::test_support::{
+        client_state::RunnerLivenessVerdict, host::supervisor::SystemProcessInspector,
+    };
+    use std::{
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        process::{Command, Stdio},
+    };
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let actor = SystemProcessInspector.identity_for_pid(child.id()).unwrap();
+    let runtime = std::sync::Arc::new(ManualIntegrationRuntime::default());
+    runtime.set_actor_verdict(actor, RunnerLivenessVerdict::Live);
+    let state = RootedIntegrationState::open(&paths, runtime).unwrap();
+    let mut record = state.load(task).unwrap().unwrap();
+    let expected = record.snapshot.revision;
+    record.snapshot.state = IntegrationStatus::Fetching;
+    record.snapshot.resume_state = None;
+    record.snapshot.pause_reason = None;
+    record.pause = None;
+    record.actor = Some(actor);
+    record.snapshot.revision = expected.next().unwrap();
+    state.replace(task, expected, &record).unwrap();
+    state
+        .reserve(
+            &record.target_key,
+            record.snapshot.integration_id,
+            record.snapshot.epoch,
+            actor,
+        )
+        .unwrap()
+        .unwrap();
+    let binding = json!({"task": task, "intent": record.snapshot.integration_id, "epoch": record.snapshot.epoch, "actor": actor});
+    let path = paths
+        .state
+        .join(format!("integrations/tasks/{task}/driver.json"));
+    let mut binding_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    binding_file
+        .write_all(&serde_json::to_vec(&binding).unwrap())
+        .unwrap();
+    binding_file.sync_all().unwrap();
+    let undrain = f.worker(&["--json", "controller", "drain", "--off"]);
+    assert!(
+        undrain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undrain.stdout)
+    );
+    let reconcile = f.worker(&["--json", "task", "reconcile"]);
+    assert!(reconcile.status.success());
+    assert_eq!(
+        state.load(task).unwrap().unwrap().actor,
+        Some(actor),
+        "live phase was reclaimed"
+    );
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    let settled = wait_integrated(&f, task);
+    assert!(settled.actor.is_none());
+    assert!(settled.receipt.unwrap().imported);
+}
+
+#[test]
+fn native_close_revokes_a_parked_cycle_without_starting_a_git_phase() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    let (f, task) = parked_source_fixture();
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let before = f
+        .project
+        .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+        .stdout;
+    let close = f.worker(&["--json", "task", "close", &task.to_string()]);
+    assert!(
+        close.status.success(),
+        "{}",
+        String::from_utf8_lossy(&close.stdout)
+    );
+    let state = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let stopped = state.load(task).unwrap().unwrap();
+    assert_eq!(stopped.snapshot.state, IntegrationStatus::Revoked);
+    assert!(stopped.tombstone.unwrap().acknowledged);
+    assert_eq!(stopped.snapshot.attempts, 0);
+    assert_eq!(
+        ClientStateStore::open(&owner_paths(&f).state)
+            .unwrap()
+            .load_task(task)
+            .unwrap()
+            .status()
+            .state(),
+        TaskState::Closed
+    );
+    assert_eq!(
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout,
+        before
+    );
+}
+
 fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> IntegrationRecord {
     let wait = f.worker(&[
         "--json",
@@ -643,6 +803,153 @@ printf '%s\n' "$@" > "$HOME/argv""#,
     assert_eq!(journal.matches("host task-prepare\n").count(), 1);
     assert_eq!(journal.matches("host task-turn\n").count(), 1);
     assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+}
+
+#[test]
+fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
+    use mac_worker::test_support::{client_state::ClientStateStore, session::SessionAgent};
+    use std::io::Read;
+    let f = integration_fixture(true);
+    let source = f.capture_fixture(SessionAgent::Codex);
+    let original = std::fs::read(&source).unwrap();
+    f.install_agent(SessionAgent::Codex);
+    let target = f.laptop.parent().unwrap().join("outside");
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    f.project
+        .git(&["clone", origin.to_str().unwrap(), target.to_str().unwrap()]);
+    f.project.git(&[
+        "-C",
+        target.to_str().unwrap(),
+        "config",
+        "user.email",
+        "fixture@example.test",
+    ]);
+    f.project.git(&[
+        "-C",
+        target.to_str().unwrap(),
+        "config",
+        "user.name",
+        "Fixture",
+    ]);
+    let fifo = |name: &str| {
+        use std::os::unix::ffi::OsStrExt;
+        let path = f.host.join(name);
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    };
+    let mut ready = fifo("aux-ready");
+    struct Release(std::fs::File);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let _ = self.0.write_all(b"resume\n");
+        }
+    }
+    let _release = Release(fifo("aux-release"));
+    let agent = f.host.join("bin/codex");
+    let work = format!(
+        r#"count=0; [ ! -f "$HOME/turn-count" ] || count=$(cat "$HOME/turn-count")
+count=$((count + 1)); printf '%s' "$count" > "$HOME/turn-count"
+if [ "$count" = 1 ]; then
+  printf 'ordinary\n' > README
+  (cd '{}' && printf 'outside\n' > README && /usr/bin/git add README && /usr/bin/git commit -m outside && /usr/bin/git push origin main) >/dev/null 2>&1 || exit 95
+else
+  /usr/bin/git rev-parse MERGE_HEAD > "$HOME/aux-target" || exit 96
+  /usr/bin/git rev-parse HEAD > "$HOME/aux-head"
+  printf 'a' > "$HOME/aux-ready"
+  IFS= read -r release < "$HOME/aux-release"
+  printf 'resolved\n' > README
+fi
+printf '%s\n' "$@" > "$HOME/argv""#,
+        target.display()
+    );
+    let script = std::fs::read_to_string(&agent).unwrap().replace("printf '%s\\n' \"$@\" > \"$HOME/argv\"", &work)
+        .replace("done < \"$HOME/placed-files\"\n", "done < \"$HOME/placed-files\"\nwhile IFS= read -r file; do printf '%s\\n' '{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"native append\"}}' >> \"$file\"; done < \"$HOME/placed-files\"\n");
+    std::fs::write(agent, script).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce conflict",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]));
+    ready.read_exact(&mut [0]).unwrap();
+    let origin_before = f
+        .project
+        .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+        .stdout;
+    let cancel = f.worker(&["--json", "task", "cancel", &task.to_string()]);
+    assert!(
+        !cancel.status.success(),
+        "a live auxiliary was acknowledged as cancelled"
+    );
+    assert!(String::from_utf8_lossy(&cancel.stdout).contains("INTEGRATION_STOP_UNCONFIRMED"));
+    let client = ClientStateStore::open(&owner_paths(&f).state).unwrap();
+    let owner = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let pending = owner.load(task).unwrap().unwrap();
+    assert!(
+        pending
+            .tombstone
+            .as_ref()
+            .is_some_and(|stop| !stop.acknowledged)
+    );
+    if let Some(entry) = client.queue_entry_for_task_turn(task).unwrap() {
+        assert!(
+            entry.is_cancel_requested(),
+            "stop did not reach the live auxiliary queue"
+        );
+    }
+    let wait = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "60s",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&wait.stdout).contains("WAIT_TIMEOUT"),
+        "{}",
+        String::from_utf8_lossy(&wait.stdout)
+    );
+    let settled = owner.load(task).unwrap().unwrap();
+    assert_eq!(settled.snapshot.state, IntegrationStatus::Revoked);
+    assert!(settled.tombstone.unwrap().acknowledged);
+    assert!(client.queue_entry_for_task_turn(task).unwrap().is_none());
+    assert!(client.load_task(task).unwrap().runner().is_none());
+    assert_eq!(
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout,
+        origin_before
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    let close = f.worker(&["--json", "task", "close", &task.to_string(), "--discard"]);
+    assert!(
+        close.status.success(),
+        "{}",
+        String::from_utf8_lossy(&close.stdout)
+    );
 }
 
 #[test]

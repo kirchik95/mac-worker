@@ -1347,13 +1347,82 @@ impl<'a> TaskClient<'a> {
             Ok(_) => {}
             Err(e)
                 if e.public_code() == "INTEGRATION_ALREADY_COMMITTED"
-                    && !matches!(operation, IntegrationMutation::Cancel) => {}
+                    && !matches!(operation, IntegrationMutation::Cancel) =>
+            {
+                if coordinator
+                    .snapshot(task)?
+                    .is_none_or(|snapshot| snapshot.state != IntegrationStatus::Integrated)
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
+            }
             Err(e) => return Err(e),
+        }
+        if coordinator.snapshot(task)?.is_none_or(|snapshot| {
+            !matches!(
+                snapshot.state,
+                IntegrationStatus::Revoked | IntegrationStatus::Integrated
+            )
+        }) {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
         }
         if matches!(operation, IntegrationMutation::Cancel) {
             coordinator.mark_given_up(task)?;
         }
         self.client_state.load_task(task)
+    }
+
+    /// Stop intent is durable before transport. Neither a remote cancel reply
+    /// nor a dead PID substitutes for journal/queue retirement.
+    pub(crate) fn settle_integration_stop(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let record = self.client_state.load_task(task)?;
+        if let Some(entry) = self.client_state.queue_entry_for_task_turn(task)? {
+            let entry = self
+                .client_state
+                .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
+                .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+            if !matches!(entry.state(), QueueState::Dispatching { .. })
+                && self.finish_waiting_cancellation(&record, &entry)?
+            {
+                return Ok(true);
+            }
+            if record.status().state() == TaskState::Active {
+                let worker = task_worker(self.config, record.status())?;
+                let remote = RemoteJobClient::new(self.runner);
+                let observed = remote.task_status(
+                    worker,
+                    &crate::task_store::TaskStatusRequest::new(record.meta().project_id(), task),
+                )?;
+                if observed.status().state() == TaskState::Active
+                    && observed
+                        .status()
+                        .turns()
+                        .last()
+                        .is_some_and(|turn| turn.turn_id() == entry.job_id())
+                {
+                    remote.task_cancel(
+                        worker,
+                        &crate::task_store::TaskCancelRequest::new(
+                            record.meta().project_id(),
+                            task,
+                            entry.job_id(),
+                        ),
+                    )?;
+                }
+            }
+            return Ok(false);
+        }
+        if let Some(runner) = record.runner() {
+            if self
+                .client_state
+                .runner_identity_verdict(runner.process_identity())
+                != RunnerLivenessVerdict::Exited
+            {
+                return Ok(false);
+            }
+            self.client_state.record_runner(task, None)?;
+        }
+        Ok(true)
     }
 
     /// Herdr session the runners this client starts inline notify about
@@ -6146,7 +6215,9 @@ impl<'a> TaskClient<'a> {
             TaskOutcome::Cancelled
         };
         log.finish_local(task, turn, outcome)?;
-        self.release_task_base(&record)?;
+        if RootedIntegrationState::read_auxiliary(self.paths, task, turn)?.is_none() {
+            self.release_task_base(&record)?;
+        }
         self.client_state.record_runner(task, None)?;
         self.client_state.remove_task_turn_after_terminal(
             turn,

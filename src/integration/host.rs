@@ -158,9 +158,54 @@ impl<'a> HostIntegrationService<'a> {
                 }
             }
             HostIntegrationAction::Revoke { tombstone } => {
-                let mut record = sidecars
-                    .load(&policy.project_id, request.task_id)?
-                    .ok_or_else(invalid)?;
+                let retained = sidecars.load(&policy.project_id, request.task_id)?;
+                let same_cycle = retained.as_ref().is_some_and(|record| {
+                    Some(record.snapshot.integration_id) == request.integration_id
+                        && record.snapshot.epoch == request.epoch
+                });
+                if !same_cycle {
+                    if retained.as_ref().is_some_and(|old| {
+                        !(old.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                            && old.push_intent.as_ref().is_none_or(|p| !p.uncertain)
+                            || old.receipt.as_ref().is_some_and(|r| r.imported))
+                    }) {
+                        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                    }
+                    let mut proof = sidecars
+                        .revoke_evidence(&policy.project_id, request.task_id)?
+                        .filter(|proof| {
+                            proof.request.integration_id == request.integration_id
+                                && proof.request.epoch == request.epoch
+                        })
+                        .unwrap_or(super::host_store::HostRevokeEvidence {
+                            request: request.clone(),
+                            head: None,
+                            turn: None,
+                            acknowledged: false,
+                        });
+                    if proof.request != *request {
+                        return Err(invalid());
+                    }
+                    sidecars.save_revoke_evidence(&policy.project_id, &proof)?;
+                    self.runtime.reach(IntegrationHook::AfterRevoke);
+                    let status = task_store.load_status(&policy.project_id, request.task_id)?;
+                    if status.state() == TaskState::Active
+                        || crate::lease::LeaseService::new(self.store)
+                            .task_scope_is_live(&policy.project_id, request.task_id)?
+                    {
+                        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                    }
+                    self.runtime.reach(IntegrationHook::BeforeRevokeAck);
+                    proof.head = status.head_oid().cloned();
+                    proof.turn = status.turns().last().map(|turn| turn.turn_id());
+                    proof.acknowledged = true;
+                    sidecars.save_revoke_evidence(&policy.project_id, &proof)?;
+                    self.runtime.reach(IntegrationHook::AfterRevokeAck);
+                    let response = HostIntegrationResponse::Revoked { identity };
+                    response.validate_for(request)?;
+                    return Ok(response);
+                }
+                let mut record = retained.ok_or_else(invalid)?;
                 if Some(record.snapshot.integration_id) != request.integration_id
                     || record.snapshot.epoch != request.epoch
                     || record.snapshot.revision.0 > request.revision.0
@@ -215,6 +260,15 @@ impl<'a> HostIntegrationService<'a> {
                 }
             }
             HostIntegrationAction::Step { step, record } => {
+                if sidecars
+                    .revoke_evidence(&policy.project_id, request.task_id)?
+                    .is_some_and(|proof| {
+                        proof.request.integration_id == request.integration_id
+                            && request.epoch <= proof.request.epoch
+                    })
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
                 let status = task_store.load_status(&policy.project_id, request.task_id)?;
                 if status.state() != TaskState::Open && *step != IntegrationStep::Repair {
                     return Err(IntegrationCode::IntegrationWorkspaceMissing.error());

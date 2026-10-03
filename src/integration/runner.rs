@@ -141,8 +141,24 @@ impl IntegrationHost for OwnerPorts<'_> {
         request: &HostIntegrationRequest,
     ) -> Result<HostIntegrationResponse, WorkerError> {
         let worker = self.worker(request.task_id)?;
+        let revoking = matches!(request.action, HostIntegrationAction::Revoke { .. });
+        if revoking && let Some(entry) = self.client.queue_entry_for_task_turn(request.task_id)? {
+            self.client
+                .retain_task_turn_cancel(entry.job_id(), self.runtime.now_millis())?;
+        }
         self.require_helper(worker)?;
-        crate::transfer::RemoteJobClient::new(self.runner).task_integration(worker, request)
+        let response =
+            crate::transfer::RemoteJobClient::new(self.runner).task_integration(worker, request);
+        if revoking
+            && !matches!(response, Ok(HostIntegrationResponse::Integrated { .. }))
+            && !self
+                .client()
+                .settle_integration_stop(request.task_id)
+                .unwrap_or(false)
+        {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+        }
+        response
     }
 }
 impl IntegrationObserver for OwnerPorts<'_> {
@@ -419,6 +435,10 @@ impl<'a> OwnerIntegration<'a> {
                 return Ok(());
             }
         }
+        if !self.coordinator().reclaim_exited_actor(task)? {
+            return Ok(());
+        }
+        let record = self.state.load(task)?.ok_or_else(invalid)?;
         let key = IntegrationPhaseKey {
             task,
             intent: record.snapshot.integration_id,
@@ -426,12 +446,21 @@ impl<'a> OwnerIntegration<'a> {
             revision: record.snapshot.revision,
             phase: IntegrationPhase::Drive,
         };
-        let permit = match self.runtime.begin_phase(&key)? {
-            IntegrationDriveAdmission::Permit(permit) => permit,
-            IntegrationDriveAdmission::Park(pause) => {
-                self.coordinator().park_for_runtime(task, pause)?;
-                return Ok(());
-            }
+        // Revoke and settlement remain available while the launch gate is shut.
+        let permit = if record
+            .tombstone
+            .as_ref()
+            .is_some_and(|stop| !stop.acknowledged)
+        {
+            None
+        } else {
+            Some(match self.runtime.begin_phase(&key)? {
+                IntegrationDriveAdmission::Permit(permit) => permit,
+                IntegrationDriveAdmission::Park(pause) => {
+                    self.coordinator().park_for_runtime(task, pause)?;
+                    return Ok(());
+                }
+            })
         };
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -475,7 +504,12 @@ impl<'a> OwnerIntegration<'a> {
         let _driver = driver_lock(&root, false)?.ok_or_else(invalid)?;
         if let Some(bytes) = read(&root, "driver.json")? {
             let binding: DriverBinding = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-            if binding.task != task || binding.actor != self.runtime.actor() {
+            let record = self.state.load(task)?.ok_or_else(invalid)?;
+            if binding.task != task
+                || binding.actor != self.runtime.actor()
+                || binding.intent != record.snapshot.integration_id
+                || binding.epoch != record.snapshot.epoch
+            {
                 return Err(invalid());
             }
         }

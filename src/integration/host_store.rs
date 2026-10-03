@@ -9,6 +9,17 @@ use std::{fs::File, io, os::fd::AsRawFd};
 pub struct HostIntegrationStore<'a> {
     store: &'a HostStore,
 }
+
+/// A stop can precede the first host phase, or the next ordinary cycle's first
+/// phase. Retain its authenticated identity without inventing an owner record.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostRevokeEvidence {
+    pub request: HostIntegrationRequest,
+    pub head: Option<crate::task::BaseOid>,
+    pub turn: Option<crate::task::TurnId>,
+    pub acknowledged: bool,
+}
 impl<'a> HostIntegrationStore<'a> {
     pub fn new(store: &'a HostStore) -> Self {
         Self { store }
@@ -47,6 +58,57 @@ impl<'a> HostIntegrationStore<'a> {
             "record.json",
             &bytes,
         )
+    }
+    pub(crate) fn revoke_evidence(
+        &self,
+        project: &str,
+        task: TaskId,
+    ) -> Result<Option<HostRevokeEvidence>, WorkerError> {
+        let Some(bytes) = self.read(project, task, "revoke.json", MAX_PRIVATE_RECORD_BYTES)? else {
+            return Ok(None);
+        };
+        let proof: HostRevokeEvidence = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        proof.request.validate()?;
+        if proof.request.task_id != task
+            || !matches!(proof.request.action, HostIntegrationAction::Revoke { .. })
+            || serde_json::to_vec(&proof).map_err(|_| invalid())? != bytes
+        {
+            return Err(invalid());
+        }
+        Ok(Some(proof))
+    }
+    pub(crate) fn save_revoke_evidence(
+        &self,
+        project: &str,
+        proof: &HostRevokeEvidence,
+    ) -> Result<(), WorkerError> {
+        proof.request.validate()?;
+        let bytes = serde_json::to_vec(proof).map_err(|_| invalid())?;
+        if bytes.len() > MAX_PRIVATE_RECORD_BYTES {
+            return Err(invalid());
+        }
+        self.write(project, proof.request.task_id, "revoke.json", &bytes)
+    }
+    pub(crate) fn revoke_proved_at(
+        &self,
+        project: &str,
+        task: TaskId,
+        status: &crate::task::TaskStatus,
+    ) -> Result<bool, WorkerError> {
+        let Some(proof) = self.revoke_evidence(project, task)? else {
+            return Ok(false);
+        };
+        if !proof.acknowledged
+            || proof.head.as_ref() != status.head_oid()
+            || proof.turn != status.turns().last().map(|turn| turn.turn_id())
+        {
+            return Ok(false);
+        }
+        Ok(self.load(project, task)?.is_none_or(|record| {
+            record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record.push_intent.as_ref().is_none_or(|p| !p.uncertain)
+                || record.receipt.as_ref().is_some_and(|r| r.imported)
+        }))
     }
     pub(crate) fn policy(
         &self,

@@ -291,6 +291,22 @@ impl<'a> IntegrationCoordinator<'a> {
         }
         Ok(())
     }
+    /// Reclaim in the observing parent: a re-exec starts with an empty absence cache.
+    pub(crate) fn reclaim_exited_actor(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let Some(mut record) = self.state.load(task)? else {
+            return Ok(true);
+        };
+        if let Some(actor) = record.actor {
+            if self.runtime.actor_verdict(actor)
+                != crate::client_state::RunnerLivenessVerdict::Exited
+            {
+                return Ok(false);
+            }
+            self.release(&mut record)?;
+            self.save(&mut record)?;
+        }
+        Ok(true)
+    }
     fn release_failed_phase(
         &self,
         task: TaskId,
