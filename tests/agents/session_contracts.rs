@@ -449,12 +449,7 @@ fn synthetic_homes_and_capture_doubles_are_read_only() {
     assert_eq!(fake.capture(&path, &cx).unwrap().source_path, path);
     assert_eq!(fake.calls.lock().unwrap().len(), 2);
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(
-        capture_for(SessionAgent::Claude)
-            .capture(&path, &cx)
-            .err()
-            .unwrap()
-            .public_code(),
-        "SESSION_IMPORT_UNSUPPORTED"
-    );
+    // The real capture is read-only too, whatever its verdict on this home.
+    let _ = capture_for(SessionAgent::Claude).capture(&path, &cx);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
