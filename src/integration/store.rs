@@ -1,6 +1,11 @@
 //! Rooted owner store seam. T3 owns its durable implementation.
 use super::contracts::*;
-use crate::{error::WorkerError, job::ProcessIdentity, paths::PathLayout, task::TaskId};
+use crate::{
+    error::WorkerError,
+    job::ProcessIdentity,
+    paths::PathLayout,
+    task::{TaskId, TurnId},
+};
 use std::sync::Arc;
 pub struct RootedIntegrationState;
 impl RootedIntegrationState {
@@ -23,6 +28,20 @@ impl IntegrationState for RootedIntegrationState {
         _task: TaskId,
         _policy: &FrozenIntegrationPolicy,
     ) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn publish_prepared(
+        &self,
+        _task: TaskId,
+        _prepared: &PreparedIntegrationTurn,
+    ) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn load_prepared(
+        &self,
+        _task: TaskId,
+        _turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
         Err(integration_unavailable())
     }
     fn replace(

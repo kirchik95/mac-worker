@@ -1,6 +1,91 @@
 use mac_worker::test_support::integration::*;
 
 #[test]
+fn authoritative_preparation_survives_aux_cas_and_enqueue_crashes() {
+    use mac_worker::test_support::task::model::{TaskState, TaskStatus};
+    use mac_worker::test_support::task::prepared_followup::PreparedFollowup;
+    for hook in [
+        IntegrationHook::AfterAuxCas,
+        IntegrationHook::AfterAuxEnqueue,
+    ] {
+        let f = IntegrationFixture::new();
+        let mut record = sample_record(f.task(), f.source(), "main");
+        record.candidates.push(sample_candidate(&record));
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let turn = prepared.followup.turn_id();
+        let state: &dyn IntegrationState = f.state();
+        let turns: &dyn IntegrationTurns = f.turns();
+        state.publish_prepared(f.task(), &prepared).unwrap();
+        record.auxiliaries.push(prepared.intent().unwrap());
+        state
+            .replace(f.task(), IntegrationRevision(0), &record)
+            .unwrap();
+        let ordinary = prepared.followup.expected();
+        let queued = ordinary
+            .with_status(
+                TaskStatus::new(
+                    TaskState::Queued,
+                    None,
+                    ordinary.status().worker().map(str::to_owned),
+                    true,
+                    Some(fixture_head()),
+                    None,
+                    vec![],
+                    vec![],
+                    None,
+                    ordinary.status().turns().to_vec(),
+                    1003,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        f.observer().insert(IntegrationTaskFacts {
+            ordinary: queued.clone(),
+            cycle_base: record.cycle_base.clone(),
+            result_imported: false,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: Some(IntegrationTurnPurpose::Resolve),
+        });
+        assert_eq!(
+            PreparedFollowup::prepare(&queued, "Rebuild".into(), turn, 1003)
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        if hook == IntegrationHook::AfterAuxEnqueue {
+            turns.enqueue(&prepared).unwrap();
+        }
+        f.crash_at(hook);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.runtime().reach(hook)))
+                .is_err()
+        );
+        f.restart();
+        assert_eq!(f.observer().facts(f.task()).unwrap().ordinary, queued);
+        let loaded = state.load_prepared(f.task(), turn).unwrap().unwrap();
+        assert_eq!(loaded.followup.expected(), ordinary);
+        assert_eq!(
+            f.stored_preparation(f.task(), turn).unwrap(),
+            Some(prepared.clone())
+        );
+        assert_eq!(
+            loaded.binding().unwrap(),
+            record.auxiliaries[0].prepared_binding
+        );
+        turns.enqueue(&loaded).unwrap();
+        turns.enqueue(&loaded).unwrap();
+        assert_eq!(f.enqueue_count(turn), 1);
+        assert_eq!(f.turn_observation(turn).unwrap().queue_position, Some(1));
+        assert_eq!(f.observations().len(), 1);
+    }
+}
+
+#[test]
 fn prepared_verify_binding_matches_the_actual_frozen_candidate_tree() {
     let mut record = sample_record(fixture_task(), fixture_source(), "main");
     let candidate = sample_candidate(&record);

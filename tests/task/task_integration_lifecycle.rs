@@ -1,5 +1,32 @@
 use mac_worker::test_support::integration::*;
 
+#[test]
+fn fixture_keeps_imported_result_through_partial_close_replay() {
+    let f = IntegrationFixture::new();
+    let record = sample_record(f.task(), f.source(), "main");
+    let receipt = IntegrationReceipt {
+        integration_id: record.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: f.source(),
+        source_head: fixture_head(),
+        target_head: record.cycle_base,
+        merge_oid: Some("e".repeat(40).parse().unwrap()),
+        disposition: IntegrationDisposition::Merged,
+        imported: false,
+        recorded_at_millis: 1004,
+    };
+    let imported = f.turns().import_receipt(f.task(), &receipt).unwrap();
+    f.restart();
+    assert_eq!(f.imports(f.task()), vec![imported.clone()]);
+    assert!(f.closes(f.task()).is_empty());
+    f.turns().close_integrated(f.task(), &imported).unwrap();
+    f.restart();
+    f.turns().close_integrated(f.task(), &imported).unwrap();
+    assert_eq!(f.closes(f.task()), vec![imported]);
+    assert_eq!(f.accepted_head(f.task()), receipt.merge_oid);
+    assert!(f.host_calls().is_empty());
+}
+
 // T3 owns this seed and replaces it when implementing the coordinator.
 #[test]
 fn unwired_coordinator_reports_typed_unavailable_without_claiming_host_completion() {
