@@ -298,6 +298,8 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
+    pub integrate: crate::integration::contracts::IntegrationOverride,
+    pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
     pub agent: AgentKind,
@@ -831,6 +833,10 @@ impl<'de> Deserialize<'de> for BatchFile {
         #[derive(Debug, Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default)]
+            integrate: Option<crate::integration::contracts::IntegrationOverride>,
+            #[serde(default)]
+            verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
             #[serde(default = "default_batch_version")]
             version: u32,
             #[serde(default)]
@@ -872,6 +878,8 @@ impl<'de> Deserialize<'de> for BatchFile {
 
         let wire = Wire::deserialize(deserializer)?;
         let has_flat_defaults = [
+            wire.integrate.is_some(),
+            wire.verify_merge.is_some(),
             wire.agent.is_some(),
             wire.model.is_some(),
             wire.effort.is_some(),
@@ -898,6 +906,12 @@ impl<'de> Deserialize<'de> for BatchFile {
         }
 
         let mut defaults = wire.defaults.unwrap_or_default();
+        if let Some(integrate) = wire.integrate {
+            defaults.integrate = integrate;
+        }
+        if wire.verify_merge.is_some() {
+            defaults.verify_merge = wire.verify_merge;
+        }
         if let Some(agent) = wire.agent {
             defaults.agent = agent;
         }
@@ -959,6 +973,10 @@ impl<'de> Deserialize<'de> for BatchFile {
 #[serde(deny_unknown_fields)]
 pub struct BatchDefaults {
     #[serde(default)]
+    pub integrate: crate::integration::contracts::IntegrationOverride,
+    #[serde(default)]
+    pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
+    #[serde(default)]
     pub questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default = "default_agent_name")]
     pub agent: String,
@@ -995,6 +1013,8 @@ pub struct BatchDefaults {
 impl Default for BatchDefaults {
     fn default() -> Self {
         Self {
+            integrate: Default::default(),
+            verify_merge: None,
             questions: None,
             agent: default_agent_name(),
             model: None,
@@ -1018,6 +1038,10 @@ impl Default for BatchDefaults {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
+    #[serde(default)]
+    pub integrate: crate::integration::contracts::IntegrationOverride,
+    #[serde(default)]
+    pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     #[serde(default)]
     pub questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default)]
@@ -1261,6 +1285,8 @@ impl<'a> TaskClient<'a> {
             ));
         }
         let request = TaskSubmitRequest {
+            integrate: Default::default(),
+            verify_merge: None,
             session_import: prepared.session_import.clone(),
             questions: prepared.questions,
             agent: prepared.agent,
@@ -6977,6 +7003,8 @@ pub(crate) fn request_from_frozen_node(
 ) -> Result<TaskSubmitRequest, WorkerError> {
     let spec = &node.frozen;
     Ok(TaskSubmitRequest {
+        integrate: Default::default(),
+        verify_merge: None,
         session_import: None,
         questions: spec.questions,
         agent: parse_agent(&spec.agent)?,
@@ -7095,6 +7123,8 @@ pub(crate) fn resolve_batch_task_without_local_workers(
             .unwrap_or(default_limits.max_followups),
     )?;
     let request = TaskSubmitRequest {
+        integrate: Default::default(),
+        verify_merge: None,
         session_import: None,
         questions: task.questions.or(defaults.questions).or(settings.questions),
         agent,
@@ -7695,6 +7725,8 @@ mod session_submission_tests {
         }
         fn request(&self) -> TaskSubmitRequest {
             TaskSubmitRequest {
+                integrate: Default::default(),
+                verify_merge: None,
                 session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,

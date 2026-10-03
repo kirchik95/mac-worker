@@ -715,6 +715,8 @@ fn attached_waits_for_drain(path: AttachedPath, json: bool, expire: bool) {
     let report = match path {
         AttachedPath::Submit => client.submit(
             mac_worker::test_support::task::client::TaskSubmitRequest {
+                integrate: Default::default(),
+                verify_merge: None,
                 session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,

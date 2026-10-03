@@ -306,6 +306,8 @@ impl RunnerFixture {
         let result = TaskClient::new(&host, &config, &paths, &state, &InlineRunnerExecutor)
             .submit(
                 TaskSubmitRequest {
+                    integrate: Default::default(),
+                    verify_merge: None,
                     session_import: imported.then(|| import(agent)),
                     questions: None,
                     agent,

@@ -1647,6 +1647,8 @@ fn dag_first_submit_start_runner_failure_is_not_hidden_by_a_queued_row() {
     let error = TaskClient::new(&runner, &config, &paths, &store, &executor)
         .submit(
             TaskSubmitRequest {
+                integrate: Default::default(),
+                verify_merge: None,
                 session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,

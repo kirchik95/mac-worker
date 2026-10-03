@@ -1775,6 +1775,8 @@ fn run_task_subcommand(
                 .with_session_selector(from_session, runtime.home());
             let report = client.submit_titled(
                 TaskSubmitRequest {
+                    integrate: Default::default(),
+                    verify_merge: None,
                     session_import: None,
                     questions,
                     agent: task_agent,
