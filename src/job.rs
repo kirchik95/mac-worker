@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     str::FromStr,
 };
@@ -2025,6 +2025,28 @@ pub enum QueueCancel {
     },
 }
 
+// The client-state cache is shared with old binaries whose observation codec
+// denies unknown fields. Carry this optional extension in the existing local
+// inventory field, not in capabilities (which would advertise false gates).
+// Old readers decode it, fail the inventory binding comparison, and re-probe.
+const ADMISSION_VERSIONS_PREFIX: &str = "@mac-worker/agent-versions:";
+const MAX_ADMISSION_AGENTS: usize = 16;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionVersionCache {
+    inventory_capabilities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    agent_versions: BTreeMap<String, String>,
+}
+
+fn valid_admission_agent_version(agent: &str, version: &str) -> bool {
+    validate_worker_name(agent).is_ok()
+        && !version.is_empty()
+        && version.len() <= 64
+        && version.bytes().all(|byte| (32..=126).contains(&byte))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionObservation {
     worker_name: String,
@@ -2037,6 +2059,8 @@ pub struct AdmissionObservation {
     /// Interactive herdr agents excluding mac-worker's reporter. Absent
     /// from cache files written before this field existed.
     interactive_agents: Option<u32>,
+    /// Validated default-profile versions; old caches have none and fail closed.
+    agent_versions: BTreeMap<String, String>,
     ssh: String,
     remote_binary: String,
     inventory_capabilities: Option<Vec<String>>,
@@ -2065,6 +2089,7 @@ impl AdmissionObservation {
             free_disk_bytes,
             observed_at_millis,
             interactive_agents: None,
+            agent_versions: BTreeMap::new(),
             ssh: String::new(),
             remote_binary: String::new(),
             inventory_capabilities: None,
@@ -2079,6 +2104,31 @@ impl AdmissionObservation {
     pub fn with_interactive_agents(mut self, interactive_agents: Option<u32>) -> Self {
         self.interactive_agents = interactive_agents;
         self
+    }
+
+    /// Retain only bounded, printable default-profile version facts. Invalid
+    /// facts must fail closed for version gates, not erase healthy capacity.
+    pub fn with_agent_versions(mut self, agent_versions: BTreeMap<String, String>) -> Self {
+        self.agent_versions = agent_versions
+            .into_iter()
+            .filter(|(agent, version)| valid_admission_agent_version(agent, version))
+            .take(MAX_ADMISSION_AGENTS)
+            .collect();
+        self
+    }
+
+    pub fn agent_versions(&self) -> &BTreeMap<String, String> {
+        &self.agent_versions
+    }
+
+    pub(crate) fn facts_fresh_at(&self, now_millis: u64) -> bool {
+        let (Some(age), Some(started)) =
+            (self.facts_age_millis, self.final_probe_started_at_millis)
+        else {
+            return false;
+        };
+        started <= now_millis
+            && age.saturating_add(now_millis - started) <= crate::agent_facts::FACTS_TTL
     }
 
     /// Local cache binding for skip-SSH. Missing fields keep the record an
@@ -2129,6 +2179,17 @@ impl AdmissionObservation {
     pub fn validate(&self) -> Result<(), WorkerError> {
         validate_worker_name(&self.worker_name)?;
         validate_requirements(&self.capabilities)?;
+        // Version-bearing durable records must have a local binding so old
+        // codecs retain the inventory extension during canonical reserialization.
+        if (!self.agent_versions.is_empty() && !self.binding_complete())
+            || self.agent_versions.len() > MAX_ADMISSION_AGENTS
+            || self
+                .agent_versions
+                .iter()
+                .any(|(agent, version)| !valid_admission_agent_version(agent, version))
+        {
+            return Err(protocol_error("admission agent versions are invalid"));
+        }
         if self.observed_at_millis == 0 {
             return Err(protocol_error(
                 "admission observation timestamp must be positive",
@@ -2174,6 +2235,16 @@ impl Serialize for AdmissionObservation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(ser::Error::custom)?;
         let bound = self.binding_complete();
+        let extended_inventory = if self.agent_versions.is_empty() {
+            self.inventory_capabilities.clone()
+        } else {
+            let extension = serde_json::to_string(&AdmissionVersionCache {
+                inventory_capabilities: self.inventory_capabilities.clone(),
+                agent_versions: self.agent_versions.clone(),
+            })
+            .map_err(ser::Error::custom)?;
+            Some(vec![format!("{ADMISSION_VERSIONS_PREFIX}{extension}")])
+        };
         let fields = 7 + usize::from(self.interactive_agents.is_some()) + if bound { 6 } else { 0 };
         let mut record = serializer.serialize_struct("AdmissionObservation", fields)?;
         record.serialize_field("worker_name", &self.worker_name)?;
@@ -2195,7 +2266,7 @@ impl Serialize for AdmissionObservation {
         if bound {
             record.serialize_field("ssh", &self.ssh)?;
             record.serialize_field("remote_binary", &self.remote_binary)?;
-            record.serialize_field("inventory_capabilities", &self.inventory_capabilities)?;
+            record.serialize_field("inventory_capabilities", &extended_inventory)?;
             record.serialize_field("slots", &self.slots)?;
             record.serialize_field("facts_age_millis", &self.facts_age_millis)?;
             record.serialize_field(
@@ -2254,9 +2325,19 @@ impl<'de> Deserialize<'de> for AdmissionObservation {
         observation.ssh = wire.ssh;
         observation.remote_binary = wire.remote_binary;
         observation.inventory_capabilities = wire.inventory_capabilities;
+        if let Some(inventory) = &observation.inventory_capabilities
+            && let [entry] = inventory.as_slice()
+            && let Some(extension) = entry.strip_prefix(ADMISSION_VERSIONS_PREFIX)
+        {
+            let extension: AdmissionVersionCache =
+                serde_json::from_str(extension).map_err(de::Error::custom)?;
+            observation.inventory_capabilities = extension.inventory_capabilities;
+            observation.agent_versions = extension.agent_versions;
+        }
         observation.slots = wire.slots;
         observation.facts_age_millis = wire.facts_age_millis;
         observation.final_probe_started_at_millis = wire.final_probe_started_at_millis;
+        observation.validate().map_err(de::Error::custom)?;
         Ok(observation)
     }
 }
@@ -6008,6 +6089,145 @@ fn incompatible_protocol(message: &str) -> WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn version_observation(bound: bool) -> AdmissionObservation {
+        let observation = AdmissionObservation::new(
+            "mini-1".into(),
+            true,
+            CandidateSlot::Idle,
+            vec!["agent:codex".into()],
+            Some(10),
+            20,
+            1_000,
+        )
+        .unwrap();
+        if bound {
+            observation.with_local_binding(
+                "mac1".into(),
+                "~/.local/bin/worker".into(),
+                vec!["node".into()],
+                1,
+                Some(0),
+                1_000,
+            )
+        } else {
+            observation
+        }
+    }
+
+    #[test]
+    fn admission_versions_codec_roundtrips_bound_records_and_refuses_unbound_versions() {
+        let versions = BTreeMap::from([
+            ("codex".into(), "0.159.3".into()),
+            ("claude".into(), "2.1.285 (Claude Code)".into()),
+        ]);
+        let observation = version_observation(true).with_agent_versions(versions.clone());
+        let bytes = serde_json::to_vec(&observation).unwrap();
+        let back: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, observation);
+        assert_eq!(serde_json::to_vec(&back).unwrap(), bytes);
+        assert!(back.binding_complete());
+        assert_eq!(back.agent_versions(), &versions);
+        // Transient projection can hold versions before with_local_binding,
+        // but cannot publish a cache an old canonical reader would reject.
+        let unbound = version_observation(false).with_agent_versions(versions);
+        assert!(serde_json::to_vec(&unbound).is_err());
+        let legacy_unbound = version_observation(false);
+        let bytes = serde_json::to_vec(&legacy_unbound).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AdmissionObservation>(&bytes).unwrap(),
+            legacy_unbound
+        );
+    }
+
+    #[test]
+    fn admission_versions_new_cache_is_canonical_for_old_closed_reader() {
+        // Frozen pre-version codec shape. Serde rejects any added top-level
+        // field; reserialization must also match ClientStateStore's canonical
+        // byte check. The old binding must miss, rather than trust these facts.
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldWire {
+            worker_name: String,
+            ready: bool,
+            slot: String,
+            capabilities: Vec<String>,
+            available_memory_bytes: Option<u64>,
+            free_disk_bytes: u64,
+            observed_at_millis: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            interactive_agents: Option<u32>,
+            ssh: String,
+            remote_binary: String,
+            inventory_capabilities: Option<Vec<String>>,
+            slots: Option<u8>,
+            facts_age_millis: Option<u64>,
+            final_probe_started_at_millis: Option<u64>,
+        }
+        let observation = version_observation(true)
+            .with_agent_versions(BTreeMap::from([("codex".into(), "0.159.3".into())]));
+        let bytes = serde_json::to_vec(&observation).unwrap();
+        let old: OldWire = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&old).unwrap(), bytes);
+        assert_eq!(old.capabilities, observation.capabilities());
+        assert_ne!(
+            old.inventory_capabilities,
+            observation.inventory_capabilities
+        );
+        let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        unknown["unknown"] = true.into();
+        assert!(serde_json::from_value::<AdmissionObservation>(unknown).is_err());
+    }
+
+    #[test]
+    fn admission_versions_validate_bounds_on_decode_and_filter_bad_probe_facts() {
+        let valid = BTreeMap::from([("codex".into(), "x".repeat(64))]);
+        let observation = version_observation(true).with_agent_versions(valid.clone());
+        assert_eq!(observation.agent_versions(), &valid);
+        let bytes = serde_json::to_vec(&observation).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for invalid in [
+            BTreeMap::from([("codex".into(), String::new())]),
+            BTreeMap::from([("codex".into(), "x".repeat(65))]),
+            BTreeMap::from([("codex".into(), "0.159.3\n".into())]),
+            BTreeMap::from([("codex".into(), "0.159.3\u{7f}".into())]),
+            BTreeMap::from([("codex".into(), "0.159.3é".into())]),
+            BTreeMap::from([("bad/name".into(), "0.159.3".into())]),
+            (0..17)
+                .map(|index| (format!("agent-{index}"), "1.0".into()))
+                .collect(),
+        ] {
+            let mut wire = original.clone();
+            let extension = AdmissionVersionCache {
+                inventory_capabilities: Some(vec!["node".into()]),
+                agent_versions: invalid.clone(),
+            };
+            wire["inventory_capabilities"][0] = format!(
+                "{ADMISSION_VERSIONS_PREFIX}{}",
+                serde_json::to_string(&extension).unwrap(),
+            )
+            .into();
+            assert!(serde_json::from_value::<AdmissionObservation>(wire).is_err());
+            let filtered = version_observation(true).with_agent_versions(invalid);
+            filtered.validate().unwrap();
+            assert!(filtered.agent_versions().len() <= 16);
+            assert!(filtered.agent_versions().values().all(|version| {
+                !version.is_empty()
+                    && version.len() <= 64
+                    && version.bytes().all(|byte| (32..=126).contains(&byte))
+            }));
+        }
+        let sixteen = (0..16)
+            .map(|index| (format!("agent-{index}"), " ".repeat(64)))
+            .collect();
+        let observation = version_observation(true).with_agent_versions(sixteen);
+        let bytes = serde_json::to_vec(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AdmissionObservation>(&bytes).unwrap(),
+            observation
+        );
+        assert_eq!(observation.agent_versions().len(), 16);
+    }
 
     #[test]
     fn host_control_error_serialization_revalidates_message_content() {

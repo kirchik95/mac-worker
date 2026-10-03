@@ -1670,7 +1670,13 @@ impl ClientStateStore {
                             observation.free_disk_bytes(),
                         )
                         .map(|candidate| {
-                            candidate.with_interactive_agents(observation.interactive_agents())
+                            candidate
+                                .with_agent_versions(if observation.facts_fresh_at(now_millis) {
+                                    observation.agent_versions().clone()
+                                } else {
+                                    Default::default()
+                                })
+                                .with_interactive_agents(observation.interactive_agents())
                         })
                         .map_err(|_| {
                             WorkerError::Protocol("cached scheduler observation is invalid".into())
@@ -8257,7 +8263,9 @@ fn advisory_now_millis() -> u64 {
 /// The admission cache may still list them; the advisory view must not.
 fn advisory_capabilities(observation: &AdmissionObservation, now_millis: u64) -> Vec<String> {
     let mut capabilities = observation.capabilities().to_vec();
-    if now_millis.saturating_sub(observation.observed_at_millis()) > FACTS_TTL {
+    if now_millis.saturating_sub(observation.observed_at_millis()) > FACTS_TTL
+        || (observation.binding_complete() && !observation.facts_fresh_at(now_millis))
+    {
         capabilities.retain(|capability| !capability.starts_with("agent:"));
     }
     capabilities
