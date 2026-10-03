@@ -408,6 +408,72 @@ fn closed_repair_failed_observation_retains_uncertainty_and_retries_safely() {
 }
 
 #[test]
+fn host_arm_refuses_the_effective_default_push_branch_before_persisting_policy() {
+    use mac_worker::test_support::task::model::{BranchName, PushTarget, TaskMeta};
+    for push in [true, false] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        let task = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap();
+        let meta = TaskStore::new(&f.store, &SystemProcessRunner)
+            .load_meta(&f.record.policy.project_id, f.record.task_id)
+            .unwrap();
+        let mut wire = serde_json::to_value(meta).unwrap();
+        wire["publish"] = if push {
+            serde_json::json!(["fetch", "push"])
+        } else {
+            serde_json::json!(["fetch"])
+        };
+        wire["publish_branch"] = serde_json::Value::Null;
+        if push {
+            wire["source"]["push_target"] =
+                serde_json::to_value(PushTarget::new(f.record.policy.origin.clone()).unwrap())
+                    .unwrap();
+        }
+        let meta: TaskMeta = serde_json::from_value(wire).unwrap();
+        std::fs::write(task.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        f.record.policy.target = BranchName::for_task(f.record.task_id);
+        let runner = RecoveryRunner::default();
+        let result = HostIntegrationService::new(&f.store, &runner, &f.runtime).execute(
+            &HostIntegrationRequest {
+                protocol_version: 7,
+                task_id: f.record.task_id,
+                integration_id: None,
+                epoch: 0,
+                revision: IntegrationRevision(0),
+                action: HostIntegrationAction::Arm {
+                    policy: f.record.policy.clone(),
+                },
+            },
+        );
+        if push {
+            assert_eq!(
+                result.unwrap_err().public_code(),
+                IntegrationCode::IntegrationPublishTargetCollision.as_str()
+            );
+            assert!(!task.join("integration/policy.json").exists());
+            assert!(host_record_optional(&f).is_none());
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                HostIntegrationResponse::Progress { snapshot: None, .. }
+            ));
+            assert!(task.join("integration/policy.json").exists());
+        }
+        assert!(runner.requests.lock().unwrap().is_empty());
+    }
+}
+
+fn host_record_optional(f: &GitIntegrationFixture) -> Option<IntegrationRecord> {
+    HostIntegrationStore::new(&f.store)
+        .load(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+}
+
+#[test]
 fn auxiliary_checks_follow_the_frozen_source_requirement() {
     use mac_worker::test_support::agents::agent::{ReportedCheck, ReportedCheckStatus::*};
     let check = |state| ReportedCheck::new("fixture", "true", state, "claim");

@@ -8,7 +8,7 @@ use crate::{
     error::WorkerError,
     host_store::HostStore,
     process::ProcessRunner,
-    task::{BranchName, ClosePolicy, TaskSource, TaskState},
+    task::{BranchName, ClosePolicy, PublishMode, TaskSource, TaskState},
     task_store::TaskStore,
 };
 pub struct HostIntegrationService<'a> {
@@ -65,7 +65,9 @@ impl<'a> HostIntegrationService<'a> {
         if format!("{:x}", digest.finalize()) != meta.project_id() {
             return Err(invalid());
         }
-        if meta.publish_branch() == Some(&policy.target) {
+        let default_publish_branch = BranchName::for_task(request.task_id);
+        let publish_branch = meta.publish_branch().unwrap_or(&default_publish_branch);
+        if meta.publish().contains(&PublishMode::Push) && publish_branch == &policy.target {
             return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
         }
         if matches!(request.action, HostIntegrationAction::Arm { .. })
