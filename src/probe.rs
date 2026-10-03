@@ -1354,7 +1354,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(&response).unwrap()["features"],
-            serde_json::json!([])
+            serde_json::json!(crate::features::HOST_FEATURES)
         );
 
         assert_eq!(

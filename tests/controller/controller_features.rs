@@ -161,7 +161,11 @@ fn health_features_describe_the_serving_binary_even_without_a_leader() {
     assert_eq!(status.state, HealthState::Stale);
     assert_eq!(
         serde_json::to_value(status).unwrap()["features"],
-        json!(["controller.events", "controller.task-logs-wait"])
+        json!([
+            "controller.events",
+            "controller.session-import",
+            "controller.task-logs-wait"
+        ])
     );
     assert_eq!(*runner.requests.lock().unwrap(), 1);
     assert!(!runner.root.path().join("absent").exists());
@@ -205,7 +209,7 @@ fn controller_status_prints_features_in_plain_and_json_output() {
     for (reply, expected) in [
         (
             Ok(None),
-            "features: controller.events, controller.task-logs-wait",
+            "features: controller.events, controller.session-import, controller.task-logs-wait",
         ),
         (Ok(Some(old_health())), "features: unknown"),
         (Err(()), "features: unknown"),
@@ -240,7 +244,11 @@ fn controller_status_prints_features_in_plain_and_json_output() {
                     if expected.ends_with("unknown") {
                         Value::Null
                     } else {
-                        json!(["controller.events", "controller.task-logs-wait"])
+                        json!([
+                            "controller.events",
+                            "controller.session-import",
+                            "controller.task-logs-wait"
+                        ])
                     }
                 );
             } else {
