@@ -194,6 +194,8 @@ impl MacWorkerDashboardSource {
         }
     }
 
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(
         mut self,
         source: Arc<dyn crate::dashboard::task::DashboardIntegrationSource>,

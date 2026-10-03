@@ -805,6 +805,8 @@ impl IntegrationHintData {
 /// The only producer input: typed identifiers and explicitly safe fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewEvent {
+    // Published by the serial T6 owner wiring after state durability.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     IntegrationChanged {
         task_id: TaskId,
         integration: crate::integration::contracts::IntegrationFactsAnnotation,
@@ -1085,6 +1087,22 @@ impl TaskFacts {
     pub fn try_new(wire: TaskFactsWire) -> Result<Self, WorkerError> {
         wire.try_into()
     }
+    pub(crate) fn integration_notice_candidate(&self) -> bool {
+        use crate::integration::contracts::IntegrationStatus;
+        self.integration.as_ref().is_some_and(|annotation| {
+            matches!(
+                annotation.state,
+                IntegrationStatus::Integrated | IntegrationStatus::Blocked
+            ) || (matches!(
+                annotation.state,
+                IntegrationStatus::Armed | IntegrationStatus::Revoked
+            ) && (self
+                .outcome
+                .is_some_and(|outcome| outcome != SafeOutcome::Done)
+                || self.eligibility_signature().abandoned_without_turn)
+                && self.eligibility_signature().quiescent == Some(true))
+        })
+    }
     pub fn eligibility_signature(&self) -> TaskEligibilitySignature {
         let (busy, quiescent) = self.proof_flags();
         let current_attention = (self.state == "open"
@@ -1153,7 +1171,8 @@ impl TaskFacts {
                 crate::integration::contracts::IntegrationStatus::Integrated
                     | crate::integration::contracts::IntegrationStatus::Blocked
                     | crate::integration::contracts::IntegrationStatus::Revoked
-            )
+            ) && !(annotation.state == crate::integration::contracts::IntegrationStatus::Armed
+                && self.outcome != Some(SafeOutcome::Done))
         }) || self.runner_present
             || self.close_intent
             || self.auto_continue_intent

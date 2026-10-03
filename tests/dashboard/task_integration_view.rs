@@ -162,6 +162,65 @@ fn compact_confirmation_requires_the_complete_same_revision_identity() {
     assert!(!annotation.confirms(&other_target));
 }
 
+#[test]
+fn terminal_dependency_failure_needs_you_while_dependency_wait_stays_queued() {
+    let mut facts = facts();
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Armed;
+    let status = TaskStatus::new(
+        TaskState::Abandoned,
+        None,
+        None,
+        false,
+        None,
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![],
+        1002,
+    )
+    .unwrap();
+    facts.ordinary = facts
+        .ordinary
+        .with_status(status)
+        .unwrap()
+        .with_abandon_code(Some("INTEGRATION_DEPENDENCY_NOT_INTEGRATED".into()))
+        .unwrap();
+    let view = project_integration(Some(&snapshot), &facts).unwrap();
+    assert_eq!(view.workflow_state, Some(WorkflowState::NeedsYou));
+    assert!(view.attention);
+}
+
+#[test]
+fn armed_lost_human_outcome_needs_you_instead_of_terminal_done() {
+    let mut facts = facts();
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Armed;
+    let status = TaskStatus::new(
+        TaskState::Lost,
+        Some(mac_worker::test_support::task::model::TaskOutcome::Lost),
+        None,
+        false,
+        None,
+        None,
+        vec![],
+        vec![],
+        None,
+        vec![],
+        1002,
+    )
+    .unwrap();
+    facts.ordinary = facts.ordinary.with_status(status).unwrap();
+    let view = project_integration(Some(&snapshot), &facts).unwrap();
+    assert_eq!(view.workflow_state, Some(WorkflowState::NeedsYou));
+    assert!(view.attention);
+    assert_eq!(
+        serde_json::to_value(view.review_state).unwrap(),
+        "ready_for_follow_up"
+    );
+}
+
 mod route {
     use super::*;
     use mac_worker::test_support::{
@@ -371,6 +430,17 @@ mod owner_adapter {
         atomic::{AtomicUsize, Ordering},
     };
     struct NoRemote;
+    struct NoProcesses;
+    impl mac_worker::test_support::host::process::ProcessRunner for NoProcesses {
+        fn run(
+            &self,
+            _: &mac_worker::test_support::host::process::ProcessRequest,
+        ) -> Result<mac_worker::test_support::host::process::ProcessResult, WorkerError> {
+            Err(WorkerError::Protocol(
+                "no process may execute in the fixture".into(),
+            ))
+        }
+    }
     impl DashboardRemoteReader for NoRemote {
         fn task_status(
             &self,
@@ -439,7 +509,8 @@ mod owner_adapter {
         assert_eq!(detail.workflow_state, Some(WorkflowState::NeedsYou));
         assert_eq!(detail.integration, detail.task.integration);
         let mutations = MacWorkerTaskMutationSource::new(config, state, paths)
-            .with_integrations(adapter.clone());
+            .with_integrations(adapter.clone())
+            .with_process_runner(Arc::new(NoProcesses));
         let mut request = TaskIntegrationRequest {
             expected: TaskMutationRequest {
                 expected_integration_id: None,
@@ -459,6 +530,20 @@ mod owner_adapter {
                 request_id: "f".repeat(32),
             },
         };
+        assert_eq!(
+            mutations
+                .accept(fixture_task(), &request.expected)
+                .unwrap_err()
+                .code,
+            "TASK_REVISION_CONFLICT"
+        );
+        let mut close = request.expected.clone();
+        close.expected_integration_id = Some(snapshot.integration_id);
+        close.expected_integration_revision = Some(snapshot.revision);
+        assert_eq!(
+            mutations.accept(fixture_task(), &close).unwrap_err().code,
+            "INTEGRATION_UNAVAILABLE"
+        );
         request.expected_integration_id =
             sample_record(fixture_task(), fixture_source(), "release")
                 .snapshot

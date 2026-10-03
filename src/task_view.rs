@@ -737,6 +737,10 @@ impl TaskListRow {
         self.integration = view.integration;
         self.workflow_state = view.workflow_state;
         self.review_state = view.review_state;
+        if self.workflow_state == Some(crate::integration::contracts::WorkflowState::NeedsYou)
+            && facts.ordinary.abandon_code() == Some(crate::integration::contracts::IntegrationCode::IntegrationDependencyNotIntegrated.as_str()) {
+            self.blocking_code = facts.ordinary.abandon_code().map(str::to_owned);
+        }
         Ok(self)
     }
 }

@@ -127,6 +127,8 @@ pub struct ExistingTaskProjectionProvider {
 }
 
 impl ExistingTaskProjectionProvider {
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(
         mut self,
         state: Arc<dyn crate::integration::contracts::IntegrationState>,
@@ -157,7 +159,9 @@ impl TaskProjectionProvider for ExistingTaskProjectionProvider {
             return Err(invalid_state());
         }
         let mut store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
-        store.integrations = self.integrations.clone();
+        if let Some(integrations) = &self.integrations {
+            store = store.with_integrations(integrations.clone());
+        }
         store.check_deadline(deadline)?;
         Ok(Arc::new(store))
     }
@@ -932,6 +936,8 @@ impl TaskFacts {
                 self.code = None;
             }
             IntegrationStatus::Revoked => {}
+            IntegrationStatus::Armed
+                if self.outcome != Some(crate::controller::events::SafeOutcome::Done) => {}
             _ => {
                 self.busy = Some(true);
                 self.quiescent = Some(false);
@@ -1297,6 +1303,53 @@ mod tests {
         bytes.push(b'\n');
         fs::write(paths.state.join("queue/state.json"), bytes).unwrap();
         jobs
+    }
+
+    #[test]
+    fn addressed_facts_use_durable_companion_and_never_infer_disabled_from_missing_record() {
+        use crate::integration::{contracts::*, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = record(1, TaskState::Open, TaskOutcome::Done);
+        let task_id = task.meta().task_id();
+        write_record(&paths, &task);
+        private_directory(&paths.state.join("turns").join(task_id.to_string()));
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let read = |reader: &TaskEventReadStore| {
+            reader.addressed_measured(&[task_id], false, None, Duration::from_secs(30))
+        };
+        let baseline = read(&reader).unwrap().value.rows.remove(0);
+        let state = Arc::new(MemoryIntegrationState::default());
+        let reader = reader.with_integrations(state.clone());
+        assert_eq!(read(&reader).unwrap().value.rows[0], baseline);
+        let mut integration = sample_record(task_id, task.status().turns()[0].turn_id(), "main");
+        state.publish_policy(task_id, &integration.policy).unwrap();
+        assert_eq!(
+            read(&reader).err().unwrap().public_code(),
+            "INTEGRATION_UNAVAILABLE"
+        );
+        assert!(
+            state
+                .replace(task_id, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        let enabled = read(&reader).unwrap().value.rows.remove(0);
+        assert_eq!(
+            enabled.integration,
+            Some(integration.snapshot.annotation().unwrap())
+        );
+        assert_ne!(enabled.fact_digest, baseline.fact_digest);
+        integration.snapshot.revision = integration.snapshot.revision.next().unwrap();
+        assert!(
+            state
+                .replace(task_id, IntegrationRevision(1), &integration)
+                .unwrap()
+        );
+        let newer = read(&reader).unwrap().value.rows.remove(0);
+        assert_ne!(newer.fact_digest, enabled.fact_digest);
+        assert_ne!(
+            newer.eligibility_signature(),
+            enabled.eligibility_signature()
+        );
     }
 
     #[test]

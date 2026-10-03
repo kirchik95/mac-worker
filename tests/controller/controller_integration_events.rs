@@ -30,8 +30,9 @@ fn integration_hints_are_bounded_title_free_and_unknown_kinds_remain_readable() 
 fn enabled_facts_bind_revision_keep_compact_identity_and_conservative_proofs() {
     use mac_worker::test_support::events::rpc::task_reads::record_facts;
     let ordinary = sample_ordinary(fixture_task(), fixture_source());
-    let mut snapshot =
-        sample_record(fixture_task(), fixture_source(), "é".repeat(127).as_str()).snapshot;
+    let target = format!("r{}", "é".repeat(127));
+    assert_eq!(target.len(), 255);
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), &target).snapshot;
     assert!(snapshot.target.len() <= MAX_TARGET_DISPLAY_BYTES);
     let pending = record_facts(&ordinary, Some(false), true)
         .unwrap()
@@ -145,4 +146,23 @@ fn disabled_facts_serialize_to_the_same_baseline_bytes() {
     );
     let decoded: TaskFacts = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn armed_human_outcome_is_quiescent_and_actionable_before_final_done() {
+    use mac_worker::test_support::events::rpc::task_reads::record_facts;
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    let mut json = serde_json::to_value(&ordinary).unwrap();
+    json["status"]["last_outcome"] = serde_json::json!({"kind":"needs_input"});
+    json["status"]["turns"][0]["outcome"] = serde_json::json!({"kind":"needs_input"});
+    let ordinary = serde_json::from_value(json).unwrap();
+    let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+    snapshot.state = IntegrationStatus::Armed;
+    let facts = record_facts(&ordinary, Some(false), false)
+        .unwrap()
+        .with_integration(&ordinary, &snapshot)
+        .unwrap();
+    assert_eq!(facts.busy, Some(false));
+    assert_eq!(facts.quiescent, Some(true));
+    assert!(facts.eligibility_signature().current_attention);
 }

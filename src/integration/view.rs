@@ -54,6 +54,7 @@ pub fn project_integration(
         TaskState::Queued => WorkflowState::Queued,
         TaskState::Active => WorkflowState::Running,
         TaskState::Open => WorkflowState::NeedsYou,
+        TaskState::Lost if ordinary_attention => WorkflowState::NeedsYou,
         TaskState::Closed | TaskState::Abandoned | TaskState::Lost => WorkflowState::Done,
     };
     let automatic = !matches!(
@@ -102,7 +103,20 @@ pub fn project_integration(
             };
             view.attention = true;
         }
+        Some(WorkflowState::NeedsYou) if status.state() == TaskState::Lost => {
+            view.review_state = ReviewState::ReadyForFollowUp;
+        }
         _ => {}
+    }
+    if matches!(
+        snapshot.state,
+        IntegrationStatus::Armed | IntegrationStatus::Revoked
+    ) && record.abandon_code()
+        == Some(IntegrationCode::IntegrationDependencyNotIntegrated.as_str())
+    {
+        view.workflow_state = Some(WorkflowState::NeedsYou);
+        view.review_state = ReviewState::ReadyForFollowUp;
+        view.attention = true;
     }
     view.validate()?;
     Ok(view)

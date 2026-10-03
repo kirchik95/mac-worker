@@ -32,6 +32,13 @@ pub const MAX_TASK_LOG_LIMIT: u32 = 65_536;
 
 /// Owner/controller adapter. Reads return durable snapshots; redrive publishes intent.
 pub trait DashboardIntegrationSource: Send + Sync + 'static {
+    fn revoke(
+        &self,
+        _task_id: TaskId,
+        _expected: crate::integration::contracts::IntegrationRevision,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        Err(crate::integration::contracts::integration_unavailable())
+    }
     fn snapshot(
         &self,
         task_id: TaskId,
@@ -44,6 +51,7 @@ pub trait DashboardIntegrationSource: Send + Sync + 'static {
 
 /// Adapter over T1's owner/controller boundary. Redrive publishes the durable epoch;
 /// phase execution belongs to the owner runner, never the HTTP handler.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub struct OwnerDashboardIntegrations {
     pub state: Arc<dyn crate::integration::contracts::IntegrationState>,
     pub host: Arc<dyn crate::integration::contracts::IntegrationHost>,
@@ -52,6 +60,20 @@ pub struct OwnerDashboardIntegrations {
     pub observer: Arc<dyn crate::integration::contracts::IntegrationObserver>,
 }
 impl DashboardIntegrationSource for OwnerDashboardIntegrations {
+    fn revoke(
+        &self,
+        task_id: TaskId,
+        expected: crate::integration::contracts::IntegrationRevision,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        let coordinator = crate::integration::coordinator::IntegrationCoordinator::new(
+            self.state.as_ref(),
+            self.host.as_ref(),
+            self.turns.as_ref(),
+            self.runtime.as_ref(),
+            self.observer.as_ref(),
+        );
+        coordinator.revoke(task_id, expected)
+    }
     fn snapshot(
         &self,
         task_id: TaskId,
@@ -160,6 +182,8 @@ impl MacWorkerTaskSource {
         }
     }
 
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
         self.integrations = Some(source);
         self
@@ -485,6 +509,8 @@ impl MacWorkerTaskMutationSource {
         }
     }
 
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
         self.integrations = Some(source);
         self
@@ -548,31 +574,38 @@ impl MacWorkerTaskMutationSource {
                 "integration identity and revision must be paired",
             ));
         }
-        if let (Some(id), Some(revision)) = (
+        match (
+            &self.integrations,
             request.expected_integration_id,
             request.expected_integration_revision,
         ) {
-            let source = self.integrations.as_ref().ok_or_else(|| {
-                ApiError::new(
-                    "INTEGRATION_UNAVAILABLE",
-                    "compatible integration owner unavailable",
-                )
-            })?;
-            let snapshot = source
-                .snapshot(task_id)
-                .map_err(map_mutation_error)?
-                .ok_or_else(|| {
-                    ApiError::new(
+            (Some(source), id, revision) => {
+                let snapshot = source.snapshot(task_id).map_err(map_mutation_error)?;
+                if let Some(snapshot) = &snapshot {
+                    crate::integration::contracts::ValidateIntegration::validate(snapshot)
+                        .map_err(map_mutation_error)?;
+                }
+                let matches = match (snapshot, id, revision) {
+                    (Some(snapshot), Some(id), Some(revision)) => {
+                        snapshot.integration_id == id && snapshot.revision == revision
+                    }
+                    (None, None, None) => true,
+                    _ => false,
+                };
+                if !matches {
+                    return Err(ApiError::new(
                         "TASK_REVISION_CONFLICT",
                         "integration changed before this action",
-                    )
-                })?;
-            if snapshot.integration_id != id || snapshot.revision != revision {
+                    ));
+                }
+            }
+            (None, Some(_), Some(_)) => {
                 return Err(ApiError::new(
-                    "TASK_REVISION_CONFLICT",
-                    "integration changed before this action",
+                    "INTEGRATION_UNAVAILABLE",
+                    "compatible integration owner unavailable",
                 ));
             }
+            _ => {}
         }
         Ok(record)
     }
@@ -623,7 +656,22 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         request: &TaskIntegrationRequest,
     ) -> Result<TaskDetailProjection, ApiError> {
         use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
-        let expected = self.load_matching(task_id, &request.expected)?;
+        let mut ordinary_expected = request.expected.clone();
+        if ordinary_expected
+            .expected_integration_id
+            .is_some_and(|id| id != request.expected_integration_id)
+            || ordinary_expected
+                .expected_integration_revision
+                .is_some_and(|revision| revision != request.integration.expected)
+        {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "integration changed before this action",
+            ));
+        }
+        ordinary_expected.expected_integration_id = Some(request.expected_integration_id);
+        ordinary_expected.expected_integration_revision = Some(request.integration.expected);
+        let expected = self.load_matching(task_id, &ordinary_expected)?;
         request.integration.validate().map_err(|_| {
             ApiError::new(
                 "TASK_REQUEST_INVALID",
@@ -720,6 +768,31 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         let expected = self.load_matching(task_id, request)?;
         #[cfg(any(test, feature = "test-support"))]
         self.after_expected_check();
+        if let Some(revision) = request.expected_integration_revision {
+            let source = self.integrations.as_ref().ok_or_else(|| {
+                ApiError::new(
+                    "INTEGRATION_UNAVAILABLE",
+                    "compatible integration owner unavailable",
+                )
+            })?;
+            let stopped = source
+                .revoke(task_id, revision)
+                .map_err(map_mutation_error)?;
+            crate::integration::contracts::ValidateIntegration::validate(&stopped)
+                .map_err(map_mutation_error)?;
+            if Some(stopped.integration_id) != request.expected_integration_id
+                || !matches!(
+                    stopped.state,
+                    crate::integration::contracts::IntegrationStatus::Revoked
+                        | crate::integration::contracts::IntegrationStatus::Integrated
+                )
+            {
+                return Err(ApiError::new(
+                    "INTEGRATION_STOP_UNCONFIRMED",
+                    "integration stop is not confirmed",
+                ));
+            }
+        }
         self.client()
             .close_from_expected(&expected, false)
             .map_err(map_mutation_error)?;
