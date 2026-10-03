@@ -536,6 +536,8 @@ pub(crate) fn failed_parent_code(
     }
 }
 
+// T4/T6 attaches the early freeze gate; fixtures already exercise this seam.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(crate) fn validate_integration_batch(
     batch: &crate::integration::contracts::FrozenIntegratingBatch,
 ) -> Result<(), WorkerError> {

@@ -1245,6 +1245,7 @@ impl<'a> TaskClient<'a> {
     }
 
     /// T6 injects the owner ports; disabled callers retain the ordinary path.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(mut self, coordinator: &'a IntegrationCoordinator<'a>) -> Self {
         self.integration = Some(coordinator);
         self
@@ -1264,6 +1265,8 @@ impl<'a> TaskClient<'a> {
         crate::dag::parent_gate_at(&self.paths.state, record)
     }
 
+    /// T4/T6 calls this before an integrating batch can enter the ordinary DAG.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn validate_integration_batch(batch: &FrozenIntegratingBatch) -> Result<(), WorkerError> {
         crate::dag::validate_integration_batch(batch)
     }
@@ -4265,6 +4268,8 @@ impl<'a> TaskClient<'a> {
     }
 
     /// Admit the already frozen auxiliary through the ordinary queue and allowance.
+    /// T6 supplies the production IntegrationTurns adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn say_integration_prepared(
         &self,
         prepared: &crate::integration::contracts::PreparedIntegrationTurn,

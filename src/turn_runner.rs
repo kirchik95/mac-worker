@@ -541,6 +541,8 @@ impl<'a> TurnRunner<'a> {
         }
     }
 
+    /// T6 injects owner ports for detached production runners.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(
         mut self,
         coordinator: &'a crate::integration::coordinator::IntegrationCoordinator<'a>,
