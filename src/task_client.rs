@@ -1306,7 +1306,30 @@ impl<'a> TaskClient<'a> {
                 .before_integration_mutation(record, operation);
             }
         };
-        let Some(snapshot) = coordinator.snapshot(task)? else {
+        let mut snapshot = coordinator.snapshot(task)?;
+        if matches!(
+            operation,
+            IntegrationMutation::Cancel | IntegrationMutation::Close
+        ) && record.status().state() == TaskState::Open
+            && let Some(last) = record.status().turns().last()
+            && last.terminal().is_some()
+            && last.outcome() == Some(&TaskOutcome::Done)
+            && (snapshot.is_none()
+                || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
+        {
+            // Retirement can precede the finalizer's intent publication. Use
+            // the same source CAS before acknowledging a stop; a delayed wake
+            // then sees this cycle's durable tombstone instead of a fresh one.
+            coordinator.on_terminal(task, last.turn_id())?;
+            snapshot = coordinator.snapshot(task)?;
+            if snapshot
+                .as_ref()
+                .is_none_or(|s| s.source_turn_id != last.turn_id())
+            {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+        }
+        let Some(snapshot) = snapshot else {
             return Ok(record.clone());
         };
         // A receipt remains history after a newer ordinary turn starts. Only
