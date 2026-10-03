@@ -1782,6 +1782,41 @@ pub(crate) mod native_launch_tests {
     }
 
     #[test]
+    fn corrupt_integration_gate_allows_ordinary_permit_and_refuses_auxiliary() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp.path().canonicalize().unwrap());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, u64::MAX);
+        let gate = paths.controller_state_root();
+        crate::controller::drain::set_drained_at(&gate, false, 1001).unwrap();
+        let bad = b"invalid integration gate";
+        let path = gate.join("integration-gate.json");
+        std::fs::write(&path, bad).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let queue = client.queue_snapshot().unwrap();
+        assert!(
+            crate::controller::drain::launch_permit(&gate, client.wait_deadline())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .err()
+                .unwrap()
+                .public_code(),
+            "CONTROLLER_TRANSPORT"
+        );
+        assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+        assert_eq!(
+            state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+            Some(prepared)
+        );
+        assert_eq!(client.queue_snapshot().unwrap(), queue);
+        assert_eq!(std::fs::read(path).unwrap(), bad);
+    }
+
+    #[test]
     fn native_pause_history_1000_cycles_stress() {
         // This runs in nextest's existing stress group, without #[ignore],
         // because 1000 real fsynced operator cycles outlast the ordinary limit.

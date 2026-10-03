@@ -355,6 +355,27 @@ fn gate_failures_do_not_block_operator_drain_or_ordinary_handoffs() {
 }
 
 #[test]
+fn ordinary_handoff_ignores_corrupt_integration_gate_before_operator_repair() {
+    let fixture = Fixture::new();
+    ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+    let gate = fixture
+        .paths
+        .controller_state_root()
+        .join("integration-gate.json");
+    let bad = b"malformed integration metadata";
+    fs::write(&gate, bad).unwrap();
+    fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!is_drained(&fixture.paths.controller_state_root()).unwrap());
+    let executor = CountingExecutor::new();
+    assert!(matches!(
+        fixture.launch(&executor, false).unwrap(),
+        RunnerStart::Started(_)
+    ));
+    assert_eq!(executor.starts(), 1);
+    assert_eq!(fs::read(gate).unwrap(), bad);
+}
+
+#[test]
 fn disable_enable_keeps_integration_paused_and_allows_ordinary_dispatch() {
     use mac_worker::test_support::controller::service::{ServiceAction, manage};
     use std::os::unix::process::ExitStatusExt;
