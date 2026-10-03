@@ -27,6 +27,10 @@ use crate::{
     project::ProjectContext,
     project_config::ProjectSettings,
     rooted_fs::{EntryKind, RootedDir},
+    session_transfer::{
+        PACKAGE_MANIFEST_PATH, PACKAGE_SESSION_DIR, REQUEST_SESSION_REF_PREFIX, SESSION_REF_PREFIX,
+        SessionPackage,
+    },
     task::{BaseOid, GitIdentity, TaskId},
 };
 
@@ -496,23 +500,77 @@ fn relative_transfer(path: &str) -> Result<RelativePath, WorkerError> {
 }
 
 fn transfer_refs_are_collectable(refs: &[String]) -> bool {
+    // Only result-only repositories can expire. Task and request session pins
+    // protect pending imports just like their base/source pins do.
     refs.iter()
         .all(|reference| reference.starts_with("refs/mac-worker/results/"))
 }
 
 impl TransferRepo {
-    // Wired by W6/T7; keep the production interface available at this gate.
+    /// Write a deterministic parentless package and durably pin its owned graph.
+    /// A retry may recreate the same pin, but never replace a different package.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn write_session_package(
         &self,
-        _runner: &dyn ProcessRunner,
-        _task_id: TaskId,
-        _package: &crate::session_transfer::SessionPackage,
+        runner: &dyn ProcessRunner,
+        task_id: TaskId,
+        package: &SessionPackage,
     ) -> Result<String, WorkerError> {
-        Err(crate::session_transfer::session_error(
-            "SESSION_IMPORT_UNSUPPORTED",
-            "not implemented yet",
-        ))
+        self.verify_alternates()?;
+        let mut blobs = BTreeMap::new();
+        let mut pending = PendingBlobBatch::new();
+        let manifest = self.queue_blob_bytes(
+            runner,
+            package.manifest_json(),
+            true,
+            &mut blobs,
+            &mut pending,
+        )?;
+        let mut files = Vec::with_capacity(package.files().len());
+        for file in package.files() {
+            let digest =
+                self.queue_blob_bytes(runner, file.bytes.clone(), true, &mut blobs, &mut pending)?;
+            files.push((&file.path, digest));
+        }
+        self.flush_pending_blobs(runner, &mut blobs, &mut pending)?;
+        let mut tree = PackageTree::default();
+        tree.blobs
+            .insert(PACKAGE_MANIFEST_PATH.to_owned(), blobs[&manifest].clone());
+        let session = tree
+            .directories
+            .entry(PACKAGE_SESSION_DIR.to_owned())
+            .or_default();
+        for (path, digest) in files {
+            session.insert(path, blobs[&digest].clone());
+        }
+        let tree_oid = tree.write(self, runner)?;
+        let output = self.transfer_git_with_env(
+            runner,
+            &[
+                "-c".into(),
+                "i18n.commitEncoding=UTF-8".into(),
+                "commit-tree".into(),
+                tree_oid.into(),
+                "-m".into(),
+                "mac-worker session package".into(),
+            ],
+            None,
+            None,
+            [
+                ("GIT_AUTHOR_NAME", "mac-worker"),
+                ("GIT_AUTHOR_EMAIL", "session@mac-worker.invalid"),
+                ("GIT_AUTHOR_DATE", "@0 +0000"),
+                ("GIT_COMMITTER_NAME", "mac-worker"),
+                ("GIT_COMMITTER_EMAIL", "session@mac-worker.invalid"),
+                ("GIT_COMMITTER_DATE", "@0 +0000"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        )?;
+        let oid = parse_oid(&output)?;
+        self.pin_owned_commit(runner, &format!("{SESSION_REF_PREFIX}{task_id}"), &oid)?;
+        Ok(oid.to_string())
     }
     pub fn resolve_base_oid(
         runner: &dyn ProcessRunner,
@@ -2264,6 +2322,46 @@ impl TransferRepo {
     }
 }
 
+/// Package paths are validated by SessionPackage. NUL-delimited mktree input
+/// preserves every allowed filename (including whitespace and quotes) literally.
+#[derive(Default)]
+struct PackageTree {
+    blobs: BTreeMap<String, String>,
+    directories: BTreeMap<String, PackageTree>,
+}
+
+impl PackageTree {
+    fn insert(&mut self, path: &str, oid: String) {
+        let mut parts = path.split('/').peekable();
+        let mut tree = self;
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                tree.blobs.insert(part.to_owned(), oid);
+                return;
+            }
+            tree = tree.directories.entry(part.to_owned()).or_default();
+        }
+    }
+
+    fn write(
+        &self,
+        repo: &TransferRepo,
+        runner: &dyn ProcessRunner,
+    ) -> Result<String, WorkerError> {
+        let mut input = Vec::new();
+        for (name, oid) in &self.blobs {
+            input.extend_from_slice(format!("100644 blob {oid}\t{name}\0").as_bytes());
+        }
+        for (name, tree) in &self.directories {
+            let oid = tree.write(repo, runner)?;
+            input.extend_from_slice(format!("040000 tree {oid}\t{name}\0").as_bytes());
+        }
+        let output =
+            repo.transfer_git(runner, &["mktree".into(), "-z".into()], None, Some(input))?;
+        parse_hex_oid(&output)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct CapturedTree {
@@ -3085,11 +3183,16 @@ fn is_dag_batch_id(value: &str) -> bool {
 }
 
 fn validate_owned_pin_ref(name: &str) -> Result<(), WorkerError> {
-    if let Some(request_id) = name.strip_prefix("refs/mac-worker/requests/")
-        && !request_id.contains('/')
-        && is_lower_hex(request_id, 32)
-    {
-        return Ok(());
+    for prefix in [
+        "refs/mac-worker/requests/",
+        SESSION_REF_PREFIX,
+        REQUEST_SESSION_REF_PREFIX,
+    ] {
+        if let Some(id) = name.strip_prefix(prefix)
+            && is_lower_hex(id, 32)
+        {
+            return Ok(());
+        }
     }
     if let Some(rest) = name.strip_prefix("refs/mac-worker/dag/") {
         let mut parts = rest.split('/');
@@ -3115,7 +3218,7 @@ fn validate_owned_pin_ref(name: &str) -> Result<(), WorkerError> {
     }
     Err(git_error(
         "BASE_UNAVAILABLE",
-        "owned pin refs must live under refs/mac-worker/requests/, refs/mac-worker/dag/, or refs/mac-worker/controller-results/",
+        "owned pin refs must live under refs/mac-worker/requests/, refs/mac-worker/sessions/, refs/mac-worker/request-sessions/, refs/mac-worker/dag/, or refs/mac-worker/controller-results/",
     ))
 }
 

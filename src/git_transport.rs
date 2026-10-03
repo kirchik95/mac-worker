@@ -17,6 +17,7 @@ use crate::{
     job::{ClientId, JobId, LeaseToken, RequestFingerprint},
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
     rooted_fs::RootedDir,
+    session_transfer::{REQUEST_SESSION_REF_PREFIX, SESSION_REF_PREFIX},
     task::{BaseOid, BranchName, TaskId},
     transfer::TransferIdentity,
     transfer_repo::{GIT_ENVIRONMENT_REMOVALS, ImportReceipt, apply_isolated_git_environment},
@@ -53,7 +54,7 @@ const ORIGIN_CONFIG_DEADLINE: Duration = Duration::from_secs(5);
 /// `PUBLISH_FAILED`. Stderr is classified, never stored.
 pub const ORIGIN_AUTH_FAILED: &str = "ORIGIN_AUTH_FAILED";
 
-pub(crate) const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
+pub(crate) const PRE_RECEIVE_HOOK: &str = "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in refs/mac-worker/bases/*|refs/mac-worker/sessions/*) ;; *) echo \"mac-worker: ref not allowed: $ref\" >&2; status=1;; esac\n  case \"$new\" in 0000000000000000000000000000000000000000) echo \"mac-worker: deletion not allowed\" >&2; status=1;; esac\ndone\nexit $status\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushReceipt {
@@ -70,8 +71,6 @@ impl PushReceipt {
 pub type FetchReceipt = ImportReceipt;
 
 pub struct SessionRefPush<'a> {
-    // Read by the W6 transport implementation; the gate rejects Some.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub package_oid: &'a str,
 }
 
@@ -95,11 +94,8 @@ impl<'a> GitTransport<'a> {
         transfer_repo: &Path,
         session: Option<SessionRefPush<'_>>,
     ) -> Result<PushReceipt, WorkerError> {
-        if session.is_some() {
-            return Err(crate::session_transfer::session_error(
-                "SESSION_PLACEMENT_FAILED",
-                "not implemented yet",
-            ));
+        if let Some(session) = &session {
+            validate_session_package_oid(session.package_oid)?;
         }
         validate_worker(worker)?;
         validate_project_id(project_id)?;
@@ -112,17 +108,19 @@ impl<'a> GitTransport<'a> {
             identity.lease_token(),
             identity.request_fingerprint()
         );
-        let request = git_request(
-            transfer_repo,
-            Some(ssh),
-            vec![
-                OsString::from("push"),
-                OsString::from("--no-verify"),
-                receive_pack.into(),
-                format!("{}:{}", worker.ssh, project_id).into(),
-                format!("{}:refs/mac-worker/bases/{}", base, task_id).into(),
-            ],
-        );
+        let mut operation = vec![OsString::from("push"), OsString::from("--no-verify")];
+        if session.is_some() {
+            operation.push("--atomic".into());
+        }
+        operation.extend([
+            receive_pack.into(),
+            format!("{}:{}", worker.ssh, project_id).into(),
+            format!("{}:refs/mac-worker/bases/{}", base, task_id).into(),
+        ]);
+        if let Some(session) = session {
+            operation.push(format!("{}:{SESSION_REF_PREFIX}{task_id}", session.package_oid).into());
+        }
+        let request = git_request(transfer_repo, Some(ssh), operation);
         let result = self.runner.run(&request).map_err(map_push_failure)?;
         if !result.status.success() {
             return Err(git_error("BASE_PUSH_FAILED", "base push failed"));
@@ -490,11 +488,8 @@ impl<'a> GitTransport<'a> {
         transfer_repo: &Path,
         session: Option<SessionRefPush<'_>>,
     ) -> Result<PushReceipt, WorkerError> {
-        if session.is_some() {
-            return Err(crate::session_transfer::session_error(
-                "SESSION_PLACEMENT_FAILED",
-                "not implemented yet",
-            ));
+        if let Some(session) = &session {
+            validate_session_package_oid(session.package_oid)?;
         }
         validate_ssh_destination(ssh_destination)?;
         validate_project_id(project_id)?;
@@ -507,18 +502,29 @@ impl<'a> GitTransport<'a> {
         let receive_pack = format!(
             "--receive-pack={remote_binary} host controller-receive-pack {token} {request_id} {fingerprint} {project_id} {worktree_id} {oid}"
         );
-        let request = git_request(
-            transfer_repo,
-            Some(ssh_command.to_owned()),
-            vec![
-                OsString::from("push"),
-                OsString::from("--porcelain"),
-                OsString::from("--no-verify"),
-                receive_pack.into(),
-                format!("{ssh_destination}:{project_id}").into(),
-                format!("{oid}:{source_ref}").into(),
-            ],
-        );
+        let mut operation = vec![
+            OsString::from("push"),
+            OsString::from("--porcelain"),
+            OsString::from("--no-verify"),
+        ];
+        if session.is_some() {
+            operation.push("--atomic".into());
+        }
+        operation.extend([
+            receive_pack.into(),
+            format!("{ssh_destination}:{project_id}").into(),
+            format!("{oid}:{source_ref}").into(),
+        ]);
+        if let Some(session) = session {
+            operation.push(
+                format!(
+                    "{}:{REQUEST_SESSION_REF_PREFIX}{request_id}",
+                    session.package_oid
+                )
+                .into(),
+            );
+        }
+        let request = git_request(transfer_repo, Some(ssh_command.to_owned()), operation);
         let result = self.runner.run(&request).map_err(map_push_failure)?;
         if !result.status.success() {
             return Err(git_error(
@@ -1462,6 +1468,20 @@ fn validate_transfer_token(value: &str) -> Result<(), WorkerError> {
         || uuid::Uuid::try_parse(value).is_err()
     {
         return Err(invalid_component("controller transfer token is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_session_package_oid(oid: &str) -> Result<(), WorkerError> {
+    if ![40, 64].contains(&oid.len())
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(crate::session_transfer::session_error(
+            "SESSION_PLACEMENT_FAILED",
+            "invalid session package object ID",
+        ));
     }
     Ok(())
 }

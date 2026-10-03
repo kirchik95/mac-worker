@@ -129,10 +129,10 @@ fn git_in(path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn session_push_facades_refuse_before_spawning_git() {
+fn session_push_facades_refuse_invalid_package_oid_before_spawning_git() {
     use mac_worker::test_support::transfer::git::SessionRefPush;
     let runner = RecordingRunner::returning_success();
-    let oid = "a".repeat(40);
+    let oid = "invalid".to_owned();
     let error = GitTransport::new(&runner)
         .push_base(
             &worker(),
