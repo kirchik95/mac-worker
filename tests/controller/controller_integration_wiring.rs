@@ -84,6 +84,45 @@ fn fixture_config(paths: &PathLayout) -> mac_worker::test_support::core::config:
 }
 
 #[test]
+fn native_controller_shutdown_keeps_the_pause_gate_closed_across_restart() {
+    let stop = |child: &mut crate::controller_process::OwnedChild| {
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        assert!(
+            child
+                .wait_timeout(crate::controller_process::CHILD_EXIT_TIMEOUT)
+                .expect("controller shutdown did not finish")
+                .success()
+        );
+    };
+    let fixture = crate::controller_process::ProcessFixture::new();
+    let root = fixture.controller_request_root();
+    let mut controller = fixture.spawn_controller_run();
+    fixture.wait_until_leader_ready(&mut controller);
+    stop(&mut controller);
+    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    let gate: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("integration-gate.json")).unwrap())
+            .unwrap();
+    assert_eq!(gate["windows"].as_array().unwrap().len(), 1);
+    assert_eq!(gate["windows"][0]["reason"], "controller_drained");
+    assert!(gate["windows"][0]["resumed_at_millis"].is_null());
+    let mut restored = fixture.spawn_controller_run();
+    fixture.wait_until_leader_ready(&mut restored);
+    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    stop(&mut restored);
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("integration-gate.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        repeated, gate,
+        "restart or repeated shutdown renewed the pause"
+    );
+    let health: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("health.json")).unwrap()).unwrap();
+    assert!(health["stopped_at_millis"].is_u64());
+}
+
+#[test]
 fn durable_cancel_retry_accepts_its_own_revoked_stop_progress() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
@@ -176,6 +215,79 @@ fn durable_cancel_retry_accepts_its_own_revoked_stop_progress() {
         Some(&TaskOutcome::Cancelled)
     );
     assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+}
+
+#[test]
+fn durable_cancel_of_an_imported_commit_settles_without_relabeling_success() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::TaskOutcome,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    integration.snapshot.state = IntegrationStatus::Integrated;
+    integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    integration.snapshot.observed_target_oid = Some(fixture_head());
+    integration.receipt = Some(IntegrationReceipt {
+        integration_id: integration.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = parse_request(
+        &serde_json::to_vec(&json!({"protocol_version": 7,
+        "request_id": "00000000000000000000000000000065", "command": "task.cancel",
+        "body": {"task_id": fixture_task()}}))
+        .unwrap(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_ALREADY_COMMITTED"
+        );
+        assert_eq!(
+            store.load(request.request_id()).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
+        assert_eq!(
+            tasks
+                .load_task(fixture_task())
+                .unwrap()
+                .status()
+                .last_outcome(),
+            Some(&TaskOutcome::Done)
+        );
+        assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+        assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    }
 }
 
 #[test]

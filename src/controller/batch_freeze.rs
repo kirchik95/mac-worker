@@ -141,6 +141,7 @@ pub fn freeze_laptop_batch(
     };
     let batch_dir = batch_file.parent().unwrap_or_else(|| Path::new("."));
     let project_state = ProjectState::load(runner, project, &[])?;
+    crate::integration::config::validate_batch_policy_inputs(&project_state.settings.task, &batch)?;
     let identity = GitIdentity::new(GIT_NAME, GIT_EMAIL)?;
     let transfer = TransferRepo::open_or_create(&paths.cache, &project_state.context.common_dir)?;
     let run_id = RunId::generate();

@@ -69,20 +69,24 @@ impl IntegrationRuntime for OwnerRuntime {
         &self,
         key: &IntegrationPhaseKey,
     ) -> Result<IntegrationDriveAdmission, WorkerError> {
-        if self.helper_unavailable.load(Ordering::Acquire) {
-            return Ok(IntegrationDriveAdmission::Park(IntegrationPauseEvidence {
-                reason: IntegrationPauseReason::HelperUnavailable,
-                effective_at_millis: self.now_millis(),
-            }));
-        }
         match crate::controller::drain::integration_admission(
             &self.paths.controller_state_root(),
             self.client.wait_deadline(),
             self.now_millis(),
         )? {
-            Ok(permit) => Ok(IntegrationDriveAdmission::Permit(
-                IntegrationPhasePermit::with_guard(key.clone(), Box::new(permit)),
-            )),
+            Ok(permit) => {
+                if self.helper_unavailable.load(Ordering::Acquire) {
+                    drop(permit);
+                    Ok(IntegrationDriveAdmission::Park(IntegrationPauseEvidence {
+                        reason: IntegrationPauseReason::HelperUnavailable,
+                        effective_at_millis: self.now_millis(),
+                    }))
+                } else {
+                    Ok(IntegrationDriveAdmission::Permit(
+                        IntegrationPhasePermit::with_guard(key.clone(), Box::new(permit)),
+                    ))
+                }
+            }
             Err(pause) => Ok(IntegrationDriveAdmission::Park(pause)),
         }
     }
@@ -176,13 +180,15 @@ impl IntegrationObserver for OwnerPorts<'_> {
                     .turns()
                     .last()
                     .filter(|turn| turn.terminal().is_none());
-                if local_pending.is_none_or(|pending| {
-                    remote
-                        .status()
-                        .turns()
-                        .iter()
-                        .any(|turn| turn.turn_id() == pending.turn_id())
-                }) {
+                if crate::task_view::remote_observation_allowed(&ordinary)
+                    && local_pending.is_none_or(|pending| {
+                        remote
+                            .status()
+                            .turns()
+                            .iter()
+                            .any(|turn| turn.turn_id() == pending.turn_id())
+                    })
+                {
                     let next =
                         ordinary.with_remote_observation(remote.status(), remote.deliveries())?;
                     self.client.update_task_if_current(&ordinary, next)?;
@@ -319,9 +325,17 @@ impl IntegrationTurns for OwnerPorts<'_> {
         {
             return Err(invalid());
         }
-        let next = local
-            .with_remote_observation(remote.status(), remote.deliveries())?
-            .with_fetched_head(Some(head))?;
+        // A host close can finish before its owner clears the close intent.
+        // Keep that intent for the existing close recovery, including re-import.
+        let observed = if local.close_intent().is_some() {
+            local.with_deliveries(crate::task::merge_origin_deliveries(
+                local.deliveries(),
+                remote.deliveries(),
+            ))?
+        } else {
+            local.with_remote_observation(remote.status(), remote.deliveries())?
+        };
+        let next = observed.with_fetched_head(Some(head))?;
         if !self.client.update_task_if_current(&local, next)? {
             return Err(WorkerError::task(
                 "TASK_REVISION_CONFLICT",
@@ -945,6 +959,54 @@ mod native_launch_tests {
     }
 
     #[test]
+    fn native_observer_keeps_close_intent_until_close_recovery_retires_it() {
+        struct ClosedHost(crate::task_store::TaskStatusResponse);
+        impl ProcessRunner for ClosedHost {
+            fn run(
+                &self,
+                request: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                use std::os::unix::process::ExitStatusExt;
+                if request
+                    .args
+                    .last()
+                    .is_some_and(|arg| arg.to_string_lossy().ends_with(" host task-status"))
+                {
+                    return Ok(crate::process::ProcessResult {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: serde_json::to_vec(&self.0).unwrap(),
+                        stderr: vec![],
+                    });
+                }
+                Err(integration_unavailable())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        let closing = ordinary
+            .with_close_intent(crate::task::TaskCloseIntent::from_record(&ordinary, false).unwrap())
+            .unwrap();
+        client.create_task(closing.clone()).unwrap();
+        let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+        wire["state"] = serde_json::json!("closed");
+        let remote = ClosedHost(crate::task_store::TaskStatusResponse::new(
+            serde_json::from_value(wire).unwrap(),
+        ));
+        let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n").unwrap();
+        let owner = OwnerIntegration::new(&remote, &config, &paths, &client, &NeverSpawn).unwrap();
+        owner
+            .state
+            .publish_policy(fixture_task(), &sample_policy("main"))
+            .unwrap();
+        let facts = owner.ports.facts(fixture_task()).unwrap();
+        assert!(facts.close_pending);
+        assert_eq!(facts.ordinary, closing);
+        assert_eq!(client.load_task(fixture_task()).unwrap(), closing);
+    }
+
+    #[test]
     fn native_redrive_recovers_the_published_epoch_without_advancing_again() {
         let root = tempfile::tempdir().unwrap();
         let paths = paths(&root.path().canonicalize().unwrap());
@@ -1032,6 +1094,176 @@ mod native_launch_tests {
             1
         );
         assert!(client.queue_snapshot().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn native_phase_and_auxiliary_permits_serialize_both_sides_of_drain_ack() {
+        use std::sync::mpsc;
+        for auxiliary in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = paths(&root.path().canonicalize().unwrap());
+            let client = ClientStateStore::open(&paths.state)
+                .unwrap()
+                .with_admission_clock(Arc::new(|| Ok(2001)));
+            let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, 601001);
+            let gate = paths.controller_state_root();
+            crate::controller::drain::set_drained_at(&gate, false, 1001).unwrap();
+            let runtime = OwnerRuntime::new(&paths, &client).unwrap();
+            let key = IntegrationPhaseKey {
+                task: record.task_id,
+                intent: record.snapshot.integration_id,
+                epoch: 0,
+                revision: record.snapshot.revision,
+                phase: IntegrationPhase::Fetch,
+            };
+            let permit: Box<dyn Send> = if auxiliary {
+                Box::new(
+                    auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                let IntegrationDriveAdmission::Permit(permit) = runtime.begin_phase(&key).unwrap()
+                else {
+                    panic!("open gate refused phase")
+                };
+                Box::new(permit)
+            };
+            let probe = File::open(gate.join("drain.lock")).unwrap();
+            assert_ne!(
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            let (begin, begun) = mpsc::channel();
+            let (ack, acknowledged) = mpsc::channel();
+            let writer_gate = gate.clone();
+            let writer = std::thread::spawn(move || {
+                begin.send(()).unwrap();
+                crate::controller::drain::set_drained_at(&writer_gate, true, 2001).unwrap();
+                ack.send(()).unwrap();
+            });
+            begun.recv().unwrap();
+            assert!(matches!(
+                acknowledged.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            drop(permit);
+            acknowledged.recv().unwrap();
+            writer.join().unwrap();
+            assert!(matches!(
+                runtime.begin_phase(&key).unwrap(),
+                IntegrationDriveAdmission::Park(IntegrationPauseEvidence {
+                    effective_at_millis: 2001,
+                    ..
+                })
+            ));
+            assert!(
+                auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                    .unwrap()
+                    .is_none()
+            );
+            let parked = state.load(record.task_id).unwrap().unwrap();
+            assert_eq!(parked.followups_spent, 1);
+            assert_eq!(
+                state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+                Some(prepared)
+            );
+            assert_eq!(client.queue_snapshot().unwrap().entries().len(), 1);
+            assert_eq!(
+                client
+                    .queue_entry(entry.job_id())
+                    .unwrap()
+                    .unwrap()
+                    .queue_id(),
+                entry.queue_id()
+            );
+        }
+    }
+
+    #[test]
+    fn native_helper_pause_after_undrain_preserves_only_the_active_remainder() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let clock = Arc::new(AtomicU64::new(1001));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, 601001);
+        let gate = paths.controller_state_root();
+        crate::controller::drain::set_drained_at(&gate, true, 121001).unwrap();
+        clock.store(1500001, Ordering::SeqCst);
+        assert!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .unwrap()
+                .is_none()
+        );
+        crate::controller::drain::set_drained_at(&gate, false, 1900001).unwrap();
+        clock.store(1923001, Ordering::SeqCst);
+        let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n").unwrap();
+        let owner =
+            OwnerIntegration::new(&NoProcesses, &config, &paths, &client, &NeverSpawn).unwrap();
+        owner
+            .runtime
+            .helper_unavailable
+            .store(true, Ordering::Release);
+        let key = IntegrationPhaseKey {
+            task: record.task_id,
+            intent: record.snapshot.integration_id,
+            epoch: 0,
+            revision: record.snapshot.revision,
+            phase: IntegrationPhase::Drive,
+        };
+        let IntegrationDriveAdmission::Park(pause) = owner.runtime.begin_phase(&key).unwrap()
+        else {
+            panic!("unavailable helper admitted")
+        };
+        owner
+            .coordinator()
+            .park_for_runtime(record.task_id, pause)
+            .unwrap();
+        let parked = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(
+            parked.snapshot.pause_reason,
+            Some(IntegrationPauseReason::HelperUnavailable)
+        );
+        assert_eq!(parked.remaining_admission_millis, Some(457000));
+        clock.store(2500001, Ordering::SeqCst);
+        let IntegrationDriveAdmission::Park(pause) = owner.runtime.begin_phase(&key).unwrap()
+        else {
+            panic!("unavailable helper admitted")
+        };
+        owner
+            .coordinator()
+            .park_for_runtime(record.task_id, pause)
+            .unwrap();
+        assert_eq!(
+            state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .pause
+                .unwrap()
+                .effective_at_millis,
+            1923001
+        );
+        drop(owner);
+        // A capable helper returns after a new owner reopens the same stores.
+        clock.store(2900001, Ordering::SeqCst);
+        assert!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .unwrap()
+                .is_some()
+        );
+        let restored = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(restored.admission_deadline_millis, Some(3357001));
+        assert_eq!(restored.followups_spent, 1);
+        assert_eq!(
+            state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+            Some(prepared)
+        );
+        assert_eq!(client.queue_snapshot().unwrap().entries().len(), 1);
     }
 
     #[test]

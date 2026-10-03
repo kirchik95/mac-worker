@@ -604,6 +604,12 @@ fn native_close_revokes_a_parked_cycle_without_starting_a_git_phase() {
 
 #[test]
 fn native_explicit_redrive_advances_one_blocked_epoch_and_recovers_via_reexec() {
+    use mac_worker::test_support::{
+        client_state::{ClientStateStore, dag::ParentGate},
+        core::config::Config,
+        host::process::SystemProcessRunner,
+        task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+    };
     let (f, task) = parked_source_fixture();
     let paths = owner_paths(&f);
     let state = RootedIntegrationState::open(
@@ -621,6 +627,21 @@ fn native_explicit_redrive_advances_one_blocked_epoch_and_recovers_via_reexec() 
     record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
     record.snapshot.retry_exhausted = true;
     state.replace(task, expected, &record).unwrap();
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let config = Config::load(&paths.config).unwrap();
+    let client = TaskClient::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &tasks,
+        &InlineRunnerExecutor,
+    );
+    assert_eq!(
+        client
+            .integration_parent_gate(&tasks.load_task(task).unwrap())
+            .unwrap(),
+        ParentGate::Waiting
+    );
     let undrain = f.worker(&["--json", "controller", "drain", "--off"]);
     assert!(undrain.status.success());
     let redrive = f.worker(&["--json", "task", "integrate", &task.to_string()]);
@@ -635,6 +656,507 @@ fn native_explicit_redrive_advances_one_blocked_epoch_and_recovers_via_reexec() 
     assert_eq!(done.snapshot.integration_id, record.snapshot.integration_id);
     assert_eq!(done.snapshot.epoch, 1);
     assert!(done.receipt.unwrap().imported);
+    assert_eq!(
+        client
+            .integration_parent_gate(&tasks.load_task(task).unwrap())
+            .unwrap(),
+        ParentGate::Ready
+    );
+}
+
+#[test]
+fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let before = state.load(task).unwrap().unwrap();
+    let policy = state.load_policy(task).unwrap().unwrap();
+    let ssh = std::fs::read_to_string(&f.ssh).unwrap();
+    assert!(ssh.contains("probe['features'].append('task.integration')"));
+    std::fs::write(
+        &f.ssh,
+        ssh.replace(
+            "probe['features'].append('task.integration')",
+            "pass # previous helper fixture",
+        ),
+    )
+    .unwrap();
+    let journal_before = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    let waited = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "15s",
+    ]);
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("WAIT_TIMEOUT"));
+    let parked = state.load(task).unwrap().unwrap();
+    assert_eq!(parked.snapshot.state, IntegrationStatus::Parked);
+    assert_eq!(
+        parked.snapshot.pause_reason,
+        Some(IntegrationPauseReason::HelperUnavailable)
+    );
+    assert_eq!(
+        parked.snapshot.integration_id,
+        before.snapshot.integration_id
+    );
+    assert_eq!(parked.snapshot.epoch, before.snapshot.epoch);
+    assert_eq!(parked.snapshot.source_head, before.snapshot.source_head);
+    assert_eq!(parked.cycle_base, before.cycle_base);
+    assert_eq!(parked.followups_spent, before.followups_spent);
+    assert_eq!(parked.snapshot.attempts, before.snapshot.attempts);
+    assert_eq!(state.load_policy(task).unwrap().unwrap(), policy);
+    let during = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(
+        during.matches("host task-prepare\n").count(),
+        journal_before.matches("host task-prepare\n").count()
+    );
+    assert_eq!(
+        during.matches("host task-integration\n").count(),
+        journal_before.matches("host task-integration\n").count()
+    );
+    std::fs::write(&f.ssh, ssh).unwrap();
+    let restored = wait_integrated(&f, task);
+    assert_eq!(
+        restored.snapshot.integration_id,
+        before.snapshot.integration_id
+    );
+    assert_eq!(restored.snapshot.epoch, before.snapshot.epoch);
+    assert_eq!(restored.followups_spent, before.followups_spent);
+    assert!(restored.receipt.unwrap().imported);
+    assert_eq!(
+        std::fs::read_to_string(f.host.join("ssh-journal"))
+            .unwrap()
+            .matches("host task-prepare\n")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn native_wait_returns_the_blocked_code_after_successful_source_import() {
+    use mac_worker::test_support::session::SessionAgent;
+    let f = integration_fixture(true);
+    f.capture_fixture(SessionAgent::Codex);
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent).unwrap().replace(r#"\"files_changed\":[]"#, r#"\"files_changed\":[],\"checks\":[{\"name\":\"fixture-check\",\"command\":\"fixture-check\",\"status\":\"fail\",\"detail\":\"fixture failed\"}]"#);
+    std::fs::write(agent, script).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "work with failing checks",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--wait",
+    ]));
+    let wait = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "60s",
+    ]);
+    assert_eq!(
+        wait.status.code(),
+        Some(i32::from(
+            IntegrationCode::IntegrationChecksFailed.error().exit_code()
+        )),
+        "{}",
+        String::from_utf8_lossy(&wait.stdout)
+    );
+    let state = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        state.load(task).unwrap().unwrap().snapshot.blocked_code,
+        Some(IntegrationCode::IntegrationChecksFailed)
+    );
+}
+
+#[test]
+fn native_dag_uses_the_imported_parent_merge_for_its_configured_child() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        core::config::Config,
+        host::process::SystemProcessRunner,
+        task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+    };
+    let f = integration_fixture(true);
+    let agent = f.host.join("bin/codex");
+    std::fs::write(&agent, r#"#!/bin/sh
+case "$1" in --version) printf '0.160.0\n'; exit 0;; auth|login) printf '{"loggedIn":true}\n'; exit 0;; esac
+printf '%s\n' "$@" >> "$HOME/dag-agent-argv"
+printf 'fixture task result\n' >> dag-result
+printf '%s\n' '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000031"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"dag work done\",\"questions\":[],\"files_changed\":[],\"checks\":[]}"}}'
+"#).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        f.project.root().join(".worker.toml"),
+        "[task]\nintegrate = 'main'\n",
+    )
+    .unwrap();
+    let batch = f.project.root().join("tasks.toml");
+    std::fs::write(&batch, "close_on = 'never'\n[[tasks]]\nid = 'parent'\nprompt = 'parent work'\n[[tasks]]\nid = 'child'\nprompt = 'child work'\ndepends_on = ['parent']\nbase = 'from:parent'\n").unwrap();
+    mac_worker::test_support::controller::drain::set_drained(
+        &owner_paths(&f).controller_state_root(),
+        true,
+    )
+    .unwrap();
+    let output = f.worker(&["--json", "task", "batch", batch.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run: RunId = report["run_id"].as_str().unwrap().parse().unwrap();
+    let paths = owner_paths(&f);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let dag = tasks.load_run_dag(run).unwrap().unwrap();
+    let parent = dag.nodes["parent"].task_id;
+    let child = dag.nodes["child"].task_id;
+    let config = Config::load(&paths.config).unwrap();
+    // Advancing is done by real finalizers/wait/driver. This read proves the
+    // unimported source cannot release its configured dependency.
+    let client = TaskClient::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &tasks,
+        &InlineRunnerExecutor,
+    );
+    assert!(tasks.load_task_optional(child).unwrap().is_none());
+    assert_ne!(
+        client
+            .integration_parent_gate(&tasks.load_task(parent).unwrap())
+            .unwrap(),
+        mac_worker::test_support::client_state::dag::ParentGate::Ready
+    );
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    let wait = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--run",
+        &run.to_string(),
+        "--timeout",
+        "90s",
+    ]);
+    assert!(
+        wait.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wait.stdout)
+    );
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let parent_record = state.load(parent).unwrap().unwrap();
+    let receipt = parent_record.receipt.unwrap();
+    assert!(receipt.imported);
+    assert_eq!(
+        tasks.load_task(child).unwrap().meta().base_oid(),
+        receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head)
+    );
+    assert_eq!(
+        state.load(child).unwrap().unwrap().snapshot.state,
+        IntegrationStatus::Integrated
+    );
+    assert_eq!(
+        tasks.load_task(parent).unwrap().status().state(),
+        TaskState::Open
+    );
+}
+
+#[test]
+fn native_mismatched_from_parent_policy_refuses_before_capture_or_admission() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    let f = integration_fixture(true);
+    let batch = f.project.root().join("tasks.toml");
+    std::fs::write(&batch, "[[tasks]]\nid = 'parent'\nprompt = 'parent work'\nintegrate = 'main'\n[[tasks]]\nid = 'child'\nprompt = 'child work'\nintegrate = 'different'\ndepends_on = ['parent']\nbase = 'from:parent'\n").unwrap();
+    let output = f.worker(&["--json", "task", "batch", batch.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("TASK_CONFIG_INVALID"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let paths = owner_paths(&f);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    assert!(tasks.list_tasks().unwrap().is_empty());
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    assert!(!paths.cache.join("transfer").exists());
+    assert!(!f.host.join("dag-agent-argv").exists());
+}
+
+fn refuse_integration_transport(f: &super::session_import_e2e::Fixture) -> String {
+    let original = std::fs::read_to_string(&f.ssh).unwrap();
+    std::fs::write(&f.ssh, original.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", "if command.endswith(' host task-integration'):\n    sys.stdin.buffer.read()\n    sys.exit(255)\nos.execv('/bin/sh', ['/bin/sh', '-c', command])")).unwrap();
+    original
+}
+
+#[test]
+fn native_offline_cancel_close_and_discard_remain_unconfirmed_until_revoke_proof() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let original_ssh = refuse_integration_transport(&f);
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let initial = state.load(task).unwrap().unwrap();
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    for args in [
+        vec!["--json", "task", "cancel"],
+        vec!["--json", "task", "close"],
+        vec!["--json", "task", "close", "--discard"],
+    ] {
+        let id = task.to_string();
+        let mut arguments = args;
+        arguments.push(&id);
+        let refused = f.worker(&arguments);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stdout).contains("INTEGRATION_STOP_UNCONFIRMED"),
+            "{}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let pending = state.load(task).unwrap().unwrap();
+        assert_eq!(
+            pending.snapshot.integration_id,
+            initial.snapshot.integration_id
+        );
+        assert_eq!(pending.snapshot.epoch, initial.snapshot.epoch);
+        assert!(!pending.tombstone.unwrap().acknowledged);
+        assert_eq!(
+            tasks.load_task(task).unwrap().status().state(),
+            TaskState::Open
+        );
+    }
+    std::fs::write(&f.ssh, original_ssh).unwrap();
+    assert!(
+        f.worker(&["--json", "task", "cancel", &task.to_string()])
+            .status
+            .success()
+    );
+    assert!(
+        state
+            .load(task)
+            .unwrap()
+            .unwrap()
+            .tombstone
+            .unwrap()
+            .acknowledged
+    );
+    assert!(
+        f.worker(&["--json", "task", "close", "--discard", &task.to_string()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        tasks.load_task(task).unwrap().status().state(),
+        TaskState::Abandoned
+    );
+    assert_eq!(state.load(task).unwrap().unwrap().snapshot.attempts, 0);
+}
+
+#[test]
+fn native_interrupted_say_waits_for_revoke_then_queues_one_ordinary_turn() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut record = state.load(task).unwrap().unwrap();
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
+    record.snapshot.resume_state = None;
+    record.snapshot.pause_reason = None;
+    record.pause = None;
+    state.replace(task, expected, &record).unwrap();
+    let original_ssh = refuse_integration_transport(&f);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let say = || {
+        f.worker(&[
+            "--json",
+            "task",
+            "say",
+            &task.to_string(),
+            "--message",
+            "ordinary replacement",
+        ])
+    };
+    let refused = say();
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("INTEGRATION_STOP_UNCONFIRMED"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(tasks.load_task(task).unwrap().status().turns().len(), 1);
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    std::fs::write(&f.ssh, original_ssh).unwrap();
+    let queued = say();
+    assert!(
+        queued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queued.stdout)
+    );
+    assert_eq!(tasks.load_task(task).unwrap().status().turns().len(), 2);
+    assert_eq!(tasks.queue_snapshot().unwrap().entries().len(), 1);
+    assert!(
+        state
+            .load(task)
+            .unwrap()
+            .unwrap()
+            .tombstone
+            .unwrap()
+            .acknowledged
+    );
+    assert_eq!(state.load(task).unwrap().unwrap().snapshot.attempts, 0);
+}
+
+struct ReleaseFixtureFifo(std::path::PathBuf);
+impl Drop for ReleaseFixtureFifo {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.0)
+        {
+            let _ = file.write_all(b"continue\n");
+        }
+    }
+}
+fn fixture_fifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[test]
+fn native_cancel_with_a_lost_push_reply_imports_the_committed_success_before_close() {
+    use mac_worker::test_support::{client_state::ClientStateStore, session::SessionAgent};
+    use std::io::BufRead;
+    let f = integration_fixture(true);
+    let source = f.capture_fixture(SessionAgent::Codex);
+    let original_source = std::fs::read(&source).unwrap();
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = std::fs::read_to_string(&agent).unwrap().replace(
+        "printf '%s\\n' \"$@\" > \"$HOME/argv\"",
+        "printf 'lost reply source\\n' > T6-result\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
+    );
+    std::fs::write(agent, script).unwrap();
+    let ready = f.laptop.parent().unwrap().join("push-ready");
+    let release = f.laptop.parent().unwrap().join("push-release");
+    fixture_fifo(&ready);
+    fixture_fifo(&release);
+    let release_on_drop = ReleaseFixtureFifo(release.clone());
+    let interception = format!(
+        r#"if command.endswith(' host task-integration'):
+    data = sys.stdin.buffer.read()
+    action = json.loads(data)['action']
+    result = subprocess.run(['/bin/sh','-c',command], input=data, capture_output=True)
+    if action.get('step') == 'push' and result.returncode == 0:
+        with open({ready:?}, 'w') as f: f.write('published\n')
+        with open({release:?}, 'r') as f: f.readline()
+        sys.exit(255)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])"#,
+        ready = ready.to_str().unwrap(),
+        release = release.to_str().unwrap()
+    );
+    let ssh = std::fs::read_to_string(&f.ssh).unwrap().replace(
+        "os.execv('/bin/sh', ['/bin/sh', '-c', command])",
+        &interception,
+    );
+    std::fs::write(&f.ssh, ssh).unwrap();
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "work",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--wait",
+    ]));
+    let mut signal = String::new();
+    std::io::BufReader::new(std::fs::File::open(ready).unwrap())
+        .read_line(&mut signal)
+        .unwrap();
+    assert_eq!(signal, "published\n");
+    let cancel = f.worker(&["--json", "task", "cancel", &task.to_string()]);
+    assert!(
+        String::from_utf8_lossy(&cancel.stdout).contains("INTEGRATION_ALREADY_COMMITTED"),
+        "{}",
+        String::from_utf8_lossy(&cancel.stdout)
+    );
+    drop(release_on_drop);
+    let committed = wait_integrated(&f, task);
+    let receipt = committed.receipt.unwrap();
+    assert!(receipt.imported);
+    assert_eq!(receipt.disposition, IntegrationDisposition::Merged);
+    let tasks = ClientStateStore::open(&owner_paths(&f).state).unwrap();
+    assert_eq!(
+        tasks.load_task(task).unwrap().status().last_outcome(),
+        Some(&TaskOutcome::Done)
+    );
+    assert!(
+        f.worker(&["--json", "task", "close", &task.to_string()])
+            .status
+            .success()
+    );
+    assert_eq!(
+        tasks.load_task(task).unwrap().status().state(),
+        TaskState::Closed
+    );
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    assert_eq!(
+        String::from_utf8(
+            f.project
+                .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        receipt.merge_oid.unwrap().as_str()
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original_source);
 }
 
 fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> IntegrationRecord {
@@ -840,10 +1362,23 @@ printf '%s\n' "$@" > "$HOME/argv""#,
     assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
 }
 
-#[test]
-fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
-    use mac_worker::test_support::{client_state::ClientStateStore, session::SessionAgent};
-    use std::io::Read;
+struct ReleaseAuxiliary(std::fs::File);
+impl Drop for ReleaseAuxiliary {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = self.0.write_all(b"resume\n");
+    }
+}
+struct RunningAuxiliaryFixture {
+    f: super::session_import_e2e::Fixture,
+    task: TaskId,
+    ready: std::fs::File,
+    _release: ReleaseAuxiliary,
+    source: std::path::PathBuf,
+    original: Vec<u8>,
+}
+fn running_auxiliary_fixture(timeout: &str) -> RunningAuxiliaryFixture {
+    use mac_worker::test_support::session::SessionAgent;
     let f = integration_fixture(true);
     let source = f.capture_fixture(SessionAgent::Codex);
     let original = std::fs::read(&source).unwrap();
@@ -877,15 +1412,8 @@ fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
             .open(path)
             .unwrap()
     };
-    let mut ready = fifo("aux-ready");
-    struct Release(std::fs::File);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            use std::io::Write;
-            let _ = self.0.write_all(b"resume\n");
-        }
-    }
-    let _release = Release(fifo("aux-release"));
+    let ready = fifo("aux-ready");
+    let release = ReleaseAuxiliary(fifo("aux-release"));
     let agent = f.host.join("bin/codex");
     let work = format!(
         r#"count=0; [ ! -f "$HOME/turn-count" ] || count=$(cat "$HOME/turn-count")
@@ -914,6 +1442,8 @@ printf '%s\n' "$@" > "$HOME/argv""#,
         "codex",
         "--prompt",
         "produce conflict",
+        "--timeout",
+        timeout,
         "--integrate",
         "main",
         "--close-on",
@@ -923,7 +1453,30 @@ printf '%s\n' "$@" > "$HOME/argv""#,
         "--no-wait",
         "--wait",
     ]));
+    RunningAuxiliaryFixture {
+        f,
+        task,
+        ready,
+        _release: release,
+        source,
+        original,
+    }
+}
+
+#[test]
+fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::io::Read;
+    let RunningAuxiliaryFixture {
+        f,
+        task,
+        mut ready,
+        _release,
+        source,
+        original,
+    } = running_auxiliary_fixture("45m");
     ready.read_exact(&mut [0]).unwrap();
+    let origin = f.laptop.parent().unwrap().join("origin.git");
     let origin_before = f
         .project
         .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
@@ -985,6 +1538,72 @@ printf '%s\n' "$@" > "$HOME/argv""#,
         "{}",
         String::from_utf8_lossy(&close.stdout)
     );
+}
+
+#[test]
+fn a_running_auxiliary_times_out_while_the_native_owner_gate_is_drained() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::model::{TaskOutcome, TaskState},
+    };
+    use std::io::Read;
+    let RunningAuxiliaryFixture {
+        f,
+        task,
+        mut ready,
+        _release,
+        source,
+        original,
+    } = running_auxiliary_fixture("30s");
+    ready.read_exact(&mut [0]).unwrap();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let running = state.load(task).unwrap().unwrap();
+    let turn = running.auxiliaries[0].turn_id;
+    let prepared = state.load_prepared(task, turn).unwrap().unwrap();
+    assert_eq!(prepared.approved_turn_limits.timeout_millis, 30_000);
+    assert!(f.worker(&["controller", "drain"]).status.success());
+    // The real supervisor's lease clock keeps running. Waiting observes its
+    // terminal result while the owner remains barred from another Git phase.
+    let waited = f.worker(&[
+        "--json",
+        "task",
+        "wait",
+        "--task-id",
+        &task.to_string(),
+        "--timeout",
+        "60s",
+    ]);
+    assert!(
+        String::from_utf8_lossy(&waited.stdout).contains("WAIT_TIMEOUT"),
+        "the parked integration must still keep wait pending: {}",
+        String::from_utf8_lossy(&waited.stdout)
+    );
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
+    assert_eq!(ordinary.status().state(), TaskState::Open);
+    assert_eq!(ordinary.status().turns().last().unwrap().turn_id(), turn);
+    assert_eq!(
+        ordinary.status().last_outcome(),
+        Some(&TaskOutcome::TimedOut)
+    );
+    assert!(ordinary.runner().is_none());
+    assert!(client.queue_entry_for_task_turn(task).unwrap().is_none());
+    let parked = state.load(task).unwrap().unwrap();
+    assert_eq!(parked.snapshot.state, IntegrationStatus::Parked);
+    assert_eq!(
+        parked.snapshot.pause_reason,
+        Some(IntegrationPauseReason::ControllerDrained)
+    );
+    assert!(parked.auxiliaries[0].accepted && parked.auxiliaries[0].completed);
+    assert_eq!(parked.followups_spent, 1);
+    assert!(parked.receipt.is_none());
+    assert_eq!(state.load_prepared(task, turn).unwrap().unwrap(), prepared);
+    assert_eq!(std::fs::read(source).unwrap(), original);
 }
 
 #[test]

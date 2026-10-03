@@ -306,6 +306,44 @@ pub(crate) fn freeze_source_policy(
     Ok(Some(policy))
 }
 
+/// From-parent policy compatibility is known before any source pin or fetch.
+pub(crate) fn validate_batch_policy_inputs(
+    settings: &crate::project_config::TaskSettings,
+    batch: &crate::task_client::BatchFile,
+) -> Result<(), WorkerError> {
+    let mut targets = std::collections::BTreeMap::new();
+    for task in &batch.tasks {
+        let inputs = batch_integration_inputs(settings, &batch.defaults, task)?;
+        let resolved = resolve_integration_settings(
+            &settings.into(),
+            None,
+            &inputs.integrate,
+            inputs.verify_merge,
+        )?;
+        if let Some(id) = &task.id {
+            targets.insert(id.as_str(), resolved.map(|(branch, _)| branch));
+        }
+    }
+    for task in &batch.tasks {
+        let Some(parent) =
+            crate::dag::parse_from_base(task.base.as_deref().unwrap_or(&batch.defaults.base))
+        else {
+            continue;
+        };
+        let inputs = batch_integration_inputs(settings, &batch.defaults, task)?;
+        if let Some((target, _)) = resolve_integration_settings(
+            &settings.into(),
+            None,
+            &inputs.integrate,
+            inputs.verify_merge,
+        )? && targets.get(parent).and_then(Option::as_ref) != Some(&target)
+        {
+            return Err(integration_error("TASK_CONFIG_INVALID"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

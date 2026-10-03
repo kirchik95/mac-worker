@@ -329,10 +329,7 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
-    // Input-only T1 contracts; T4/T6 supply their production consumers.
-    #[allow(dead_code)]
     pub integrate: crate::integration::contracts::IntegrationOverride,
-    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -1073,10 +1070,8 @@ impl Default for BatchDefaults {
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
     #[serde(default)]
-    #[allow(dead_code)] // Input-only until T4/T6 wiring.
     pub integrate: crate::integration::contracts::IntegrationOverride,
     #[serde(default)]
-    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     #[serde(default)]
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -1267,7 +1262,6 @@ impl<'a> TaskClient<'a> {
     }
 
     /// T4/T6 calls this before an integrating batch can enter the ordinary DAG.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn validate_integration_batch(batch: &FrozenIntegratingBatch) -> Result<(), WorkerError> {
         crate::dag::validate_integration_batch(batch)
     }
@@ -1973,7 +1967,10 @@ impl<'a> TaskClient<'a> {
                     None,
                 )?;
                 if let Some(policy) = &frozen_policy {
-                    if publish_branch.as_ref() == Some(&policy.target) {
+                    let default = BranchName::for_task(task_id);
+                    if publish.contains(&PublishMode::Push)
+                        && publish_branch.as_ref().unwrap_or(&default) == &policy.target
+                    {
                         return Err(crate::integration::contracts::IntegrationCode::IntegrationPublishTargetCollision.error());
                     }
                     request.close_policy = crate::task::ClosePolicy::Never;
@@ -5362,12 +5359,7 @@ impl<'a> TaskClient<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let quiescent = !dag_pending && self.tasks_are_quiescent(&records)?;
         let exit_code = if quiescent {
-            records
-                .iter()
-                .filter_map(|record| record.status().last_outcome())
-                .map(|outcome| crate::task::classify_task_outcome(outcome).aggregate)
-                .max()
-                .unwrap_or(0)
+            self.wait_exit_code(&records)?
         } else {
             0
         };
@@ -5664,6 +5656,7 @@ impl<'a> TaskClient<'a> {
     ) -> Result<RunReport, WorkerError> {
         let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
         // Refuse unsupported helpers before frozen DAG/source pins or run rows.
+        crate::integration::config::validate_batch_policy_inputs(&project.settings.task, batch)?;
         for task in &batch.tasks {
             let request = resolve_batch_task(
                 self.config,
@@ -7052,6 +7045,57 @@ impl<'a> TaskClient<'a> {
         }
         Ok(true)
     }
+
+    fn wait_exit_code(&self, records: &[LocalTaskRecord]) -> Result<u8, WorkerError> {
+        let mut aggregate = 0;
+        for record in records {
+            let mut exit = record.status().last_outcome().map_or(0, |outcome| {
+                crate::task::classify_task_outcome(outcome).aggregate
+            });
+            let task = record.meta().task_id();
+            if let Some(integration) = RootedIntegrationState::read_task(self.paths, task)?.1 {
+                let mut latest = None;
+                for turn in record.status().turns().iter().rev() {
+                    if RootedIntegrationState::read_auxiliary(self.paths, task, turn.turn_id())?
+                        .is_none()
+                    {
+                        latest = Some(turn.turn_id());
+                        break;
+                    }
+                }
+                if latest == Some(integration.snapshot.source_turn_id) {
+                    match integration.snapshot.state {
+                        IntegrationStatus::Integrated => {
+                            let receipt = integration
+                                .receipt
+                                .as_ref()
+                                .filter(|r| r.imported)
+                                .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+                            let accepted =
+                                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+                            if record.fetched_head() != Some(accepted)
+                                || record.status().head_oid() != Some(accepted)
+                            {
+                                return Err(IntegrationCode::IntegrationStateInvalid.error());
+                            }
+                            exit = 0;
+                        }
+                        IntegrationStatus::Blocked => {
+                            exit = integration
+                                .snapshot
+                                .blocked_code
+                                .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?
+                                .error()
+                                .exit_code();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            aggregate = aggregate.max(exit);
+        }
+        Ok(aggregate)
+    }
 }
 
 fn event_task_created(report: &TaskReport) -> serde_json::Value {
@@ -8436,9 +8480,12 @@ mod session_submission_tests {
         version: std::sync::Mutex<String>,
         fail_after_pin: AtomicBool,
         fail_release: AtomicBool,
+        integration_capable: AtomicBool,
+        requests: std::sync::Mutex<Vec<ProcessRequest>>,
     }
     impl ProcessRunner for Remote {
         fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.requests.lock().unwrap().push(request.clone());
             if request.program == "/usr/bin/git" {
                 let session = request.args.iter().any(|arg| {
                     arg.to_str()
@@ -8471,10 +8518,14 @@ mod session_submission_tests {
                     .to_string_lossy()
                     .ends_with(" host probe")
             );
+            let mut features = vec![crate::features::HOST_FEATURE_SESSION_IMPORT];
+            if self.integration_capable.load(Ordering::SeqCst) {
+                features.push(crate::features::HOST_FEATURE_INTEGRATION);
+            }
             let probe = serde_json::json!({
                 "protocol_version":crate::protocol::PROTOCOL_VERSION,
                 "supervision_version":crate::protocol::SUPERVISION_VERSION,
-                "features":[crate::features::HOST_FEATURE_SESSION_IMPORT],
+                "features":features,
                 "hostname":"fixture", "arch":"arm64", "os_version":"26", "free_disk_bytes":100_u64 << 30,
                 "total_disk_bytes":200_u64 << 30, "memory_pressure":"normal", "swap_used_bytes":0,
                 "available_memory_bytes":8_u64 << 30, "slot_state":"idle", "active_lease":null,
@@ -8553,6 +8604,8 @@ mod session_submission_tests {
                     version: std::sync::Mutex::new("0.160.0".into()),
                     fail_after_pin: AtomicBool::new(false),
                     fail_release: AtomicBool::new(false),
+                    integration_capable: AtomicBool::new(false),
+                    requests: std::sync::Mutex::new(vec![]),
                 },
                 task: TaskId::generate(),
                 turn: TurnId::generate(),
@@ -8615,6 +8668,93 @@ mod session_submission_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn direct_implicit_push_branch_collision_refuses_before_source_pins_or_task_effects() {
+        let fixture = Fixture::new();
+        fixture
+            .remote
+            .integration_capable
+            .store(true, Ordering::SeqCst);
+        let origin = fixture
+            ._temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("origin.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&fixture.project)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["clone", "--bare", ".", origin.to_str().unwrap()]);
+        let target = BranchName::for_task(fixture.task);
+        git(&[
+            "--git-dir",
+            origin.to_str().unwrap(),
+            "branch",
+            target.as_str(),
+            "main",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", origin.display()),
+        ]);
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture'\nssh = 'never-connect'\nslots = 1\ncapabilities = ['origin:file']\n").unwrap();
+        let client = TaskClient::new(
+            &fixture.remote,
+            &config,
+            &fixture.paths,
+            &state,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        let mut request = fixture.request();
+        request.wip = false;
+        request.publish = Some(vec!["fetch".into(), "push".into()]);
+        request.integrate = crate::integration::contracts::IntegrationOverride::Target(target);
+        let result = client.submit_with_ids(
+            request,
+            Some(fixture.task),
+            Some(fixture.turn),
+            None,
+            &mut vec![],
+            &mut vec![],
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err().public_code(),
+            "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        );
+        assert!(state.list_tasks().unwrap().is_empty());
+        assert!(state.queue_snapshot().unwrap().entries().is_empty());
+        assert!(!fixture.paths.cache.join("transfer").exists());
+        assert!(
+            !fixture
+                .remote
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request
+                    .args
+                    .iter()
+                    .any(|arg| arg == "update-ref" || arg == "fetch"))
+        );
     }
 
     #[test]

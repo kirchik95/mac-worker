@@ -68,9 +68,7 @@ pub enum HostOperation {
     TaskPrebind,
     TaskCancel,
     TaskTurn,
-    #[allow(dead_code)] // T6 wires the frozen transport operation.
     TaskIntegration,
-    #[allow(dead_code)]
     TaskIntegrationTurn,
     RefreshFacts,
     RefreshFactsClear,

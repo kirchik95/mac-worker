@@ -329,6 +329,41 @@ impl TaskSubmitHandler<'_> {
             &DETACHED_EXECUTOR,
         );
         let report = match execute_task_mutation(&client, &prepared) {
+            Err(error)
+                if error.public_code() == "INTEGRATION_ALREADY_COMMITTED"
+                    && matches!(prepared, PreparedTaskMutation::Cancel { .. }) =>
+            {
+                let current = self.client_state.load_task(prepared.task_id())?;
+                let (_, integration) =
+                    crate::integration::store::RootedIntegrationState::read_task(
+                        self.paths,
+                        prepared.task_id(),
+                    )?;
+                let settled = integration.as_ref().is_some_and(|record| {
+                    record.snapshot.state
+                        == crate::integration::contracts::IntegrationStatus::Integrated
+                        && record.receipt.as_ref().is_some_and(|receipt| {
+                            let accepted =
+                                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+                            receipt.imported
+                                && current.status().head_oid() == Some(accepted)
+                                && current.fetched_head() == Some(accepted)
+                        })
+                        && current.runner().is_none()
+                }) && self
+                    .client_state
+                    .queue_entry_for_task_turn(prepared.task_id())?
+                    .is_none();
+                if !settled {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                            .error(),
+                    );
+                }
+                // Save a terminal informational refusal only after import and
+                // retirement, so a committed result never stays pending forever.
+                return Ok(rejection_result(&error));
+            }
             Err(
                 error @ WorkerError::Task {
                     code: "TASK_REVISION_CONFLICT",

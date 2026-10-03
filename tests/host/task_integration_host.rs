@@ -111,6 +111,226 @@ fn owner_can_revoke_an_armed_cycle_before_the_first_host_phase_and_fence_late_fe
     assert!(f.git(&["status", "--porcelain=v1"]).is_empty());
 }
 
+#[test]
+fn stale_revoke_cannot_acknowledge_or_rewrite_a_newer_ordinary_turn() {
+    use mac_worker::test_support::{
+        host::job::JobId,
+        task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+    };
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    let revoke = request(
+        &f,
+        HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: f.record.snapshot.epoch,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1002,
+                acknowledged: false,
+            },
+        },
+    );
+    execute(&f, &revoke).unwrap();
+    let task = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    let mut status = serde_json::to_value(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+    )
+    .unwrap();
+    status["turns"].as_array_mut().unwrap().push(
+        serde_json::to_value(TurnSummary::new(
+            2,
+            JobId::new(uuid::Uuid::from_u128(101)),
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(false),
+            false,
+            Some(1003),
+            Some(1004),
+        ))
+        .unwrap(),
+    );
+    let status: TaskStatus = serde_json::from_value(status).unwrap();
+    std::fs::write(
+        task.join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let before = host_record(&f);
+    let mut stale = revoke;
+    stale.revision = stale.revision.next().unwrap();
+    if let HostIntegrationAction::Revoke { tombstone } = &mut stale.action {
+        tombstone.revision = stale.revision;
+    }
+    assert_eq!(
+        execute(&f, &stale).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(host_record(&f), before);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        status
+    );
+}
+
+#[test]
+fn acknowledged_stop_before_push_fences_real_close_discard_and_ordinary_resume() {
+    use mac_worker::test_support::{
+        client_state::RunnerLivenessVerdict,
+        core::{error::WorkerError, paths::PathLayout},
+        host::job::ProcessIdentity,
+        task::store::TaskCloseRequest,
+    };
+    use std::sync::{Arc, Mutex, mpsc};
+    struct BeforePush {
+        base: ManualIntegrationRuntime,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl IntegrationRuntime for BeforePush {
+        fn now_millis(&self) -> u64 {
+            self.base.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.base.actor()
+        }
+        fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+            self.base.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.base.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            self.base.reach(hook);
+            if hook == IntegrationHook::BeforePush
+                && let Some(entered) = self.entered.lock().unwrap().take()
+            {
+                entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    for operation in ["cancel", "close", "discard", "say"] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        let source = f.commit_task();
+        f.prepare();
+        f.record.snapshot.state = IntegrationStatus::CommitReady;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let (enter, entered) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let runtime = Arc::new(BeforePush {
+            base: ManualIntegrationRuntime::default(),
+            entered: Mutex::new(Some(enter)),
+            release: Mutex::new(resume),
+        });
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(observed(&f));
+        let turns = FakeIntegrationTurns::default();
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        std::thread::scope(|scope| {
+            let driver = scope.spawn(|| owner.drive_once(f.record.task_id));
+            if entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_err()
+            {
+                let _ = release.send(());
+                panic!("BeforePush was not reached: {:?}", driver.join().unwrap());
+            }
+            let _release_on_panic = crate::support::on_drop(|| {
+                if std::thread::panicking() {
+                    let _ = release.send(());
+                }
+            });
+            let pushing = state.load(f.record.task_id).unwrap().unwrap();
+            assert!(pushing.push_intent.as_ref().unwrap().uncertain);
+            let stopped = owner
+                .revoke(f.record.task_id, pushing.snapshot.revision)
+                .unwrap();
+            assert_eq!(stopped.state, IntegrationStatus::Revoked);
+            assert!(
+                state
+                    .load(f.record.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .tombstone
+                    .unwrap()
+                    .acknowledged
+            );
+            let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+            match operation {
+                "close" | "discard" => {
+                    tasks
+                        .close(&TaskCloseRequest::new(
+                            &f.record.policy.project_id,
+                            f.record.task_id,
+                            operation == "discard",
+                        ))
+                        .unwrap();
+                }
+                "say" => {
+                    let prepared = f.prepared(IntegrationTurnPurpose::Verify);
+                    acquire_auxiliary(&f, &prepared);
+                    tasks
+                        .prepare_resume(
+                            &f.record.policy.project_id,
+                            f.record.task_id,
+                            prepared.followup.turn_id(),
+                            2,
+                            "fixture-worker",
+                            &source,
+                        )
+                        .unwrap();
+                }
+                "cancel" => {}
+                _ => unreachable!(),
+            }
+            release.send(()).unwrap();
+            assert_eq!(
+                driver.join().unwrap().unwrap().state,
+                IntegrationStatus::Revoked
+            );
+        });
+        assert_eq!(f.origin_tip(), target, "{operation} allowed a late push");
+        assert!(turns.imports(f.record.task_id).is_empty());
+        assert!(
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .actor
+                .is_none()
+        );
+        assert!(f.execute(IntegrationStep::Push).is_err());
+    }
+}
+
 fn observed(f: &GitIntegrationFixture) -> IntegrationTaskFacts {
     use mac_worker::test_support::task::model::LocalTaskRecord;
     let tasks = TaskStore::new(&f.store, &SystemProcessRunner);

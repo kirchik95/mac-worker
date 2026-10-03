@@ -1621,12 +1621,43 @@ pub(crate) fn park_record(
     record: &mut IntegrationRecord,
     pause: IntegrationPauseEvidence,
 ) -> Result<(), WorkerError> {
-    if record.pause.is_some()
-        || matches!(
-            record.snapshot.state,
-            IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
-        )
-    {
+    if let Some(previous) = record.pause {
+        if previous.reason == pause.reason {
+            return Ok(());
+        }
+        if pause.reason == IntegrationPauseReason::HelperUnavailable
+            && matches!(
+                previous.reason,
+                IntegrationPauseReason::ControllerDrained
+                    | IntegrationPauseReason::ControllerDisabled
+            )
+        {
+            // The persisted global gate may have reopened before this helper
+            // observation. Spend that active interval, then park the remainder.
+            let Some(paths) = paths else {
+                return Ok(());
+            };
+            if crate::controller::drain::resumed_at(
+                &paths.controller_state_root(),
+                previous.effective_at_millis,
+            )?
+            .is_none()
+            {
+                return Ok(());
+            }
+            resume_record(state, runtime, Some(paths), record)?;
+        } else {
+            // A newly closed global valve supersedes helper unavailability;
+            // both intervals stay paused and the saved remainder is unchanged.
+            record.pause = Some(pause);
+            record.snapshot.pause_reason = Some(pause.reason);
+            return persist_record(state, runtime, record);
+        }
+    }
+    if matches!(
+        record.snapshot.state,
+        IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
+    ) {
         return Ok(());
     }
     if let Some(paths) = paths {

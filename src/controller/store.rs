@@ -1658,6 +1658,9 @@ fn saved_rejection(result: Option<&Value>) -> Result<Option<WorkerError>, Worker
         "TASK_CLOSED" if message == "task is terminal" => {
             WorkerError::task(code, "task is terminal")
         }
+        "INTEGRATION_ALREADY_COMMITTED" if message == "integration contract rejected" => {
+            crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted.error()
+        }
         "CAPACITY_BUSY" | "CAPABILITY_MISSING" => {
             WorkerError::capacity_public(code, message.to_owned())
         }
@@ -1674,6 +1677,7 @@ fn known_rejection_code(code: &str) -> Option<&'static str> {
         "CAPABILITY_MISSING" => Some("CAPABILITY_MISSING"),
         "TASK_REVISION_CONFLICT" => Some("TASK_REVISION_CONFLICT"),
         "TASK_CLOSED" => Some("TASK_CLOSED"),
+        "INTEGRATION_ALREADY_COMMITTED" => Some("INTEGRATION_ALREADY_COMMITTED"),
         _ => None,
     }
 }

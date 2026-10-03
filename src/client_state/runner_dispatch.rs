@@ -4,6 +4,7 @@ impl ClientStateStore {
     /// Reuses a waiting detached runner without allocating another process.
     /// The queue reservation is authoritative; runner metadata is published
     /// recipient-first while the same state/queue lock is still held.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn claim_parked_for_waiting_runner(
         &self,
         task_id: TaskId,

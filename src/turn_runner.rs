@@ -542,7 +542,6 @@ impl<'a> TurnRunner<'a> {
     }
 
     /// T6 injects owner ports for detached production runners.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(
         mut self,
         coordinator: &'a crate::integration::coordinator::IntegrationCoordinator<'a>,
@@ -554,8 +553,13 @@ impl<'a> TurnRunner<'a> {
         mut self,
         coordinator: Option<&'a crate::integration::coordinator::IntegrationCoordinator<'a>>,
     ) -> Self {
-        self.integration = coordinator;
-        self
+        match coordinator {
+            Some(coordinator) => self.with_integration(coordinator),
+            None => {
+                self.integration = None;
+                self
+            }
+        }
     }
 
     /// Clock for [`Self::follow_remote`] idle waits. Production sleeps.

@@ -159,6 +159,39 @@ impl<'a> HostIntegrationService<'a> {
             }
             HostIntegrationAction::Revoke { tombstone } => {
                 let retained = sidecars.load(&policy.project_id, request.task_id)?;
+                let status = task_store.load_status(&policy.project_id, request.task_id)?;
+                let mut source = None;
+                for turn in status.turns().iter().rev() {
+                    if sidecars
+                        .prepared(&policy.project_id, request.task_id, turn.turn_id())?
+                        .is_none()
+                    {
+                        source = Some(turn.turn_id());
+                        break;
+                    }
+                }
+                let source = source.ok_or_else(invalid)?;
+                let retained_identity = retained.as_ref().is_some_and(|record| {
+                    Some(record.snapshot.integration_id) == request.integration_id
+                });
+                if retained_identity
+                    && retained.as_ref().is_some_and(|record| {
+                        record.snapshot.source_turn_id != source
+                            || request.epoch < record.snapshot.epoch
+                    })
+                {
+                    return Err(invalid());
+                }
+                if !retained_identity
+                    && Some(IntegrationId::derive(
+                        request.task_id,
+                        source,
+                        status.head_oid().ok_or_else(invalid)?,
+                        &policy.target_key()?,
+                    )?) != request.integration_id
+                {
+                    return Err(invalid());
+                }
                 let same_cycle = retained.as_ref().is_some_and(|record| {
                     Some(record.snapshot.integration_id) == request.integration_id
                         && record.snapshot.epoch == request.epoch
