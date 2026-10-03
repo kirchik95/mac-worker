@@ -488,6 +488,44 @@ fn preview_prints_effective_per_task_target_verify_and_disable() {
 }
 
 #[test]
+fn explicit_controller_redrive_refuses_unwired_support_without_rpc_or_durable_rows() {
+    use clap::Parser;
+    use mac_worker::test_support::{
+        cli::Cli,
+        runtime::{RuntimeContext, run_with_io_in_context},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(root.path()).unwrap();
+    let config = home.join("config.toml");
+    std::fs::write(
+        &config,
+        "version = 1\n[controller]\nenabled = true\nssh = 'fixture.invalid'\n",
+    )
+    .unwrap();
+    let cli = Cli::try_parse_from([
+        "worker",
+        "--config",
+        config.to_str().unwrap(),
+        "task",
+        "integrate",
+        "00000000000000000000000000000002",
+    ])
+    .unwrap();
+    let runtime = RuntimeContext::isolated(Default::default(), home.clone(), home.clone());
+    let runner = PreflightRunner::new(vec![]);
+    let mut stderr = Vec::new();
+    let exit = run_with_io_in_context(cli, &runner, &runtime, &mut Vec::new(), &mut stderr);
+    assert_eq!(exit, 69);
+    assert!(
+        String::from_utf8(stderr)
+            .unwrap()
+            .contains("INTEGRATION_UNAVAILABLE")
+    );
+    assert!(runner.requests.lock().unwrap().is_empty());
+    assert!(!home.join(".local/state/mac-worker-controller").exists());
+}
+
+#[test]
 fn authoritative_target_accepts_255_bytes_and_rejects_256() {
     assert!(validate_integration_target(&"a".repeat(255)).is_ok());
     assert!(validate_integration_target(&"a".repeat(256)).is_err());

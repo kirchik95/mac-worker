@@ -5180,6 +5180,9 @@ fn run_enabled_controller_task(
             Ok(report.exit_code())
         }
         Command::Task {
+            command: TaskCommand::Integrate { .. },
+        } => Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error()),
+        Command::Task {
             command: TaskCommand::Reconcile,
         } => {
             let report =
