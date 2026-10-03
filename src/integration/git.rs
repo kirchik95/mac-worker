@@ -30,6 +30,105 @@ const HARDENING: &[(&str, &str)] = &[
     ("core.fsync", "objects,derived-metadata,reference"),
     ("core.fsyncMethod", "fsync"),
 ];
+const DRIVER_PATTERN: &str =
+    "^(filter\\..*\\.(clean|smudge|process|required)|merge\\..*\\.(driver|recursive))$";
+
+/// Read-only laptop preflight uses the same overrides as host integration Git.
+/// Driver discovery is a bounded local config read; it never runs a driver.
+pub(crate) fn hardened_read_request(
+    runner: &dyn ProcessRunner,
+    repo: &RootedDir,
+    operation: Vec<OsString>,
+) -> Result<ProcessRequest, WorkerError> {
+    repo.verify_bound()?;
+    let mut config: Vec<_> = HARDENING
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    let read_policy = |mut request: ProcessRequest| {
+        request.policy.deadline = Duration::from_secs(30);
+        request
+            .environment_remove
+            .extend(["GIT_NAMESPACE".into(), "GIT_SHALLOW_FILE".into()]);
+        request.environment.extend([
+            ("GIT_ATTR_NOSYSTEM".into(), "1".into()),
+            ("GIT_NO_LAZY_FETCH".into(), "1".into()),
+            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+            ("GIT_GRAFT_FILE".into(), "/dev/null".into()),
+        ]);
+        request
+    };
+    let probe = read_policy(git_request_with_config(
+        repo.path(),
+        None,
+        &config,
+        vec![
+            "config".into(),
+            "--null".into(),
+            "--name-only".into(),
+            "--get-regexp".into(),
+            DRIVER_PATTERN.into(),
+        ],
+    ));
+    let names = runner.run(&probe)?;
+    config.extend(driver_overrides(&names)?);
+    repo.verify_bound()?;
+    Ok(read_policy(git_request_with_config(
+        repo.path(),
+        Some(origin_git_ssh_command()?),
+        &config,
+        operation,
+    )))
+}
+
+fn driver_overrides(names: &ProcessResult) -> Result<Vec<(String, String)>, WorkerError> {
+    if !matches!(names.status.code(), Some(0 | 1)) || names.stdout.len() > GIT_OUTPUT_BYTES {
+        return Err(invalid());
+    }
+    let mut drivers = BTreeSet::new();
+    for raw in names.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let key = std::str::from_utf8(raw).map_err(|_| invalid())?;
+        let (prefix, _) = key.rsplit_once('.').ok_or_else(invalid)?;
+        if prefix.len() > 256 || prefix.chars().any(|c| c.is_control() || c == '=') {
+            return Err(invalid());
+        }
+        drivers.insert(prefix.to_owned());
+    }
+    if drivers.len() > 64 {
+        return Err(invalid());
+    }
+    let mut config = Vec::new();
+    for driver in drivers {
+        if driver.starts_with("filter.") {
+            for field in ["clean", "smudge", "process"] {
+                config.push((format!("{driver}.{field}"), String::new()));
+            }
+            config.push((format!("{driver}.required"), "false".into()));
+        } else {
+            // Preserve directional built-in union. A configured binary
+            // replacement is unsupported and fails closed.
+            if driver == "merge.binary" {
+                return Err(invalid());
+            }
+            let command = if driver == "merge.union" {
+                "/usr/bin/git merge-file --union %A %O %B"
+            } else {
+                "/usr/bin/git merge-file %A %O %B"
+            };
+            config.push((format!("{driver}.driver"), command.into()));
+            config.push((
+                format!("{driver}.recursive"),
+                if driver == "merge.union" {
+                    "union"
+                } else {
+                    "text"
+                }
+                .into(),
+            ));
+        }
+    }
+    Ok(config)
+}
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceState {
@@ -222,8 +321,7 @@ impl<'a> IntegrationGit<'a> {
                 "--null".into(),
                 "--name-only".into(),
                 "--get-regexp".into(),
-                "^(filter\\..*\\.(clean|smudge|process|required)|merge\\..*\\.(driver|recursive))$"
-                    .into(),
+                DRIVER_PATTERN.into(),
             ],
         );
         probe.policy.deadline = GIT_DEADLINE.min(self.remaining());
@@ -234,51 +332,7 @@ impl<'a> IntegrationGit<'a> {
             .runner
             .run_interruptible(&probe, &|| self.stopped())
             .map_err(|_| IntegrationCode::IntegrationNetwork.error())?;
-        if !matches!(names.status.code(), Some(0 | 1)) || names.stdout.len() > GIT_OUTPUT_BYTES {
-            return Err(invalid());
-        }
-        let mut drivers = BTreeSet::new();
-        for raw in names.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-            let key = std::str::from_utf8(raw).map_err(|_| invalid())?;
-            let (prefix, _) = key.rsplit_once('.').ok_or_else(invalid)?;
-            if prefix.len() > 256 || prefix.chars().any(|c| c.is_control() || c == '=') {
-                return Err(invalid());
-            }
-            drivers.insert(prefix.to_owned());
-        }
-        if drivers.len() > 64 {
-            return Err(invalid());
-        }
-        for driver in drivers {
-            if driver.starts_with("filter.") {
-                for field in ["clean", "smudge", "process"] {
-                    config.push((format!("{driver}.{field}"), String::new()));
-                }
-                config.push((format!("{driver}.required"), "false".into()));
-            } else {
-                // Built-in union keeps its directional merge semantics even
-                // when the repository has configured a command under that name.
-                // A configured binary replacement is unsupported and fails closed.
-                if driver == "merge.binary" {
-                    return Err(invalid());
-                }
-                let command = if driver == "merge.union" {
-                    "/usr/bin/git merge-file --union %A %O %B"
-                } else {
-                    "/usr/bin/git merge-file %A %O %B"
-                };
-                config.push((format!("{driver}.driver"), command.into()));
-                config.push((
-                    format!("{driver}.recursive"),
-                    if driver == "merge.union" {
-                        "union"
-                    } else {
-                        "text"
-                    }
-                    .into(),
-                ));
-            }
-        }
+        config.extend(driver_overrides(&names)?);
         let mut args = Vec::new();
         if let Some(attrs) = attrs {
             args.push(format!("--attr-source={attrs}").into());
