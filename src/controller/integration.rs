@@ -42,9 +42,11 @@ pub fn prepare_integrating_submit(
     if submit.wip {
         return Err(IntegrationCode::IntegrationWipBase.error());
     }
-    if submit.publish_branch.as_deref() == Some(integration.target.as_str()) {
-        return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
-    }
+    integration.validate_publication_branch(
+        submit.task_id,
+        &submit.publish,
+        submit.publish_branch.as_deref(),
+    )?;
     if submit.close_on != integration.requested_close && submit.close_on != ClosePolicy::Never {
         return Err(invalid());
     }
@@ -139,9 +141,11 @@ fn validate_batch_bindings(
         if node.frozen.wip || matches!(node.base, DagBase::Frozen { wip: true, .. }) {
             return Err(IntegrationCode::IntegrationWipBase.error());
         }
-        if node.frozen.publish_branch.as_deref() == Some(policy.target.as_str()) {
-            return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
-        }
+        policy.validate_publication_branch(
+            node.task_id,
+            &node.frozen.publish,
+            node.frozen.publish_branch.as_deref(),
+        )?;
         if node.frozen.project_id != policy.project_id
             || node.frozen.origin_url.as_deref() != Some(policy.origin.as_str())
             || (effective && node.frozen.close_on != ClosePolicy::Never)

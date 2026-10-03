@@ -4,7 +4,7 @@ use mac_worker::test_support::integration::{
     IntegrationSnapshot, MAX_PUBLIC_SNAPSHOT_BYTES, decode_snapshot, encode_snapshot,
     public_target_display,
 };
-use mac_worker::test_support::task::model::{ClosePolicy, RunId, TaskId, TurnId};
+use mac_worker::test_support::task::model::{BranchName, ClosePolicy, RunId, TaskId, TurnId};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -239,11 +239,139 @@ fn integrating_submit_freezes_effective_never_and_refuses_unsafe_bindings() {
     ] {
         let mut wire = serde_json::to_value(submit()).unwrap();
         wire[field] = value;
+        if field == "publish_branch" {
+            wire["publish"] = json!(["fetch", "push"]);
+        }
         let error =
             prepare_integrating_submit(serde_json::from_value(wire).unwrap(), policy.clone())
                 .unwrap_err();
         assert_eq!(error.public_code(), code, "{field}");
     }
+}
+
+#[test]
+fn push_target_collisions_use_the_effective_branch_in_submit_wrappers_and_adapters() {
+    for explicit in [false, true] {
+        let mut body = submit();
+        body.publish.push("push".into());
+        let target = BranchName::for_task(body.task_id);
+        body.publish_branch = explicit.then(|| target.to_string());
+        let mut policy = sample_policy(target.as_str());
+        policy.requested_close = ClosePolicy::Done;
+        let prepared = prepare_integrating_submit(body.clone(), policy.clone());
+        assert_eq!(
+            prepared.unwrap_err().public_code(),
+            "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        );
+        body.close_on = ClosePolicy::Never;
+        let wrapper = FrozenIntegratingSubmit {
+            submit: body,
+            integration: policy,
+        };
+        assert_eq!(
+            wrapper.validate().unwrap_err().public_code(),
+            "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        );
+        assert_eq!(
+            validate_integrating_submit(&wrapper)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        );
+        assert!(
+            serde_json::from_value::<FrozenIntegratingSubmit>(
+                serde_json::to_value(&wrapper).unwrap()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn push_target_collisions_are_checked_for_every_batch_node_and_strict_wrapper() {
+    for name in ["parent", "child"] {
+        for explicit in [false, true] {
+            let mut body = batch();
+            let node = body.nodes.get_mut(name).unwrap();
+            node.frozen.publish.push("push".into());
+            let target = BranchName::for_task(node.task_id);
+            node.frozen.publish_branch = explicit.then(|| target.to_string());
+            let mut map = policies();
+            for policy in map.values_mut().flatten() {
+                policy.target = target.clone();
+            }
+            assert_eq!(
+                prepare_integrating_batch(body.clone(), map.clone())
+                    .unwrap_err()
+                    .public_code(),
+                "INTEGRATION_PUBLISH_TARGET_COLLISION",
+                "{name}/{explicit}"
+            );
+            for node in body.nodes.values_mut() {
+                node.frozen.close_on = ClosePolicy::Never;
+            }
+            let wrapper = FrozenIntegratingBatch {
+                batch: body,
+                integrations: map,
+            };
+            assert_eq!(
+                wrapper.validate().unwrap_err().public_code(),
+                "INTEGRATION_PUBLISH_TARGET_COLLISION",
+                "{name}/{explicit}"
+            );
+            assert_eq!(
+                validate_integrating_batch(&wrapper)
+                    .unwrap_err()
+                    .public_code(),
+                "INTEGRATION_PUBLISH_TARGET_COLLISION"
+            );
+            assert!(
+                serde_json::from_value::<FrozenIntegratingBatch>(
+                    serde_json::to_value(&wrapper).unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn fetch_only_target_names_and_distinct_effective_push_branches_remain_valid() {
+    for push in [false, true] {
+        for explicit in [false, true] {
+            let mut body = submit();
+            if push {
+                body.publish.push("push".into());
+            }
+            let target = BranchName::for_task(body.task_id);
+            body.publish_branch = explicit.then(|| {
+                if push {
+                    "publication".into()
+                } else {
+                    target.to_string()
+                }
+            });
+            let mut policy = sample_policy(if push && !explicit {
+                "main"
+            } else {
+                target.as_str()
+            });
+            policy.requested_close = ClosePolicy::Done;
+            let wrapper = prepare_integrating_submit(body, policy).unwrap();
+            validate_integrating_submit(&wrapper).unwrap();
+            let _: FrozenIntegratingSubmit =
+                serde_json::from_value(serde_json::to_value(wrapper).unwrap()).unwrap();
+        }
+    }
+    let mut body = batch();
+    let target = BranchName::for_task(body.nodes["child"].task_id);
+    body.nodes.get_mut("child").unwrap().frozen.publish_branch = Some(target.to_string());
+    let mut map = policies();
+    for policy in map.values_mut().flatten() {
+        policy.target = target.clone();
+    }
+    let wrapper = prepare_integrating_batch(body, map).unwrap();
+    validate_integrating_batch(&wrapper).unwrap();
 }
 
 #[test]
