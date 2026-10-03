@@ -53,9 +53,11 @@ Open your project, a Git repository with at least one commit:
 
 ```bash
 cd /path/to/your/project
-worker task submit --agent codex --no-integrate --wait \
+worker task submit --agent codex --wait \
   --prompt "Create SETUP_CHECK.md containing: mac-worker works."
 ```
+
+If your project already sets `[task] integrate`, add `--no-integrate` to this submit so the check file does not land on the target.
 
 Use the printed task ID in place of `<task-id>`:
 
@@ -78,7 +80,7 @@ verify_merge = "never"
 ```
 
 <!-- Part 2: reconcile T6 lifecycle and notification wiring. -->
-Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. The notifier reports `Task integrated into main`. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
+Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
 
 Task overrides take precedence over batch defaults, then project settings. Submit `--no-integrate` disables inherited integration. Verification defaults to `never`; resolve and verify turns share the task's `max_followups` allowance. Integration requires a committed base already reachable from the target; `--wip` cannot integrate.
 
@@ -86,7 +88,7 @@ Task overrides take precedence over batch defaults, then project settings. Submi
 Use `worker controller drain` to pause new integration phases and auxiliary admissions; an admitted step or running turn finishes before parking. Resume explicitly with `worker controller drain --off`. Controller disable and helper rollback also stop new integration work; restore compatible support and the owner gate before resuming retained Open tasks.
 
 <!-- Part 2: reconcile T6 legacy retention settlement. -->
-rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
 <!-- Part 2: reconcile T6 legacy retention settlement. -->
 GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs; compatible restore observes any uncertain push while keeping a host-closed task Closed.

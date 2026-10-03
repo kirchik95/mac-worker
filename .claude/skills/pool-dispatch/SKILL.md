@@ -85,7 +85,7 @@ Follow the `integration` snapshot and `workflow_state`, not ordinary `done` alon
 Verification defaults to `never`. Resolve and verify turns consume the ordinary `max_followups` allowance; re-drive cannot replenish it. A source with checks requires a nonempty all-pass recovery report; a source with no checks may have an empty recovery report. Any `fail` or `error` blocks. The host does not run project checks, and agent claims are not independent verification.
 
 <!-- Part 2: reconcile T6 pause, rollback and explicit resume. -->
-Controller drain, disable and helper rollback stop new integration phases and auxiliary admissions. Admitted steps and running turns finish before parking. Respect the operator's pause; resume requires compatible support and an explicitly reopened owner gate. Parking preserves remaining active admission time, auxiliary ID, queue position and spent follow-ups. A running auxiliary keeps its execution timeout. A pre-feature helper can lose the repair workspace after seven idle host-status days; see [the operator warning and settlement limits](../../../docs/usage.md#pause-stop-and-rollback).
+Controller drain, disable and helper rollback stop new integration phases and auxiliary admissions. Admitted steps and running turns finish before parking. Respect the operator's pause; resume requires compatible support and an explicitly reopened owner gate. Parking preserves remaining active admission time, auxiliary ID, queue position and spent follow-ups. A running auxiliary keeps its execution timeout. A pre-feature helper can lose the repair workspace after seven idle host-status days; see repository `docs/usage.md`, section "Pause, stop and rollback", for the operator warning and settlement limits.
 
 ## Follow
 

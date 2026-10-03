@@ -238,7 +238,7 @@ lockfiles = ["Cargo.lock"]
 Integration is opt-in and disabled by default. Configure `[task] integrate = "main"` in the project's `.worker.toml`, then submit tasks or batches normally. The setting names a branch on this project's own canonical origin; there is no implicit `main`, origin-HEAD discovery, other-remote target, or laptop-wide enabling default. Settings are frozen before submission effects, so later agent edits to `.worker.toml` cannot change a task's policy.
 
 <!-- Part 2: reconcile T6 final-result, import, close and notifier wiring. -->
-After the final eligible ordinary Done result is imported and its runner retires, automatic integration adds one merge commit to the target without an accept action. Conflicts resume the same worker, agent and session. The notifier reports `Task integrated into main`. Requested `--close-on done` closes only after the integration receipt and accepted result are imported; `--close-on never` retains the Open workspace and session for later `say`.
+After the final eligible ordinary Done result is imported and its runner retires, automatic integration adds one merge commit to the target without an accept action. Conflicts resume the same worker, agent and session. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Blocked and dependency-failure notices are titled `Integration blocked` and `Dependency not integrated`. Requested `--close-on done` closes only after the integration receipt and accepted result are imported; `--close-on never` retains the Open workspace and session for later `say`.
 
 ### Configuration and admission
 
@@ -310,7 +310,7 @@ Manual `worker task close <id>` stops unfinished integration and keeps the resul
 For blocked Open tasks, repair the cause and run `worker task integrate <id>`. Re-drive keeps the source and target, starts a new epoch, and respects remaining task follow-ups; it cannot change targets or resurrect terminal tasks. Integrated re-drive is idempotent. `say` on blocked integration revokes the old epoch and restores the source workspace before starting an ordinary follow-up; active integration is busy unless an explicit interrupt completes its stop barrier.
 
 <!-- Part 2: reconcile T6 legacy seven-day retention and closed-task settlement. -->
-rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
 <!-- Part 2: reconcile T6 legacy seven-day retention and closed-task settlement. -->
 Old GC measures seven idle days from the last host-status update, not the rollback date, so already-idle tasks can expire sooner after rollback. Non-discard retention close keeps result refs/history/session binding but removes the workspace. The integration-aware helper protects parked, blocked and uncertain repair state; a pre-feature helper cannot honor that protection. There is no host layout/version barrier to prevent an operational rollback.

@@ -118,9 +118,11 @@ Expect a task ID, the outcome and summary, `worker task diff` / the card’s fil
 In a Git repository with at least one commit, submit a small task:
 
 ```bash
-worker task submit --agent codex --no-integrate --wait \
+worker task submit --agent codex --wait \
   --prompt "Create SETUP_CHECK.md containing: mac-worker works."
 ```
+
+If your project already sets `[task] integrate`, add `--no-integrate` to this submit so the check file does not land on the target.
 
 The command prints a task ID. Substitute it for `<task-id>` below:
 
@@ -156,7 +158,7 @@ verify_merge = "never"
 The target is a short branch name on this project's own canonical origin, not another remote or a full ref. It must exist, and the task's committed base must be reachable from it. There is no implicit `main` or laptop-wide enabling default. Submit overrides, then batch defaults, then project settings determine the target and verification policy. `--no-integrate` or task `integrate = false` disables inherited integration.
 
 <!-- Part 2: reconcile T6 lifecycle and notification wiring. -->
-Submit a task or batch normally. After the final ordinary Done result is imported and its runner retires, integration adds one merge commit per task to the target, with the old target first and the task result second. A result already reachable from the target needs no new merge. The notifier reports `Task integrated into main`; no accept action is needed. Requested `--close-on done` closes after integration and result import, while `never` keeps the workspace and session Open for later `say`.
+Submit a task or batch normally. After the final ordinary Done result is imported and its runner retires, integration adds one merge commit per task to the target, with the old target first and the task result second. A result already reachable from the target needs no new merge. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. No accept action is needed. Requested `--close-on done` closes after integration and result import, while `never` keeps the workspace and session Open for later `say`.
 
 Conflicts use the same worker, agent and session to repair the merge. Verification defaults to `never`. Opt in with `--verify-merge moved-target` when you want an agent to check a changed clean combination after target movement. Resolve and verify turns consume `max_followups`. A source that reported checks requires a nonempty all-pass report from recovery; a source with no checks allows an empty recovery report. Any `fail` or `error` blocks integration. The host does not run project checks.
 
@@ -167,7 +169,7 @@ Use `status`, `result`, `list --json`, or the dashboard to see `integration` and
 `worker controller drain` pauses new integration phases and auxiliary admissions; admitted steps and running turns finish before parking. Resume with `worker controller drain --off`. Disable closes the gate before unloading the controller; helper rollback also parks integration. Restore compatible support, re-enable the controller if needed, and explicitly undrain to resume retained Open work.
 
 <!-- Part 2: reconcile T6 legacy retention settlement. -->
-rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
 <!-- Part 2: reconcile T6 legacy retention settlement. -->
 GC counts seven idle days since the last host-status update, not since rollback; an already-idle task can expire sooner. Non-discard retention close keeps result refs but removes the workspace. Restore observes uncertain pushes first and can settle a reachable merge or source result while keeping the task Closed; it cannot reopen, recreate the workspace, push again, or admit a repair turn.
