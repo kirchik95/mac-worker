@@ -349,6 +349,21 @@ fn import_round_trip(agent: SessionAgent) {
         .session(&project, task)
         .unwrap();
     assert_eq!(binding.unwrap().session_ref(), imported.as_str());
+    let context =
+        mac_worker::test_support::task::project::ProjectInspector::new(&SystemProcessRunner)
+            .inspect(fixture.project.root())
+            .unwrap();
+    let transfer = mac_worker::test_support::transfer::repo::TransferRepo::open_or_create(
+        &fixture.laptop.join(".cache/mac-worker"),
+        &context.common_dir,
+    )
+    .unwrap();
+    for prefix in ["refs/mac-worker/bases/", "refs/mac-worker/sessions/"] {
+        assert!(
+            !transfer.has_ref(&format!("{prefix}{task}")),
+            "completed direct turn leaked {prefix}"
+        );
+    }
 }
 
 #[test]
@@ -419,6 +434,62 @@ fn codex_controller_submit_streams_places_and_resumes_native_session() {
         report["session_import"]["package_oid"].as_str().unwrap()
     );
     assert_eq!(fs::read(source).unwrap(), original);
+    let context =
+        mac_worker::test_support::task::project::ProjectInspector::new(&SystemProcessRunner)
+            .inspect(fixture.project.root())
+            .unwrap();
+    let git_path =
+        mac_worker::test_support::transfer::repo::TransferRepo::controller_transfer_git_path(
+            &controller.controller_xdg_cache.join("mac-worker"),
+            &context.project_id,
+            &context.worktree_id,
+        )
+        .unwrap();
+    assert!(git_path.is_dir());
+    for prefix in ["refs/mac-worker/bases/", "refs/mac-worker/sessions/"] {
+        let result = Command::new("/usr/bin/git")
+            .env_clear()
+            .args([
+                "--git-dir",
+                git_path.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                &format!("{prefix}{task}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "completed controller turn leaked {prefix}"
+        );
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(
+        &fs::read(controller.envelope_paths().into_iter().next().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let request_pin = format!(
+        "refs/mac-worker/request-sessions/{}",
+        envelope["request_id"].as_str().unwrap()
+    );
+    let result = Command::new("/usr/bin/git")
+        .env_clear()
+        .args([
+            "--git-dir",
+            git_path.to_str().unwrap(),
+            "rev-parse",
+            "--verify",
+            &request_pin,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "request package pin must remain replayable"
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap().trim(),
+        report["session_import"]["package_oid"].as_str().unwrap()
+    );
     leader.terminate_and_reap();
 }
 
