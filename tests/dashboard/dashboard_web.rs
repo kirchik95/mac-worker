@@ -955,8 +955,12 @@ fn fixture_detail() -> TaskDetailProjection {
         ended_at_millis: Some(2_000),
     };
     TaskDetailProjection {
+        integration: None,
+        workflow_state: None,
         questions_policy: mac_worker::test_support::task::model::QuestionsPolicy::Ask,
         task: TaskListRow {
+            integration: None,
+            workflow_state: None,
             task_id,
             run_id: Some(run_id),
             run_position: Some(1),
