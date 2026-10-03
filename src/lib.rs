@@ -653,7 +653,10 @@ pub(crate) fn run_with_stdio_in_context(
             stderr,
         );
     }
-    if matches!(&cli.command, Command::Task { .. } | Command::Runner { .. }) {
+    if matches!(
+        &cli.command,
+        Command::Task { .. } | Command::Runner { .. } | Command::IntegrationRunner { .. }
+    ) {
         return run_task_command(cli, runner, runtime, stdout, stderr);
     }
     if let Command::Controller { command } = cli.command {
@@ -1023,6 +1026,17 @@ fn run_controller_command(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    let diagnostics = crate::controller::drain::OperatorRunner::new(runner);
+    let runner = if matches!(
+        &command,
+        ControllerCommand::Disable { .. }
+            | ControllerCommand::Drain { .. }
+            | ControllerCommand::Status
+    ) {
+        &diagnostics as &dyn ProcessRunner
+    } else {
+        runner
+    };
     let result = (|| -> Result<(), WorkerError> {
         let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
@@ -1260,11 +1274,13 @@ fn run_controller_command(
                     Some(!off),
                 )?
             } else {
-                crate::controller::drain::set_drained_with_event_sink(
+                if let Some(warning) = crate::controller::drain::set_drained_with_warning(
                     &paths.controller_state_root(),
                     !off,
                     _events.as_ref().map(ControllerEventPublisher::sink),
-                )?;
+                )? {
+                    diagnostics.record(warning);
+                }
                 !off
             };
             if json {
@@ -1313,6 +1329,19 @@ fn run_controller_command(
                     crate::controller::drain::is_drained(&paths.controller_state_root()),
                 )
             };
+            let integration_pause = if let Some(controller) = config
+                .as_ref()
+                .map(|c| &c.controller)
+                .filter(|c| !c.ssh.is_empty())
+            {
+                crate::controller::control::integration_pause_via_controller(runner, controller)
+                    .ok()
+                    .flatten()
+            } else {
+                crate::controller::drain::integration_pause(&paths.controller_state_root())
+                    .ok()
+                    .flatten()
+            };
             if json {
                 let mut value = serde_json::to_value(&status).map_err(std::io::Error::other)?;
                 value["service"] = match &service {
@@ -1324,6 +1353,12 @@ fn run_controller_command(
                     .map_or(serde_json::Value::Null, |flag| serde_json::json!(flag));
                 if let Err(error) = &drained {
                     value["drain_error_code"] = serde_json::json!(error.public_code());
+                }
+                // This CLI object already adds service/drained to health and
+                // has no strict decoder. The strict health/drain DTOs stay intact.
+                if let Some(pause) = integration_pause {
+                    value["integration_pause"] =
+                        serde_json::to_value(pause).map_err(std::io::Error::other)?;
                 }
                 serde_json::to_writer(&mut *stdout, &value).map_err(std::io::Error::other)?;
                 writeln!(stdout)?;
@@ -1360,6 +1395,17 @@ fn run_controller_command(
                     Ok(flag) => writeln!(stdout, "drained: {flag}")?,
                     Err(error) => writeln!(stdout, "drained: unknown [{}]", error.public_code())?,
                 };
+                if let Some(pause) = integration_pause {
+                    let reason = match pause.reason {
+                        crate::integration::contracts::IntegrationPauseReason::ControllerDisabled => "controller_disabled",
+                        _ => "controller_drained",
+                    };
+                    writeln!(
+                        stdout,
+                        "integration: paused ({reason}) since {}; resume with: worker controller drain --off",
+                        pause.effective_at_millis
+                    )?;
+                }
             }
             stdout.flush()?;
             return Ok(());
@@ -1522,6 +1568,7 @@ fn run_controller_command(
         Ok(())
     })();
 
+    diagnostics.emit(stderr);
     match result {
         Ok(()) => 0,
         Err(error) => {
@@ -1561,6 +1608,7 @@ fn run_host_controller_rpc(
             stdout,
             crate::controller::ControllerFault::None,
             crate::controller::RpcExecution {
+                integration_features: None,
                 executor,
                 home: runtime.home(),
             },
@@ -1646,7 +1694,7 @@ fn run_task_command(
             }
             return Ok(if report.has_config_errors() { 1 } else { 0 });
         }
-        if config.controller.enabled {
+        if config.controller.enabled && matches!(&cli.command, Command::Task { .. }) {
             return run_enabled_controller_task(
                 cli.command,
                 runner,
@@ -1681,6 +1729,19 @@ fn run_task_command(
             .with_json_events(json);
 
         match command {
+            Command::IntegrationRunner { task_id } => {
+                let snapshot = crate::integration::runner::run_native_child(
+                    runner,
+                    &config,
+                    &paths,
+                    &client_state,
+                    task_id,
+                )?;
+                if json {
+                    write_json_line(stdout, &snapshot)?;
+                }
+                Ok(0)
+            }
             Command::Runner {
                 task_id,
                 turn_id,
@@ -1984,8 +2045,10 @@ fn run_task_subcommand(
             write_wait_report(&report, json, stdout)?;
             Ok(report.exit_code())
         }
-        TaskCommand::Integrate { .. } => {
-            Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error())
+        TaskCommand::Integrate { task_id } => {
+            let snapshot = client.integrate(task_id)?;
+            write_integration_redrive(task_id, &snapshot, json, stdout)?;
+            Ok(0)
         }
         TaskCommand::Reconcile => {
             let report = client.operator_reconcile()?;
@@ -2013,6 +2076,28 @@ fn run_task_subcommand(
             }
             Ok(0)
         }
+    }
+}
+
+fn write_integration_redrive(
+    task_id: crate::task::TaskId,
+    snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({"protocol_version": PROTOCOL_VERSION, "task_id": task_id, "integration": snapshot}),
+        )
+    } else {
+        writeln!(
+            stdout,
+            "task {task_id}: integration epoch {} {:?}",
+            snapshot.epoch, snapshot.state
+        )?;
+        stdout.flush()?;
+        Ok(())
     }
 }
 
@@ -2358,6 +2443,7 @@ fn write_task_report_with_interrupt(
         if let Some(summary) = &report.session_submission {
             response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?;
         }
+        insert_integration_view(&mut response, report.integration_view());
         write_json_line(stdout, &response)
     } else {
         if let Some(summary) = &report.session_submission {
@@ -2378,6 +2464,9 @@ fn write_task_report_with_interrupt(
             task_state_name(report.status().state())
         )?;
         write_turn_diagnostics(stdout, report.status())?;
+        if let Some(view) = report.integration_view() {
+            write_integration_line(stdout, view.integration.as_ref())?;
+        }
         writeln!(
             stdout,
             "questions policy: {}",
@@ -2490,9 +2579,69 @@ pub(crate) fn write_task_list_report(
                 writeln!(stdout, "{line}")?;
             }
         }
+        for task in report.tasks() {
+            write_integration_line(stdout, task.integration.as_ref())?;
+        }
         stdout.flush()?;
         Ok(())
     }
+}
+
+fn insert_integration_view(
+    value: &mut serde_json::Value,
+    view: Option<&crate::integration::contracts::IntegrationView>,
+) {
+    if let Some(view) = view {
+        if let Some(snapshot) = &view.integration {
+            value["integration"] = serde_json::json!(snapshot);
+        }
+        if let Some(workflow) = view.workflow_state {
+            value["workflow_state"] = serde_json::json!(workflow);
+        }
+        value["requested_close"] = serde_json::json!(view.requested_close);
+        value["review_state"] = serde_json::json!(view.review_state);
+    }
+}
+fn write_integration_line(
+    stdout: &mut dyn Write,
+    snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+) -> Result<(), WorkerError> {
+    if let Some(snapshot) = snapshot {
+        let state = serde_json::to_value(snapshot.state).map_err(io::Error::other)?;
+        write!(
+            stdout,
+            "integration: {} target={} attempts={}",
+            state.as_str().unwrap_or("unavailable"),
+            snapshot.target,
+            snapshot.attempts
+        )?;
+        if let Some(code) = snapshot.blocked_code {
+            write!(stdout, " code={}", code.as_str())?;
+        }
+        if let Some(reason) = snapshot.pause_reason {
+            let reason = serde_json::to_value(reason).map_err(io::Error::other)?;
+            write!(
+                stdout,
+                " reason={}",
+                reason.as_str().unwrap_or("unavailable")
+            )?;
+        }
+        if let Some(resume) = snapshot.resume_state {
+            let resume = serde_json::to_value(resume).map_err(io::Error::other)?;
+            write!(
+                stdout,
+                " resume={}",
+                resume.as_str().unwrap_or("unavailable")
+            )?;
+        }
+        if let Some(merge) = &snapshot.merge_oid {
+            write!(stdout, " merge={merge}")?;
+        } else if let Some(target) = &snapshot.observed_target_oid {
+            write!(stdout, " observed={target}")?;
+        }
+        writeln!(stdout)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_task_result_report(
@@ -2524,6 +2673,7 @@ pub(crate) fn write_task_result_report(
         if !report.warnings().is_empty() {
             value["warnings"] = serde_json::json!(report.warnings());
         }
+        insert_integration_view(&mut value, report.integration_view());
         write_json_line(stdout, &value)
     } else {
         writeln!(
@@ -2533,6 +2683,9 @@ pub(crate) fn write_task_result_report(
             task_state_name(report.status().state())
         )?;
         write_turn_diagnostics(stdout, report.status())?;
+        if let Some(view) = report.integration_view() {
+            write_integration_line(stdout, view.integration.as_ref())?;
+        }
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
         }
@@ -2833,6 +2986,43 @@ fn run_command_with_stdio_in_context(
         }
     ) {
         return run_host_task_prepare(cli.config, runtime, runner, stdin, stdout);
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskIntegration
+        }
+    ) {
+        return run_host_task_control_endpoint(
+            cli.config,
+            runtime,
+            runner,
+            stdin,
+            stdout,
+            |request: crate::integration::contracts::HostIntegrationRequest, store, runner| {
+                let native = crate::integration::host::HostIntegrationRuntime::new()?;
+                crate::integration::host::HostIntegrationService::new(store, runner, &native)
+                    .execute(&request)
+            },
+        );
+    }
+    if matches!(
+        &cli.command,
+        Command::Host {
+            command: HostCommand::TaskIntegrationTurn
+        }
+    ) {
+        return run_host_control_endpoint(
+            cli.config,
+            runtime,
+            stdin,
+            stdout,
+            |request: crate::integration::remote::IntegrationTurnRequest, store, launcher| {
+                crate::integration::contracts::ValidateIntegration::validate(&request)?;
+                JobService::new(store, launcher)
+                    .submit_integration_turn(&request.prepared, request.request)
+            },
+        );
     }
     if matches!(
         &cli.command,
@@ -5180,8 +5370,26 @@ fn run_enabled_controller_task(
             Ok(report.exit_code())
         }
         Command::Task {
-            command: TaskCommand::Integrate { .. },
-        } => Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error()),
+            command: TaskCommand::Integrate { task_id },
+        } => {
+            require_controller_integration_peer(runner, config)?;
+            let selector = controller_read_request("task.list", serde_json::json!({"integration": {"task_ids": [task_id]}}))?;
+            let reply = crate::controller::send_controller_read::<crate::integration::contracts::IntegrationReadResult>(runner, &config.controller, &selector)?;
+            let facts = reply.into_result();
+            crate::integration::contracts::ValidateIntegration::validate(&facts)?;
+            if facts.integrations.len() != 1 {
+                return Err(crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error());
+            }
+            let snapshot = facts.integrations.get(&task_id).and_then(Option::as_ref)
+                .ok_or_else(crate::integration::contracts::integration_unavailable)?;
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            let request = crate::controller::parse_request(&serde_json::to_vec(&serde_json::json!({"protocol_version": PROTOCOL_VERSION, "request_id": request_id, "command": "task.integrate", "body": {"task_id": task_id, "expected": snapshot.revision, "request_id": request_id}})).map_err(|_| crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error())?)?;
+            let ack = crate::controller::send_controller_mutation(runner, &config.controller, &paths.controller_cache_root(), &request, stderr)?;
+            let snapshot: crate::integration::contracts::IntegrationSnapshot = serde_json::from_value(ack.result().cloned().ok_or_else(crate::integration::contracts::integration_unavailable)?).map_err(|_| crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error())?;
+            crate::integration::contracts::ValidateIntegration::validate(&snapshot)?;
+            write_integration_redrive(task_id, &snapshot, json, stdout)?;
+            Ok(0)
+        }
         Command::Task {
             command: TaskCommand::Reconcile,
         } => {
@@ -5225,6 +5433,11 @@ fn run_enabled_controller_task(
                 unreachable!("batch --preview is handled before enabled controller routing");
             }
             let project = runtime.current_dir()?;
+            let settings = crate::project_state::ProjectState::load(runner, &project, &[])?.settings.task;
+            let batch = crate::task_client::load_batch_file(&file)?;
+            if crate::integration::config::batch_is_integrating(&settings, &batch)? {
+                require_controller_integration_peer(runner, config)?;
+            }
             let frozen = crate::controller::freeze_laptop_batch(
                 runner,
                 config,
@@ -5234,12 +5447,7 @@ fn run_enabled_controller_task(
                 name,
                 max_parallel,
             )?;
-            let body = serde_json::to_value(frozen.body()).map_err(|_| {
-                WorkerError::Protocol(
-                    "CONTROLLER_TRANSPORT: frozen batch could not be encoded".into(),
-                )
-            })?;
-            let request = controller_read_request("task.batch", body)?;
+            let request = controller_read_request(frozen.command(), frozen.operation_body()?)?;
             crate::controller::persist_operation_envelope(
                 &paths.controller_cache_root(),
                 &request,
@@ -5456,6 +5664,17 @@ struct ControllerSubmitFields {
     wait_for_capacity: bool,
 }
 
+fn require_controller_integration_peer(
+    runner: &dyn ProcessRunner,
+    config: &Config,
+) -> Result<(), WorkerError> {
+    let health =
+        crate::controller::health_read::fetch_controller_health(runner, &config.controller);
+    crate::controller::integration::require_controller_integration(
+        &health.features.unwrap_or_default(),
+    )
+}
+
 fn freeze_and_submit_via_controller(
     runner: &dyn ProcessRunner,
     paths: &PathLayout,
@@ -5494,12 +5713,24 @@ fn freeze_and_submit_via_controller(
         wait_for_capacity,
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
-    crate::integration::config::reject_unrouted_settings(
+    let integrating = crate::integration::config::resolve_integration_settings(
         &(&probed.settings.task).into(),
+        None,
         &integrate,
         verify_merge,
-        wip,
     )?;
+    if integrating.is_some() {
+        if wip {
+            return Err(crate::integration::contracts::IntegrationCode::IntegrationWipBase.error());
+        }
+        if probed.origin.is_none() {
+            return Err(WorkerError::task(
+                "INVALID_ORIGIN",
+                "integration requires own origin",
+            ));
+        }
+        require_controller_integration_peer(runner, config)?;
+    }
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
     let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
     if let Some(selector) = &from_session {
@@ -5538,6 +5769,15 @@ fn freeze_and_submit_via_controller(
     } else {
         transfer.resolve_base(runner, &probed.context, &base)?
     };
+    let integration = crate::integration::config::freeze_source_policy(
+        runner,
+        &probed,
+        &integrate,
+        verify_merge,
+        close_on,
+        integrating.map(|_| captured.oid().clone()),
+        None,
+    )?;
     let agent_name = match agent {
         crate::agent::AgentKind::Codex => "codex",
         crate::agent::AgentKind::Claude => "claude",
@@ -5627,11 +5867,24 @@ fn freeze_and_submit_via_controller(
         branch: probed.context.branch.clone(),
         wait_for_capacity,
     };
+    let (command, operation_body) = match integration {
+        Some(policy) => (
+            "task.submit-integrating",
+            serde_json::to_value(crate::controller::integration::prepare_integrating_submit(
+                body.clone(),
+                policy,
+            )?),
+        ),
+        None => ("task.submit", serde_json::to_value(&body)),
+    };
+    let operation_body = operation_body.map_err(|_| {
+        WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
+    })?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
-        "command": "task.submit",
-        "body": body,
+        "command": command,
+        "body": operation_body,
     }))
     .map_err(|_| {
         WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
@@ -5685,13 +5938,13 @@ struct ControllerSubmitPinRetirement {
 const SUBMIT_PIN_RETIREMENTS: &str = "submit-pin-retirements";
 const MAX_SUBMIT_PIN_RETIREMENT_BYTES: u64 = 16 * 1024;
 
-fn record_controller_submit_pins(
+pub(crate) fn record_controller_submit_pins(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
     transfer: &crate::transfer_repo::TransferRepo,
 ) -> Result<(), WorkerError> {
-    let body: crate::prepared_submit::FrozenSubmitBody =
-        serde_json::from_value(request.body().clone()).map_err(io::Error::other)?;
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
     let marker = ControllerSubmitPinRetirement {
         request_id: request.request_id().to_owned(),
         payload_sha256: request.payload_sha256().to_owned(),
@@ -5717,7 +5970,7 @@ pub(crate) fn acknowledge_controller_submit_pins(
     cache_root: &Path,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
-    if request.command() != "task.submit" {
+    if !matches!(request.command(), "task.submit" | "task.submit-integrating") {
         return Ok(());
     }
     let root = match crate::rooted_fs::RootedDir::open(&cache_root.join(SUBMIT_PIN_RETIREMENTS)) {
@@ -5734,13 +5987,9 @@ pub(crate) fn acknowledge_controller_submit_pins(
         Err(error) => return Err(error.into()),
     };
     let mut marker = decode_controller_submit_pins(&name, &bytes)?;
-    if marker.payload_sha256 != request.payload_sha256()
-        || request
-            .body()
-            .get("task_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(marker.task_id.to_string().as_str())
-    {
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
+    if marker.payload_sha256 != request.payload_sha256() || body.task_id != marker.task_id {
         return Err(WorkerError::task(
             "CONTROLLER_REQUEST_CONFLICT",
             "submit pin retirement does not match the frozen request",
@@ -5788,7 +6037,7 @@ fn decode_controller_submit_pins(
     Ok(marker)
 }
 
-fn reconcile_controller_submit_pins(
+pub(crate) fn reconcile_controller_submit_pins(
     paths: &PathLayout,
     runner: &dyn ProcessRunner,
     stderr: &mut dyn Write,
@@ -5849,7 +6098,7 @@ fn reconcile_controller_submit_pins(
 
 // W7 records source-finish on the controller, not in the laptop envelope.
 // Keep a private digest-bound foreground receipt only after W7 verifies finish.
-fn record_session_source_finished(
+pub(crate) fn record_session_source_finished(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
@@ -5874,16 +6123,16 @@ fn record_session_source_finished(
     }
 }
 
-fn require_session_source_finished(
+pub(crate) fn require_session_source_finished(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
-    if request.command() != "task.submit"
-        || request
-            .body()
-            .get("session_import")
-            .is_none_or(serde_json::Value::is_null)
-    {
+    if !matches!(request.command(), "task.submit" | "task.submit-integrating") {
+        return Ok(());
+    }
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
+    if body.session_import.is_none() {
         return Ok(());
     }
     let finished = (|| -> io::Result<bool> {
@@ -6494,9 +6743,11 @@ fn controller_task_result(
     // Status already carries warnings in the legacy protocol. Fetch it only
     // for result rendering, after the result reply's identity was verified.
     let status = controller_task_status(runner, config, task_id)?;
-    Ok(reply
+    let mut report = reply
         .into_result()
-        .into_report_with_warnings(status.warnings().to_vec()))
+        .into_report_with_warnings(status.warnings().to_vec());
+    report.integration_view = status.integration_view().cloned();
+    Ok(report)
 }
 
 fn write_error(stderr: &mut dyn Write, error: &WorkerError) {

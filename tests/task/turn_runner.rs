@@ -1617,6 +1617,98 @@ fn successful_submission_reports_the_handed_off_runner() {
 }
 
 #[test]
+fn successful_ordinary_terminal_survives_native_integration_recovery_failure() {
+    use mac_worker::test_support::integration::*;
+    struct ArmedRunner<'a>(&'a AcceptedThenTerminalRunner);
+    impl ProcessRunner for ArmedRunner<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request
+                .args
+                .last()
+                .is_some_and(|arg| arg.to_string_lossy().ends_with(" host task-integration"))
+            {
+                let arm: HostIntegrationRequest = decode_request(request)?;
+                assert!(matches!(arm.action, HostIntegrationAction::Arm { .. }));
+                return canonical_process(&HostIntegrationResponse::Progress {
+                    identity: IntegrationResponseIdentity::for_request(&arm),
+                    snapshot: None,
+                });
+            }
+            let result = self.0.run(request)?;
+            if request
+                .args
+                .last()
+                .is_some_and(|arg| arg == HostOperation::TaskStatus.command())
+            {
+                let response: TaskStatusResponse = serde_json::from_slice(&result.stdout).unwrap();
+                if response.status().state() == TaskState::Closed {
+                    // This fixture normally reports Closed on Done; integration
+                    // with Never retains the imported source as Open.
+                    let mut status = serde_json::to_value(response.status()).unwrap();
+                    status["state"] = serde_json::json!("open");
+                    return canonical_process(&TaskStatusResponse::new(
+                        serde_json::from_value(status).unwrap(),
+                    ));
+                }
+            }
+            Ok(result)
+        }
+    }
+    let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+    let fixture = AcceptedThenTerminalFixture::new();
+    let ordinary = fixture.state.load_task(fixture.task_id).unwrap();
+    let state = RootedIntegrationState::open(
+        &fixture.paths,
+        Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut policy = sample_policy("main");
+    policy.project_id = ordinary.meta().project_id().into();
+    policy.base_oid = Some(ordinary.meta().base_oid().clone());
+    state.publish_policy(fixture.task_id, &policy).unwrap();
+    // Optional integration admission fails only after the ordinary turn has
+    // imported its result and retired its runner, prompt and queue row.
+    mac_worker::test_support::controller::ControllerStore::open(
+        &fixture.paths.controller_state_root(),
+    )
+    .unwrap();
+    let gate = fixture
+        .paths
+        .controller_state_root()
+        .join("integration-gate.json");
+    fs::write(&gate, b"invalid integration gate").unwrap();
+    fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+    let report = TurnRunner::new(
+        &ArmedRunner(&fixture.runner),
+        &fixture.config,
+        &fixture.paths,
+        &fixture.state,
+        &fixture.executor,
+    )
+    .run(fixture.task_id, fixture.turn_id, None);
+    let finished = fixture.state.load_task(fixture.task_id).unwrap();
+    assert_eq!(finished.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(finished.status().state(), TaskState::Open);
+    assert_eq!(finished.fetched_head(), finished.status().head_oid());
+    assert!(finished.runner().is_none());
+    assert!(
+        fixture
+            .state
+            .queue_entry(fixture.turn_id)
+            .unwrap()
+            .is_none()
+    );
+    let report = report.expect("integration recovery replaced an imported ordinary success");
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.status().last_outcome(), Some(&TaskOutcome::Done));
+    // Recovery remains retryable: no integration success/stop is fabricated.
+    let integration = state.load(fixture.task_id).unwrap().unwrap();
+    assert_ne!(integration.snapshot.state, IntegrationStatus::Integrated);
+    assert!(integration.receipt.is_none());
+    assert!(integration.tombstone.is_none());
+}
+
+#[test]
 fn questions_submit_resolves_flag_over_project_over_default() {
     use mac_worker::test_support::task::model::QuestionsPolicy::{Ask, Decide};
     let _cwd_lock = CURRENT_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());

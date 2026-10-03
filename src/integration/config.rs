@@ -161,34 +161,17 @@ pub fn batch_integration_preview(
     })
 }
 
-/// Temporary fail-closed boundary until T6 routes enabled inputs to wrappers.
-/// Ordinary submission must never parse opt-in and then silently ignore it.
-pub(crate) fn reject_unrouted_integration(
+pub(crate) fn batch_is_integrating(
     settings: &crate::project_config::TaskSettings,
-    request: &crate::task_client::TaskSubmitRequest,
-) -> Result<(), WorkerError> {
-    reject_unrouted_settings(
-        &settings.into(),
-        &request.integrate,
-        request.verify_merge,
-        request.wip,
-    )
+    batch: &crate::task_client::BatchFile,
+) -> Result<bool, WorkerError> {
+    let mut enabled = false;
+    for task in &batch.tasks {
+        enabled |= batch_integration_preview(settings, &batch.defaults, task)?.is_some();
+    }
+    Ok(enabled)
 }
 
-pub(crate) fn reject_unrouted_settings(
-    settings: &IntegrationPolicySettings,
-    integrate: &IntegrationOverride,
-    verify: Option<VerifyPolicy>,
-    wip: bool,
-) -> Result<(), WorkerError> {
-    if resolve_integration_settings(settings, None, integrate, verify)?.is_some() {
-        if wip {
-            return Err(IntegrationCode::IntegrationWipBase.error());
-        }
-        return Err(IntegrationCode::IntegrationUnavailable.error());
-    }
-    Ok(())
-}
 pub fn preflight_integration_base(
     runner: &dyn ProcessRunner,
     origin: &str,
@@ -278,11 +261,94 @@ pub fn preflight_integration_base(
     }
 }
 
+/// Freeze the project's explicit policy against the already captured source.
+/// From-task ancestry is bound by its parent's imported receipt on the owner.
+pub(crate) fn freeze_source_policy(
+    runner: &dyn ProcessRunner,
+    project: &crate::project_state::ProjectState,
+    integrate: &IntegrationOverride,
+    verify: Option<VerifyPolicy>,
+    requested_close: ClosePolicy,
+    base_oid: Option<BaseOid>,
+    base_task: Option<TaskId>,
+) -> Result<Option<FrozenIntegrationPolicy>, WorkerError> {
+    let policy = resolve_integration_policy(
+        &IntegrationProjectPolicy {
+            settings: (&project.settings.task).into(),
+            project_id: project.context.project_id.clone(),
+            base_oid,
+            base_task,
+        },
+        None,
+        integrate,
+        verify,
+        requested_close,
+        project.origin.as_deref().unwrap_or(""),
+        if base_task.is_some() {
+            IntegrationBaseKind::FromTask
+        } else {
+            IntegrationBaseKind::Committed
+        },
+    )?;
+    let Some(mut policy) = policy else {
+        return Ok(None);
+    };
+    if base_task.is_none() {
+        let repo = RootedDir::open_anchored_absolute(&project.context.root)?;
+        policy.base_preflight = preflight_integration_base(
+            runner,
+            &policy.origin,
+            &policy.target,
+            policy.base_oid.as_ref(),
+            &repo,
+        )?;
+    }
+    Ok(Some(policy))
+}
+
+/// From-parent policy compatibility is known before any source pin or fetch.
+pub(crate) fn validate_batch_policy_inputs(
+    settings: &crate::project_config::TaskSettings,
+    batch: &crate::task_client::BatchFile,
+) -> Result<(), WorkerError> {
+    let mut targets = std::collections::BTreeMap::new();
+    for task in &batch.tasks {
+        let inputs = batch_integration_inputs(settings, &batch.defaults, task)?;
+        let resolved = resolve_integration_settings(
+            &settings.into(),
+            None,
+            &inputs.integrate,
+            inputs.verify_merge,
+        )?;
+        if let Some(id) = &task.id {
+            targets.insert(id.as_str(), resolved.map(|(branch, _)| branch));
+        }
+    }
+    for task in &batch.tasks {
+        let Some(parent) =
+            crate::dag::parse_from_base(task.base.as_deref().unwrap_or(&batch.defaults.base))
+        else {
+            continue;
+        };
+        let inputs = batch_integration_inputs(settings, &batch.defaults, task)?;
+        if let Some((target, _)) = resolve_integration_settings(
+            &settings.into(),
+            None,
+            &inputs.integrate,
+            inputs.verify_merge,
+        )? && targets.get(parent).and_then(Option::as_ref) != Some(&target)
+        {
+            return Err(integration_error("TASK_CONFIG_INVALID"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn batch_inputs_survive_resolution_and_refuse_unrouted_enabled_submits() {
+    fn batch_inputs_survive_resolution_including_disabled_override() {
         let root = tempfile::tempdir().unwrap();
         let settings = crate::project_config::ProjectSettings::load(root.path(), &[])
             .unwrap()
@@ -300,15 +366,28 @@ mod tests {
             if index == 0 {
                 assert!(matches!(request.integrate, IntegrationOverride::Target(_)));
                 assert_eq!(request.verify_merge, Some(VerifyPolicy::MovedTarget));
-                assert_eq!(
-                    reject_unrouted_integration(&settings, &request)
-                        .unwrap_err()
-                        .public_code(),
-                    "INTEGRATION_UNAVAILABLE"
-                );
+                let (target, verify) = resolve_integration_settings(
+                    &(&settings).into(),
+                    None,
+                    &request.integrate,
+                    request.verify_merge,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(target.as_str(), "main");
+                assert_eq!(verify, VerifyPolicy::MovedTarget);
             } else {
                 assert_eq!(request.integrate, IntegrationOverride::Disabled);
-                assert!(reject_unrouted_integration(&settings, &request).is_ok());
+                assert!(
+                    resolve_integration_settings(
+                        &(&settings).into(),
+                        None,
+                        &request.integrate,
+                        request.verify_merge
+                    )
+                    .unwrap()
+                    .is_none()
+                );
             }
         }
     }

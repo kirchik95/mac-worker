@@ -32,6 +32,49 @@ struct DrainResult {
     drained: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationPauseResult {
+    integration_pause: Option<crate::integration::contracts::IntegrationPauseEvidence>,
+}
+impl ControllerReadIdentity for IntegrationPauseResult {
+    fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
+        if !is_pause_read(request)
+            || self.integration_pause.is_some_and(|pause| {
+                !matches!(
+                    pause.reason,
+                    crate::integration::contracts::IntegrationPauseReason::ControllerDrained
+                        | crate::integration::contracts::IntegrationPauseReason::ControllerDisabled
+                )
+            })
+        {
+            return Err(invalid_controller_reply());
+        }
+        Ok(())
+    }
+}
+
+fn is_pause_read(request: &ControllerRequest) -> bool {
+    request.command() == "controller.drain"
+        && request.body() == &serde_json::json!({"integration_pause": true})
+}
+
+pub(crate) fn integration_pause_via_controller(
+    runner: &dyn ProcessRunner,
+    controller: &ControllerConfig,
+) -> Result<Option<crate::integration::contracts::IntegrationPauseEvidence>, WorkerError> {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION, "request_id": uuid::Uuid::new_v4().simple().to_string(),
+        "command": "controller.drain", "body": {"integration_pause": true},
+    })).map_err(|_| invalid_request())?;
+    let request = parse_request(&payload)?;
+    Ok(
+        send_controller_read::<IntegrationPauseResult>(runner, controller, &request)?
+            .into_result()
+            .integration_pause,
+    )
+}
+
 impl ControllerReadIdentity for DrainResult {
     fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
         let body = parse_body(request).map_err(|_| invalid_controller_reply())?;
@@ -72,6 +115,14 @@ pub(crate) fn serve_drain(
     state_root: &Path,
     sink: Option<std::sync::Arc<dyn super::events::EventSink>>,
 ) -> Result<Vec<u8>, WorkerError> {
+    if is_pause_read(request) {
+        return encode_json_frame(&ControllerReadReply::from_request(
+            request,
+            IntegrationPauseResult {
+                integration_pause: drain::integration_pause(state_root)?,
+            },
+        ));
+    }
     let body = parse_body(request)?;
     let drained = match body.drained {
         Some(drained) => {

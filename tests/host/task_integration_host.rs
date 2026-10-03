@@ -27,24 +27,71 @@ fn execute(
     HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime).execute(request)
 }
 fn legacy_close(f: &GitIntegrationFixture) {
-    let task = f
-        .store
-        .task_dir(&f.record.policy.project_id, f.record.task_id)
+    use mac_worker::test_support::host::{gc::apply_baseline_retention_close, lease::LeaseService};
+    let project = &f.record.policy.project_id;
+    let task = f.record.task_id;
+    let before = f.store.task_status(project, task).unwrap();
+    assert_eq!(before.state(), TaskState::Open);
+    assert!(
+        !LeaseService::new(&f.store)
+            .task_scope_is_live(project, task)
+            .unwrap()
+    );
+    let mirror = f.store.mirror_if_present(project).unwrap().unwrap();
+    let refs = integration_git(
+        mirror.path(),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/task",
+            "refs/mac-worker/bases",
+        ],
+    );
+    let expiry = before.updated_at_millis() + TASK_RETENTION_MILLIS;
+    assert!(
+        !apply_baseline_retention_close(&f.store, &SystemProcessRunner, project, task, expiry - 1)
+            .unwrap()
+    );
+    assert!(f.workspace().exists());
+    assert!(
+        apply_baseline_retention_close(&f.store, &SystemProcessRunner, project, task, expiry + 1)
+            .unwrap()
+    );
+    let after = f.store.task_status(project, task).unwrap();
+    assert_eq!(after.state(), TaskState::Closed);
+    assert_eq!(after.head_oid(), before.head_oid());
+    assert_eq!(after.turns(), before.turns());
+    assert_eq!(after.updated_at_millis(), expiry + 1);
+    assert!(!f.workspace().exists());
+    assert_eq!(
+        integration_git(
+            mirror.path(),
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/task",
+                "refs/mac-worker/bases"
+            ]
+        ),
+        refs
+    );
+}
+
+fn integration_git(path: &std::path::Path, args: &[&str]) -> String {
+    let result = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
         .unwrap();
-    let mut wire = serde_json::to_value(
-        f.store
-            .task_status(&f.record.policy.project_id, f.record.task_id)
-            .unwrap(),
-    )
-    .unwrap();
-    wire["state"] = serde_json::json!("closed");
-    let status: TaskStatus = serde_json::from_value(wire).unwrap();
-    std::fs::write(
-        task.join("status.json"),
-        serde_json::to_vec(&status).unwrap(),
-    )
-    .unwrap();
-    std::fs::remove_dir_all(f.workspace()).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
 }
 
 fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
@@ -52,6 +99,518 @@ fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
         .load(&f.record.policy.project_id, f.record.task_id)
         .unwrap()
         .unwrap()
+}
+
+#[test]
+fn source_retirement_stop_is_durable_before_intent_staging_and_recovery() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::ProjectRegistry,
+        core::{config::Config, error::WorkerError, paths::PathLayout},
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+        task::{client::TaskClient, model::LocalTaskRecord, turn_runner::InlineRunnerExecutor},
+    };
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus, sync::Arc};
+    struct CloseTransport<'a>(&'a TaskStore<'a>);
+    impl ProcessRunner for CloseTransport<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == "/usr/bin/git" {
+                return SystemProcessRunner.run(request);
+            }
+            assert_eq!(request.program, "/usr/bin/ssh");
+            assert_eq!(
+                request.args.last().unwrap(),
+                "~/.local/bin/worker host task-close"
+            );
+            let close = serde_json::from_slice(request.stdin.as_ref().unwrap()).unwrap();
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: serde_json::to_vec(&self.0.close(&close)?).unwrap(),
+                stderr: vec![],
+            })
+        }
+    }
+    for mutation in ["cancel", "close", "discard"] {
+        let mut f = GitIntegrationFixture::new();
+        let original = f.commit_base();
+        let head = f.commit_task();
+        let mut arm = request(
+            &f,
+            HostIntegrationAction::Arm {
+                policy: f.record.policy.clone(),
+            },
+        );
+        arm.integration_id = None;
+        arm.revision = IntegrationRevision(0);
+        execute(&f, &arm).unwrap();
+        let host_tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+        let ordinary = LocalTaskRecord::new(
+            host_tasks
+                .load_meta(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            host_tasks
+                .load_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            Some(1001),
+            None,
+            Some(head),
+            "c".repeat(64),
+            Some("fixture-worker".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config.toml"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        client.create_task(ordinary.clone()).unwrap();
+        let checkout = root.join("checkout");
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .args(["clone", &f.record.policy.origin, checkout.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        ProjectRegistry::open(&paths.controller_state_root())
+            .unwrap()
+            .register(
+                ordinary.meta().project_id(),
+                ordinary.meta().worktree_id(),
+                &checkout,
+            )
+            .unwrap();
+        client
+            .write_task_project_path(&ordinary, &checkout)
+            .unwrap();
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        let turns = FakeIntegrationTurns::default();
+        let observer = FakeIntegrationObserver::default();
+        // Deliberately retain the old finalizer observation even after close.
+        // Staging must be fenced by durable source identity, not a fresh read.
+        observer.insert(IntegrationTaskFacts {
+            ordinary: ordinary.clone(),
+            cycle_base: f.record.cycle_base.clone(),
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        });
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n",
+        )
+        .unwrap();
+        let transport = CloseTransport(&host_tasks);
+        let task_client =
+            TaskClient::new(&transport, &config, &paths, &client, &InlineRunnerExecutor)
+                .with_integration(&owner);
+        assert!(state.load(f.record.task_id).unwrap().is_none());
+        if mutation == "cancel" {
+            task_client.cancel(f.record.task_id).unwrap();
+            assert_eq!(client.load_task(f.record.task_id).unwrap(), ordinary);
+        } else {
+            task_client
+                .close(f.record.task_id, mutation == "discard")
+                .unwrap();
+        }
+        // Reopen the owner before the delayed ordinary finalizer wake.
+        let reopened =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        let owner = IntegrationCoordinator::new(&reopened, &host, &turns, &f.runtime, &observer);
+        owner
+            .on_terminal(f.record.task_id, fixture_source())
+            .unwrap();
+        let after = IntegrationRunner::new(owner).run(f.record.task_id).unwrap();
+        assert_eq!(
+            f.origin_tip(),
+            original,
+            "{mutation} acknowledged before a late cycle pushed"
+        );
+        assert_eq!(after.state, IntegrationStatus::Revoked);
+        let saved = reopened.load(f.record.task_id).unwrap().unwrap();
+        assert!(saved.tombstone.unwrap().acknowledged);
+        assert_eq!(saved.snapshot.source_turn_id, fixture_source());
+    }
+}
+
+#[test]
+fn owner_can_revoke_an_armed_cycle_before_the_first_host_phase_and_fence_late_fetch() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    let source = f.commit_task();
+    let mut arm = request(
+        &f,
+        HostIntegrationAction::Arm {
+            policy: f.record.policy.clone(),
+        },
+    );
+    arm.integration_id = None;
+    arm.revision = IntegrationRevision(0);
+    execute(&f, &arm).unwrap();
+    assert!(
+        HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let state = MemoryIntegrationState::default();
+    state
+        .publish_policy(f.record.task_id, &f.record.policy)
+        .unwrap();
+    state
+        .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+        .unwrap();
+    let turns = FakeIntegrationTurns::default();
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+    let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    assert_eq!(
+        owner
+            .revoke(f.record.task_id, f.record.snapshot.revision)
+            .unwrap()
+            .state,
+        IntegrationStatus::Revoked
+    );
+    assert!(
+        state
+            .load(f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .tombstone
+            .unwrap()
+            .acknowledged
+    );
+    assert_eq!(
+        f.execute(IntegrationStep::Fetch).unwrap_err().public_code(),
+        IntegrationCode::IntegrationStopUnconfirmed.as_str()
+    );
+    assert_eq!(f.origin_tip(), target);
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), source.as_str());
+    assert!(f.git(&["status", "--porcelain=v1"]).is_empty());
+}
+
+#[test]
+fn stale_prephase_revoke_preserves_the_newer_epoch_fence_across_crash_replay() {
+    for crash in [
+        None,
+        Some(IntegrationHook::AfterRevoke),
+        Some(IntegrationHook::BeforeRevokeAck),
+        Some(IntegrationHook::AfterRevokeAck),
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        f.commit_task();
+        let mut arm = request(
+            &f,
+            HostIntegrationAction::Arm {
+                policy: f.record.policy.clone(),
+            },
+        );
+        arm.integration_id = None;
+        arm.revision = IntegrationRevision(0);
+        execute(&f, &arm).unwrap();
+        let revoke = |epoch| HostIntegrationRequest {
+            epoch,
+            ..request(
+                &f,
+                HostIntegrationAction::Revoke {
+                    tombstone: IntegrationTombstone {
+                        epoch,
+                        revision: f.record.snapshot.revision,
+                        requested_at_millis: 1002,
+                        acknowledged: false,
+                    },
+                },
+            )
+        };
+        let old = revoke(0);
+        let newer = revoke(1);
+        assert!(matches!(
+            execute(&f, &old).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        if let Some(hook) = crash {
+            f.runtime.crash_at(hook);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&f, &newer)))
+                    .is_err()
+            );
+            f.runtime.restart();
+        }
+        assert!(matches!(
+            execute(&f, &newer).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        let proof_path = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("integration/revoke.json");
+        let proof = std::fs::read(&proof_path).unwrap();
+        assert!(matches!(
+            execute(&f, &newer).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&proof_path).unwrap(),
+            proof,
+            "identical replay changed its proof"
+        );
+        let stale = execute(&f, &old);
+        assert_eq!(
+            std::fs::read(&proof_path).unwrap(),
+            proof,
+            "stale revoke erased the acknowledged newer fence: {stale:?}"
+        );
+        f.record.snapshot.epoch = 1;
+        assert_eq!(
+            f.execute(IntegrationStep::Prepare)
+                .unwrap_err()
+                .public_code(),
+            IntegrationCode::IntegrationStopUnconfirmed.as_str()
+        );
+        assert_eq!(f.origin_tip(), target);
+    }
+}
+
+#[test]
+fn stale_revoke_cannot_acknowledge_or_rewrite_a_newer_ordinary_turn() {
+    use mac_worker::test_support::{
+        host::job::JobId,
+        task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+    };
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    let revoke = request(
+        &f,
+        HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: f.record.snapshot.epoch,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1002,
+                acknowledged: false,
+            },
+        },
+    );
+    execute(&f, &revoke).unwrap();
+    let task = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    let mut status = serde_json::to_value(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+    )
+    .unwrap();
+    status["turns"].as_array_mut().unwrap().push(
+        serde_json::to_value(TurnSummary::new(
+            2,
+            JobId::new(uuid::Uuid::from_u128(101)),
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(false),
+            false,
+            Some(1003),
+            Some(1004),
+        ))
+        .unwrap(),
+    );
+    let status: TaskStatus = serde_json::from_value(status).unwrap();
+    std::fs::write(
+        task.join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let before = host_record(&f);
+    let mut stale = revoke;
+    stale.revision = stale.revision.next().unwrap();
+    if let HostIntegrationAction::Revoke { tombstone } = &mut stale.action {
+        tombstone.revision = stale.revision;
+    }
+    assert_eq!(
+        execute(&f, &stale).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(host_record(&f), before);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        status
+    );
+}
+
+#[test]
+fn acknowledged_stop_before_push_fences_real_close_discard_and_ordinary_resume() {
+    use mac_worker::test_support::{
+        client_state::RunnerLivenessVerdict,
+        core::{error::WorkerError, paths::PathLayout},
+        host::job::ProcessIdentity,
+        task::store::TaskCloseRequest,
+    };
+    use std::sync::{Arc, Mutex, mpsc};
+    struct BeforePush {
+        base: ManualIntegrationRuntime,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl IntegrationRuntime for BeforePush {
+        fn now_millis(&self) -> u64 {
+            self.base.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.base.actor()
+        }
+        fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+            self.base.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.base.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            self.base.reach(hook);
+            if hook == IntegrationHook::BeforePush
+                && let Some(entered) = self.entered.lock().unwrap().take()
+            {
+                entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    for operation in ["cancel", "close", "discard", "say"] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        let source = f.commit_task();
+        f.prepare();
+        f.record.snapshot.state = IntegrationStatus::CommitReady;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let (enter, entered) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let runtime = Arc::new(BeforePush {
+            base: ManualIntegrationRuntime::default(),
+            entered: Mutex::new(Some(enter)),
+            release: Mutex::new(resume),
+        });
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(observed(&f));
+        let turns = FakeIntegrationTurns::default();
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        std::thread::scope(|scope| {
+            let driver = scope.spawn(|| owner.drive_once(f.record.task_id));
+            if entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_err()
+            {
+                let _ = release.send(());
+                panic!("BeforePush was not reached: {:?}", driver.join().unwrap());
+            }
+            let _release_on_panic = crate::support::on_drop(|| {
+                if std::thread::panicking() {
+                    let _ = release.send(());
+                }
+            });
+            let pushing = state.load(f.record.task_id).unwrap().unwrap();
+            assert!(pushing.push_intent.as_ref().unwrap().uncertain);
+            let stopped = owner
+                .revoke(f.record.task_id, pushing.snapshot.revision)
+                .unwrap();
+            assert_eq!(stopped.state, IntegrationStatus::Revoked);
+            assert!(
+                state
+                    .load(f.record.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .tombstone
+                    .unwrap()
+                    .acknowledged
+            );
+            let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+            match operation {
+                "close" | "discard" => {
+                    tasks
+                        .close(&TaskCloseRequest::new(
+                            &f.record.policy.project_id,
+                            f.record.task_id,
+                            operation == "discard",
+                        ))
+                        .unwrap();
+                }
+                "say" => {
+                    let prepared = f.prepared(IntegrationTurnPurpose::Verify);
+                    acquire_auxiliary(&f, &prepared);
+                    tasks
+                        .prepare_resume(
+                            &f.record.policy.project_id,
+                            f.record.task_id,
+                            prepared.followup.turn_id(),
+                            2,
+                            "fixture-worker",
+                            &source,
+                        )
+                        .unwrap();
+                }
+                "cancel" => {}
+                _ => unreachable!(),
+            }
+            release.send(()).unwrap();
+            assert_eq!(
+                driver.join().unwrap().unwrap().state,
+                IntegrationStatus::Revoked
+            );
+        });
+        assert_eq!(f.origin_tip(), target, "{operation} allowed a late push");
+        assert!(turns.imports(f.record.task_id).is_empty());
+        assert!(
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .actor
+                .is_none()
+        );
+        assert!(f.execute(IntegrationStep::Push).is_err());
+    }
 }
 
 fn observed(f: &GitIntegrationFixture) -> IntegrationTaskFacts {
@@ -969,6 +1528,10 @@ fn owner_import_ack_is_retained_after_repair() {
     f.prepare();
     f.push();
     f.execute(IntegrationStep::Repair).unwrap();
+    let repaired_status = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
     f.record = host_record(&f);
     let receipt = f.record.receipt.as_mut().unwrap();
     receipt.imported = true;
@@ -979,8 +1542,15 @@ fn owner_import_ack_is_retained_after_repair() {
     let retained = host_record(&f);
     assert!(retained.receipt.unwrap().imported);
     assert_eq!(retained.snapshot.state, IntegrationStatus::Integrated);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        repaired_status,
+        "acknowledgement must not refresh an already repaired status"
+    );
     HostGc::new(&f.store, &SystemProcessRunner)
-        .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+        .apply_at(repaired_status.updated_at_millis() + TASK_RETENTION_MILLIS + 1)
         .unwrap();
     assert!(!f.workspace().exists());
     assert_eq!(
@@ -1525,6 +2095,40 @@ fn lost_push_reply_settles_after_legacy_close_without_workspace_resurrection() {
 }
 
 #[test]
+fn closed_receipt_repair_advances_the_retained_status_timestamp_even_after_clock_rollback() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    f.push();
+    let status_path = f.workspace().parent().unwrap().join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&status_path).unwrap()).unwrap();
+    status["updated_at_millis"] = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 86_400_000)
+        .into();
+    let status: mac_worker::test_support::task::model::TaskStatus =
+        serde_json::from_value(status).unwrap();
+    std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    legacy_close(&f);
+    let before = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    f.execute(IntegrationStep::Repair).unwrap();
+    let repaired = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    assert_eq!(repaired.state(), TaskState::Closed);
+    assert_eq!(repaired.head_oid(), Some(&merge));
+    assert!(repaired.updated_at_millis() > before.updated_at_millis());
+}
+
+#[test]
 fn native_receipt_repair_replays_after_ref_head_and_index_effects() {
     use mac_worker::test_support::{
         core::error::WorkerError,
@@ -1858,4 +2462,146 @@ fn all_rpc_codecs_enforce_the_exact_raw_frame_limit() {
     bytes.push(b' ');
     assert!(decode_host_response(&bytes).is_err());
     assert!(decode_host_request(&bytes).is_err());
+}
+
+#[test]
+fn prephase_revoke_rejects_other_ids_and_sources_and_survives_gc_replay() {
+    use mac_worker::test_support::{
+        host::job::JobId,
+        task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+    };
+    let mut f = GitIntegrationFixture::new();
+    let origin = f.commit_base();
+    f.commit_task();
+    let mut arm = request(
+        &f,
+        HostIntegrationAction::Arm {
+            policy: f.record.policy.clone(),
+        },
+    );
+    arm.integration_id = None;
+    arm.revision = IntegrationRevision(0);
+    execute(&f, &arm).unwrap();
+    let stop = request(
+        &f,
+        HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: 0,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1002,
+                acknowledged: false,
+            },
+        },
+    );
+    execute(&f, &stop).unwrap();
+    let task_dir = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    let proof = task_dir.join("integration/revoke.json");
+    let before = std::fs::read(&proof).unwrap();
+    let mut wrong_id = stop.clone();
+    wrong_id.integration_id = Some(
+        IntegrationId::derive(
+            f.record.task_id,
+            fixture_source(),
+            &fixture_head(),
+            &f.record.target_key,
+        )
+        .unwrap(),
+    );
+    assert_ne!(wrong_id.integration_id, stop.integration_id);
+    assert_eq!(
+        execute(&f, &wrong_id).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(std::fs::read(&proof).unwrap(), before);
+    let mut status = serde_json::to_value(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let next_source = JobId::new(uuid::Uuid::from_u128(222));
+    status["turns"].as_array_mut().unwrap().push(
+        serde_json::to_value(TurnSummary::new(
+            2,
+            next_source,
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(false),
+            false,
+            Some(1003),
+            Some(1004),
+        ))
+        .unwrap(),
+    );
+    let status: TaskStatus = serde_json::from_value(status).unwrap();
+    std::fs::write(
+        task_dir.join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let mut next_stop = stop.clone();
+    next_stop.integration_id = Some(
+        IntegrationId::derive(
+            f.record.task_id,
+            next_source,
+            status.head_oid().unwrap(),
+            &f.record.target_key,
+        )
+        .unwrap(),
+    );
+    execute(&f, &next_stop).unwrap();
+    let next_proof = std::fs::read(&proof).unwrap();
+    assert_eq!(
+        execute(&f, &stop).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(std::fs::read(&proof).unwrap(), next_proof);
+    HostGc::new(&f.store, &SystemProcessRunner)
+        .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+        .unwrap();
+    execute(&f, &next_stop).unwrap();
+    assert_eq!(std::fs::read(&proof).unwrap(), next_proof);
+    let reopened = mac_worker::test_support::host::store::HostStore::open(f.store.root()).unwrap();
+    let late =
+        HostIntegrationService::new(&reopened, &SystemProcessRunner, &f.runtime).execute(&request(
+            &f,
+            HostIntegrationAction::Step {
+                step: IntegrationStep::Prepare,
+                record: Box::new(f.record.clone()),
+            },
+        ));
+    eprintln!("delayed revoked source Prepare after replacement proof and GC: {late:?}");
+    if late.is_ok() {
+        f.record = HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .unwrap();
+        f.push();
+    }
+    eprintln!(
+        "origin before stopped-cycle replay: {origin}; origin afterward: {}",
+        f.origin_tip()
+    );
+    assert_eq!(
+        f.origin_tip(),
+        origin,
+        "a later source's stop proof erased the earlier acknowledged fence and allowed its push"
+    );
+    assert_eq!(late.unwrap_err().public_code(), "INTEGRATION_STATE_INVALID");
+    legacy_close(&f);
+    HostGc::new(&f.store, &SystemProcessRunner)
+        .apply_at(1001 + TASK_RETENTION_MILLIS * 2 + 10000)
+        .unwrap();
+    assert!(
+        !task_dir.exists(),
+        "closed expired task metadata survived GC"
+    );
+    assert!(execute(&f, &stop).is_err());
+    assert!(execute(&f, &next_stop).is_err());
+    assert!(f.execute(IntegrationStep::Prepare).is_err());
+    assert!(!f.workspace().exists());
+    assert_eq!(f.origin_tip(), origin);
 }

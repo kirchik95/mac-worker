@@ -16,6 +16,64 @@ use std::{fs::File, io, os::fd::AsRawFd, sync::Arc};
 pub struct RootedIntegrationState {
     root: RootedDir,
     runtime: Arc<dyn IntegrationRuntime>,
+    event_sink: Option<Arc<dyn crate::controller::events::EventSink>>,
+}
+
+/// The projection port opens only existing sidecars. Reads cannot initialize
+/// owner state, take a reservation or acquire Git authority.
+pub(crate) struct ExistingIntegrationState {
+    paths: PathLayout,
+}
+impl ExistingIntegrationState {
+    pub(crate) fn new(paths: &PathLayout) -> Self {
+        Self {
+            paths: paths.clone(),
+        }
+    }
+}
+impl IntegrationState for ExistingIntegrationState {
+    fn load_policy(&self, task: TaskId) -> Result<Option<FrozenIntegrationPolicy>, WorkerError> {
+        RootedIntegrationState::read_task(&self.paths, task).map(|(policy, _)| policy)
+    }
+    fn load(&self, task: TaskId) -> Result<Option<IntegrationRecord>, WorkerError> {
+        RootedIntegrationState::read_task(&self.paths, task).map(|(_, record)| record)
+    }
+    fn load_prepared(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        RootedIntegrationState::read_auxiliary(&self.paths, task, turn)
+    }
+    fn publish_policy(&self, _: TaskId, _: &FrozenIntegrationPolicy) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn publish_prepared(&self, _: TaskId, _: &PreparedIntegrationTurn) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn replace(
+        &self,
+        _: TaskId,
+        _: IntegrationRevision,
+        _: &IntegrationRecord,
+    ) -> Result<bool, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn reserve(
+        &self,
+        _: &TargetKey,
+        _: IntegrationId,
+        _: u32,
+        _: ProcessIdentity,
+    ) -> Result<Option<TargetReservation>, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn release(&self, _: &TargetReservation) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn due(&self, _: u64, _: usize) -> Result<Vec<TaskId>, WorkerError> {
+        Err(integration_unavailable())
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +172,21 @@ fn reference(p: &PreparedIntegrationTurn, record: &IntegrationRecord) -> Result<
     Ok(())
 }
 impl RootedIntegrationState {
+    pub(crate) fn with_event_sink(
+        mut self,
+        sink: Option<Arc<dyn crate::controller::events::EventSink>>,
+    ) -> Self {
+        self.event_sink = sink;
+        self
+    }
+    pub(crate) fn publish_task_policy(
+        paths: &PathLayout,
+        task: TaskId,
+        policy: &FrozenIntegrationPolicy,
+    ) -> Result<(), WorkerError> {
+        let state = Self::open(paths, Arc::new(super::host::HostIntegrationRuntime::new()?))?;
+        state.publish_policy(task, policy)
+    }
     pub fn open(
         paths: &PathLayout,
         runtime: Arc<dyn IntegrationRuntime>,
@@ -121,7 +194,11 @@ impl RootedIntegrationState {
         let state =
             RootedDir::open_or_create_anchored_absolute(&paths.state).map_err(WorkerError::Io)?;
         let root = child(&state, "integrations", true)?;
-        let store = Self { root, runtime };
+        let store = Self {
+            root,
+            runtime,
+            event_sink: None,
+        };
         {
             let _lock = store.lock()?;
             for name in ["tasks", "due", "reservations"] {
@@ -345,6 +422,15 @@ impl IntegrationState for RootedIntegrationState {
         if next.task_id != task || next.snapshot.revision != expected.next()? {
             return Err(invalid());
         }
+        let hint = self
+            .event_sink
+            .as_ref()
+            .map(|_| next.snapshot.annotation())
+            .transpose()?;
+        let hints = self
+            .event_sink
+            .as_ref()
+            .map(|sink| crate::client_state::events::DeferredHints::begin(sink.clone()));
         let _lock = self.lock()?;
         let old = self.record(task)?;
         if old
@@ -380,6 +466,12 @@ impl IntegrationState for RootedIntegrationState {
             index
                 .remove_owned_regular(&due_name(&e))
                 .map_err(WorkerError::Io)?;
+        }
+        if let (Some(scope), Some(integration)) = (&hints, hint) {
+            scope.capture(crate::controller::events::NewEvent::IntegrationChanged {
+                task_id: task,
+                integration,
+            });
         }
         Ok(true)
     }

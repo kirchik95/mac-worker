@@ -1,5 +1,5 @@
 import { type ReactNode } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
@@ -8,6 +8,8 @@ import { useSnapshot } from '@/hooks/useSnapshot'
 import { useTaskPreviews } from '@/hooks/useTaskPreviews'
 import { snapshot, task, worker } from '@/test/fixtures'
 import { TaskDetail } from '@/views/TaskDetail'
+import integrationFixtures from '@/lib/integration.fixtures.json'
+import { decodeIntegrationView } from '@/lib/integration.contract'
 import App, { documentTitle, parseTaskHash } from './App'
 
 afterEach(() => {
@@ -17,6 +19,42 @@ afterEach(() => {
 })
 
 describe('App states', () => {
+  it('enables blocked integration actions in Overview after a confirmed preview loads', async () => {
+    const view = decodeIntegrationView(integrationFixtures.cases.find(row => row.name === 'blocked')!.view)
+    const row = { ...task({ state: 'open' }), ...view }
+    const armed = decodeIntegrationView(integrationFixtures.cases.find(row => row.name === 'armed')!.view)
+    const dependency = { ...task({ task_id: 'b'.repeat(32), state: 'abandoned',
+      blocking_code: 'INTEGRATION_DEPENDENCY_NOT_INTEGRATED' }), ...armed,
+      workflow_state: 'needs_you' as const }
+    let loadPreview!: (value: unknown) => void
+    const preview = new Promise(resolve => { loadPreview = resolve })
+    const fetch = vi.fn((url: string, options?: RequestInit) => {
+      if (String(url).includes('/api/v1/snapshot')) return Promise.resolve({ ok: true,
+        json: async () => snapshot({ tasks: [row, dependency] }) })
+      if (options?.method === 'POST') return Promise.resolve({ ok: true, json: async () => ({}) })
+      if (String(url).endsWith(`/tasks/${row.task_id}`)) return Promise.resolve({ ok: true,
+        json: () => preview })
+      return Promise.resolve({ ok: true, json: async () => ({ task: dependency }) })
+    })
+    vi.stubGlobal('fetch', fetch)
+    render(<App />)
+    const redrive = await screen.findByRole('button', { name: 'Re-drive integration' })
+    expect(redrive).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Close task' })).toBeDisabled()
+    await act(async () => loadPreview({ task: row, ...view, head_oid: 'a'.repeat(40),
+      turns: [], timeline: [], questions: [], files_changed: [] }))
+    await waitFor(() => expect(redrive).toBeEnabled())
+    expect(screen.getByRole('button', { name: 'Close task' })).toBeEnabled()
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith(`/tasks/${dependency.task_id}`))).toBe(true)
+    fireEvent.click(redrive)
+    await screen.findByText('Action requested. Waiting for task update.')
+    const [url, options] = fetch.mock.calls.find(([, options]) => options?.method === 'POST')!
+    expect(url).toBe(`/api/v1/tasks/${row.task_id}/integrate`)
+    expect(JSON.parse(options!.body as string)).toMatchObject({ expected: { expected_task_id: row.task_id },
+      expected_integration_id: view.integration!.integration_id,
+      integration: { task_id: row.task_id, expected: view.integration!.revision } })
+  })
+
   it('shows the skeleton until the first snapshot arrives', () => {
     vi.stubGlobal(
       'fetch',

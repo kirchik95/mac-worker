@@ -14,7 +14,7 @@ fn invalid() -> WorkerError {
     IntegrationCode::IntegrationStateInvalid.error()
 }
 
-fn add_requirements(
+pub(crate) fn add_requirements(
     requires: &mut Vec<String>,
     policy: &FrozenIntegrationPolicy,
 ) -> Result<(), WorkerError> {
@@ -354,6 +354,21 @@ pub fn nested_integration_submit(
     if request.command() != "task.submit-integrating" {
         return Ok(None);
     }
+    source_submit_body(request.command(), request.body()).map(Some)
+}
+
+/// Source transport and cleanup extract the strict ordinary input while keeping
+/// the original wrapper digest. A rejected policy never hides retained pins.
+pub(crate) fn source_submit_body(
+    command: &str,
+    body: &serde_json::Value,
+) -> Result<FrozenSubmitBody, WorkerError> {
+    if command == "task.submit" {
+        return serde_json::from_value(body.clone()).map_err(|_| invalid());
+    }
+    if command != "task.submit-integrating" {
+        return Err(invalid());
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Nested {
@@ -363,8 +378,8 @@ pub fn nested_integration_submit(
     }
     // A rejected policy must not hide already-pinned base/session inputs from
     // the existing rollback lifecycle. Do not validate policy on this route.
-    let nested: Nested = serde_json::from_value(request.body().clone()).map_err(|_| invalid())?;
-    Ok(Some(nested.submit))
+    let nested: Nested = serde_json::from_value(body.clone()).map_err(|_| invalid())?;
+    Ok(nested.submit)
 }
 
 pub fn prepare_integration_redrive(

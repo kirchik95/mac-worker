@@ -222,6 +222,88 @@ fn controller_status_cli_reports_an_old_record_as_stale() {
 }
 
 #[test]
+fn controller_status_shows_integration_pause_only_while_its_window_is_open() {
+    use mac_worker::test_support::{
+        controller::{
+            ControllerStore,
+            drain::set_drained,
+            service::{ServiceAction, manage},
+        },
+        runtime::{RuntimeContext, run_with_stdio_in_context},
+    };
+    struct MissingService;
+    impl ProcessRunner for MissingService {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(request.program, "/bin/launchctl");
+            assert_eq!(request.args[0], "print");
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(113 << 8),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let env = std::collections::BTreeMap::from([
+        ("HOME".into(), home.as_os_str().to_owned()),
+        ("XDG_STATE_HOME".into(), home.as_os_str().to_owned()),
+    ]);
+    let paths = PathLayout::discover(None, &env, &home).unwrap();
+    let runtime = RuntimeContext::isolated(env, home.clone(), home.clone());
+    let root = paths.controller_state_root();
+    ControllerStore::open(&root).unwrap();
+    let show = |json: bool| {
+        let mut args = vec!["worker", "controller", "status"];
+        if json {
+            args.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_stdio_in_context(
+            Cli::try_parse_from(args).unwrap(),
+            &MissingService,
+            &runtime,
+            &mut Cursor::new(Vec::new()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, 0, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stderr.is_empty());
+        String::from_utf8(stdout).unwrap()
+    };
+    let baseline_json = show(true);
+    let baseline_human = show(false);
+    assert!(!baseline_json.contains("integration_pause"));
+    assert!(!baseline_human.contains("integration:"));
+    manage(
+        &home,
+        &paths,
+        &home.join("config"),
+        501,
+        &MissingService,
+        ServiceAction::Uninstall,
+    )
+    .unwrap();
+    let paused: Value = serde_json::from_str(&show(true)).unwrap();
+    assert_eq!(paused["drained"], false);
+    assert_eq!(paused["integration_pause"]["reason"], "controller_disabled");
+    assert!(
+        paused["integration_pause"]["effective_at_millis"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(paused["integration_pause"].as_object().unwrap().len(), 2);
+    let human = show(false);
+    assert!(human.contains("integration: paused (controller_disabled) since "));
+    assert!(human.contains("resume with: worker controller drain --off"));
+    set_drained(&root, false).unwrap();
+    assert_eq!(show(true), baseline_json);
+    assert_eq!(show(false), baseline_human);
+}
+
+#[test]
 fn doctor_with_controller_only_inventory_reaches_the_health_operation() {
     use std::{collections::BTreeMap, ffi::OsString};
     let repo = support::GitRepo::init();

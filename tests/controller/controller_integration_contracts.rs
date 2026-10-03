@@ -615,7 +615,7 @@ fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() 
 }
 
 #[test]
-fn old_execution_rejects_safe_selector_with_zero_durable_mutation_rows() {
+fn unavailable_execution_rejects_safe_selector_with_zero_durable_mutation_rows() {
     use mac_worker::test_support::{
         controller::{ControllerFault, ControllerStore, encode_json_frame, serve_rpc_with_runtime},
         core::error::WorkerError,
@@ -647,7 +647,7 @@ fn old_execution_rejects_safe_selector_with_zero_durable_mutation_rows() {
         ControllerFault::None,
     )
     .unwrap_err();
-    assert_eq!(error.public_code(), "INVALID_REQUEST", "{error:?}");
+    assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE", "{error:?}");
     assert_eq!(
         ControllerStore::open(&paths.controller_state_root())
             .unwrap()

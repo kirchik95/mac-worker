@@ -315,7 +315,7 @@ mod route {
         },
     };
     use std::{
-        io::{Read, Write},
+        io::{BufRead, BufReader, Read, Write},
         net::TcpStream,
         sync::{
             Arc,
@@ -427,12 +427,31 @@ mod route {
         }
         stream.write_all(b"\r\n").unwrap();
         stream.write_all(&bytes).unwrap();
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).unwrap();
-        let (headers, body) = reply.split_once("\r\n\r\n").unwrap();
+        // A rejected request may close with unread request bytes. Read the
+        // complete framed response rather than waiting for a TCP EOF/reset.
+        let mut reader = BufReader::new(stream);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            headers.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("JSON response must have a content length");
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
         (
             headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
-            serde_json::from_str(body).unwrap(),
+            serde_json::from_slice(&body).unwrap(),
         )
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

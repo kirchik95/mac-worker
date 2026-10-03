@@ -12,6 +12,7 @@ pub struct IntegrationCoordinator<'a> {
     turns: &'a dyn IntegrationTurns,
     runtime: &'a dyn IntegrationRuntime,
     observer: &'a dyn IntegrationObserver,
+    owner_paths: Option<&'a crate::paths::PathLayout>,
 }
 impl<'a> IntegrationCoordinator<'a> {
     pub fn new(
@@ -27,7 +28,12 @@ impl<'a> IntegrationCoordinator<'a> {
             turns,
             runtime,
             observer,
+            owner_paths: None,
         }
+    }
+    pub(crate) fn with_owner_gate(mut self, paths: &'a crate::paths::PathLayout) -> Self {
+        self.owner_paths = Some(paths);
+        self
     }
     pub fn on_terminal(&self, task: TaskId, source: TurnId) -> Result<(), WorkerError> {
         let Some(policy) = self.state.load_policy(task)? else {
@@ -111,6 +117,21 @@ impl<'a> IntegrationCoordinator<'a> {
             .head_oid()
             .cloned()
             .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        // Import/repair changes the public head to M/T, while the ordinary
+        // source turn stays the same. A repeated terminal wake is that cycle's
+        // recovery, never a new source derived from the accepted merge.
+        if let Some(old) = &old
+            && old.snapshot.source_turn_id == source
+        {
+            if head != old.snapshot.source_head
+                && !old.receipt.as_ref().is_some_and(|receipt| {
+                    &head == receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head)
+                })
+            {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+            return Ok(());
+        }
         let target_key = policy.target_key()?;
         let id = IntegrationId::derive(task, source, &head, &target_key)?;
         if let Some(old) = &old {
@@ -253,17 +274,10 @@ impl<'a> IntegrationCoordinator<'a> {
         Ok(())
     }
     fn save(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
-        let expected = record.snapshot.revision;
-        record.snapshot.revision = expected.next()?;
-        record.snapshot.updated_at_millis = self.runtime.now_millis();
-        if !self.state.replace(record.task_id, expected, record)? {
-            return Err(WorkerError::task(
-                "TASK_REVISION_CONFLICT",
-                "integration changed before publication",
-            ));
+        if let Some(paths) = self.owner_paths {
+            extend_elapsed_pauses(self.state, self.runtime, paths, record)?;
         }
-        self.runtime.reach(IntegrationHook::AfterStateBeforeEvent);
-        Ok(())
+        persist_record(self.state, self.runtime, record)
     }
     fn release(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
         if let Some(actor) = record.actor {
@@ -276,6 +290,22 @@ impl<'a> IntegrationCoordinator<'a> {
             record.actor = None;
         }
         Ok(())
+    }
+    /// Reclaim in the observing parent: a re-exec starts with an empty absence cache.
+    pub(crate) fn reclaim_exited_actor(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let Some(mut record) = self.state.load(task)? else {
+            return Ok(true);
+        };
+        if let Some(actor) = record.actor {
+            if self.runtime.actor_verdict(actor)
+                != crate::client_state::RunnerLivenessVerdict::Exited
+            {
+                return Ok(false);
+            }
+            self.release(&mut record)?;
+            self.save(&mut record)?;
+        }
+        Ok(true)
     }
     fn release_failed_phase(
         &self,
@@ -300,46 +330,7 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         pause: IntegrationPauseEvidence,
     ) -> Result<(), WorkerError> {
-        if record.pause.is_some() {
-            return Ok(());
-        }
-        let resume = record.snapshot.state;
-        if matches!(
-            resume,
-            IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
-        ) {
-            return Ok(());
-        }
-        record.remaining_admission_millis = record
-            .admission_deadline_millis
-            .take()
-            .map(|deadline| {
-                deadline
-                    .saturating_sub(pause.effective_at_millis)
-                    .min(AUXILIARY_ADMISSION_MILLIS)
-            })
-            .or(record.remaining_admission_millis);
-        record.remaining_backoff_millis = record
-            .snapshot
-            .retry_at_millis
-            .take()
-            .map(|deadline| {
-                deadline
-                    .saturating_sub(pause.effective_at_millis)
-                    .min(30000)
-            })
-            .or(record.remaining_backoff_millis);
-        // RetryWait already has its actual host phase as resume_state.
-        if resume != IntegrationStatus::RetryWait {
-            record.snapshot.resume_state = Some(resume);
-        }
-        record.snapshot.state = IntegrationStatus::Parked;
-        record.snapshot.pause_reason = Some(pause.reason);
-        record.pause = Some(pause);
-        self.release(record)?;
-        self.save(record)?;
-        self.runtime.reach(IntegrationHook::AfterPark);
-        Ok(())
+        park_record(self.state, self.runtime, self.owner_paths, record, pause)
     }
     fn key(&self, record: &IntegrationRecord, phase: IntegrationPhase) -> IntegrationPhaseKey {
         IntegrationPhaseKey {
@@ -357,7 +348,12 @@ impl<'a> IntegrationCoordinator<'a> {
     ) -> Result<Option<IntegrationPhasePermit>, WorkerError> {
         self.runtime.reach(IntegrationHook::BeforePhasePermit);
         match self.runtime.begin_phase(&self.key(record, phase))? {
-            IntegrationDriveAdmission::Permit(p) => Ok(Some(p)),
+            IntegrationDriveAdmission::Permit(p) => {
+                if let Some(paths) = self.owner_paths {
+                    extend_elapsed_pauses(self.state, self.runtime, paths, record)?;
+                }
+                Ok(Some(p))
+            }
             IntegrationDriveAdmission::Park(p) => {
                 self.park(record, p)?;
                 Ok(None)
@@ -426,6 +422,7 @@ impl<'a> IntegrationCoordinator<'a> {
         retry.retries += 1;
         retry.code = code;
         retry.due_at_millis = self.runtime.now_millis().saturating_add(delay);
+        record.snapshot.updated_at_millis = self.runtime.now_millis();
         record.snapshot.retry_at_millis = Some(retry.due_at_millis);
         record.snapshot.resume_state = Some(if phase == IntegrationPhase::Push {
             IntegrationStatus::Fetching
@@ -438,28 +435,18 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(record)
     }
     fn resume(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
-        let now = self.runtime.now_millis();
-        record.snapshot.state = record
-            .snapshot
-            .resume_state
-            .take()
-            .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
-        record.pause = None;
-        record.snapshot.pause_reason = None;
-        if let Some(remaining) = record.remaining_admission_millis.take() {
-            record.admission_deadline_millis = Some(now.saturating_add(remaining));
-        }
-        if let Some(remaining) = record.remaining_backoff_millis.take() {
-            record.snapshot.resume_state = Some(record.snapshot.state);
-            record.snapshot.state = IntegrationStatus::RetryWait;
-            record.snapshot.retry_at_millis = Some(now.saturating_add(remaining));
-        } else {
-            record.snapshot.retry_at_millis = None;
-        }
-        self.save(record)
+        resume_record(self.state, self.runtime, self.owner_paths, record)
     }
     pub fn configured(&self, task: TaskId) -> Result<bool, WorkerError> {
         Ok(self.state.load_policy(task)?.is_some())
+    }
+    pub(crate) fn park_for_runtime(
+        &self,
+        task: TaskId,
+        pause: IntegrationPauseEvidence,
+    ) -> Result<(), WorkerError> {
+        let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        self.park(&mut record, pause)
     }
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
@@ -1167,6 +1154,7 @@ impl<'a> IntegrationCoordinator<'a> {
             return Ok(record.snapshot);
         };
         if record.admission_deadline_millis.is_none() && !observation.accepted {
+            record.snapshot.updated_at_millis = self.runtime.now_millis();
             record.admission_deadline_millis = Some(
                 self.runtime
                     .now_millis()
@@ -1192,6 +1180,13 @@ impl<'a> IntegrationCoordinator<'a> {
             self.runtime.reach(IntegrationHook::AfterAuxPrompt);
             self.runtime.reach(IntegrationHook::AfterAuxCas);
             self.runtime.reach(IntegrationHook::AfterAuxEnqueue);
+            // Native publication/launch valves durably record their own gate
+            // and budget observations. Do not overwrite that revision.
+            record = self
+                .state
+                .load(record.task_id)?
+                .ok_or_else(integration_unavailable)?;
+            prepared.validate_for(&record)?;
         }
         let observation = self.turns.observe(auxiliary.turn_id)?;
         observation.validate()?;
@@ -1303,7 +1298,11 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         step: IntegrationStep,
     ) -> Result<Option<HostIntegrationResponse>, WorkerError> {
-        if record.snapshot.state == IntegrationStatus::Blocked
+        if (record.snapshot.state == IntegrationStatus::Blocked
+            && record
+                .phase_retries
+                .iter()
+                .any(|retry| retry.phase == IntegrationPhase::Repair))
             || record
                 .snapshot
                 .retry_at_millis
@@ -1323,6 +1322,8 @@ impl<'a> IntegrationCoordinator<'a> {
         };
         record.snapshot.resume_state = None;
         record.snapshot.retry_at_millis = None;
+        record.snapshot.blocked_code = None;
+        record.snapshot.retry_exhausted = false;
         record.snapshot.pause_reason = None;
         record.pause = None;
         if !record.phase_retries.iter().any(|r| r.phase == phase) {
@@ -1400,18 +1401,57 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.snapshot.state == IntegrationStatus::Integrated {
             return Ok(record.snapshot);
         }
+        self.redrive_record(record, false)
+    }
+    pub(crate) fn resume_redrive(
+        &self,
+        task: TaskId,
+        intent: IntegrationId,
+        epoch: u32,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.integration_id != intent || record.snapshot.epoch != epoch {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "integration cycle changed",
+            ));
+        }
+        self.redrive_record(record, true)
+    }
+    fn redrive_record(
+        &self,
+        record: IntegrationRecord,
+        resuming: bool,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let task = record.task_id;
         let facts = self.observer.facts(task)?;
         if facts.ordinary.status().state() != TaskState::Open
             || facts.stop_requested
             || facts.close_pending
+            || record.snapshot.blocked_code
+                == Some(IntegrationCode::IntegrationDependencyNotIntegrated)
+            || !facts.ordinary.status().turns().iter().any(|turn| {
+                turn.turn_id() == record.snapshot.source_turn_id
+                    && turn.outcome() == Some(&TaskOutcome::Done)
+            })
         {
             return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
         }
-        if record.snapshot.state != IntegrationStatus::Blocked {
+        let stopped = resuming
+            && record.snapshot.state == IntegrationStatus::Revoked
+            && record.tombstone.as_ref().is_some_and(|t| t.acknowledged);
+        if record.snapshot.state != IntegrationStatus::Blocked && !stopped {
             return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
         }
-        self.revoke(task, expected)?;
+        if !stopped {
+            self.revoke(task, record.snapshot.revision)?;
+        }
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.state != IntegrationStatus::Revoked
+            || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
+        {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+        }
         record.snapshot.epoch = record
             .snapshot
             .epoch
@@ -1525,6 +1565,186 @@ impl<'a> IntegrationCoordinator<'a> {
         }
     }
 }
+
+pub(crate) fn persist_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next()?;
+    record.snapshot.updated_at_millis = runtime.now_millis();
+    if !state.replace(record.task_id, expected, record)? {
+        return Err(WorkerError::task(
+            "TASK_REVISION_CONFLICT",
+            "integration changed before publication",
+        ));
+    }
+    runtime.reach(IntegrationHook::AfterStateBeforeEvent);
+    Ok(())
+}
+pub(crate) fn extend_elapsed_pauses(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: &crate::paths::PathLayout,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    extend_elapsed_pauses_through(state, runtime, paths, record, runtime.now_millis())
+}
+fn extend_elapsed_pauses_through(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: &crate::paths::PathLayout,
+    record: &mut IntegrationRecord,
+    through: u64,
+) -> Result<(), WorkerError> {
+    if record.pause.is_some()
+        || (record.admission_deadline_millis.is_none() && record.snapshot.retry_at_millis.is_none())
+    {
+        return Ok(());
+    }
+    let extra = crate::controller::drain::elapsed_pause_time(
+        &paths.controller_state_root(),
+        record.snapshot.updated_at_millis,
+        through,
+    )?;
+    if extra != 0 {
+        record.admission_deadline_millis = record
+            .admission_deadline_millis
+            .map(|d| d.saturating_add(extra));
+        record.snapshot.retry_at_millis = record
+            .snapshot
+            .retry_at_millis
+            .map(|d| d.saturating_add(extra));
+        persist_record(state, runtime, record)?;
+    }
+    Ok(())
+}
+pub(crate) fn park_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: Option<&crate::paths::PathLayout>,
+    record: &mut IntegrationRecord,
+    pause: IntegrationPauseEvidence,
+) -> Result<(), WorkerError> {
+    if let Some(previous) = record.pause {
+        if previous.reason == pause.reason {
+            return Ok(());
+        }
+        if pause.reason == IntegrationPauseReason::HelperUnavailable
+            && matches!(
+                previous.reason,
+                IntegrationPauseReason::ControllerDrained
+                    | IntegrationPauseReason::ControllerDisabled
+            )
+        {
+            // The persisted global gate may have reopened before this helper
+            // observation. Spend that active interval, then park the remainder.
+            let Some(paths) = paths else {
+                return Ok(());
+            };
+            if crate::controller::drain::resumed_at(
+                &paths.controller_state_root(),
+                previous.effective_at_millis,
+            )?
+            .is_none()
+            {
+                return Ok(());
+            }
+            resume_record(state, runtime, Some(paths), record)?;
+        } else {
+            // A newly closed global valve supersedes helper unavailability;
+            // both intervals stay paused and the saved remainder is unchanged.
+            record.pause = Some(pause);
+            record.snapshot.pause_reason = Some(pause.reason);
+            return persist_record(state, runtime, record);
+        }
+    }
+    if matches!(
+        record.snapshot.state,
+        IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
+    ) {
+        return Ok(());
+    }
+    if let Some(paths) = paths {
+        extend_elapsed_pauses_through(state, runtime, paths, record, pause.effective_at_millis)?;
+    }
+    record.remaining_admission_millis = record
+        .admission_deadline_millis
+        .take()
+        .map(|d| {
+            d.saturating_sub(pause.effective_at_millis)
+                .min(AUXILIARY_ADMISSION_MILLIS)
+        })
+        .or(record.remaining_admission_millis);
+    record.remaining_backoff_millis = record
+        .snapshot
+        .retry_at_millis
+        .take()
+        .map(|d| d.saturating_sub(pause.effective_at_millis).min(30000))
+        .or(record.remaining_backoff_millis);
+    if record.snapshot.state != IntegrationStatus::RetryWait {
+        record.snapshot.resume_state = Some(record.snapshot.state);
+    }
+    record.snapshot.state = IntegrationStatus::Parked;
+    record.snapshot.pause_reason = Some(pause.reason);
+    record.pause = Some(pause);
+    if let Some(actor) = record.actor.take() {
+        state.release(&TargetReservation {
+            key: record.target_key.clone(),
+            integration_id: record.snapshot.integration_id,
+            epoch: record.snapshot.epoch,
+            actor,
+        })?;
+    }
+    persist_record(state, runtime, record)?;
+    runtime.reach(IntegrationHook::AfterPark);
+    Ok(())
+}
+pub(crate) fn resume_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: Option<&crate::paths::PathLayout>,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    let mut now = runtime.now_millis();
+    if let Some(paths) = paths
+        && let Some(pause) = &record.pause
+        && matches!(
+            pause.reason,
+            IntegrationPauseReason::ControllerDrained | IntegrationPauseReason::ControllerDisabled
+        )
+        && let Some(end) = crate::controller::drain::resumed_at(
+            &paths.controller_state_root(),
+            pause.effective_at_millis,
+        )?
+    {
+        now = end.saturating_add(crate::controller::drain::elapsed_pause_time(
+            &paths.controller_state_root(),
+            end,
+            now,
+        )?);
+    }
+    record.snapshot.state = record
+        .snapshot
+        .resume_state
+        .take()
+        .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+    record.pause = None;
+    record.snapshot.pause_reason = None;
+    if let Some(remaining) = record.remaining_admission_millis.take() {
+        record.admission_deadline_millis = Some(now.saturating_add(remaining));
+    }
+    if let Some(remaining) = record.remaining_backoff_millis.take() {
+        record.snapshot.resume_state = Some(record.snapshot.state);
+        record.snapshot.state = IntegrationStatus::RetryWait;
+        record.snapshot.retry_at_millis = Some(now.saturating_add(remaining));
+    } else {
+        record.snapshot.retry_at_millis = None;
+    }
+    persist_record(state, runtime, record)
+}
+
 fn auxiliary_checks(
     source: &[crate::agent::ReportedCheck],
     checks: &[crate::agent::ReportedCheck],

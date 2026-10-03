@@ -664,6 +664,10 @@ impl ClientStateStore {
             .map(|sink| events::DeferredHints::begin(sink.clone()))
     }
 
+    pub(crate) fn event_sink(&self) -> Option<Arc<dyn crate::controller::events::EventSink>> {
+        self.event_sink.clone()
+    }
+
     fn capture_hint(&self, event: crate::controller::events::NewEvent) {
         if let Some(sink) = &self.event_sink {
             events::DeferredHints::capture_for(sink, event);

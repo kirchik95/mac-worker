@@ -533,6 +533,62 @@ fn review_native_closed_reachable_source_without_a_candidate_imports_the_observe
 }
 
 #[test]
+fn legacy_closed_blocked_cycle_observes_once_and_then_stays_terminal() {
+    use native_owner::*;
+    for reachable in [false, true] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        f.prepare();
+        if reachable {
+            f.push();
+        }
+        retention_close(&f);
+        let mut retained = f.record.clone();
+        retained.snapshot.state = IntegrationStatus::Blocked;
+        retained.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+        let state = MemoryIntegrationState::default();
+        state
+            .publish_policy(retained.task_id, &retained.policy)
+            .unwrap();
+        state
+            .replace(retained.task_id, IntegrationRevision(0), &retained)
+            .unwrap();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(observed(&f));
+        let turns = FakeIntegrationTurns::default();
+        let host = Host::new(&f, 0);
+        let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+        let settled = coordinator.drive_once(retained.task_id).unwrap();
+        assert_eq!(
+            settled.state,
+            if reachable {
+                IntegrationStatus::Integrated
+            } else {
+                IntegrationStatus::Blocked
+            }
+        );
+        if !reachable {
+            assert_eq!(
+                settled.blocked_code,
+                Some(IntegrationCode::IntegrationWorkspaceMissing)
+            );
+        }
+        assert!(!host.calls.lock().unwrap().is_empty());
+        let calls = host.calls.lock().unwrap().len();
+        coordinator.drive_once(retained.task_id).unwrap();
+        assert_eq!(host.calls.lock().unwrap().len(), calls);
+        assert!(
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|step| *step == IntegrationStep::Repair)
+        );
+    }
+}
+
+#[test]
 fn review_native_closed_observation_keeps_network_uncertainty_and_the_repair_retry() {
     use mac_worker::test_support::{
         core::error::{ProcessError, WorkerError},
@@ -2701,4 +2757,448 @@ fn an_unmaterialized_auxiliary_reservation_spends_the_shared_ordinary_followup_a
     assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
     assert!(f.host_calls().is_empty());
     assert!(runner.requests().is_empty());
+}
+
+mod rooted_git_concurrency {
+    use super::*;
+    use mac_worker::test_support::{
+        core::{error::WorkerError, paths::PathLayout},
+        host::process::SystemProcessRunner,
+        task::model::TaskId,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    struct Actor {
+        identity: ProcessIdentity,
+        clock: ManualIntegrationRuntime,
+        liveness: Arc<ManualIntegrationRuntime>,
+    }
+    impl IntegrationRuntime for Actor {
+        fn now_millis(&self) -> u64 {
+            self.clock.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.identity
+        }
+        fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+            self.liveness.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.clock.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            self.clock.reach(hook);
+        }
+    }
+    fn actor(n: u32, liveness: Arc<ManualIntegrationRuntime>) -> Actor {
+        let identity = ProcessIdentity::new(6_000_000 + n, 1000).unwrap();
+        liveness.set_actor_verdict(identity, RunnerLivenessVerdict::Live);
+        Actor {
+            identity,
+            clock: ManualIntegrationRuntime::default(),
+            liveness,
+        }
+    }
+    struct HeldHost<'a> {
+        fixture: &'a GitIntegrationFixture,
+        ready: mpsc::Sender<TaskId>,
+        release: Mutex<mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+    impl IntegrationHost for HeldHost<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.ready.send(request.task_id).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            HostIntegrationService::new(
+                &self.fixture.store,
+                &SystemProcessRunner,
+                &self.fixture.runtime,
+            )
+            .execute(request)
+        }
+    }
+    struct ReleaseAll(Vec<mpsc::Sender<()>>);
+    impl Drop for ReleaseAll {
+        fn drop(&mut self) {
+            for sender in &self.0 {
+                let _ = sender.send(());
+            }
+        }
+    }
+    fn paths(root: &std::path::Path) -> PathLayout {
+        PathLayout {
+            config: root.join("config"),
+            state: root.join("owner"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        }
+    }
+    fn install(
+        state: &RootedIntegrationState,
+        fixture: &GitIntegrationFixture,
+        observer: &FakeIntegrationObserver,
+    ) {
+        state
+            .publish_policy(fixture.record.task_id, &fixture.record.policy)
+            .unwrap();
+        state
+            .replace(
+                fixture.record.task_id,
+                IntegrationRevision(0),
+                &fixture.record,
+            )
+            .unwrap();
+        observer.insert(super::native_owner::observed(fixture));
+        let arm = HostIntegrationRequest {
+            protocol_version: 7,
+            task_id: fixture.record.task_id,
+            integration_id: None,
+            epoch: 0,
+            revision: IntegrationRevision(0),
+            action: HostIntegrationAction::Arm {
+                policy: fixture.record.policy.clone(),
+            },
+        };
+        HostIntegrationService::new(&fixture.store, &SystemProcessRunner, &fixture.runtime)
+            .execute(&arm)
+            .unwrap();
+    }
+    fn reservations(paths: &PathLayout) -> usize {
+        std::fs::read_dir(paths.state.join("integrations/reservations"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count()
+    }
+
+    #[test]
+    fn rooted_owner_real_git_fences_concurrent_cycle_drivers() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp.path().canonicalize().unwrap());
+        let liveness = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, liveness.clone()).unwrap();
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        let head = f.commit_task();
+        let observer = FakeIntegrationObserver::default();
+        let turns = FakeIntegrationTurns::default();
+        install(&state, &f, &observer);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let host = HeldHost {
+            fixture: &f,
+            ready: ready_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        };
+        let actors: Vec<_> = (1..=4).map(|n| actor(n, liveness.clone())).collect();
+        std::thread::scope(|scope| {
+            let _release_on_panic = ReleaseAll(vec![release_tx.clone()]);
+            let first = scope.spawn(|| {
+                IntegrationCoordinator::new(&state, &host, &turns, &actors[0], &observer)
+                    .drive_once(f.record.task_id)
+                    .unwrap()
+            });
+            assert_eq!(ready_rx.recv().unwrap(), f.record.task_id);
+            let held = state.load(f.record.task_id).unwrap().unwrap();
+            assert_eq!(held.actor, Some(actors[0].identity));
+            let others: Vec<_> = actors[1..]
+                .iter()
+                .map(|actor| {
+                    scope.spawn(|| {
+                        IntegrationCoordinator::new(&state, &host, &turns, actor, &observer)
+                            .drive_once(f.record.task_id)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for other in others {
+                assert_eq!(other.join().unwrap(), held.snapshot);
+            }
+            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(reservations(&paths), 1);
+            assert_eq!(f.origin_tip(), target);
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap().state, IntegrationStatus::CommitReady);
+        });
+        assert_eq!(reservations(&paths), 0);
+        let ready = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(
+            f.parents(ready.candidates[0].merge_oid.as_ref().unwrap()),
+            vec![target, head]
+        );
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        let done = IntegrationRunner::new(IntegrationCoordinator::new(
+            &state, &host, &turns, &actors[3], &observer,
+        ))
+        .run(f.record.task_id)
+        .unwrap();
+        assert_eq!(done.state, IntegrationStatus::Integrated);
+        assert_eq!(f.origin_tip(), done.merge_oid.unwrap());
+        assert_eq!(host_record_count(&state, f.record.task_id), 1);
+    }
+    #[test]
+    fn distinct_rooted_tasks_share_one_canonical_target_and_preserve_both_git_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = paths(&root);
+        let live = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, live.clone()).unwrap();
+        let mut first = GitIntegrationFixture::at_for_task(
+            root.join("first"),
+            TaskId::new(uuid::Uuid::from_u128(201)),
+            None,
+        );
+        let target = first.commit_base();
+        first.commit_task();
+        let mut second = GitIntegrationFixture::at_for_task(
+            root.join("second"),
+            TaskId::new(uuid::Uuid::from_u128(202)),
+            Some(first.origin()),
+        );
+        second.git(&["fetch", &second.record.policy.origin, target.as_str()]);
+        second.git(&["reset", "--hard", target.as_str()]);
+        second.record.policy.base_oid = Some(target.clone());
+        second.record.cycle_base = target.clone();
+        second.write("second.txt", b"second\n");
+        let second_head = second.commit("second");
+        second.freeze_source(&second_head);
+        let observer = FakeIntegrationObserver::default();
+        let turns = FakeIntegrationTurns::default();
+        install(&state, &first, &observer);
+        install(&state, &second, &observer);
+        assert_eq!(first.record.target_key, second.record.target_key);
+        let actor_a = actor(30, live.clone());
+        let actor_b = actor(31, live);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held = HeldHost {
+            fixture: &first,
+            ready: ready_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        };
+        let host_b =
+            HostIntegrationService::new(&second.store, &SystemProcessRunner, &second.runtime);
+        std::thread::scope(|scope| {
+            let _release_on_panic = ReleaseAll(vec![release_tx.clone()]);
+            let running = scope.spawn(|| {
+                IntegrationCoordinator::new(&state, &held, &turns, &actor_a, &observer)
+                    .drive_once(first.record.task_id)
+                    .unwrap()
+            });
+            ready_rx.recv().unwrap();
+            let before = state.load(second.record.task_id).unwrap().unwrap();
+            assert_eq!(
+                IntegrationCoordinator::new(&state, &host_b, &turns, &actor_b, &observer)
+                    .drive_once(second.record.task_id)
+                    .unwrap(),
+                before.snapshot
+            );
+            assert_eq!(state.load(second.record.task_id).unwrap().unwrap(), before);
+            assert_eq!(reservations(&paths), 1);
+            release_tx.send(()).unwrap();
+            running.join().unwrap();
+        });
+        let host_a =
+            HostIntegrationService::new(&first.store, &SystemProcessRunner, &first.runtime);
+        let a = IntegrationRunner::new(IntegrationCoordinator::new(
+            &state, &host_a, &turns, &actor_a, &observer,
+        ))
+        .run(first.record.task_id)
+        .unwrap();
+        let b = IntegrationRunner::new(IntegrationCoordinator::new(
+            &state, &host_b, &turns, &actor_b, &observer,
+        ))
+        .run(second.record.task_id)
+        .unwrap();
+        assert_eq!(a.state, IntegrationStatus::Integrated);
+        assert_eq!(b.state, IntegrationStatus::Integrated);
+        let merge = b.merge_oid.unwrap();
+        assert_eq!(
+            second.parents(&merge),
+            vec![a.merge_oid.unwrap(), second_head]
+        );
+        assert_eq!(second.git(&["show", &format!("{merge}:task.txt")]), "task");
+        assert_eq!(
+            second.git(&["show", &format!("{merge}:second.txt")]),
+            "second"
+        );
+        assert_eq!(reservations(&paths), 0);
+    }
+
+    fn host_record_count(state: &RootedIntegrationState, task: TaskId) -> usize {
+        state.load(task).unwrap().unwrap().candidates.len()
+    }
+
+    #[test]
+    fn four_real_git_targets_hold_the_shared_cap_and_resolution_releases_it_for_ready_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = paths(&root);
+        let liveness = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, liveness.clone()).unwrap();
+        let observer = FakeIntegrationObserver::default();
+        let turns = FakeIntegrationTurns::default();
+        let mut fixtures = vec![];
+        for n in 0..5 {
+            let task = TaskId::new(uuid::Uuid::from_u128(100 + n));
+            let mut f =
+                GitIntegrationFixture::at_for_task(root.join(format!("git-{n}")), task, None);
+            if n == 0 {
+                f.write("payload.txt", b"base\n");
+            }
+            f.commit_base();
+            if n == 0 {
+                f.write("payload.txt", b"ours\n");
+            }
+            f.commit_task();
+            if n == 0 {
+                f.advance_target_with("payload.txt", b"theirs\n");
+            }
+            install(&state, &f, &observer);
+            fixtures.push(f);
+        }
+        let actors: Vec<_> = (10..15).map(|n| actor(n, liveness.clone())).collect();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut releases = vec![];
+        let mut hosts = vec![];
+        for f in &fixtures {
+            let (tx, rx) = mpsc::channel();
+            releases.push(tx);
+            hosts.push(HeldHost {
+                fixture: f,
+                ready: ready_tx.clone(),
+                release: Mutex::new(rx),
+                calls: AtomicUsize::new(0),
+            });
+        }
+        let fifth = fixtures[4].record.task_id;
+        std::thread::scope(|scope| {
+            let _release_on_panic = ReleaseAll(releases.clone());
+            let mut drivers = vec![];
+            for n in 0..4 {
+                let state = &state;
+                let host = &hosts[n];
+                let turns = &turns;
+                let actor = &actors[n];
+                let observer = &observer;
+                let task = fixtures[n].record.task_id;
+                drivers.push(scope.spawn(move || {
+                    IntegrationCoordinator::new(state, host, turns, actor, observer)
+                        .drive_once(task)
+                        .unwrap()
+                }));
+            }
+            let mut held = std::collections::BTreeSet::new();
+            for _ in 0..4 {
+                held.insert(ready_rx.recv().unwrap());
+            }
+            assert_eq!(held.len(), 4);
+            assert_eq!(reservations(&paths), 4);
+            let before = state.load(fifth).unwrap().unwrap();
+            assert_eq!(
+                IntegrationCoordinator::new(&state, &hosts[4], &turns, &actors[4], &observer)
+                    .drive_once(fifth)
+                    .unwrap(),
+                before.snapshot
+            );
+            assert_eq!(state.load(fifth).unwrap().unwrap(), before);
+            assert_eq!(hosts[4].calls.load(Ordering::SeqCst), 0);
+            releases[0].send(()).unwrap();
+            assert_eq!(
+                drivers.remove(0).join().unwrap().state,
+                IntegrationStatus::Resolving
+            );
+            assert_eq!(reservations(&paths), 3);
+            let resumed = scope.spawn(|| {
+                IntegrationCoordinator::new(&state, &hosts[4], &turns, &actors[4], &observer)
+                    .drive_once(fifth)
+                    .unwrap()
+            });
+            assert_eq!(ready_rx.recv().unwrap(), fifth);
+            assert_eq!(reservations(&paths), 4);
+            for release in releases.iter().skip(1) {
+                release.send(()).unwrap();
+            }
+            for driver in drivers {
+                assert_eq!(driver.join().unwrap().state, IntegrationStatus::CommitReady);
+            }
+            assert_eq!(
+                resumed.join().unwrap().state,
+                IntegrationStatus::CommitReady
+            );
+        });
+        assert_eq!(reservations(&paths), 0);
+        let first = fixtures[0].record.task_id;
+        let host = HostIntegrationService::new(
+            &fixtures[0].store,
+            &SystemProcessRunner,
+            &fixtures[0].runtime,
+        );
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &actors[0], &observer);
+        for _ in 0..8 {
+            owner.drive_once(first).unwrap();
+            if state
+                .load(first)
+                .unwrap()
+                .unwrap()
+                .auxiliaries
+                .last()
+                .is_some_and(|intent| intent.queue_position.is_some())
+            {
+                break;
+            }
+        }
+        let queued = state.load(first).unwrap().unwrap();
+        let intent = queued.auxiliaries.last().unwrap();
+        assert!(intent.queue_position.is_some());
+        let deadline = queued.admission_deadline_millis.unwrap();
+        actors[0]
+            .clock
+            .advance(std::time::Duration::from_millis(1234));
+        actors[0]
+            .clock
+            .set_drive_gate(Some(IntegrationPauseReason::ControllerDrained));
+        owner.drive_once(first).unwrap();
+        let parked = state.load(first).unwrap().unwrap();
+        let saved = parked.auxiliaries.last().unwrap();
+        assert_eq!(saved.turn_id, intent.turn_id);
+        assert_eq!(saved.queue_position, intent.queue_position);
+        assert_eq!(
+            parked.remaining_admission_millis,
+            Some(deadline.saturating_sub(actors[0].now_millis()))
+        );
+        actors[0]
+            .clock
+            .advance(std::time::Duration::from_millis(900_000));
+        actors[0].clock.set_drive_gate(None);
+        owner.drive_once(first).unwrap();
+        let restored = state.load(first).unwrap().unwrap();
+        let next = restored.auxiliaries.last().unwrap();
+        assert_eq!(next.turn_id, intent.turn_id);
+        assert_eq!(next.queue_position, intent.queue_position);
+        assert_eq!(
+            restored.admission_deadline_millis,
+            Some(actors[0].now_millis() + parked.remaining_admission_millis.unwrap())
+        );
+        assert_eq!(restored.followups_spent, parked.followups_spent);
+    }
 }

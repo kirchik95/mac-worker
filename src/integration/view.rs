@@ -4,6 +4,28 @@ use crate::error::WorkerError;
 use crate::task::{LocalTaskRecord, TaskOutcome, TaskState, TurnId};
 use crate::task_view::{ReviewState, review_state};
 
+pub(crate) fn read_owner_view(
+    paths: &crate::paths::PathLayout,
+    ordinary: &LocalTaskRecord,
+    runner: bool,
+) -> Result<Option<IntegrationView>, WorkerError> {
+    let task = ordinary.meta().task_id();
+    let (_, record) = super::store::RootedIntegrationState::read_task(paths, task)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let current = snapshot_covers_latest_work(&record.snapshot, ordinary, |turn| {
+        super::store::RootedIntegrationState::read_auxiliary(paths, task, turn)
+            .map(|prepared| prepared.is_some())
+    })?;
+    let facts = IntegrationTaskFacts::from_record(ordinary, runner);
+    let mut view = project_integration_for_current_work(Some(&record.snapshot), &facts, current)?;
+    view.requested_close = record.policy.requested_close;
+    // Keep the receipt visible as history once newer ordinary work exists.
+    view.integration = Some(record.snapshot);
+    Ok(Some(view))
+}
+
 impl IntegrationTaskFacts {
     /// Ordinary read facts; an observer may add its admission/auxiliary evidence.
     pub fn from_record(ordinary: &LocalTaskRecord, runner_present: bool) -> Self {
