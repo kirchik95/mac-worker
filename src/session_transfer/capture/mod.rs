@@ -3,8 +3,9 @@ pub mod codex;
 use super::{SessionAgent, SessionCapture, session_error};
 use crate::error::WorkerError;
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 pub fn capture_for(agent: SessionAgent) -> Box<dyn SessionCapture> {
@@ -14,8 +15,42 @@ pub fn capture_for(agent: SessionAgent) -> Box<dyn SessionCapture> {
     }
 }
 pub fn read_complete_lines(path: &Path, max_bytes: u64) -> Result<Vec<Vec<u8>>, WorkerError> {
-    let file =
-        File::open(path).map_err(|_| session_error("SESSION_UNREADABLE", "cannot read session"))?;
+    let bytes = read_session_bytes(open_session_file(path)?, max_bytes)?;
+    complete_lines(&bytes)
+}
+
+pub(super) fn open_session_file(path: &Path) -> Result<File, WorkerError> {
+    let file = OpenOptions::new()
+        .read(true)
+        // NONBLOCK prevents a substituted FIFO from blocking before fstat.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| session_error("SESSION_UNREADABLE", "cannot open session"))?;
+    require_regular(&file)?;
+    Ok(file)
+}
+
+fn require_regular(file: &File) -> Result<std::fs::Metadata, WorkerError> {
+    // File::metadata uses fstat: inspect the opened object, never its path.
+    let metadata = file
+        .metadata()
+        .map_err(|_| session_error("SESSION_UNREADABLE", "cannot inspect session"))?;
+    if !metadata.is_file() {
+        return Err(session_error(
+            "SESSION_UNREADABLE",
+            "session is not a regular file",
+        ));
+    }
+    Ok(metadata)
+}
+
+pub(super) fn read_session_bytes(file: File, max_bytes: u64) -> Result<Vec<u8>, WorkerError> {
+    if require_regular(&file)?.len() > max_bytes {
+        return Err(session_error(
+            "SESSION_TOO_LARGE",
+            "session exceeds size cap",
+        ));
+    }
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -26,6 +61,10 @@ pub fn read_complete_lines(path: &Path, max_bytes: u64) -> Result<Vec<Vec<u8>>, 
             "session exceeds size cap",
         ));
     }
+    Ok(bytes)
+}
+
+pub(super) fn complete_lines(bytes: &[u8]) -> Result<Vec<Vec<u8>>, WorkerError> {
     let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let mut lines = Vec::new();
     for line in bytes[..complete].split_inclusive(|&b| b == b'\n') {
