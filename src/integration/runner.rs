@@ -1817,9 +1817,8 @@ pub(crate) mod native_launch_tests {
     }
 
     #[test]
+    #[ignore] // 1,000 fsynced cycles run in the nightly stress selection.
     fn native_pause_history_1000_cycles_stress() {
-        // This runs in nextest's existing stress group, without #[ignore],
-        // because 1000 real fsynced operator cycles outlast the ordinary limit.
         let root = tempfile::tempdir().unwrap();
         let gate = root.path().canonicalize().unwrap().join("controller");
         for cycle in 0..1000 {

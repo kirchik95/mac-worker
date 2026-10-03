@@ -711,6 +711,72 @@ mod tests {
             .1
     }
 
+    mod integration {
+        use super::*;
+
+        #[test]
+        fn pause_history_thousand_updates_and_locked_cap_crossing_are_bounded() {
+            let mut gate = IntegrationGate {
+                version: 1,
+                windows: vec![],
+            };
+            for cycle in 0..1000 {
+                let start = 1000 + cycle * 2000;
+                gate.windows.push(PauseWindow {
+                    reason:
+                        crate::integration::contracts::IntegrationPauseReason::ControllerDrained,
+                    effective_at_millis: start,
+                    resumed_at_millis: None,
+                });
+                prune_pause_history(&mut gate, start);
+                assert!(gate.windows.len() <= MAX_PAUSE_WINDOWS);
+                assert_eq!(gate.windows.last().unwrap().effective_at_millis, start);
+                assert!(gate.windows.last().unwrap().resumed_at_millis.is_none());
+                gate.windows.last_mut().unwrap().resumed_at_millis = Some(start + 1500);
+                prune_pause_history(&mut gate, start + 1500);
+                let retained: u64 = gate
+                    .windows
+                    .iter()
+                    .map(|window| window.resumed_at_millis.unwrap() - window.effective_at_millis)
+                    .sum();
+                let exact = (cycle + 1) * 1500;
+                if cycle < 256 {
+                    assert_eq!(retained, exact)
+                } else {
+                    assert!(retained <= exact)
+                }
+                assert!(
+                    serde_json::to_vec(&gate).unwrap().len()
+                        <= crate::integration::contracts::MAX_PRIVATE_RECORD_BYTES
+                );
+            }
+            // A short real locked-writer run crosses the same cap, keeping the
+            // gate regression fast while nightly retains all fsynced cycles.
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().canonicalize().unwrap().join("controller");
+            seed_history(&path, 254);
+            for cycle in 254..262 {
+                let start = 1000 + cycle * 2000;
+                set_drained_at(&path, true, start).unwrap();
+                assert!(is_drained(&path).unwrap());
+                let open = history(&path);
+                assert!(open.windows.len() <= MAX_PAUSE_WINDOWS);
+                assert_eq!(open.windows.last().unwrap().effective_at_millis, start);
+                assert!(open.windows.last().unwrap().resumed_at_millis.is_none());
+                set_drained_at(&path, false, start + 1500).unwrap();
+                assert!(!is_drained(&path).unwrap());
+                let retained = elapsed_pause_time(&path, 1000, start + 1500).unwrap();
+                let exact = (cycle + 1) * 1500;
+                if cycle < 256 {
+                    assert_eq!(retained, exact)
+                } else {
+                    assert!(retained <= exact)
+                }
+                assert!(history(&path).windows.len() <= MAX_PAUSE_WINDOWS);
+            }
+        }
+    }
+
     #[test]
     fn operator_prunes_an_existing_history_to_the_hard_cap() {
         let temp = tempfile::tempdir().unwrap();
