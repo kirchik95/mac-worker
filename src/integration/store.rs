@@ -205,7 +205,13 @@ impl RootedIntegrationState {
         paths: &PathLayout,
         task: TaskId,
     ) -> Result<(Option<FrozenIntegrationPolicy>, Option<IntegrationRecord>), WorkerError> {
-        let root = match RootedDir::open_anchored_absolute(&paths.state.join("integrations")) {
+        Self::read_task_at(&paths.state, task)
+    }
+    pub(crate) fn read_task_at(
+        state: &std::path::Path,
+        task: TaskId,
+    ) -> Result<(Option<FrozenIntegrationPolicy>, Option<IntegrationRecord>), WorkerError> {
+        let root = match RootedDir::open_anchored_absolute(&state.join("integrations")) {
             Ok(root) => root,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
             Err(e) => return Err(WorkerError::Io(e)),
@@ -223,10 +229,35 @@ impl RootedIntegrationState {
         let record = read(&dir, "record.json", MAX_PRIVATE_RECORD_BYTES)?
             .map(|b| decode_record(&b))
             .transpose()?;
-        if record.as_ref().is_some_and(|r| r.task_id != task) {
+        if record
+            .as_ref()
+            .is_some_and(|r| r.task_id != task || policy.as_ref() != Some(&r.policy))
+        {
             return Err(invalid());
         }
         Ok((policy, record))
+    }
+    /// Durable purpose read before ordinary follow-up/terminal effects. No creation or flock.
+    pub(crate) fn read_auxiliary(
+        paths: &PathLayout,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        let (_, record) = Self::read_task(paths, task)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if !record.auxiliaries.iter().any(|a| a.turn_id == turn) {
+            return Ok(None);
+        }
+        let root = RootedDir::open_anchored_absolute(&paths.state.join("integrations"))
+            .map_err(WorkerError::Io)?;
+        let dir = child(&root, &format!("tasks/{task}/prepared"), false)?;
+        let bytes =
+            read(&dir, &prepared_name(turn), MAX_PREPARED_TURN_BYTES)?.ok_or_else(invalid)?;
+        let prepared = decode_prepared_turn(&bytes)?;
+        reference(&prepared, &record)?;
+        Ok(Some(prepared))
     }
 }
 impl IntegrationState for RootedIntegrationState {

@@ -22,10 +22,15 @@ use crate::{
     dag::{
         DagBase, DagFrozenSpec, DagNode, DagNodeState, DagRecord, GraphNode, ParentGate,
         accepted_import_oid, dag_pin_ref, dag_run_is_quiescent, merge_pending_into_projection,
-        parent_gate, parse_from_base, validate_batch_graph,
+        parse_from_base, validate_batch_graph,
     },
     error::WorkerError,
     git_transport::GitTransport,
+    integration::{
+        contracts::{FrozenIntegratingBatch, IntegrationCode, IntegrationStatus},
+        coordinator::IntegrationCoordinator,
+        store::RootedIntegrationState,
+    },
     job::{
         ClientId, CommandSpec, MAX_LOG_CHUNK_BYTES, ProcessIdentity, QueueEntry, QueueEntryKind,
         QueueRunReference, QueueSnapshot, QueueState,
@@ -1178,8 +1183,16 @@ pub struct TaskClient<'a> {
     json_events: bool,
     // Laptop-only capture intent. Never frozen or copied into batch/DAG nodes.
     session_selector: Option<(crate::session_transfer::SessionSelector, PathBuf)>,
+    integration: Option<&'a IntegrationCoordinator<'a>>,
     #[cfg(any(test, feature = "test-support"))]
     drain_wait: Option<&'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync)>,
+}
+
+#[derive(Clone, Copy)]
+enum IntegrationMutation {
+    Close,
+    Cancel,
+    Say,
 }
 
 impl<'a> TaskClient<'a> {
@@ -1199,9 +1212,75 @@ impl<'a> TaskClient<'a> {
             herdr_notifier: None,
             json_events: false,
             session_selector: None,
+            integration: None,
             #[cfg(any(test, feature = "test-support"))]
             drain_wait: None,
         }
+    }
+
+    /// T6 injects the owner ports; disabled callers retain the ordinary path.
+    pub fn with_integration(mut self, coordinator: &'a IntegrationCoordinator<'a>) -> Self {
+        self.integration = Some(coordinator);
+        self
+    }
+
+    pub fn integration_parent_gate(
+        &self,
+        record: &LocalTaskRecord,
+    ) -> Result<ParentGate, WorkerError> {
+        crate::dag::parent_gate_at(&self.paths.state, record)
+    }
+
+    pub fn validate_integration_batch(batch: &FrozenIntegratingBatch) -> Result<(), WorkerError> {
+        crate::dag::validate_integration_batch(batch)
+    }
+
+    fn integration_enabled(&self, task: TaskId) -> Result<bool, WorkerError> {
+        if let Some(coordinator) = self.integration {
+            return coordinator.configured(task);
+        }
+        Ok(RootedIntegrationState::read_task(self.paths, task)?
+            .0
+            .is_some())
+    }
+
+    fn before_integration_mutation(
+        &self,
+        record: &LocalTaskRecord,
+        operation: IntegrationMutation,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        let task = record.meta().task_id();
+        if !self.integration_enabled(task)? {
+            return Ok(record.clone());
+        }
+        let coordinator = self
+            .integration
+            .ok_or_else(|| IntegrationCode::IntegrationUnavailable.error())?;
+        let Some(snapshot) = coordinator.snapshot(task)? else {
+            return Ok(record.clone());
+        };
+        if snapshot.state == IntegrationStatus::Integrated {
+            if matches!(operation, IntegrationMutation::Cancel) {
+                return Err(IntegrationCode::IntegrationAlreadyCommitted.error());
+            }
+            return Ok(record.clone());
+        }
+        if matches!(operation, IntegrationMutation::Say)
+            && !matches!(
+                snapshot.state,
+                IntegrationStatus::Blocked | IntegrationStatus::Revoked
+            )
+        {
+            return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+        }
+        match coordinator.revoke(task, snapshot.revision) {
+            Ok(_) => {}
+            Err(e)
+                if e.public_code() == "INTEGRATION_ALREADY_COMMITTED"
+                    && !matches!(operation, IntegrationMutation::Cancel) => {}
+            Err(e) => return Err(e),
+        }
+        self.client_state.load_task(task)
     }
 
     /// Herdr session the runners this client starts inline notify about
@@ -2748,6 +2827,9 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn close(&self, task_id: TaskId, discard: bool) -> Result<TaskReport, WorkerError> {
+        if self.integration_enabled(task_id)? {
+            return self.close_from_expected(&self.client_state.load_task(task_id)?, discard);
+        }
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
         self.close_from_expected(&record, discard)
@@ -2803,6 +2885,10 @@ impl<'a> TaskClient<'a> {
         let task_id = expected.meta().task_id();
         let record = self.client_state.load_task(task_id)?;
         validate_close_target(&record, expected)?;
+        let enabled = self.integration_enabled(task_id)?;
+        let record = self.before_integration_mutation(&record, IntegrationMutation::Close)?;
+        let barrier_expected = record.clone();
+        let expected = if enabled { &barrier_expected } else { expected };
         let record = if record.auto_continue_intent().is_some() {
             self.clear_auto_continue_for_human(expected)?;
             let current = self.client_state.load_task(task_id)?;
@@ -3676,6 +3762,10 @@ impl<'a> TaskClient<'a> {
         stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        if self.integration_enabled(task_id)? {
+            let record = self.before_integration_mutation(&record, IntegrationMutation::Say)?;
+            return self.say_from_expected(&record, message, attached, stdout, stderr);
+        }
         if record.auto_continue_intent().is_some() {
             // Reconciliation would launch the answer the human is replacing.
             return self.say_from_expected(&record, message, attached, stdout, stderr);
@@ -3693,8 +3783,20 @@ impl<'a> TaskClient<'a> {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<TaskReport, WorkerError> {
+        let current = if self.integration_enabled(expected.meta().task_id())? {
+            let current = self.client_state.load_task(expected.meta().task_id())?;
+            if !operator_revision_matches(&current, expected) {
+                return Err(task_error(
+                    "TASK_REVISION_CONFLICT",
+                    "task changed before follow-up",
+                ));
+            }
+            self.before_integration_mutation(&current, IntegrationMutation::Say)?
+        } else {
+            expected.clone()
+        };
         let prepared = PreparedFollowup::prepare(
-            expected,
+            &current,
             message,
             TurnId::generate(),
             current_time_millis()?,
@@ -3921,6 +4023,10 @@ impl<'a> TaskClient<'a> {
         }
         prepared.validate_self_consistency()?;
         let current = self.client_state.load_task(task_id)?;
+        // Auxiliary admission has its own authoritative, persisted wrapper.
+        if RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?.is_none() {
+            self.before_integration_mutation(&current, IntegrationMutation::Say)?;
+        }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
@@ -4575,6 +4681,9 @@ impl<'a> TaskClient<'a> {
 
     pub fn cancel(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        if self.integration_enabled(task_id)? {
+            return self.cancel_from_expected(&record);
+        }
         if record.auto_continue_intent().is_some() {
             return self.cancel_from_expected(&record);
         }
@@ -4589,6 +4698,15 @@ impl<'a> TaskClient<'a> {
     ) -> Result<TaskReport, WorkerError> {
         let task_id = expected.meta().task_id();
         let current = self.client_state.load_task(task_id)?;
+        let enabled = self.integration_enabled(task_id)?;
+        if enabled && !operator_revision_matches(&current, expected) {
+            return Err(task_error(
+                "TASK_REVISION_CONFLICT",
+                "task changed before cancel",
+            ));
+        }
+        let current = self.before_integration_mutation(&current, IntegrationMutation::Cancel)?;
+        let expected = if enabled { &current } else { expected };
         let Some(expected_last) = expected.status().turns().last() else {
             let current = self.client_state.load_task(task_id)?;
             if current.status().turns().is_empty() {
@@ -5378,7 +5496,7 @@ impl<'a> TaskClient<'a> {
             else {
                 continue;
             };
-            if parent_gate(&parent_record) != ParentGate::Ready {
+            if self.integration_parent_gate(&parent_record)? != ParentGate::Ready {
                 continue;
             }
             let Some(last) = parent_record.status().turns().last() else {
@@ -5405,13 +5523,24 @@ impl<'a> TaskClient<'a> {
                 .map(|oid| transfer.has_object_with_runner(self.runner, oid))
                 .transpose()?
                 .unwrap_or(false);
-            let Some(oid) = accepted_import_oid(
-                &parent_record,
-                last_turn_id,
-                queue_busy,
-                journal_complete,
-                object_exists,
-            ) else {
+            let accepted =
+                if RootedIntegrationState::read_task(self.paths, parent_record.meta().task_id())?
+                    .0
+                    .is_some()
+                {
+                    (!queue_busy && journal_complete && object_exists)
+                        .then(|| parent_record.fetched_head().cloned())
+                        .flatten()
+                } else {
+                    accepted_import_oid(
+                        &parent_record,
+                        last_turn_id,
+                        queue_busy,
+                        journal_complete,
+                        object_exists,
+                    )
+                };
+            let Some(oid) = accepted else {
                 drop(transfer);
                 continue;
             };

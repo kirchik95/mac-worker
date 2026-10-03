@@ -822,3 +822,234 @@ fn frozen_failed_source_checks_cannot_be_bypassed_by_redrive() {
             .all(|r| !matches!(r.action, HostIntegrationAction::Step { .. }))
     );
 }
+
+fn owner_config() -> mac_worker::test_support::core::config::Config {
+    use mac_worker::test_support::core::config::{Config, WorkerEntry};
+    Config {
+        version: 1,
+        notifications: Default::default(),
+        controller: Default::default(),
+        ssh: Default::default(),
+        workers: vec![WorkerEntry {
+            name: "fixture-worker".into(),
+            ssh: "unused".into(),
+            slots: 1,
+            capabilities: vec![],
+            remote_binary: "worker".into(),
+            herdr: false,
+        }],
+    }
+}
+
+#[test]
+fn enabled_mutations_revoke_before_reconcile_and_ambiguous_stop_keeps_the_task_open() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use driver_fixture::*;
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{
+            client::TaskClient,
+            model::{ClosePolicy, TaskState},
+            turn_runner::InlineRunnerExecutor,
+        },
+    };
+    for operation in ["close", "discard", "cancel", "blocked_say", "active_say"] {
+        let f = IntegrationFixture::new();
+        let paths = paths(f.root());
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        store.create_task(ordinary.clone()).unwrap();
+        let rig = Rig::new(Mode::Offline, ClosePolicy::Never);
+        if operation == "blocked_say" {
+            let mut record = rig.record();
+            let revision = record.snapshot.revision;
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationResolveBlocked);
+            record.snapshot.revision = revision.next().unwrap();
+            rig.state
+                .replace(fixture_task(), revision, &record)
+                .unwrap();
+        }
+        let coordinator = rig.coordinator();
+        let runner = RecordingRunner::default();
+        let config = owner_config();
+        let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+            .with_integration(&coordinator);
+        let error = match operation {
+            "close" | "discard" => client.close(fixture_task(), operation == "discard"),
+            "cancel" => client.cancel(fixture_task()),
+            _ => client.say(
+                fixture_task(),
+                "fix it".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            ),
+        }
+        .unwrap_err();
+        assert_eq!(
+            error.public_code(),
+            if operation == "active_say" {
+                "TASK_BUSY"
+            } else {
+                "INTEGRATION_STOP_UNCONFIRMED"
+            },
+            "{operation}"
+        );
+        assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+        assert_eq!(
+            store.load_task(fixture_task()).unwrap().status().state(),
+            TaskState::Open
+        );
+        assert!(
+            runner.requests().is_empty(),
+            "ordinary I/O before revoke: {operation}"
+        );
+        if operation != "active_say" {
+            assert!(rig.record().tombstone.is_some_and(|t| !t.acknowledged));
+            assert!(
+                rig.host
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|r| matches!(r.action, HostIntegrationAction::Revoke { .. }))
+            );
+        } else {
+            assert!(rig.host.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn integrated_cancel_cannot_relabel_committed_work() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use driver_fixture::*;
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{client::TaskClient, model::ClosePolicy, turn_runner::InlineRunnerExecutor},
+    };
+    let rig = Rig::new(Mode::Clean, ClosePolicy::Never);
+    IntegrationRunner::new(rig.coordinator())
+        .run(fixture_task())
+        .unwrap();
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    store.create_task(ordinary.clone()).unwrap();
+    let coordinator = rig.coordinator();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+        .with_integration(&coordinator);
+    assert_eq!(
+        client.cancel(fixture_task()).unwrap_err().public_code(),
+        "INTEGRATION_ALREADY_COMMITTED"
+    );
+    assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn configured_dag_parent_requires_imported_current_receipt_and_block_is_reversible() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use mac_worker::test_support::{
+        client_state::{ClientStateStore, dag::ParentGate},
+        task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+    };
+    use std::sync::Arc;
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &record.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &record)
+        .unwrap();
+    // The companion is an allowed rooted state entry after reopening the client.
+    drop(store);
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor);
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    for status in [
+        IntegrationStatus::Pending,
+        IntegrationStatus::Parked,
+        IntegrationStatus::Blocked,
+    ] {
+        let expected = record.snapshot.revision;
+        record.snapshot.revision = expected.next().unwrap();
+        record.snapshot.state = status;
+        record.snapshot.blocked_code = (status == IntegrationStatus::Blocked)
+            .then_some(IntegrationCode::IntegrationResolveBlocked);
+        if status == IntegrationStatus::Parked {
+            record.snapshot.resume_state = Some(IntegrationStatus::Resolving);
+            record.snapshot.pause_reason = Some(IntegrationPauseReason::ControllerDrained);
+            record.pause = Some(IntegrationPauseEvidence {
+                reason: IntegrationPauseReason::ControllerDrained,
+                effective_at_millis: 1000,
+            });
+        } else {
+            record.snapshot.resume_state = None;
+            record.snapshot.pause_reason = None;
+            record.pause = None;
+        }
+        state.replace(fixture_task(), expected, &record).unwrap();
+        assert_eq!(
+            client.integration_parent_gate(&ordinary).unwrap(),
+            ParentGate::Waiting
+        );
+    }
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Integrated;
+    record.snapshot.blocked_code = None;
+    let merge: mac_worker::test_support::task::model::BaseOid = "e".repeat(40).parse().unwrap();
+    record.snapshot.merge_oid = Some(merge.clone());
+    record.snapshot.observed_target_oid = Some(record.cycle_base.clone());
+    record.snapshot.disposition = Some(IntegrationDisposition::Merged);
+    record.receipt = Some(IntegrationReceipt {
+        integration_id: record.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: record.cycle_base.clone(),
+        merge_oid: Some(merge.clone()),
+        disposition: IntegrationDisposition::Merged,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state.replace(fixture_task(), expected, &record).unwrap();
+    assert_eq!(
+        client.integration_parent_gate(&ordinary).unwrap(),
+        ParentGate::Waiting,
+        "stale H is insufficient"
+    );
+    let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+    wire["head_oid"] = serde_json::to_value(&merge).unwrap();
+    let accepted = ordinary
+        .with_status(serde_json::from_value(wire).unwrap())
+        .unwrap()
+        .with_fetched_head(Some(merge))
+        .unwrap();
+    assert_eq!(
+        client.integration_parent_gate(&accepted).unwrap(),
+        ParentGate::Ready
+    );
+    let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+    wire["state"] = "closed".into();
+    let closed_stale = ordinary
+        .with_status(serde_json::from_value(wire).unwrap())
+        .unwrap();
+    assert_ne!(
+        client.integration_parent_gate(&closed_stale).unwrap(),
+        ParentGate::Ready
+    );
+    assert!(runner.requests().is_empty());
+}

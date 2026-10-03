@@ -143,9 +143,9 @@ use crate::{
     agent_facts::FACTS_TTL,
     config::Config,
     dag::{
-        ClaimedNodeAction, DAG_PARENT_FAILED, DagClaim, DagFrozenSpec, DagNodeState, DagRecord,
-        ParentGate, claimed_node_action, dag_pin_ref, dag_run_is_quiescent,
-        dag_submission_complete, parent_gate, parents_failed, parents_ready,
+        ClaimedNodeAction, DagClaim, DagFrozenSpec, DagNodeState, DagRecord, ParentGate,
+        claimed_node_action, dag_pin_ref, dag_run_is_quiescent, dag_submission_complete,
+        failed_parent_code, parent_gate_at, parents_failed, parents_ready,
     },
     error::WorkerError,
     job::{
@@ -4084,10 +4084,11 @@ impl ClientStateStore {
                 continue;
             }
             if node.state != DagNodeState::Blocked && parents_failed(node, &gates) {
+                let code = failed_parent_code(node, &gates);
                 dag.nodes
                     .get_mut(&batch_id)
                     .expect("id from keys")
-                    .mark_blocked(DAG_PARENT_FAILED);
+                    .mark_blocked(code);
                 changed = true;
                 continue;
             }
@@ -5245,7 +5246,7 @@ impl ClientStateStore {
                 DagNodeState::Waiting | DagNodeState::Claimed => ParentGate::Waiting,
                 DagNodeState::Submitted => {
                     match self.task_optional_from_dir(tasks, node.task_id)? {
-                        Some(record) => parent_gate(&record),
+                        Some(record) => parent_gate_at(&self.inner.state_root, &record)?,
                         None => ParentGate::Waiting,
                     }
                 }
@@ -7540,7 +7541,7 @@ fn validate_root_entries(root: RawFd) -> Result<(), WorkerError> {
         match entry.to_bytes() {
             b"client-id" | b"jobs" | b".mac-worker-state" | b"jobs.lock" | b"queue"
             | b"affinity" | b"observations" | b"tasks" | b"runs" | b"dags" | b"dag-pending"
-            | b"active-tasks" | b"turns" | b"runners" => {}
+            | b"active-tasks" | b"turns" | b"runners" | b"integrations" => {}
             bytes if std::str::from_utf8(bytes).is_err() => {
                 return Err(invalid_state("state root contains a non-UTF-8 entry"));
             }
