@@ -85,6 +85,10 @@ const DRAIN_LOCK: &str = "drain.lock";
 const DRAIN_FILE: &str = "drain.json";
 const MAX_DRAIN_BYTES: u64 = 4096;
 const INTEGRATION_GATE: &str = "integration-gate.json";
+// Admission consults ten active minutes and backoff at most thirty seconds.
+// Keep a wide margin, measured in active time rather than wall time.
+const PAUSE_HISTORY_ACTIVE_MILLIS: u64 = 60 * 60 * 1000;
+const MAX_PAUSE_WINDOWS: usize = 256;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +117,6 @@ fn read_integration_gate(
     };
     let gate: IntegrationGate = serde_json::from_slice(&bytes).map_err(|_| invalid_state())?;
     if gate.version != 1
-        || gate.windows.is_empty()
         || gate.windows.iter().enumerate().any(|(i, window)| {
             !matches!(
                 window.reason,
@@ -188,6 +191,7 @@ fn update_integration_gate(
     {
         window.resumed_at_millis = Some(now.max(window.effective_at_millis));
     }
+    prune_pause_history(&mut gate, now);
     let bytes = serde_json::to_vec(&gate).map_err(|_| invalid_state())?;
     if bytes.len() > crate::integration::contracts::MAX_PRIVATE_RECORD_BYTES {
         return Err(invalid_state());
@@ -201,6 +205,34 @@ fn update_integration_gate(
             .write_private_atomic_no_replace(INTEGRATION_GATE, &bytes)
             .map_err(store_io),
     }
+}
+
+fn prune_pause_history(gate: &mut IntegrationGate, now: u64) {
+    let mut cursor = now.max(
+        gate.windows
+            .last()
+            .map_or(0, |w| w.resumed_at_millis.unwrap_or(w.effective_at_millis)),
+    );
+    let mut active = 0u64;
+    let mut first_retained = 0;
+    for (index, window) in gate.windows.iter().enumerate().rev() {
+        if let Some(end) = window.resumed_at_millis {
+            active = active.saturating_add(cursor.saturating_sub(end));
+            if active > PAUSE_HISTORY_ACTIVE_MILLIS {
+                first_retained = index + 1;
+                break;
+            }
+        }
+        cursor = window.effective_at_millis;
+    }
+    gate.windows.drain(..first_retained);
+    // Rapid cycling can exceed the cap inside a live budget. Losing the
+    // oldest closed pauses then charges more active time, never less: an
+    // auxiliary may expire early with a re-drivable queue timeout. The open
+    // window is last and is never dropped. Below the cap, live accounting
+    // stays exact because only windows beyond the active horizon are removed.
+    let excess = gate.windows.len().saturating_sub(MAX_PAUSE_WINDOWS);
+    gate.windows.drain(..excess);
 }
 
 #[derive(Deserialize, Serialize)]
@@ -363,16 +395,23 @@ pub(crate) fn elapsed_pause_time(
 }
 pub(crate) fn resumed_at(state_root: &Path, effective_at: u64) -> Result<Option<u64>, WorkerError> {
     let Some(root) = open_existing_controller_root(state_root)? else {
-        return Ok(None);
+        return Ok(Some(effective_at));
     };
     let Some((_, gate)) = read_integration_gate(&root)? else {
-        return Ok(None);
+        return Ok(Some(effective_at));
     };
-    Ok(gate
-        .windows
-        .iter()
-        .find(|w| w.effective_at_millis == effective_at)
-        .and_then(|w| w.resumed_at_millis))
+    Ok(
+        match gate
+            .windows
+            .iter()
+            .find(|w| w.effective_at_millis == effective_at)
+        {
+            Some(window) => window.resumed_at_millis,
+            // A pruned or reset window is forgotten pause time. Charge from its
+            // original anchor; using recovery time would renew an old budget.
+            None => Some(effective_at),
+        },
+    )
 }
 
 fn existing_lock(root: &RootedDir) -> Result<Option<File>, WorkerError> {
@@ -448,4 +487,98 @@ fn state_bytes(drained: bool) -> Result<Vec<u8>, WorkerError> {
 
 fn invalid_state() -> WorkerError {
     WorkerError::Protocol("CONTROLLER_TRANSPORT: controller drain state is invalid".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history(path: &Path) -> IntegrationGate {
+        read_integration_gate(&open_controller_root(path).unwrap())
+            .unwrap()
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn operator_prunes_an_existing_history_to_the_hard_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("controller");
+        seed_history(&path, 300);
+        set_drained_at(&path, true, 601000).unwrap();
+        let gate = history(&path);
+        assert_eq!(gate.windows.len(), 256);
+        assert!(gate.windows.last().unwrap().resumed_at_millis.is_none());
+    }
+
+    fn seed_history(path: &Path, count: u64) {
+        set_drained_at(path, false, 1000).unwrap();
+        let gate = IntegrationGate {
+            version: 1,
+            windows: (0..count)
+                .map(|cycle| PauseWindow {
+                    reason:
+                        crate::integration::contracts::IntegrationPauseReason::ControllerDrained,
+                    effective_at_millis: 1000 + cycle * 2000,
+                    resumed_at_millis: Some(2500 + cycle * 2000),
+                })
+                .collect(),
+        };
+        open_controller_root(path)
+            .unwrap()
+            .write_private_atomic_no_replace(INTEGRATION_GATE, &serde_json::to_vec(&gate).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn pause_history_horizon_counts_active_time_and_keeps_the_open_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("controller");
+        let day = 86400000;
+        set_drained_at(&path, true, 1000).unwrap();
+        set_drained_at(&path, false, day + 1000).unwrap();
+        set_drained_at(&path, true, day + 1001001).unwrap();
+        set_drained_at(&path, false, 2 * day + 1001001).unwrap();
+        assert_eq!(
+            history(&path).windows.len(),
+            2,
+            "paused days are not active time"
+        );
+        set_drained_at(&path, true, 2 * day + 4001001).unwrap();
+        let gate = history(&path);
+        assert_eq!(gate.windows.len(), 2);
+        assert_eq!(gate.windows[0].effective_at_millis, day + 1001001);
+        assert!(gate.windows[1].resumed_at_millis.is_none());
+    }
+
+    #[test]
+    fn pruned_pause_recovery_charges_missing_history_instead_of_renewing_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("controller");
+        seed_history(&path, 257);
+        set_drained_at(&path, false, 515000).unwrap();
+        assert_eq!(resumed_at(&path, 1000).unwrap(), Some(1000));
+        let old_resume = resumed_at(&path, 1000).unwrap().unwrap();
+        let pause = elapsed_pause_time(&path, old_resume, 515000).unwrap();
+        let remaining = (old_resume + pause + 600000).saturating_sub(515000);
+        assert!(
+            remaining <= 471500,
+            "pruned recovery extended a live budget"
+        );
+    }
+
+    #[test]
+    fn undrain_can_leave_an_empty_expired_history_that_admission_accepts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("controller");
+        set_drained_at(&path, true, 1000).unwrap();
+        set_drained_at(&path, false, 2000).unwrap();
+        set_drained_at(&path, false, 4000000).unwrap();
+        assert!(history(&path).windows.is_empty());
+        assert!(
+            integration_admission(&path, crate::client_state::WaitDeadline::new(None), 4000000)
+                .unwrap()
+                .is_ok()
+        );
+    }
 }

@@ -1550,6 +1550,111 @@ mod native_launch_tests {
     }
 
     #[test]
+    fn queued_auxiliary_history_pruning_is_exact_below_cap_and_conservative_above_it() {
+        for cycles in [200, 257] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = paths(&root.path().canonicalize().unwrap());
+            let clock = Arc::new(AtomicU64::new(1001));
+            let read_clock = clock.clone();
+            let client = ClientStateStore::open(&paths.state)
+                .unwrap()
+                .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+            let deadline = if cycles == 200 { 601001 } else { 130001 };
+            let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, deadline);
+            let gate = paths.controller_state_root();
+            crate::controller::drain::set_drained_at(&gate, true, 1001).unwrap();
+            assert!(
+                auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                    .unwrap()
+                    .is_none()
+            );
+            // Restore completed windows as a delayed/restarted owner would
+            // find them; the operator write below performs actual pruning.
+            let windows = (0..cycles)
+                .map(|cycle| {
+                    serde_json::json!({
+                        "reason": "controller_drained", "effective_at_millis": 1001 + cycle * 2000,
+                        "resumed_at_millis": 2501 + cycle * 2000,
+                    })
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(
+                gate.join("integration-gate.json"),
+                serde_json::to_vec(&serde_json::json!({"version":1,"windows":windows})).unwrap(),
+            )
+            .unwrap();
+            crate::controller::drain::set_drained_at(&gate, false, 1001 + cycles * 2000).unwrap();
+            clock.store(1001 + cycles * 2000, Ordering::SeqCst);
+            let result = auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id());
+            let restored = state.load(record.task_id).unwrap().unwrap();
+            if cycles == 200 {
+                assert!(result.unwrap().is_some());
+                assert_eq!(restored.admission_deadline_millis, Some(901001));
+                assert_eq!(
+                    restored.admission_deadline_millis.unwrap() - clock.load(Ordering::SeqCst),
+                    500000
+                );
+            } else {
+                assert_eq!(
+                    result.err().unwrap().public_code(),
+                    "INTEGRATION_TURN_QUEUE_TIMEOUT"
+                );
+                assert_eq!(restored.snapshot.state, IntegrationStatus::Blocked);
+                assert!(
+                    restored.tombstone.is_none(),
+                    "budget expiry must stay re-drivable"
+                );
+            }
+            assert_eq!(
+                restored.snapshot.integration_id,
+                record.snapshot.integration_id
+            );
+            assert_eq!(restored.snapshot.epoch, record.snapshot.epoch);
+            assert_eq!(restored.followups_spent, 1);
+            assert_eq!(
+                state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+                Some(prepared)
+            );
+            assert_eq!(client.queue_snapshot().unwrap().entries().len(), 1);
+            assert_eq!(
+                client
+                    .queue_entry(entry.job_id())
+                    .unwrap()
+                    .unwrap()
+                    .queue_id(),
+                entry.queue_id()
+            );
+        }
+    }
+
+    #[test]
+    fn native_pause_history_1000_cycles_stress() {
+        // This runs in nextest's existing stress group, without #[ignore],
+        // because 1000 real fsynced operator cycles outlast the ordinary limit.
+        let root = tempfile::tempdir().unwrap();
+        let gate = root.path().canonicalize().unwrap().join("controller");
+        for cycle in 0..1000 {
+            let start = 1000 + cycle * 2000;
+            crate::controller::drain::set_drained_at(&gate, true, start).unwrap();
+            assert!(crate::controller::drain::is_drained(&gate).unwrap());
+            crate::controller::drain::set_drained_at(&gate, false, start + 1500).unwrap();
+            assert!(!crate::controller::drain::is_drained(&gate).unwrap());
+            if cycle == 199 {
+                assert_eq!(
+                    crate::controller::drain::elapsed_pause_time(&gate, 1000, 401000).unwrap(),
+                    300000
+                );
+            }
+        }
+        let bytes = std::fs::read(gate.join("integration-gate.json")).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(metadata["windows"].as_array().unwrap().len() <= 256);
+        assert!(bytes.len() <= MAX_PRIVATE_RECORD_BYTES);
+        let pause = crate::controller::drain::elapsed_pause_time(&gate, 1000, 2001000).unwrap();
+        assert!((601000u64 + pause).saturating_sub(2001000) <= 100000);
+    }
+
+    #[test]
     fn a_completed_pause_is_accounted_once_even_when_no_owner_observed_the_drain() {
         let root = tempfile::tempdir().unwrap();
         let paths = paths(&root.path().canonicalize().unwrap());
