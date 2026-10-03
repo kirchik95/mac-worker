@@ -337,6 +337,7 @@ pub enum TaskCommand {
     },
     #[command(about = "Re-drive a blocked integration after repairing its cause")]
     Integrate {
+        /// Task whose configured integration to re-drive
         task_id: TaskId,
     },
     #[command(about = "Re-drive a failed origin delivery after credentials are repaired")]

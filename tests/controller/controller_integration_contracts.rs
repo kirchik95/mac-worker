@@ -437,16 +437,49 @@ fn nested_session_cleanup_can_locate_both_pins_even_when_policy_is_rejected() {
     let wrapped = prepare_integrating_submit(body.clone(), policy).unwrap();
     let mut wire = serde_json::to_value(wrapped).unwrap();
     wire["integration"]["base_oid"] = json!("c".repeat(40));
-    let req = request("task.submit-integrating", wire);
+    let req = request("task.submit-integrating", wire.clone());
     assert!(parse_integrating_submit(&req, &[CONTROLLER_FEATURE_INTEGRATION.to_owned()]).is_err());
+    wire["integration"] = Value::Null;
+    let malformed = request("task.submit-integrating", wire);
+    assert!(
+        parse_integrating_submit(&malformed, &[CONTROLLER_FEATURE_INTEGRATION.to_owned()]).is_err()
+    );
+    assert_eq!(
+        nested_integration_submit(&malformed)
+            .unwrap()
+            .unwrap()
+            .base_oid,
+        body.base_oid
+    );
     let nested = nested_integration_submit(&req).unwrap().unwrap();
     assert_eq!(nested.base_oid, body.base_oid);
     assert_eq!(nested.session_import, body.session_import);
     // Fake source-finished/pin lifecycle sees the very same frozen identities;
     // retries are envelope-only and do not invoke a capture callback.
-    let mut pins = BTreeMap::from([(nested.base_oid.to_string(), true), ("d".repeat(40), true)]);
+    let package = nested
+        .session_import
+        .as_ref()
+        .unwrap()
+        .package_oid()
+        .to_owned();
+    let mut finished = BTreeMap::from([
+        (nested.base_oid.to_string(), true),
+        (package.clone(), false),
+    ]);
+    assert!(
+        ![nested.base_oid.to_string(), package.clone()]
+            .iter()
+            .all(|oid| finished[oid])
+    );
+    finished.insert(package.clone(), true);
+    assert!(
+        [nested.base_oid.to_string(), package.clone()]
+            .iter()
+            .all(|oid| finished[oid])
+    );
+    let mut pins = BTreeMap::from([(nested.base_oid.to_string(), true), (package.clone(), true)]);
     assert!(pins.values().all(|pinned| *pinned));
-    for oid in [nested.base_oid.to_string(), "d".repeat(40)] {
+    for oid in [nested.base_oid.to_string(), package] {
         pins.insert(oid, false);
     }
     assert!(pins.values().all(|pinned| !pinned));

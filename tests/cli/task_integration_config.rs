@@ -120,6 +120,23 @@ fn policy_precedence_freezes_requested_close_and_defaults() {
 fn resolution_requires_origin_and_valid_base_provenance() {
     let mut project = project_policy();
     project.settings.integrate = target("main");
+    let mut overlong = project.clone();
+    // General BranchName remains uncapped; only integration freeze has a bound.
+    overlong.settings.integrate = IntegrationOverride::Target("a".repeat(256).parse().unwrap());
+    assert_eq!(
+        resolve_integration_policy(
+            &overlong,
+            None,
+            &IntegrationOverride::Inherit,
+            None,
+            ClosePolicy::Never,
+            "https://example.test/repo.git",
+            IntegrationBaseKind::Committed
+        )
+        .unwrap_err()
+        .public_code(),
+        "TASK_CONFIG_INVALID"
+    );
     let resolve = |project: &IntegrationProjectPolicy, origin, kind| {
         resolve_integration_policy(
             project,
@@ -339,6 +356,18 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
         assert_eq!(remote[0].policy.stdout_limit, 8 * 1024 * 1024);
         assert_eq!(remote[0].policy.stderr_limit, 64 * 1024);
         for request in requests.iter() {
+            assert!(
+                request
+                    .environment_remove
+                    .iter()
+                    .any(|name| name == "GIT_NAMESPACE")
+            );
+            assert!(
+                request
+                    .environment_remove
+                    .iter()
+                    .any(|name| name == "GIT_SHALLOW_FILE")
+            );
             assert!(!request.args.iter().any(|arg| arg == "fetch"
                 || arg == "update-ref"
                 || arg.to_string_lossy().contains("refs/mac-worker/")));

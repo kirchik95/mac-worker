@@ -354,14 +354,12 @@ pub fn nested_integration_submit(
     #[serde(deny_unknown_fields)]
     struct Nested {
         submit: FrozenSubmitBody,
-        integration: serde_json::Value,
+        #[serde(rename = "integration")]
+        _integration: serde_json::Value,
     }
     // A rejected policy must not hide already-pinned base/session inputs from
     // the existing rollback lifecycle. Do not validate policy on this route.
     let nested: Nested = serde_json::from_value(request.body().clone()).map_err(|_| invalid())?;
-    if !nested.integration.is_object() {
-        return Err(invalid());
-    }
     Ok(Some(nested.submit))
 }
 

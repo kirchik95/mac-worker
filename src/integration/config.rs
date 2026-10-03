@@ -202,7 +202,10 @@ pub fn preflight_integration_base(
     let key = TargetKey::new(origin, branch.as_str())
         .map_err(|_| integration_error("TASK_CONFIG_INVALID"))?;
     let reference = format!("refs/heads/{}", key.branch.as_str());
-    let request = crate::git_transport::origin_ref_request(key.origin, &reference)?;
+    let mut request = crate::git_transport::origin_ref_request(key.origin, &reference)?;
+    request
+        .environment_remove
+        .extend(["GIT_NAMESPACE".into(), "GIT_SHALLOW_FILE".into()]);
     let Ok(result) = runner.run(&request) else {
         return Ok(Unknown);
     };
@@ -240,6 +243,9 @@ pub fn preflight_integration_base(
             operation,
         );
         request.policy.deadline = std::time::Duration::from_secs(30);
+        request
+            .environment_remove
+            .extend(["GIT_NAMESPACE".into(), "GIT_SHALLOW_FILE".into()]);
         request.environment.extend([
             ("GIT_NO_LAZY_FETCH".into(), "1".into()),
             ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
