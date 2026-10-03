@@ -1136,6 +1136,7 @@ fn run_controller_command(
                         )
                     })?;
                     let request = envelope.to_request()?;
+                    require_session_source_finished(&paths, &request)?;
                     let ack = crate::controller::send_controller_mutation(
                         runner,
                         &config.controller,
@@ -1724,6 +1725,7 @@ fn run_task_subcommand(
 ) -> Result<u8, WorkerError> {
     match command {
         TaskCommand::Submit {
+            from_session,
             agent,
             model,
             effort,
@@ -1753,9 +1755,21 @@ fn run_task_subcommand(
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
             let project = project.unwrap_or(runtime.current_dir()?);
             let task_agent = match agent.as_deref() {
-                Some(agent) => parse_task_agent(agent)?,
-                None => client.default_task_agent(&project)?,
+                Some(agent) => {
+                    let agent = parse_task_agent(agent)?;
+                    if let Some(selector) = &from_session {
+                        crate::task_client::require_session_agent(agent, selector)?;
+                    }
+                    agent
+                }
+                None => match &from_session {
+                    Some(selector) => selector.agent().agent_kind(),
+                    None => client.default_task_agent(&project)?,
+                },
             };
+            let client = client
+                .clone()
+                .with_session_selector(from_session, runtime.home());
             let report = client.submit_titled(
                 TaskSubmitRequest {
                     session_import: None,
@@ -2304,8 +2318,14 @@ fn write_task_report_with_interrupt(
             }
         }
         insert_receipt_fields(&mut response, report.failure_receipt());
+        if let Some(summary) = &report.session_submission {
+            response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?;
+        }
         write_json_line(stdout, &response)
     } else {
+        if let Some(summary) = &report.session_submission {
+            write_session_summary(summary, stdout)?;
+        }
         if let Some(interrupted) = interrupted {
             writeln!(
                 stdout,
@@ -4803,6 +4823,7 @@ fn run_enabled_controller_task(
         Command::Task {
             command:
                 TaskCommand::Submit {
+                    from_session,
                     agent,
                     model,
                     effort,
@@ -4833,7 +4854,12 @@ fn run_enabled_controller_task(
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
             let project = project.unwrap_or(runtime.current_dir()?);
             let task_agent = match agent.as_deref() {
-                Some(agent) => parse_task_agent(agent)?,
+                Some(agent) => {
+                    let agent = parse_task_agent(agent)?;
+                    if let Some(selector) = &from_session { crate::task_client::require_session_agent(agent, selector)?; }
+                    agent
+                }
+                None if from_session.is_some() => from_session.as_ref().unwrap().agent().agent_kind(),
                 None => {
                     let settings = crate::project_state::ProjectState::load(runner, &project, &[])?
                         .settings
@@ -4841,11 +4867,13 @@ fn run_enabled_controller_task(
                     parse_task_agent(&settings.default_agent)?
                 }
             };
-            let ack = freeze_and_submit_via_controller(
+            let (ack, session_submission) = freeze_and_submit_via_controller(
                 runner,
                 paths,
                 config,
                 ControllerSubmitFields {
+                    from_session,
+                    capture_home: runtime.home().to_path_buf(),
                     questions,
                     project,
                     prompt,
@@ -4882,22 +4910,23 @@ fn run_enabled_controller_task(
                     crate::controller::ControllerWaitSelector::Task(task_id),
                     None,
                 )?;
-                let report = controller_task_status(runner, config, task_id)?;
+                let mut report = controller_task_status(runner, config, task_id)?;
+                report.session_submission = session_submission;
                 write_task_report(&report, json, stdout)?;
                 return Ok(waited.exit_code());
             }
             if json {
-                write_json_line(
-                    stdout,
-                    &serde_json::json!({
-                        "protocol_version": PROTOCOL_VERSION,
-                        "task_id": controller_ack_id(ack.task_id()),
-                        "turn_id": controller_ack_id(ack.turn_id()),
-                        "request_id": ack.request_id(),
-                        "status": ack.status(),
-                    }),
-                )?;
+                let mut response = serde_json::json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "task_id": controller_ack_id(ack.task_id()),
+                    "turn_id": controller_ack_id(ack.turn_id()),
+                    "request_id": ack.request_id(),
+                    "status": ack.status(),
+                });
+                if let Some(summary) = &session_submission { response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?; }
+                write_json_line(stdout, &response)?;
             } else {
+                if let Some(summary) = &session_submission { write_session_summary(summary, stdout)?; }
                 writeln!(
                     stdout,
                     "task {}: queued (controller)",
@@ -5356,6 +5385,8 @@ fn controller_ack_id(id: Option<&str>) -> &str {
 }
 
 struct ControllerSubmitFields {
+    from_session: Option<crate::session_transfer::SessionSelector>,
+    capture_home: PathBuf,
     questions: Option<crate::task::QuestionsPolicy>,
     project: PathBuf,
     prompt: String,
@@ -5383,8 +5414,16 @@ fn freeze_and_submit_via_controller(
     config: &Config,
     cli: ControllerSubmitFields,
     stderr: &mut dyn Write,
-) -> Result<crate::controller::ControllerAck, WorkerError> {
+) -> Result<
+    (
+        crate::controller::ControllerAck,
+        Option<crate::task_client::SessionSubmission>,
+    ),
+    WorkerError,
+> {
     let ControllerSubmitFields {
+        from_session,
+        capture_home,
         questions,
         project,
         prompt,
@@ -5406,6 +5445,23 @@ fn freeze_and_submit_via_controller(
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
+    let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
+    if let Some(selector) = &from_session {
+        crate::task_client::require_session_agent(agent, selector)?;
+        crate::task_client::require_session_snapshot(runner, &source_name, wip, &probed.context)?;
+        let health =
+            crate::controller::health_read::fetch_controller_health(runner, &config.controller);
+        if !health.features.is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature == crate::features::CONTROLLER_FEATURE_SESSION_IMPORT)
+        }) {
+            return Err(WorkerError::task(
+                "CAPABILITY_MISSING",
+                "controller does not support session import; upgrade and restart the controller",
+            ));
+        }
+    }
     let transfer = crate::transfer_repo::TransferRepo::open_or_create(
         &paths.cache,
         &probed.context.common_dir,
@@ -5414,6 +5470,7 @@ fn freeze_and_submit_via_controller(
     let task_id = crate::task::TaskId::generate();
     let turn_id = crate::task::TurnId::generate();
     let request_id = format!("{:x}", uuid::Uuid::new_v4().simple());
+    let mut pins = crate::task_client::UnpublishedTaskPins::new(&transfer, runner, task_id, true);
     let captured = if wip {
         transfer.build_wip_base(
             runner,
@@ -5441,14 +5498,45 @@ fn freeze_and_submit_via_controller(
         Some("unattended") => "unattended",
         _ => "workspace",
     };
-    let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
     let publish = if publish.is_empty() {
         probed.settings.task.publish.clone()
     } else {
         publish
     };
+    let model = model.or(probed.settings.task.model.clone());
+    let (session_import, session_submission) = if let Some(selector) = &from_session {
+        transfer.check_sensitive_tree(runner, captured.oid(), &probed.settings)?;
+        let (import, summary) = crate::task_client::capture_session(
+            runner,
+            &transfer,
+            task_id,
+            selector,
+            &probed.context.root,
+            &capture_home,
+        )?;
+        (
+            Some(import),
+            Some(crate::task_client::SessionSubmission {
+                default_model: model.is_none(),
+                ..summary
+            }),
+        )
+    } else {
+        (None, None)
+    };
+    let env_profile = env_profile.or(probed.settings.task.env_profile.clone());
+    let mut requirements = probed.requirements.clone();
+    if let Some(import) = &session_import {
+        requirements = crate::task_client::task_requirements(
+            &requirements,
+            agent,
+            env_profile.as_deref(),
+            None,
+        );
+        crate::task_client::add_session_requirements(&mut requirements, import);
+    }
     let body = crate::prepared_submit::FrozenSubmitBody {
-        session_import: None,
+        session_import,
         questions: questions.or(probed.settings.task.questions),
         task_id,
         turn_id,
@@ -5457,14 +5545,14 @@ fn freeze_and_submit_via_controller(
         prompt,
         title,
         agent: agent_name.to_owned(),
-        model: model.or(probed.settings.task.model.clone()),
+        model,
         effort: effort.or(probed.settings.task.effort.clone()),
         source: source_name,
         origin_url: probed.origin.clone(),
         publish,
         publish_branch,
         close_on,
-        env_profile: env_profile.or(probed.settings.task.env_profile.clone()),
+        env_profile,
         worker,
         wip,
         project_id: probed.context.project_id.clone(),
@@ -5475,7 +5563,7 @@ fn freeze_and_submit_via_controller(
         max_budget_usd_cents: limits.turn.max_budget_usd_cents,
         max_followups: limits.max_followups,
         permissions: permissions.to_owned(),
-        requires: probed.requirements.clone(),
+        requires: requirements,
         include_untracked: probed.settings.snapshot.include_untracked.clone(),
         include_empty_dirs: probed.settings.snapshot.include_empty_dirs.clone(),
         allow_sensitive: probed.settings.snapshot.allow_sensitive.clone(),
@@ -5493,6 +5581,9 @@ fn freeze_and_submit_via_controller(
         WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
     })?;
     let request = crate::controller::parse_request(&payload)?;
+    // Envelope persistence can be uncertain after its atomic publication.
+    // Retain both frozen pins before crossing that boundary; retry never recaptures.
+    pins.retain();
     crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
     crate::controller::stream_source_receive(
         runner,
@@ -5503,13 +5594,100 @@ fn freeze_and_submit_via_controller(
         &body.worktree_id,
         captured.oid(),
     )?;
-    crate::controller::send_controller_mutation(
+    if body.session_import.is_some() {
+        record_session_source_finished(paths, &request)?;
+    }
+    let ack = crate::controller::send_controller_mutation(
         runner,
         &config.controller,
         &paths.controller_cache_root(),
         &request,
         stderr,
-    )
+    )?;
+    Ok((ack, session_submission))
+}
+
+// W7 records source-finish on the controller, not in the laptop envelope.
+// Keep a private digest-bound foreground receipt only after W7 verifies finish.
+fn record_session_source_finished(
+    paths: &PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), WorkerError> {
+    let root = crate::rooted_fs::RootedDir::create(
+        &paths.controller_cache_root().join("source-finished"),
+    )?;
+    let name = format!("{}.json", request.request_id());
+    let digest = request.payload_sha256().as_bytes();
+    match root.write_private_atomic_no_replace(&name, digest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if root.read_private_regular(&name, 64)? == digest {
+                Ok(())
+            } else {
+                Err(WorkerError::task(
+                    "CONTROLLER_REQUEST_CONFLICT",
+                    "source finish receipt does not match the frozen request",
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn require_session_source_finished(
+    paths: &PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), WorkerError> {
+    if request.command() != "task.submit"
+        || request
+            .body()
+            .get("session_import")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(());
+    }
+    let finished = (|| -> io::Result<bool> {
+        let root = crate::rooted_fs::RootedDir::open(
+            &paths.controller_cache_root().join("source-finished"),
+        )?;
+        Ok(
+            root.read_private_regular(&format!("{}.json", request.request_id()), 64)?
+                == request.payload_sha256().as_bytes(),
+        )
+    })()
+    .unwrap_or(false);
+    if !finished {
+        return Err(WorkerError::task(
+            "CONTROLLER_SOURCE_CONFLICT",
+            "imported submit's source stream has no verified finish receipt; envelope-only retry is unsafe. Keep the laptop pins and original request; do not recapture the live session. Submit a new --from-session task only after checking controller pending/status for this task",
+        ));
+    }
+    Ok(())
+}
+
+fn write_session_summary(
+    summary: &crate::task_client::SessionSubmission,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    writeln!(
+        stdout,
+        "continuing {} session {} ({} bytes, {} secrets scrubbed): {}",
+        summary.agent.as_str(),
+        &summary.source_id[..summary.source_id.len().min(8)],
+        summary.size,
+        summary.scrubbed,
+        serde_json::to_string(&summary.preview).map_err(io::Error::other)?
+    )?;
+    if summary.recently_modified {
+        writeln!(
+            stdout,
+            "note: the session changed in the last 10 s; the pool gets a snapshot as of now"
+        )?;
+    }
+    if summary.default_model {
+        writeln!(stdout, "note: the worker's default model applies")?;
+    }
+    Ok(())
 }
 
 fn persist_and_send_controller(
@@ -7595,6 +7773,7 @@ mod enabled_submit_freeze_tests {
     fn submit_command(project: PathBuf, no_wait: bool, wait: bool) -> Command {
         Command::Task {
             command: TaskCommand::Submit {
+                from_session: None,
                 agent: None,
                 model: None,
                 effort: None,

@@ -373,6 +373,7 @@ impl PublishRetryReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
+    pub(crate) session_submission: Option<SessionSubmission>,
     task_id: TaskId,
     questions_policy: QuestionsPolicy,
     run_id: Option<RunId>,
@@ -457,6 +458,7 @@ impl TaskReport {
             .and_then(|event| serde_json::from_value(event["auto_continue_turns"].clone()).ok())
             .unwrap_or_default();
         Self {
+            session_submission: None,
             questions_policy,
             task_id: projection.task_id,
             run_id: projection.run_id,
@@ -1135,6 +1137,7 @@ pub struct PreviewIssue {
     pub message: String,
 }
 
+#[derive(Clone)]
 pub struct TaskClient<'a> {
     pub(crate) runner: &'a dyn ProcessRunner,
     pub(crate) config: &'a Config,
@@ -1143,6 +1146,8 @@ pub struct TaskClient<'a> {
     pub(crate) executor: &'a dyn RunnerExecutor,
     pub(crate) herdr_notifier: Option<crate::herdr::HerdrSocket>,
     json_events: bool,
+    // Laptop-only capture intent. Never frozen or copied into batch/DAG nodes.
+    session_selector: Option<(crate::session_transfer::SessionSelector, PathBuf)>,
     #[cfg(any(test, feature = "test-support"))]
     drain_wait: Option<&'a (dyn Fn(Duration) -> Result<(), WorkerError> + Send + Sync)>,
 }
@@ -1163,6 +1168,7 @@ impl<'a> TaskClient<'a> {
             executor,
             herdr_notifier: None,
             json_events: false,
+            session_selector: None,
             #[cfg(any(test, feature = "test-support"))]
             drain_wait: None,
         }
@@ -1172,6 +1178,16 @@ impl<'a> TaskClient<'a> {
     /// finished turns.  Detached runners receive theirs from the CLI.
     pub fn with_herdr_notifier(mut self, socket: Option<crate::herdr::HerdrSocket>) -> Self {
         self.herdr_notifier = socket;
+        self
+    }
+
+    /// Opt in to laptop capture on an ordinary, fresh submit only.
+    pub fn with_session_selector(
+        mut self,
+        selector: Option<crate::session_transfer::SessionSelector>,
+        home: &Path,
+    ) -> Self {
+        self.session_selector = selector.map(|selector| (selector, home.to_path_buf()));
         self
     }
 
@@ -1311,7 +1327,7 @@ impl<'a> TaskClient<'a> {
     /// `original_created_at` instead of copying this body.
     pub(crate) fn submit_with_ids(
         &self,
-        request: TaskSubmitRequest,
+        mut request: TaskSubmitRequest,
         task_id_override: Option<TaskId>,
         turn_id_override: Option<TurnId>,
         title: Option<String>,
@@ -1325,6 +1341,15 @@ impl<'a> TaskClient<'a> {
             self.reconcile_runners()?;
         }
         validate_prompt(&request.prompt)?;
+        if let Some((selector, _)) = &self.session_selector {
+            if frozen.is_some() || request.run_id.is_some() || request.session_import.is_some() {
+                return Err(task_error(
+                    "TASK_CONFIG_INVALID",
+                    "session capture is only supported for ordinary fresh submits",
+                ));
+            }
+            require_session_agent(request.agent, selector)?;
+        }
         validate_task_agent(request.agent)?;
         validate_preference(self.config, &request.preference)?;
 
@@ -1338,7 +1363,7 @@ impl<'a> TaskClient<'a> {
             publish,
             publish_branch,
             source,
-            requirements,
+            mut requirements,
             policy,
             prepared_base,
             settings,
@@ -1562,6 +1587,14 @@ impl<'a> TaskClient<'a> {
                 let publish_names = request.publish.as_deref().unwrap_or(&settings.publish);
                 let publish = parse_publish_modes(publish_names)?;
                 let source_name = request.source.as_deref().unwrap_or(&settings.source);
+                if self.session_selector.is_some() {
+                    require_session_snapshot(
+                        self.runner,
+                        source_name,
+                        request.wip,
+                        &initial.context,
+                    )?;
+                }
                 let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
                 let origin_url = if needs_origin {
                     initial.origin.clone().ok_or_else(|| {
@@ -1594,12 +1627,14 @@ impl<'a> TaskClient<'a> {
                 let affinity = self
                     .client_state
                     .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
-                if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
-                    &observations,
-                    &requirements,
-                    &request.preference,
-                    &affinity,
-                ) {
+                if self.session_selector.is_none()
+                    && let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                        &observations,
+                        &requirements,
+                        &request.preference,
+                        &affinity,
+                    )
+                {
                     if let WorkerPreference::Pinned { worker } = &request.preference
                         && let Some(missing) =
                             rejections.iter().find_map(|rejection| match rejection {
@@ -1679,7 +1714,9 @@ impl<'a> TaskClient<'a> {
                 self.client_state.wait_deadline(),
             )?
         };
-        let built_local_base = matches!(prepared_base, PreparedSubmitBase::Resolve { .. });
+        let unpublished =
+            frozen.is_none() && self.client_state.load_task_optional(task_id)?.is_none();
+        let mut pins = UnpublishedTaskPins::new(&transfer, self.runner, task_id, unpublished);
         let base = match prepared_base {
             PreparedSubmitBase::Ready(base) => base,
             PreparedSubmitBase::Resolve { wip, request_base } => {
@@ -1693,10 +1730,52 @@ impl<'a> TaskClient<'a> {
         if !matches!(source, TaskSource::Origin { .. })
             && let Err(error) = transfer.check_sensitive_tree(self.runner, base.oid(), &settings)
         {
-            if built_local_base {
-                let _ = transfer.release_base(self.runner, task_id);
-            }
             return Err(error);
+        }
+        let session_submission = if let Some((selector, home)) = &self.session_selector {
+            let (import, summary) = capture_session(
+                self.runner,
+                &transfer,
+                task_id,
+                selector,
+                &context.root,
+                home,
+            )?;
+            request.session_import = Some(import);
+            Some(SessionSubmission {
+                default_model: model.is_none(),
+                ..summary
+            })
+        } else {
+            None
+        };
+        if let Some(import) = &request.session_import {
+            add_session_requirements(&mut requirements, import);
+            let observations = self.observe_admission(&request.preference)?;
+            let affinity = self
+                .client_state
+                .affinity_hints(&context.project_id, &context.worktree_id)?;
+            if let Selection::NoEligible { rejections } = SchedulerPolicy::select(
+                &observations,
+                &requirements,
+                &request.preference,
+                &affinity,
+            ) {
+                if let WorkerPreference::Pinned { worker } = &request.preference
+                    && let Some(missing) = rejections.iter().find_map(|rejection| match rejection {
+                        crate::scheduler::CandidateRejection::MissingCapabilities {
+                            name,
+                            missing,
+                        } if name == worker => Some(missing.as_slice()),
+                        _ => None,
+                    })
+                {
+                    return Err(capability_missing(worker, missing));
+                }
+                if !request.wait_for_capacity {
+                    return Err(capacity_busy());
+                }
+            }
         }
         let reserved_branch = publish.contains(&PublishMode::Push).then(|| {
             publish_branch
@@ -1828,7 +1907,6 @@ impl<'a> TaskClient<'a> {
                         record_for_rollback.questions_policy(),
                     );
                     if existing != expected {
-                        let _ = transfer.release_base(self.runner, task_id);
                         return Err(task_error(
                             "TASK_ID_CONFLICT",
                             "task ID is already present with different metadata",
@@ -1849,15 +1927,11 @@ impl<'a> TaskClient<'a> {
                     )
                 }
                 Err(error) => {
-                    let _ = transfer.release_base(self.runner, task_id);
                     return Err(error);
                 }
             }
         };
-        if let Err(error) = validate_prompt(&composed_prompt) {
-            let _ = transfer.release_base(self.runner, task_id);
-            return Err(error);
-        }
+        validate_prompt(&composed_prompt)?;
         let mut preserve_durable = resuming || frozen.is_some();
         if resuming
             && crate::dag::dag_submission_complete(&record_for_rollback)
@@ -1875,6 +1949,8 @@ impl<'a> TaskClient<'a> {
                     request.run_id,
                 )?;
             }
+            pins.retain();
+            drop(pins);
             drop(transfer);
             let mut report = self.report_for(task_id)?;
             report.events.push(event_task_created(&report));
@@ -1892,7 +1968,6 @@ impl<'a> TaskClient<'a> {
                     ) {
                         Ok(run) => Some(run),
                         Err(error) => {
-                            let _ = transfer.release_base(self.runner, task_id);
                             return Err(error);
                         }
                     }
@@ -1901,6 +1976,9 @@ impl<'a> TaskClient<'a> {
             }
         };
         if !resuming {
+            // Creation may publish a record before reporting a final sync failure.
+            // From this point only durable compensation may retire adopted pins.
+            pins.retain();
             match self.client_state.create_task(record_for_rollback.clone()) {
                 Ok(()) => {}
                 Err(error) if error.public_code() == "TASK_ID_CONFLICT" => {
@@ -1939,11 +2017,15 @@ impl<'a> TaskClient<'a> {
                             .client_state
                             .release_run_publish_branch_for_task(run_id, task_id, branch);
                     }
-                    let _ = transfer.release_base(self.runner, task_id);
+                    if unpublished && self.client_state.load_task_optional(task_id)?.is_none() {
+                        transfer.release_task_refs(self.runner, task_id)?;
+                    }
                     return Err(error);
                 }
             }
         }
+        pins.retain();
+        drop(pins);
         let (mut report, queued_turn) = match (|| -> Result<(TaskReport, TurnId), WorkerError> {
             self.client_state
                 .write_task_project_path(&record_for_rollback, &context.root)?;
@@ -2045,6 +2127,7 @@ impl<'a> TaskClient<'a> {
         drop(transfer);
         drop(submit_guard);
         report.events.push(event_task_created(&report));
+        report.session_submission = session_submission;
         if request.attached {
             if drained {
                 self.wait_for_drain_admission(task_id, turn_id, stdout, stderr)?;
@@ -4372,6 +4455,7 @@ impl<'a> TaskClient<'a> {
 
     fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         Ok(TaskReport {
+            session_submission: None,
             questions_policy: record.questions_policy(),
             task_id: record.meta().task_id(),
             run_id: record.meta().run_id(),
@@ -5416,7 +5500,7 @@ impl<'a> TaskClient<'a> {
                 &branch,
             )?;
         }
-        transfer.release_base(self.runner, record.meta().task_id())?;
+        transfer.release_task_refs(self.runner, record.meta().task_id())?;
         let task_id = record.meta().task_id();
         let removed_queue = if let Some(turn_id) = turn_id
             .or(record.submission_rollback_turn_id())
@@ -5839,6 +5923,7 @@ impl<'a> TaskClient<'a> {
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         Ok(TaskReport {
+            session_submission: None,
             questions_policy: record.questions_policy(),
             task_id,
             run_id: record.meta().run_id(),
@@ -5858,6 +5943,7 @@ impl<'a> TaskClient<'a> {
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let observed = self.observe_task(record)?;
         Ok(TaskReport {
+            session_submission: None,
             questions_policy: observed.record.questions_policy(),
             task_id: observed.record.meta().task_id(),
             run_id: observed.record.meta().run_id(),
@@ -5996,7 +6082,7 @@ impl<'a> TaskClient<'a> {
                 turn_id,
                 TaskOutcome::failed("RUNNER_HANDOFF_FAILED"),
             )?;
-            transfer.release_base(self.runner, task_id)?;
+            transfer.release_task_refs(self.runner, task_id)?;
             self.client_state.record_runner(task_id, None)?;
             self.client_state.remove_task_turn_after_terminal(
                 turn_id,
@@ -6020,7 +6106,7 @@ impl<'a> TaskClient<'a> {
             record.meta(),
             self.client_state.wait_deadline(),
         )?;
-        transfer.release_base(self.runner, record.meta().task_id())
+        transfer.release_task_refs(self.runner, record.meta().task_id())
     }
 
     fn observe_admission(
@@ -6515,7 +6601,155 @@ fn task_origin_requirement(meta: &TaskMeta) -> Option<String> {
     meta.origin_requirement()
 }
 
-fn task_requirements(
+/// Foreground-only summary. Source paths and transcripts never enter this DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionSubmission {
+    pub agent: crate::session_transfer::SessionAgent,
+    pub source_id: String,
+    pub package_oid: String,
+    pub size: u64,
+    pub scrubbed: u32,
+    #[serde(skip)]
+    pub preview: String,
+    #[serde(skip)]
+    pub recently_modified: bool,
+    #[serde(skip)]
+    pub default_model: bool,
+}
+
+pub(crate) fn require_session_agent(
+    agent: AgentKind,
+    selector: &crate::session_transfer::SessionSelector,
+) -> Result<(), WorkerError> {
+    if agent != selector.agent().agent_kind() {
+        return Err(task_error(
+            "SESSION_AGENT_MISMATCH",
+            "--agent must match --from-session; drop --agent to use the session's agent",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_session_snapshot(
+    runner: &dyn ProcessRunner,
+    source: &str,
+    wip: bool,
+    context: &crate::project::ProjectContext,
+) -> Result<(), WorkerError> {
+    if source == "origin" {
+        return Err(task_error(
+            "SESSION_REQUIRES_SNAPSHOT",
+            "session import requires --source local (a laptop snapshot)",
+        ));
+    }
+    if context.dirty && !wip {
+        let dirty = crate::transfer_repo::dirty_report(runner, context)?;
+        return Err(task_error(
+            "SESSION_NEEDS_WIP",
+            format!(
+                "checkout has uncommitted changes ({} modified, {} added, {} deleted); add --wip to capture the session's working state",
+                dirty.modified, dirty.added, dirty.deleted
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn add_session_requirements(
+    requirements: &mut Vec<String>,
+    import: &crate::session_transfer::SessionImportMeta,
+) {
+    for requirement in [
+        format!("feature:{}", crate::features::HOST_FEATURE_SESSION_IMPORT),
+        crate::session_transfer::agent_min_requirement(
+            import.agent(),
+            import.source_agent_version(),
+        ),
+    ] {
+        if !requirements.contains(&requirement) {
+            requirements.push(requirement);
+        }
+    }
+}
+
+pub(crate) fn capture_session(
+    runner: &dyn ProcessRunner,
+    transfer: &TransferRepo,
+    task_id: TaskId,
+    selector: &crate::session_transfer::SessionSelector,
+    project_root: &Path,
+    home: &Path,
+) -> Result<
+    (
+        crate::session_transfer::SessionImportMeta,
+        SessionSubmission,
+    ),
+    WorkerError,
+> {
+    use crate::session_transfer::{
+        CaptureContext, SessionImportMeta, capture::capture_for, scrub::Scrubber,
+    };
+    let scrubber = Scrubber::new(vec![]);
+    let cx = CaptureContext {
+        project_root,
+        home,
+        scrubber: &scrubber,
+        now: std::time::SystemTime::now(),
+    };
+    let capture = capture_for(selector.agent());
+    let source = capture.discover(selector, &cx)?;
+    let captured = capture.capture(&source, &cx)?;
+    let oid = transfer.write_session_package(runner, task_id, &captured.package)?;
+    let manifest = captured.package.manifest();
+    let import = SessionImportMeta::new(selector.agent(), &oid, &manifest.source_agent_version)?;
+    let summary = SessionSubmission {
+        agent: selector.agent(),
+        source_id: manifest.source_session_id.clone(),
+        package_oid: oid,
+        size: manifest.files.iter().map(|file| file.bytes).sum(),
+        scrubbed: manifest.scrubbed,
+        preview: captured.first_prompt_preview.unwrap_or_default(),
+        recently_modified: captured.recently_modified,
+        default_model: false,
+    };
+    Ok((import, summary))
+}
+
+/// Covers every fallible pre-publication step, including errors propagated by `?`.
+/// Once a record/envelope may have become durable, its recovery path owns cleanup.
+pub(crate) struct UnpublishedTaskPins<'a> {
+    transfer: &'a TransferRepo,
+    runner: &'a dyn ProcessRunner,
+    task_id: TaskId,
+    armed: bool,
+}
+impl<'a> UnpublishedTaskPins<'a> {
+    pub(crate) fn new(
+        transfer: &'a TransferRepo,
+        runner: &'a dyn ProcessRunner,
+        task_id: TaskId,
+        armed: bool,
+    ) -> Self {
+        Self {
+            transfer,
+            runner,
+            task_id,
+            armed,
+        }
+    }
+    pub(crate) fn retain(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for UnpublishedTaskPins<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.transfer.release_task_refs(self.runner, self.task_id);
+        }
+    }
+}
+
+pub(crate) fn task_requirements(
     project: &[String],
     agent: AgentKind,
     profile: Option<&str>,
@@ -7165,7 +7399,7 @@ fn capacity_busy() -> WorkerError {
 
 fn capability_missing(worker: &str, missing: &[String]) -> WorkerError {
     WorkerError::capacity_public(
-        "CAPABILITY_MISSING",
+        crate::scheduler::rejection_code_for_missing(missing),
         format!(
             "pinned worker {worker} is missing required capabilities: {}",
             missing.join(", ")
@@ -7232,6 +7466,458 @@ fn default_source_name() -> String {
 
 fn default_publish_modes() -> Vec<String> {
     vec!["fetch".into()]
+}
+
+#[cfg(test)]
+mod session_submission_tests {
+    use super::*;
+    use crate::{
+        client_state::ClientStateWritePoint,
+        process::{ProcessRequest, ProcessResult, SystemProcessRunner},
+        session_transfer::{SessionSelector, testing::FakeAgentHome},
+    };
+    use std::{
+        ffi::OsString,
+        os::unix::process::ExitStatusExt,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    struct Remote {
+        version: std::sync::Mutex<String>,
+        fail_after_pin: AtomicBool,
+        fail_release: AtomicBool,
+    }
+    impl ProcessRunner for Remote {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == "/usr/bin/git" {
+                let session = request.args.iter().any(|arg| {
+                    arg.to_str()
+                        .is_some_and(|text| text.starts_with("refs/mac-worker/sessions/"))
+                });
+                let update = request.args.iter().any(|arg| arg == "update-ref");
+                let delete = request.args.iter().any(|arg| arg == "-d");
+                if session && update && delete && self.fail_release.load(Ordering::SeqCst) {
+                    return Err(task_error(
+                        "BASE_UNAVAILABLE",
+                        "injected package release failure",
+                    ));
+                }
+                let result = SystemProcessRunner.run(request)?;
+                if session && update && !delete && self.fail_after_pin.swap(false, Ordering::SeqCst)
+                {
+                    return Err(task_error(
+                        "TASK_CONFIG_INVALID",
+                        "injected failure after package pin",
+                    ));
+                }
+                return Ok(result);
+            }
+            assert_eq!(request.program, OsString::from("/usr/bin/ssh"));
+            assert!(
+                request
+                    .args
+                    .last()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(" host probe")
+            );
+            let probe = serde_json::json!({
+                "protocol_version":crate::protocol::PROTOCOL_VERSION,
+                "supervision_version":crate::protocol::SUPERVISION_VERSION,
+                "features":[crate::features::HOST_FEATURE_SESSION_IMPORT],
+                "hostname":"fixture", "arch":"arm64", "os_version":"26", "free_disk_bytes":100_u64 << 30,
+                "total_disk_bytes":200_u64 << 30, "memory_pressure":"normal", "swap_used_bytes":0,
+                "available_memory_bytes":8_u64 << 30, "slot_state":"idle", "active_lease":null,
+                "capabilities":[], "configured_slots":1, "busy_slots":0,
+                "agent_facts":{ "collected_at_millis":current_time_millis().unwrap(), "agents":[{"name":"codex","version":self.version.lock().unwrap().clone(),"auth":"authenticated","auth_by_profile":[]}], "env_profiles":[],"git_identity":true }, "facts_age_millis":0,
+            });
+            Ok(ProcessResult {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: serde_json::to_vec(&probe).unwrap(),
+                stderr: vec![],
+            })
+        }
+    }
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        home: FakeAgentHome,
+        paths: PathLayout,
+        project: PathBuf,
+        config: Config,
+        remote: Remote,
+        task: TaskId,
+        turn: TurnId,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let project = root.join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("/usr/bin/git")
+                    .env_clear()
+                    .env("HOME", &root)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(&project)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "--initial-branch=main"]);
+            git(&["config", "user.name", "Fixture"]);
+            git(&["config", "user.email", "fixture@example.test"]);
+            std::fs::write(project.join("README"), b"fixture\n").unwrap();
+            git(&["add", "README"]);
+            git(&["commit", "-m", "fixture"]);
+            let home = FakeAgentHome::new();
+            home.codex(
+                "018f0f4a-6b5c-7d8e-9f00-112233445566",
+                project.to_str().unwrap(),
+                "0.160.0",
+                1,
+            );
+            let paths = PathLayout {
+                config: root.join("config.toml"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let config = Config::parse(
+                "version = 1\n[[workers]]\nname = 'fixture'\nssh = 'never-connect'\nslots = 1\n",
+            )
+            .unwrap();
+            Self {
+                _temp: temp,
+                home,
+                paths,
+                project,
+                config,
+                remote: Remote {
+                    version: std::sync::Mutex::new("0.160.0".into()),
+                    fail_after_pin: AtomicBool::new(false),
+                    fail_release: AtomicBool::new(false),
+                },
+                task: TaskId::generate(),
+                turn: TurnId::generate(),
+            }
+        }
+        fn request(&self) -> TaskSubmitRequest {
+            TaskSubmitRequest {
+                session_import: None,
+                questions: None,
+                agent: AgentKind::Codex,
+                model: None,
+                effort: None,
+                prompt: "continue".into(),
+                project: self.project.clone(),
+                base: "HEAD".into(),
+                wip: true,
+                source: None,
+                publish: None,
+                publish_branch: None,
+                cli_includes: vec![],
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                preference: WorkerPreference::Pinned {
+                    worker: "fixture".into(),
+                },
+                wait_for_capacity: true,
+                attached: false,
+                run_id: None,
+            }
+        }
+        fn client<'a>(&'a self, state: &'a ClientStateStore) -> TaskClient<'a> {
+            TaskClient::new(
+                &self.remote,
+                &self.config,
+                &self.paths,
+                state,
+                &crate::turn_runner::InlineRunnerExecutor,
+            )
+            .with_session_selector(
+                Some("codex".parse::<SessionSelector>().unwrap()),
+                self.home.home(),
+            )
+        }
+        fn transfer(&self) -> TransferRepo {
+            let context = ProjectInspector::new(&self.remote)
+                .inspect(&self.project)
+                .unwrap();
+            TransferRepo::open_or_create(&self.paths.cache, &context.common_dir).unwrap()
+        }
+        fn assert_pins(&self, present: bool) {
+            let transfer = self.transfer();
+            for prefix in ["refs/mac-worker/bases/", "refs/mac-worker/sessions/"] {
+                assert_eq!(
+                    transfer.has_ref(&format!("{prefix}{}", self.task)),
+                    present,
+                    "{prefix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_pinned_old_worker_rejection_releases_unpublished_package() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        *fixture.remote.version.lock().unwrap() = "0.158.9".into();
+        let result = fixture.client(&state).submit_with_ids(
+            fixture.request(),
+            Some(fixture.task),
+            Some(fixture.turn),
+            None,
+            &mut vec![],
+            &mut vec![],
+            true,
+            None,
+            None,
+        );
+        assert_eq!(result.unwrap_err().public_code(), "SESSION_AGENT_TOO_OLD");
+        assert!(state.load_task_optional(fixture.task).unwrap().is_none());
+        fixture.assert_pins(false);
+    }
+
+    #[test]
+    fn session_absent_replay_keeps_records_and_prepare_requests_byte_identical() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let original_client = TaskClient::new(
+            &fixture.remote,
+            &fixture.config,
+            &fixture.paths,
+            &state,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        let request = || {
+            let mut request = fixture.request();
+            request.wip = false;
+            request
+        };
+        original_client
+            .submit_with_ids(
+                request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let original = state.load_task(fixture.task).unwrap();
+        let record_bytes = serde_json::to_vec(&original).unwrap();
+        let prepare_request = crate::task_store::TaskPrepareRequest::new(
+            original.meta().clone(),
+            fixture.turn,
+            "fixture",
+        );
+        let prepare_bytes = serde_json::to_vec(&prepare_request).unwrap();
+        // A deliberately unreadable live transcript proves None never discovers or captures.
+        let source = fixture.home.home().join(".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-018f0f4a-6b5c-7d8e-9f00-112233445566.jsonl");
+        std::fs::write(source, b"invalid\n").unwrap();
+        let report = original_client
+            .with_session_selector(None, fixture.home.home())
+            .submit_with_ids(
+                request(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                Some(100),
+            )
+            .unwrap();
+        assert!(report.session_submission.is_none());
+        let replay = state.load_task(fixture.task).unwrap();
+        assert_eq!(record_bytes, serde_json::to_vec(&replay).unwrap());
+        let replay_request = crate::task_store::TaskPrepareRequest::new(
+            replay.meta().clone(),
+            fixture.turn,
+            "fixture",
+        );
+        assert_eq!(prepare_bytes, serde_json::to_vec(&replay_request).unwrap());
+        assert!(
+            !String::from_utf8(record_bytes)
+                .unwrap()
+                .contains("session_import")
+        );
+        assert!(
+            !fixture
+                .transfer()
+                .has_ref(&format!("refs/mac-worker/sessions/{}", fixture.task))
+        );
+    }
+
+    #[test]
+    fn session_replay_and_conflict_preserve_adopted_pins() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let mut request = fixture.request();
+        request.wip = false;
+        fixture
+            .client(&state)
+            .submit_with_ids(
+                request.clone(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                Some(100),
+            )
+            .unwrap();
+        let original = state.load_task(fixture.task).unwrap();
+        request.session_import = original.meta().session_import().cloned();
+        let original_bytes = serde_json::to_vec(&original).unwrap();
+        let client = TaskClient::new(
+            &fixture.remote,
+            &fixture.config,
+            &fixture.paths,
+            &state,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        client
+            .submit_with_ids(
+                request.clone(),
+                Some(fixture.task),
+                Some(fixture.turn),
+                None,
+                &mut vec![],
+                &mut vec![],
+                true,
+                None,
+                Some(100),
+            )
+            .unwrap();
+        request.prompt.push_str(" changed");
+        assert_eq!(
+            client
+                .submit_with_ids(
+                    request,
+                    Some(fixture.task),
+                    Some(fixture.turn),
+                    None,
+                    &mut vec![],
+                    &mut vec![],
+                    true,
+                    None,
+                    Some(100)
+                )
+                .unwrap_err()
+                .public_code(),
+            "TASK_ID_CONFLICT"
+        );
+        assert_eq!(
+            serde_json::to_vec(&state.load_task(fixture.task).unwrap()).unwrap(),
+            original_bytes
+        );
+        assert!(
+            fixture
+                .transfer()
+                .has_ref(&format!("refs/mac-worker/sessions/{}", fixture.task))
+        );
+    }
+
+    #[test]
+    fn session_failure_immediately_after_pin_releases_unpublished_refs() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        fixture.remote.fail_after_pin.store(true, Ordering::SeqCst);
+        let result = fixture.client(&state).submit_with_ids(
+            fixture.request(),
+            Some(fixture.task),
+            Some(fixture.turn),
+            None,
+            &mut vec![],
+            &mut vec![],
+            true,
+            None,
+            None,
+        );
+        assert_eq!(result.unwrap_err().public_code(), "TASK_CONFIG_INVALID");
+        assert!(state.load_task_optional(fixture.task).unwrap().is_none());
+        assert!(state.queue_entry(fixture.turn).unwrap().is_none());
+        fixture.assert_pins(false);
+    }
+
+    #[test]
+    fn session_failure_before_record_releases_base_and_package() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let mut request = fixture.request();
+        request.prompt = "x".repeat(crate::task::MAX_PROMPT_BYTES);
+        let result = fixture.client(&state).submit_with_ids(
+            request,
+            Some(fixture.task),
+            Some(fixture.turn),
+            None,
+            &mut vec![],
+            &mut vec![],
+            true,
+            None,
+            None,
+        );
+        assert_eq!(result.unwrap_err().public_code(), "TASK_PROMPT_TOO_LARGE");
+        assert!(state.load_task_optional(fixture.task).unwrap().is_none());
+        fixture.assert_pins(false);
+    }
+
+    #[test]
+    fn session_rollback_keeps_marker_until_package_release_succeeds() {
+        let fixture = Fixture::new();
+        let state = ClientStateStore::open_with_write_fault(
+            &fixture.paths.state,
+            ClientStateWritePoint::BeforeTurnPromptWrite,
+        )
+        .unwrap();
+        fixture.remote.fail_release.store(true, Ordering::SeqCst);
+        let client = fixture.client(&state);
+        assert!(
+            client
+                .submit_with_ids(
+                    fixture.request(),
+                    Some(fixture.task),
+                    Some(fixture.turn),
+                    None,
+                    &mut vec![],
+                    &mut vec![],
+                    true,
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        let record = state.load_task(fixture.task).unwrap();
+        assert!(
+            record.submission_rollback_turn_id().is_some()
+                || record.submission_intent_turn_id().is_some()
+        );
+        assert!(
+            fixture
+                .transfer()
+                .has_ref(&format!("refs/mac-worker/sessions/{}", fixture.task))
+        );
+        fixture.remote.fail_release.store(false, Ordering::SeqCst);
+        client.reconcile_runners().unwrap();
+        assert!(state.load_task_optional(fixture.task).unwrap().is_none());
+        assert!(state.queue_entry(fixture.turn).unwrap().is_none());
+        fixture.assert_pins(false);
+    }
 }
 
 #[cfg(test)]
