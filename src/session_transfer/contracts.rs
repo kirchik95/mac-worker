@@ -300,6 +300,39 @@ impl TryFrom<SessionImportMetaWire> for SessionImportMeta {
         Ok(meta)
     }
 }
+/// Native version metadata must be numeric with an optional bounded suffix,
+/// and must not carry a value the transcript scrubber would remove.
+pub(super) fn supported_agent_version(version: &str, scrubber: &Scrubber) -> bool {
+    if version.len() > 64 || version.contains('/') {
+        return false;
+    }
+    let numeric = if let Some((numeric, suffix)) = version.split_once(['-', '+']) {
+        if suffix.is_empty()
+            || suffix.len() > 32
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.')
+        {
+            return false;
+        }
+        numeric
+    } else {
+        version
+    };
+    let mut components = 0;
+    if !numeric.split('.').all(|part| {
+        components += 1;
+        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+    }) || !(2..=4).contains(&components)
+    {
+        return false;
+    }
+    let json = serde_json::to_vec(version).expect("version string serializes");
+    scrubber
+        .scrub_line(&json)
+        .is_ok_and(|line| line.replacements == 0)
+}
+
 impl SessionImportMeta {
     pub fn new(
         agent: SessionAgent,
@@ -322,12 +355,7 @@ impl SessionImportMeta {
                 .package_oid
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || self.source_agent_version.is_empty()
-            || self.source_agent_version.len() > 64
-            || !self
-                .source_agent_version
-                .bytes()
-                .all(|b| (33..=126).contains(&b))
+            || !supported_agent_version(&self.source_agent_version, &Scrubber::new(vec![]))
         {
             return Err(session_error(
                 "TASK_CONFIG_INVALID",

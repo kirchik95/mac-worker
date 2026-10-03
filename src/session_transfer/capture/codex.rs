@@ -1,4 +1,4 @@
-use super::{read_complete_lines, relative_inside};
+use super::{RootedSessionFile, complete_lines, relative_inside, unsupported_version};
 use crate::{error::WorkerError, session_transfer::tokens};
 use serde_json::Value;
 use std::{
@@ -50,7 +50,7 @@ impl SessionCapture for CodexCapture {
                 compressed_match |= name.ends_with(&format!("-{id}.jsonl.zst"));
             } else if name.ends_with(".jsonl") {
                 considered += 1;
-                if first_line_cwd(path)
+                if first_line_cwd(&sessions, path)
                     .is_some_and(|cwd| relative_inside(cx.project_root, Path::new(&cwd)).is_ok())
                 {
                     found = Some(path.to_owned());
@@ -83,9 +83,14 @@ impl SessionCapture for CodexCapture {
         {
             return Err(compressed_error());
         }
-        let lines = read_complete_lines(source, MAX_FILE_BYTES)?;
+        let main_file = RootedSessionFile::open(&cx.home.join(".codex/sessions"), source)?;
+        let metadata = main_file.metadata()?;
+        let lines = complete_lines(&main_file.read_bytes(MAX_FILE_BYTES)?)?;
         let id = filename_id(source).ok_or_else(unreadable_meta)?;
         let (cwd, version) = session_meta(lines.first().ok_or_else(unreadable_meta)?, id)?;
+        if !supported_agent_version(&version, cx.scrubber) {
+            return Err(unsupported_version());
+        }
         let source_cwd_relative = relative_inside(cx.project_root, Path::new(&cwd))?;
         let canonical_root = cx
             .project_root
@@ -120,14 +125,12 @@ impl SessionCapture for CodexCapture {
                 bytes: text,
             }],
         )?;
-        let modified = fs::metadata(source)
-            .and_then(|metadata| metadata.modified())
-            .map_err(|_| {
-                session_error(
-                    "SESSION_UNREADABLE",
-                    "cannot read session modification time",
-                )
-            })?;
+        let modified = metadata.modified().map_err(|_| {
+            session_error(
+                "SESSION_UNREADABLE",
+                "cannot read session modification time",
+            )
+        })?;
         // A future mtime (clock skew) is conservatively considered live too.
         let recently_modified = cx
             .now
@@ -184,8 +187,15 @@ fn visit_rollouts(
     Ok(false)
 }
 
-fn first_line_cwd(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+fn first_line_cwd(store_root: &Path, path: &Path) -> Option<String> {
+    RootedSessionFile::open(store_root, path)
+        .ok()?
+        .with_file(|file| Ok(first_line_cwd_in(file)))
+        .ok()
+        .flatten()
+}
+
+fn first_line_cwd_in(file: &File) -> Option<String> {
     let mut reader = BufReader::new(file.take(MAX_META_LINE_BYTES + 1));
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line).ok()?;
@@ -221,14 +231,8 @@ fn session_meta(line: &[u8], id: &str) -> Result<(String, String), WorkerError> 
         .ok_or_else(unreadable_meta)?;
     let version = meta["payload"]["cli_version"]
         .as_str()
-        .ok_or_else(unreadable_meta)?;
-    // Match the frozen SessionImportMeta version grammar, without imposing a
-    // semantic-version policy on native metadata here.
-    if !Path::new(cwd).is_absolute()
-        || version.is_empty()
-        || version.len() > 64
-        || !version.bytes().all(|byte| (33..=126).contains(&byte))
-    {
+        .ok_or_else(unsupported_version)?;
+    if !Path::new(cwd).is_absolute() {
         return Err(unreadable_meta());
     }
     Ok((cwd.to_owned(), version.to_owned()))
@@ -285,4 +289,31 @@ fn compressed_error() -> WorkerError {
         "SESSION_UNREADABLE",
         "compressed Codex sessions are not supported",
     )
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn sec_fix_first_line_cwd_refuses_substituted_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let day = store.join("2026/01/01");
+        fs::create_dir_all(&day).unwrap();
+        let source = day.join("rollout.jsonl");
+        fs::write(
+            &source,
+            b"{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/synthetic/project\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_line_cwd(&store, &source).as_deref(),
+            Some("/synthetic/project")
+        );
+        fs::rename(&day, temp.path().join("original")).unwrap();
+        symlink(temp.path().join("original"), &day).unwrap();
+        assert!(first_line_cwd(&store, &source).is_none());
+    }
 }
