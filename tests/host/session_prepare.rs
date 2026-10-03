@@ -755,6 +755,26 @@ fn manifest_hash_mismatch_is_refused_before_placement() {
     assert!(f.ref_exists(&f.reference()));
 }
 #[test]
+fn raw_package_cap_does_not_charge_manifest_metadata() {
+    let f = Fixture::new();
+    f.lease();
+    // Match SessionPackage's frozen caps: native file bytes total 64 MiB;
+    // manifest metadata is admitted separately under the per-file cap.
+    let tree = format!(
+        "100644 blob {} 1\tmanifest.json\0\
+        100644 blob {} {}\tsession/rollout.jsonl\0",
+        f.oid, f.oid, MAX_PACKAGE_BYTES
+    );
+    let runner = GitFault {
+        tree: Some(tree.into_bytes()),
+        delete: false,
+        blob_reads: AtomicUsize::new(0),
+    };
+    placement_failed(f.prepare_fake(f.meta(true, None), &FakePlace::default(), &runner));
+    // The deliberately invalid blob OID fails at reading, not size admission.
+    assert_eq!(runner.blob_reads.load(Ordering::Relaxed), 1);
+}
+#[test]
 fn tree_caps_and_non_package_entries_are_checked_before_blob_reads() {
     let f = Fixture::new();
     f.lease();
@@ -765,6 +785,12 @@ fn tree_caps_and_non_package_entries_are_checked_before_blob_reads() {
     }
     for tree in [
         header(MAX_PACKAGE_BYTES + 1, "manifest.json"),
+        format!(
+            "{}{}{}",
+            header(0, "manifest.json"),
+            header(MAX_PACKAGE_BYTES, "session/a"),
+            header(1, "session/b")
+        ),
         too_many,
         header(1, "outside"),
         format!("120000 blob {} 1\tsession/link\0", f.oid),

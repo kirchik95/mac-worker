@@ -1001,9 +1001,13 @@ impl<'a> TaskStore<'a> {
             let size = columns[3]
                 .parse::<u64>()
                 .map_err(|_| session_placement_failed())?;
-            total = total
-                .checked_add(size)
-                .ok_or_else(session_placement_failed)?;
+            // SessionPackage caps native bytes; manifest metadata has its
+            // own per-file cap and is not charged against the raw session.
+            if path != PACKAGE_MANIFEST_PATH {
+                total = total
+                    .checked_add(size)
+                    .ok_or_else(session_placement_failed)?;
+            }
             if size > MAX_FILE_BYTES
                 || total > MAX_PACKAGE_BYTES
                 || entries.len() > MAX_PACKAGE_FILES
