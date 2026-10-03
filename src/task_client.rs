@@ -1297,6 +1297,14 @@ impl<'a> TaskClient<'a> {
         let Some(snapshot) = coordinator.snapshot(task)? else {
             return Ok(record.clone());
         };
+        // A receipt remains history after a newer ordinary turn starts. Only
+        // the cycle covering the latest ordinary work supplies mutation rules.
+        if !coordinator.covers_latest_ordinary_work(record, &snapshot)? {
+            if matches!(operation, IntegrationMutation::Say { new_turn: true }) {
+                coordinator.check_ordinary_followup_allowance(record)?;
+            }
+            return Ok(record.clone());
+        }
         if snapshot.state == IntegrationStatus::Integrated {
             if matches!(operation, IntegrationMutation::Cancel) {
                 return Err(IntegrationCode::IntegrationAlreadyCommitted.error());

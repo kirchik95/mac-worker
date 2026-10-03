@@ -1,6 +1,128 @@
 use mac_worker::test_support::integration::*;
 
 #[test]
+fn review_native_target_movement_after_resolve_invalidates_the_old_evidence() {
+    native_target_movement_after(IntegrationTurnPurpose::Resolve);
+}
+
+#[test]
+fn review_native_target_movement_after_verify_invalidates_the_old_evidence() {
+    native_target_movement_after(IntegrationTurnPurpose::Verify);
+}
+
+fn native_target_movement_after(purpose: IntegrationTurnPurpose) {
+    use super::task_integration_lifecycle::native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    f.commit_task();
+    match purpose {
+        IntegrationTurnPurpose::Resolve => {
+            f.advance_target_with("payload.txt", b"theirs\n");
+        }
+        IntegrationTurnPurpose::Verify => {
+            f.record.policy.verify = VerifyPolicy::MovedTarget;
+            f.advance_target();
+        }
+    }
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 0);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let first = queued(&coordinator, &state, f.record.task_id);
+    if purpose == IntegrationTurnPurpose::Resolve {
+        f.write("payload.txt", b"resolved\n");
+    }
+    complete(&f, &state, &turns, &observer, first);
+    let accepted = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(accepted.state, IntegrationStatus::Fetching);
+    assert_eq!(
+        accepted.verification,
+        if purpose == IntegrationTurnPurpose::Resolve {
+            IntegrationVerification::ResolveAgentReport
+        } else {
+            IntegrationVerification::VerifyAgentReport
+        }
+    );
+    let target = f.advance_target_with("later.txt", b"later\n");
+    f.runtime.advance(std::time::Duration::from_millis(1));
+    let moved = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(moved.attempts, 2);
+    assert_eq!(
+        moved.verification,
+        IntegrationVerification::SourceAgentReportOnly
+    );
+    let record = state.load(f.record.task_id).unwrap().unwrap();
+    assert_eq!(record.candidates.last().unwrap().target_head, target);
+    assert_released(&f, &state);
+    let second = queued(&coordinator, &state, f.record.task_id);
+    assert_ne!(first, second);
+    assert_eq!(turns.enqueue_count(first), 1);
+    assert_eq!(turns.enqueue_count(second), 1);
+    assert_eq!(
+        state
+            .load_prepared(f.record.task_id, second)
+            .unwrap()
+            .unwrap()
+            .attempt,
+        2
+    );
+}
+
+#[test]
+fn review_native_unresolved_markers_get_a_second_resolver_then_exhaust_the_budget() {
+    use super::task_integration_lifecycle::native_owner::*;
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    f.commit_task();
+    let target = f.advance_target_with("payload.txt", b"theirs\n");
+    let state = state(&f);
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(observed(&f));
+    let turns = FakeIntegrationTurns::default();
+    let host = Host::new(&f, 0);
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+    let first = queued(&coordinator, &state, f.record.task_id);
+    assert!(
+        std::fs::read_to_string(f.workspace().join("payload.txt"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+    complete(&f, &state, &turns, &observer, first);
+    let retry = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(retry.state, IntegrationStatus::Resolving);
+    assert_eq!(retry.resolve_turns, 2);
+    let second = queued(&coordinator, &state, f.record.task_id);
+    assert_ne!(first, second);
+    complete(&f, &state, &turns, &observer, second);
+    let blocked = coordinator.drive_once(f.record.task_id).unwrap();
+    assert_eq!(blocked.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        blocked.blocked_code,
+        Some(IntegrationCode::IntegrationConflictBudgetExhausted)
+    );
+    assert_eq!(blocked.resolve_turns, 2);
+    assert_eq!(
+        state
+            .load(f.record.task_id)
+            .unwrap()
+            .unwrap()
+            .followups_spent,
+        2
+    );
+    assert_eq!(turns.enqueue_count(first), 1);
+    assert_eq!(turns.enqueue_count(second), 1);
+    assert_eq!(f.origin_tip(), target);
+    assert!(!host.calls.lock().unwrap().contains(&IntegrationStep::Push));
+    assert_released(&f, &state);
+}
+
+#[test]
 fn authoritative_preparation_survives_aux_cas_and_enqueue_crashes() {
     use mac_worker::test_support::task::model::{TaskState, TaskStatus};
     use mac_worker::test_support::task::prepared_followup::PreparedFollowup;
