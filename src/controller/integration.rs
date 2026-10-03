@@ -325,10 +325,19 @@ pub fn nested_integration_submit(
     if request.command() != "task.submit-integrating" {
         return Ok(None);
     }
-    let wrapper: FrozenIntegratingSubmit =
-        serde_json::from_value(request.body().clone()).map_err(|_| invalid())?;
-    validate_integrating_submit(&wrapper)?;
-    Ok(Some(wrapper.submit))
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Nested {
+        submit: FrozenSubmitBody,
+        integration: serde_json::Value,
+    }
+    // A rejected policy must not hide already-pinned base/session inputs from
+    // the existing rollback lifecycle. Do not validate policy on this route.
+    let nested: Nested = serde_json::from_value(request.body().clone()).map_err(|_| invalid())?;
+    if !nested.integration.is_object() {
+        return Err(invalid());
+    }
+    Ok(Some(nested.submit))
 }
 
 pub fn prepare_integration_redrive(
