@@ -758,6 +758,7 @@ mod tests {
     ) -> LocalTaskRecord {
         let task_id = TaskId::new(Uuid::from_u128(1));
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

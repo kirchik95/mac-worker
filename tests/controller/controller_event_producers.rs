@@ -70,6 +70,7 @@ fn task_record_with_base(
     base_oid: mac_worker::test_support::task::model::BaseOid,
 ) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::generate(),
         run_id: None,
         project_id: "a".repeat(64),

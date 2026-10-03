@@ -26,6 +26,7 @@ const REPO_ID: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 
 fn sample_record() -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: TaskId::new(Uuid::from_u128(1)),
         run_id: None,
         project_id: PROJECT_ID.to_owned(),

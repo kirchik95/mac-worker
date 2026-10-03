@@ -95,6 +95,7 @@ mod task_ports {
         let turn = JobId::new(uuid::Uuid::from_u128(seed));
         let base: BaseOid = "a".repeat(40).parse().unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task,
             run_id: None,
             project_id: project.context.project_id.clone(),

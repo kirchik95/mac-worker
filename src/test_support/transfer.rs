@@ -8,7 +8,8 @@ pub use crate::transfer::{
 pub mod git {
     pub use crate::git_transport::{
         FetchReceipt, GitServerExecutor, GitTransport, HostGitService, OBJECT_STORE_SYNC_RECEIPT,
-        ORIGIN_AUTH_FAILED, PushReceipt, ReceivePackComponents, UploadPackComponents,
+        ORIGIN_AUTH_FAILED, PushReceipt, ReceivePackComponents, SessionRefPush,
+        UploadPackComponents,
     };
 }
 pub mod outbox {

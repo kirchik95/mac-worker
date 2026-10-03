@@ -113,6 +113,7 @@ fn oid_of(repo: &GitRepo) -> BaseOid {
 
 fn frozen_body(oid: &BaseOid) -> FrozenSubmitBody {
     FrozenSubmitBody {
+        session_import: None,
         questions: None,
         task_id: TaskId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5566)),
         turn_id: TurnId::new(Uuid::from_u128(0x018f_0f4a_6b5c_7d8e_9f00_1122_3344_5577)),
@@ -228,6 +229,7 @@ fn streamed_source_receipt_binds_real_taskclient_submit_and_result_fetch() {
             identity.worktree_id(),
             identity.expected_oid(),
             repo.root(),
+            None,
         )
         .unwrap();
     let receipt = {
@@ -543,6 +545,7 @@ fn real_no_wait_admission_rejection_terminalises_the_durable_row() {
             identity.worktree_id(),
             identity.expected_oid(),
             repo.root(),
+            None,
         )
         .unwrap();
     {
@@ -863,6 +866,7 @@ fn occupied_slot_no_wait_rejection_survives_freed_capacity_and_replay() {
             identity.worktree_id(),
             identity.expected_oid(),
             repo.root(),
+            None,
         )
         .unwrap();
     {

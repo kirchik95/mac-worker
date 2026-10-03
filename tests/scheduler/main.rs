@@ -14,6 +14,7 @@ mod scheduler_policy;
 mod scheduler_queue;
 
 mod project_preflight_ports;
+mod session_eligibility;
 mod task_diagnostics_ports;
 mod task_ports_fixture;
 mod task_reconciliation_ports;

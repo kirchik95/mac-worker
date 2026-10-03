@@ -384,6 +384,7 @@ fn task_record_in_run(
 ) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id,
         project_id,
@@ -456,6 +457,7 @@ fn closed_push_task_record(
 ) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id,
@@ -784,6 +786,7 @@ fn active_record_with_pending_turn(
 ) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id,
         project_id,
@@ -856,6 +859,7 @@ fn origin_queued_task_record(
 ) -> LocalTaskRecord {
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id,
@@ -1081,6 +1085,7 @@ fn active_task(store: &ClientStateStore, task_number: u128, turn_id: JobId) {
     let task_id = TaskId::new(Uuid::from_u128(task_number));
     let base_oid: BaseOid = "a".repeat(40).parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: Some(TaskRunId::new(Uuid::from_u128(99))),
         project_id: PROJECT_ID.into(),

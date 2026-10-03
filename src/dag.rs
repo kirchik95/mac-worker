@@ -772,6 +772,7 @@ mod tests {
         let base_oid = oid();
         let turn = turn_id.unwrap_or_else(|| JobId::new(Uuid::from_u128(2)));
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

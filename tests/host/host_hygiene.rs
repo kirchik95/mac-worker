@@ -77,6 +77,7 @@ fn write_open_task(store: &HostStore, with_meta: bool) {
     );
     if with_meta {
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id: task,
             run_id: None,
             project_id: PROJECT_ID.into(),

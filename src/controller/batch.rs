@@ -225,6 +225,7 @@ pub fn prepare_task_batch(
             cache_root,
             runner,
             SourceSubmitBind {
+                session_oid: None,
                 request_id: &source.request_id,
                 fingerprint: &fingerprint,
                 project_id: &source.project_id,

@@ -18,9 +18,10 @@ use crate::{
         transfer::{SourceSubmitBind, VerifiedResultMeta, import_controller_result},
     },
     error::WorkerError,
-    git_transport::GitTransport,
+    git_transport::{GitTransport, SessionRefPush},
     job::RequestFingerprint,
     paths::PathLayout,
+    prepared_submit::FrozenSubmitBody,
     process::ProcessRunner,
     project_state::ProjectState,
     protocol::PROTOCOL_VERSION,
@@ -39,11 +40,23 @@ pub fn stream_source_receive(
     worktree_id: &str,
     oid: &BaseOid,
 ) -> Result<(), WorkerError> {
+    let frozen: FrozenSubmitBody =
+        serde_json::from_value(operation.body().clone()).map_err(|_| source_conflict())?;
+    if frozen.project_id != project_id
+        || frozen.worktree_id != worktree_id
+        || frozen.base_oid != *oid
+    {
+        return Err(source_conflict());
+    }
     let fingerprint = RequestFingerprint::new(operation.payload_sha256().to_owned())?;
     stream_nested_source(
         runner,
         controller,
         SourceSubmitBind {
+            session_oid: frozen
+                .session_import
+                .as_ref()
+                .map(|import| import.package_oid()),
             request_id: operation.request_id(),
             fingerprint: &fingerprint,
             project_id,
@@ -63,16 +76,17 @@ pub fn stream_nested_source(
     bind: SourceSubmitBind<'_>,
     local_git: &Path,
 ) -> Result<(), WorkerError> {
-    let prepare = transfer_request(
-        "controller.transfer.source.prepare",
-        json!({
-            "request_id": bind.request_id,
-            "fingerprint": bind.fingerprint.as_str(),
-            "project_id": bind.project_id,
-            "worktree_id": bind.worktree_id,
-            "expected_oid": bind.expected_oid.as_str(),
-        }),
-    )?;
+    let mut body = json!({
+        "request_id": bind.request_id,
+        "fingerprint": bind.fingerprint.as_str(),
+        "project_id": bind.project_id,
+        "worktree_id": bind.worktree_id,
+        "expected_oid": bind.expected_oid.as_str(),
+    });
+    if let Some(oid) = bind.session_oid {
+        body["session_oid"] = json!(oid);
+    }
+    let prepare = transfer_request("controller.transfer.source.prepare", body.clone())?;
     let identity =
         send_controller_read::<ControllerSourcePrepareResult>(runner, controller, &prepare)?
             .into_result();
@@ -83,6 +97,7 @@ pub fn stream_nested_source(
         bind.project_id,
         bind.worktree_id,
         bind.expected_oid,
+        bind.session_oid,
     )?;
     let worker = controller_worker_entry(controller)?;
     let ssh = SshTransport::new(runner).git_ssh_command(&worker)?;
@@ -97,18 +112,11 @@ pub fn stream_nested_source(
         bind.worktree_id,
         bind.expected_oid,
         local_git,
+        bind.session_oid
+            .map(|package_oid| SessionRefPush { package_oid }),
     )?;
-    let finish = transfer_request(
-        "controller.transfer.source.finish",
-        json!({
-            "token": identity.token(),
-            "request_id": bind.request_id,
-            "fingerprint": bind.fingerprint.as_str(),
-            "project_id": bind.project_id,
-            "worktree_id": bind.worktree_id,
-            "expected_oid": bind.expected_oid.as_str(),
-        }),
-    )?;
+    body["token"] = json!(identity.token());
+    let finish = transfer_request("controller.transfer.source.finish", body)?;
     let receipt =
         send_controller_read::<ControllerSourceFinishResult>(runner, controller, &finish)?
             .into_result();
@@ -116,8 +124,10 @@ pub fn stream_nested_source(
         receipt.request_id(),
         receipt.oid(),
         receipt.request_ref(),
+        receipt.session_oid(),
         bind.request_id,
         bind.expected_oid,
+        bind.session_oid,
     )
 }
 
@@ -194,12 +204,14 @@ fn require_source_bind(
     project_id: &str,
     worktree_id: &str,
     oid: &BaseOid,
+    session_oid: Option<&str>,
 ) -> Result<(), WorkerError> {
     if identity.request_id() != expected_request_id
         || identity.fingerprint() != expected_fingerprint
         || identity.project_id() != project_id
         || identity.worktree_id() != worktree_id
         || identity.expected_oid() != oid.as_str()
+        || identity.session_oid() != session_oid
     {
         return Err(source_conflict());
     }
@@ -210,13 +222,16 @@ fn require_receipt_bind(
     returned_request_id: &str,
     returned_oid: &str,
     returned_ref: &str,
+    returned_session_oid: Option<&str>,
     expected_request_id: &str,
     oid: &BaseOid,
+    session_oid: Option<&str>,
 ) -> Result<(), WorkerError> {
     let expected_ref = TransferRepo::frozen_request_ref(expected_request_id)?;
     if returned_request_id != expected_request_id
         || returned_oid != oid.as_str()
         || returned_ref != expected_ref
+        || returned_session_oid != session_oid
     {
         return Err(source_conflict());
     }
@@ -262,6 +277,160 @@ fn transfer_request(command: &str, body: Value) -> Result<ControllerRequest, Wor
         )
     })?;
     parse_request(&payload)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::process::{ProcessRequest, ProcessResult};
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::ExitStatus,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct WrongSessionReply {
+        expected: Option<String>,
+        calls: AtomicUsize,
+    }
+
+    impl ProcessRunner for WrongSessionReply {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(
+                request.program, "/usr/bin/ssh",
+                "invalid reply must never reach Git"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let payload = crate::controller::decode_frame(request.stdin.as_ref().unwrap()).unwrap();
+            let parsed: Value = serde_json::from_slice(payload).unwrap();
+            assert_eq!(parsed["command"], "controller.transfer.source.prepare");
+            let body = &parsed["body"];
+            assert_eq!(
+                body.get("session_oid").and_then(Value::as_str),
+                self.expected.as_deref()
+            );
+            if self.expected.is_none() {
+                assert!(body.get("session_oid").is_none());
+            }
+            let mut result = body.clone();
+            result["token"] = json!("018f0f4a6b5c7d8e9f00112233445599");
+            result["session_oid"] = json!("c".repeat(40));
+            let reply = json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "command": parsed["command"], "request_id": parsed["request_id"],
+                "payload_sha256": crate::controller::canonical_request_sha256(PROTOCOL_VERSION, "controller.transfer.source.prepare", body).unwrap(),
+                "result": result,
+            });
+            Ok(ProcessResult {
+                status: ExitStatus::from_raw(0),
+                stdout: crate::controller::encode_json_frame(&reply).unwrap(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn frozen_session_is_sent_in_prepare_and_a_different_reply_never_pushes() {
+        let project = "a".repeat(64);
+        let worktree = "b".repeat(64);
+        let base: BaseOid = "a".repeat(40).parse().unwrap();
+        for package in [None, Some("b".repeat(40))] {
+            let mut body = json!({
+                "task_id": "018f0f4a6b5c7d8e9f00112233445566",
+                "turn_id": "018f0f4a6b5c7d8e9f00112233445577",
+                "created_at_millis": 1700000000000u64, "prompt": "synthetic continuation",
+                "agent": "codex", "source": "local", "publish": ["fetch"],
+                "close_on": "never", "wip": true, "project_id": project, "worktree_id": worktree,
+                "base_oid": base.as_str(), "timeout_millis": 2700000, "max_followups": 10,
+                "permissions": "workspace", "requires": [], "include_untracked": [],
+                "include_empty_dirs": [], "allow_sensitive": [], "cli_includes": []
+            });
+            if let Some(oid) = &package {
+                body["session_import"] = serde_json::to_value(
+                    crate::session_transfer::SessionImportMeta::new(
+                        crate::session_transfer::SessionAgent::Codex,
+                        oid,
+                        "0.160.0",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let operation = parse_request(
+                &serde_json::to_vec(&json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "request_id": "018f0f4a6b5c7d8e9f00112233445588",
+                    "command": "task.submit", "body": body
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let runner = WrongSessionReply {
+                expected: package,
+                calls: AtomicUsize::new(0),
+            };
+            let controller = ControllerConfig {
+                enabled: true,
+                ssh: "fakecontroller".into(),
+                remote_binary: "~/.local/bin/worker".into(),
+            };
+            let error = stream_source_receive(
+                &runner,
+                &controller,
+                &operation,
+                Path::new("/unused"),
+                &project,
+                &worktree,
+                &base,
+            )
+            .unwrap_err();
+            assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE");
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn prepare_and_finish_identity_compare_optional_session_oids() {
+        let base: BaseOid = "a".repeat(40).parse().unwrap();
+        let expected_session = "b".repeat(40);
+        let request = "018f0f4a6b5c7d8e9f00112233445588";
+        for returned in [None, Some(expected_session.as_str()), Some(base.as_str())] {
+            let mut value = json!({
+                "token": "token", "request_id": request, "fingerprint": "fingerprint",
+                "project_id": "project", "worktree_id": "worktree", "expected_oid": base.as_str()
+            });
+            if let Some(oid) = returned {
+                value["session_oid"] = json!(oid);
+            }
+            let identity: ControllerSourcePrepareResult = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                require_source_bind(
+                    &identity,
+                    request,
+                    "fingerprint",
+                    "project",
+                    "worktree",
+                    &base,
+                    Some(&expected_session)
+                )
+                .is_ok(),
+                returned == Some(expected_session.as_str())
+            );
+            assert_eq!(
+                require_receipt_bind(
+                    request,
+                    base.as_str(),
+                    &TransferRepo::frozen_request_ref(request).unwrap(),
+                    returned,
+                    request,
+                    &base,
+                    Some(&expected_session)
+                )
+                .is_ok(),
+                returned == Some(expected_session.as_str())
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +600,7 @@ mod tests {
                 &project,
                 &worktree,
                 &oid,
+                None,
             )
             .is_err()
         );
@@ -449,6 +619,7 @@ mod tests {
                 &project,
                 &worktree,
                 &oid,
+                None,
             )
             .is_ok()
         );

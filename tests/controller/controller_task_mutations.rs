@@ -162,6 +162,7 @@ fn open_task_record(
     repo_id: String,
 ) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: project_id.to_owned(),

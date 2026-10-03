@@ -230,6 +230,7 @@ fn seeded_record_with(
 ) -> LocalTaskRecord {
     let (task_id, turn_id) = seeded_ids();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: "a".repeat(64),

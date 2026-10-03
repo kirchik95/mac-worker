@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::{
     future::Future,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -115,6 +115,7 @@ mod rooted_fs;
 mod runner_log;
 mod scheduler;
 mod scheduler_adapter;
+pub mod session_transfer;
 mod skills;
 mod snapshot;
 mod supervisor;
@@ -1098,6 +1099,7 @@ fn run_controller_command(
                     "controller pending and retry require enabled controller mode",
                 ));
             }
+            reconcile_controller_submit_pins(&paths, runner, stderr);
             match command {
                 ControllerCommand::Pending { all } => {
                     let envelopes = crate::controller::list_pending_envelopes(
@@ -1135,6 +1137,7 @@ fn run_controller_command(
                         )
                     })?;
                     let request = envelope.to_request()?;
+                    require_session_source_finished(&paths, &request)?;
                     let ack = crate::controller::send_controller_mutation(
                         runner,
                         &config.controller,
@@ -1142,6 +1145,7 @@ fn run_controller_command(
                         &request,
                         stderr,
                     )?;
+                    reconcile_controller_submit_pins(&paths, runner, stderr);
                     write_controller_retry_ack(&request, &ack, json, stdout)?;
                 }
                 _ => unreachable!("recovery command checked above"),
@@ -1723,6 +1727,7 @@ fn run_task_subcommand(
 ) -> Result<u8, WorkerError> {
     match command {
         TaskCommand::Submit {
+            from_session,
             agent,
             model,
             effort,
@@ -1752,11 +1757,24 @@ fn run_task_subcommand(
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
             let project = project.unwrap_or(runtime.current_dir()?);
             let task_agent = match agent.as_deref() {
-                Some(agent) => parse_task_agent(agent)?,
-                None => client.default_task_agent(&project)?,
+                Some(agent) => {
+                    let agent = parse_task_agent(agent)?;
+                    if let Some(selector) = &from_session {
+                        crate::task_client::require_session_agent(agent, selector)?;
+                    }
+                    agent
+                }
+                None => match &from_session {
+                    Some(selector) => selector.agent().agent_kind(),
+                    None => client.default_task_agent(&project)?,
+                },
             };
+            let client = client
+                .clone()
+                .with_session_selector(from_session, runtime.home());
             let report = client.submit_titled(
                 TaskSubmitRequest {
+                    session_import: None,
                     questions,
                     agent: task_agent,
                     model,
@@ -2302,8 +2320,14 @@ fn write_task_report_with_interrupt(
             }
         }
         insert_receipt_fields(&mut response, report.failure_receipt());
+        if let Some(summary) = &report.session_submission {
+            response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?;
+        }
         write_json_line(stdout, &response)
     } else {
+        if let Some(summary) = &report.session_submission {
+            write_session_summary(summary, stdout)?;
+        }
         if let Some(interrupted) = interrupted {
             writeln!(
                 stdout,
@@ -4801,6 +4825,7 @@ fn run_enabled_controller_task(
         Command::Task {
             command:
                 TaskCommand::Submit {
+                    from_session,
                     agent,
                     model,
                     effort,
@@ -4831,7 +4856,12 @@ fn run_enabled_controller_task(
             let limits = make_task_limits(timeout, max_turns, max_budget, max_followups)?;
             let project = project.unwrap_or(runtime.current_dir()?);
             let task_agent = match agent.as_deref() {
-                Some(agent) => parse_task_agent(agent)?,
+                Some(agent) => {
+                    let agent = parse_task_agent(agent)?;
+                    if let Some(selector) = &from_session { crate::task_client::require_session_agent(agent, selector)?; }
+                    agent
+                }
+                None if from_session.is_some() => from_session.as_ref().unwrap().agent().agent_kind(),
                 None => {
                     let settings = crate::project_state::ProjectState::load(runner, &project, &[])?
                         .settings
@@ -4839,11 +4869,13 @@ fn run_enabled_controller_task(
                     parse_task_agent(&settings.default_agent)?
                 }
             };
-            let ack = freeze_and_submit_via_controller(
+            let (ack, session_submission) = freeze_and_submit_via_controller(
                 runner,
                 paths,
                 config,
                 ControllerSubmitFields {
+                    from_session,
+                    capture_home: runtime.home().to_path_buf(),
                     questions,
                     project,
                     prompt,
@@ -4880,22 +4912,23 @@ fn run_enabled_controller_task(
                     crate::controller::ControllerWaitSelector::Task(task_id),
                     None,
                 )?;
-                let report = controller_task_status(runner, config, task_id)?;
+                let mut report = controller_task_status(runner, config, task_id)?;
+                report.session_submission = session_submission;
                 write_task_report(&report, json, stdout)?;
                 return Ok(waited.exit_code());
             }
             if json {
-                write_json_line(
-                    stdout,
-                    &serde_json::json!({
-                        "protocol_version": PROTOCOL_VERSION,
-                        "task_id": controller_ack_id(ack.task_id()),
-                        "turn_id": controller_ack_id(ack.turn_id()),
-                        "request_id": ack.request_id(),
-                        "status": ack.status(),
-                    }),
-                )?;
+                let mut response = serde_json::json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "task_id": controller_ack_id(ack.task_id()),
+                    "turn_id": controller_ack_id(ack.turn_id()),
+                    "request_id": ack.request_id(),
+                    "status": ack.status(),
+                });
+                if let Some(summary) = &session_submission { response["session_import"] = serde_json::to_value(summary).map_err(io::Error::other)?; }
+                write_json_line(stdout, &response)?;
             } else {
+                if let Some(summary) = &session_submission { write_session_summary(summary, stdout)?; }
                 writeln!(
                     stdout,
                     "task {}: queued (controller)",
@@ -5174,6 +5207,7 @@ fn run_enabled_controller_task(
                     runner,
                     &config.controller,
                     crate::controller::SourceSubmitBind {
+                        session_oid: None,
                         request_id: source.request_id(),
                         fingerprint: &fingerprint,
                         project_id: source.project_id(),
@@ -5353,6 +5387,8 @@ fn controller_ack_id(id: Option<&str>) -> &str {
 }
 
 struct ControllerSubmitFields {
+    from_session: Option<crate::session_transfer::SessionSelector>,
+    capture_home: PathBuf,
     questions: Option<crate::task::QuestionsPolicy>,
     project: PathBuf,
     prompt: String,
@@ -5380,8 +5416,16 @@ fn freeze_and_submit_via_controller(
     config: &Config,
     cli: ControllerSubmitFields,
     stderr: &mut dyn Write,
-) -> Result<crate::controller::ControllerAck, WorkerError> {
+) -> Result<
+    (
+        crate::controller::ControllerAck,
+        Option<crate::task_client::SessionSubmission>,
+    ),
+    WorkerError,
+> {
     let ControllerSubmitFields {
+        from_session,
+        capture_home,
         questions,
         project,
         prompt,
@@ -5403,6 +5447,23 @@ fn freeze_and_submit_via_controller(
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
+    let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
+    if let Some(selector) = &from_session {
+        crate::task_client::require_session_agent(agent, selector)?;
+        crate::task_client::require_session_snapshot(runner, &source_name, wip, &probed.context)?;
+        let health =
+            crate::controller::health_read::fetch_controller_health(runner, &config.controller);
+        if !health.features.is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature == crate::features::CONTROLLER_FEATURE_SESSION_IMPORT)
+        }) {
+            return Err(WorkerError::task(
+                "CAPABILITY_MISSING",
+                "controller does not support session import; upgrade and restart the controller",
+            ));
+        }
+    }
     let transfer = crate::transfer_repo::TransferRepo::open_or_create(
         &paths.cache,
         &probed.context.common_dir,
@@ -5411,6 +5472,7 @@ fn freeze_and_submit_via_controller(
     let task_id = crate::task::TaskId::generate();
     let turn_id = crate::task::TurnId::generate();
     let request_id = format!("{:x}", uuid::Uuid::new_v4().simple());
+    let mut pins = crate::task_client::UnpublishedTaskPins::new(&transfer, runner, task_id, true);
     let captured = if wip {
         transfer.build_wip_base(
             runner,
@@ -5438,13 +5500,45 @@ fn freeze_and_submit_via_controller(
         Some("unattended") => "unattended",
         _ => "workspace",
     };
-    let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
     let publish = if publish.is_empty() {
         probed.settings.task.publish.clone()
     } else {
         publish
     };
+    let model = model.or(probed.settings.task.model.clone());
+    let (session_import, session_submission) = if let Some(selector) = &from_session {
+        transfer.check_sensitive_tree(runner, captured.oid(), &probed.settings)?;
+        let (import, summary) = crate::task_client::capture_session(
+            runner,
+            &transfer,
+            task_id,
+            selector,
+            &probed.context.root,
+            &capture_home,
+        )?;
+        (
+            Some(import),
+            Some(crate::task_client::SessionSubmission {
+                default_model: model.is_none(),
+                ..summary
+            }),
+        )
+    } else {
+        (None, None)
+    };
+    let env_profile = env_profile.or(probed.settings.task.env_profile.clone());
+    let mut requirements = probed.requirements.clone();
+    if let Some(import) = &session_import {
+        requirements = crate::task_client::task_requirements(
+            &requirements,
+            agent,
+            env_profile.as_deref(),
+            None,
+        );
+        crate::task_client::add_session_requirements(&mut requirements, import);
+    }
     let body = crate::prepared_submit::FrozenSubmitBody {
+        session_import,
         questions: questions.or(probed.settings.task.questions),
         task_id,
         turn_id,
@@ -5453,14 +5547,14 @@ fn freeze_and_submit_via_controller(
         prompt,
         title,
         agent: agent_name.to_owned(),
-        model: model.or(probed.settings.task.model.clone()),
+        model,
         effort: effort.or(probed.settings.task.effort.clone()),
         source: source_name,
         origin_url: probed.origin.clone(),
         publish,
         publish_branch,
         close_on,
-        env_profile: env_profile.or(probed.settings.task.env_profile.clone()),
+        env_profile,
         worker,
         wip,
         project_id: probed.context.project_id.clone(),
@@ -5471,7 +5565,7 @@ fn freeze_and_submit_via_controller(
         max_budget_usd_cents: limits.turn.max_budget_usd_cents,
         max_followups: limits.max_followups,
         permissions: permissions.to_owned(),
-        requires: probed.requirements.clone(),
+        requires: requirements,
         include_untracked: probed.settings.snapshot.include_untracked.clone(),
         include_empty_dirs: probed.settings.snapshot.include_empty_dirs.clone(),
         allow_sensitive: probed.settings.snapshot.allow_sensitive.clone(),
@@ -5489,6 +5583,14 @@ fn freeze_and_submit_via_controller(
         WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen submit could not be encoded".into())
     })?;
     let request = crate::controller::parse_request(&payload)?;
+    // Independent of the expiring envelope: ACK publication and paired pin
+    // retirement can be recovered even after the envelope is pruned.
+    if body.wip || body.session_import.is_some() {
+        record_controller_submit_pins(paths, &request, &transfer)?;
+    }
+    // Envelope persistence can be uncertain after its atomic publication.
+    // Retain both frozen pins before crossing that boundary; retry never recaptures.
+    pins.retain();
     crate::controller::persist_operation_envelope(&paths.controller_cache_root(), &request)?;
     crate::controller::stream_source_receive(
         runner,
@@ -5499,13 +5601,279 @@ fn freeze_and_submit_via_controller(
         &body.worktree_id,
         captured.oid(),
     )?;
-    crate::controller::send_controller_mutation(
+    if body.wip || body.session_import.is_some() {
+        record_session_source_finished(paths, &request)?;
+    }
+    let ack = crate::controller::send_controller_mutation(
         runner,
         &config.controller,
         &paths.controller_cache_root(),
         &request,
         stderr,
-    )
+    )?;
+    reconcile_controller_submit_pins(paths, runner, stderr);
+    Ok((ack, session_submission))
+}
+
+// A private laptop-only release intent. Request/task/repo identity is immutable;
+// acknowledged is published before the expiring envelope may be settled. No
+// timestamp or absence of an envelope can authorize release.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ControllerSubmitPinRetirement {
+    request_id: String,
+    payload_sha256: String,
+    task_id: crate::task::TaskId,
+    repo_id: String,
+    acknowledged: bool,
+}
+
+const SUBMIT_PIN_RETIREMENTS: &str = "submit-pin-retirements";
+const MAX_SUBMIT_PIN_RETIREMENT_BYTES: u64 = 16 * 1024;
+
+fn record_controller_submit_pins(
+    paths: &PathLayout,
+    request: &crate::controller::ControllerRequest,
+    transfer: &crate::transfer_repo::TransferRepo,
+) -> Result<(), WorkerError> {
+    let body: crate::prepared_submit::FrozenSubmitBody =
+        serde_json::from_value(request.body().clone()).map_err(io::Error::other)?;
+    let marker = ControllerSubmitPinRetirement {
+        request_id: request.request_id().to_owned(),
+        payload_sha256: request.payload_sha256().to_owned(),
+        task_id: body.task_id,
+        repo_id: transfer.repo_id().to_owned(),
+        acknowledged: false,
+    };
+    let root = crate::controller::leader::open_controller_root(
+        &paths.controller_cache_root().join(SUBMIT_PIN_RETIREMENTS),
+    )?;
+    let lock = root.open_private_lock("retirements.lock")?;
+    crate::controller::leader::lock_exclusive(&lock)?;
+    let name = format!("{}.json", request.request_id());
+    let bytes = serde_json::to_vec(&marker).map_err(io::Error::other)?;
+    root.write_private_atomic_no_replace(&name, &bytes)?;
+    Ok(())
+}
+
+/// Called only after the controller ACK has been verified. Persist this proof
+/// before settling the envelope, so pruning cannot erase an interrupted release.
+/// Missing markers are legacy or non-submit operations and own no cleanup here.
+pub(crate) fn acknowledge_controller_submit_pins(
+    cache_root: &Path,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), WorkerError> {
+    if request.command() != "task.submit" {
+        return Ok(());
+    }
+    let root = match crate::rooted_fs::RootedDir::open(&cache_root.join(SUBMIT_PIN_RETIREMENTS)) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let lock = root.open_private_lock("retirements.lock")?;
+    crate::controller::leader::lock_exclusive(&lock)?;
+    let name = format!("{}.json", request.request_id());
+    let bytes = match root.read_private_regular(&name, MAX_SUBMIT_PIN_RETIREMENT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut marker = decode_controller_submit_pins(&name, &bytes)?;
+    if marker.payload_sha256 != request.payload_sha256()
+        || request
+            .body()
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(marker.task_id.to_string().as_str())
+    {
+        return Err(WorkerError::task(
+            "CONTROLLER_REQUEST_CONFLICT",
+            "submit pin retirement does not match the frozen request",
+        ));
+    }
+    let finished = crate::rooted_fs::RootedDir::open(&cache_root.join("source-finished"))?;
+    if finished.read_private_regular(&name, 64)? != request.payload_sha256().as_bytes() {
+        return Err(WorkerError::task(
+            "CONTROLLER_SOURCE_CONFLICT",
+            "submit pin retirement requires a verified source finish",
+        ));
+    }
+    if !marker.acknowledged {
+        marker.acknowledged = true;
+        root.replace_private_regular_exact(
+            &name,
+            &bytes,
+            &serde_json::to_vec(&marker).map_err(io::Error::other)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn decode_controller_submit_pins(
+    name: &str,
+    bytes: &[u8],
+) -> Result<ControllerSubmitPinRetirement, WorkerError> {
+    let marker: ControllerSubmitPinRetirement =
+        serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    crate::controller::protocol::validate_request_id(&marker.request_id)?;
+    if name != format!("{}.json", marker.request_id)
+        || marker.repo_id.len() != 64
+        || marker.payload_sha256.len() != 64
+        || !marker
+            .repo_id
+            .bytes()
+            .chain(marker.payload_sha256.bytes())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(WorkerError::task(
+            "CONTROLLER_REQUEST_CONFLICT",
+            "invalid submit pin retirement identity",
+        ));
+    }
+    Ok(marker)
+}
+
+fn reconcile_controller_submit_pins(
+    paths: &PathLayout,
+    runner: &dyn ProcessRunner,
+    stderr: &mut dyn Write,
+) {
+    let result = (|| -> Result<(), WorkerError> {
+        let root = match crate::rooted_fs::RootedDir::open(
+            &paths.controller_cache_root().join(SUBMIT_PIN_RETIREMENTS),
+        ) {
+            Ok(root) => root,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        // Lock order is retirement -> transfer; no envelope/state/queue lock is held.
+        let lock = root.open_private_lock("retirements.lock")?;
+        crate::controller::leader::lock_exclusive(&lock)?;
+        for name in root.list_names()? {
+            let Some(name) = std::str::from_utf8(&name)
+                .ok()
+                .filter(|name| name.ends_with(".json"))
+            else {
+                continue;
+            };
+            let release = (|| -> Result<(), WorkerError> {
+                let marker = decode_controller_submit_pins(
+                    name,
+                    &root.read_private_regular(name, MAX_SUBMIT_PIN_RETIREMENT_BYTES)?,
+                )?;
+                if !marker.acknowledged {
+                    return Ok(());
+                }
+                crate::transfer_repo::TransferRepo::release_retired_laptop_task_refs(
+                    &paths.cache,
+                    runner,
+                    &marker.repo_id,
+                    marker.task_id,
+                )?;
+                root.remove_owned_regular(name)?;
+                Ok(())
+            })();
+            if let Err(error) = release {
+                let _ = writeln!(
+                    stderr,
+                    "controller submit pin retirement remains pending ({})",
+                    error.public_code()
+                );
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = writeln!(
+            stderr,
+            "controller submit pin retirements could not be reconciled ({})",
+            error.public_code()
+        );
+    }
+}
+
+// W7 records source-finish on the controller, not in the laptop envelope.
+// Keep a private digest-bound foreground receipt only after W7 verifies finish.
+fn record_session_source_finished(
+    paths: &PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), WorkerError> {
+    let root = crate::controller::leader::open_controller_root(
+        &paths.controller_cache_root().join("source-finished"),
+    )?;
+    let name = format!("{}.json", request.request_id());
+    let digest = request.payload_sha256().as_bytes();
+    match root.write_private_atomic_no_replace(&name, digest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if root.read_private_regular(&name, 64)? == digest {
+                Ok(())
+            } else {
+                Err(WorkerError::task(
+                    "CONTROLLER_REQUEST_CONFLICT",
+                    "source finish receipt does not match the frozen request",
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn require_session_source_finished(
+    paths: &PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), WorkerError> {
+    if request.command() != "task.submit"
+        || request
+            .body()
+            .get("session_import")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(());
+    }
+    let finished = (|| -> io::Result<bool> {
+        let root = crate::rooted_fs::RootedDir::open(
+            &paths.controller_cache_root().join("source-finished"),
+        )?;
+        Ok(
+            root.read_private_regular(&format!("{}.json", request.request_id()), 64)?
+                == request.payload_sha256().as_bytes(),
+        )
+    })()
+    .unwrap_or(false);
+    if !finished {
+        return Err(WorkerError::task(
+            "CONTROLLER_SOURCE_CONFLICT",
+            "imported submit's source stream has no verified finish receipt; envelope-only retry is unsafe. Keep the laptop pins and original request; do not recapture the live session. Submit a new --from-session task only after checking controller pending/status for this task",
+        ));
+    }
+    Ok(())
+}
+
+fn write_session_summary(
+    summary: &crate::task_client::SessionSubmission,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    writeln!(
+        stdout,
+        "continuing {} session {} ({} bytes, {} secrets scrubbed): {}",
+        summary.agent.as_str(),
+        &summary.source_id[..summary.source_id.len().min(8)],
+        summary.size,
+        summary.scrubbed,
+        serde_json::to_string(&summary.preview).map_err(io::Error::other)?
+    )?;
+    if summary.recently_modified {
+        writeln!(
+            stdout,
+            "note: the session changed in the last 10 s; the pool gets a snapshot as of now"
+        )?;
+    }
+    if summary.default_model {
+        writeln!(stdout, "note: the worker's default model applies")?;
+    }
+    Ok(())
 }
 
 fn persist_and_send_controller(
@@ -6186,6 +6554,7 @@ mod tests {
         let task_id = TaskId::new(Uuid::from_u128(1));
         let base_oid: BaseOid = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),
@@ -7373,6 +7742,302 @@ mod enabled_submit_freeze_tests {
         }
     }
 
+    struct RetirementReleaseFault {
+        rpc: MockControllerRpc,
+        prefix: &'static str,
+    }
+
+    impl ProcessRunner for RetirementReleaseFault {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.program == "/usr/bin/git"
+                && request.args.iter().any(|arg| arg == "update-ref")
+                && request.args.iter().any(|arg| arg == "-d")
+                && request
+                    .args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with(self.prefix))
+            {
+                return Err(WorkerError::task(
+                    "BASE_UNAVAILABLE",
+                    "injected pin release failure",
+                ));
+            }
+            self.rpc.run(request)
+        }
+    }
+
+    fn pin_retirement_fixture() -> (
+        Fixture,
+        crate::transfer_repo::TransferRepo,
+        crate::controller::ControllerRequest,
+    ) {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.paths.config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &fixture.paths.config,
+            "version = 1\n[controller]\nenabled = true\nssh = 'fakecontroller'\n",
+        )
+        .unwrap();
+        let mut command = submit_command(fixture.repo.clone(), false, false);
+        if let Command::Task {
+            command: TaskCommand::Submit { wip, .. },
+        } = &mut command
+        {
+            *wip = true;
+        } else {
+            unreachable!()
+        }
+        let remote = RetirementReleaseFault {
+            rpc: MockControllerRpc::new(),
+            prefix: "refs/mac-worker/bases/",
+        };
+        let mut stderr = vec![];
+        assert_eq!(
+            crate::run_enabled_controller_task(
+                command,
+                &remote,
+                &fixture.runtime,
+                &fixture.paths,
+                &fixture.config,
+                true,
+                &mut vec![],
+                &mut stderr,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("retirement remains pending")
+        );
+        let envelope = std::fs::read_dir(fixture.paths.controller_cache_root())
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("op-"))
+            .unwrap()
+            .path();
+        let value: Value = serde_json::from_slice(&std::fs::read(envelope).unwrap()).unwrap();
+        let request = load_operation_envelope(
+            &fixture.paths.controller_cache_root(),
+            value["request_id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .unwrap()
+        .to_request()
+        .unwrap();
+        let context = crate::project::ProjectInspector::new(&crate::process::SystemProcessRunner)
+            .inspect(&fixture.repo)
+            .unwrap();
+        let transfer = crate::transfer_repo::TransferRepo::open_or_create(
+            &fixture.paths.cache,
+            &context.common_dir,
+        )
+        .unwrap();
+        let task: TaskId = request.body()["task_id"].as_str().unwrap().parse().unwrap();
+        let base: BaseOid = request.body()["base_oid"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        transfer
+            .pin_object(
+                &crate::process::SystemProcessRunner,
+                &format!("refs/mac-worker/sessions/{task}"),
+                &base,
+            )
+            .unwrap();
+        (fixture, transfer, request)
+    }
+
+    #[test]
+    fn controller_pin_retirement_recovers_after_prune_partial_release_and_source_removal() {
+        let (fixture, transfer, request) = pin_retirement_fixture();
+        let task = request.body()["task_id"].as_str().unwrap();
+        let marker = fixture
+            .paths
+            .controller_cache_root()
+            .join(super::SUBMIT_PIN_RETIREMENTS)
+            .join(format!("{}.json", request.request_id()));
+        let pending: super::ControllerSubmitPinRetirement =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert!(pending.acknowledged);
+        std::fs::remove_file(
+            fixture
+                .paths
+                .controller_cache_root()
+                .join(format!("op-{}.json", request.request_id())),
+        )
+        .unwrap();
+        let partial = RetirementReleaseFault {
+            rpc: MockControllerRpc::new(),
+            prefix: "refs/mac-worker/sessions/",
+        };
+        super::reconcile_controller_submit_pins(&fixture.paths, &partial, &mut vec![]);
+        assert!(!transfer.has_ref(&format!("refs/mac-worker/bases/{task}")));
+        assert!(transfer.has_ref(&format!("refs/mac-worker/sessions/{task}")));
+        assert!(marker.exists());
+        // Cleanup uses the frozen cache id, not a live source checkout.
+        std::fs::remove_dir_all(&fixture.repo).unwrap();
+        assert_eq!(
+            super::run_controller_command(
+                crate::cli::ControllerCommand::Pending { all: true },
+                true,
+                Some(fixture.paths.config.clone()),
+                &fixture.runtime,
+                &crate::process::SystemProcessRunner,
+                &mut vec![],
+                &mut vec![],
+            ),
+            0
+        );
+        assert!(!transfer.has_ref(&format!("refs/mac-worker/sessions/{task}")));
+        assert!(!marker.exists());
+        super::reconcile_controller_submit_pins(
+            &fixture.paths,
+            &crate::process::SystemProcessRunner,
+            &mut vec![],
+        );
+    }
+
+    #[test]
+    fn controller_pin_retirement_handles_multiple_submits_on_one_laptop() {
+        let (fixture, transfer, first) = pin_retirement_fixture();
+        let mut command = submit_command(fixture.repo.clone(), false, false);
+        if let Command::Task {
+            command: TaskCommand::Submit { wip, .. },
+        } = &mut command
+        {
+            *wip = true;
+        } else {
+            unreachable!()
+        }
+        let remote = MockControllerRpc::new();
+        assert_eq!(
+            crate::run_enabled_controller_task(
+                command,
+                &remote,
+                &fixture.runtime,
+                &fixture.paths,
+                &fixture.config,
+                true,
+                &mut vec![],
+                &mut vec![],
+            )
+            .unwrap(),
+            0
+        );
+        let second = remote.submit_bodies.lock().unwrap()[0]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for task in [first.body()["task_id"].as_str().unwrap(), &second] {
+            for prefix in ["bases", "sessions"] {
+                assert!(!transfer.has_ref(&format!("refs/mac-worker/{prefix}/{task}")));
+            }
+        }
+        assert!(
+            !std::fs::read_dir(
+                fixture
+                    .paths
+                    .controller_cache_root()
+                    .join(super::SUBMIT_PIN_RETIREMENTS)
+            )
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        );
+    }
+
+    #[test]
+    fn controller_pin_retirement_never_uses_age_absence_or_unverified_finish_as_ack() {
+        let (fixture, transfer, request) = pin_retirement_fixture();
+        let task = request.body()["task_id"].as_str().unwrap();
+        let root = crate::rooted_fs::RootedDir::open(
+            &fixture
+                .paths
+                .controller_cache_root()
+                .join(super::SUBMIT_PIN_RETIREMENTS),
+        )
+        .unwrap();
+        let name = format!("{}.json", request.request_id());
+        let bytes = root
+            .read_private_regular(&name, super::MAX_SUBMIT_PIN_RETIREMENT_BYTES)
+            .unwrap();
+        let mut marker: super::ControllerSubmitPinRetirement =
+            serde_json::from_slice(&bytes).unwrap();
+        marker.acknowledged = false;
+        root.replace_private_regular_exact(&name, &bytes, &serde_json::to_vec(&marker).unwrap())
+            .unwrap();
+        std::fs::remove_file(
+            fixture
+                .paths
+                .controller_cache_root()
+                .join(format!("op-{}.json", request.request_id())),
+        )
+        .unwrap();
+        let finished = fixture
+            .paths
+            .controller_cache_root()
+            .join("source-finished")
+            .join(&name);
+        std::fs::remove_file(&finished).unwrap();
+        assert!(
+            super::acknowledge_controller_submit_pins(
+                &fixture.paths.controller_cache_root(),
+                &request
+            )
+            .is_err()
+        );
+        super::reconcile_controller_submit_pins(
+            &fixture.paths,
+            &crate::process::SystemProcessRunner,
+            &mut vec![],
+        );
+        for prefix in ["bases", "sessions"] {
+            assert!(transfer.has_ref(&format!("refs/mac-worker/{prefix}/{task}")));
+        }
+        // A digest mismatch cannot make the marker releasable either.
+        crate::rooted_fs::RootedDir::open(finished.parent().unwrap())
+            .unwrap()
+            .write_private_atomic_no_replace(&name, b"wrong digest")
+            .unwrap();
+        assert!(
+            super::acknowledge_controller_submit_pins(
+                &fixture.paths.controller_cache_root(),
+                &request
+            )
+            .is_err()
+        );
+        // Even a verified ACK must leave its envelope pending if the
+        // independent cleanup proof cannot be saved with verified finish.
+        crate::controller::send_controller_mutation(
+            &MockControllerRpc::new(),
+            &fixture.config.controller,
+            &fixture.paths.controller_cache_root(),
+            &request,
+            &mut vec![],
+        )
+        .unwrap();
+        let envelope =
+            load_operation_envelope(&fixture.paths.controller_cache_root(), request.request_id())
+                .unwrap()
+                .unwrap();
+        assert!(serde_json::to_value(envelope).unwrap()["outcome"].is_null());
+        std::fs::remove_file(finished).unwrap();
+        super::record_session_source_finished(&fixture.paths, &request).unwrap();
+        super::acknowledge_controller_submit_pins(&fixture.paths.controller_cache_root(), &request)
+            .unwrap();
+        super::reconcile_controller_submit_pins(
+            &fixture.paths,
+            &crate::process::SystemProcessRunner,
+            &mut vec![],
+        );
+        for prefix in ["bases", "sessions"] {
+            assert!(!transfer.has_ref(&format!("refs/mac-worker/{prefix}/{task}")));
+        }
+    }
+
     fn git(repo: &std::path::Path, args: &[&str]) {
         let output = SystemCommand::new("/usr/bin/git")
             .current_dir(repo)
@@ -7590,6 +8255,7 @@ mod enabled_submit_freeze_tests {
     fn submit_command(project: PathBuf, no_wait: bool, wait: bool) -> Command {
         Command::Task {
             command: TaskCommand::Submit {
+                from_session: None,
                 agent: None,
                 model: None,
                 effort: None,

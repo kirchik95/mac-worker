@@ -49,6 +49,96 @@ pub use active_tasks::{
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod session_claim_tests {
+    use super::*;
+    use crate::scheduler::CandidateSlot;
+
+    #[test]
+    fn session_version_gate_is_rechecked_at_queue_claim() {
+        let now = 10_000;
+        for (version, age, expected) in [
+            (Some("0.160.0"), Some(0), true),
+            (Some("0.159.3"), Some(FACTS_TTL), true),
+            (Some("0.158.9"), Some(0), false),
+            (Some("0.160.0"), Some(FACTS_TTL + 1), false),
+            (Some("0.160.0"), None, false),
+            (None, Some(0), false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store =
+                ClientStateStore::open(&root.path().canonicalize().unwrap().join("state")).unwrap();
+            let owner = ProcessIdentity::new(std::process::id(), 100).unwrap();
+            let turn = JobId::generate();
+            let entry = QueueEntry::new(
+                turn,
+                store.client_id(),
+                "a".repeat(64),
+                "b".repeat(64),
+                crate::job::CommandSpec::argv(vec!["task".into()])
+                    .unwrap()
+                    .summary()
+                    .unwrap(),
+                vec!["agent:codex".into(), "agent-min:codex@0.160.0".into()],
+                WorkerPreference::Pinned {
+                    worker: "fixture".into(),
+                },
+                QueueEntryKind::TaskTurn,
+                None,
+                owner,
+                1,
+            )
+            .unwrap();
+            let enqueued = store.enqueue(entry).unwrap();
+            let before = serde_json::to_vec(&enqueued).unwrap();
+            let observation = AdmissionObservation::new(
+                "fixture".into(),
+                true,
+                CandidateSlot::Idle,
+                vec!["agent:codex".into()],
+                Some(8 << 30),
+                100 << 30,
+                now,
+            )
+            .unwrap()
+            .with_local_binding(
+                "fake-host".into(),
+                "~/.local/bin/worker".into(),
+                vec![],
+                1,
+                age,
+                now,
+            )
+            .with_agent_versions(
+                version
+                    .map(|v| BTreeMap::from([("codex".into(), v.into())]))
+                    .unwrap_or_default(),
+            );
+            store.publish_admission_observation(observation).unwrap();
+            let claimed = store
+                .claim_task_turn_with_slot_ceilings(
+                    owner,
+                    turn,
+                    &["fixture".into()],
+                    now,
+                    &BTreeMap::from([("fixture".into(), 1)]),
+                )
+                .unwrap();
+            assert_eq!(
+                claimed.is_some(),
+                expected,
+                "version={version:?} age={age:?}"
+            );
+            if !expected {
+                assert_eq!(
+                    serde_json::to_vec(&store.queue_entry(turn).unwrap().unwrap()).unwrap(),
+                    before
+                );
+            }
+        }
+    }
+}
+
 use crate::{
     agent_facts::FACTS_TTL,
     config::Config,
@@ -1670,7 +1760,13 @@ impl ClientStateStore {
                             observation.free_disk_bytes(),
                         )
                         .map(|candidate| {
-                            candidate.with_interactive_agents(observation.interactive_agents())
+                            candidate
+                                .with_agent_versions(if observation.facts_fresh_at(now_millis) {
+                                    observation.agent_versions().clone()
+                                } else {
+                                    Default::default()
+                                })
+                                .with_interactive_agents(observation.interactive_agents())
                         })
                         .map_err(|_| {
                             WorkerError::Protocol("cached scheduler observation is invalid".into())
@@ -1973,11 +2069,12 @@ impl ClientStateStore {
                 if occupied >= usize::from(ceiling) {
                     continue;
                 }
-                let capabilities = read_observation_optional(
-                    self.inner.observations.as_raw_fd(),
-                    worker,
-                )?
-                .map(|observation| observation.capabilities().to_vec());
+                let observation = read_observation_optional(self.inner.observations.as_raw_fd(), worker)?;
+                let capabilities = observation.as_ref().map(|observation| observation.capabilities());
+                let empty_versions = BTreeMap::new();
+                let agent_versions = observation.as_ref()
+                    .filter(|observation| observation.facts_fresh_at(claimed_at_millis))
+                    .map_or(&empty_versions, AdmissionObservation::agent_versions);
                 for index in 0..snapshot.entries.len() {
                     let candidate = &snapshot.entries[index];
                     if candidate.kind() != QueueEntryKind::TaskTurn
@@ -1986,14 +2083,14 @@ impl ClientStateStore {
                     }
                     if !matches!(candidate.state(), QueueState::Waiting { owner: row_owner } if *row_owner == owner)
                         || candidate.is_cancel_requested()
-                        || !candidate.eligible_for(worker, capabilities.as_deref())
+                        || !candidate.eligible_for(worker, capabilities, agent_versions)
                         || !self.run_has_capacity(snapshot, candidate)?
                     {
                         continue;
                     }
                     let mut blocked = false;
                     for older in &snapshot.entries[..index] {
-                        if self.blocks_queue_claim(snapshot, older, candidate, worker, capabilities.as_deref(), owner, &tasks)? {
+                        if self.blocks_queue_claim(snapshot, older, candidate, worker, capabilities, agent_versions, owner, &tasks)? {
                             blocked = true;
                             break;
                         }
@@ -8257,7 +8354,9 @@ fn advisory_now_millis() -> u64 {
 /// The admission cache may still list them; the advisory view must not.
 fn advisory_capabilities(observation: &AdmissionObservation, now_millis: u64) -> Vec<String> {
     let mut capabilities = observation.capabilities().to_vec();
-    if now_millis.saturating_sub(observation.observed_at_millis()) > FACTS_TTL {
+    if now_millis.saturating_sub(observation.observed_at_millis()) > FACTS_TTL
+        || (observation.binding_complete() && !observation.facts_fresh_at(now_millis))
+    {
         capabilities.retain(|capability| !capability.starts_with("agent:"));
     }
     capabilities

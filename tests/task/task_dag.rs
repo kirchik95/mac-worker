@@ -195,6 +195,7 @@ fn open_store() -> (tempfile::TempDir, PathBuf, ClientStateStore) {
 
 fn intent_task(run_id: RunId, task_id: TaskId, turn_id: TurnId) -> LocalTaskRecord {
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: Some(run_id),
         project_id: PROJECT_ID.to_owned(),
@@ -1398,6 +1399,7 @@ fn plant_rollback_incomplete_matching_frozen(fixture: &FrozenDagFixture) {
         })
         .collect();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: node.task_id,
         run_id: Some(fixture.run_id),
         project_id: node.frozen.project_id.clone(),
@@ -1645,6 +1647,7 @@ fn dag_first_submit_start_runner_failure_is_not_hidden_by_a_queued_row() {
     let error = TaskClient::new(&runner, &config, &paths, &store, &executor)
         .submit(
             TaskSubmitRequest {
+                session_import: None,
                 questions: None,
                 agent: AgentKind::Codex,
                 model: None,

@@ -38,6 +38,38 @@ use crate::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::host_store::HostStoreWritePoint;
 
+/// Import metadata is immutable, so publication, interrupted publication and
+/// accepted replay all enforce the same first-turn resume/binding contract.
+fn validate_imported_first_turn(
+    task_store: &TaskStore<'_>,
+    meta: &crate::task::TaskMeta,
+    turn: &crate::turn::TurnMaterial,
+) -> Result<(), WorkerError> {
+    if meta.session_import().is_none() || turn.turn_number() != 1 {
+        return Ok(());
+    }
+    if !turn.resume() {
+        return Err(protocol_code(
+            "TASK_SESSION_CONFLICT",
+            "imported first turn must resume the placed session",
+        ));
+    }
+    let binding = task_store
+        .session(meta.project_id(), meta.task_id())?
+        .ok_or_else(|| {
+            protocol_code("SESSION_UNBOUND", "imported turn requires a bound session")
+        })?;
+    if binding.agent() != meta.agent()
+        || binding.session_ref() != crate::session_transfer::imported_session_id(&meta.task_id())
+    {
+        return Err(protocol_code(
+            "TASK_SESSION_CONFLICT",
+            "imported turn has a different agent session binding",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) const EXECUTION_PAYLOAD_VERSION: u32 = 2;
 const MAX_HOST_JSON_BYTES: u64 = 1024 * 1024;
 const CANCEL_SUPERVISOR_HANDOFF_DEADLINE: Duration = Duration::from_secs(5);
@@ -400,6 +432,7 @@ impl<'a> JobService<'a> {
             require_matching_accepted(&disposition, &submit)?;
             let replay_meta = task_store.load_meta(material.project_id(), turn.task_id())?;
             validate_turn_origin(&replay_meta, request.origin_url())?;
+            validate_imported_first_turn(&task_store, &replay_meta, &turn)?;
             let task_status = task_store.load_status(material.project_id(), turn.task_id())?;
             if let Some(lease) = self
                 .leases
@@ -544,6 +577,7 @@ impl<'a> JobService<'a> {
                 "turn does not match the prepared task",
             ));
         }
+        validate_imported_first_turn(&task_store, &meta, &turn)?;
         if turn.resume()
             && task_store
                 .session(material.project_id(), turn.task_id())?
@@ -577,7 +611,10 @@ impl<'a> JobService<'a> {
                 &initial_status,
                 job_meta.created_at_millis(),
             )?;
-            if turn.agent() == crate::agent::AgentKind::Claude && !turn.resume() {
+            if turn.agent() == crate::agent::AgentKind::Claude
+                && !turn.resume()
+                && meta.session_import().is_none()
+            {
                 task_store.bind_session(
                     material.project_id(),
                     turn.task_id(),
@@ -649,7 +686,10 @@ impl<'a> JobService<'a> {
         )?;
         self.store
             .record_accepted_after(&published, &submit, &initial_status, now_millis()?)?;
-        if turn.agent() == crate::agent::AgentKind::Claude && !turn.resume() {
+        if turn.agent() == crate::agent::AgentKind::Claude
+            && !turn.resume()
+            && meta.session_import().is_none()
+        {
             task_store.bind_session(
                 material.project_id(),
                 turn.task_id(),

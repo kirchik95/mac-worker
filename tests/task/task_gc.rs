@@ -134,6 +134,7 @@ fn set_ref(path: &Path, reference: &str, oid: &str) {
 
 fn task_meta(task_id: TaskId, base_oid: BaseOid, created_at_millis: u64) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: PROJECT_ID.into(),

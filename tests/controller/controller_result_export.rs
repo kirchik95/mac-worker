@@ -185,6 +185,7 @@ fn bind_task(isolated: &Isolated, task_id: TaskId, request_id: &str, fingerprint
 
 fn submit_body(task: u128, turn: u128, oid: &BaseOid) -> FrozenSubmitBody {
     FrozenSubmitBody {
+        session_import: None,
         questions: None,
         task_id: task_n(task),
         turn_id: turn_n(turn),
@@ -315,6 +316,7 @@ fn task_meta(task: u128, oid: &BaseOid) -> TaskMeta {
 
 fn task_meta_in(task: u128, oid: &BaseOid, project_id: &str, worktree_id: &str) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_n(task),
         run_id: None,
         project_id: project_id.into(),

@@ -71,6 +71,7 @@ fn task_meta(base_oid: BaseOid) -> TaskMeta {
 
 fn task_meta_for(task_id: TaskId, base_oid: BaseOid) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -417,6 +418,7 @@ fn origin_prepare_fetches_the_exact_base_before_workspace_creation() {
     acquire_lease(&store);
     let base_oid: BaseOid = "0123456789012345678901234567890123456789".parse().unwrap();
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -498,6 +500,7 @@ fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
         }
     }
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -542,6 +545,7 @@ fn origin_prepare_pins_the_base_ref_and_rejects_a_conflicting_oid() {
             .unwrap();
     }
     let other = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),
@@ -1468,6 +1472,7 @@ fn prepare_rejects_wrong_project_before_creating_a_task() {
     acquire_task_lease_request(&store, &task_scope);
     let (admission, transfer) = transfer_guard_for(&store, other_job);
     let wrong_meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: other_project.into(),

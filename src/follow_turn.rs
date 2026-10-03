@@ -506,6 +506,7 @@ mod tests {
         let task_id = TaskId::new(Uuid::from_u128(1));
         let job_id = JobId::new(Uuid::from_u128(2));
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: PROJECT.into(),

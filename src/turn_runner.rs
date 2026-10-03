@@ -18,7 +18,7 @@ use crate::{
     client_state::{ClientStateStore, ReservedSlotTakeover, RunnerSlotDecision},
     config::{Config, WorkerEntry},
     error::WorkerError,
-    git_transport::GitTransport,
+    git_transport::{GitTransport, SessionRefPush},
     job::{
         CommandSpec, ExecutionScope, LeaseAcquireRequest, LeaseAcquireResponse, LeaseRecord,
         LeaseToken, LogCursor, LogStream, ProcessIdentity, QueueEntryKind, QueueState,
@@ -29,6 +29,7 @@ use crate::{
     project_state::ProjectState,
     runner_log::{Completion, RunnerLog as LogWriter},
     scheduler::{CandidateObservation, SchedulerPolicy, WorkerPreference},
+    session_transfer::imported_session_id,
     supervisor::SystemProcessInspector,
     task::{
         ClosePolicy, LocalTaskRecord, RunnerIdentity, TaskId, TaskOutcome, TaskState, TaskStatus,
@@ -42,6 +43,13 @@ use crate::{
     transfer_repo::TransferRepo,
     turn::{TaskTurnRequest, TurnMaterial},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnStart {
+    Fresh,
+    Imported,
+    FollowUp,
+}
 
 const LOG_CHUNK_LIMIT: u32 = 64 * 1024;
 const EARLY_EXIT_DIAGNOSTIC_LIMIT: usize = 256;
@@ -771,7 +779,7 @@ impl<'a> TurnRunner<'a> {
             && let Ok(transfer) =
                 crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
-            transfer.release_base(self.runner, task_id)?;
+            transfer.release_task_refs(self.runner, task_id)?;
             self.client_state.record_runner(task_id, None)?;
             let _ = self
                 .client_state
@@ -1204,8 +1212,13 @@ impl<'a> TurnRunner<'a> {
         // A first turn may already have bound its agent session before a
         // crash leaves the local prompt in place. Turn number, rather than
         // the mutable session-present projection, is the durable distinction
-        // between first launch and a follow-up launch.
-        let resume = turn_number > 1;
+        // between first launch and a follow-up launch. Immutable import meta
+        // distinguishes a fresh first launch from an imported first resume.
+        let start = match (turn_number, initial_record.meta().session_import()) {
+            (1, Some(_)) => TurnStart::Imported,
+            (1, None) => TurnStart::Fresh,
+            _ => TurnStart::FollowUp,
+        };
         let turn_limits = initial_record.meta().limits().turn.clone();
         let turn = TurnMaterial::from_prompt(
             task_id,
@@ -1223,7 +1236,7 @@ impl<'a> TurnRunner<'a> {
             &prompt,
             initial_record.meta().env_profile().map(str::to_owned),
             turn_id.as_uuid(),
-            resume,
+            start != TurnStart::Fresh,
         )?;
         let turn = match initial_record.meta().effective_policy() {
             Some(effective) => turn.with_effective_policy(effective)?,
@@ -1248,7 +1261,7 @@ impl<'a> TurnRunner<'a> {
             self.recorded_agent_version(worker, turn.agent()).as_deref(),
         );
         let remote = RemoteJobClient::new(self.runner);
-        let prebound = if !turn.resume() && adapter.prebind_session().is_some() {
+        let prebound = if start == TurnStart::Fresh && adapter.prebind_session().is_some() {
             Some(
                 remote
                     .task_prebind(
@@ -1267,8 +1280,9 @@ impl<'a> TurnRunner<'a> {
         } else {
             None
         };
-        let session_ref = if turn.resume() {
-            Some(
+        let session_ref = match start {
+            TurnStart::Imported => Some(imported_session_id(&task_id)),
+            TurnStart::FollowUp => Some(
                 remote
                     .task_session(
                         worker,
@@ -1277,9 +1291,8 @@ impl<'a> TurnRunner<'a> {
                     .binding()
                     .session_ref()
                     .to_owned(),
-            )
-        } else {
-            prebound.clone()
+            ),
+            TurnStart::Fresh => prebound.clone(),
         };
         let launch = if let Some(ref session) = session_ref {
             adapter
@@ -1342,7 +1355,7 @@ impl<'a> TurnRunner<'a> {
                         "task turn was cancelled before host acceptance",
                     ));
                 }
-                let prepared = if turn.resume() {
+                let prepared = if start == TurnStart::FollowUp {
                     remote.task_status(
                         worker,
                         &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -1360,6 +1373,11 @@ impl<'a> TurnRunner<'a> {
                                 task_id,
                                 turn.base_oid(),
                                 transfer.path(),
+                                initial_record.meta().session_import().map(|import| {
+                                    SessionRefPush {
+                                        package_oid: import.package_oid(),
+                                    }
+                                }),
                             )?;
                         }
                         remote.task_prepare(
@@ -1370,6 +1388,15 @@ impl<'a> TurnRunner<'a> {
                                 worker.name.clone(),
                             ),
                         )?;
+                        if start == TurnStart::Imported {
+                            verify_imported_session(
+                                &remote,
+                                worker,
+                                initial_record.meta().project_id(),
+                                task_id,
+                                initial_record.meta().agent(),
+                            )?;
+                        }
                         remote.task_status(
                             worker,
                             &TaskStatusRequest::new(initial_record.meta().project_id(), task_id),
@@ -1409,7 +1436,7 @@ impl<'a> TurnRunner<'a> {
                         "task turn was cancelled before host acceptance",
                     ));
                 }
-                if !turn.resume() {
+                if start != TurnStart::FollowUp {
                     if let Some(ref session) = prebound {
                         remote.task_prebind(
                             worker,
@@ -1425,7 +1452,8 @@ impl<'a> TurnRunner<'a> {
                     self.persist_status(task_id, prepared.status().clone())?;
                 }
                 if prepared.status().state().is_terminal()
-                    || (!turn.resume() && matches!(prepared.status().state(), TaskState::Open))
+                    || (start != TurnStart::FollowUp
+                        && matches!(prepared.status().state(), TaskState::Open))
                 {
                     prepared.status().clone()
                 } else {
@@ -1685,7 +1713,7 @@ impl<'a> TurnRunner<'a> {
             "outcome": outcome,
         });
         append_event(log, follow, event.clone())?;
-        transfer.release_base(self.runner, task_id)?;
+        transfer.release_task_refs(self.runner, task_id)?;
         drop(transfer);
         retire_completed_turn(self.client_state, self.paths, turn_id, owner, task_id)?;
         self.auto_continue_after_terminal(task_id, turn_id, follow);
@@ -1724,7 +1752,7 @@ impl<'a> TurnRunner<'a> {
             "outcome": outcome,
         });
         append_event(log, follow, event.clone())?;
-        transfer.release_base(self.runner, task_id)?;
+        transfer.release_task_refs(self.runner, task_id)?;
         drop(transfer);
         self.client_state.record_runner(task_id, None)?;
         self.client_state
@@ -2150,7 +2178,7 @@ impl<'a> TurnRunner<'a> {
             && let Ok(transfer) =
                 crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
-            transfer.release_base(self.runner, record.meta().task_id())?;
+            transfer.release_task_refs(self.runner, record.meta().task_id())?;
             self.client_state
                 .record_runner(record.meta().task_id(), None)?;
             let _ = self
@@ -2225,7 +2253,7 @@ impl<'a> TurnRunner<'a> {
             && let Ok(transfer) =
                 crate::controller::registry::open_transfer_repo(self.paths, &project, record.meta())
         {
-            transfer.release_base(self.runner, task_id)?;
+            transfer.release_task_refs(self.runner, task_id)?;
             self.client_state.record_runner(task_id, None)?;
             let _ = self
                 .client_state
@@ -2369,12 +2397,12 @@ pub(crate) fn finalize_completed_turn(
         }
         let published = client_state.load_task(task_id)?;
         if imported.is_some() {
-            transfer.release_base(runner, task_id)?;
+            transfer.release_task_refs(runner, task_id)?;
         }
         retire_completed_turn(client_state, paths, turn_id, owner, task_id)?;
         return Ok(published.status().clone());
     }
-    transfer.release_base(runner, task_id)?;
+    transfer.release_task_refs(runner, task_id)?;
     retire_completed_turn(client_state, paths, turn_id, owner, task_id)?;
     Ok(client_state.load_task(task_id)?.status().clone())
 }
@@ -2986,6 +3014,36 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
     )
 }
 
+fn verify_imported_session(
+    remote: &RemoteJobClient<'_>,
+    worker: &WorkerEntry,
+    project_id: &str,
+    task_id: TaskId,
+    agent: AgentKind,
+) -> Result<(), WorkerError> {
+    let session = remote
+        .task_session(worker, &TaskSessionRequest::new(project_id, task_id))
+        .map_err(|error| {
+            if error.public_code() == "SESSION_UNBOUND" {
+                task_error(
+                    "SESSION_PLACEMENT_FAILED",
+                    "prepared import has no session binding",
+                )
+            } else {
+                error
+            }
+        })?;
+    if session.binding().agent() != agent
+        || session.binding().session_ref() != imported_session_id(&task_id)
+    {
+        return Err(task_error(
+            "SESSION_PLACEMENT_FAILED",
+            "prepared import has a different agent session binding",
+        ));
+    }
+    Ok(())
+}
+
 fn task_error(
     code: &'static str,
     message: impl Into<std::borrow::Cow<'static, str>>,
@@ -3024,6 +3082,404 @@ fn fallback_process_identity(pid: u32) -> Result<ProcessIdentity, WorkerError> {
 }
 
 #[cfg(test)]
+mod session_pin_cleanup_tests {
+    use super::*;
+    use crate::{
+        agent::PermissionPolicy,
+        job::QueueEntry,
+        process::{ProcessRequest, ProcessResult, SystemProcessRunner},
+        session_transfer::{
+            CODEX_ROLLOUT_FILE, PackageFile, PackageSource, SessionAgent, SessionImportMeta,
+            SessionPackage, testing::codex_fixture, tokens::normalize,
+        },
+        task::{GitIdentity, PublishMode, TaskLimits, TaskMeta, TaskMetaInput, TaskSource},
+    };
+    use std::{
+        fs,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    struct LocalOnlyRunner {
+        fail_session_release: AtomicBool,
+    }
+    impl ProcessRunner for LocalOnlyRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(
+                request.program, "/usr/bin/git",
+                "cleanup must not contact a worker or provider"
+            );
+            if self.fail_session_release.load(Ordering::SeqCst)
+                && request.args.iter().any(|arg| arg == "update-ref")
+                && request.args.iter().any(|arg| arg == "-d")
+                && request.args.iter().any(|arg| {
+                    arg.to_str()
+                        .is_some_and(|text| text.starts_with("refs/mac-worker/sessions/"))
+                })
+            {
+                return Err(task_error(
+                    "BASE_UNAVAILABLE",
+                    "injected session pin release failure",
+                ));
+            }
+            SystemProcessRunner.run(request)
+        }
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        paths: PathLayout,
+        config: Config,
+        store: ClientStateStore,
+        runner: LocalOnlyRunner,
+        transfer: TransferRepo,
+        task: TaskId,
+        turn: TurnId,
+        owner: ProcessIdentity,
+    }
+    impl Fixture {
+        fn new(imported: bool, wip: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let project = base.join("project");
+            fs::create_dir(&project).unwrap();
+            let git = |args: &[&str]| {
+                let result = Command::new("/usr/bin/git")
+                    .env_clear()
+                    .env("HOME", &base)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(&project)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            };
+            git(&["init", "--initial-branch=main"]);
+            git(&["config", "user.name", "Fixture"]);
+            git(&["config", "user.email", "fixture@example.test"]);
+            fs::write(project.join("README"), b"fixture\n").unwrap();
+            git(&["add", "README"]);
+            git(&["commit", "-m", "fixture"]);
+            let paths = PathLayout {
+                config: base.join("config.toml"),
+                state: base.join("state"),
+                cache: base.join("cache"),
+                data: base.join("data"),
+            };
+            let config = Config::parse(
+                "version = 1\n[[workers]]\nname = 'fixture'\nssh = 'never-connect'\nslots = 1\n",
+            )
+            .unwrap();
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let runner = LocalOnlyRunner {
+                fail_session_release: AtomicBool::new(false),
+            };
+            let state = ProjectState::load(&runner, &project, &[]).unwrap();
+            let transfer =
+                TransferRepo::open_or_create(&paths.cache, &state.context.common_dir).unwrap();
+            let (task, turn) = (TaskId::generate(), TurnId::generate());
+            let identity = GitIdentity::new("Fixture", "fixture@example.test").unwrap();
+            let base_commit = if wip {
+                transfer
+                    .build_wip_base(&runner, &state.context, task, &state.settings, &identity)
+                    .unwrap()
+            } else {
+                transfer
+                    .resolve_base(&runner, &state.context, "HEAD")
+                    .unwrap()
+            };
+            let import = imported.then(|| {
+                let id = "018f0f4a-6b5c-7d8e-9f00-112233445566";
+                let package = SessionPackage::build(
+                    PackageSource {
+                        agent: SessionAgent::Codex,
+                        source_session_id: id.into(),
+                        source_agent_version: "0.160.0".into(),
+                        source_cwd_relative: String::new(),
+                        scrubbed: 0,
+                    },
+                    vec![PackageFile {
+                        path: CODEX_ROLLOUT_FILE.into(),
+                        bytes: normalize(
+                            &codex_fixture(id, project.to_str().unwrap(), "0.160.0", 1),
+                            &[project.to_str().unwrap()],
+                            id,
+                        )
+                        .unwrap(),
+                    }],
+                )
+                .unwrap();
+                SessionImportMeta::new(
+                    SessionAgent::Codex,
+                    transfer
+                        .write_session_package(&runner, task, &package)
+                        .unwrap(),
+                    "0.160.0",
+                )
+                .unwrap()
+            });
+            let now = now_millis().unwrap();
+            let meta = TaskMeta::new(TaskMetaInput {
+                session_import: import,
+                task_id: task,
+                run_id: None,
+                project_id: state.context.project_id.clone(),
+                worktree_id: state.context.worktree_id.clone(),
+                agent: AgentKind::Codex,
+                model: None,
+                effort: None,
+                policy: PermissionPolicy::Workspace,
+                source: TaskSource::Local {
+                    wip,
+                    push_target: None,
+                },
+                publish: vec![PublishMode::Fetch],
+                publish_branch: None,
+                base_oid: base_commit.oid().clone(),
+                limits: TaskLimits::default(),
+                close_policy: ClosePolicy::Never,
+                env_profile: None,
+                git_identity: identity,
+                title: None,
+                prompt: "continue".into(),
+                created_at_millis: now,
+            })
+            .unwrap();
+            let record = LocalTaskRecord::new(
+                meta,
+                TaskStatus::new(
+                    TaskState::Queued,
+                    None,
+                    None,
+                    false,
+                    Some(base_commit.oid().clone()),
+                    None,
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    now,
+                )
+                .unwrap(),
+                None,
+                None,
+                None,
+                transfer.repo_id().into(),
+                None,
+                true,
+                None,
+            )
+            .unwrap();
+            store.create_task(record.clone()).unwrap();
+            store.write_task_project_path(&record, &project).unwrap();
+            store.write_turn_prompt(task, turn, "continue").unwrap();
+            let owner = current_process_identity().unwrap();
+            store
+                .enqueue(
+                    QueueEntry::new(
+                        turn,
+                        store.client_id(),
+                        state.context.project_id,
+                        state.context.worktree_id,
+                        CommandSpec::argv(vec!["task".into()])
+                            .unwrap()
+                            .summary()
+                            .unwrap(),
+                        vec![],
+                        WorkerPreference::Automatic,
+                        QueueEntryKind::TaskTurn,
+                        None,
+                        owner,
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            drop(LogWriter::open(&paths.state, task, turn).unwrap());
+            Self {
+                _root: root,
+                paths,
+                config,
+                store,
+                runner,
+                transfer,
+                task,
+                turn,
+                owner,
+            }
+        }
+        fn turn_runner(&self) -> TurnRunner<'_> {
+            TurnRunner::new(
+                &self.runner,
+                &self.config,
+                &self.paths,
+                &self.store,
+                &InlineRunnerExecutor,
+            )
+        }
+        fn assert_retired(&self) {
+            for prefix in ["refs/mac-worker/bases/", "refs/mac-worker/sessions/"] {
+                assert!(
+                    !self.transfer.has_ref(&format!("{prefix}{}", self.task)),
+                    "cleanup leaked {prefix}"
+                );
+            }
+            assert!(self.store.queue_entry(self.turn).unwrap().is_none());
+            assert!(self.store.read_turn_prompt(self.task, self.turn).is_err());
+            assert_eq!(
+                self.store.load_task(self.task).unwrap().status().state(),
+                TaskState::Abandoned
+            );
+        }
+    }
+
+    #[test]
+    fn imported_and_sessionless_handoff_failure_retire_task_pins() {
+        for imported in [false, true] {
+            for wip in [false, true] {
+                let fixture = Fixture::new(imported, wip);
+                fixture
+                    .turn_runner()
+                    .abandon_handoff_failure(fixture.task, fixture.turn, fixture.owner)
+                    .unwrap();
+                fixture.assert_retired();
+                assert_eq!(
+                    fixture
+                        .store
+                        .load_task(fixture.task)
+                        .unwrap()
+                        .abandon_code(),
+                    Some("RUNNER_HANDOFF_FAILED")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn imported_and_sessionless_cancel_before_acceptance_retire_task_pins() {
+        for imported in [false, true] {
+            for wip in [false, true] {
+                let fixture = Fixture::new(imported, wip);
+                let record = fixture.store.load_task(fixture.task).unwrap();
+                fixture
+                    .turn_runner()
+                    .cancel_before_acceptance(
+                        &record,
+                        fixture.task,
+                        fixture.turn,
+                        fixture.owner,
+                        None,
+                    )
+                    .unwrap();
+                fixture.assert_retired();
+                assert_eq!(
+                    fixture
+                        .store
+                        .load_task(fixture.task)
+                        .unwrap()
+                        .status()
+                        .last_outcome(),
+                    Some(&TaskOutcome::Cancelled)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_imported_handoff_and_cancel_keep_pins_and_records() {
+        let fixture = Fixture::new(true, true);
+        let before = serde_json::to_vec(&fixture.store.load_task(fixture.task).unwrap()).unwrap();
+        let row = fixture.store.queue_entry(fixture.turn).unwrap();
+        let mut log = LogWriter::open(&fixture.paths.state, fixture.task, fixture.turn).unwrap();
+        log.accepted("fixture", b"accepted\n").unwrap();
+        drop(log);
+        fixture
+            .turn_runner()
+            .abandon_handoff_failure(fixture.task, fixture.turn, fixture.owner)
+            .unwrap();
+        let record = fixture.store.load_task(fixture.task).unwrap();
+        assert_eq!(
+            fixture
+                .turn_runner()
+                .cancel_before_acceptance(&record, fixture.task, fixture.turn, fixture.owner, None)
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(
+            serde_json::to_vec(&fixture.store.load_task(fixture.task).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(fixture.store.queue_entry(fixture.turn).unwrap(), row);
+        for prefix in ["refs/mac-worker/bases/", "refs/mac-worker/sessions/"] {
+            assert!(
+                fixture
+                    .transfer
+                    .has_ref(&format!("{prefix}{}", fixture.task))
+            );
+        }
+    }
+
+    #[test]
+    fn session_release_failure_keeps_completion_marker_and_queue_until_retry() {
+        for handoff in [false, true] {
+            let fixture = Fixture::new(true, true);
+            fixture
+                .runner
+                .fail_session_release
+                .store(true, Ordering::SeqCst);
+            let clean = || {
+                if handoff {
+                    fixture.turn_runner().abandon_handoff_failure(
+                        fixture.task,
+                        fixture.turn,
+                        fixture.owner,
+                    )
+                } else {
+                    fixture.turn_runner().cancel_before_acceptance(
+                        &fixture.store.load_task(fixture.task).unwrap(),
+                        fixture.task,
+                        fixture.turn,
+                        fixture.owner,
+                        None,
+                    )
+                }
+            };
+            assert_eq!(clean().unwrap_err().public_code(), "BASE_UNAVAILABLE");
+            assert!(fixture.store.queue_entry(fixture.turn).unwrap().is_some());
+            assert!(
+                fixture
+                    .store
+                    .read_turn_prompt(fixture.task, fixture.turn)
+                    .is_ok()
+            );
+            assert!(
+                crate::runner_log::snapshot(&fixture.paths.state, fixture.task, fixture.turn)
+                    .unwrap()
+                    .unwrap()
+                    .completion
+                    .is_some()
+            );
+            assert!(
+                fixture
+                    .transfer
+                    .has_ref(&format!("refs/mac-worker/sessions/{}", fixture.task))
+            );
+            fixture
+                .runner
+                .fail_session_release
+                .store(false, Ordering::SeqCst);
+            clean().unwrap();
+            fixture.assert_retired();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         current_process_identity, early_exit_diagnostic_line, handoff_spawn_admitted,
@@ -3031,6 +3487,108 @@ mod tests {
         open_handoff_journal_for_spawn, turn_exit_code,
     };
     use crate::task::TaskOutcome;
+
+    struct ImportedSessionRunner(Option<crate::task_store::SessionBinding>);
+
+    impl crate::process::ProcessRunner for ImportedSessionRunner {
+        fn run(
+            &self,
+            request: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, crate::error::WorkerError> {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                request
+                    .args
+                    .iter()
+                    .any(|arg| arg == crate::transfer::HostOperation::TaskSession.command())
+            );
+            let (status, mut stdout) = match &self.0 {
+                Some(binding) => (
+                    0,
+                    serde_json::to_vec(&crate::task_store::TaskSessionResponse::new(
+                        binding.clone(),
+                    ))
+                    .unwrap(),
+                ),
+                None => (
+                    1 << 8,
+                    serde_json::to_vec(
+                        &crate::job::HostControlError::new(
+                            "SESSION_UNBOUND",
+                            "fixture has no session",
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            };
+            stdout.push(b'\n');
+            Ok(crate::process::ProcessResult {
+                status: std::process::ExitStatus::from_raw(status),
+                stdout,
+                stderr: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn imported_post_prepare_session_verification_requires_exact_agent_and_ref() {
+        use crate::{
+            agent::AgentKind, config::Config, session_transfer::imported_session_id, task::TaskId,
+            task_store::SessionBinding, transfer::RemoteJobClient,
+        };
+        let task_id = TaskId::generate();
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let worker = config.worker("mini-1").unwrap();
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            for (bound_agent, reference, valid) in [
+                (agent, imported_session_id(&task_id), true),
+                (agent, uuid::Uuid::new_v4().to_string(), false),
+                (AgentKind::Cursor, imported_session_id(&task_id), false),
+            ] {
+                let runner = ImportedSessionRunner(Some(
+                    SessionBinding::new(bound_agent, reference, 1).unwrap(),
+                ));
+                let result = super::verify_imported_session(
+                    &RemoteJobClient::new(&runner),
+                    worker,
+                    &"a".repeat(64),
+                    task_id,
+                    agent,
+                );
+                if valid {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().public_code(),
+                        "SESSION_PLACEMENT_FAILED"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_post_prepare_missing_session_is_a_placement_failure() {
+        use crate::{agent::AgentKind, config::Config, task::TaskId, transfer::RemoteJobClient};
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = \"mini-1\"\nssh = \"mac1\"\nslots = 1\n",
+        )
+        .unwrap();
+        let runner = ImportedSessionRunner(None);
+        let error = super::verify_imported_session(
+            &RemoteJobClient::new(&runner),
+            config.worker("mini-1").unwrap(),
+            &"a".repeat(64),
+            TaskId::generate(),
+            AgentKind::Claude,
+        )
+        .unwrap_err();
+        assert_eq!(error.public_code(), "SESSION_PLACEMENT_FAILED");
+    }
 
     #[test]
     fn handoff_spawn_permit_rejects_cancelled_adopted_bound_foreign_or_missing_rows() {
@@ -3595,6 +4153,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         let store = ClientStateStore::open(&paths.state).unwrap();
         let (task_id, turn_id, _) = plant_reserved_turn(&store, owner, true);
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),
@@ -3941,6 +4500,7 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
         let active = follow_task_status(TaskState::Active, turn_id);
         let open = follow_task_status(TaskState::Open, turn_id);
         let meta = TaskMeta::new(TaskMetaInput {
+            session_import: None,
             task_id,
             run_id: None,
             project_id: "a".repeat(64),

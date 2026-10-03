@@ -4,8 +4,15 @@
 //! request field gets a feature string; clients must check for it before use.
 //! A missing feature list means an older peer whose features are unknown.
 
-pub const HOST_FEATURES: &[&str] = &[];
-pub const CONTROLLER_FEATURES: &[&str] = &["controller.events", "controller.task-logs-wait"];
+pub const HOST_FEATURE_SESSION_IMPORT: &str = "task.session-import";
+pub const CONTROLLER_FEATURE_SESSION_IMPORT: &str = "controller.session-import";
+
+pub const HOST_FEATURES: &[&str] = &[HOST_FEATURE_SESSION_IMPORT];
+pub const CONTROLLER_FEATURES: &[&str] = &[
+    "controller.events",
+    CONTROLLER_FEATURE_SESSION_IMPORT,
+    "controller.task-logs-wait",
+];
 /// Added only after an existing-only live generation/hello proof.
 pub const CONTROLLER_SOCKET: &str = "controller.socket";
 
@@ -15,10 +22,14 @@ mod tests {
 
     #[test]
     fn registries_are_sorted_unique_and_contain_the_supported_features() {
-        assert!(HOST_FEATURES.is_empty());
+        assert_eq!(HOST_FEATURES, [HOST_FEATURE_SESSION_IMPORT]);
         assert_eq!(
             CONTROLLER_FEATURES,
-            ["controller.events", "controller.task-logs-wait"]
+            [
+                "controller.events",
+                CONTROLLER_FEATURE_SESSION_IMPORT,
+                "controller.task-logs-wait"
+            ]
         );
         for features in [HOST_FEATURES, CONTROLLER_FEATURES] {
             assert!(features.windows(2).all(|pair| pair[0] < pair[1]));

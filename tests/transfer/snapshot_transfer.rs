@@ -695,6 +695,7 @@ fn git_base_push_runtime_failure_matrix_is_content_free() {
                 TaskId::new(uuid::Uuid::from_u128(4)),
                 &base,
                 cache.path(),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -724,6 +725,7 @@ fn git_invalid_local_transport_configuration_proves_no_receiver_started() {
             TaskId::new(uuid::Uuid::from_u128(4)),
             &base,
             cache.path(),
+            None,
         )
         .unwrap_err();
     assert!(
@@ -3108,6 +3110,7 @@ fn git_transfer_identity_debug_and_failures_never_expose_the_lease_token() {
                 .parse::<BaseOid>()
                 .unwrap(),
             cache.path(),
+            None,
         )
         .unwrap_err();
 

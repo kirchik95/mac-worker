@@ -178,6 +178,7 @@ fn execution_payload(agent: AgentKind, turn: bool) -> Vec<u8> {
 
 fn task_meta(agent: AgentKind) -> TaskMeta {
     TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id: task_id(),
         run_id: None,
         project_id: PROJECT_ID.into(),

@@ -264,6 +264,7 @@ pub(super) fn request(repo: &crate::support::GitRepo, wait: bool) -> TaskSubmitR
 }
 pub(super) fn request_from_path(project: &std::path::Path, wait: bool) -> TaskSubmitRequest {
     TaskSubmitRequest {
+        session_import: None,
         questions: None,
         agent: AgentKind::Codex,
         model: None,

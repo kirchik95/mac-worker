@@ -106,6 +106,7 @@ fn plant_task_turn(
     let task_id = TaskId::new(Uuid::from_u128(number));
     let turn_id = TurnId::new(Uuid::from_u128(number + 1_000));
     let meta = TaskMeta::new(TaskMetaInput {
+        session_import: None,
         task_id,
         run_id: None,
         project_id: PROJECT_ID.into(),
