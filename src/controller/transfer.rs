@@ -414,22 +414,9 @@ impl ControllerTransfer {
             .expected_oid
             .parse()
             .map_err(|_| invalid_component("expected OID"))?;
-        // Verify both exact refs, including completed-receipt replays.
-        require_received_refs(&transfer, runner, &record)?;
-        if let Some(existing) = &record.receipt_oid {
-            if existing != oid.as_str() {
-                return Err(conflict("source receipt already names a different object"));
-            }
-            self.repair_source_lookup(&record)?;
-            let request_ref = TransferRepo::frozen_request_ref(&record.request_id)?;
-            return Ok(ControllerSourceReceipt {
-                request_id: record.request_id,
-                oid,
-                request_ref,
-                token: record.token,
-                session_oid: record.session_oid,
-            });
-        }
+        // Receive paths may fetch into scratch refs. Verify the owned graph
+        // and create-or-same pin instead of requiring the request refs to
+        // pre-exist. Revalidate both OIDs on completed-receipt replays too.
         transfer.pin_frozen_source(runner, &record.request_id, &oid)?;
         if let Some(session_oid) = &record.session_oid {
             let session: BaseOid = session_oid
@@ -443,6 +430,20 @@ impl ControllerTransfer {
                 &request_session_ref(&record.request_id)?,
                 &session,
             )?;
+        }
+        if let Some(existing) = &record.receipt_oid {
+            if existing != oid.as_str() {
+                return Err(conflict("source receipt already names a different object"));
+            }
+            self.repair_source_lookup(&record)?;
+            let request_ref = TransferRepo::frozen_request_ref(&record.request_id)?;
+            return Ok(ControllerSourceReceipt {
+                request_id: record.request_id,
+                oid,
+                request_ref,
+                token: record.token,
+                session_oid: record.session_oid,
+            });
         }
         let previous = encode(&record)?;
         record.receipt_oid = Some(oid.as_str().to_owned());
@@ -911,38 +912,6 @@ pub fn import_controller_result(
         &source_ref,
         &meta.imported_oid,
     )
-}
-
-fn require_received_refs(
-    transfer: &TransferRepo,
-    runner: &dyn ProcessRunner,
-    record: &SourceRecord,
-) -> Result<(), WorkerError> {
-    let request_ref = TransferRepo::frozen_request_ref(&record.request_id)?;
-    if transfer
-        .read_ref_oid(runner, &request_ref)?
-        .as_ref()
-        .map(BaseOid::as_str)
-        != Some(record.expected_oid.as_str())
-    {
-        return Err(conflict(
-            "streamed source ref is missing or does not match the expected OID",
-        ));
-    }
-    if let Some(oid) = &record.session_oid {
-        let reference = request_session_ref(&record.request_id)?;
-        if transfer
-            .read_ref_oid(runner, &reference)?
-            .as_ref()
-            .map(BaseOid::as_str)
-            != Some(oid.as_str())
-        {
-            return Err(conflict(
-                "streamed session ref is missing or does not match the expected OID",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
