@@ -80,6 +80,7 @@ export interface Worker {
 }
 
 export interface TaskRow {
+  /** Present with a workflow only while the cycle covers the latest ordinary turn. */
   integration?: IntegrationSnapshot
   workflow_state?: WorkflowState
   task_id: string
@@ -233,6 +234,7 @@ export function lastDelivery(task: {
 }
 
 export interface TaskDetail {
+  /** Retained receipt history; current actions use task.integration and its workflow. */
   integration?: IntegrationSnapshot
   workflow_state?: WorkflowState
   task: TaskRow

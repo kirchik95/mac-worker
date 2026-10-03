@@ -3,8 +3,15 @@ import { task } from '@/test/fixtures'
 import fixtures from './integration.fixtures.json'
 import { decodeIntegrationView } from './integration.contract'
 import { needsAttention } from './attention'
+import type { TaskState } from './api'
 
 describe('integration attention', () => {
+  it.each(fixtures.followups)('uses ordinary attention for $name with a historical receipt', followup => {
+    const view = decodeIntegrationView(followup.view)
+    const row = { ...task({ state: followup.ordinary_state as TaskState, last_outcome: followup.last_outcome }),
+      ...view, integration: decodeIntegrationView({ ...view, integration: followup.history }).integration }
+    expect(needsAttention(row)).toBe(view.attention)
+  })
   it('excludes automatic work and integrated Open/Never tasks, including parked', () => {
     for (const name of ['pending', 'parked_controller_drained_pending', 'integrated']) {
       const view = decodeIntegrationView(fixtures.cases.find(row => row.name === name)!.view)

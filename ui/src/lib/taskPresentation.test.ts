@@ -2,11 +2,20 @@ import { describe, expect, it } from 'vitest'
 import { task } from '@/test/fixtures'
 import fixtures from './integration.fixtures.json'
 import { decodeIntegrationView } from './integration.contract'
-import { readyForReview, taskPresentation, taskEventKey, waitingReason } from './taskPresentation'
+import { needsAnswer, readyForReview, taskPresentation, taskEventKey, waitingReason } from './taskPresentation'
+import type { TaskState } from './api'
 
 const integrated = () => ({ ...task({ state: 'open', review_state: 'ready_for_review' }),
   ...decodeIntegrationView(fixtures.cases.find(row => row.name === 'integrated')!.view) })
 describe('integration presentation', () => {
+  it.each(fixtures.followups)('presents $name as ordinary work when its receipt is history', followup => {
+    const view = decodeIntegrationView(followup.view)
+    const row = { ...task({ state: followup.ordinary_state as TaskState, last_outcome: followup.last_outcome }),
+      ...view, integration: decodeIntegrationView({ ...view, integration: followup.history }).integration }
+    expect(taskPresentation(row).label).toBe(followup.label)
+    expect(needsAnswer(row)).toBe(followup.name === 'needs_input')
+    expect(readyForReview(row)).toBe(false)
+  })
   it('shows integrated done and no review demand despite legacy Open', () => {
     expect(readyForReview(integrated())).toBe(false)
     expect(taskPresentation(integrated()).label).toBe('Integrated')

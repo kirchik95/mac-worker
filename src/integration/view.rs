@@ -1,7 +1,7 @@
 //! Pure projections of durable integration state. Reads never drive work.
 use super::contracts::*;
 use crate::error::WorkerError;
-use crate::task::{LocalTaskRecord, TaskOutcome, TaskState};
+use crate::task::{LocalTaskRecord, TaskOutcome, TaskState, TurnId};
 use crate::task_view::{ReviewState, review_state};
 
 impl IntegrationTaskFacts {
@@ -25,9 +25,73 @@ impl IntegrationTaskFacts {
     }
 }
 
+/// Sidecars identify auxiliary turns across epochs. Stop at the latest ordinary
+/// turn, so an older receipt never covers newer questions, failures or runners.
+pub fn snapshot_covers_latest_work(
+    snapshot: &IntegrationSnapshot,
+    record: &LocalTaskRecord,
+    mut is_auxiliary: impl FnMut(TurnId) -> Result<bool, WorkerError>,
+) -> Result<bool, WorkerError> {
+    snapshot.validate()?;
+    for turn in record.status().turns().iter().rev() {
+        if !is_auxiliary(turn.turn_id())? {
+            return Ok(turn.turn_id() == snapshot.source_turn_id);
+        }
+    }
+    // Admission/dependency snapshots may precede materialized ordinary history.
+    Ok(record.status().turns().is_empty()
+        && matches!(
+            snapshot.state,
+            IntegrationStatus::Armed | IntegrationStatus::Revoked
+        ))
+}
+
+/// Pure callers can identify this epoch's deterministic auxiliary IDs. Durable
+/// read adapters use prepared sidecars instead, including those of older epochs.
+pub(crate) fn snapshot_covers_current_epoch_work(
+    snapshot: &IntegrationSnapshot,
+    record: &LocalTaskRecord,
+) -> Result<bool, WorkerError> {
+    snapshot_covers_latest_work(snapshot, record, |turn| {
+        for attempt in 1..=MAX_CANDIDATES as u8 {
+            for (purpose, limit) in [
+                (IntegrationTurnPurpose::Resolve, MAX_RESOLVE_TURNS),
+                (IntegrationTurnPurpose::Verify, MAX_VERIFY_TURNS),
+            ] {
+                for ordinal in 1..=limit {
+                    if turn
+                        == auxiliary_turn_id(
+                            snapshot.integration_id,
+                            snapshot.epoch,
+                            attempt,
+                            purpose,
+                            ordinal,
+                        )?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    })
+}
+
 pub fn project_integration(
     snapshot: Option<&IntegrationSnapshot>,
     facts: &IntegrationTaskFacts,
+) -> Result<IntegrationView, WorkerError> {
+    let current = snapshot
+        .map(|snapshot| snapshot_covers_current_epoch_work(snapshot, &facts.ordinary))
+        .transpose()?
+        .unwrap_or(false);
+    project_integration_for_current_work(snapshot, facts, current)
+}
+
+pub(crate) fn project_integration_for_current_work(
+    snapshot: Option<&IntegrationSnapshot>,
+    facts: &IntegrationTaskFacts,
+    current: bool,
 ) -> Result<IntegrationView, WorkerError> {
     let record = &facts.ordinary;
     let status = record.status();
@@ -40,7 +104,7 @@ pub fn project_integration(
             .last_outcome()
             .is_some_and(|outcome| !matches!(outcome, TaskOutcome::Done | TaskOutcome::Cancelled)));
     let mut view = IntegrationView {
-        integration: snapshot.cloned(),
+        integration: snapshot.filter(|_| current).cloned(),
         workflow_state: None,
         review_state: ordinary_review,
         attention: ordinary_attention,
@@ -50,6 +114,9 @@ pub fn project_integration(
         return Ok(view);
     };
     snapshot.validate()?;
+    if !current {
+        return Ok(view);
+    }
     let ordinary_workflow = match status.state() {
         TaskState::Queued => WorkflowState::Queued,
         TaskState::Active => WorkflowState::Running,

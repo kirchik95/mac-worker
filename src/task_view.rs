@@ -158,6 +158,7 @@ pub struct TaskListProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListRow {
+    /// Current cycle only; a historical receipt is retained on the detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<crate::integration::contracts::IntegrationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +210,7 @@ pub struct TaskRunProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskDetailProjection {
+    /// May be history when task.integration and workflow_state are absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<crate::integration::contracts::IntegrationSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -723,9 +725,29 @@ fn agent_name(agent: AgentKind) -> &'static str {
 
 impl TaskListRow {
     /// Attach an already-read companion snapshot without observing or driving workers.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(
-        mut self,
+        self,
         snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        facts: &crate::integration::contracts::IntegrationTaskFacts,
+    ) -> Result<Self, crate::error::WorkerError> {
+        let view = crate::integration::view::project_integration(snapshot, facts)?;
+        self.with_integration_view(view, facts)
+    }
+    pub(crate) fn with_current_integration(
+        self,
+        snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        facts: &crate::integration::contracts::IntegrationTaskFacts,
+        current: bool,
+    ) -> Result<Self, crate::error::WorkerError> {
+        let view = crate::integration::view::project_integration_for_current_work(
+            snapshot, facts, current,
+        )?;
+        self.with_integration_view(view, facts)
+    }
+    fn with_integration_view(
+        mut self,
+        view: crate::integration::contracts::IntegrationView,
         facts: &crate::integration::contracts::IntegrationTaskFacts,
     ) -> Result<Self, crate::error::WorkerError> {
         if self.task_id != facts.ordinary.meta().task_id() {
@@ -733,7 +755,6 @@ impl TaskListRow {
                 "INTEGRATION_STATE_INVALID",
             ));
         }
-        let view = crate::integration::view::project_integration(snapshot, facts)?;
         self.integration = view.integration;
         self.workflow_state = view.workflow_state;
         self.review_state = view.review_state;
@@ -745,13 +766,29 @@ impl TaskListRow {
     }
 }
 impl TaskDetailProjection {
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(
         mut self,
         snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
         facts: &crate::integration::contracts::IntegrationTaskFacts,
     ) -> Result<Self, crate::error::WorkerError> {
         self.task = self.task.with_integration(snapshot, facts)?;
-        self.integration = self.task.integration.clone();
+        // Detail retains the receipt even when its cycle no longer covers the row.
+        self.integration = snapshot.cloned();
+        self.workflow_state = self.task.workflow_state;
+        self.review_state = self.task.review_state;
+        Ok(self)
+    }
+    pub(crate) fn with_current_integration(
+        mut self,
+        snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        facts: &crate::integration::contracts::IntegrationTaskFacts,
+        current: bool,
+    ) -> Result<Self, crate::error::WorkerError> {
+        self.task = self
+            .task
+            .with_current_integration(snapshot, facts, current)?;
+        self.integration = snapshot.cloned();
         self.workflow_state = self.task.workflow_state;
         self.review_state = self.task.review_state;
         Ok(self)

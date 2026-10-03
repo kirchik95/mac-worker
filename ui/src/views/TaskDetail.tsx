@@ -10,6 +10,7 @@ import { duration, humanize, relativeTime, shortId } from '@/lib/format'
 import { Check, ChevronRight, History, Monitor, Reply, Terminal } from 'lucide-react'
 import { AgentMark } from '@/components/AgentMark'
 import { TaskBadge } from '@/components/TaskBadge'
+import { currentIntegration } from '@/lib/taskPresentation'
 import { Button } from '@/components/ui/button'
 import { ActionFeedback, type ActionState } from '@/components/ActionFeedback'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -294,7 +295,7 @@ export function TaskDetail({
     setAction({ kind, state: 'pending' })
     setActionError(null)
     try {
-      const integration = detail.integration ?? detail.task.integration
+      const integration = currentIntegration(detail.task)
       if (kind === 'integrate' && (!integration || !Number.isSafeInteger(integration.revision)))
         throw new ApiError(409, 'Integration revision is unavailable; refresh the task.')
       if (kind === 'integrate' && (redriveIntent.current?.integration_id !== integration!.integration_id ||
@@ -345,8 +346,9 @@ export function TaskDetail({
   const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
 
   const integration = detail.integration ?? task.integration
-  const blocked = integration?.state === 'blocked'
-  const ordinaryActions = !integration || ['armed', 'revoked'].includes(integration.state)
+  const current = currentIntegration(task)
+  const blocked = current?.state === 'blocked'
+  const ordinaryActions = !current || ['armed', 'revoked'].includes(current.state)
   const waiting = ordinaryActions && detail.review_state === 'waiting_on_you'
   const reviewable = ordinaryActions && detail.review_state === 'ready_for_review'
   const closing = detail.review_state === 'close_pending'
@@ -474,7 +476,8 @@ export function TaskDetail({
         ) : null}
       </header>
       {integration ? (
-        <section className="mw-panel" aria-label="Integration">
+        <section className="mw-panel" aria-label={current ? 'Integration' : 'Integration history'}>
+          {!current ? <p>Previous integration</p> : null}
           <p>Integration target: {integration.target}</p>
           <p>State: {integration.state}</p>
           {integration.pause_reason ? <p>Paused: {integration.pause_reason} · Resume: {integration.resume_state}</p> : null}

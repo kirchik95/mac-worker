@@ -16,7 +16,7 @@ pub use crate::integration::remote::RemoteIntegrationHost;
 pub use crate::integration::runner::IntegrationRunner;
 pub use crate::integration::store::RootedIntegrationState;
 pub use crate::integration::testing::*;
-pub use crate::integration::view::project_integration;
+pub use crate::integration::view::{project_integration, snapshot_covers_latest_work};
 pub use crate::job::ProcessIdentity;
 pub use crate::prepared_submit::FrozenSubmitBody;
 pub use crate::task_client::{BatchDefaults, BatchFile, BatchTask, TaskSubmitRequest};

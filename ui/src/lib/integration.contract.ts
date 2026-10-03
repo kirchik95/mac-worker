@@ -64,6 +64,7 @@ export interface IntegrationFactsAnnotation {
   result_oid: string | null
 }
 export interface IntegrationView {
+  /** Current cycle overlay; historical receipts belong to TaskDetail.integration. */
   integration?: IntegrationSnapshot
   workflow_state?: WorkflowState
   review_state: ReviewState

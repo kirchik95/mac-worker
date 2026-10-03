@@ -258,6 +258,21 @@ impl FrozenIntegrationPolicy {
     pub fn target_key(&self) -> Result<TargetKey, WorkerError> {
         TargetKey::new(&self.origin, self.target.as_str())
     }
+    /// Ordinary Push defaults to the task branch even when no branch was frozen.
+    pub fn validate_publication_branch(
+        &self,
+        task: TaskId,
+        publish: &[String],
+        publish_branch: Option<&str>,
+    ) -> Result<(), WorkerError> {
+        let default = BranchName::for_task(task);
+        if publish.iter().any(|mode| mode == "push")
+            && publish_branch.unwrap_or(default.as_str()) == self.target.as_str()
+        {
+            return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
+        }
+        Ok(())
+    }
 }
 impl ValidateIntegration for FrozenIntegrationPolicy {
     fn validate(&self) -> Result<(), WorkerError> {
@@ -269,7 +284,9 @@ impl ValidateIntegration for FrozenIntegrationPolicy {
         {
             return Err(invalid());
         }
-        canonical_origin(&self.origin)?;
+        if canonical_origin(&self.origin)? != self.origin {
+            return Err(invalid());
+        }
         validate_integration_target(self.target.as_str())?;
         check_size(self, MAX_PRIVATE_RECORD_BYTES)
     }
@@ -682,6 +699,7 @@ pub enum WorkflowState {
     Done,
 }
 contract!(IntegrationView {
+    /// Only the cycle covering the latest ordinary turn appears in this overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     integration: Option<IntegrationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1432,6 +1450,11 @@ contract!(FrozenIntegratingSubmit {
 impl ValidateIntegration for FrozenIntegratingSubmit {
     fn validate(&self) -> Result<(), WorkerError> {
         self.integration.validate()?;
+        self.integration.validate_publication_branch(
+            self.submit.task_id,
+            &self.submit.publish,
+            self.submit.publish_branch.as_deref(),
+        )?;
         if self.submit.close_on != ClosePolicy::Never
             || self.submit.wip
             || self.submit.project_id != self.integration.project_id
@@ -1441,7 +1464,6 @@ impl ValidateIntegration for FrozenIntegratingSubmit {
                 .as_ref()
                 .is_some_and(|base| base != &self.submit.base_oid)
             || self.submit.origin_url.as_deref() != Some(self.integration.origin.as_str())
-            || self.submit.publish_branch.as_deref() == Some(self.integration.target.as_str())
         {
             return Err(invalid());
         }
@@ -1461,8 +1483,15 @@ impl ValidateIntegration for FrozenIntegratingBatch {
         {
             return Err(invalid());
         }
-        for policy in self.integrations.values().flatten() {
-            policy.validate()?;
+        for node in self.batch.nodes.values() {
+            if let Some(policy) = &self.integrations[&node.task_id] {
+                policy.validate()?;
+                policy.validate_publication_branch(
+                    node.task_id,
+                    &node.frozen.publish,
+                    node.frozen.publish_branch.as_deref(),
+                )?;
+            }
         }
         check_size(self, MAX_INTEGRATION_RPC_BYTES)
     }
