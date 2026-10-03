@@ -22,19 +22,30 @@ pub fn set_drained_with_event_sink(
     drained: bool,
     sink: Option<std::sync::Arc<dyn crate::controller::events::EventSink>>,
 ) -> Result<(), WorkerError> {
+    if let Some(warning) = set_drained_with_warning(state_root, drained, sink)? {
+        warning.print();
+    }
+    Ok(())
+}
+
+pub(crate) fn set_drained_with_warning(
+    state_root: &Path,
+    drained: bool,
+    sink: Option<std::sync::Arc<dyn crate::controller::events::EventSink>>,
+) -> Result<Option<GateWarning>, WorkerError> {
     set_gate_at(
         state_root,
-        drained,
+        Some(drained),
         crate::integration::contracts::IntegrationPauseReason::ControllerDrained,
         super::leader::now_millis()?,
         sink,
     )
 }
 
-pub(crate) fn close_for_disable(state_root: &Path) -> Result<(), WorkerError> {
+pub(crate) fn close_for_disable(state_root: &Path) -> Result<Option<GateWarning>, WorkerError> {
     set_gate_at(
         state_root,
-        true,
+        None,
         crate::integration::contracts::IntegrationPauseReason::ControllerDisabled,
         super::leader::now_millis()?,
         None,
@@ -43,38 +54,165 @@ pub(crate) fn close_for_disable(state_root: &Path) -> Result<(), WorkerError> {
 
 fn set_gate_at(
     state_root: &Path,
-    drained: bool,
+    drained: Option<bool>,
     reason: crate::integration::contracts::IntegrationPauseReason,
     now: u64,
     sink: Option<std::sync::Arc<dyn crate::controller::events::EventSink>>,
-) -> Result<(), WorkerError> {
+) -> Result<Option<GateWarning>, WorkerError> {
     let hints = sink.map(crate::client_state::events::DeferredHints::begin);
     let root = open_controller_root(state_root)?;
     let lock = root.open_private_lock(DRAIN_LOCK).map_err(store_io)?;
     lock_exclusive(&lock)?;
     validate_lock(&root, &lock)?;
-    update_integration_gate(&root, drained, reason, now)?;
-    let next = state_bytes(drained)?;
-    let changed = if root.entry_exists(DRAIN_FILE).map_err(store_io)? {
-        let (previous, state) = read_state(&root)?;
-        if state.drained != drained {
-            root.replace_private_regular_exact(DRAIN_FILE, &previous, &next)
+    // Ordinary dispatch is independent of optional integration metadata.
+    // Commit its operator flag first, under the same admission lock.
+    if let Some(drained) = drained {
+        let next = state_bytes(drained)?;
+        let changed = if root.entry_exists(DRAIN_FILE).map_err(store_io)? {
+            let (previous, state) = read_state(&root)?;
+            if state.drained != drained {
+                root.replace_private_regular_exact(DRAIN_FILE, &previous, &next)
+                    .map_err(store_io)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            root.write_private_atomic_no_replace(DRAIN_FILE, &next)
                 .map_err(store_io)?;
             true
-        } else {
-            false
+        };
+        if changed && let Some(hints) = &hints {
+            hints.capture(crate::controller::events::NewEvent::ControllerDrainChanged { drained });
         }
-    } else {
-        root.write_private_atomic_no_replace(DRAIN_FILE, &next)
-            .map_err(store_io)?;
-        true
-    };
-    if changed && let Some(hints) = &hints {
-        hints.capture(crate::controller::events::NewEvent::ControllerDrainChanged { drained });
+        mark_initialized(&root, &lock)?;
     }
-    mark_initialized(&root, &lock)?;
+    let warning = match update_integration_gate(&root, drained.unwrap_or(true), reason, now) {
+        Ok(warning) => warning.map(|error| GateWarning::new(&error, true, drained.is_none())),
+        Err(error) => Some(GateWarning::new(&error, false, drained.is_none())),
+    };
     // On both success and error, reverse local drop order releases the lock first.
-    Ok(())
+    Ok(warning)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GateWarning {
+    code: String,
+    reset: bool,
+    disabled: bool,
+}
+
+impl GateWarning {
+    pub(crate) fn new(error: &WorkerError, reset: bool, disabled: bool) -> Self {
+        Self {
+            code: error.public_code(),
+            reset,
+            disabled,
+        }
+    }
+    fn line(&self) -> String {
+        let detail = if self.reset {
+            "pause history was reset"
+        } else {
+            "pause could not be persisted"
+        };
+        let resume = if self.disabled && !self.reset {
+            "; integration may resume after re-enable"
+        } else {
+            ""
+        };
+        format!(
+            "warning: integration gate [{}]; {detail}{resume}",
+            self.code
+        )
+    }
+    pub(crate) fn print(&self) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{}", self.line());
+    }
+}
+
+/// Only public gate diagnostics cross the operator transport. Ordinary result
+/// DTOs and arbitrary remote stderr stay unchanged and unexposed.
+pub(crate) struct OperatorRunner<'a> {
+    runner: &'a dyn crate::process::ProcessRunner,
+    warnings: std::sync::Mutex<Vec<GateWarning>>,
+}
+impl<'a> OperatorRunner<'a> {
+    pub(crate) fn new(runner: &'a dyn crate::process::ProcessRunner) -> Self {
+        Self {
+            runner,
+            warnings: std::sync::Mutex::new(vec![]),
+        }
+    }
+    pub(crate) fn record(&self, warning: GateWarning) {
+        let mut warnings = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+        if !warnings
+            .iter()
+            .any(|existing| existing.line() == warning.line())
+        {
+            warnings.push(warning);
+        }
+    }
+    fn capture(&self, result: &crate::process::ProcessResult) {
+        // Match complete known lines rather than forwarding untrusted stderr.
+        for code in ["IO", "CONTROLLER_TRANSPORT"] {
+            for reset in [false, true] {
+                for disabled in [false, true] {
+                    let warning = GateWarning {
+                        code: code.into(),
+                        reset,
+                        disabled,
+                    };
+                    if result
+                        .stderr
+                        .split(|b| *b == b'\n')
+                        .take(16)
+                        .any(|line| line == warning.line().as_bytes())
+                    {
+                        self.record(warning);
+                    }
+                }
+            }
+        }
+    }
+    pub(crate) fn emit(&self, stderr: &mut dyn std::io::Write) {
+        for warning in self
+            .warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let _ = writeln!(stderr, "{}", warning.line());
+        }
+    }
+}
+impl crate::process::ProcessRunner for OperatorRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        let result = self.runner.run(request)?;
+        self.capture(&result);
+        Ok(result)
+    }
+    fn run_in_new_session(
+        &self,
+        request: &crate::process::ProcessRequest,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        let result = self.runner.run_in_new_session(request)?;
+        self.capture(&result);
+        Ok(result)
+    }
+    fn run_interruptible(
+        &self,
+        request: &crate::process::ProcessRequest,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<crate::process::ProcessResult, WorkerError> {
+        let result = self.runner.run_interruptible(request, stop)?;
+        self.capture(&result);
+        Ok(result)
+    }
 }
 
 use super::leader::{
@@ -115,7 +253,12 @@ fn read_integration_gate(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(store_io(e)),
     };
-    let gate: IntegrationGate = serde_json::from_slice(&bytes).map_err(|_| invalid_state())?;
+    let gate = decode_integration_gate(&bytes)?;
+    Ok(Some((bytes, gate)))
+}
+
+fn decode_integration_gate(bytes: &[u8]) -> Result<IntegrationGate, WorkerError> {
+    let gate: IntegrationGate = serde_json::from_slice(bytes).map_err(|_| invalid_state())?;
     if gate.version != 1
         || gate.windows.iter().enumerate().any(|(i, window)| {
             !matches!(
@@ -134,36 +277,56 @@ fn read_integration_gate(
     {
         return Err(invalid_state());
     }
-    Ok(Some((bytes, gate)))
+    Ok(gate)
 }
 fn update_integration_gate(
     root: &RootedDir,
     drained: bool,
     reason: crate::integration::contracts::IntegrationPauseReason,
     now: u64,
-) -> Result<(), WorkerError> {
-    let previous = read_integration_gate(root)?;
-    if previous.is_none() && !drained {
-        return Ok(());
+) -> Result<Option<WorkerError>, WorkerError> {
+    let old = match root.read_private_regular(
+        INTEGRATION_GATE,
+        crate::integration::contracts::MAX_PRIVATE_RECORD_BYTES as u64,
+    ) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(store_io(e)),
+    };
+    let mut warning = None;
+    let previous = match old.as_ref() {
+        None => None,
+        Some(bytes) => match decode_integration_gate(bytes) {
+            Ok(gate) => Some(gate),
+            Err(error) => {
+                // Quarantine only a bounded, private file that was read
+                // successfully. I/O/safety failures never enter this branch.
+                const CORRUPT: &str = "integration-gate.json.corrupt";
+                if root.entry_exists(CORRUPT).map_err(store_io)? {
+                    let saved = root
+                        .read_private_regular(
+                            CORRUPT,
+                            crate::integration::contracts::MAX_PRIVATE_RECORD_BYTES as u64,
+                        )
+                        .map_err(store_io)?;
+                    root.replace_private_regular_exact(CORRUPT, &saved, bytes)
+                        .map_err(store_io)?;
+                } else {
+                    root.write_private_atomic_no_replace(CORRUPT, bytes)
+                        .map_err(store_io)?;
+                }
+                warning = Some(error);
+                None
+            }
+        },
+    };
+    if old.is_none() && !drained {
+        return Ok(None);
     }
-    let mut gate = previous
-        .as_ref()
-        .map(|(_, gate)| IntegrationGate {
-            version: gate.version,
-            windows: gate
-                .windows
-                .iter()
-                .map(|w| PauseWindow {
-                    reason: w.reason,
-                    effective_at_millis: w.effective_at_millis,
-                    resumed_at_millis: w.resumed_at_millis,
-                })
-                .collect(),
-        })
-        .unwrap_or(IntegrationGate {
-            version: 1,
-            windows: vec![],
-        });
+    let mut gate = previous.unwrap_or(IntegrationGate {
+        version: 1,
+        windows: vec![],
+    });
     if drained {
         if gate
             .windows
@@ -196,15 +359,16 @@ fn update_integration_gate(
     if bytes.len() > crate::integration::contracts::MAX_PRIVATE_RECORD_BYTES {
         return Err(invalid_state());
     }
-    match previous {
-        Some((old, _)) if old == bytes => Ok(()),
-        Some((old, _)) => root
+    match old {
+        Some(old) if old == bytes => {}
+        Some(old) => root
             .replace_private_regular_exact(INTEGRATION_GATE, &old, &bytes)
-            .map_err(store_io),
+            .map_err(store_io)?,
         None => root
             .write_private_atomic_no_replace(INTEGRATION_GATE, &bytes)
-            .map_err(store_io),
+            .map_err(store_io)?,
     }
+    Ok(warning)
 }
 
 fn prune_pause_history(gate: &mut IntegrationGate, now: u64) {
@@ -281,13 +445,16 @@ pub(crate) fn set_drained_at(
     drained: bool,
     now: u64,
 ) -> Result<(), WorkerError> {
-    set_gate_at(
+    if let Some(warning) = set_gate_at(
         state_root,
-        drained,
+        Some(drained),
         crate::integration::contracts::IntegrationPauseReason::ControllerDrained,
         now,
         None,
-    )
+    )? {
+        warning.print();
+    }
+    Ok(())
 }
 
 /// Read-only observation. A missing controller store is ordinary local
@@ -300,8 +467,41 @@ pub fn is_drained(state_root: &Path) -> Result<bool, WorkerError> {
         return Ok(false);
     };
     lock_shared(&lock)?;
+    read_drain_flag(&root, &lock)
+}
+
+fn read_drain_flag(root: &RootedDir, lock: &File) -> Result<bool, WorkerError> {
+    let initialized = validate_lock(root, lock)?;
+    // Disable may establish only an integration window. No ordinary flag
+    // was committed until a controller store opens or an operator drains.
+    if !initialized && !root.entry_exists(DRAIN_FILE).map_err(store_io)? {
+        return Ok(false);
+    }
+    Ok(read_state(root)?.1.drained)
+}
+
+pub(crate) fn integration_pause(
+    state_root: &Path,
+) -> Result<Option<crate::integration::contracts::IntegrationPauseEvidence>, WorkerError> {
+    let Some(root) = open_existing_controller_root(state_root)? else {
+        return Ok(None);
+    };
+    let Some(lock) = existing_lock(&root)? else {
+        return Ok(None);
+    };
+    lock_shared(&lock)?;
     validate_lock(&root, &lock)?;
-    Ok(read_state(&root)?.1.drained)
+    Ok(read_integration_gate(&root)?.and_then(|(_, gate)| {
+        gate.windows
+            .last()
+            .filter(|w| w.resumed_at_millis.is_none())
+            .map(
+                |w| crate::integration::contracts::IntegrationPauseEvidence {
+                    reason: w.reason,
+                    effective_at_millis: w.effective_at_millis,
+                },
+            )
+    }))
 }
 
 /// None means drained; errors also prohibit launch. No files are created
@@ -311,22 +511,33 @@ pub(crate) fn launch_permit(
     deadline: crate::client_state::WaitDeadline,
 ) -> Result<Option<DrainLaunchPermit>, WorkerError> {
     let hints = crate::client_state::events::DeferredHints::fence();
-    Ok(
-        integration_permit(state_root, deadline)?.map(|permit| DrainLaunchPermit {
-            _lock: permit.0,
+    deadline.remaining()?;
+    let Some(root) = open_existing_controller_root(state_root)? else {
+        return Ok(Some(DrainLaunchPermit {
+            _lock: None,
             _hints: hints,
-        }),
-    )
+        }));
+    };
+    let Some(lock) = existing_lock(&root)? else {
+        return Ok(Some(DrainLaunchPermit {
+            _lock: None,
+            _hints: hints,
+        }));
+    };
+    deadline.lock(lock.as_raw_fd(), libc::LOCK_SH)?;
+    if read_drain_flag(&root, &lock)? {
+        return Ok(None);
+    }
+    Ok(Some(DrainLaunchPermit {
+        _lock: Some(lock),
+        _hints: hints,
+    }))
 }
 
 /// Only the file guard crosses the Send integration phase contract. Queue
 /// launchers retain their existing thread-local deferred-hint fence above.
-pub(crate) struct IntegrationDrainPermit(Option<File>);
-pub(crate) fn integration_permit(
-    state_root: &Path,
-    deadline: crate::client_state::WaitDeadline,
-) -> Result<Option<IntegrationDrainPermit>, WorkerError> {
-    Ok(integration_admission(state_root, deadline, super::leader::now_millis()?)?.ok())
+pub(crate) struct IntegrationDrainPermit {
+    _lock: Option<File>,
 }
 
 /// Gate state and effective time are observed together under the admission lock.
@@ -340,15 +551,15 @@ pub(crate) fn integration_admission(
 > {
     deadline.remaining()?;
     let Some(root) = open_existing_controller_root(state_root)? else {
-        return Ok(Ok(IntegrationDrainPermit(None)));
+        return Ok(Ok(IntegrationDrainPermit { _lock: None }));
     };
     let Some(lock) = existing_lock(&root)? else {
-        return Ok(Ok(IntegrationDrainPermit(None)));
+        return Ok(Ok(IntegrationDrainPermit { _lock: None }));
     };
     deadline.lock(lock.as_raw_fd(), libc::LOCK_SH)?;
     validate_lock(&root, &lock)?;
     let metadata = read_integration_gate(&root)?;
-    if read_state(&root)?.1.drained
+    if read_drain_flag(&root, &lock)?
         || metadata.as_ref().is_some_and(|(_, gate)| {
             gate.windows
                 .last()
@@ -366,7 +577,7 @@ pub(crate) fn integration_admission(
             },
         ));
     }
-    Ok(Ok(IntegrationDrainPermit(Some(lock))))
+    Ok(Ok(IntegrationDrainPermit { _lock: Some(lock) }))
 }
 
 /// Called while the caller holds the shared drain permit. The record's durable
@@ -577,6 +788,37 @@ mod tests {
         assert!(history(&path).windows.is_empty());
         assert!(
             integration_admission(&path, crate::client_state::WaitDeadline::new(None), 4000000)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn corrupt_gate_refuses_integration_until_an_operator_quarantines_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("controller");
+        set_drained_at(&path, false, 1001).unwrap();
+        let root = open_controller_root(&path).unwrap();
+        root.write_private_atomic_no_replace(INTEGRATION_GATE, b"invalid gate")
+            .unwrap();
+        assert!(
+            integration_admission(&path, crate::client_state::WaitDeadline::new(None), 2001)
+                .is_err()
+        );
+        set_drained_at(&path, true, 2001).expect("corrupt gate blocked ordinary drain");
+        assert!(is_drained(&path).unwrap());
+        assert!(
+            integration_admission(&path, crate::client_state::WaitDeadline::new(None), 2001)
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(path.join("integration-gate.json.corrupt")).unwrap(),
+            b"invalid gate"
+        );
+        set_drained_at(&path, false, 3001).unwrap();
+        assert!(
+            integration_admission(&path, crate::client_state::WaitDeadline::new(None), 3001)
                 .unwrap()
                 .is_ok()
         );

@@ -1026,6 +1026,17 @@ fn run_controller_command(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    let diagnostics = crate::controller::drain::OperatorRunner::new(runner);
+    let runner = if matches!(
+        &command,
+        ControllerCommand::Disable { .. }
+            | ControllerCommand::Drain { .. }
+            | ControllerCommand::Status
+    ) {
+        &diagnostics as &dyn ProcessRunner
+    } else {
+        runner
+    };
     let result = (|| -> Result<(), WorkerError> {
         let explicit_config = config_override.is_some();
         let paths = discover_paths(config_override, runtime)?;
@@ -1263,11 +1274,13 @@ fn run_controller_command(
                     Some(!off),
                 )?
             } else {
-                crate::controller::drain::set_drained_with_event_sink(
+                if let Some(warning) = crate::controller::drain::set_drained_with_warning(
                     &paths.controller_state_root(),
                     !off,
                     _events.as_ref().map(ControllerEventPublisher::sink),
-                )?;
+                )? {
+                    diagnostics.record(warning);
+                }
                 !off
             };
             if json {
@@ -1316,6 +1329,19 @@ fn run_controller_command(
                     crate::controller::drain::is_drained(&paths.controller_state_root()),
                 )
             };
+            let integration_pause = if let Some(controller) = config
+                .as_ref()
+                .map(|c| &c.controller)
+                .filter(|c| !c.ssh.is_empty())
+            {
+                crate::controller::control::integration_pause_via_controller(runner, controller)
+                    .ok()
+                    .flatten()
+            } else {
+                crate::controller::drain::integration_pause(&paths.controller_state_root())
+                    .ok()
+                    .flatten()
+            };
             if json {
                 let mut value = serde_json::to_value(&status).map_err(std::io::Error::other)?;
                 value["service"] = match &service {
@@ -1327,6 +1353,12 @@ fn run_controller_command(
                     .map_or(serde_json::Value::Null, |flag| serde_json::json!(flag));
                 if let Err(error) = &drained {
                     value["drain_error_code"] = serde_json::json!(error.public_code());
+                }
+                // This CLI object already adds service/drained to health and
+                // has no strict decoder. The strict health/drain DTOs stay intact.
+                if let Some(pause) = integration_pause {
+                    value["integration_pause"] =
+                        serde_json::to_value(pause).map_err(std::io::Error::other)?;
                 }
                 serde_json::to_writer(&mut *stdout, &value).map_err(std::io::Error::other)?;
                 writeln!(stdout)?;
@@ -1363,6 +1395,17 @@ fn run_controller_command(
                     Ok(flag) => writeln!(stdout, "drained: {flag}")?,
                     Err(error) => writeln!(stdout, "drained: unknown [{}]", error.public_code())?,
                 };
+                if let Some(pause) = integration_pause {
+                    let reason = match pause.reason {
+                        crate::integration::contracts::IntegrationPauseReason::ControllerDisabled => "controller_disabled",
+                        _ => "controller_drained",
+                    };
+                    writeln!(
+                        stdout,
+                        "integration: paused ({reason}) since {}; resume with: worker controller drain --off",
+                        pause.effective_at_millis
+                    )?;
+                }
             }
             stdout.flush()?;
             return Ok(());
@@ -1525,6 +1568,7 @@ fn run_controller_command(
         Ok(())
     })();
 
+    diagnostics.emit(stderr);
     match result {
         Ok(()) => 0,
         Err(error) => {

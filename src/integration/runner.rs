@@ -1628,6 +1628,85 @@ mod native_launch_tests {
     }
 
     #[test]
+    fn native_disable_pause_survives_enable_without_blocking_ordinary_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let now = crate::controller::leader::now_millis().unwrap();
+        let clock = Arc::new(AtomicU64::new(now));
+        let read_clock = clock.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))));
+        let (state, record, prepared, entry) = queued_auxiliary(&paths, &client, now + 600000);
+        let gate = paths.controller_state_root();
+        let _ = crate::controller::drain::close_for_disable(&gate).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(gate.join("integration-gate.json")).unwrap())
+                .unwrap();
+        let effective = metadata["windows"][0]["effective_at_millis"]
+            .as_u64()
+            .unwrap();
+        clock.store(effective + 900000, Ordering::SeqCst);
+        assert!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .unwrap()
+                .is_none()
+        );
+        let parked = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(
+            parked.pause.unwrap().reason,
+            IntegrationPauseReason::ControllerDisabled
+        );
+        assert!(!crate::controller::drain::is_drained(&gate).unwrap());
+        crate::controller::ControllerStore::open(&gate).unwrap();
+        assert!(
+            crate::controller::drain::launch_permit(
+                &gate,
+                crate::client_state::WaitDeadline::new(None)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .unwrap()
+                .is_none()
+        );
+        let resume = effective + 1100000;
+        crate::controller::drain::set_drained_at(&gate, false, resume).unwrap();
+        clock.store(resume, Ordering::SeqCst);
+        assert!(
+            auxiliary_launch_permit(&paths, &client, record.task_id, entry.job_id())
+                .unwrap()
+                .is_some()
+        );
+        let restored = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(
+            restored.admission_deadline_millis,
+            Some(resume + parked.remaining_admission_millis.unwrap())
+        );
+        assert_eq!(
+            restored.snapshot.integration_id,
+            record.snapshot.integration_id
+        );
+        assert_eq!(restored.snapshot.epoch, record.snapshot.epoch);
+        assert_eq!(restored.followups_spent, 1);
+        assert_eq!(
+            state.load_prepared(record.task_id, entry.job_id()).unwrap(),
+            Some(prepared)
+        );
+        assert_eq!(
+            client
+                .queue_entry(entry.job_id())
+                .unwrap()
+                .unwrap()
+                .queue_id(),
+            entry.queue_id()
+        );
+        assert_eq!(client.queue_snapshot().unwrap().entries().len(), 1);
+    }
+
+    #[test]
     fn native_pause_history_1000_cycles_stress() {
         // This runs in nextest's existing stress group, without #[ignore],
         // because 1000 real fsynced operator cycles outlast the ordinary limit.
