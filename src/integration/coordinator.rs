@@ -464,6 +464,22 @@ impl<'a> IntegrationCoordinator<'a> {
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
     }
+    pub(crate) fn covers_latest_ordinary_work(
+        &self,
+        ordinary: &crate::task::LocalTaskRecord,
+        snapshot: &IntegrationSnapshot,
+    ) -> Result<bool, WorkerError> {
+        for turn in ordinary.status().turns().iter().rev() {
+            if self
+                .state
+                .load_prepared(ordinary.meta().task_id(), turn.turn_id())?
+                .is_none()
+            {
+                return Ok(turn.turn_id() == snapshot.source_turn_id);
+            }
+        }
+        Ok(false)
+    }
     fn followups_spent(
         &self,
         ordinary: &crate::task::LocalTaskRecord,

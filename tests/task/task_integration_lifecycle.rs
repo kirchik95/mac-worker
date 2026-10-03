@@ -1541,6 +1541,256 @@ fn enabled_mutations_revoke_before_reconcile_and_ambiguous_stop_keeps_the_task_o
 }
 
 #[test]
+fn review_old_integrated_receipt_allows_cancel_of_later_needs_input_work() {
+    old_integrated_cancel_of_later_terminal(
+        mac_worker::test_support::task::model::TaskOutcome::NeedsInput,
+    );
+}
+
+#[test]
+fn review_old_integrated_receipt_allows_cancel_of_later_failed_work() {
+    old_integrated_cancel_of_later_terminal(
+        mac_worker::test_support::task::model::TaskOutcome::Failed {
+            reason: "EXIT_CODE_3".into(),
+        },
+    );
+}
+
+#[test]
+fn review_old_integrated_receipt_allows_cancel_replay_of_later_cancelled_work() {
+    old_integrated_cancel_of_later_terminal(
+        mac_worker::test_support::task::model::TaskOutcome::Cancelled,
+    );
+}
+
+fn old_integrated_cancel_of_later_terminal(
+    outcome: mac_worker::test_support::task::model::TaskOutcome,
+) {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use driver_fixture::*;
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{
+            client::TaskClient,
+            model::{
+                ClosePolicy, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
+            },
+            turn_runner::InlineRunnerExecutor,
+        },
+    };
+    let rig = Rig::new(Mode::Clean, ClosePolicy::Never);
+    IntegrationRunner::new(rig.coordinator())
+        .run(fixture_task())
+        .unwrap();
+    let prior = rig.record();
+    let calls = rig.host.calls.lock().unwrap().clone();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    let mut history = ordinary.status().turns().to_vec();
+    history.push(TurnSummary::new(
+        2,
+        TurnId::generate(),
+        Some(match outcome {
+            TaskOutcome::Cancelled => TurnTerminal::Cancelled,
+            TaskOutcome::Failed { .. } => TurnTerminal::Failed,
+            _ => TurnTerminal::Succeeded,
+        }),
+        Some(outcome.clone()),
+        Some(false),
+        false,
+        Some(2000),
+        Some(2001),
+    ));
+    let accepted = prior.receipt.as_ref().unwrap().merge_oid.clone().unwrap();
+    let status = TaskStatus::new(
+        TaskState::Open,
+        Some(outcome),
+        Some("fixture-worker".into()),
+        true,
+        Some(accepted.clone()),
+        Some("later ordinary work".into()),
+        vec![],
+        vec![],
+        None,
+        history,
+        2001,
+    )
+    .unwrap();
+    let ordinary = ordinary
+        .with_status(status)
+        .unwrap()
+        .with_fetched_head(Some(accepted))
+        .unwrap();
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    store.create_task(ordinary.clone()).unwrap();
+    let coordinator = rig.coordinator();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+        .with_integration(&coordinator);
+    let report = client.cancel_from_expected(&ordinary).unwrap();
+    assert_eq!(report.status(), ordinary.status());
+    assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+    assert_eq!(rig.record(), prior);
+    assert_eq!(*rig.host.calls.lock().unwrap(), calls);
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
+fn review_old_integrated_receipt_allows_a_later_ordinary_say_and_waiting_turn_cancel() {
+    use crate::support::{GitRepo, task_harness::paths};
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::drain::set_drained,
+        host::process::SystemProcessRunner,
+        task::{
+            client::TaskClient,
+            model::{LocalTaskRecord, TaskOutcome, TaskState},
+            project_state::ProjectState,
+            turn_runner::InlineRunnerExecutor,
+        },
+    };
+    use std::sync::Arc;
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let repo = GitRepo::init();
+    repo.write("base.txt", b"base\n");
+    repo.commit_all("base");
+    assert!(
+        repo.git(&["remote", "add", "origin", "https://example.test/repo.git"])
+            .status
+            .success()
+    );
+    let project = ProjectState::load(&SystemProcessRunner, repo.root(), &[]).unwrap();
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let mut wire = serde_json::to_value(sample_ordinary(fixture_task(), fixture_source())).unwrap();
+    wire["meta"]["project_id"] = project.context.project_id.clone().into();
+    wire["meta"]["worktree_id"] = project.context.worktree_id.clone().into();
+    wire["status"]["head_oid"] = "e".repeat(40).into();
+    wire["fetched_head"] = "e".repeat(40).into();
+    let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    store.create_task(ordinary.clone()).unwrap();
+    store
+        .write_task_project_path(&ordinary, repo.root())
+        .unwrap();
+    let runtime = Arc::new(ManualIntegrationRuntime::default());
+    let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+    let mut prior = sample_record(fixture_task(), fixture_source(), "main");
+    prior.policy.project_id = project.context.project_id;
+    prior.snapshot.state = IntegrationStatus::Integrated;
+    prior.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+    prior.snapshot.observed_target_oid = Some(prior.cycle_base.clone());
+    prior.snapshot.disposition = Some(IntegrationDisposition::Merged);
+    prior.receipt = Some(IntegrationReceipt {
+        integration_id: prior.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: prior.snapshot.source_head.clone(),
+        target_head: prior.cycle_base.clone(),
+        merge_oid: prior.snapshot.merge_oid.clone(),
+        disposition: IntegrationDisposition::Merged,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state.publish_policy(fixture_task(), &prior.policy).unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &prior)
+        .unwrap();
+    let host = FakeIntegrationHost::default();
+    let turns = FakeIntegrationTurns::default();
+    let observer = FakeIntegrationObserver::default();
+    let coordinator =
+        IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+    let config = owner_config();
+    let client = TaskClient::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &store,
+        &InlineRunnerExecutor,
+    )
+    .with_integration(&coordinator);
+    set_drained(&paths.controller_state_root(), true).unwrap();
+    client
+        .say(
+            fixture_task(),
+            "follow up".into(),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let queued = store.load_task(fixture_task()).unwrap();
+    assert_eq!(queued.status().state(), TaskState::Active);
+    assert_eq!(queued.status().turns().len(), 2);
+    assert_eq!(
+        client
+            .say(
+                fixture_task(),
+                "another".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .unwrap_err()
+            .public_code(),
+        "TASK_BUSY"
+    );
+    let turn = queued.status().turns().last().unwrap().turn_id();
+    let cancelled = client.cancel_from_expected(&queued).unwrap();
+    assert_eq!(cancelled.status().state(), TaskState::Open);
+    assert_eq!(
+        cancelled.status().last_outcome(),
+        Some(&TaskOutcome::Cancelled)
+    );
+    assert!(store.queue_entry(turn).unwrap().is_none());
+    assert_eq!(state.load(fixture_task()).unwrap(), Some(prior));
+    assert!(host.calls().is_empty());
+}
+
+#[test]
+fn review_integrated_source_with_a_completed_auxiliary_still_refuses_cancellation() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use driver_fixture::*;
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{
+            client::TaskClient,
+            model::{ClosePolicy, TaskOutcome},
+            turn_runner::InlineRunnerExecutor,
+        },
+    };
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let turn = rig.queued();
+    rig.complete(turn, TaskOutcome::Done, vec![]);
+    IntegrationRunner::new(rig.coordinator())
+        .run(fixture_task())
+        .unwrap();
+    let prior = rig.record();
+    let ordinary = rig.observer.facts(fixture_task()).unwrap().ordinary;
+    assert_eq!(ordinary.status().turns().last().unwrap().turn_id(), turn);
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    store.create_task(ordinary.clone()).unwrap();
+    let coordinator = rig.coordinator();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+        .with_integration(&coordinator);
+    assert_eq!(
+        client
+            .cancel_from_expected(&ordinary)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_ALREADY_COMMITTED"
+    );
+    assert_eq!(rig.record(), prior);
+    assert!(runner.requests().is_empty());
+}
+
+#[test]
 fn integrated_cancel_cannot_relabel_committed_work() {
     use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
     use driver_fixture::*;
