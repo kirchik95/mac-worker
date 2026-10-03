@@ -302,6 +302,10 @@ fn execute_with_context(
         Command::Controller { .. } => Err(WorkerError::Protocol(
             "public controller commands require the stdio execution boundary".into(),
         )),
+        Command::IntegrationRunner { .. }
+        | Command::Host {
+            command: HostCommand::TaskIntegration | HostCommand::TaskIntegrationTurn,
+        } => Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error()),
         Command::Runner { .. } => Err(WorkerError::Protocol(
             "hidden runner requires the stdio execution boundary".into(),
         )),
@@ -1744,6 +1748,9 @@ fn run_task_subcommand(
             max_budget,
             max_followups,
             questions,
+            integrate,
+            no_integrate,
+            verify_merge,
             close_on,
             env_profile,
             worker,
@@ -1775,8 +1782,15 @@ fn run_task_subcommand(
                 .with_session_selector(from_session, runtime.home());
             let report = client.submit_titled(
                 TaskSubmitRequest {
-                    integrate: Default::default(),
-                    verify_merge: None,
+                    integrate: if no_integrate {
+                        crate::integration::contracts::IntegrationOverride::Disabled
+                    } else {
+                        integrate.map_or(
+                            Default::default(),
+                            crate::integration::contracts::IntegrationOverride::Target,
+                        )
+                    },
+                    verify_merge,
                     session_import: None,
                     questions,
                     agent: task_agent,
@@ -1954,6 +1968,9 @@ fn run_task_subcommand(
             let report = client.wait(selector, timeout)?;
             write_wait_report(&report, json, stdout)?;
             Ok(report.exit_code())
+        }
+        TaskCommand::Integrate { .. } => {
+            Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error())
         }
         TaskCommand::Reconcile => {
             let report = client.operator_reconcile()?;
@@ -4844,6 +4861,9 @@ fn run_enabled_controller_task(
                     max_budget,
                     max_followups,
                     questions,
+                    integrate,
+                    no_integrate,
+                    verify_merge,
                     close_on,
                     env_profile,
                     worker,
@@ -4877,6 +4897,9 @@ fn run_enabled_controller_task(
                 paths,
                 config,
                 ControllerSubmitFields {
+                    integrate: if no_integrate { crate::integration::contracts::IntegrationOverride::Disabled }
+                        else { integrate.map_or(Default::default(), crate::integration::contracts::IntegrationOverride::Target) },
+                    verify_merge,
                     from_session,
                     capture_home: runtime.home().to_path_buf(),
                     questions,
@@ -5390,6 +5413,8 @@ fn controller_ack_id(id: Option<&str>) -> &str {
 }
 
 struct ControllerSubmitFields {
+    integrate: crate::integration::contracts::IntegrationOverride,
+    verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     from_session: Option<crate::session_transfer::SessionSelector>,
     capture_home: PathBuf,
     questions: Option<crate::task::QuestionsPolicy>,
@@ -5427,6 +5452,8 @@ fn freeze_and_submit_via_controller(
     WorkerError,
 > {
     let ControllerSubmitFields {
+        integrate,
+        verify_merge,
         from_session,
         capture_home,
         questions,
@@ -5449,6 +5476,12 @@ fn freeze_and_submit_via_controller(
         wait_for_capacity,
     } = cli;
     let probed = crate::project_state::ProjectState::load(runner, &project, &includes)?;
+    crate::integration::config::reject_unrouted_settings(
+        &(&probed.settings.task).into(),
+        &integrate,
+        verify_merge,
+        wip,
+    )?;
     let limits = crate::task_client::effective_task_limits(&limits, &probed.settings.task)?;
     let source_name = source.unwrap_or_else(|| probed.settings.task.source.clone());
     if let Some(selector) = &from_session {
@@ -8258,6 +8291,9 @@ mod enabled_submit_freeze_tests {
     fn submit_command(project: PathBuf, no_wait: bool, wait: bool) -> Command {
         Command::Task {
             command: TaskCommand::Submit {
+                integrate: None,
+                no_integrate: false,
+                verify_merge: None,
                 from_session: None,
                 agent: None,
                 model: None,

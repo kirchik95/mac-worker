@@ -39,6 +39,8 @@ pub struct ProjectSettings {
 /// task enums after all project policy has been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSettings {
+    pub integrate: crate::integration::contracts::IntegrationOverride,
+    pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     pub questions: Option<crate::task::QuestionsPolicy>,
     pub source: String,
     pub publish: Vec<String>,
@@ -149,6 +151,10 @@ struct RawSetupSettings {
 #[serde(deny_unknown_fields)]
 struct RawTaskSettings {
     #[serde(default)]
+    integrate: crate::integration::contracts::IntegrationOverride,
+    #[serde(default)]
+    verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
+    #[serde(default)]
     questions: Option<crate::task::QuestionsPolicy>,
     #[serde(default = "default_task_source")]
     source: String,
@@ -175,6 +181,8 @@ struct RawTaskSettings {
 impl Default for RawTaskSettings {
     fn default() -> Self {
         Self {
+            integrate: Default::default(),
+            verify_merge: None,
             questions: None,
             source: default_task_source(),
             publish: default_task_publish(),
@@ -483,6 +491,15 @@ fn verify_setup_lockfiles_exist(root: &Path, setup: &SetupSettings) -> Result<()
 }
 
 fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerError> {
+    crate::integration::config::resolve_integration_settings(
+        &crate::integration::config::IntegrationPolicySettings {
+            integrate: raw.integrate.clone(),
+            verify_merge: raw.verify_merge,
+        },
+        None,
+        &Default::default(),
+        None,
+    )?;
     if !matches!(raw.source.as_str(), "local" | "origin") {
         return Err(task_config(
             "task source must be local or origin (TASK_CONFIG_INVALID)",
@@ -558,6 +575,8 @@ fn validate_task_settings(raw: RawTaskSettings) -> Result<TaskSettings, WorkerEr
         }
     }
     Ok(TaskSettings {
+        integrate: raw.integrate,
+        verify_merge: raw.verify_merge,
         questions: raw.questions,
         source: raw.source,
         publish,

@@ -1,6 +1,238 @@
-use mac_worker::test_support::integration::{
-    IntegrationOverride, VerifyPolicy, validate_integration_target,
-};
+use mac_worker::test_support::integration::*;
+use mac_worker::test_support::task::model::ClosePolicy;
+
+fn target(name: &str) -> IntegrationOverride {
+    IntegrationOverride::Target(validate_integration_target(name).unwrap())
+}
+
+fn project_policy() -> IntegrationProjectPolicy {
+    let policy = sample_policy("main");
+    IntegrationProjectPolicy {
+        settings: IntegrationPolicySettings::default(),
+        project_id: policy.project_id,
+        base_oid: policy.base_oid,
+        base_task: None,
+    }
+}
+
+#[test]
+fn policy_precedence_freezes_requested_close_and_defaults() {
+    let mut project = project_policy();
+    let resolve = |project: &IntegrationProjectPolicy,
+                   batch: Option<&IntegrationPolicySettings>,
+                   task: &IntegrationOverride,
+                   verify| {
+        resolve_integration_policy(
+            project,
+            batch,
+            task,
+            verify,
+            ClosePolicy::Done,
+            "https://example.test/repo.git",
+            IntegrationBaseKind::Committed,
+        )
+    };
+    assert!(
+        resolve(&project, None, &IntegrationOverride::Inherit, None)
+            .unwrap()
+            .is_none()
+    );
+    project.settings.integrate = target("project");
+    project.settings.verify_merge = Some(VerifyPolicy::MovedTarget);
+    let batch = IntegrationPolicySettings {
+        integrate: target("batch"),
+        verify_merge: Some(VerifyPolicy::Never),
+    };
+    for (defaults, override_, verify, branch, expected_verify) in [
+        (
+            None,
+            IntegrationOverride::Inherit,
+            None,
+            "project",
+            VerifyPolicy::MovedTarget,
+        ),
+        (
+            Some(&batch),
+            IntegrationOverride::Inherit,
+            None,
+            "batch",
+            VerifyPolicy::Never,
+        ),
+        (
+            Some(&batch),
+            target("task"),
+            Some(VerifyPolicy::MovedTarget),
+            "task",
+            VerifyPolicy::MovedTarget,
+        ),
+    ] {
+        let frozen = resolve(&project, defaults, &override_, verify)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.target.as_str(), branch);
+        assert_eq!(frozen.verify, expected_verify);
+        assert_eq!(frozen.requested_close, ClosePolicy::Done);
+        assert_eq!(frozen.base_oid, project.base_oid);
+        assert_eq!(frozen.base_preflight, IntegrationBasePreflight::Unknown);
+    }
+    assert!(
+        resolve(&project, Some(&batch), &IntegrationOverride::Disabled, None)
+            .unwrap()
+            .is_none()
+    );
+    let disabled_batch = IntegrationPolicySettings {
+        integrate: IntegrationOverride::Disabled,
+        verify_merge: None,
+    };
+    assert!(
+        resolve(
+            &project,
+            Some(&disabled_batch),
+            &IntegrationOverride::Inherit,
+            None
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        resolve(
+            &project_policy(),
+            None,
+            &IntegrationOverride::Inherit,
+            Some(VerifyPolicy::Never)
+        )
+        .unwrap_err()
+        .public_code(),
+        "TASK_CONFIG_INVALID"
+    );
+    assert!(
+        resolve(
+            &project,
+            None,
+            &IntegrationOverride::Disabled,
+            Some(VerifyPolicy::MovedTarget)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn resolution_requires_origin_and_valid_base_provenance() {
+    let mut project = project_policy();
+    project.settings.integrate = target("main");
+    let resolve = |project: &IntegrationProjectPolicy, origin, kind| {
+        resolve_integration_policy(
+            project,
+            None,
+            &IntegrationOverride::Inherit,
+            None,
+            ClosePolicy::Never,
+            origin,
+            kind,
+        )
+    };
+    assert_eq!(
+        resolve(&project, "", IntegrationBaseKind::Committed)
+            .unwrap_err()
+            .public_code(),
+        "TASK_CONFIG_INVALID"
+    );
+    project.base_oid = None;
+    assert!(
+        resolve(
+            &project,
+            "https://example.test/repo.git",
+            IntegrationBaseKind::Committed
+        )
+        .is_err()
+    );
+    assert!(
+        resolve(
+            &project,
+            "https://example.test/repo.git",
+            IntegrationBaseKind::FromTask
+        )
+        .is_err()
+    );
+    project.base_task = Some(fixture_task());
+    let frozen = resolve(
+        &project,
+        "https://example.test/repo.git",
+        IntegrationBaseKind::FromTask,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(frozen.base_task, Some(fixture_task()));
+    assert_eq!(frozen.base_preflight, IntegrationBasePreflight::Unknown);
+}
+
+#[test]
+fn cli_parses_opt_in_disable_redrive_and_hidden_forms() {
+    use clap::Parser;
+    use mac_worker::test_support::cli::{Cli, Command, TaskCommand, into_command};
+    for args in [
+        vec!["--integrate", "main", "--verify-merge", "moved-target"],
+        vec!["--no-integrate"],
+    ] {
+        let mut argv = vec!["worker", "task", "submit", "--prompt", "work"];
+        argv.extend(args);
+        let parsed = Cli::try_parse_from(argv).unwrap();
+        assert!(matches!(
+            into_command(parsed),
+            Command::Task {
+                command: TaskCommand::Submit { .. }
+            }
+        ));
+    }
+    for args in [
+        vec!["--integrate", "main", "--no-integrate"],
+        vec!["--integrate", "refs/heads/main"],
+        vec!["--verify-merge", "always"],
+    ] {
+        let mut argv = vec!["worker", "task", "submit", "--prompt", "work"];
+        argv.extend(args);
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+    for argv in [
+        vec![
+            "worker",
+            "task",
+            "integrate",
+            "00000000000000000000000000000002",
+        ],
+        vec!["worker", "host", "task-integration"],
+        vec!["worker", "host", "task-integration-turn"],
+        vec![
+            "worker",
+            "integration-runner",
+            "00000000000000000000000000000002",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(argv).is_ok());
+    }
+}
+
+#[test]
+fn project_settings_parse_optional_integration_without_global_default() {
+    use mac_worker::test_support::task::project_config::ProjectSettings;
+    let root = tempfile::tempdir().unwrap();
+    assert!(ProjectSettings::load(root.path(), &[]).is_ok());
+    for input in [
+        "[task]\nintegrate = 'main'\nverify_merge = 'moved-target'",
+        "[task]\nintegrate = false",
+    ] {
+        std::fs::write(root.path().join(".worker.toml"), input).unwrap();
+        assert!(ProjectSettings::load(root.path(), &[]).is_ok());
+    }
+    for input in [
+        "[task]\nintegrate = true",
+        "[task]\nintegrate = 'refs/heads/main'",
+        "[task]\nverify_merge = 'never'",
+    ] {
+        std::fs::write(root.path().join(".worker.toml"), input).unwrap();
+        assert!(ProjectSettings::load(root.path(), &[]).is_err());
+    }
+}
 
 #[test]
 fn authoritative_target_accepts_255_bytes_and_rejects_256() {

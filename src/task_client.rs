@@ -1609,6 +1609,7 @@ impl<'a> TaskClient<'a> {
                 let initial =
                     ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
                 let settings = &initial.settings.task;
+                crate::integration::config::reject_unrouted_integration(settings, &request)?;
                 let limits = effective_task_limits(&request.limits, settings)?;
                 let env_profile = request
                     .env_profile
@@ -6930,6 +6931,7 @@ pub(crate) fn freeze_spec(
     state: &ProjectState,
 ) -> Result<DagFrozenSpec, WorkerError> {
     let settings = &state.settings.task;
+    crate::integration::config::reject_unrouted_integration(settings, request)?;
     let limits = effective_task_limits(&request.limits, settings)?;
     let env_profile = request
         .env_profile
@@ -7128,8 +7130,12 @@ pub(crate) fn resolve_batch_task_without_local_workers(
             .unwrap_or(default_limits.max_followups),
     )?;
     let request = TaskSubmitRequest {
-        integrate: Default::default(),
-        verify_merge: None,
+        integrate: if task.integrate.is_inherit() {
+            defaults.integrate.clone()
+        } else {
+            task.integrate.clone()
+        },
+        verify_merge: task.verify_merge.or(defaults.verify_merge),
         session_import: None,
         questions: task.questions.or(defaults.questions).or(settings.questions),
         agent,
