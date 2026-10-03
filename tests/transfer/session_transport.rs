@@ -598,6 +598,133 @@ fn none_push_paths_keep_exact_single_ref_operations() {
 }
 
 #[test]
+fn paired_release_is_idempotent_with_and_without_a_base_pin() {
+    for with_base in [false, true] {
+        let fixture = Fixture::new();
+        let oid = fixture
+            .transfer
+            .write_session_package(&SystemProcessRunner, task_id(), &package())
+            .unwrap();
+        let base_ref = format!("refs/mac-worker/bases/{}", task_id());
+        let session_ref = format!("{SESSION_REF_PREFIX}{}", task_id());
+        let other_task = TaskId::new(Uuid::from_u128(2));
+        let other_ref = format!("{SESSION_REF_PREFIX}{other_task}");
+        fixture
+            .transfer
+            .write_session_package(&SystemProcessRunner, other_task, &package())
+            .unwrap();
+        if with_base {
+            git_ok(
+                fixture.transfer.path(),
+                &["update-ref", &base_ref, fixture.base.as_str()],
+            );
+        }
+        // Delete packed pins too, not just loose ref files.
+        git_ok(fixture.transfer.path(), &["pack-refs", "--all", "--prune"]);
+        fixture
+            .transfer
+            .release_task_refs(&SystemProcessRunner, task_id())
+            .unwrap();
+        fixture
+            .transfer
+            .release_task_refs(&SystemProcessRunner, task_id())
+            .unwrap();
+        assert!(!has_ref(fixture.transfer.path(), &base_ref));
+        assert!(!has_ref(fixture.transfer.path(), &session_ref));
+        assert_eq!(
+            git_ok(fixture.transfer.path(), &["rev-parse", &other_ref]),
+            format!("{oid}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn individual_releases_preserve_the_other_task_pin() {
+    let fixture = Fixture::new();
+    fixture
+        .transfer
+        .write_session_package(&SystemProcessRunner, task_id(), &package())
+        .unwrap();
+    let base_ref = format!("refs/mac-worker/bases/{}", task_id());
+    let session_ref = format!("{SESSION_REF_PREFIX}{}", task_id());
+    git_ok(
+        fixture.transfer.path(),
+        &["update-ref", &base_ref, fixture.base.as_str()],
+    );
+    fixture
+        .transfer
+        .release_base(&SystemProcessRunner, task_id())
+        .unwrap();
+    assert!(!has_ref(fixture.transfer.path(), &base_ref));
+    assert!(has_ref(fixture.transfer.path(), &session_ref));
+    git_ok(
+        fixture.transfer.path(),
+        &["update-ref", &base_ref, fixture.base.as_str()],
+    );
+    fixture
+        .transfer
+        .release_session(&SystemProcessRunner, task_id())
+        .unwrap();
+    fixture
+        .transfer
+        .release_session(&SystemProcessRunner, task_id())
+        .unwrap();
+    assert!(has_ref(fixture.transfer.path(), &base_ref));
+    assert!(!has_ref(fixture.transfer.path(), &session_ref));
+}
+
+struct FailSessionDeletion;
+
+impl ProcessRunner for FailSessionDeletion {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        if request.args.iter().any(|arg| arg == "update-ref")
+            && request.args.iter().any(|arg| arg == "-d")
+            && request
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with(SESSION_REF_PREFIX))
+        {
+            return Err(WorkerError::Git {
+                code: "BASE_UNAVAILABLE",
+                message: "synthetic deletion failure".into(),
+            });
+        }
+        SystemProcessRunner.run(request)
+    }
+}
+
+#[test]
+fn paired_release_reports_failure_and_retry_finishes_partial_cleanup() {
+    let fixture = Fixture::new();
+    fixture
+        .transfer
+        .write_session_package(&SystemProcessRunner, task_id(), &package())
+        .unwrap();
+    let base_ref = format!("refs/mac-worker/bases/{}", task_id());
+    let session_ref = format!("{SESSION_REF_PREFIX}{}", task_id());
+    git_ok(
+        fixture.transfer.path(),
+        &["update-ref", &base_ref, fixture.base.as_str()],
+    );
+    assert_eq!(
+        fixture
+            .transfer
+            .release_task_refs(&FailSessionDeletion, task_id())
+            .unwrap_err()
+            .public_code(),
+        "BASE_UNAVAILABLE"
+    );
+    assert!(!has_ref(fixture.transfer.path(), &base_ref));
+    assert!(has_ref(fixture.transfer.path(), &session_ref));
+    fixture
+        .transfer
+        .release_task_refs(&SystemProcessRunner, task_id())
+        .unwrap();
+    assert!(!has_ref(fixture.transfer.path(), &base_ref));
+    assert!(!has_ref(fixture.transfer.path(), &session_ref));
+}
+
+#[test]
 fn live_session_refs_prevent_transfer_repo_collection() {
     for prefix in [SESSION_REF_PREFIX, REQUEST_SESSION_REF_PREFIX] {
         let fixture = Fixture::new();

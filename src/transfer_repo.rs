@@ -1701,6 +1701,29 @@ impl TransferRepo {
         self.update_ref(runner, &name, None)
     }
 
+    /// Idempotently retire the task's package pin without touching its base.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub fn release_session(
+        &self,
+        runner: &dyn ProcessRunner,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        self.unpin_object(runner, &format!("{SESSION_REF_PREFIX}{task_id}"))
+    }
+
+    /// Release both task pins, including committed snapshots with no base pin.
+    /// If either deletion fails, the caller must retain its recovery marker;
+    /// retrying this operation completes any partially finished cleanup.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub fn release_task_refs(
+        &self,
+        runner: &dyn ProcessRunner,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        self.release_base(runner, task_id)?;
+        self.release_session(runner, task_id)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn import_result(
         &self,
