@@ -4,7 +4,7 @@
 
 Date: 2026-10-03.
 
-Branch: `integ/session-transfer`, based on `main` `3a1a097`. **Not pushed, not deployed.**
+Branch: `integ/session-transfer`, based on `main` `3a1a097`. Merged into `main` as `67183a0` and deployed to the pool on 2026-10-03; not pushed yet.
 
 Spec: [2026-10-03-session-transfer-design.md](../specs/2026-10-03-session-transfer-design.md); its Round 2 section is binding.
 
@@ -59,7 +59,7 @@ Spike: [2026-10-03-session-transfer-spike.md](2026-10-03-session-transfer-spike.
 ## Verification
 - **Full suite on `eb007f6`:** 3897 tests, 3894 passed. The 3 failures were stale feature-list expectations, updated in `d5c63cb`. Clippy is clean.
 - **Full suite on the final head:** see "Final gate" below.
-- **Live:** none yet. The T0 spike proved real Claude Code 2.1.288 and Codex 0.160.0 → 0.159.3 resumes of placed sessions. T8 (pool acceptance) has not run.
+- **Live:** the T0 spike proved real Claude Code 2.1.288 and Codex 0.160.0 → 0.159.3 resumes of placed sessions. For the pool run, see [Live acceptance (T8)](#live-acceptance-t8).
 
 ## Final gate
 - **`e447143`** (all tracks and fixes merged): 3927 tests, 3908 passed, 18 failed, 1 timeout. All 19 came from one integration conflict: FD tightened the `SessionImportMeta` version grammar, but host prepare (W5) reused `SessionImportMeta::new(agent, oid, "1")` only to validate object ids, in the package reader and in the receipt check. Fixed in `2c249ef` with an explicit object-id check.
@@ -68,8 +68,26 @@ Spike: [2026-10-03-session-transfer-spike.md](2026-10-03-session-transfer-spike.
   - `cargo clippy --locked --all-targets -- -D warnings` clean;
   - `cargo nextest run --locked`: **3927 tests, 3927 passed**, 22 skipped, 685 s.
 
+## Landing and deploy
+- `3ee22bf` merged F1 (`fix/claude-stream-verbose`) into `main`, then `67183a0` merged `integ/session-transfer`. Full suite on `67183a0`: 3955 tests, 3955 passed, 22 skipped, 668 s.
+- `0.1.0+67183a0b9f59-release` was deployed to the laptop, the controller on mini-1, and mini-1, mini-2 and mini-3.
+
+## Live acceptance (T8)
+Every run used the checkout `pool-smoke-20260912`. In the source session, the agent wrote two code words into an untracked file. The pool turn then had to recall both words without using tools.
+
+| Check | Mode | Worker | Result |
+| --- | --- | --- | --- |
+| Codex 0.160.0 → 0.159.3, task `1db47bed` | controller | mini-3 | **Pass.** It recalled both words. A `say` follow-up continued the imported session and appended a third word. The diff held exactly that line, which shows that the `--wip` state arrived. |
+| Codex, task `c0dd185d` | direct (`[controller] enabled = false`) | mini-2 | **Pass.** It recalled both words. |
+| Claude Code 2.1.288 → 2.1.285, task `8ebe0682` | controller | none | **Not run.** No mini has a Claude login: over SSH, `claude auth status` reports `loggedIn: false`. So no worker offers `agent:claude@agents`, and the task stayed queued with `NO_WORKER_OFFERS`. The owner chose not to log Claude in on the minis for now. The T0 spike and the tests cover Claude placement and resume. |
+| Large real session (S7) | | | Pending: waiting for the owner to choose a session. |
+
+Findings:
+- **Queued tasks could not be stopped (pre-existing bug).** A queued task has no turn summary before its first dispatch. On such a task, `task cancel` returned it unchanged, and `task close` refused with `TASK_BUSY` because its runner waits for capacity. Fixed in `61cf4f0`, merged as `42ec370`. Full suite: 3958 tests, 3958 passed, 921 s. Task `8ebe0682` is cleared by its pending controller close requests once the fix is deployed.
+- **The Codex preview showed the AGENTS.md instructions that Codex injects.** Newer Codex releases record the typed prompt as a completed `UserMessage` item, not as a `user_message` event. Fixed in `93147dc`, merged as `803fe8c`.
+
 ## Open
-- **T8 live acceptance:** requires deploying the integration build to the laptop, controller and minis. Coordinate with other pool work; no open tasks may be running.
+- **T8:** the large real session (S7) has not run yet. The live Claude run waits until a mini has a Claude login.
 - **Claude transcripts** of imported tasks stay in the worker's `~/.claude/projects`, which is pre-existing behaviour for Claude pool tasks.
 - **Deferred:** controller request-cache GC; legacy laptop pins created before retirement markers.
 - **Phase B** (pull a pool session back to the laptop) is next.
