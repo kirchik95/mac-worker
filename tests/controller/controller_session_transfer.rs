@@ -237,6 +237,24 @@ impl Fixture {
         TransferRepo::open_or_create_controller_cache(&self.paths.cache, PROJECT, WORKTREE).unwrap()
     }
 
+    fn fetch_scratch(&self, oid: &BaseOid) {
+        let output = git(
+            self.cache().path(),
+            &[
+                "fetch".into(),
+                "--no-write-fetch-head".into(),
+                self.repo.root().to_str().unwrap().into(),
+                format!("{oid}:refs/scratch/{oid}"),
+            ],
+            None,
+        );
+        assert!(
+            output.status.success(),
+            "scratch fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn submit(&self) -> Result<(), mac_worker::test_support::core::error::WorkerError> {
         let config = Config::parse("version = 1\n").unwrap();
         let state = ClientStateStore::open(&self.paths.state).unwrap();
@@ -358,7 +376,91 @@ fn package_stream_verifies_both_refs_and_repins_for_real_submit() {
 }
 
 #[test]
-fn missing_session_ref_cannot_finish_or_bind() {
+fn cached_objects_are_verified_and_pinned_without_preexisting_request_refs() {
+    for session in [false, true] {
+        let f = Fixture::new(session);
+        let session_oid = session.then(|| f.package.as_str());
+        let identity = f.prepare(session_oid);
+        f.fetch_scratch(&f.base);
+        if session {
+            f.fetch_scratch(&f.package);
+        }
+        let request_ref = format!("refs/mac-worker/requests/{REQUEST}");
+        let session_ref = format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}");
+        assert!(ref_oid(f.cache().path(), &request_ref).is_none());
+        assert!(ref_oid(f.cache().path(), &session_ref).is_none());
+
+        let receipt = f.finish(&identity, session_oid);
+        assert_eq!(receipt["oid"], f.base.as_str());
+        assert_eq!(
+            ref_oid(f.cache().path(), &request_ref),
+            Some(f.base.to_string())
+        );
+        assert_eq!(
+            ref_oid(f.cache().path(), &session_ref),
+            session.then(|| f.package.to_string())
+        );
+        assert_eq!(f.finish(&identity, session_oid), receipt);
+        f.submit().unwrap();
+    }
+}
+
+#[test]
+fn completed_receipt_replay_revalidates_the_owned_session_graph() {
+    let f = Fixture::new(true);
+    let identity = f.prepare(Some(f.package.as_str()));
+    f.fetch_scratch(&f.base);
+    f.fetch_scratch(&f.package);
+    // Pre-seed exact refs to reach the completed-receipt path even before
+    // the object-only receive regression is fixed.
+    for (reference, oid) in [
+        (format!("refs/mac-worker/requests/{REQUEST}"), &f.base),
+        (format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}"), &f.package),
+    ] {
+        assert!(
+            git(
+                f.cache().path(),
+                &["update-ref".into(), reference, oid.to_string()],
+                None
+            )
+            .status
+            .success()
+        );
+    }
+    f.finish(&identity, Some(f.package.as_str()));
+    let blob = git(
+        f.cache().path(),
+        &[
+            "rev-parse".into(),
+            format!("{}:{PACKAGE_SESSION_DIR}/{CODEX_ROLLOUT_FILE}", f.package),
+        ],
+        None,
+    );
+    assert!(blob.status.success());
+    let blob = String::from_utf8(blob.stdout).unwrap();
+    let blob = blob.trim();
+    fs::remove_file(
+        f.cache()
+            .path()
+            .join("objects")
+            .join(&blob[..2])
+            .join(&blob[2..]),
+    )
+    .unwrap();
+    assert_eq!(
+        ref_oid(
+            f.cache().path(),
+            &format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}")
+        ),
+        Some(f.package.to_string())
+    );
+    assert_failed(f.finish_output(&identity, Some(f.package.as_str())));
+    assert!(f.submit().is_err());
+    assert!(!f.paths.controller_project_root().exists());
+}
+
+#[test]
+fn missing_session_object_cannot_finish_or_bind() {
     let f = Fixture::new(true);
     let identity = f.prepare(Some(f.package.as_str()));
     assert!(f.push(&identity, &f.specs(None)).status.success());
@@ -485,7 +587,7 @@ fn no_session_hook_rejects_a_session_ref() {
 }
 
 #[test]
-fn replay_compares_session_identity_and_receipt_refs() {
+fn replay_compares_session_identity_and_repairs_missing_receipt_refs() {
     let f = Fixture::new(true);
     let identity = f.prepare(Some(f.package.as_str()));
     assert_eq!(f.prepare(Some(f.package.as_str())), identity);
@@ -503,18 +605,20 @@ fn replay_compares_session_identity_and_receipt_refs() {
     assert_eq!(f.finish(&identity, Some(f.package.as_str())), receipt);
     assert_failed(f.finish_output(&identity, Some(f.base.as_str())));
     assert_failed(f.finish_output(&identity, None));
-    let deleted = git(
-        f.cache().path(),
-        &[
-            "update-ref".into(),
-            "-d".into(),
-            format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}"),
-        ],
-        None,
-    );
-    assert!(deleted.status.success());
-    assert_failed(f.finish_output(&identity, Some(f.package.as_str())));
-    assert!(f.submit().is_err());
+    for (reference, oid) in [
+        (format!("refs/mac-worker/requests/{REQUEST}"), &f.base),
+        (format!("{REQUEST_SESSION_REF_PREFIX}{REQUEST}"), &f.package),
+    ] {
+        let deleted = git(
+            f.cache().path(),
+            &["update-ref".into(), "-d".into(), reference.clone()],
+            None,
+        );
+        assert!(deleted.status.success());
+        assert_eq!(f.finish(&identity, Some(f.package.as_str())), receipt);
+        assert_eq!(ref_oid(f.cache().path(), &reference), Some(oid.to_string()));
+    }
+    f.submit().unwrap();
 }
 
 #[test]

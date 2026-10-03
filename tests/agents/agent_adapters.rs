@@ -433,14 +433,20 @@ fn results_are_extracted_or_unknown_never_an_error_for_every_adapter() {
     }
 }
 
+// Intermediate records injected into complete transcripts below, not a
+// standalone transcript for the turn-log rendering reference tests.
+const CLAUDE_VERBOSE_RECORDS: &str =
+    include_str!("../fixtures/agent_fragments/claude-verbose-records.jsonl");
+
 #[test]
 fn claude_verbose_records_normalize_activity_and_ignore_other_content() {
     let adapter = adapter_for(AgentKind::Claude);
-    let events: Vec<_> = fixture_lines("claude-verbose-records.jsonl")
+    let events: Vec<_> = CLAUDE_VERBOSE_RECORDS
+        .lines()
         .filter_map(|line| {
-            serde_json::from_str::<serde_json::Value>(&line)
+            serde_json::from_str::<serde_json::Value>(line)
                 .expect("verbose fixture records must be valid JSON");
-            adapter.parse_event(&line)
+            adapter.parse_event(line)
         })
         .collect();
     assert_eq!(
@@ -460,7 +466,7 @@ fn claude_verbose_records_normalize_activity_and_ignore_other_content() {
 #[test]
 fn claude_verbose_records_preserve_results_sessions_and_classification() {
     let adapter = adapter_for(AgentKind::Claude);
-    let verbose = fixture("claude-verbose-records.jsonl");
+    let verbose = CLAUDE_VERBOSE_RECORDS;
     let unknown = concat!(
         r#"{"type":"system","subtype":"future_record","status":"blocked","summary":"not a result"}"#,
         "\n",
