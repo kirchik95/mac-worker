@@ -997,7 +997,9 @@ impl<'a> TaskStore<'a> {
                 return Err(session_placement_failed());
             }
             // Validate blob OIDs before ever passing them as git arguments.
-            SessionImportMeta::new(import.agent(), columns[2], "1")?;
+            if !valid_object_id(columns[2]) {
+                return Err(session_placement_failed());
+            }
             let size = columns[3]
                 .parse::<u64>()
                 .map_err(|_| session_placement_failed())?;
@@ -2497,7 +2499,9 @@ struct SessionImportReceipt {
 }
 impl SessionImportReceipt {
     fn validate(&self) -> Result<(), WorkerError> {
-        SessionImportMeta::new(self.agent, &self.package_oid, "1")?;
+        if !valid_object_id(&self.package_oid) {
+            return Err(session_placement_failed());
+        }
         let id = uuid::Uuid::parse_str(&self.session_id).map_err(|_| session_placement_failed())?;
         if self.schema != 1
             || id.hyphenated().to_string() != self.session_id
@@ -2525,6 +2529,12 @@ impl SessionImportReceipt {
             _ => Err(session_placement_failed()),
         }
     }
+}
+fn valid_object_id(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn valid_session_relative(path: &str) -> bool {
     !path.is_empty()
