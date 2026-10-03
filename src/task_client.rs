@@ -298,7 +298,10 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
+    // Input-only T1 contracts; T4/T6 supply their production consumers.
+    #[allow(dead_code)]
     pub integrate: crate::integration::contracts::IntegrationOverride,
+    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -1039,8 +1042,10 @@ impl Default for BatchDefaults {
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
     #[serde(default)]
+    #[allow(dead_code)] // Input-only until T4/T6 wiring.
     pub integrate: crate::integration::contracts::IntegrationOverride,
     #[serde(default)]
+    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     #[serde(default)]
     pub questions: Option<crate::task::QuestionsPolicy>,

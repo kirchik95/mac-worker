@@ -19,3 +19,4 @@ mod session_place_claude;
 mod session_place_codex;
 mod session_prepare;
 mod supervisor;
+mod task_integration_host;

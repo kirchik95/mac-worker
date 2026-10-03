@@ -1,6 +1,7 @@
 //! Explicit integration-test access; implementation modules remain private.
 pub use crate::client_state::RunnerLivenessVerdict;
 pub use crate::controller::batch::{BatchKind, FrozenBatchBody, FrozenBatchSource};
+pub use crate::controller::events::rpc::task_reads::ensure_produced_task_facts_bytes;
 pub use crate::controller::integration::*;
 pub use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};
 pub use crate::features::{CONTROLLER_FEATURE_INTEGRATION, HOST_FEATURE_INTEGRATION};

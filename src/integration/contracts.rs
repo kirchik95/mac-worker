@@ -193,7 +193,7 @@ pub enum VerifyPolicy {
     MovedTarget,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum IntegrationBaseKind {
     Committed,
     FromTask,
@@ -488,6 +488,7 @@ pub enum IntegrationVerification {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(clippy::enum_variant_names)] // The prefix is the stable diagnostic wire catalog.
 pub enum IntegrationCode {
     IntegrationAuthFailed,
     IntegrationNetwork,
@@ -746,6 +747,27 @@ contract!(IntegrationWorkspaceBinding {
     head: BaseOid, merge_head: BaseOid, attribute_source: BaseOid, ours: BaseOid,
     theirs: BaseOid, pinned_tree: Option<BaseOid>, clean_h: CleanHManifest,
 });
+impl IntegrationWorkspaceBinding {
+    pub fn validate_for(&self, candidate: &IntegrationCandidate) -> Result<(), WorkerError> {
+        self.validate()?;
+        candidate.validate()?;
+        if self.candidate != candidate.id
+            || self.head != candidate.source_head
+            || self.merge_head != candidate.target_head
+            || self.attribute_source != candidate.attribute_source
+            || self.ours != candidate.ours
+            || self.theirs != candidate.theirs
+            || self.clean_h != candidate.clean_h
+            || self
+                .pinned_tree
+                .as_ref()
+                .is_some_and(|tree| Some(tree) != candidate.tree_oid.as_ref())
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
 impl ValidateIntegration for IntegrationWorkspaceBinding {
     fn validate(&self) -> Result<(), WorkerError> {
         if self.candidate.attempt == 0
@@ -808,6 +830,23 @@ mod approved_limits_wire {
     }
 }
 impl PreparedIntegrationTurn {
+    pub fn validate_for(&self, record: &IntegrationRecord) -> Result<(), WorkerError> {
+        self.validate()?;
+        record.validate()?;
+        if self.integration_id != record.snapshot.integration_id
+            || self.epoch != record.snapshot.epoch
+            || self.followup.task_id() != record.task_id
+            || self.workspace_binding.head != record.snapshot.source_head
+        {
+            return Err(invalid());
+        }
+        let candidate = record
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == self.workspace_binding.candidate)
+            .ok_or_else(invalid)?;
+        self.workspace_binding.validate_for(candidate)
+    }
     pub fn binding(&self) -> Result<String, WorkerError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| invalid())?;
@@ -1057,6 +1096,14 @@ impl ValidateIntegration for IntegrationRecord {
                 return Err(invalid());
             }
         }
+        let attempts: std::collections::HashSet<_> = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.attempt)
+            .collect();
+        if attempts.len() != self.candidates.len() {
+            return Err(invalid());
+        }
         for auxiliary in &self.auxiliaries {
             auxiliary.validate()?;
             if auxiliary.integration_id != self.snapshot.integration_id
@@ -1064,6 +1111,14 @@ impl ValidateIntegration for IntegrationRecord {
             {
                 return Err(invalid());
             }
+        }
+        let turns: std::collections::HashSet<_> = self
+            .auxiliaries
+            .iter()
+            .map(|auxiliary| auxiliary.turn_id)
+            .collect();
+        if turns.len() != self.auxiliaries.len() {
+            return Err(invalid());
         }
         for receipt in &self.archived_receipts {
             receipt.validate()?;
@@ -1454,12 +1509,10 @@ pub fn validate_conflict_paths(paths: &[String]) -> Result<(), WorkerError> {
     if paths.len() > MAX_CONFLICT_PATHS {
         return Err(integration_error("INTEGRATION_CONFLICT_LIST_TOO_LARGE"));
     }
-    let mut bytes = 0;
     for path in paths {
         validate_relative_path(path)?;
-        bytes += serde_json::to_vec(path).map_err(|_| invalid())?.len() + 1;
     }
-    if bytes > MAX_PROMPT_BYTES {
+    if serde_json::to_vec(paths).map_err(|_| invalid())?.len() > MAX_PROMPT_BYTES {
         return Err(integration_error("INTEGRATION_CONFLICT_LIST_TOO_LARGE"));
     }
     Ok(())
@@ -1664,9 +1717,13 @@ mod tests {
 
     #[test]
     fn from_task_policy_preserves_unresolved_base_provenance() {
+        assert_eq!(
+            serde_json::to_value(IntegrationBaseKind::FromTask).unwrap(),
+            json!("from-task")
+        );
         let policy = json!({
             "schema_version":1,"origin":"https://example.test/repo.git","target":"main",
-            "verify":"never","requested_close":"never","base_kind":"from_task",
+            "verify":"never","requested_close":"never","base_kind":"from-task",
             "base_oid":null,"base_task":task(),"base_preflight":"unknown","project_id":"a".repeat(64),
         });
         assert!(serde_json::from_value::<FrozenIntegrationPolicy>(policy.clone()).is_ok());

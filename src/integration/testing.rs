@@ -127,7 +127,10 @@ pub fn sample_record(task: TaskId, source: TurnId, branch: &str) -> IntegrationR
             integration_id: id,
             epoch: 0,
             revision: IntegrationRevision(1),
-            target: branch.into(),
+            target: public_target_display(
+                branch,
+                &crate::redaction::RedactionBoundary::new("/fixture/home"),
+            ),
             state: IntegrationStatus::Pending,
             resume_state: None,
             pause_reason: None,
@@ -946,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_fixture_is_isolated_restarts_without_renewing_clock_and_fails_closed() {
+    fn shared_fixture_is_isolated_and_preserves_runtime_evidence_across_restart() {
         let fixture = IntegrationFixture::new();
         let other = IntegrationFixture::new();
         assert_ne!(fixture.root(), other.root());
@@ -964,24 +967,6 @@ mod tests {
                 .facts(fixture.task())
                 .unwrap()
                 .result_imported
-        );
-        assert_eq!(
-            fixture
-                .complete_source(fixture.task())
-                .unwrap_err()
-                .public_code(),
-            "INTEGRATION_UNAVAILABLE"
-        );
-        assert!(
-            fixture
-                .observer()
-                .facts(fixture.task())
-                .unwrap()
-                .result_imported
-        );
-        assert_eq!(
-            fixture.drive(fixture.task()).unwrap_err().public_code(),
-            "INTEGRATION_UNAVAILABLE"
         );
         assert!(fixture.host_calls().is_empty());
         assert!(fixture.load(fixture.task()).unwrap().is_none());

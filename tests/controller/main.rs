@@ -33,6 +33,8 @@ mod controller_followup_process_runtime;
 mod controller_health;
 mod controller_health_routes;
 mod controller_health_runtime;
+mod controller_integration_events;
+mod controller_integration_wiring;
 mod controller_lifecycle_compat;
 mod controller_liveness_seams;
 mod controller_logical_import;

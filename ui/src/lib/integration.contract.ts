@@ -178,6 +178,7 @@ export function integrationAnnotationConfirms(annotation: IntegrationFactsAnnota
   try {
     const fact = decodeIntegrationAnnotation(annotation)
     const full = decodeIntegrationSnapshot(snapshot)
+    if (!Number.isSafeInteger(fact.revision) || !Number.isSafeInteger(full.revision)) return false
     return fact.integration_id === full.integration_id && fact.epoch === full.epoch && fact.revision === full.revision &&
       fact.state === full.state && fact.code === full.blocked_code && fact.result_oid === (full.merge_oid ?? full.observed_target_oid)
   } catch { return false }

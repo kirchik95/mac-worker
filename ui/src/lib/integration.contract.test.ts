@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import fixtures from './integration.fixtures.json'
 import {
   decodeIntegrationView, parseIntegrationAnnotation, integrationCodes,
+  integrationAnnotationConfirms,
 } from './integration.contract'
 
 describe('frozen integration public contracts', () => {
@@ -31,5 +32,17 @@ describe('frozen integration public contracts', () => {
       })).toThrow('INTEGRATION_STATE_INVALID')
     }
     expect(() => decodeIntegrationView({ ...pending, future: true })).toThrow()
+  })
+
+  it('confirms exact companion facts and refuses revisions beyond JavaScript integer precision', () => {
+    const snapshot = decodeIntegrationView(fixtures.cases.find(row => row.name === 'pending')!.view).integration!
+    const annotation = {
+      integration_id: snapshot.integration_id, epoch: snapshot.epoch, revision: snapshot.revision,
+      state: snapshot.state, code: snapshot.blocked_code, result_oid: snapshot.merge_oid ?? snapshot.observed_target_oid,
+    }
+    expect(integrationAnnotationConfirms(annotation, snapshot)).toBe(true)
+    expect(integrationAnnotationConfirms({ ...annotation, revision: annotation.revision + 1 }, snapshot)).toBe(false)
+    const unsafe = Number.MAX_SAFE_INTEGER + 1
+    expect(integrationAnnotationConfirms({ ...annotation, revision: unsafe }, { ...snapshot, revision: unsafe })).toBe(false)
   })
 })

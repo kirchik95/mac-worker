@@ -317,13 +317,9 @@ impl TaskEventReadStore {
                     return Err(invalid_state());
                 }
             }
-            if serde_json::to_vec(&snapshot.facts)
-                .map_err(|_| invalid_state())?
-                .len()
-                > 2048
-            {
-                return Err(invalid_state());
-            }
+            ensure_produced_task_facts_bytes(
+                &serde_json::to_vec(&snapshot.facts).map_err(|_| invalid_state())?,
+            )?;
             result.rows.push(snapshot.facts.clone());
         }
         if progress.next_task < snapshots.len() {
@@ -845,14 +841,16 @@ pub fn record_facts(
             crate::redaction::RedactionBoundary::from_env().title(record.meta().title().as_str())
         }),
     })?;
-    if serde_json::to_vec(&facts)
-        .map_err(|_| invalid_state())?
-        .len()
-        > 2048
-    {
+    ensure_produced_task_facts_bytes(&serde_json::to_vec(&facts).map_err(|_| invalid_state())?)?;
+    Ok(facts)
+}
+
+/// The producer guard remains independent of tolerant decoder normalization.
+pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError> {
+    if bytes.len() > crate::controller::events::contracts::MAX_TASK_FACT_BYTES {
         return Err(invalid_state());
     }
-    Ok(facts)
+    Ok(())
 }
 
 fn digest(bytes: &[u8]) -> String {
