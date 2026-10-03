@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     agent_facts::{AgentAuth, AgentFacts, FACTS_TTL},
@@ -59,8 +62,10 @@ impl SchedulerProbeAdapter {
                         for feature in probe.features.iter().flatten() {
                             push_unique(&mut capabilities, format!("feature:{feature}"));
                         }
-                        append_agent_capabilities(
+                        let mut agent_versions = BTreeMap::new();
+                        append_agent_facts(
                             &mut capabilities,
+                            &mut agent_versions,
                             probe.agent_facts.as_ref(),
                             probe.facts_age_millis,
                         );
@@ -73,9 +78,11 @@ impl SchedulerProbeAdapter {
                             probe.free_disk_bytes,
                         )
                         .map(|observation| {
-                            observation.with_interactive_agents(
-                                probe.herdr_fact().and_then(|herdr| herdr.interactive_agents),
-                            )
+                            observation
+                                .with_agent_versions(agent_versions)
+                                .with_interactive_agents(
+                                    probe.herdr_fact().and_then(|herdr| herdr.interactive_agents),
+                                )
                         })
                     }
                     _ => CandidateObservation::new(
@@ -112,8 +119,9 @@ fn is_origin_capability(capability: &str) -> bool {
         .is_some_and(|host| !host.is_empty())
 }
 
-fn append_agent_capabilities(
+fn append_agent_facts(
     capabilities: &mut Vec<String>,
+    agent_versions: &mut BTreeMap<String, String>,
     facts: Option<&AgentFacts>,
     facts_age_millis: Option<u64>,
 ) {
@@ -130,6 +138,9 @@ fn append_agent_capabilities(
         .map(|profile| profile.name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     for agent in &facts.agents {
+        if let Some(version) = &agent.version {
+            agent_versions.insert(agent.name.clone(), version.clone());
+        }
         if agent.auth == AgentAuth::Authenticated {
             push_unique(capabilities, format!("agent:{}", agent.name));
         }

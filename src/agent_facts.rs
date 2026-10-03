@@ -65,6 +65,33 @@ const LOCATE_VERSION_SEPARATOR: &str = "MAC_WORKER_FACTS_VERSION";
 /// [`EnvProfile::entries`].
 const BINARY_RESOLUTION_ENV: &[&str] = &["PATH", "ZDOTDIR", "HOME", "SHELL"];
 
+/// Compare leading `major.minor[.patch]` components, ignoring version suffixes.
+/// A newer major is accepted; within a major, at most one minor of lag is
+/// accepted. Patch differences do not affect eligibility; invalid text is unknown.
+pub fn version_satisfies(observed: &str, minimum: &str) -> Option<bool> {
+    fn components(version: &str) -> Option<(u64, u64)> {
+        let end = version
+            .bytes()
+            .position(|byte| !byte.is_ascii_digit() && byte != b'.')
+            .unwrap_or(version.len());
+        let mut parts = version[..end].split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next()?.parse::<u64>().ok()?;
+        if let Some(patch) = parts.next() {
+            patch.parse::<u64>().ok()?;
+        }
+        parts.next().is_none().then_some((major, minor))
+    }
+
+    let (observed_major, observed_minor) = components(observed)?;
+    let (minimum_major, minimum_minor) = components(minimum)?;
+    Some(
+        observed_major > minimum_major
+            || (observed_major == minimum_major
+                && observed_minor.saturating_add(1) >= minimum_minor),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAuth {
     Authenticated,
@@ -2290,6 +2317,75 @@ mod tests {
         collect_origin_https_helpers,
     };
     use crate::process::SystemProcessRunner;
+
+    #[test]
+    fn version_satisfies_accepts_one_minor_lag_and_ignores_patch_and_suffixes() {
+        for (observed, minimum) in [
+            ("0.159.3", "0.160.0"),
+            ("0.160", "0.160.0"),
+            ("0.161.0", "0.160.0"),
+            ("2.1.285", "2.1.288"),
+            ("2.0.0", "1.99.999"),
+            ("0.159.3-beta", "0.160.0+build.42"),
+            ("2.1.285 (Claude Code)", "2.1.288-beta"),
+            ("0.159-beta", "0.160 build text"),
+            ("0.18446744073709551615.0", "0.18446744073709551615.1"),
+        ] {
+            assert_eq!(
+                super::version_satisfies(observed, minimum),
+                Some(true),
+                "{observed} vs {minimum}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_satisfies_rejects_older_major_or_more_than_one_minor_lag() {
+        for (observed, minimum) in [
+            ("0.158.9", "0.160.0"),
+            ("1.9.0", "2.0.0"),
+            ("0.999.999", "1.0.0"),
+            ("2.0.999-beta", "2.2.0"),
+        ] {
+            assert_eq!(
+                super::version_satisfies(observed, minimum),
+                Some(false),
+                "{observed} vs {minimum}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_satisfies_returns_unknown_for_unparsable_versions() {
+        for garbage in [
+            "",
+            "garbage",
+            "v0.160.0",
+            " 0.160.0",
+            "0",
+            "0.",
+            ".160",
+            "0..160",
+            "0.160.",
+            "0.160.x",
+            "0.160.0.1",
+            "０.160.0",
+            "18446744073709551616.1",
+            "0.18446744073709551616",
+            "0.160.18446744073709551616",
+        ] {
+            assert_eq!(
+                super::version_satisfies(garbage, "0.160.0"),
+                None,
+                "observed {garbage}"
+            );
+            assert_eq!(
+                super::version_satisfies("0.160.0", garbage),
+                None,
+                "minimum {garbage}"
+            );
+        }
+    }
 
     fn generous_budget(clock: &SystemFactsClock) -> FactsBudget<'_> {
         FactsBudget::new(DEFAULT_FACTS_REFRESH_BUDGET, clock)

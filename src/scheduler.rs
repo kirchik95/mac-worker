@@ -1,5 +1,10 @@
 use std::{cmp::Reverse, collections::BTreeMap};
 
+use crate::{
+    agent_facts::version_satisfies,
+    session_transfer::contracts::{AGENT_MIN_REQUIREMENT_PREFIX, parse_agent_min_requirement},
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateSlot {
     Idle,
@@ -18,6 +23,9 @@ pub struct CandidateObservation {
     ready: bool,
     slot: CandidateSlot,
     capabilities: Vec<String>,
+    /// Default-profile agent versions from fresh host facts. Missing versions
+    /// cannot satisfy an agent-min requirement.
+    agent_versions: BTreeMap<String, String>,
     available_memory_bytes: Option<u64>,
     free_disk_bytes: u64,
     /// Interactive herdr agents on this worker, excluding mac-worker's
@@ -53,10 +61,35 @@ impl CandidateObservation {
             ready,
             slot,
             capabilities,
+            agent_versions: BTreeMap::new(),
             available_memory_bytes,
             free_disk_bytes,
             interactive_agents: None,
         })
+    }
+
+    pub fn with_agent_versions(mut self, agent_versions: BTreeMap<String, String>) -> Self {
+        self.agent_versions = agent_versions;
+        self
+    }
+
+    pub fn agent_versions(&self) -> &BTreeMap<String, String> {
+        &self.agent_versions
+    }
+
+    fn satisfies(&self, requirement: &str) -> bool {
+        if requirement.starts_with(AGENT_MIN_REQUIREMENT_PREFIX) {
+            let Some((agent, minimum)) = parse_agent_min_requirement(requirement) else {
+                return false;
+            };
+            self.agent_versions()
+                .get(agent.as_str())
+                .is_some_and(|observed| version_satisfies(observed, &minimum) == Some(true))
+        } else {
+            self.capabilities
+                .iter()
+                .any(|capability| capability == requirement)
+        }
     }
 
     pub fn with_interactive_agents(mut self, interactive_agents: Option<u32>) -> Self {
@@ -150,6 +183,18 @@ pub enum Selection {
     NoEligible { rejections: Vec<CandidateRejection> },
 }
 
+/// Pinned-worker rejection code, prioritizing an unsatisfied version gate.
+pub fn rejection_code_for_missing(missing: &[String]) -> &'static str {
+    if missing
+        .iter()
+        .any(|requirement| requirement.starts_with(AGENT_MIN_REQUIREMENT_PREFIX))
+    {
+        "SESSION_AGENT_TOO_OLD"
+    } else {
+        "CAPABILITY_MISSING"
+    }
+}
+
 pub struct SchedulerPolicy;
 
 impl SchedulerPolicy {
@@ -217,7 +262,7 @@ fn evaluate_refs<'a>(
         } else {
             let missing = requirements
                 .iter()
-                .filter(|requirement| !observation.capabilities.contains(*requirement))
+                .filter(|requirement| !observation.satisfies(requirement))
                 .cloned()
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
