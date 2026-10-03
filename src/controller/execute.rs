@@ -1061,7 +1061,10 @@ pub fn serve_rpc_with_execution(
             crate::ControllerEventRuntime::system(),
         )?;
         _events = events;
-        let handler = TaskSubmitHandler::new(runner, config, paths, &client_state);
+        let mut handler = TaskSubmitHandler::new(runner, config, paths, &client_state);
+        if let Some(features) = execution.integration_features {
+            handler.features = features.to_vec();
+        }
         let ack = store.handle_with(&request, &handler, fault)?;
         crate::controller::protocol::encode_json_frame(&ack)?
     };

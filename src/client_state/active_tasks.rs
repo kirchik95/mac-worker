@@ -139,7 +139,9 @@ impl ClientStateStore {
             };
             match read_task_from_dir(&tasks, text, task_id) {
                 Ok(record) => {
-                    if !should_keep_active_index(&record, &queued_turns) {
+                    if !should_keep_active_index(&record, &queued_turns)
+                        && !self.closed_integration_needs_active_index(&record)
+                    {
                         continue;
                     }
                     match self.ensure_active_task_index_locked(task_id) {
@@ -286,7 +288,9 @@ impl ClientStateStore {
             };
             match read_task_from_dir(&tasks, &name, task_id) {
                 Ok(record) => {
-                    if should_keep_active_index(&record, &queued_turns) {
+                    if should_keep_active_index(&record, &queued_turns)
+                        || self.closed_integration_needs_active_index(&record)
+                    {
                         if let Err(error) = self.ensure_active_task_index_locked(task_id) {
                             report.failed.push((task_id.to_string(), error.to_string()));
                             continue;
@@ -344,12 +348,39 @@ impl ClientStateStore {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<bool, WorkerError> {
-        if task_record_needs_active_index(record) {
+        if task_record_needs_active_index(record)
+            || self.closed_integration_needs_active_index(record)
+        {
             return Ok(true);
         }
         match self.load_queue_task_turn_ids_locked() {
             Ok(queued) => Ok(record_has_relevant_queue_turn(record, &queued)),
             Err(_) => Ok(true),
+        }
+    }
+
+    fn closed_integration_needs_active_index(&self, record: &LocalTaskRecord) -> bool {
+        use crate::integration::contracts::{IntegrationPhase, IntegrationStatus};
+        if record.status().state() != TaskState::Closed {
+            return false;
+        }
+        match crate::integration::store::RootedIntegrationState::read_task_at(
+            &self.inner.state_root,
+            record.meta().task_id(),
+        ) {
+            Ok((_, Some(integration))) => {
+                !matches!(
+                    integration.snapshot.state,
+                    IntegrationStatus::Integrated | IntegrationStatus::Revoked
+                ) && (integration.snapshot.state != IntegrationStatus::Blocked
+                    || !integration
+                        .phase_retries
+                        .iter()
+                        .any(|retry| retry.phase == IntegrationPhase::Repair))
+            }
+            Ok((_, None)) => false,
+            // Unreadable optional evidence cannot prove a repair is finished.
+            Err(_) => true,
         }
     }
 

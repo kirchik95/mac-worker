@@ -7131,12 +7131,16 @@ impl<'a> TaskClient<'a> {
                     }
                 }
                 if latest.is_some_and(|turn| turn.turn_id() == integration.snapshot.source_turn_id)
-                    && !matches!(
+                    && (!matches!(
                         integration.snapshot.state,
                         IntegrationStatus::Integrated
                             | IntegrationStatus::Blocked
                             | IntegrationStatus::Revoked
-                    )
+                    ) || (record.status().state() == TaskState::Closed
+                        && integration.snapshot.state == IntegrationStatus::Blocked
+                        && !integration.phase_retries.iter().any(|retry| {
+                            retry.phase == crate::integration::contracts::IntegrationPhase::Repair
+                        })))
                 {
                     return Ok(false);
                 }
@@ -7179,8 +7183,12 @@ impl<'a> TaskClient<'a> {
                                 .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
                             let accepted =
                                 receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
-                            if record.fetched_head() != Some(accepted)
-                                || record.status().head_oid() != Some(accepted)
+                            // The detached driver may import between this poll's
+                            // ordinary read and its integration read. Verify the
+                            // durable import against the current local record.
+                            let imported = self.client_state.load_task(task)?;
+                            if imported.fetched_head() != Some(accepted)
+                                || imported.status().head_oid() != Some(accepted)
                             {
                                 return Err(IntegrationCode::IntegrationStateInvalid.error());
                             }
@@ -9265,6 +9273,194 @@ mod tests {
             ) -> Result<crate::process::ProcessResult, WorkerError> {
                 panic!("absence confirmation is read-only")
             }
+        }
+
+        #[test]
+        fn wait_accepts_a_receipt_imported_after_its_ordinary_snapshot() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config.toml"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let before = sample_ordinary(fixture_task(), fixture_source());
+            store.create_task(before.clone()).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+            let accepted: BaseOid = "e".repeat(40).parse().unwrap();
+            integration.snapshot.state = IntegrationStatus::Integrated;
+            integration.snapshot.observed_target_oid = Some(accepted.clone());
+            integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+            integration.receipt = Some(IntegrationReceipt {
+                integration_id: integration.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: accepted.clone(),
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: true,
+                recorded_at_millis: 1002,
+            });
+            let mut status = serde_json::to_value(before.status()).unwrap();
+            status["head_oid"] = accepted.as_str().into();
+            let imported = before
+                .with_status(serde_json::from_value(status).unwrap())
+                .unwrap()
+                .with_fetched_head(Some(accepted))
+                .unwrap();
+            assert!(store.update_task_if_current(&before, imported).unwrap());
+            state
+                .publish_policy(integration.task_id, &integration.policy)
+                .unwrap();
+            state
+                .replace(integration.task_id, IntegrationRevision(0), &integration)
+                .unwrap();
+            let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+            let client = TaskClient::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &crate::turn_runner::InlineRunnerExecutor,
+            );
+            assert_eq!(client.wait_exit_code(&[before]).unwrap(), 0);
+        }
+
+        #[test]
+        fn wait_does_not_return_the_pre_retention_block_before_closed_observation() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let before = sample_ordinary(fixture_task(), fixture_source());
+            let mut wire = serde_json::to_value(before.status()).unwrap();
+            wire["state"] = "closed".into();
+            let closed = before
+                .with_status(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            store.create_task(closed.clone()).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let config=Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+            let client = TaskClient::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &crate::turn_runner::InlineRunnerExecutor,
+            );
+            assert!(
+                !client
+                    .tasks_are_quiescent(std::slice::from_ref(&closed))
+                    .unwrap()
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkspaceMissing);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 0,
+                code: IntegrationCode::IntegrationWorkerOffline,
+                due_at_millis: 1002,
+            });
+            state.replace(record.task_id, previous, &record).unwrap();
+            assert!(client.tasks_are_quiescent(&[closed]).unwrap());
+        }
+
+        #[test]
+        fn closed_integration_repair_stays_in_the_leader_index_until_settled() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let ordinary = sample_ordinary(fixture_task(), fixture_source());
+            let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+            wire["state"] = "closed".into();
+            store
+                .create_task(
+                    ordinary
+                        .with_status(serde_json::from_value(wire).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            store.bootstrap_active_task_index().unwrap();
+            let config = ActiveTaskConfig::default();
+            assert_eq!(
+                store.select_active_task_ids(&config).unwrap().selected,
+                vec![record.task_id]
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.state = IntegrationStatus::RetryWait;
+            record.snapshot.resume_state = Some(IntegrationStatus::Published);
+            record.snapshot.retry_at_millis = Some(3000);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 1,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 3000,
+            });
+            state.replace(record.task_id, previous, &record).unwrap();
+            let reopened = ClientStateStore::open(&paths.state).unwrap();
+            assert_eq!(
+                reopened
+                    .refresh_active_task_index(&[record.task_id], &config)
+                    .unwrap()
+                    .retained,
+                vec![record.task_id]
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.resume_state = None;
+            record.snapshot.retry_at_millis = None;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkspaceMissing);
+            state.replace(record.task_id, previous, &record).unwrap();
+            assert_eq!(
+                reopened
+                    .refresh_active_task_index(&[record.task_id], &config)
+                    .unwrap()
+                    .retired,
+                vec![record.task_id]
+            );
         }
 
         #[test]

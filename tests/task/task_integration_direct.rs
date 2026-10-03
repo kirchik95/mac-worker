@@ -443,13 +443,28 @@ fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
 }
 
 fn parked_source_fixture() -> (super::session_import_e2e::Fixture, TaskId) {
+    configured_parked_source_fixture(
+        "never",
+        |_| {},
+        "printf 'ordinary result\\n' > T6-result",
+        ":",
+    )
+}
+
+fn configured_parked_source_fixture(
+    verify: &str,
+    prepare: impl FnOnce(&super::session_import_e2e::Fixture),
+    source_body: &str,
+    auxiliary_body: &str,
+) -> (super::session_import_e2e::Fixture, TaskId) {
     use mac_worker::test_support::session::SessionAgent;
     let f = integration_fixture(true);
+    prepare(&f);
     f.capture_fixture(SessionAgent::Codex);
     f.install_agent(SessionAgent::Codex);
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
     let drain = format!(
-        "printf 'ordinary result\\n' > T6-result\n/usr/bin/env HOME={} {} --config {} controller drain >/dev/null || exit 94\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
+        "if [ ! -e \"$HOME/source-finished\" ]; then\n: > \"$HOME/source-finished\"\n{source_body}\n/usr/bin/env HOME={} {} --config {} controller drain >/dev/null || exit 94\nelse\n{auxiliary_body}\nfi\nprintf '%s\\n' \"$@\" > \"$HOME/argv\"",
         quote(f.laptop.to_str().unwrap()),
         quote(env!("CARGO_BIN_EXE_worker")),
         quote(f.config.to_str().unwrap())
@@ -469,6 +484,8 @@ fn parked_source_fixture() -> (super::session_import_e2e::Fixture, TaskId) {
         "produce work",
         "--integrate",
         "main",
+        "--verify-merge",
+        verify,
         "--close-on",
         "never",
         "--worker",
@@ -533,6 +550,460 @@ fn native_read_surfaces_expose_the_same_parked_companion_without_driving_git() {
         f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
         target
     );
+}
+
+#[test]
+fn native_legacy_retention_restore_observes_m_or_h_and_imports_without_resurrecting_closed_work() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        host::{
+            gc::apply_baseline_retention_close,
+            process::SystemProcessRunner,
+            store::{HostStore, TASK_RETENTION_MILLIS},
+        },
+        task::store::TaskStore,
+    };
+    use std::sync::Arc;
+    for (target, parked) in [
+        ("merge", true),
+        ("source", false),
+        ("neither", true),
+        ("failed_then_merge", false),
+    ] {
+        let (f, task) = parked_source_fixture();
+        let paths = owner_paths(&f);
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        let original = state.load(task).unwrap().unwrap();
+        let host = HostStore::open(&f.host_root()).unwrap();
+        let mut phase = original.clone();
+        phase.snapshot.state = IntegrationStatus::Pending;
+        phase.snapshot.resume_state = None;
+        phase.snapshot.pause_reason = None;
+        phase.pause = None;
+        let request = HostIntegrationRequest {
+            protocol_version: 7,
+            task_id: task,
+            integration_id: Some(phase.snapshot.integration_id),
+            epoch: phase.snapshot.epoch,
+            revision: phase.snapshot.revision,
+            action: HostIntegrationAction::Step {
+                step: IntegrationStep::Prepare,
+                record: Box::new(phase),
+            },
+        };
+        let runtime = ManualIntegrationRuntime::default();
+        let HostIntegrationResponse::CandidateReady { candidate, .. } =
+            HostIntegrationService::new(&host, &SystemProcessRunner, &runtime)
+                .execute(&request)
+                .unwrap()
+        else {
+            panic!("clean real candidate required")
+        };
+        let merge = candidate.merge_oid.clone().unwrap();
+        let mut retained = HostIntegrationStore::new(&host)
+            .load(&original.policy.project_id, task)
+            .unwrap()
+            .unwrap();
+        retained.snapshot.observed_target_oid = Some(candidate.target_head.clone());
+        retained.snapshot.merge_oid = Some(merge.clone());
+        retained.snapshot.state = if parked {
+            IntegrationStatus::Parked
+        } else {
+            IntegrationStatus::Blocked
+        };
+        retained.snapshot.resume_state = parked.then_some(IntegrationStatus::Pushing);
+        retained.snapshot.pause_reason =
+            parked.then_some(IntegrationPauseReason::ControllerDrained);
+        retained.pause = parked.then_some(IntegrationPauseEvidence {
+            reason: IntegrationPauseReason::ControllerDrained,
+            effective_at_millis: 1001,
+        });
+        retained.snapshot.blocked_code = (!parked).then_some(IntegrationCode::IntegrationNetwork);
+        retained.push_intent = Some(IntegrationPushIntent {
+            candidate: candidate.id,
+            expected_target: candidate.target_head.clone(),
+            merge_oid: merge.clone(),
+            started_at_millis: 1001,
+            uncertain: true,
+        });
+        retained.snapshot.revision = original.snapshot.revision.next().unwrap();
+        let host_task = host.task_dir(&original.policy.project_id, task).unwrap();
+        std::fs::write(
+            host_task.join("integration/record.json"),
+            encode_record(&retained).unwrap(),
+        )
+        .unwrap();
+        state
+            .replace(task, original.snapshot.revision, &retained)
+            .unwrap();
+        let mirror = host
+            .mirror_if_present(&original.policy.project_id)
+            .unwrap()
+            .unwrap();
+        let refs = f.project.git(&[
+            "--git-dir",
+            mirror.path().to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/task",
+            "refs/mac-worker/bases",
+        ]);
+        if target != "neither" {
+            let accepted = if target == "source" {
+                &retained.snapshot.source_head
+            } else {
+                &merge
+            };
+            f.project.git(&[
+                "--git-dir",
+                mirror.path().to_str().unwrap(),
+                "push",
+                &original.policy.origin,
+                &format!("{accepted}:refs/heads/main"),
+            ]);
+        }
+        let host_status = TaskStore::new(&host, &SystemProcessRunner)
+            .load_status(&original.policy.project_id, task)
+            .unwrap();
+        let expiry = host_status.updated_at_millis() + TASK_RETENTION_MILLIS;
+        assert!(
+            !apply_baseline_retention_close(
+                &host,
+                &SystemProcessRunner,
+                &original.policy.project_id,
+                task,
+                expiry - 1
+            )
+            .unwrap()
+        );
+        assert!(
+            apply_baseline_retention_close(
+                &host,
+                &SystemProcessRunner,
+                &original.policy.project_id,
+                task,
+                expiry + 1
+            )
+            .unwrap()
+        );
+        assert!(!host_task.join("workspace").exists());
+        assert_eq!(
+            f.project.git(&[
+                "--git-dir",
+                mirror.path().to_str().unwrap(),
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/task",
+                "refs/mac-worker/bases"
+            ]),
+            refs
+        );
+        let local_store = ClientStateStore::open(&paths.state).unwrap();
+        let closed = local_store
+            .load_task(task)
+            .unwrap()
+            .with_status(
+                TaskStore::new(&host, &SystemProcessRunner)
+                    .load_status(&original.policy.project_id, task)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(closed.status().state(), TaskState::Closed);
+        assert_eq!(
+            closed.status().last_outcome(),
+            Some(&mac_worker::test_support::task::model::TaskOutcome::Done)
+        );
+        let config = mac_worker::test_support::core::config::Config::parse(
+            &std::fs::read_to_string(&f.config).unwrap(),
+        )
+        .unwrap();
+        let client = mac_worker::test_support::task::client::TaskClient::new(
+            &SystemProcessRunner,
+            &config,
+            &paths,
+            &local_store,
+            &mac_worker::test_support::task::turn_runner::InlineRunnerExecutor,
+        );
+        assert_ne!(
+            client.integration_parent_gate(&closed).unwrap(),
+            mac_worker::test_support::client_state::dag::ParentGate::Ready,
+            "Closed+Done alone cannot release a configured child"
+        );
+        let ssh = std::fs::read_to_string(&f.ssh).unwrap();
+        let logging = r#"if command.endswith(' host task-integration'):
+    data = sys.stdin.buffer.read()
+    action = json.loads(data)['action']
+    with open(os.path.join(os.environ['HOME'], 'restore-steps'), 'a') as log: log.write(action.get('step', 'other') + '\n')
+    result = subprocess.run(['/bin/sh','-c',command], input=data, capture_output=True)
+    marker = os.path.join(os.environ['HOME'], 'observe-offline')
+    if os.path.exists(marker):
+        os.unlink(marker)
+        with open(os.path.join(os.environ['HOME'], 'observation-ready'), 'w') as signal: signal.write('observed\n')
+        with open(os.path.join(os.environ['HOME'], 'observation-release')) as signal: signal.readline()
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])"#;
+        std::fs::write(
+            &f.ssh,
+            ssh.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", logging),
+        )
+        .unwrap();
+        assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+        let recovered = if target == "failed_then_merge" {
+            let origin = f.laptop.parent().unwrap().join("origin.git");
+            let hidden = origin.with_extension("offline");
+            std::fs::rename(&origin, &hidden).unwrap();
+            std::fs::write(f.host.join("observe-offline"), b"once").unwrap();
+            let ready = f.host.join("observation-ready");
+            let release = f.host.join("observation-release");
+            fixture_fifo(&ready);
+            fixture_fifo(&release);
+            Some(std::thread::scope(|scope| {
+                let release_on_drop = ReleaseFixtureFifo(release);
+                let waiter = scope.spawn(|| wait_integrated(&f, task));
+                let mut signal = String::new();
+                std::io::BufRead::read_line(
+                    &mut std::io::BufReader::new(std::fs::File::open(ready).unwrap()),
+                    &mut signal,
+                )
+                .unwrap();
+                assert_eq!(signal, "observed\n");
+                let uncertain = state.load(task).unwrap().unwrap();
+                assert!(uncertain.push_intent.as_ref().unwrap().uncertain);
+                assert!(uncertain.receipt.is_none());
+                std::fs::rename(hidden, origin).unwrap();
+                drop(release_on_drop);
+                let done = waiter.join().unwrap();
+                assert!(
+                    done.phase_retries
+                        .iter()
+                        .any(|retry| retry.phase == IntegrationPhase::Repair
+                            && retry.code == IntegrationCode::IntegrationNetwork
+                            && retry.retries > 0)
+                );
+                done
+            }))
+        } else {
+            None
+        };
+        if target == "neither" {
+            let result = f.worker(&[
+                "--json",
+                "task",
+                "wait",
+                "--task-id",
+                &task.to_string(),
+                "--timeout",
+                "30s",
+            ]);
+            assert!(!result.status.success());
+            assert_eq!(
+                state.load(task).unwrap().unwrap().snapshot.state,
+                IntegrationStatus::Blocked
+            );
+            assert_eq!(
+                state.load(task).unwrap().unwrap().snapshot.blocked_code,
+                Some(IntegrationCode::IntegrationWorkspaceMissing)
+            );
+            assert!(state.load(task).unwrap().unwrap().receipt.is_none());
+        } else {
+            let done = recovered.unwrap_or_else(|| wait_integrated(&f, task));
+            let receipt = done.receipt.unwrap();
+            assert!(receipt.imported);
+            let accepted = if target == "source" {
+                &retained.snapshot.source_head
+            } else {
+                &merge
+            };
+            assert_eq!(
+                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head),
+                accepted
+            );
+            let local = ClientStateStore::open(&paths.state)
+                .unwrap()
+                .load_task(task)
+                .unwrap();
+            assert_eq!(local.status().head_oid(), Some(accepted));
+            assert_eq!(local.fetched_head(), Some(accepted));
+            assert_eq!(local.status().state(), TaskState::Closed);
+            assert!(
+                HostIntegrationStore::new(&host)
+                    .load(&original.policy.project_id, task)
+                    .unwrap()
+                    .unwrap()
+                    .receipt
+                    .unwrap()
+                    .imported
+            );
+        }
+        assert_eq!(
+            TaskStore::new(&host, &SystemProcessRunner)
+                .load_status(&original.policy.project_id, task)
+                .unwrap()
+                .state(),
+            TaskState::Closed
+        );
+        assert!(!host_task.join("workspace").exists());
+        let steps = std::fs::read_to_string(f.host.join("restore-steps")).unwrap();
+        assert!(
+            steps.lines().all(|step| step == "repair"),
+            "{target}: {steps}"
+        );
+        let late = f.worker(&["--json", "task", "integrate", &task.to_string()]);
+        assert!(!late.status.success());
+        assert!(!host_task.join("workspace").exists());
+        assert_eq!(
+            std::fs::read_to_string(f.host.join("ssh-journal"))
+                .unwrap()
+                .matches("host task-prepare\n")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn native_union_uses_frozen_h_attributes_and_pinned_verification_before_receipt_import() {
+    let (f, task) = configured_parked_source_fixture(
+        "moved-target",
+        |f| {
+            f.project.write(".gitattributes", b"payload.txt -merge\n");
+            f.project.write("payload.txt", b"base\n");
+            f.project.commit_all("attribute base");
+            f.project.git(&["push", "origin", "HEAD:main"]);
+        },
+        "printf 'payload.txt merge=union\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt",
+        "/usr/bin/git write-tree > \"$HOME/verify-before\"\n/usr/bin/git write-tree > \"$HOME/verify-after\"",
+    );
+    let owner = RootedIntegrationState::open(
+        &owner_paths(&f),
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let source = owner.load(task).unwrap().unwrap().snapshot.source_head;
+    f.project.write("payload.txt", b"theirs\n");
+    f.project.commit_all("outside target");
+    let target = String::from_utf8(f.project.git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    f.project.git(&["push", "origin", "HEAD:main"]);
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    let done = wait_integrated(&f, task);
+    let candidate = done.candidates.last().unwrap();
+    assert_eq!(candidate.attribute_source, source);
+    assert_eq!(candidate.ours, source);
+    assert_eq!(candidate.theirs.as_str(), target.trim());
+    let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
+    assert_eq!(
+        f.project
+            .git(&["show", &format!("{merge}:payload.txt")])
+            .stdout,
+        b"ours\ntheirs\n"
+    );
+    let parents = String::from_utf8(
+        f.project
+            .git(&["show", "-s", "--format=%P", merge.as_str()])
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(parents.trim(), format!("{} {source}", target.trim()));
+    assert_eq!(done.snapshot.verify_turns, 1);
+    for file in ["verify-before", "verify-after"] {
+        assert_eq!(
+            std::fs::read_to_string(f.host.join(file)).unwrap().trim(),
+            candidate.tree_oid.as_ref().unwrap().as_str()
+        );
+    }
+    assert!(done.receipt.as_ref().unwrap().imported);
+}
+
+#[test]
+fn native_binary_h_attributes_resolve_in_the_same_session_and_verifier_index_tampering_blocks() {
+    for tamper in [false, true] {
+        let attributes = if tamper {
+            "payload.txt merge=union"
+        } else {
+            "payload.txt -merge"
+        };
+        let source =
+            format!("printf '{attributes}\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt");
+        let auxiliary = if tamper {
+            "printf 'changed\\n' > payload.txt\n/usr/bin/git add payload.txt"
+        } else {
+            "printf 'resolved\\n' > payload.txt\n/usr/bin/git add payload.txt"
+        };
+        let (f, task) = configured_parked_source_fixture(
+            if tamper { "moved-target" } else { "never" },
+            |f| {
+                f.project
+                    .write(".gitattributes", b"payload.txt merge=union\n");
+                f.project.write("payload.txt", b"base\n");
+                f.project.commit_all("attribute base");
+                f.project.git(&["push", "origin", "HEAD:main"]);
+            },
+            &source,
+            auxiliary,
+        );
+        f.project.write("payload.txt", b"theirs\n");
+        f.project.commit_all("outside target");
+        f.project.git(&["push", "origin", "HEAD:main"]);
+        let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
+        assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+        if tamper {
+            let wait = f.worker(&[
+                "--json",
+                "task",
+                "wait",
+                "--task-id",
+                &task.to_string(),
+                "--timeout",
+                "60s",
+            ]);
+            assert!(
+                !wait.status.success(),
+                "{}",
+                String::from_utf8_lossy(&wait.stdout)
+            );
+            let owner = RootedIntegrationState::open(
+                &owner_paths(&f),
+                std::sync::Arc::new(ManualIntegrationRuntime::default()),
+            )
+            .unwrap();
+            let blocked = owner.load(task).unwrap().unwrap();
+            assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
+            assert_eq!(
+                blocked.snapshot.blocked_code,
+                Some(IntegrationCode::IntegrationVerifyTreeMismatch)
+            );
+            assert_eq!(
+                f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
+                target
+            );
+        } else {
+            let done = wait_integrated(&f, task);
+            assert_eq!(done.snapshot.resolve_turns, 1);
+            assert_eq!(done.snapshot.verify_turns, 0);
+            let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
+            assert_eq!(
+                f.project
+                    .git(&["show", &format!("{merge}:payload.txt")])
+                    .stdout,
+                b"resolved\n"
+            );
+            assert!(done.receipt.as_ref().unwrap().imported);
+        }
+        let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+        assert_eq!(journal.matches("host task-prepare\n").count(), 1);
+        assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(f.host.join("placed-files"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
 }
 
 struct RunningDashboard(std::process::Child);
@@ -1356,6 +1827,112 @@ impl Drop for ReleaseFixtureFifo {
         }
     }
 }
+
+#[test]
+fn native_rpc_leader_and_direct_recovery_share_the_detached_git_driver() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+        core::config::Config,
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
+        task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+    };
+    struct LocalOnly(std::path::PathBuf);
+    impl ProcessRunner for LocalOnly {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let mut request = request.clone();
+            if request.program == "ssh" || request.program == "/usr/bin/ssh" {
+                request.program = self.0.clone().into_os_string();
+            }
+            SystemProcessRunner.run(&request)
+        }
+    }
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let owner = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let origin_before = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
+    let ready = f.host.join("driver-ready");
+    let release = f.host.join("driver-release");
+    fixture_fifo(&ready);
+    fixture_fifo(&release);
+    let script = std::fs::read_to_string(&f.ssh).unwrap();
+    let hold = r#"if command.endswith(' host task-integration'):
+    data = sys.stdin.buffer.read()
+    action = json.loads(data)['action']
+    if action.get('step') == 'push':
+        with open(os.path.join(os.environ['HOME'], 'driver-ready'), 'w') as signal: signal.write('admitted\n')
+        with open(os.path.join(os.environ['HOME'], 'driver-release')) as signal: signal.readline()
+    result = subprocess.run(['/bin/sh','-c',command], input=data, capture_output=True)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])"#;
+    std::fs::write(
+        &f.ssh,
+        script.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", hold),
+    )
+    .unwrap();
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    let config = Config::parse(&std::fs::read_to_string(&f.config).unwrap()).unwrap();
+    let runner = LocalOnly(f.ssh.clone());
+    let state = ClientStateStore::open(&paths.state).unwrap();
+    std::thread::scope(|scope| {
+        let release_on_drop = ReleaseFixtureFifo(release);
+        let waiter = scope.spawn(|| wait_integrated(&f, task));
+        let mut admitted = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(std::fs::File::open(ready).unwrap()),
+            &mut admitted,
+        )
+        .unwrap();
+        assert_eq!(admitted, "admitted\n");
+        let held = owner.load(task).unwrap().unwrap();
+        assert!(held.actor.is_some());
+        assert_eq!(held.snapshot.state, IntegrationStatus::Pushing);
+        let direct = scope.spawn(|| f.worker(&["--json", "task", "reconcile"]));
+        let leader = scope.spawn(|| {
+            TaskClient::new(&runner, &config, &paths, &state, &InlineRunnerExecutor)
+                .tick_selected_recovery()
+                .unwrap()
+        });
+        let rpc=scope.spawn(|| {
+            let wire=serde_json::json!({"protocol_version":7,"request_id":uuid::Uuid::new_v4().simple().to_string(),"command":"task.wait.poll","body":{"task_id":task}});
+            let input=encode_json_frame(&wire).unwrap(); let mut out=vec![];
+            serve_rpc_with_integration_features(&paths,&config,&runner,&mut std::io::Cursor::new(input),&mut out,&[CONTROLLER_FEATURE_INTEGRATION.into()]).unwrap();
+            let reply:Value=serde_json::from_slice(decode_frame(&out).unwrap()).unwrap();
+            assert_eq!(reply["result"]["quiescent"],false);
+        });
+        let result = direct.join().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        leader.join().unwrap();
+        rpc.join().unwrap();
+        assert_eq!(owner.load(task).unwrap().unwrap().actor, held.actor);
+        assert_eq!(
+            f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
+            origin_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.host.join("ssh-journal"))
+                .unwrap()
+                .matches("host task-integration\n")
+                .count(),
+            3
+        );
+        drop(release_on_drop);
+        let done = waiter.join().unwrap();
+        assert!(done.receipt.unwrap().imported);
+        assert_eq!(done.candidates.len(), 1);
+    });
+}
 fn fixture_fifo(path: &std::path::Path) {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -1472,9 +2049,21 @@ fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> Inte
     ]);
     assert!(
         wait.status.success(),
-        "out={} err={}",
+        "out={} err={} record={:?} local={:?} steps={:?}",
         String::from_utf8_lossy(&wait.stdout),
-        String::from_utf8_lossy(&wait.stderr)
+        String::from_utf8_lossy(&wait.stderr),
+        RootedIntegrationState::open(
+            &owner_paths(f),
+            std::sync::Arc::new(ManualIntegrationRuntime::default())
+        )
+        .unwrap()
+        .load(task)
+        .unwrap(),
+        mac_worker::test_support::client_state::ClientStateStore::open(&owner_paths(f).state)
+            .unwrap()
+            .load_task(task)
+            .unwrap(),
+        std::fs::read_to_string(f.host.join("restore-steps"))
     );
     let owner = RootedIntegrationState::open(
         &owner_paths(f),

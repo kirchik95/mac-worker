@@ -1425,6 +1425,9 @@ impl<'a> IntegrationGit<'a> {
                 {
                     return Err(invalid());
                 }
+                if current.head_oid() == Some(result) {
+                    return Ok(current);
+                }
                 crate::task::TaskStatus::new(
                     current.state(),
                     current.last_outcome().cloned(),
@@ -1436,7 +1439,12 @@ impl<'a> IntegrationGit<'a> {
                     current.files_changed().to_vec(),
                     current.diff_stat().map(str::to_owned),
                     current.turns().to_vec(),
-                    self.now_millis(),
+                    self.now_millis().max(
+                        current
+                            .updated_at_millis()
+                            .checked_add(1)
+                            .ok_or_else(invalid)?,
+                    ),
                 )?
                 .copying_reported_checks(&current)
             },
@@ -1721,14 +1729,25 @@ pub mod testing {
             Self::at(root)
         }
         pub fn at(root: PathBuf) -> Self {
+            Self::at_for_task(root, fixture_task(), None)
+        }
+        pub fn at_for_task(
+            root: PathBuf,
+            task_id: crate::task::TaskId,
+            existing_origin: Option<&Path>,
+        ) -> Self {
             fs::create_dir_all(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let store = HostStore::open(&root.join("host")).unwrap();
-            let origin = root.join("origin.git");
-            fs::create_dir(&origin).unwrap();
-            git(&origin, &["init", "--bare", "."]);
-            git(&origin, &["config", "receive.denyNonFastForwards", "true"]);
-            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            let origin = existing_origin
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.join("origin.git"));
+            if existing_origin.is_none() {
+                fs::create_dir(&origin).unwrap();
+                git(&origin, &["init", "--bare", "."]);
+                git(&origin, &["config", "receive.denyNonFastForwards", "true"]);
+            }
+            let mut record = sample_record(task_id, fixture_source(), "main");
             record.policy.origin = format!("file://{}", origin.display());
             use sha2::{Digest, Sha256};
             let mut hash = Sha256::new();

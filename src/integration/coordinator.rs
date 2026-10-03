@@ -1298,7 +1298,11 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         step: IntegrationStep,
     ) -> Result<Option<HostIntegrationResponse>, WorkerError> {
-        if record.snapshot.state == IntegrationStatus::Blocked
+        if (record.snapshot.state == IntegrationStatus::Blocked
+            && record
+                .phase_retries
+                .iter()
+                .any(|retry| retry.phase == IntegrationPhase::Repair))
             || record
                 .snapshot
                 .retry_at_millis
@@ -1318,6 +1322,8 @@ impl<'a> IntegrationCoordinator<'a> {
         };
         record.snapshot.resume_state = None;
         record.snapshot.retry_at_millis = None;
+        record.snapshot.blocked_code = None;
+        record.snapshot.retry_exhausted = false;
         record.snapshot.pause_reason = None;
         record.pause = None;
         if !record.phase_retries.iter().any(|r| r.phase == phase) {

@@ -135,6 +135,133 @@ fn concrete_event_client_companion_matrix_refuses_old_and_rolled_back_execution_
 }
 
 #[test]
+fn native_notifier_repairs_dropped_hints_confirms_revisions_and_deduplicates_across_restart() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::ControllerLeader,
+        events::{
+            EventSource, NoticeChannel, NotifyOptions, PreviousProjection, TaskAddressQuery,
+            client::{ControllerEventClient, TaskReconciler},
+            journal::{ControllerJournal, JournalOptions},
+            notify::{
+                NotifyCache,
+                follow::{NotifyExit, NotifyLoop},
+            },
+            testing::{ManualEventRuntime, RecordingNoticeChannel},
+        },
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    ClientStateStore::open(&paths.state)
+        .unwrap()
+        .create_task(sample_ordinary(fixture_task(), fixture_source()))
+        .unwrap();
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(record.task_id, &record.policy)
+        .unwrap();
+    state
+        .replace(record.task_id, IntegrationRevision(0), &record)
+        .unwrap();
+    let runtime = Arc::new(ManualEventRuntime::new());
+    let leader = ControllerLeader::acquire(&paths.controller_state_root()).unwrap();
+    let _journal = ControllerJournal::initialize_for_leader(
+        &paths,
+        &leader,
+        JournalOptions {
+            runtime: runtime.clone(),
+        },
+    )
+    .unwrap();
+    let peer = Arc::new(CompanionPeer {
+        paths: paths.clone(),
+        config: config.clone(),
+        discovery: true,
+        execution: true,
+        calls: Mutex::new(vec![]),
+    });
+    let mut controller = config.controller;
+    controller.enabled = true;
+    controller.ssh = "fixture.invalid".into();
+    let client = ControllerEventClient::new(peer.clone(), controller.clone(), runtime.clone());
+    let channel = Arc::new(RecordingNoticeChannel::new());
+    let channels: Vec<Arc<dyn NoticeChannel>> = vec![channel.clone()];
+    for epoch in [0, 1, 1, 2, 2] {
+        if epoch > record.snapshot.epoch {
+            let revision = record.snapshot.revision;
+            record.snapshot.revision = revision.next().unwrap();
+            record.snapshot.epoch = epoch;
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+            state.replace(record.task_id, revision, &record).unwrap();
+        }
+        // Reopen both durable cache and actual reconciler on each iteration.
+        // No IntegrationChanged hint is published: only repair sees the change.
+        let cache = NotifyCache::open(&paths, &controller).unwrap();
+        let saved = cache.load().unwrap();
+        let mut reconciler = TaskReconciler::new(
+            PreviousProjection::Absent,
+            saved.consumed_after,
+            saved
+                .pending
+                .iter()
+                .map(|candidate| candidate.task_id)
+                .collect(),
+            runtime.clone(),
+        );
+        let mut diagnostics = vec![];
+        assert_eq!(
+            NotifyLoop {
+                source: &client,
+                reconciler: &mut reconciler,
+                cache: &cache,
+                channels: &channels,
+                options: &NotifyOptions::default(),
+                runtime: runtime.clone(),
+                stop_at: None
+            }
+            .run(&mut diagnostics)
+            .unwrap(),
+            NotifyExit::Complete,
+            "{}",
+            String::from_utf8_lossy(&diagnostics)
+        );
+        assert_eq!(channel.records().len(), epoch as usize);
+        let facts = client
+            .tasks(
+                TaskAddressQuery::try_new(vec![record.task_id], false, None).unwrap(),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let companion = client
+            .integrations(&[record.task_id], Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            facts.rows[0]
+                .integration
+                .as_ref()
+                .unwrap()
+                .confirms(companion.integrations[&record.task_id].as_ref().unwrap())
+        );
+        assert!(!paths.controller_state_root().join("requests").exists());
+    }
+    assert!(
+        peer.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body.get("integration").is_some())
+    );
+}
+
+#[test]
 fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_processes() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
@@ -194,6 +321,72 @@ fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_proc
         assert!(!paths.controller_state_root().exists());
         assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
     }
+}
+
+#[test]
+fn capable_rpc_redrive_uses_the_native_imported_receipt_idempotently() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    ClientStateStore::open(&paths.state)
+        .unwrap()
+        .create_task(ordinary.clone())
+        .unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    record.snapshot.state = IntegrationStatus::Integrated;
+    record.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    record.snapshot.observed_target_oid = Some(fixture_head());
+    record.receipt = Some(IntegrationReceipt {
+        integration_id: record.snapshot.integration_id,
+        epoch: record.snapshot.epoch,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        recorded_at_millis: 1001,
+        imported: true,
+    });
+    state
+        .publish_policy(record.task_id, &record.policy)
+        .unwrap();
+    state
+        .replace(record.task_id, IntegrationRevision(0), &record)
+        .unwrap();
+    let request_id = "00000000000000000000000000000054";
+    let request = json!({"protocol_version":7,"request_id":request_id,"command":"task.integrate",
+        "body":{"task_id":record.task_id,"expected":record.snapshot.revision,"request_id":request_id}});
+    let mut output = vec![];
+    serve_rpc_with_integration_features(
+        &paths,
+        &config,
+        &NoProcesses,
+        &mut std::io::Cursor::new(encode_json_frame(&request).unwrap()),
+        &mut output,
+        &[CONTROLLER_FEATURE_INTEGRATION.into()],
+    )
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(decode_frame(&output).unwrap()).unwrap();
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["result"], json!(record.snapshot));
+    assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+    assert_eq!(
+        ClientStateStore::open(&paths.state)
+            .unwrap()
+            .load_task(record.task_id)
+            .unwrap(),
+        ordinary
+    );
 }
 impl mac_worker::test_support::host::process::ProcessRunner for NoProcesses {
     fn run(

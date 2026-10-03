@@ -1528,6 +1528,10 @@ fn owner_import_ack_is_retained_after_repair() {
     f.prepare();
     f.push();
     f.execute(IntegrationStep::Repair).unwrap();
+    let repaired_status = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
     f.record = host_record(&f);
     let receipt = f.record.receipt.as_mut().unwrap();
     receipt.imported = true;
@@ -1538,8 +1542,15 @@ fn owner_import_ack_is_retained_after_repair() {
     let retained = host_record(&f);
     assert!(retained.receipt.unwrap().imported);
     assert_eq!(retained.snapshot.state, IntegrationStatus::Integrated);
+    assert_eq!(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+        repaired_status,
+        "acknowledgement must not refresh an already repaired status"
+    );
     HostGc::new(&f.store, &SystemProcessRunner)
-        .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+        .apply_at(repaired_status.updated_at_millis() + TASK_RETENTION_MILLIS + 1)
         .unwrap();
     assert!(!f.workspace().exists());
     assert_eq!(
@@ -2081,6 +2092,40 @@ fn lost_push_reply_settles_after_legacy_close_without_workspace_resurrection() {
     assert!(!f.workspace().exists());
     assert_eq!(f.origin_tip(), merge);
     assert!(f.execute(IntegrationStep::Push).is_err());
+}
+
+#[test]
+fn closed_receipt_repair_advances_the_retained_status_timestamp_even_after_clock_rollback() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let merge = f.prepare();
+    f.push();
+    let status_path = f.workspace().parent().unwrap().join("status.json");
+    let mut status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&status_path).unwrap()).unwrap();
+    status["updated_at_millis"] = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 86_400_000)
+        .into();
+    let status: mac_worker::test_support::task::model::TaskStatus =
+        serde_json::from_value(status).unwrap();
+    std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    legacy_close(&f);
+    let before = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    f.execute(IntegrationStep::Repair).unwrap();
+    let repaired = f
+        .store
+        .task_status(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    assert_eq!(repaired.state(), TaskState::Closed);
+    assert_eq!(repaired.head_oid(), Some(&merge));
+    assert!(repaired.updated_at_millis() > before.updated_at_millis());
 }
 
 #[test]

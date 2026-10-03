@@ -332,6 +332,17 @@ impl IntegrationTurns for OwnerPorts<'_> {
                 local.deliveries(),
                 remote.deliveries(),
             ))?
+        } else if local.status().state() == TaskState::Closed
+            && remote.status().state() == TaskState::Closed
+        {
+            // Ordinary observation freezes terminal tasks. A validated receipt
+            // authorizes this retained result-head repair while preserving Closed.
+            local
+                .with_status(remote.status().clone())?
+                .with_deliveries(crate::task::merge_origin_deliveries(
+                    local.deliveries(),
+                    remote.deliveries(),
+                ))?
         } else {
             local.with_remote_observation(remote.status(), remote.deliveries())?
         };
@@ -598,10 +609,18 @@ impl<'a> OwnerIntegration<'a> {
         let Some(record) = self.state.load(task)? else {
             return Ok(());
         };
+        let closed = self.ports.client.load_task(task)?.status().state() == TaskState::Closed;
+        let closed_observation = closed
+            && record.snapshot.state == IntegrationStatus::Blocked
+            && !record
+                .phase_retries
+                .iter()
+                .any(|retry| retry.phase == IntegrationPhase::Repair);
         if matches!(
             record.snapshot.state,
             IntegrationStatus::Integrated | IntegrationStatus::Blocked | IntegrationStatus::Revoked
-        ) && record.tombstone.as_ref().is_none_or(|t| t.acknowledged)
+        ) && !closed_observation
+            && record.tombstone.as_ref().is_none_or(|t| t.acknowledged)
         {
             return Ok(());
         }
@@ -633,10 +652,11 @@ impl<'a> OwnerIntegration<'a> {
             phase: IntegrationPhase::Drive,
         };
         // Revoke and settlement remain available while the launch gate is shut.
-        let permit = if record
-            .tombstone
-            .as_ref()
-            .is_some_and(|stop| !stop.acknowledged)
+        let permit = if closed
+            || record
+                .tombstone
+                .as_ref()
+                .is_some_and(|stop| !stop.acknowledged)
         {
             None
         } else {
