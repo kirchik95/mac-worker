@@ -49,6 +49,7 @@ const GRAMMAR_PATHS: &[&[&str]] = &[
     &["task", "result"],
     &["task", "fetch"],
     &["task", "close"],
+    &["task", "integrate"],
     &["task", "publish-retry"],
     &["task", "wait"],
     &["task", "reconcile"],
@@ -267,6 +268,7 @@ mod tests {
         assert!(output.contains("Usage: worker task submit"));
         assert!(output.contains("--message"));
         assert!(output.contains("Usage: worker task wait"));
+        assert!(output.contains("Usage: worker task integrate"));
     }
 
     #[test]
