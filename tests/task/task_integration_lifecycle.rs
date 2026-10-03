@@ -334,6 +334,7 @@ pub(crate) mod driver_fixture {
         Resolve,
         Verify,
         Offline,
+        RepairOffline,
         Missing,
         Reachable,
     }
@@ -362,6 +363,9 @@ pub(crate) mod driver_fixture {
             let HostIntegrationAction::Step { step, record } = &request.action else {
                 panic!("unexpected arm");
             };
+            if matches!(mode, Mode::RepairOffline) && *step == IntegrationStep::Repair {
+                return Err(IntegrationCode::IntegrationWorkerOffline.error());
+            }
             if matches!(mode, Mode::Missing) {
                 return Ok(HostIntegrationResponse::TargetMoved {
                     identity,
@@ -695,4 +699,126 @@ fn legacy_closed_only_observes_and_settles_retained_ancestry() {
             }
         )));
     }
+}
+
+#[test]
+fn detached_runner_drives_ready_phases_and_yields_for_admission_or_backoff() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    for (mode, want) in [
+        (Mode::Clean, IntegrationStatus::Integrated),
+        (Mode::Resolve, IntegrationStatus::Resolving),
+        (Mode::Offline, IntegrationStatus::RetryWait),
+    ] {
+        let rig = Rig::new(mode, ClosePolicy::Never);
+        let snapshot = IntegrationRunner::new(rig.coordinator())
+            .run(fixture_task())
+            .unwrap();
+        assert_eq!(snapshot.state, want);
+        if matches!(mode, Mode::Resolve) {
+            let auxiliary = rig.record().auxiliaries.pop().unwrap();
+            assert!(auxiliary.queue_position.is_some());
+            assert_eq!(rig.turns.enqueue_count(auxiliary.turn_id), 1);
+        }
+        if matches!(mode, Mode::Offline) {
+            assert_eq!(rig.host.calls.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn published_repair_retries_without_repeating_push_and_parks_backoff_once() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    use std::time::Duration;
+    let rig = Rig::new(Mode::RepairOffline, ClosePolicy::Never);
+    for _ in 0..3 {
+        rig.drive();
+    }
+    let receipt = rig.record().receipt.unwrap();
+    assert_eq!(rig.drive().state, IntegrationStatus::RetryWait);
+    assert_eq!(
+        rig.record().snapshot.resume_state,
+        Some(IntegrationStatus::Published)
+    );
+    rig.runtime.advance(Duration::from_millis(500));
+    rig.runtime
+        .set_drive_gate(Some(IntegrationPauseReason::ControllerDisabled));
+    rig.runtime.advance(Duration::from_secs(900));
+    rig.runtime.restart();
+    assert_eq!(rig.drive().state, IntegrationStatus::Parked);
+    assert_eq!(rig.record().remaining_backoff_millis, Some(1500));
+    rig.drive();
+    assert_eq!(rig.record().remaining_backoff_millis, Some(1500));
+    *rig.host.mode.lock().unwrap() = Mode::Clean;
+    rig.runtime.set_drive_gate(None);
+    assert_eq!(rig.drive().state, IntegrationStatus::RetryWait);
+    rig.runtime.advance(Duration::from_millis(1500));
+    assert_eq!(
+        IntegrationRunner::new(rig.coordinator())
+            .run(fixture_task())
+            .unwrap()
+            .state,
+        IntegrationStatus::Integrated
+    );
+    let mut imported = receipt;
+    imported.imported = true;
+    assert_eq!(rig.turns.imports(fixture_task()), vec![imported]);
+    assert_eq!(
+        rig.host
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(
+                r.action,
+                HostIntegrationAction::Step {
+                    step: IntegrationStep::Push,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn frozen_failed_source_checks_cannot_be_bypassed_by_redrive() {
+    use driver_fixture::*;
+    use mac_worker::test_support::{
+        agents::agent::{ReportedCheck, ReportedCheckStatus},
+        task::model::ClosePolicy,
+    };
+    let rig = Rig::new(Mode::Clean, ClosePolicy::Never);
+    let mut record = rig.record();
+    let revision = record.snapshot.revision;
+    record.source_checks = vec![ReportedCheck::new(
+        "source",
+        "test",
+        ReportedCheckStatus::Fail,
+        "failure",
+    )];
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+    record.snapshot.revision = revision.next().unwrap();
+    rig.state
+        .replace(fixture_task(), revision, &record)
+        .unwrap();
+    rig.coordinator()
+        .redrive(fixture_task(), record.snapshot.revision)
+        .unwrap();
+    let snapshot = rig.drive();
+    assert_eq!(snapshot.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        snapshot.blocked_code,
+        Some(IntegrationCode::IntegrationChecksFailed)
+    );
+    assert!(
+        rig.host
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| !matches!(r.action, HostIntegrationAction::Step { .. }))
+    );
 }

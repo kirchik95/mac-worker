@@ -390,6 +390,25 @@ impl<'a> IntegrationCoordinator<'a> {
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
     }
+    pub(crate) fn ready_to_drive(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        Ok(!matches!(
+            record.snapshot.state,
+            IntegrationStatus::Integrated
+                | IntegrationStatus::Blocked
+                | IntegrationStatus::Revoked
+                | IntegrationStatus::Parked
+                | IntegrationStatus::RetryWait
+        ) && !record.auxiliaries.last().is_some_and(|a| {
+            a.attempt == record.snapshot.attempts
+                && a.queue_position.is_some()
+                && !a.completed
+                && matches!(
+                    record.snapshot.state,
+                    IntegrationStatus::Resolving | IntegrationStatus::Verifying
+                )
+        }))
+    }
     pub fn drive_once(&self, task: TaskId) -> Result<IntegrationSnapshot, WorkerError> {
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
         let facts = self.observer.facts(task)?;
@@ -412,6 +431,15 @@ impl<'a> IntegrationCoordinator<'a> {
             record.snapshot.state,
             IntegrationStatus::Integrated | IntegrationStatus::Blocked | IntegrationStatus::Revoked
         ) {
+            return Ok(record.snapshot);
+        }
+        if record.source_checks.iter().any(|c| {
+            matches!(
+                c.status(),
+                crate::agent::ReportedCheckStatus::Fail | crate::agent::ReportedCheckStatus::Error
+            )
+        }) {
+            self.block(&mut record, IntegrationCode::IntegrationChecksFailed)?;
             return Ok(record.snapshot);
         }
         if !facts.session_import_complete
@@ -455,8 +483,15 @@ impl<'a> IntegrationCoordinator<'a> {
         if matches!(
             record.snapshot.state,
             IntegrationStatus::Resolving | IntegrationStatus::Verifying
-        ) && !record.auxiliaries.is_empty()
-        {
+        ) && record.auxiliaries.last().is_some_and(|a| {
+            a.attempt == record.snapshot.attempts
+                && a.purpose
+                    == if record.snapshot.state == IntegrationStatus::Resolving {
+                        IntegrationTurnPurpose::Resolve
+                    } else {
+                        IntegrationTurnPurpose::Verify
+                    }
+        }) {
             return self.drive_auxiliary(record, &facts);
         }
         if record.snapshot.state == IntegrationStatus::Published {
@@ -666,7 +701,9 @@ impl<'a> IntegrationCoordinator<'a> {
                 if step == IntegrationStep::AcceptTurn {
                     record.ready_at_millis = self.runtime.now_millis().saturating_add(1);
                 }
-                if step == IntegrationStep::Fetch && let Some(p) = &mut record.push_intent {
+                if step == IntegrationStep::Fetch
+                    && let Some(p) = &mut record.push_intent
+                {
                     p.uncertain = false;
                 }
                 self.save(record)?;
@@ -709,6 +746,13 @@ impl<'a> IntegrationCoordinator<'a> {
             }
             HostIntegrationResponse::Integrated { receipt, .. } => {
                 self.validate_receipt(record, &receipt)?;
+                let mut receipt = receipt;
+                if let Some(old) = &record.receipt {
+                    receipt.imported = old.imported;
+                    if &receipt != old {
+                        return Err(IntegrationCode::IntegrationStateInvalid.error());
+                    }
+                }
                 record.snapshot.state = IntegrationStatus::Published;
                 record.snapshot.merge_oid = receipt.merge_oid.clone();
                 record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
@@ -780,18 +824,34 @@ impl<'a> IntegrationCoordinator<'a> {
             return self.block(record, IntegrationCode::IntegrationConflictBudgetExhausted);
         }
         let facts = self.observer.facts(record.task_id)?;
-        let prepared = match PreparedIntegrationTurn::prepare(
-            &facts.ordinary,
-            record,
-            purpose,
+        if record.followups_spent >= facts.ordinary.meta().limits().max_followups {
+            return self.block(record, IntegrationCode::IntegrationFollowupLimit);
+        }
+        let turn = auxiliary_turn_id(
+            record.snapshot.integration_id,
+            record.snapshot.epoch,
             record.snapshot.attempts,
+            purpose,
             ordinal,
-        ) {
-            Ok(p) => p,
-            Err(e) if e.public_code() == "FOLLOWUP_LIMIT" => {
-                return self.block(record, IntegrationCode::IntegrationFollowupLimit);
+        )?;
+        let prepared = match self.state.load_prepared(record.task_id, turn)? {
+            Some(prepared) => {
+                prepared.validate_for(record)?;
+                prepared
             }
-            Err(e) => return Err(e),
+            None => match PreparedIntegrationTurn::prepare(
+                &facts.ordinary,
+                record,
+                purpose,
+                record.snapshot.attempts,
+                ordinal,
+            ) {
+                Ok(p) => p,
+                Err(e) if e.public_code() == "FOLLOWUP_LIMIT" => {
+                    return self.block(record, IntegrationCode::IntegrationFollowupLimit);
+                }
+                Err(e) => return Err(e),
+            },
         };
         self.state.publish_prepared(record.task_id, &prepared)?;
         let intent = prepared.intent()?;
@@ -944,31 +1004,42 @@ impl<'a> IntegrationCoordinator<'a> {
         mut record: IntegrationRecord,
         closed: bool,
     ) -> Result<IntegrationSnapshot, WorkerError> {
-        if !closed {
-            let Some(p) = self.permit(&mut record, IntegrationPhase::Repair)? else {
-                return Ok(record.snapshot);
-            };
-            drop(p);
-        }
         let receipt = record
             .receipt
             .clone()
             .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
-        let request = self.request(&record, IntegrationStep::Repair);
-        let response = self.host.execute(&request)?;
-        response.validate_for(&request)?;
-        if let HostIntegrationResponse::Integrated {
-            receipt: repaired, ..
-        } = response
-        {
-            self.validate_receipt(&record, &repaired)?;
-            if repaired.merge_oid != receipt.merge_oid
-                || repaired.target_head != receipt.target_head
+        let task = record.task_id;
+        if closed {
+            let Some(response) = self.closed_observation(&mut record, IntegrationStep::Repair)?
+            else {
+                return Ok(record.snapshot);
+            };
+            if let HostIntegrationResponse::Integrated {
+                receipt: repaired, ..
+            } = response
             {
+                self.validate_receipt(&record, &repaired)?;
+                let mut expected = receipt.clone();
+                expected.imported = repaired.imported;
+                if repaired != expected {
+                    return Err(IntegrationCode::IntegrationStateInvalid.error());
+                }
+            } else {
                 return Err(IntegrationCode::IntegrationStateInvalid.error());
             }
         } else {
-            return Err(IntegrationCode::IntegrationStateInvalid.error());
+            let snapshot = self.host_phase(record, IntegrationStep::Repair)?;
+            if snapshot.state != IntegrationStatus::Published {
+                return Ok(snapshot);
+            }
+            record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+            // Repair and owner import are separate admissions. An acknowledged drain
+            // during transport permits the outcome, but cannot chain another phase.
+            let Some(permit) = self.permit(&mut record, IntegrationPhase::Repair)? else {
+                return Ok(record.snapshot);
+            };
+            self.save(&mut record)?;
+            drop(permit);
         }
         let imported = self.turns.import_receipt(record.task_id, &receipt)?;
         self.validate_receipt(&record, &imported)?;
@@ -981,6 +1052,11 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(&mut record)?;
         self.runtime.reach(IntegrationHook::AfterOwnerImport);
         if record.policy.requested_close == crate::task::ClosePolicy::Done && !closed {
+            let Some(permit) = self.permit(&mut record, IntegrationPhase::Repair)? else {
+                return Ok(record.snapshot);
+            };
+            self.save(&mut record)?;
+            drop(permit);
             self.turns.close_integrated(record.task_id, &imported)?;
             self.runtime.reach(IntegrationHook::AfterClose);
         }
@@ -994,6 +1070,54 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(&mut record)?;
         Ok(record.snapshot)
     }
+    fn closed_observation(
+        &self,
+        record: &mut IntegrationRecord,
+        step: IntegrationStep,
+    ) -> Result<Option<HostIntegrationResponse>, WorkerError> {
+        if record.snapshot.state == IntegrationStatus::Blocked
+            || record
+                .snapshot
+                .retry_at_millis
+                .is_some_and(|d| d > self.runtime.now_millis())
+        {
+            return Ok(None);
+        }
+        let phase = if step == IntegrationStep::Repair {
+            IntegrationPhase::Repair
+        } else {
+            IntegrationPhase::Fetch
+        };
+        record.snapshot.state = if step == IntegrationStep::Repair {
+            IntegrationStatus::Published
+        } else {
+            IntegrationStatus::Fetching
+        };
+        record.snapshot.resume_state = None;
+        record.snapshot.retry_at_millis = None;
+        record.snapshot.pause_reason = None;
+        record.pause = None;
+        if !record.phase_retries.iter().any(|r| r.phase == phase) {
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase,
+                retries: 0,
+                code: IntegrationCode::IntegrationWorkerOffline,
+                due_at_millis: self.runtime.now_millis(),
+            });
+        }
+        self.save(record)?;
+        let request = self.request(record, step);
+        match self.host.execute(&request) {
+            Ok(response) => {
+                response.validate_for(&request)?;
+                Ok(Some(response))
+            }
+            Err(_) => {
+                self.retry(record, phase, IntegrationCode::IntegrationWorkerOffline)?;
+                Ok(None)
+            }
+        }
+    }
     fn settle_closed(
         &self,
         mut record: IntegrationRecord,
@@ -1001,53 +1125,25 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.receipt.is_some() {
             return self.finish_receipt(record, true);
         }
-        let request = self.request(&record, IntegrationStep::Fetch);
-        let response = self.host.execute(&request);
-        match response {
-            Ok(response) => {
-                response.validate_for(&request)?;
-                if let HostIntegrationResponse::Integrated { receipt, .. } = response {
-                    self.validate_receipt(&record, &receipt)?;
-                    record.snapshot.merge_oid = receipt.merge_oid.clone();
-                    record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
-                    record.snapshot.disposition = Some(receipt.disposition);
-                    record.receipt = Some(receipt);
-                    record.snapshot.state = IntegrationStatus::Published;
-                    record.snapshot.resume_state = None;
-                    record.snapshot.pause_reason = None;
-                    record.pause = None;
-                    self.save(&mut record)?;
-                    self.finish_receipt(record, true)
-                } else {
-                    self.block(&mut record, IntegrationCode::IntegrationWorkspaceMissing)?;
-                    Ok(record.snapshot)
-                }
-            }
-            Err(_) => {
-                // Closed authorizes observation only, never a phase/turn/push or workspace revival.
-                if !record
-                    .phase_retries
-                    .iter()
-                    .any(|r| r.phase == IntegrationPhase::Fetch)
-                {
-                    record.phase_retries.push(IntegrationPhaseRetry {
-                        phase: IntegrationPhase::Fetch,
-                        retries: 0,
-                        code: IntegrationCode::IntegrationWorkerOffline,
-                        due_at_millis: self.runtime.now_millis(),
-                    });
-                }
-                record.snapshot.state = IntegrationStatus::Fetching;
-                record.pause = None;
-                record.snapshot.pause_reason = None;
+        if let Some(response) = self.closed_observation(&mut record, IntegrationStep::Fetch)? {
+            if let HostIntegrationResponse::Integrated { receipt, .. } = response {
+                self.validate_receipt(&record, &receipt)?;
+                record.snapshot.merge_oid = receipt.merge_oid.clone();
+                record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
+                record.snapshot.disposition = Some(receipt.disposition);
+                record.receipt = Some(receipt);
+                record.snapshot.state = IntegrationStatus::Published;
                 record.snapshot.resume_state = None;
-                self.retry(
-                    &mut record,
-                    IntegrationPhase::Fetch,
-                    IntegrationCode::IntegrationWorkerOffline,
-                )?;
+                record.snapshot.pause_reason = None;
+                record.pause = None;
+                self.save(&mut record)?;
+                self.finish_receipt(record, true)
+            } else {
+                self.block(&mut record, IntegrationCode::IntegrationWorkspaceMissing)?;
                 Ok(record.snapshot)
             }
+        } else {
+            Ok(record.snapshot)
         }
     }
     pub fn redrive(
