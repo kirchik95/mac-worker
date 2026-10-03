@@ -1218,7 +1218,7 @@ pub struct TaskClient<'a> {
 enum IntegrationMutation {
     Close,
     Cancel,
-    Say,
+    Say { new_turn: bool },
 }
 
 impl<'a> TaskClient<'a> {
@@ -1296,15 +1296,21 @@ impl<'a> TaskClient<'a> {
             if matches!(operation, IntegrationMutation::Cancel) {
                 return Err(IntegrationCode::IntegrationAlreadyCommitted.error());
             }
+            if matches!(operation, IntegrationMutation::Say { new_turn: true }) {
+                coordinator.check_ordinary_followup_allowance(record)?;
+            }
             return Ok(record.clone());
         }
-        if matches!(operation, IntegrationMutation::Say)
+        if matches!(operation, IntegrationMutation::Say { .. })
             && !matches!(
                 snapshot.state,
                 IntegrationStatus::Blocked | IntegrationStatus::Revoked
             )
         {
             return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+        }
+        if matches!(operation, IntegrationMutation::Say { new_turn: true }) {
+            coordinator.check_ordinary_followup_allowance(record)?;
         }
         match coordinator.revoke(task, snapshot.revision) {
             Ok(_) => {}
@@ -3811,7 +3817,10 @@ impl<'a> TaskClient<'a> {
     ) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         if self.integration_enabled(task_id)? {
-            let record = self.before_integration_mutation(&record, IntegrationMutation::Say)?;
+            let record = self.before_integration_mutation(
+                &record,
+                IntegrationMutation::Say { new_turn: true },
+            )?;
             return self.say_from_expected(&record, message, attached, stdout, stderr);
         }
         if record.auto_continue_intent().is_some() {
@@ -3839,7 +3848,7 @@ impl<'a> TaskClient<'a> {
                     "task changed before follow-up",
                 ));
             }
-            self.before_integration_mutation(&current, IntegrationMutation::Say)?
+            self.before_integration_mutation(&current, IntegrationMutation::Say { new_turn: true })?
         } else {
             expected.clone()
         };
@@ -4094,7 +4103,13 @@ impl<'a> TaskClient<'a> {
                 return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
             }
         } else {
-            self.before_integration_mutation(&current, IntegrationMutation::Say)?;
+            self.before_integration_mutation(
+                &current,
+                IntegrationMutation::Say {
+                    new_turn: current.status().turns().last().map(TurnSummary::turn_id)
+                        != Some(turn_id),
+                },
+            )?;
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);

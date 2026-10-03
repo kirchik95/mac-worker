@@ -629,3 +629,29 @@ fn crash_after_park_retains_the_effective_timestamp_and_exact_remaining_budget()
     );
     assert_eq!(rig.turns.enqueue_count(turn), 1);
 }
+
+#[test]
+fn a_previous_epoch_auxiliary_cannot_stage_a_source_cycle_when_the_purpose_hint_is_missing() {
+    use super::task_integration_lifecycle::driver_fixture::*;
+    use mac_worker::test_support::task::model::{ClosePolicy, TaskOutcome};
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let turn = rig.queued();
+    rig.complete(turn, TaskOutcome::Done, vec![]);
+    rig.coordinator()
+        .revoke(fixture_task(), rig.record().snapshot.revision)
+        .unwrap();
+    let mut record = rig.record();
+    let revision = record.snapshot.revision;
+    record.snapshot.revision = revision.next().unwrap();
+    record.snapshot.epoch = 1;
+    record.candidates.clear();
+    record.auxiliaries.clear();
+    rig.state
+        .replace(fixture_task(), revision, &record)
+        .unwrap();
+    let mut facts = rig.observer.facts(fixture_task()).unwrap();
+    facts.auxiliary_purpose = None;
+    rig.observer.insert(facts);
+    rig.coordinator().on_terminal(fixture_task(), turn).unwrap();
+    assert_eq!(rig.record(), record);
+}

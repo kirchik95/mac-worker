@@ -1715,11 +1715,18 @@ fn the_next_ordinary_cycle_uses_the_previously_accepted_merge_as_its_base() {
     use mac_worker::test_support::task::model::{
         ClosePolicy, TaskOutcome, TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal,
     };
-    let rig = Rig::new(Mode::Clean, ClosePolicy::Never);
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let auxiliary = rig.queued();
+    rig.complete(auxiliary, TaskOutcome::Done, vec![]);
     IntegrationRunner::new(rig.coordinator())
         .run(fixture_task())
         .unwrap();
     let old = rig.record();
+    let mut spent = old.clone();
+    let revision = spent.snapshot.revision;
+    spent.snapshot.revision = revision.next().unwrap();
+    spent.followups_spent = 2; // One materialized auxiliary and one retained reservation.
+    rig.state.replace(fixture_task(), revision, &spent).unwrap();
     let accepted = old.receipt.as_ref().unwrap().merge_oid.clone().unwrap();
     let mut facts = rig.observer.facts(fixture_task()).unwrap();
     let prior = facts.ordinary.status();
@@ -1740,7 +1747,7 @@ fn the_next_ordinary_cycle_uses_the_previously_accepted_merge_as_its_base() {
             .iter()
             .cloned()
             .chain([TurnSummary::new(
-                2,
+                prior.turns().len() as u32 + 1,
                 source,
                 Some(TurnTerminal::Succeeded),
                 Some(TaskOutcome::Done),
@@ -1759,6 +1766,7 @@ fn the_next_ordinary_cycle_uses_the_previously_accepted_merge_as_its_base() {
         .unwrap()
         .with_fetched_head(Some(head))
         .unwrap();
+    facts.auxiliary_purpose = None;
     rig.observer.insert(facts);
     rig.coordinator()
         .on_terminal(fixture_task(), source)
@@ -1769,7 +1777,7 @@ fn the_next_ordinary_cycle_uses_the_previously_accepted_merge_as_its_base() {
     assert_eq!(next.cycle_base, accepted);
     assert_eq!(next.archived_receipts, vec![old.receipt.unwrap()]);
     assert_eq!(next.source_summary, "new source");
-    assert_eq!(next.followups_spent, 1);
+    assert_eq!(next.followups_spent, 3);
 }
 
 #[test]
@@ -1812,4 +1820,59 @@ fn selected_recovery_uses_durable_run_position_as_a_readiness_tie_breaker() {
     assert_eq!(staged.ready_at_millis, f.runtime().now_millis());
     client.reconcile_selected(&[fixture_task()]).unwrap();
     assert_eq!(f.load(fixture_task()).unwrap(), Some(staged));
+}
+
+#[test]
+fn an_unmaterialized_auxiliary_reservation_spends_the_shared_ordinary_followup_allowance() {
+    use crate::support::{recording_runner::RecordingRunner, task_harness::paths};
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        task::{client::TaskClient, model::LocalTaskRecord, turn_runner::InlineRunnerExecutor},
+    };
+    let f = IntegrationFixture::new();
+    let paths = paths(f.root());
+    let store = ClientStateStore::open(&paths.state).unwrap();
+    let mut wire = serde_json::to_value(sample_ordinary(fixture_task(), fixture_source())).unwrap();
+    wire["meta"]["limits"]["max_followups"] = 1.into();
+    let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    store.create_task(ordinary.clone()).unwrap();
+    f.enable(fixture_task(), "main").unwrap();
+    let mut facts = f.observer().facts(fixture_task()).unwrap();
+    facts.ordinary = ordinary.clone();
+    facts.result_imported = true;
+    f.observer().insert(facts);
+    f.coordinator()
+        .on_terminal(fixture_task(), fixture_source())
+        .unwrap();
+    let mut record = f.load(fixture_task()).unwrap().unwrap();
+    let revision = record.snapshot.revision;
+    record.snapshot.revision = revision.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationResolveBlocked);
+    record.snapshot.resolve_turns = 1;
+    record.followups_spent = 1;
+    f.state()
+        .replace(fixture_task(), revision, &record)
+        .unwrap();
+    let coordinator = f.coordinator();
+    let runner = RecordingRunner::default();
+    let config = owner_config();
+    let client = TaskClient::new(&runner, &config, &paths, &store, &InlineRunnerExecutor)
+        .with_integration(&coordinator);
+    assert_eq!(
+        client
+            .say(
+                fixture_task(),
+                "fix".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new()
+            )
+            .unwrap_err()
+            .public_code(),
+        "FOLLOWUP_LIMIT"
+    );
+    assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+    assert!(f.host_calls().is_empty());
+    assert!(runner.requests().is_empty());
 }

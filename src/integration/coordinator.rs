@@ -74,6 +74,11 @@ impl<'a> IntegrationCoordinator<'a> {
             }
             return Ok(());
         }
+        // Preparations outlive compact epoch references so a late old auxiliary
+        // completion remains distinguishable from an ordinary source turn.
+        if self.state.load_prepared(task, source)?.is_some() {
+            return Ok(());
+        }
         let facts = self.observer.facts(task)?;
         let ordinary = &facts.ordinary;
         let status = ordinary.status();
@@ -209,7 +214,7 @@ impl<'a> IntegrationCoordinator<'a> {
             phase_retries: vec![],
             ready_at_millis: now,
             run_position: 0,
-            followups_spent: ordinary.status().turns().len().saturating_sub(1) as u32,
+            followups_spent: self.followups_spent(ordinary, old.as_ref())?,
             snapshot: IntegrationSnapshot {
                 schema_version: INTEGRATION_SCHEMA_VERSION,
                 integration_id: id,
@@ -440,6 +445,55 @@ impl<'a> IntegrationCoordinator<'a> {
     }
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
+    }
+    fn followups_spent(
+        &self,
+        ordinary: &crate::task::LocalTaskRecord,
+        previous: Option<&IntegrationRecord>,
+    ) -> Result<u32, WorkerError> {
+        let turns = ordinary.status().turns();
+        let materialized = u32::try_from(turns.len().saturating_sub(1))
+            .map_err(|_| IntegrationCode::IntegrationStateInvalid.error())?;
+        let Some(previous) = previous else {
+            return Ok(materialized);
+        };
+        let source = turns
+            .iter()
+            .position(|t| t.turn_id() == previous.snapshot.source_turn_id)
+            .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        // The prior counter already charged all reserved auxiliaries, including
+        // ones absent from task history. Charge only later ordinary turns again.
+        let mut spent = previous.followups_spent;
+        for turn in &turns[source + 1..] {
+            if self
+                .state
+                .load_prepared(ordinary.meta().task_id(), turn.turn_id())?
+                .is_none()
+            {
+                spent = spent
+                    .checked_add(1)
+                    .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+            }
+        }
+        Ok(spent.max(materialized))
+    }
+    pub(crate) fn check_ordinary_followup_allowance(
+        &self,
+        ordinary: &crate::task::LocalTaskRecord,
+    ) -> Result<(), WorkerError> {
+        if ordinary.status().state() != TaskState::Open {
+            return Ok(());
+        }
+        let previous = self.state.load(ordinary.meta().task_id())?;
+        if self.followups_spent(ordinary, previous.as_ref())?
+            >= ordinary.meta().limits().max_followups
+        {
+            return Err(WorkerError::task(
+                "FOLLOWUP_LIMIT",
+                "task follow-up limit has been reached",
+            ));
+        }
+        Ok(())
     }
     pub(crate) fn set_run_position(&self, task: TaskId, position: u64) -> Result<(), WorkerError> {
         let Some(mut record) = self.state.load(task)? else {
