@@ -68,6 +68,8 @@ pub enum HostOperation {
     TaskPrebind,
     TaskCancel,
     TaskTurn,
+    TaskIntegration,
+    TaskIntegrationTurn,
     RefreshFacts,
     RefreshFactsClear,
     Cancel,
@@ -103,6 +105,8 @@ impl HostOperation {
             Self::TaskPrebind => "~/.local/bin/worker host task-prebind",
             Self::TaskCancel => "~/.local/bin/worker host task-cancel",
             Self::TaskTurn => "~/.local/bin/worker host task-turn",
+            Self::TaskIntegration => "~/.local/bin/worker host task-integration",
+            Self::TaskIntegrationTurn => "~/.local/bin/worker host task-integration-turn",
             Self::RefreshFacts => "~/.local/bin/worker host refresh-facts",
             Self::RefreshFactsClear => {
                 "~/.local/bin/worker host refresh-facts --clear-auth-incidents"

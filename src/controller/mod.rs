@@ -22,6 +22,7 @@ pub(crate) mod execute;
 pub(crate) mod health;
 pub(crate) mod health_read;
 pub(crate) mod init;
+pub(crate) mod integration;
 pub(crate) mod leader;
 pub(crate) mod lifecycle;
 pub(crate) mod protocol;

@@ -837,6 +837,14 @@ impl ValidateIntegration for PreparedIntegrationTurn {
                     attempt: self.attempt,
                 })
             || self.followup.task_id() != binding.task_id
+            || self.followup.turn_id()
+                != auxiliary_turn_id(
+                    self.integration_id,
+                    self.epoch,
+                    self.attempt,
+                    self.purpose,
+                    self.ordinal,
+                )?
             || self.followup.base_oid() != &binding.head
             || (self.purpose == IntegrationTurnPurpose::Verify && binding.pinned_tree.is_none())
             || self.approved_turn_limits.timeout_millis == 0
@@ -995,7 +1003,7 @@ contract!(IntegrationRecord {
     snapshot: IntegrationSnapshot, target_key: TargetKey, cycle_base: BaseOid,
     source_revision: String, source_summary: String, source_checks: Vec<ReportedCheck>,
     git_identity: GitIdentity, actor: Option<ProcessIdentity>,
-    candidates: Vec<IntegrationCandidate>, auxiliaries: Vec<PreparedIntegrationTurn>,
+    candidates: Vec<IntegrationCandidate>, auxiliaries: Vec<IntegrationAuxiliaryIntent>,
     archived_receipts: Vec<IntegrationReceipt>, push_intent: Option<IntegrationPushIntent>,
     receipt: Option<IntegrationReceipt>, tombstone: Option<IntegrationTombstone>,
     pause: Option<IntegrationPauseEvidence>, remaining_admission_millis: Option<u64>,
@@ -1010,6 +1018,13 @@ impl ValidateIntegration for IntegrationRecord {
         self.target_key.validate()?;
         if self.schema_version != INTEGRATION_SCHEMA_VERSION
             || self.target_key != self.policy.target_key()?
+            || self.snapshot.integration_id
+                != IntegrationId::derive(
+                    self.task_id,
+                    self.snapshot.source_turn_id,
+                    &self.snapshot.source_head,
+                    &self.target_key,
+                )?
             || !valid_digest(&self.source_revision)
             || self.source_summary.len() > MAX_MESSAGE_SUMMARY_BYTES
             || self.candidates.len() > MAX_CANDIDATES
@@ -1046,7 +1061,6 @@ impl ValidateIntegration for IntegrationRecord {
             auxiliary.validate()?;
             if auxiliary.integration_id != self.snapshot.integration_id
                 || auxiliary.epoch != self.snapshot.epoch
-                || auxiliary.followup.task_id() != self.task_id
             {
                 return Err(invalid());
             }
@@ -1058,6 +1072,46 @@ impl ValidateIntegration for IntegrationRecord {
             receipt.validate()?;
         }
         check_size(self, MAX_PRIVATE_RECORD_BYTES)
+    }
+}
+// Complete preparation lives in its own sidecar; this is its compact reference.
+contract!(IntegrationAuxiliaryIntent {
+    turn_id: TurnId, integration_id: IntegrationId, epoch: u32, attempt: u8,
+    purpose: IntegrationTurnPurpose, ordinal: u8, prepared_binding: String,
+    created_at_millis: u64, queue_position: Option<u64>, accepted: bool, completed: bool,
+});
+impl ValidateIntegration for IntegrationAuxiliaryIntent {
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.turn_id
+            != auxiliary_turn_id(
+                self.integration_id,
+                self.epoch,
+                self.attempt,
+                self.purpose,
+                self.ordinal,
+            )?
+            || !valid_digest(&self.prepared_binding)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+impl PreparedIntegrationTurn {
+    pub fn intent(&self) -> Result<IntegrationAuxiliaryIntent, WorkerError> {
+        Ok(IntegrationAuxiliaryIntent {
+            turn_id: self.followup.turn_id(),
+            integration_id: self.integration_id,
+            epoch: self.epoch,
+            attempt: self.attempt,
+            purpose: self.purpose,
+            ordinal: self.ordinal,
+            prepared_binding: self.binding()?,
+            created_at_millis: self.followup.created_at_millis(),
+            queue_position: None,
+            accepted: false,
+            completed: false,
+        })
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1089,23 +1143,19 @@ pub enum HostIntegrationAction {
     },
 }
 contract!(HostIntegrationRequest {
-    protocol_version: u32,
-    task_id: TaskId,
-    integration_id: IntegrationId,
-    epoch: u32,
-    revision: IntegrationRevision,
-    action: HostIntegrationAction,
+    protocol_version: u32, task_id: TaskId, integration_id: Option<IntegrationId>,
+    epoch: u32, revision: IntegrationRevision, action: HostIntegrationAction,
 });
 contract!(IntegrationResponseIdentity {
-    protocol_version: u32,
-    task_id: TaskId,
-    integration_id: IntegrationId,
-    epoch: u32,
-    revision: IntegrationRevision,
+    protocol_version: u32, task_id: TaskId, integration_id: Option<IntegrationId>,
+    epoch: u32, revision: IntegrationRevision,
 });
 impl ValidateIntegration for IntegrationResponseIdentity {
     fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != crate::protocol::PROTOCOL_VERSION || self.revision.0 == 0 {
+        if self.protocol_version != crate::protocol::PROTOCOL_VERSION
+            || (self.integration_id.is_none() && (self.revision.0 != 0 || self.epoch != 0))
+            || (self.integration_id.is_some() && self.revision.0 == 0)
+        {
             return Err(invalid());
         }
         Ok(())
@@ -1124,15 +1174,18 @@ impl IntegrationResponseIdentity {
 }
 impl ValidateIntegration for HostIntegrationRequest {
     fn validate(&self) -> Result<(), WorkerError> {
-        if self.protocol_version != crate::protocol::PROTOCOL_VERSION || self.revision.0 == 0 {
-            return Err(invalid());
-        }
+        IntegrationResponseIdentity::for_request(self).validate()?;
         match &self.action {
-            HostIntegrationAction::Arm { policy } => policy.validate()?,
+            HostIntegrationAction::Arm { policy } => {
+                if self.integration_id.is_some() {
+                    return Err(invalid());
+                }
+                policy.validate()?;
+            }
             HostIntegrationAction::Step { record, .. } => {
                 record.validate()?;
                 if record.task_id != self.task_id
-                    || record.snapshot.integration_id != self.integration_id
+                    || Some(record.snapshot.integration_id) != self.integration_id
                     || record.snapshot.epoch != self.epoch
                     || record.snapshot.revision != self.revision
                 {
@@ -1140,7 +1193,10 @@ impl ValidateIntegration for HostIntegrationRequest {
                 }
             }
             HostIntegrationAction::Revoke { tombstone } => {
-                if tombstone.epoch != self.epoch || tombstone.revision != self.revision {
+                if self.integration_id.is_none()
+                    || tombstone.epoch != self.epoch
+                    || tombstone.revision != self.revision
+                {
                     return Err(invalid());
                 }
             }
@@ -1154,7 +1210,7 @@ impl ValidateIntegration for HostIntegrationRequest {
 pub enum HostIntegrationResponse {
     Progress {
         identity: IntegrationResponseIdentity,
-        snapshot: IntegrationSnapshot,
+        snapshot: Option<IntegrationSnapshot>,
     },
     NeedTurn {
         identity: IntegrationResponseIdentity,
@@ -1203,12 +1259,17 @@ impl ValidateIntegration for HostIntegrationResponse {
         self.identity().validate()?;
         match self {
             Self::Progress { snapshot, identity } => {
-                snapshot.validate()?;
-                if snapshot.integration_id != identity.integration_id
-                    || snapshot.epoch != identity.epoch
-                    || snapshot.revision != identity.revision
-                {
+                if snapshot.is_some() != identity.integration_id.is_some() {
                     return Err(invalid());
+                }
+                if let Some(snapshot) = snapshot {
+                    snapshot.validate()?;
+                    if Some(snapshot.integration_id) != identity.integration_id
+                        || snapshot.epoch != identity.epoch
+                        || snapshot.revision != identity.revision
+                    {
+                        return Err(invalid());
+                    }
                 }
             }
             Self::NeedTurn {
@@ -1217,7 +1278,7 @@ impl ValidateIntegration for HostIntegrationResponse {
                 ..
             } => {
                 candidate.validate()?;
-                if candidate.id.integration_id != identity.integration_id
+                if Some(candidate.id.integration_id) != identity.integration_id
                     || candidate.id.epoch != identity.epoch
                     || candidate.clean_h.branch != BranchName::for_task(identity.task_id)
                 {
@@ -1226,7 +1287,7 @@ impl ValidateIntegration for HostIntegrationResponse {
             }
             Self::Integrated { receipt, identity } => {
                 receipt.validate()?;
-                if receipt.integration_id != identity.integration_id
+                if Some(receipt.integration_id) != identity.integration_id
                     || receipt.epoch != identity.epoch
                 {
                     return Err(invalid());
@@ -1303,6 +1364,7 @@ pub trait IntegrationHost: Send + Sync {
     ) -> Result<HostIntegrationResponse, WorkerError>;
 }
 pub trait IntegrationState: Send + Sync {
+    fn load_policy(&self, task: TaskId) -> Result<Option<FrozenIntegrationPolicy>, WorkerError>;
     fn load(&self, task: TaskId) -> Result<Option<IntegrationRecord>, WorkerError>;
     fn publish_policy(
         &self,
@@ -1340,6 +1402,20 @@ pub trait IntegrationRuntime: Send + Sync {
 }
 pub trait IntegrationObserver: Send + Sync {
     fn facts(&self, task: TaskId) -> Result<IntegrationTaskFacts, WorkerError>;
+}
+contract!(IntegrationRedriveRequest {
+    task_id: TaskId,
+    expected: IntegrationRevision,
+    request_id: String,
+});
+impl ValidateIntegration for IntegrationRedriveRequest {
+    fn validate(&self) -> Result<(), WorkerError> {
+        let id = uuid::Uuid::parse_str(&self.request_id).map_err(|_| invalid())?;
+        if id.is_nil() || id.simple().to_string() != self.request_id || self.expected.0 == 0 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 
 pub fn validate_integration_target(target: &str) -> Result<BranchName, WorkerError> {
@@ -1613,6 +1689,24 @@ mod tests {
         let mut invalid = wire;
         invalid["identity"]["protocol_version"] = json!(6);
         assert!(decode_host_response(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+    #[test]
+    fn arm_freezes_policy_before_a_final_source_identity_exists() {
+        let request = json!({
+            "protocol_version":7,"task_id":task(),"integration_id":null,"epoch":0,"revision":0,
+            "action":{"action":"arm","policy":{
+                "schema_version":1,"origin":"https://example.test/repo.git","target":"main",
+                "verify":"never","requested_close":"done","base_kind":"committed",
+                "base_oid":"b".repeat(40),"base_task":null,"base_preflight":"pass",
+                "project_id":"a".repeat(64),
+            }},
+        });
+        let request = decode_host_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let response = json!({"response":"progress","snapshot":null,"identity":{
+            "protocol_version":7,"task_id":task(),"integration_id":null,"epoch":0,"revision":0,
+        }});
+        let response = decode_host_response(&serde_json::to_vec(&response).unwrap()).unwrap();
+        response.validate_for(&request).unwrap();
     }
 
     #[test]

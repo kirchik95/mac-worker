@@ -1,2 +1,21 @@
 //! Explicit integration-test access; implementation modules remain private.
+pub use crate::client_state::RunnerLivenessVerdict;
+pub use crate::controller::batch::{BatchKind, FrozenBatchBody, FrozenBatchSource};
+pub use crate::controller::integration::*;
+pub use crate::dag::{DagBase, DagFrozenSpec, DagNode, DagNodeState};
+pub use crate::features::{CONTROLLER_FEATURE_INTEGRATION, HOST_FEATURE_INTEGRATION};
+pub use crate::integration::config::*;
 pub use crate::integration::contracts::*;
+pub use crate::integration::coordinator::IntegrationCoordinator;
+pub use crate::integration::git::IntegrationGit;
+pub use crate::integration::git::testing::GitIntegrationFixture;
+pub use crate::integration::host::HostIntegrationService;
+pub use crate::integration::host_store::HostIntegrationStore;
+pub use crate::integration::remote::RemoteIntegrationHost;
+pub use crate::integration::runner::IntegrationRunner;
+pub use crate::integration::store::RootedIntegrationState;
+pub use crate::integration::testing::*;
+pub use crate::integration::view::project_integration;
+pub use crate::job::ProcessIdentity;
+pub use crate::prepared_submit::FrozenSubmitBody;
+pub use crate::task_client::{BatchDefaults, BatchFile, BatchTask, TaskSubmitRequest};
