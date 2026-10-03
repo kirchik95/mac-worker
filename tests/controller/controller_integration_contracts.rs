@@ -316,6 +316,32 @@ fn gated_wrappers_hash_the_entire_body_and_publish_policy_before_effects() {
 }
 
 #[test]
+fn owner_decode_requires_integration_admission_requirements() {
+    let mut policy = sample_policy("main");
+    policy.requested_close = ClosePolicy::Done;
+    let wrapped = prepare_integrating_submit(submit(), policy).unwrap();
+    let mut wire = serde_json::to_value(&wrapped).unwrap();
+    wire["submit"]["requires"] = json!([]);
+    assert!(
+        parse_integrating_submit(
+            &request("task.submit-integrating", wire),
+            &[CONTROLLER_FEATURE_INTEGRATION.to_owned()]
+        )
+        .is_err()
+    );
+    let wrapped = prepare_integrating_batch(batch(), policies()).unwrap();
+    let mut wire = serde_json::to_value(&wrapped).unwrap();
+    wire["batch"]["nodes"]["parent"]["frozen"]["requires"] = json!([]);
+    assert!(
+        parse_integrating_batch(
+            &request("task.batch-integrating", wire),
+            &[CONTROLLER_FEATURE_INTEGRATION.to_owned()]
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() {
     use mac_worker::test_support::controller::{
         ControllerReadIdentity, ControllerReadReply, decode_frame,
@@ -337,6 +363,7 @@ fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() 
             .unwrap();
     let reply: ControllerReadReply<IntegrationReadResult> =
         serde_json::from_slice(decode_frame(&bytes).unwrap()).unwrap();
+    let _: baseline::ReadEnvelope = serde_json::from_slice(decode_frame(&bytes).unwrap()).unwrap();
     reply.verify_envelope(&req).unwrap();
     reply.result().verify_payload(&req).unwrap();
     let wrong = request(
@@ -523,7 +550,12 @@ fn copied_baseline_strict_decoders_prove_disabled_dtos_keep_their_bytes() {
     baseline_accepts_current_bytes::<baseline::Followup, PreparedFollowup>(&followup);
     let frozen_batch = batch();
     let dag = json!({"version":1,"run_id":frozen_batch.run_id,"max_parallel":1,"created_at_millis":1000,"nodes":frozen_batch.nodes});
-    let _: baseline::Dag = serde_json::from_value(dag).unwrap();
+    let dag: mac_worker::test_support::client_state::dag::DagRecord =
+        serde_json::from_value(dag).unwrap();
+    baseline_accepts_current_bytes::<
+        baseline::Dag,
+        mac_worker::test_support::client_state::dag::DagRecord,
+    >(&dag);
     let body = submit();
     let before = serde_json::to_vec(&body).unwrap();
     let disabled = resolve_integration_policy(

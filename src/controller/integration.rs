@@ -53,9 +53,9 @@ pub fn prepare_integrating_submit(
         submit,
         integration,
     };
-    validate_integrating_submit(&wrapper)?;
-    add_requirements(&mut wrapper.submit.requires, &wrapper.integration)?;
     wrapper.validate()?;
+    add_requirements(&mut wrapper.submit.requires, &wrapper.integration)?;
+    validate_integrating_submit(&wrapper)?;
     Ok(wrapper)
 }
 
@@ -65,10 +65,32 @@ pub fn validate_integrating_submit(wrapper: &FrozenIntegratingSubmit) -> Result<
     wrapper.validate()?;
     if wrapper.integration.base_kind != IntegrationBaseKind::Committed
         || wrapper.integration.base_oid.as_ref() != Some(&wrapper.submit.base_oid)
+        || wrapper.submit.task_id.as_uuid().is_nil()
+        || wrapper.submit.turn_id.as_uuid().is_nil()
+        || wrapper
+            .submit
+            .session_import
+            .as_ref()
+            .is_some_and(|import| import.package_oid() == wrapper.submit.base_oid.as_str())
     {
         return Err(invalid());
     }
     wrapper.submit.prepared()?;
+    validate_requirements(&wrapper.submit.requires, &wrapper.integration)
+}
+
+fn validate_requirements(
+    requires: &[String],
+    policy: &FrozenIntegrationPolicy,
+) -> Result<(), WorkerError> {
+    let mut expected = Vec::new();
+    add_requirements(&mut expected, policy)?;
+    if !expected
+        .iter()
+        .all(|requirement| requires.contains(requirement))
+    {
+        return Err(invalid());
+    }
     Ok(())
 }
 
@@ -131,6 +153,9 @@ fn validate_batch_bindings(
         }
         node.frozen.limits()?;
         node.frozen.permission_policy()?;
+        if effective {
+            validate_requirements(&node.frozen.requires, policy)?;
+        }
         match &node.base {
             DagBase::Frozen { oid, .. } => {
                 if policy.base_kind != IntegrationBaseKind::Committed
