@@ -204,6 +204,71 @@ fn decision_of(facts: &TaskFacts) -> Option<Decision> {
     if signature.quiescent != Some(true) {
         return None;
     }
+    if let Some(annotation) = &facts.integration {
+        use crate::integration::contracts::IntegrationStatus;
+        if facts.integration_confirmation.as_ref() != Some(annotation) {
+            return None;
+        }
+        let (label, sound, attention, done) =
+            match annotation.state {
+                IntegrationStatus::Integrated
+                    if facts.outcome == Some(SafeOutcome::Done) && facts.result_imported =>
+                {
+                    ("Integrated", NoticeSound::Done, false, true)
+                }
+                IntegrationStatus::Blocked
+                    if facts.outcome == Some(SafeOutcome::Blocked)
+                        && facts.code.as_ref().map(SafeCode::as_str)
+                            == annotation.code.map(|code| code.as_str()) =>
+                {
+                    ("Integration blocked", NoticeSound::Request, true, false)
+                }
+                IntegrationStatus::Armed | IntegrationStatus::Revoked
+                    if signature.abandoned_without_turn =>
+                {
+                    if facts.code.as_ref().is_some_and(|code| {
+                        code.as_str() == "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+                    }) {
+                        (
+                            "Dependency not integrated",
+                            NoticeSound::Request,
+                            true,
+                            false,
+                        )
+                    } else {
+                        ("Abandoned", NoticeSound::None, false, false)
+                    }
+                }
+                IntegrationStatus::Armed | IntegrationStatus::Revoked
+                    if facts
+                        .outcome
+                        .is_some_and(|outcome| outcome != SafeOutcome::Done) =>
+                {
+                    let outcome = facts.outcome?;
+                    (
+                        outcome_label(outcome),
+                        sound_for_outcome(outcome),
+                        signature.current_attention,
+                        false,
+                    )
+                }
+                _ => return None,
+            };
+        return Some(Decision {
+            fingerprint: sha256_hex(&format!(
+                "integration:{}:{}:{}",
+                annotation.integration_id,
+                annotation.epoch,
+                serde_json::to_string(&annotation.state).ok()?
+            )),
+            task_id: facts.task_id,
+            title: facts.title.clone(),
+            label,
+            sound,
+            attention,
+            done,
+        });
+    }
     if signature.abandoned_without_turn {
         let code = signature
             .code
@@ -235,6 +300,27 @@ fn decision_of(facts: &TaskFacts) -> Option<Decision> {
         attention: signature.current_attention,
         done: outcome == SafeOutcome::Done,
     })
+}
+
+/// Only already confirmed enabled attention contributes to a repair summary.
+pub(crate) fn confirmed_integration_attention_key(facts: &TaskFacts) -> Option<String> {
+    facts.integration.as_ref()?;
+    let decision = decision_of(facts)?;
+    decision.attention.then_some(decision.fingerprint)
+}
+
+fn integration_confirmations_complete(result: &Reconciliation) -> bool {
+    result
+        .confirmed
+        .iter()
+        .chain(
+            result
+                .changes
+                .iter()
+                .filter_map(|change| change.current.as_ref()),
+        )
+        .filter(|facts| facts.integration_notice_candidate())
+        .all(|facts| facts.integration_confirmation.as_ref() == facts.integration.as_ref())
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -302,21 +388,21 @@ fn repair_complete(result: &Reconciliation) -> bool {
 }
 
 fn attention_count(result: &Reconciliation) -> usize {
+    if integration_confirmations_complete(result)
+        && let Some(summary) = &result.attention
+    {
+        return summary.count;
+    }
     result
-        .attention
-        .as_ref()
-        .map(|summary| summary.count)
-        .unwrap_or_else(|| {
-            result
-                .confirmed
-                .iter()
-                .filter(|facts| decision_of(facts).is_some_and(|decision| decision.attention))
-                .count()
-        })
+        .confirmed
+        .iter()
+        .filter(|facts| decision_of(facts).is_some_and(|decision| decision.attention))
+        .count()
 }
 
 fn resolved_attention_fingerprint(result: &Reconciliation) -> String {
-    if let Some(AttentionSummary { fingerprint, .. }) = &result.attention
+    if integration_confirmations_complete(result)
+        && let Some(AttentionSummary { fingerprint, .. }) = &result.attention
         && is_digest(fingerprint)
     {
         return fingerprint.clone();
@@ -331,6 +417,10 @@ fn attention_fingerprint(facts: &[TaskFacts]) -> String {
             continue;
         };
         if !decision.attention {
+            continue;
+        }
+        if facts.integration.is_some() {
+            lines.push(decision.fingerprint);
             continue;
         }
         let turn = facts

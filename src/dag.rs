@@ -772,6 +772,8 @@ pub(crate) fn pending_list_row(
         DagNodeState::Submitted => None,
     };
     TaskListRow {
+        integration: None,
+        workflow_state: None,
         task_id: node.task_id,
         run_id: Some(run_id),
         run_position: None,

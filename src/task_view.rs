@@ -158,6 +158,10 @@ pub struct TaskListProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_state: Option<crate::integration::contracts::WorkflowState>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub run_position: Option<u32>,
@@ -205,6 +209,10 @@ pub struct TaskRunProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskDetailProjection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_state: Option<crate::integration::contracts::WorkflowState>,
     pub questions_policy: crate::task::QuestionsPolicy,
     pub task: TaskListRow,
     pub project_id: String,
@@ -473,6 +481,8 @@ pub fn project_task_detail(
         .collect::<Vec<_>>();
 
     Ok(TaskDetailProjection {
+        integration: None,
+        workflow_state: None,
         questions_policy: record.questions_policy(),
         task,
         project_id: record.meta().project_id().to_owned(),
@@ -538,6 +548,8 @@ fn task_list_row(
     let task_id = record.meta().task_id();
 
     Ok(TaskListRow {
+        integration: None,
+        workflow_state: None,
         task_id,
         run_id: record.meta().run_id(),
         run_position,
@@ -709,6 +721,43 @@ fn agent_name(agent: AgentKind) -> &'static str {
     }
 }
 
+impl TaskListRow {
+    /// Attach an already-read companion snapshot without observing or driving workers.
+    pub fn with_integration(
+        mut self,
+        snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        facts: &crate::integration::contracts::IntegrationTaskFacts,
+    ) -> Result<Self, crate::error::WorkerError> {
+        if self.task_id != facts.ordinary.meta().task_id() {
+            return Err(crate::integration::contracts::integration_error(
+                "INTEGRATION_STATE_INVALID",
+            ));
+        }
+        let view = crate::integration::view::project_integration(snapshot, facts)?;
+        self.integration = view.integration;
+        self.workflow_state = view.workflow_state;
+        self.review_state = view.review_state;
+        if self.workflow_state == Some(crate::integration::contracts::WorkflowState::NeedsYou)
+            && facts.ordinary.abandon_code() == Some(crate::integration::contracts::IntegrationCode::IntegrationDependencyNotIntegrated.as_str()) {
+            self.blocking_code = facts.ordinary.abandon_code().map(str::to_owned);
+        }
+        Ok(self)
+    }
+}
+impl TaskDetailProjection {
+    pub fn with_integration(
+        mut self,
+        snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        facts: &crate::integration::contracts::IntegrationTaskFacts,
+    ) -> Result<Self, crate::error::WorkerError> {
+        self.task = self.task.with_integration(snapshot, facts)?;
+        self.integration = self.task.integration.clone();
+        self.workflow_state = self.task.workflow_state;
+        self.review_state = self.task.review_state;
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -828,6 +877,8 @@ mod tests {
 
     fn list_row(delivery: Option<OriginDelivery>, publish_push: bool) -> TaskListRow {
         TaskListRow {
+            integration: None,
+            workflow_state: None,
             task_id: TaskId::new(Uuid::from_u128(1)),
             run_id: None,
             run_position: None,

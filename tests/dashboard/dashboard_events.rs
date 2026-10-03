@@ -470,6 +470,8 @@ impl ProjectionSource {
         let task_id = TaskId::new(uuid::Uuid::from_u128(1));
         let mut projection = TaskListProjection::empty();
         projection.tasks.push(TaskListRow {
+            integration: None,
+            workflow_state: None,
             task_id,
             run_id: None,
             run_position: None,

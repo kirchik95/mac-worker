@@ -71,6 +71,7 @@ impl NotifyLoop<'_> {
             journal_available: Mutex::new(None),
             unsupported: AtomicBool::new(false),
             fault: Mutex::new(None),
+            integration_attention: Mutex::new(std::collections::BTreeMap::new()),
         };
         let channels: Vec<Arc<dyn NoticeChannel>> = self
             .channels
@@ -201,6 +202,9 @@ impl NotifyLoop<'_> {
             }
             let had_events =
                 matches!(&read, Some(EventReadResult::Batch(batch)) if !batch.events.is_empty());
+            if repair_due && !repair_active {
+                staged.integration_attention.lock().unwrap().clear();
+            }
             let input = ReconcileInput {
                 read,
                 repair_due,
@@ -256,6 +260,13 @@ impl NotifyLoop<'_> {
                 }
             };
             result.validate()?;
+            if !confirm_integrations(self.source, &mut result, deadline) {
+                writeln!(
+                    diagnostics,
+                    "integration confirmation unavailable or changed; notification deferred"
+                )?;
+            }
+            staged.compose_integration_attention(&mut result)?;
             retry = 0;
             if *staged.journal_available.lock().unwrap() == Some(false) {
                 result.consumed_after = None;
@@ -320,6 +331,78 @@ impl NotifyLoop<'_> {
             }
         }
     }
+}
+
+fn confirm_integrations(
+    source: &dyn EventSource,
+    result: &mut crate::controller::events::Reconciliation,
+    deadline: Duration,
+) -> bool {
+    let missing = confirm_fact_integrations(
+        source,
+        result.confirmed.iter_mut().chain(
+            result
+                .changes
+                .iter_mut()
+                .filter_map(|change| change.current.as_mut()),
+        ),
+        deadline,
+    );
+    for id in &missing {
+        if result.pending_ids.len() < NOTIFY_PENDING_CAPACITY && !result.pending_ids.contains(id) {
+            result.pending_ids.push(*id);
+        }
+    }
+    if !missing.is_empty() {
+        result.repair_needed = true;
+        result.attention = None;
+    }
+    missing.is_empty()
+}
+
+fn confirm_fact_integrations<'a>(
+    source: &dyn EventSource,
+    rows: impl Iterator<Item = &'a mut crate::controller::events::TaskFacts>,
+    deadline: Duration,
+) -> Vec<crate::task::TaskId> {
+    use crate::integration::contracts::{MAX_READ_TASKS, ValidateIntegration};
+    let mut rows: Vec<_> = rows.collect();
+    let ids: std::collections::BTreeSet<_> = rows
+        .iter()
+        .filter(|facts| {
+            facts.integration_notice_candidate()
+                && facts.integration_confirmation.as_ref() != facts.integration.as_ref()
+        })
+        .map(|facts| facts.task_id)
+        .collect();
+    let mut snapshots = std::collections::BTreeMap::new();
+    for chunk in ids.into_iter().collect::<Vec<_>>().chunks(MAX_READ_TASKS) {
+        if let Ok(read) = source.integrations(chunk, deadline)
+            && read.validate().is_ok()
+            && read.integrations.keys().copied().collect::<Vec<_>>() == chunk
+        {
+            snapshots.extend(read.integrations);
+        }
+    }
+    let mut missing = std::collections::BTreeSet::new();
+    for facts in &mut rows {
+        if !facts.integration_notice_candidate() {
+            facts.integration_confirmation = None;
+            continue;
+        }
+        if facts.integration_confirmation.as_ref() == facts.integration.as_ref() {
+            continue;
+        }
+        facts.integration_confirmation = None;
+        let confirmed = snapshots
+            .get(&facts.task_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|snapshot| facts.confirm_integration(snapshot));
+        if !confirmed {
+            missing.insert(facts.task_id);
+        }
+    }
+    missing.into_iter().collect()
 }
 
 fn load_baseline(
@@ -394,8 +477,97 @@ struct StagingSource<'a> {
     journal_available: Mutex<Option<bool>>,
     unsupported: AtomicBool,
     fault: Mutex<Option<WorkerError>>,
+    // Current enabled attention keys only, never snapshots/titles or persisted projections.
+    integration_attention: Mutex<std::collections::BTreeMap<crate::task::TaskId, String>>,
 }
 impl StagingSource<'_> {
+    fn observe_integration_facts<'a>(
+        &self,
+        rows: impl Iterator<Item = &'a crate::controller::events::TaskFacts>,
+    ) -> Result<(), WorkerError> {
+        let mut keys = self.integration_attention.lock().unwrap();
+        for facts in rows {
+            if facts.integration_notice_candidate()
+                && facts.integration_confirmation.as_ref() != facts.integration.as_ref()
+            {
+                continue;
+            }
+            if let Some(key) = super::cache::confirmed_integration_attention_key(facts) {
+                if keys.len() >= crate::controller::events::REPAIR_MAX_DIRECTORY_ENTRIES
+                    && !keys.contains_key(&facts.task_id)
+                {
+                    return Err(WorkerError::Unavailable("CONTROLLER_EVENTS_REPAIR_REGISTRY_TOO_LARGE: integration attention registry too large".into()));
+                }
+                keys.insert(facts.task_id, key);
+            } else {
+                keys.remove(&facts.task_id);
+            }
+        }
+        Ok(())
+    }
+    fn compose_integration_attention(
+        &self,
+        result: &mut crate::controller::events::Reconciliation,
+    ) -> Result<(), WorkerError> {
+        self.observe_integration_facts(
+            result.confirmed.iter().chain(
+                result
+                    .changes
+                    .iter()
+                    .filter_map(|change| change.current.as_ref()),
+            ),
+        )?;
+        let mut keys = self.integration_attention.lock().unwrap();
+        for change in &result.changes {
+            if change.current.is_none() {
+                keys.remove(&change.task_id);
+            }
+        }
+        if let Some(summary) = &mut result.attention
+            && !keys.is_empty()
+        {
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
+            hash.update(b"mac-worker/integration-attention/v1\0");
+            hash.update(summary.fingerprint.as_bytes());
+            hash.update((summary.count as u64).to_be_bytes());
+            for (id, key) in keys.iter() {
+                hash.update(id.to_string().as_bytes());
+                hash.update(key.as_bytes());
+            }
+            summary.fingerprint = format!("{:x}", hash.finalize());
+        }
+        Ok(())
+    }
+    fn confirm_read_facts(
+        &self,
+        rows: &mut [crate::controller::events::TaskFacts],
+        deadline: Duration,
+    ) -> Result<(), WorkerError> {
+        let missing = confirm_fact_integrations(self.inner, rows.iter_mut(), deadline);
+        if !missing.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            state.repair_needed = true;
+            for id in missing {
+                if state.pending.len() < NOTIFY_PENDING_CAPACITY
+                    && !state
+                        .pending
+                        .iter()
+                        .any(|candidate| candidate.task_id == id)
+                {
+                    state.pending.push(PendingCandidate {
+                        task_id: id,
+                        turn_id: None,
+                    });
+                }
+            }
+            if let Err(error) = self.cache.save(&state) {
+                *self.fault.lock().unwrap() = Some(error);
+            }
+            return Err(crate::integration::contracts::integration_unavailable());
+        }
+        self.observe_integration_facts(rows.iter())
+    }
     fn saved(&self) -> NotifyState {
         self.state.lock().unwrap().clone()
     }
@@ -417,6 +589,13 @@ impl StagingSource<'_> {
     }
 }
 impl EventSource for StagingSource<'_> {
+    fn integrations(
+        &self,
+        task_ids: &[crate::task::TaskId],
+        deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        self.inner.integrations(task_ids, deadline)
+    }
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
         self.inner.discover(deadline)
     }
@@ -471,14 +650,27 @@ impl EventSource for StagingSource<'_> {
         query: TaskAddressQuery,
         deadline: Duration,
     ) -> Result<TaskFactsBatch, WorkerError> {
-        self.support(self.inner.tasks(query, deadline))
+        let mut facts = self.support(self.inner.tasks(query, deadline))?;
+        facts.validate()?;
+        self.confirm_read_facts(&mut facts.rows, deadline)?;
+        let mut keys = self.integration_attention.lock().unwrap();
+        for id in &facts.missing {
+            keys.remove(id);
+        }
+        Ok(facts)
     }
     fn repair(
         &self,
         query: TaskRepairQuery,
         deadline: Duration,
     ) -> Result<TaskRepairPage, WorkerError> {
-        self.support(self.inner.repair(query, deadline))
+        if query.after.is_none() {
+            self.integration_attention.lock().unwrap().clear();
+        }
+        let mut page = self.support(self.inner.repair(query, deadline))?;
+        page.validate()?;
+        self.confirm_read_facts(&mut page.rows, deadline)?;
+        Ok(page)
     }
 }
 
@@ -739,6 +931,361 @@ mod tests {
             .unwrap();
             (exit, String::from_utf8(diagnostics).unwrap())
         }
+    }
+
+    #[test]
+    fn integration_lost_hints_confirm_through_companion_and_restart_without_replay() {
+        use crate::integration::{contracts::*, testing::*};
+        for state in [
+            IntegrationStatus::Armed,
+            IntegrationStatus::Integrated,
+            IntegrationStatus::Blocked,
+        ] {
+            let mut h = Fixture::new();
+            let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+            snapshot.state = state;
+            snapshot.epoch = 1;
+            let outcome = if state == IntegrationStatus::Armed {
+                SafeOutcome::NeedsInput
+            } else if state == IntegrationStatus::Integrated {
+                snapshot.disposition = Some(IntegrationDisposition::Merged);
+                snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+                SafeOutcome::Done
+            } else {
+                snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+                SafeOutcome::Blocked
+            };
+            let mut current = facts(outcome);
+            current.integration = Some(snapshot.annotation().unwrap());
+            current.code = snapshot
+                .blocked_code
+                .map(|code| crate::controller::events::SafeCode::from_public_code(code.as_str()));
+            let mut result = fresh();
+            result.changes[0].current = Some(current.clone());
+            result.changes[0].cause = ChangeCause::RepairDifference;
+            result.confirmed = vec![current.clone()];
+            result.repair = RepairProgress::Complete;
+            h.supported();
+            h.source
+                .queue_integrations(Ok(IntegrationReadResult {
+                    schema_version: 1,
+                    integrations: [(current.task_id, Some(snapshot.clone()))].into(),
+                }))
+                .unwrap();
+            h.reconciler.queue(Ok(result)).unwrap();
+            assert_eq!(
+                h.run(NotifyOptions::default(), None).0,
+                NotifyExit::Complete
+            );
+            assert_eq!(h.channel.records().len(), 1, "{state:?}");
+            assert!(
+                h.source.requests().is_empty(),
+                "lost hint is repaired from facts, with no journal read"
+            );
+            h.supported();
+            h.source
+                .queue_integrations(Ok(IntegrationReadResult {
+                    schema_version: 1,
+                    integrations: [(current.task_id, Some(snapshot))].into(),
+                }))
+                .unwrap();
+            h.reconciler
+                .queue(Ok(Reconciliation::test_cold(
+                    Some(cursor(6)),
+                    vec![current],
+                )))
+                .unwrap();
+            assert_eq!(
+                h.run(NotifyOptions::default(), None).0,
+                NotifyExit::Complete
+            );
+            assert_eq!(h.channel.records().len(), 1);
+        }
+    }
+
+    #[test]
+    fn integration_attention_is_complete_across_pages_and_epoch_bound_after_restart() {
+        use crate::integration::{contracts::*, testing::*};
+        let mut h = Fixture::new();
+        let mut snapshots: Vec<_> = [fixture_task(), TaskId::new(uuid::Uuid::from_u128(99))]
+            .into_iter()
+            .map(|id| {
+                let mut snapshot = sample_record(id, fixture_source(), "main").snapshot;
+                snapshot.state = IntegrationStatus::Blocked;
+                snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+                (id, snapshot)
+            })
+            .collect();
+        let mut first_fingerprint = None;
+        for round in 0..3 {
+            h.supported();
+            if round == 1 {
+                snapshots.reverse();
+            }
+            if round == 2 {
+                snapshots[0].1.epoch += 1;
+            }
+            for (index, (id, snapshot)) in snapshots.iter().enumerate() {
+                let mut current = facts(SafeOutcome::Blocked);
+                current.task_id = *id;
+                current.integration = Some(snapshot.annotation().unwrap());
+                current.code = Some(crate::controller::events::SafeCode::from_public_code(
+                    "INTEGRATION_CHECKS_FAILED",
+                ));
+                h.source
+                    .queue_integrations(Ok(IntegrationReadResult {
+                        schema_version: 1,
+                        integrations: [(*id, Some(snapshot.clone()))].into(),
+                    }))
+                    .unwrap();
+                let mut result = Reconciliation::test_cold(Some(cursor(6)), vec![current]);
+                if index == 0 {
+                    result.repair = RepairProgress::InProgress;
+                    result.repair_needed = true;
+                } else {
+                    result.attention = Some(AttentionSummary {
+                        count: 2,
+                        fingerprint: "a".repeat(64),
+                    });
+                }
+                h.reconciler.queue(Ok(result)).unwrap();
+            }
+            assert_eq!(
+                h.run(NotifyOptions::default(), None).0,
+                NotifyExit::Complete
+            );
+            let notices = h.channel.records();
+            assert_eq!(notices.len(), if round == 2 { 2 } else { 1 });
+            assert_eq!(notices.last().unwrap().0.body, "2 tasks");
+            assert_eq!(
+                notices.last().unwrap().0.sound,
+                crate::controller::events::NoticeSound::Request
+            );
+            let fingerprint = h.cache.load().unwrap().attention_overflow;
+            if round == 0 {
+                first_fingerprint = fingerprint;
+            } else if round == 1 {
+                assert_eq!(fingerprint, first_fingerprint);
+            } else {
+                assert_ne!(fingerprint, first_fingerprint);
+            }
+        }
+    }
+
+    #[test]
+    fn integration_terminal_dependency_error_requires_companion_and_requests_attention() {
+        use crate::integration::{contracts::*, testing::*};
+        let mut h = Fixture::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Armed;
+        let mut current = facts(SafeOutcome::Blocked);
+        current.state = "abandoned".into();
+        current.latest_turn_id = None;
+        current.outcome = None;
+        current.code = Some(crate::controller::events::SafeCode::from_public_code(
+            "INTEGRATION_DEPENDENCY_NOT_INTEGRATED",
+        ));
+        current.integration = Some(snapshot.annotation().unwrap());
+        let mut result = fresh();
+        result.confirmed = vec![current.clone()];
+        result.changes[0].current = Some(current.clone());
+        result.changes[0].cause = ChangeCause::RepairDifference;
+        result.repair = RepairProgress::Complete;
+        h.supported();
+        h.source
+            .queue_integrations(Ok(IntegrationReadResult {
+                schema_version: 1,
+                integrations: [(current.task_id, Some(snapshot))].into(),
+            }))
+            .unwrap();
+        h.reconciler.queue(Ok(result)).unwrap();
+        assert_eq!(
+            h.run(NotifyOptions::default(), None).0,
+            NotifyExit::Complete
+        );
+        let notices = h.channel.records();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].0.sound,
+            crate::controller::events::NoticeSound::Request
+        );
+        assert_eq!(notices[0].0.title, "Dependency not integrated");
+    }
+
+    #[test]
+    fn integration_missing_source_companion_persists_candidate_before_failure() {
+        use crate::integration::{contracts::*, testing::*};
+        struct Reader(TaskId);
+        impl EventReconciler for Reader {
+            fn reconcile(
+                &mut self,
+                source: &dyn EventSource,
+                _: ReconcileInput,
+                deadline: Duration,
+            ) -> Result<Reconciliation, WorkerError> {
+                source.tasks(
+                    TaskAddressQuery::try_new(vec![self.0], false, None)?,
+                    deadline,
+                )?;
+                Ok(complete())
+            }
+        }
+        let h = Fixture::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        let mut current = facts(SafeOutcome::Blocked);
+        current.integration = Some(snapshot.annotation().unwrap());
+        current.code = Some(crate::controller::events::SafeCode::from_public_code(
+            "INTEGRATION_CHECKS_FAILED",
+        ));
+        h.supported();
+        h.source
+            .queue_tasks(Ok(TaskFactsBatch {
+                rows: vec![current.clone()],
+                missing: vec![],
+                proof_after: None,
+                baseline_after: None,
+            }))
+            .unwrap();
+        h.source
+            .queue_integrations(Ok(IntegrationReadResult {
+                schema_version: 1,
+                integrations: [(current.task_id, None)].into(),
+            }))
+            .unwrap();
+        let channels: Vec<Arc<dyn NoticeChannel>> = vec![h.channel.clone()];
+        let mut reader = Reader(current.task_id);
+        let exit = NotifyLoop {
+            source: &h.source,
+            reconciler: &mut reader,
+            cache: &h.cache,
+            channels: &channels,
+            options: &NotifyOptions::default(),
+            runtime: h.runtime.clone(),
+            stop_at: None,
+        }
+        .run(&mut Vec::new())
+        .unwrap();
+        assert_eq!(exit, NotifyExit::Incomplete);
+        assert!(h.channel.records().is_empty());
+        let saved = h.cache.load().unwrap();
+        assert!(saved.repair_needed);
+        assert!(
+            saved
+                .pending
+                .iter()
+                .any(|candidate| candidate.task_id == current.task_id)
+        );
+        assert!(saved.decisions.is_empty());
+    }
+
+    #[test]
+    fn integration_summary_confirms_source_rows_even_when_reconciler_does_not_yield_them() {
+        use crate::integration::{contracts::*, testing::*};
+        struct Reader;
+        impl EventReconciler for Reader {
+            fn reconcile(
+                &mut self,
+                source: &dyn EventSource,
+                _: ReconcileInput,
+                deadline: Duration,
+            ) -> Result<Reconciliation, WorkerError> {
+                source.repair(TaskRepairQuery::default(), deadline)?;
+                let mut result = complete();
+                result.attention = Some(AttentionSummary {
+                    count: 1,
+                    fingerprint: "a".repeat(64),
+                });
+                Ok(result)
+            }
+        }
+        let h = Fixture::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        let mut reader = Reader;
+        for epoch in [1, 2] {
+            snapshot.epoch = epoch;
+            let mut current = facts(SafeOutcome::Blocked);
+            current.integration = Some(snapshot.annotation().unwrap());
+            current.code = Some(crate::controller::events::SafeCode::from_public_code(
+                "INTEGRATION_CHECKS_FAILED",
+            ));
+            h.supported();
+            h.source
+                .queue_repair(Ok(TaskRepairPage {
+                    rows: vec![current.clone()],
+                    next: None,
+                    complete: true,
+                    restart: false,
+                    baseline_after: None,
+                }))
+                .unwrap();
+            h.source
+                .queue_integrations(Ok(IntegrationReadResult {
+                    schema_version: 1,
+                    integrations: [(current.task_id, Some(snapshot.clone()))].into(),
+                }))
+                .unwrap();
+            let channels: Vec<Arc<dyn NoticeChannel>> = vec![h.channel.clone()];
+            assert_eq!(
+                NotifyLoop {
+                    source: &h.source,
+                    reconciler: &mut reader,
+                    cache: &h.cache,
+                    channels: &channels,
+                    options: &NotifyOptions::default(),
+                    runtime: h.runtime.clone(),
+                    stop_at: None,
+                }
+                .run(&mut Vec::new())
+                .unwrap(),
+                NotifyExit::Complete
+            );
+            assert_eq!(h.channel.records().len(), epoch as usize);
+        }
+    }
+
+    #[test]
+    fn integration_changed_companion_defers_notice_and_keeps_durable_candidate() {
+        use crate::integration::{contracts::*, testing::*};
+        let mut h = Fixture::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        let mut current = facts(SafeOutcome::Blocked);
+        current.integration = Some(snapshot.annotation().unwrap());
+        current.code = Some(crate::controller::events::SafeCode::from_public_code(
+            "INTEGRATION_CHECKS_FAILED",
+        ));
+        let mut result = fresh();
+        result.changes[0].current = Some(current.clone());
+        result.changes[0].cause = ChangeCause::RepairDifference;
+        result.confirmed = vec![current.clone()];
+        result.repair = RepairProgress::Complete;
+        snapshot.revision = snapshot.revision.next().unwrap();
+        h.supported();
+        h.source
+            .queue_integrations(Ok(IntegrationReadResult {
+                schema_version: 1,
+                integrations: [(current.task_id, Some(snapshot))].into(),
+            }))
+            .unwrap();
+        h.reconciler.queue(Ok(result)).unwrap();
+        let (exit, diagnostics) = h.run(NotifyOptions::default(), Some(Duration::from_secs(1)));
+        assert_eq!(exit, NotifyExit::Incomplete);
+        assert!(diagnostics.contains("confirmation unavailable or changed"));
+        assert!(h.channel.records().is_empty());
+        assert!(
+            h.cache
+                .load()
+                .unwrap()
+                .pending
+                .iter()
+                .any(|candidate| candidate.task_id == current.task_id)
+        );
+        assert!(h.cache.load().unwrap().decisions.is_empty());
     }
 
     #[test]

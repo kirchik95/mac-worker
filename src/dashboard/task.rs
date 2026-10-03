@@ -30,6 +30,125 @@ use crate::{
 
 pub const MAX_TASK_LOG_LIMIT: u32 = 65_536;
 
+/// Owner/controller adapter. Reads return durable snapshots; redrive publishes intent.
+pub trait DashboardIntegrationSource: Send + Sync + 'static {
+    fn revoke(
+        &self,
+        _task_id: TaskId,
+        _expected: crate::integration::contracts::IntegrationRevision,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        Err(crate::integration::contracts::integration_unavailable())
+    }
+    fn snapshot(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError>;
+    fn redrive(
+        &self,
+        request: &crate::integration::contracts::IntegrationRedriveRequest,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError>;
+}
+
+/// Adapter over T1's owner/controller boundary. Redrive publishes the durable epoch;
+/// phase execution belongs to the owner runner, never the HTTP handler.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub struct OwnerDashboardIntegrations {
+    pub state: Arc<dyn crate::integration::contracts::IntegrationState>,
+    pub host: Arc<dyn crate::integration::contracts::IntegrationHost>,
+    pub turns: Arc<dyn crate::integration::contracts::IntegrationTurns>,
+    pub runtime: Arc<dyn crate::integration::contracts::IntegrationRuntime>,
+    pub observer: Arc<dyn crate::integration::contracts::IntegrationObserver>,
+}
+impl DashboardIntegrationSource for OwnerDashboardIntegrations {
+    fn revoke(
+        &self,
+        task_id: TaskId,
+        expected: crate::integration::contracts::IntegrationRevision,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        let coordinator = crate::integration::coordinator::IntegrationCoordinator::new(
+            self.state.as_ref(),
+            self.host.as_ref(),
+            self.turns.as_ref(),
+            self.runtime.as_ref(),
+            self.observer.as_ref(),
+        );
+        coordinator.revoke(task_id, expected)
+    }
+    fn snapshot(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError> {
+        let read = crate::controller::integration::serve_integration_read(
+            self.state.as_ref(),
+            &[task_id],
+        )?;
+        read.integrations
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(crate::integration::contracts::integration_unavailable)
+    }
+    fn redrive(
+        &self,
+        request: &crate::integration::contracts::IntegrationRedriveRequest,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        let request = crate::controller::integration::prepare_integration_redrive(request)?;
+        let coordinator = crate::integration::coordinator::IntegrationCoordinator::new(
+            self.state.as_ref(),
+            self.host.as_ref(),
+            self.turns.as_ref(),
+            self.runtime.as_ref(),
+            self.observer.as_ref(),
+        );
+        crate::controller::integration::execute_integration_redrive(&coordinator, &request)
+    }
+}
+
+fn attach_detail_integration(
+    detail: TaskDetailProjection,
+    record: &LocalTaskRecord,
+    runner: bool,
+    source: Option<&dyn DashboardIntegrationSource>,
+) -> Result<TaskDetailProjection, ApiError> {
+    let Some(source) = source else {
+        return Ok(detail);
+    };
+    let snapshot = source
+        .snapshot(record.meta().task_id())
+        .map_err(map_mutation_error)?;
+    let facts = crate::integration::contracts::IntegrationTaskFacts::from_record(record, runner);
+    detail
+        .with_integration(snapshot.as_ref(), &facts)
+        .map_err(map_mutation_error)
+}
+
+fn attach_list_integrations(
+    projection: &mut crate::task_view::TaskListProjection,
+    records: &[LocalTaskRecord],
+    source: Option<&dyn DashboardIntegrationSource>,
+) -> Result<(), DashboardError> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    for row in &mut projection.tasks {
+        let Some(record) = records
+            .iter()
+            .find(|record| record.meta().task_id() == row.task_id)
+        else {
+            continue;
+        };
+        let snapshot = source.snapshot(row.task_id).map_err(map_local_error)?;
+        let facts = crate::integration::contracts::IntegrationTaskFacts::from_record(
+            record,
+            row.runner.is_some(),
+        );
+        *row = row
+            .clone()
+            .with_integration(snapshot.as_ref(), &facts)
+            .map_err(map_local_error)?;
+    }
+    Ok(())
+}
+
 pub trait DashboardTaskSource: Send + Sync + 'static {
     fn task_detail(&self, task_id: TaskId) -> Result<TaskDetailProjection, ApiError>;
     fn read_task_log(
@@ -46,6 +165,7 @@ pub struct MacWorkerTaskSource {
     pub config: Arc<Config>,
     pub local_tasks: Arc<ClientStateStore>,
     pub remote: Arc<dyn DashboardRemoteReader>,
+    integrations: Option<Arc<dyn DashboardIntegrationSource>>,
 }
 
 impl MacWorkerTaskSource {
@@ -58,7 +178,15 @@ impl MacWorkerTaskSource {
             config,
             local_tasks,
             remote,
+            integrations: None,
         }
+    }
+
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
+        self.integrations = Some(source);
+        self
     }
 
     fn owned_record(&self, task_id: TaskId) -> Result<LocalTaskRecord, ApiError> {
@@ -120,8 +248,14 @@ impl DashboardTaskSource for MacWorkerTaskSource {
             .runner_liveness(task_id)
             .map_err(map_local_api_error)?;
         let (view, freshness) = self.effective_task_view(&record)?;
-        project_task_detail(&view, view.status(), runner, freshness)
-            .map_err(map_task_view_api_error)
+        let detail = project_task_detail(&view, view.status(), runner, freshness)
+            .map_err(map_task_view_api_error)?;
+        attach_detail_integration(
+            detail,
+            &view,
+            runner.is_some(),
+            self.integrations.as_deref(),
+        )
     }
 
     fn read_task_log(
@@ -169,6 +303,7 @@ impl DashboardTaskSource for MacWorkerTaskSource {
 pub(crate) fn project_local_tasks(
     config: &Config,
     state: &ClientStateStore,
+    integrations: Option<&dyn DashboardIntegrationSource>,
 ) -> Result<DashboardTaskCollection, DashboardError> {
     let records = state.list_tasks().map_err(map_local_error)?;
     let runs = state.list_runs().map_err(map_local_error)?;
@@ -183,7 +318,7 @@ pub(crate) fn project_local_tasks(
         })
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(map_local_error)?;
-    let projection = project_task_list_with_blocking_codes(
+    let mut projection = project_task_list_with_blocking_codes(
         &records,
         &runs,
         &runner_states,
@@ -191,6 +326,7 @@ pub(crate) fn project_local_tasks(
         &blocking_codes,
     )
     .map_err(map_task_view_error)?;
+    attach_list_integrations(&mut projection, &records, integrations)?;
     Ok(DashboardTaskCollection {
         projection,
         errors: Vec::new(),
@@ -202,6 +338,7 @@ pub(crate) fn collect_task_projection(
     state: &ClientStateStore,
     remote: &dyn DashboardRemoteReader,
     deadline: Duration,
+    integrations: Option<&dyn DashboardIntegrationSource>,
 ) -> Result<DashboardTaskCollection, DashboardError> {
     let records = state.list_tasks().map_err(map_local_error)?;
     let runs = state.list_runs().map_err(map_local_error)?;
@@ -253,7 +390,7 @@ pub(crate) fn collect_task_projection(
         freshness.insert(task_id, task_freshness);
     }
 
-    let projection = project_task_list_with_blocking_codes(
+    let mut projection = project_task_list_with_blocking_codes(
         &effective_records,
         &runs,
         &runner_states,
@@ -261,6 +398,7 @@ pub(crate) fn collect_task_projection(
         &blocking_codes,
     )
     .map_err(map_task_view_error)?;
+    attach_list_integrations(&mut projection, &effective_records, integrations)?;
     Ok(DashboardTaskCollection { projection, errors })
 }
 
@@ -302,6 +440,10 @@ fn map_task_view_api_error(error: TaskViewError) -> ApiError {
 #[serde(deny_unknown_fields)]
 pub struct TaskMutationRequest {
     #[serde(default)]
+    pub expected_integration_id: Option<crate::integration::contracts::IntegrationId>,
+    #[serde(default)]
+    pub expected_integration_revision: Option<crate::integration::contracts::IntegrationRevision>,
+    #[serde(default)]
     pub message: Option<String>,
     pub expected_task_id: TaskId,
     pub expected_turn_id: Option<TurnId>,
@@ -311,7 +453,25 @@ pub struct TaskMutationRequest {
     pub expected_state: TaskState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIntegrationRequest {
+    pub expected: TaskMutationRequest,
+    pub expected_integration_id: crate::integration::contracts::IntegrationId,
+    pub integration: crate::integration::contracts::IntegrationRedriveRequest,
+}
+
 pub trait DashboardTaskMutationSource: Send + Sync + 'static {
+    fn integrate(
+        &self,
+        _task_id: TaskId,
+        _request: &TaskIntegrationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        Err(ApiError::new(
+            "INTEGRATION_UNAVAILABLE",
+            "integration support is unavailable",
+        ))
+    }
     fn reply(
         &self,
         task_id: TaskId,
@@ -330,6 +490,7 @@ pub struct MacWorkerTaskMutationSource {
     paths: PathLayout,
     runner: Arc<dyn ProcessRunner>,
     executor: Arc<dyn RunnerExecutor>,
+    integrations: Option<Arc<dyn DashboardIntegrationSource>>,
     #[cfg(any(test, feature = "test-support"))]
     after_expected_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -342,9 +503,17 @@ impl MacWorkerTaskMutationSource {
             paths,
             runner: Arc::new(SystemProcessRunner),
             executor: Arc::new(DetachedRunnerExecutor),
+            integrations: None,
             #[cfg(any(test, feature = "test-support"))]
             after_expected_check: None,
         }
+    }
+
+    // The serial T6 entry-point wiring installs this adapter.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub fn with_integrations(mut self, source: Arc<dyn DashboardIntegrationSource>) -> Self {
+        self.integrations = Some(source);
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -397,6 +566,47 @@ impl MacWorkerTaskMutationSource {
                 "task changed before this action",
             ));
         }
+        if request.expected_integration_id.is_some()
+            != request.expected_integration_revision.is_some()
+        {
+            return Err(ApiError::new(
+                "TASK_REQUEST_INVALID",
+                "integration identity and revision must be paired",
+            ));
+        }
+        match (
+            &self.integrations,
+            request.expected_integration_id,
+            request.expected_integration_revision,
+        ) {
+            (Some(source), id, revision) => {
+                let snapshot = source.snapshot(task_id).map_err(map_mutation_error)?;
+                if let Some(snapshot) = &snapshot {
+                    crate::integration::contracts::ValidateIntegration::validate(snapshot)
+                        .map_err(map_mutation_error)?;
+                }
+                let matches = match (snapshot, id, revision) {
+                    (Some(snapshot), Some(id), Some(revision)) => {
+                        snapshot.integration_id == id && snapshot.revision == revision
+                    }
+                    (None, None, None) => true,
+                    _ => false,
+                };
+                if !matches {
+                    return Err(ApiError::new(
+                        "TASK_REVISION_CONFLICT",
+                        "integration changed before this action",
+                    ));
+                }
+            }
+            (None, Some(_), Some(_)) => {
+                return Err(ApiError::new(
+                    "INTEGRATION_UNAVAILABLE",
+                    "compatible integration owner unavailable",
+                ));
+            }
+            _ => {}
+        }
         Ok(record)
     }
 
@@ -417,8 +627,14 @@ impl MacWorkerTaskMutationSource {
             .local_tasks
             .runner_liveness(task_id)
             .map_err(map_local_api_error)?;
-        project_task_detail(&record, record.status(), runner, TaskFreshness::Current)
-            .map_err(map_task_view_api_error)
+        let detail = project_task_detail(&record, record.status(), runner, TaskFreshness::Current)
+            .map_err(map_task_view_api_error)?;
+        attach_detail_integration(
+            detail,
+            &record,
+            runner.is_some(),
+            self.integrations.as_deref(),
+        )
     }
 }
 
@@ -434,6 +650,93 @@ fn expected_status_matches(record: &LocalTaskRecord, expected: &TaskMutationRequ
 }
 
 impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
+    fn integrate(
+        &self,
+        task_id: TaskId,
+        request: &TaskIntegrationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
+        let mut ordinary_expected = request.expected.clone();
+        if ordinary_expected
+            .expected_integration_id
+            .is_some_and(|id| id != request.expected_integration_id)
+            || ordinary_expected
+                .expected_integration_revision
+                .is_some_and(|revision| revision != request.integration.expected)
+        {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "integration changed before this action",
+            ));
+        }
+        ordinary_expected.expected_integration_id = Some(request.expected_integration_id);
+        ordinary_expected.expected_integration_revision = Some(request.integration.expected);
+        let expected = self.load_matching(task_id, &ordinary_expected)?;
+        request.integration.validate().map_err(|_| {
+            ApiError::new(
+                "TASK_REQUEST_INVALID",
+                "invalid integration re-drive identity",
+            )
+        })?;
+        if request.integration.task_id != task_id {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "task changed before this action",
+            ));
+        }
+        let source = self.integrations.as_ref().ok_or_else(|| {
+            ApiError::new(
+                "INTEGRATION_UNAVAILABLE",
+                "compatible integration owner unavailable",
+            )
+        })?;
+        let snapshot = source
+            .snapshot(task_id)
+            .map_err(map_mutation_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "TASK_REVISION_CONFLICT",
+                    "integration changed before this action",
+                )
+            })?;
+        snapshot.validate().map_err(map_mutation_error)?;
+        if snapshot.integration_id != request.expected_integration_id
+            || snapshot.revision != request.integration.expected
+        {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "integration changed before this action",
+            ));
+        }
+        if expected.status().state() != TaskState::Open {
+            return Err(ApiError::new(
+                "TASK_CLOSED",
+                "terminal task cannot be re-driven",
+            ));
+        }
+        if snapshot.state != IntegrationStatus::Integrated {
+            if snapshot.state != IntegrationStatus::Blocked {
+                return Err(ApiError::new(
+                    "TASK_BUSY",
+                    "integration is already in progress",
+                ));
+            }
+            let next = source
+                .redrive(&request.integration)
+                .map_err(map_mutation_error)?;
+            next.validate().map_err(map_mutation_error)?;
+            if next.integration_id != snapshot.integration_id
+                || next.epoch <= snapshot.epoch
+                || next.revision <= snapshot.revision
+            {
+                return Err(ApiError::new(
+                    "INTEGRATION_STATE_INVALID",
+                    "re-drive returned a different integration binding",
+                ));
+            }
+        }
+        self.project(task_id)
+    }
     fn reply(
         &self,
         task_id: TaskId,
@@ -465,6 +768,31 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         let expected = self.load_matching(task_id, request)?;
         #[cfg(any(test, feature = "test-support"))]
         self.after_expected_check();
+        if let Some(revision) = request.expected_integration_revision {
+            let source = self.integrations.as_ref().ok_or_else(|| {
+                ApiError::new(
+                    "INTEGRATION_UNAVAILABLE",
+                    "compatible integration owner unavailable",
+                )
+            })?;
+            let stopped = source
+                .revoke(task_id, revision)
+                .map_err(map_mutation_error)?;
+            crate::integration::contracts::ValidateIntegration::validate(&stopped)
+                .map_err(map_mutation_error)?;
+            if Some(stopped.integration_id) != request.expected_integration_id
+                || !matches!(
+                    stopped.state,
+                    crate::integration::contracts::IntegrationStatus::Revoked
+                        | crate::integration::contracts::IntegrationStatus::Integrated
+                )
+            {
+                return Err(ApiError::new(
+                    "INTEGRATION_STOP_UNCONFIRMED",
+                    "integration stop is not confirmed",
+                ));
+            }
+        }
         self.client()
             .close_from_expected(&expected, false)
             .map_err(map_mutation_error)?;

@@ -1,16 +1,33 @@
 import type { TaskRow } from '@/lib/api'
+export const blockedIntegration = (task: TaskRow) => task.integration?.state === 'blocked'
+export const integrationDependencyFailure = (task: TaskRow) =>
+  task.integration != null && task.workflow_state === 'needs_you' &&
+  task.blocking_code === 'INTEGRATION_DEPENDENCY_NOT_INTEGRATED'
+const ordinaryActions = (task: TaskRow) => !task.integration || ['armed', 'revoked'].includes(task.integration.state)
 export type TaskTone = 'neutral' | 'warning' | 'success' | 'error'
 export const needsAnswer = (task: TaskRow) =>
-  task.state === 'open' &&
+  ordinaryActions(task) && task.state === 'open' &&
   (task.review_state === 'waiting_on_you' || task.last_outcome?.kind === 'needs_input')
 export const readyForReview = (task: TaskRow) =>
-  task.state === 'open' && task.review_state === 'ready_for_review'
+  ordinaryActions(task) && task.state === 'open' && task.review_state === 'ready_for_review'
 export function taskPresentation(task: TaskRow): {
   label: string
   tone: TaskTone
   kind: string
   action: string
 } {
+  if (task.integration?.state === 'integrated')
+    return { label: 'Integrated', tone: 'success', kind: 'closed', action: 'Open task' }
+  if (blockedIntegration(task))
+    return { label: 'Integration blocked', tone: 'error', kind: 'error', action: 'Recover integration' }
+  if (integrationDependencyFailure(task))
+    return { label: 'Dependency not integrated', tone: 'error', kind: 'error', action: 'Open task' }
+  if (task.integration?.state === 'parked')
+    return { label: 'Integration paused', tone: 'neutral', kind: 'running', action: 'Open task' }
+  if (task.workflow_state === 'integrating')
+    return { label: 'Integrating', tone: 'neutral', kind: 'running', action: 'Open task' }
+  if (task.workflow_state === 'running')
+    return { label: 'Running', tone: 'neutral', kind: 'running', action: 'Open task' }
   if (task.state === 'closed')
     return { label: 'Closed', tone: 'neutral', kind: 'closed', action: 'Open task' }
   if (task.state === 'active')
@@ -33,7 +50,8 @@ export function taskPresentation(task: TaskRow): {
   return { label: 'Open', tone: 'neutral', kind: 'review', action: 'Open task' }
 }
 export const taskEventKey = (task: TaskRow) =>
-  [task.task_id, task.state, task.review_state, task.turn_count, task.updated_at_millis].join(':')
+  [task.task_id, task.state, task.review_state, task.turn_count, task.updated_at_millis,
+    ...(task.integration ? [task.integration.integration_id, task.integration.epoch, task.integration.revision, task.integration.state] : [])].join(':')
 
 /** Both admitted and parked task rows can report missing capabilities. */
 export function setupAgent(task: TaskRow): string | null {
@@ -48,6 +66,9 @@ export function setupAgent(task: TaskRow): string | null {
   return agents.includes(task.agent) ? task.agent : (agents[0] ?? null)
 }
 export function waitingReason(task: TaskRow): string {
+  const integration = task.integration
+  if (integration?.state === 'parked') return `Integration paused: ${integration.pause_reason}; resume ${integration.resume_state}`
+  if (integration && !['armed', 'revoked'].includes(integration.state)) return integration.blocked_code ?? `Integration ${integration.state} into ${integration.target}`
   const code = task.blocking_code
   if (!code) return task.state === 'active' ? 'Agent turn in progress' : 'Open the task for details'
   if (code === 'RUN_MAX_PARALLEL') return 'Run concurrency limit reached'
