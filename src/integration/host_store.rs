@@ -77,6 +77,21 @@ impl<'a> HostIntegrationStore<'a> {
         }
         Ok(Some(proof))
     }
+    /// Ordinary status is the durable source succession fence. Preparations
+    /// survive epoch changes, so auxiliary completions cannot retire a source.
+    pub(crate) fn latest_ordinary_source(
+        &self,
+        project: &str,
+        task: TaskId,
+        status: &crate::task::TaskStatus,
+    ) -> Result<Option<crate::task::TurnId>, WorkerError> {
+        for turn in status.turns().iter().rev() {
+            if self.prepared(project, task, turn.turn_id())?.is_none() {
+                return Ok(Some(turn.turn_id()));
+            }
+        }
+        Ok(None)
+    }
     pub(crate) fn save_revoke_evidence(
         &self,
         project: &str,

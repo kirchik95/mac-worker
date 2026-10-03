@@ -160,17 +160,9 @@ impl<'a> HostIntegrationService<'a> {
             HostIntegrationAction::Revoke { tombstone } => {
                 let retained = sidecars.load(&policy.project_id, request.task_id)?;
                 let status = task_store.load_status(&policy.project_id, request.task_id)?;
-                let mut source = None;
-                for turn in status.turns().iter().rev() {
-                    if sidecars
-                        .prepared(&policy.project_id, request.task_id, turn.turn_id())?
-                        .is_none()
-                    {
-                        source = Some(turn.turn_id());
-                        break;
-                    }
-                }
-                let source = source.ok_or_else(invalid)?;
+                let source = sidecars
+                    .latest_ordinary_source(&policy.project_id, request.task_id, &status)?
+                    .ok_or_else(invalid)?;
                 let retained_identity = retained.as_ref().is_some_and(|record| {
                     Some(record.snapshot.integration_id) == request.integration_id
                 });
@@ -321,6 +313,18 @@ impl<'a> HostIntegrationService<'a> {
                 }
                 if status.head_oid() != Some(&record.snapshot.source_head)
                     && *step != IntegrationStep::Repair
+                {
+                    return Err(invalid());
+                }
+                // A later ordinary turn durably retires all preceding source
+                // identities, including no-change turns with the same head.
+                // Repair keeps its retained-receipt observation authority.
+                if *step != IntegrationStep::Repair
+                    && sidecars.latest_ordinary_source(
+                        &policy.project_id,
+                        request.task_id,
+                        &status,
+                    )? != Some(record.snapshot.source_turn_id)
                 {
                     return Err(invalid());
                 }

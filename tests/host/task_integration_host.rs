@@ -2371,3 +2371,145 @@ fn all_rpc_codecs_enforce_the_exact_raw_frame_limit() {
     assert!(decode_host_response(&bytes).is_err());
     assert!(decode_host_request(&bytes).is_err());
 }
+
+#[test]
+fn prephase_revoke_rejects_other_ids_and_sources_and_survives_gc_replay() {
+    use mac_worker::test_support::{
+        host::job::JobId,
+        task::model::{TaskOutcome, TurnSummary, TurnTerminal},
+    };
+    let mut f = GitIntegrationFixture::new();
+    let origin = f.commit_base();
+    f.commit_task();
+    let mut arm = request(
+        &f,
+        HostIntegrationAction::Arm {
+            policy: f.record.policy.clone(),
+        },
+    );
+    arm.integration_id = None;
+    arm.revision = IntegrationRevision(0);
+    execute(&f, &arm).unwrap();
+    let stop = request(
+        &f,
+        HostIntegrationAction::Revoke {
+            tombstone: IntegrationTombstone {
+                epoch: 0,
+                revision: f.record.snapshot.revision,
+                requested_at_millis: 1002,
+                acknowledged: false,
+            },
+        },
+    );
+    execute(&f, &stop).unwrap();
+    let task_dir = f
+        .store
+        .task_dir(&f.record.policy.project_id, f.record.task_id)
+        .unwrap();
+    let proof = task_dir.join("integration/revoke.json");
+    let before = std::fs::read(&proof).unwrap();
+    let mut wrong_id = stop.clone();
+    wrong_id.integration_id = Some(
+        IntegrationId::derive(
+            f.record.task_id,
+            fixture_source(),
+            &fixture_head(),
+            &f.record.target_key,
+        )
+        .unwrap(),
+    );
+    assert_ne!(wrong_id.integration_id, stop.integration_id);
+    assert_eq!(
+        execute(&f, &wrong_id).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(std::fs::read(&proof).unwrap(), before);
+    let mut status = serde_json::to_value(
+        f.store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap(),
+    )
+    .unwrap();
+    let next_source = JobId::new(uuid::Uuid::from_u128(222));
+    status["turns"].as_array_mut().unwrap().push(
+        serde_json::to_value(TurnSummary::new(
+            2,
+            next_source,
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(false),
+            false,
+            Some(1003),
+            Some(1004),
+        ))
+        .unwrap(),
+    );
+    let status: TaskStatus = serde_json::from_value(status).unwrap();
+    std::fs::write(
+        task_dir.join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let mut next_stop = stop.clone();
+    next_stop.integration_id = Some(
+        IntegrationId::derive(
+            f.record.task_id,
+            next_source,
+            status.head_oid().unwrap(),
+            &f.record.target_key,
+        )
+        .unwrap(),
+    );
+    execute(&f, &next_stop).unwrap();
+    let next_proof = std::fs::read(&proof).unwrap();
+    assert_eq!(
+        execute(&f, &stop).unwrap_err().public_code(),
+        "INTEGRATION_STATE_INVALID"
+    );
+    assert_eq!(std::fs::read(&proof).unwrap(), next_proof);
+    HostGc::new(&f.store, &SystemProcessRunner)
+        .apply_at(1001 + TASK_RETENTION_MILLIS + 1)
+        .unwrap();
+    execute(&f, &next_stop).unwrap();
+    assert_eq!(std::fs::read(&proof).unwrap(), next_proof);
+    let reopened = mac_worker::test_support::host::store::HostStore::open(f.store.root()).unwrap();
+    let late =
+        HostIntegrationService::new(&reopened, &SystemProcessRunner, &f.runtime).execute(&request(
+            &f,
+            HostIntegrationAction::Step {
+                step: IntegrationStep::Prepare,
+                record: Box::new(f.record.clone()),
+            },
+        ));
+    eprintln!("delayed revoked source Prepare after replacement proof and GC: {late:?}");
+    if late.is_ok() {
+        f.record = HostIntegrationStore::new(&f.store)
+            .load(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .unwrap();
+        f.push();
+    }
+    eprintln!(
+        "origin before stopped-cycle replay: {origin}; origin afterward: {}",
+        f.origin_tip()
+    );
+    assert_eq!(
+        f.origin_tip(),
+        origin,
+        "a later source's stop proof erased the earlier acknowledged fence and allowed its push"
+    );
+    assert_eq!(late.unwrap_err().public_code(), "INTEGRATION_STATE_INVALID");
+    legacy_close(&f);
+    HostGc::new(&f.store, &SystemProcessRunner)
+        .apply_at(1001 + TASK_RETENTION_MILLIS * 2 + 10000)
+        .unwrap();
+    assert!(
+        !task_dir.exists(),
+        "closed expired task metadata survived GC"
+    );
+    assert!(execute(&f, &stop).is_err());
+    assert!(execute(&f, &next_stop).is_err());
+    assert!(f.execute(IntegrationStep::Prepare).is_err());
+    assert!(!f.workspace().exists());
+    assert_eq!(f.origin_tip(), origin);
+}
