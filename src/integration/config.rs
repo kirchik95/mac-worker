@@ -198,14 +198,16 @@ pub fn preflight_integration_base(
 ) -> Result<IntegrationBasePreflight, WorkerError> {
     use IntegrationBasePreflight::{Pass, Unknown};
     // Pure validation precedes even the advertisement. Use the existing
-    // preflight environment and bounds, not a target fetch/transfer ref.
+    // preflight bounds and integration-only hardening, not a target fetch/ref.
     let key = TargetKey::new(origin, branch.as_str())
         .map_err(|_| integration_error("TASK_CONFIG_INVALID"))?;
     let reference = format!("refs/heads/{}", key.branch.as_str());
-    let mut request = crate::git_transport::origin_ref_request(key.origin, &reference)?;
-    request
-        .environment_remove
-        .extend(["GIT_NAMESPACE".into(), "GIT_SHALLOW_FILE".into()]);
+    let advertised = crate::git_transport::origin_ref_request(key.origin, &reference)?;
+    let Ok(mut request) = super::git::hardened_read_request(runner, local_repo, advertised.args)
+    else {
+        return Ok(Unknown);
+    };
+    request.policy = advertised.policy;
     let Ok(result) = runner.run(&request) else {
         return Ok(Unknown);
     };
@@ -233,24 +235,7 @@ pub fn preflight_integration_base(
     };
 
     let run_local = |operation: Vec<std::ffi::OsString>| {
-        let mut request = crate::git_transport::git_request_with_config(
-            local_repo.path(),
-            None,
-            &[
-                ("core.hooksPath".into(), "/dev/null".into()),
-                ("core.fsmonitor".into(), "false".into()),
-            ],
-            operation,
-        );
-        request.policy.deadline = std::time::Duration::from_secs(30);
-        request
-            .environment_remove
-            .extend(["GIT_NAMESPACE".into(), "GIT_SHALLOW_FILE".into()]);
-        request.environment.extend([
-            ("GIT_NO_LAZY_FETCH".into(), "1".into()),
-            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
-            ("GIT_GRAFT_FILE".into(), "/dev/null".into()),
-        ]);
+        let request = super::git::hardened_read_request(runner, local_repo, operation)?;
         runner.run(&request)
     };
     // A negative answer in shallow/incomplete history is not a proof. Traverse
