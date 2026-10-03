@@ -320,3 +320,379 @@ fn fixture_retains_full_authoritative_branch_but_bounds_public_display() {
     assert!(record.snapshot.target.len() <= MAX_TARGET_DISPLAY_BYTES);
     assert!(record.snapshot.target.ends_with('…'));
 }
+
+pub(crate) mod driver_fixture {
+    use super::*;
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        task::model::{ClosePolicy, TaskOutcome, TaskState, TurnId, TurnSummary, TurnTerminal},
+    };
+    use std::sync::Mutex;
+    #[derive(Clone, Copy)]
+    pub enum Mode {
+        Clean,
+        Resolve,
+        Verify,
+        Offline,
+        Missing,
+        Reachable,
+    }
+    pub struct Host {
+        pub mode: Mutex<Mode>,
+        pub calls: Mutex<Vec<HostIntegrationRequest>>,
+    }
+    impl IntegrationHost for Host {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            request.validate()?;
+            self.calls.lock().unwrap().push(request.clone());
+            let identity = IntegrationResponseIdentity::for_request(request);
+            let mode = *self.mode.lock().unwrap();
+            if matches!(mode, Mode::Offline) {
+                return Err(IntegrationCode::IntegrationWorkerOffline.error());
+            }
+            if matches!(
+                request.action,
+                HostIntegrationAction::Revoke { .. } | HostIntegrationAction::Read
+            ) {
+                return Ok(HostIntegrationResponse::Revoked { identity });
+            }
+            let HostIntegrationAction::Step { step, record } = &request.action else {
+                panic!("unexpected arm");
+            };
+            if matches!(mode, Mode::Missing) {
+                return Ok(HostIntegrationResponse::TargetMoved {
+                    identity,
+                    observed_target: record.cycle_base.clone(),
+                });
+            }
+            let mut candidate = record.candidates.last().cloned().unwrap_or_else(|| {
+                let mut c = sample_candidate(record);
+                c.id.attempt = record.snapshot.attempts.max(1);
+                c.timestamp_millis = record.snapshot.updated_at_millis;
+                c.merge_oid = None;
+                if matches!(mode, Mode::Resolve) {
+                    c.tree_oid = None;
+                    c.conflict_paths = vec!["conflict.txt".into()];
+                }
+                c
+            });
+            if matches!(step, IntegrationStep::Push | IntegrationStep::Repair)
+                || matches!(mode, Mode::Reachable)
+            {
+                return Ok(HostIntegrationResponse::Integrated {
+                    identity,
+                    receipt: IntegrationReceipt {
+                        integration_id: record.snapshot.integration_id,
+                        epoch: record.snapshot.epoch,
+                        source_turn_id: record.snapshot.source_turn_id,
+                        source_head: record.snapshot.source_head.clone(),
+                        target_head: candidate.target_head,
+                        merge_oid: candidate.merge_oid.clone(),
+                        disposition: if candidate.merge_oid.is_some() {
+                            IntegrationDisposition::Merged
+                        } else {
+                            IntegrationDisposition::AlreadyIntegrated
+                        },
+                        imported: false,
+                        recorded_at_millis: 1000,
+                    },
+                });
+            }
+            if matches!(mode, Mode::Resolve | Mode::Verify)
+                && matches!(step, IntegrationStep::Fetch | IntegrationStep::Prepare)
+                && !record
+                    .auxiliaries
+                    .iter()
+                    .any(|a| a.completed && a.attempt == candidate.id.attempt)
+            {
+                return Ok(HostIntegrationResponse::NeedTurn {
+                    identity,
+                    candidate: Box::new(candidate),
+                    purpose: if matches!(mode, Mode::Resolve) {
+                        IntegrationTurnPurpose::Resolve
+                    } else {
+                        IntegrationTurnPurpose::Verify
+                    },
+                });
+            }
+            if matches!(step, IntegrationStep::AcceptTurn) {
+                candidate.tree_oid = Some("c".repeat(40).parse().unwrap());
+            }
+            if matches!(step, IntegrationStep::Build) {
+                candidate.merge_oid = Some("e".repeat(40).parse().unwrap());
+            }
+            Ok(HostIntegrationResponse::CandidateReady {
+                identity,
+                candidate: Box::new(candidate),
+            })
+        }
+    }
+    pub struct Rig {
+        pub state: MemoryIntegrationState,
+        pub host: Host,
+        pub turns: FakeIntegrationTurns,
+        pub runtime: ManualIntegrationRuntime,
+        pub observer: FakeIntegrationObserver,
+    }
+    impl Rig {
+        pub fn new(mode: Mode, close: ClosePolicy) -> Self {
+            let rig = Self {
+                state: MemoryIntegrationState::default(),
+                host: Host {
+                    mode: Mutex::new(mode),
+                    calls: Mutex::new(vec![]),
+                },
+                turns: FakeIntegrationTurns::default(),
+                runtime: ManualIntegrationRuntime::default(),
+                observer: FakeIntegrationObserver::default(),
+            };
+            let mut policy = sample_policy("main");
+            policy.requested_close = close;
+            if matches!(mode, Mode::Verify) {
+                policy.verify = VerifyPolicy::MovedTarget;
+            }
+            rig.state.publish_policy(fixture_task(), &policy).unwrap();
+            rig.observer.insert(IntegrationTaskFacts {
+                ordinary: sample_ordinary(fixture_task(), fixture_source()),
+                cycle_base: policy.base_oid.unwrap(),
+                result_imported: true,
+                session_import_complete: true,
+                continuation_pending: false,
+                runner_present: false,
+                stop_requested: false,
+                close_pending: false,
+                submission_pending: false,
+                auxiliary_purpose: None,
+            });
+            rig.coordinator()
+                .on_terminal(fixture_task(), fixture_source())
+                .unwrap();
+            rig
+        }
+        pub fn coordinator(&self) -> IntegrationCoordinator<'_> {
+            IntegrationCoordinator::new(
+                &self.state,
+                &self.host,
+                &self.turns,
+                &self.runtime,
+                &self.observer,
+            )
+        }
+        pub fn record(&self) -> IntegrationRecord {
+            self.state.load(fixture_task()).unwrap().unwrap()
+        }
+        pub fn drive(&self) -> IntegrationSnapshot {
+            self.coordinator().drive_once(fixture_task()).unwrap()
+        }
+        pub fn queued(&self) -> TurnId {
+            for _ in 0..8 {
+                self.drive();
+                if let Some(a) = self.record().auxiliaries.last()
+                    && self.turns.queue_position(a.turn_id).is_some()
+                {
+                    return a.turn_id;
+                }
+            }
+            panic!("auxiliary was not queued");
+        }
+        pub fn complete(
+            &self,
+            turn: TurnId,
+            outcome: TaskOutcome,
+            checks: Vec<mac_worker::test_support::agents::agent::ReportedCheck>,
+        ) {
+            let position = self.turns.queue_position(turn).unwrap();
+            self.turns
+                .set_observation(IntegrationTurnObservation {
+                    turn_id: turn,
+                    queue_position: Some(position),
+                    accepted: true,
+                    completed: true,
+                })
+                .unwrap();
+            let mut facts = self.observer.facts(fixture_task()).unwrap();
+            let old = facts.ordinary.status();
+            let status = mac_worker::test_support::task::model::TaskStatus::new(
+                TaskState::Open,
+                Some(outcome.clone()),
+                old.worker().map(str::to_owned),
+                true,
+                old.head_oid().cloned(),
+                Some("auxiliary result".into()),
+                vec![],
+                vec![],
+                None,
+                old.turns()
+                    .iter()
+                    .cloned()
+                    .chain([TurnSummary::new(
+                        2,
+                        turn,
+                        Some(TurnTerminal::Succeeded),
+                        Some(outcome),
+                        Some(false),
+                        false,
+                        Some(1000),
+                        Some(self.runtime.now_millis()),
+                    )])
+                    .collect(),
+                self.runtime.now_millis(),
+            )
+            .unwrap()
+            .with_reported_checks(checks)
+            .unwrap();
+            facts.ordinary = facts.ordinary.with_status(status).unwrap();
+            facts.auxiliary_purpose = Some(IntegrationTurnPurpose::Resolve);
+            self.observer.insert(facts);
+        }
+    }
+}
+
+#[test]
+fn clean_driver_pins_before_push_imports_once_and_replays_requested_close() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    for close in [ClosePolicy::Done, ClosePolicy::Never] {
+        let rig = Rig::new(Mode::Clean, close);
+        let mut snapshot = rig.record().snapshot;
+        for _ in 0..12 {
+            snapshot = rig.drive();
+            if snapshot.state == IntegrationStatus::Integrated {
+                break;
+            }
+        }
+        assert_eq!(snapshot.state, IntegrationStatus::Integrated);
+        assert_eq!(rig.turns.imports(fixture_task()).len(), 1);
+        assert_eq!(
+            rig.turns.closes(fixture_task()).len(),
+            usize::from(close == ClosePolicy::Done)
+        );
+        for _ in 0..3 {
+            assert_eq!(rig.drive(), snapshot);
+        }
+        let calls = rig.host.calls.lock().unwrap();
+        let pushes: Vec<_> = calls
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    HostIntegrationAction::Step {
+                        step: IntegrationStep::Push,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(pushes.len(), 1);
+        let HostIntegrationAction::Step { record, .. } = &pushes[0].action else {
+            unreachable!()
+        };
+        assert!(record.push_intent.as_ref().unwrap().uncertain);
+        assert!(record.candidates.last().unwrap().merge_oid.is_some());
+        assert_eq!(snapshot.attempts, 1);
+    }
+}
+
+#[test]
+fn offline_phase_has_three_durable_delays_then_exhausts_without_sleep() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    let rig = Rig::new(Mode::Offline, ClosePolicy::Never);
+    for delay in [2000, 10000, 30000] {
+        let snapshot = rig.drive();
+        assert_eq!(snapshot.state, IntegrationStatus::RetryWait);
+        assert_eq!(
+            snapshot.retry_at_millis,
+            Some(rig.runtime.now_millis() + delay)
+        );
+        rig.runtime.advance(std::time::Duration::from_millis(delay));
+        rig.runtime.restart();
+    }
+    let snapshot = rig.drive();
+    assert_eq!(snapshot.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        snapshot.blocked_code,
+        Some(IntegrationCode::IntegrationWorkerOffline)
+    );
+    assert!(snapshot.retry_exhausted);
+    assert_eq!(rig.host.calls.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn uncertain_revoke_stays_nonterminal_and_reuses_the_same_tombstone() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    let rig = Rig::new(Mode::Offline, ClosePolicy::Never);
+    let revision = rig.record().snapshot.revision;
+    assert_eq!(
+        rig.coordinator()
+            .revoke(fixture_task(), revision)
+            .unwrap_err()
+            .public_code(),
+        "INTEGRATION_STOP_UNCONFIRMED"
+    );
+    let tombstone = rig.record().tombstone.unwrap();
+    assert!(!tombstone.acknowledged);
+    *rig.host.mode.lock().unwrap() = Mode::Clean;
+    let snapshot = rig
+        .coordinator()
+        .revoke(fixture_task(), rig.record().snapshot.revision)
+        .unwrap();
+    assert_eq!(snapshot.state, IntegrationStatus::Revoked);
+    assert_eq!(
+        rig.record().tombstone.unwrap().requested_at_millis,
+        tombstone.requested_at_millis
+    );
+    let count = rig.host.calls.lock().unwrap().len();
+    rig.drive();
+    assert_eq!(rig.host.calls.lock().unwrap().len(), count);
+}
+
+#[test]
+fn legacy_closed_only_observes_and_settles_retained_ancestry() {
+    use driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    for (mode, want) in [
+        (Mode::Reachable, IntegrationStatus::Integrated),
+        (Mode::Missing, IntegrationStatus::Blocked),
+    ] {
+        let rig = Rig::new(mode, ClosePolicy::Never);
+        let mut facts = rig.observer.facts(fixture_task()).unwrap();
+        let mut wire = serde_json::to_value(facts.ordinary.status()).unwrap();
+        wire["state"] = "closed".into();
+        facts.ordinary = facts
+            .ordinary
+            .with_status(serde_json::from_value(wire).unwrap())
+            .unwrap();
+        rig.observer.insert(facts);
+        rig.runtime
+            .set_drive_gate(Some(IntegrationPauseReason::HelperUnavailable));
+        let snapshot = rig.drive();
+        assert_eq!(snapshot.state, want);
+        if want == IntegrationStatus::Blocked {
+            assert_eq!(
+                snapshot.blocked_code,
+                Some(IntegrationCode::IntegrationWorkspaceMissing)
+            );
+        }
+        assert_eq!(
+            rig.observer
+                .facts(fixture_task())
+                .unwrap()
+                .ordinary
+                .status()
+                .state(),
+            mac_worker::test_support::task::model::TaskState::Closed
+        );
+        assert!(rig.host.calls.lock().unwrap().iter().all(|r| matches!(
+            r.action,
+            HostIntegrationAction::Step {
+                step: IntegrationStep::Fetch | IntegrationStep::Repair,
+                ..
+            }
+        )));
+    }
+}
