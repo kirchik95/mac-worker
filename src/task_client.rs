@@ -7260,7 +7260,15 @@ pub(crate) fn freeze_spec(
     state: &ProjectState,
 ) -> Result<DagFrozenSpec, WorkerError> {
     let settings = &state.settings.task;
-    crate::integration::config::reject_unrouted_integration(settings, request)?;
+    let integration = crate::integration::config::resolve_integration_settings(
+        &settings.into(),
+        None,
+        &request.integrate,
+        request.verify_merge,
+    )?;
+    if integration.is_some() && request.wip {
+        return Err(IntegrationCode::IntegrationWipBase.error());
+    }
     let limits = effective_task_limits(&request.limits, settings)?;
     let env_profile = request
         .env_profile
@@ -7277,11 +7285,20 @@ pub(crate) fn freeze_spec(
         .clone()
         .unwrap_or_else(|| settings.source.clone());
     let parsed_publish = parse_publish_modes(&publish)?;
-    let origin_url = if source == "origin" || parsed_publish.contains(&PublishMode::Push) {
+    let origin_url = if integration.is_some()
+        || source == "origin"
+        || parsed_publish.contains(&PublishMode::Push)
+    {
         state.origin.clone()
     } else {
         None
     };
+    if integration.is_some() && origin_url.is_none() {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "integration requires own origin",
+        ));
+    }
     let parsed_source = parse_task_source(
         &source,
         request.wip,

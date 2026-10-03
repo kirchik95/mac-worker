@@ -5685,13 +5685,13 @@ struct ControllerSubmitPinRetirement {
 const SUBMIT_PIN_RETIREMENTS: &str = "submit-pin-retirements";
 const MAX_SUBMIT_PIN_RETIREMENT_BYTES: u64 = 16 * 1024;
 
-fn record_controller_submit_pins(
+pub(crate) fn record_controller_submit_pins(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
     transfer: &crate::transfer_repo::TransferRepo,
 ) -> Result<(), WorkerError> {
-    let body: crate::prepared_submit::FrozenSubmitBody =
-        serde_json::from_value(request.body().clone()).map_err(io::Error::other)?;
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
     let marker = ControllerSubmitPinRetirement {
         request_id: request.request_id().to_owned(),
         payload_sha256: request.payload_sha256().to_owned(),
@@ -5717,7 +5717,7 @@ pub(crate) fn acknowledge_controller_submit_pins(
     cache_root: &Path,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
-    if request.command() != "task.submit" {
+    if !matches!(request.command(), "task.submit" | "task.submit-integrating") {
         return Ok(());
     }
     let root = match crate::rooted_fs::RootedDir::open(&cache_root.join(SUBMIT_PIN_RETIREMENTS)) {
@@ -5734,13 +5734,9 @@ pub(crate) fn acknowledge_controller_submit_pins(
         Err(error) => return Err(error.into()),
     };
     let mut marker = decode_controller_submit_pins(&name, &bytes)?;
-    if marker.payload_sha256 != request.payload_sha256()
-        || request
-            .body()
-            .get("task_id")
-            .and_then(serde_json::Value::as_str)
-            != Some(marker.task_id.to_string().as_str())
-    {
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
+    if marker.payload_sha256 != request.payload_sha256() || body.task_id != marker.task_id {
         return Err(WorkerError::task(
             "CONTROLLER_REQUEST_CONFLICT",
             "submit pin retirement does not match the frozen request",
@@ -5788,7 +5784,7 @@ fn decode_controller_submit_pins(
     Ok(marker)
 }
 
-fn reconcile_controller_submit_pins(
+pub(crate) fn reconcile_controller_submit_pins(
     paths: &PathLayout,
     runner: &dyn ProcessRunner,
     stderr: &mut dyn Write,
@@ -5849,7 +5845,7 @@ fn reconcile_controller_submit_pins(
 
 // W7 records source-finish on the controller, not in the laptop envelope.
 // Keep a private digest-bound foreground receipt only after W7 verifies finish.
-fn record_session_source_finished(
+pub(crate) fn record_session_source_finished(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
@@ -5874,16 +5870,16 @@ fn record_session_source_finished(
     }
 }
 
-fn require_session_source_finished(
+pub(crate) fn require_session_source_finished(
     paths: &PathLayout,
     request: &crate::controller::ControllerRequest,
 ) -> Result<(), WorkerError> {
-    if request.command() != "task.submit"
-        || request
-            .body()
-            .get("session_import")
-            .is_none_or(serde_json::Value::is_null)
-    {
+    if !matches!(request.command(), "task.submit" | "task.submit-integrating") {
+        return Ok(());
+    }
+    let body =
+        crate::controller::integration::source_submit_body(request.command(), request.body())?;
+    if body.session_import.is_none() {
         return Ok(());
     }
     let finished = (|| -> io::Result<bool> {

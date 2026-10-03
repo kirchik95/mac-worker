@@ -293,6 +293,51 @@ pub fn preflight_integration_base(
     }
 }
 
+/// Freeze the project's explicit policy against the already captured source.
+/// From-task ancestry is bound by its parent's imported receipt on the owner.
+pub(crate) fn freeze_source_policy(
+    runner: &dyn ProcessRunner,
+    project: &crate::project_state::ProjectState,
+    integrate: &IntegrationOverride,
+    verify: Option<VerifyPolicy>,
+    requested_close: ClosePolicy,
+    base_oid: Option<BaseOid>,
+    base_task: Option<TaskId>,
+) -> Result<Option<FrozenIntegrationPolicy>, WorkerError> {
+    let policy = resolve_integration_policy(
+        &IntegrationProjectPolicy {
+            settings: (&project.settings.task).into(),
+            project_id: project.context.project_id.clone(),
+            base_oid,
+            base_task,
+        },
+        None,
+        integrate,
+        verify,
+        requested_close,
+        project.origin.as_deref().unwrap_or(""),
+        if base_task.is_some() {
+            IntegrationBaseKind::FromTask
+        } else {
+            IntegrationBaseKind::Committed
+        },
+    )?;
+    let Some(mut policy) = policy else {
+        return Ok(None);
+    };
+    if base_task.is_none() {
+        let repo = RootedDir::open_anchored_absolute(&project.context.root)?;
+        policy.base_preflight = preflight_integration_base(
+            runner,
+            &policy.origin,
+            &policy.target,
+            policy.base_oid.as_ref(),
+            &repo,
+        )?;
+    }
+    Ok(Some(policy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

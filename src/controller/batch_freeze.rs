@@ -72,6 +72,7 @@ impl LaptopBatchSourceStream {
 pub struct LaptopFrozenBatch {
     body: FrozenBatchBody,
     sources: Vec<LaptopBatchSourceStream>,
+    integration: Option<crate::integration::contracts::FrozenIntegratingBatch>,
 }
 
 impl LaptopFrozenBatch {
@@ -81,6 +82,25 @@ impl LaptopFrozenBatch {
 
     pub fn sources(&self) -> &[LaptopBatchSourceStream] {
         &self.sources
+    }
+    pub fn integrating(&self) -> Option<&crate::integration::contracts::FrozenIntegratingBatch> {
+        self.integration.as_ref()
+    }
+    pub fn command(&self) -> &'static str {
+        if self.integration.is_some() {
+            "task.batch-integrating"
+        } else {
+            "task.batch"
+        }
+    }
+    pub fn operation_body(&self) -> Result<serde_json::Value, WorkerError> {
+        match &self.integration {
+            Some(wrapper) => serde_json::to_value(wrapper),
+            None => serde_json::to_value(&self.body),
+        }
+        .map_err(|_| {
+            WorkerError::Protocol("CONTROLLER_TRANSPORT: frozen batch could not be encoded".into())
+        })
     }
 }
 
@@ -127,6 +147,7 @@ pub fn freeze_laptop_batch(
     let run_id = RunId::generate();
     let created = freeze_time_millis()?;
     let mut nodes = BTreeMap::new();
+    let mut integration_inputs = BTreeMap::new();
     let mut dag_pins = Vec::new();
     let mut source_pins = Vec::new();
     let mut source_rows: BTreeMap<(String, String, String), LaptopBatchSourceStream> =
@@ -150,6 +171,14 @@ pub fn freeze_laptop_batch(
                 depends_on.push(parent.to_owned());
             }
             let mut frozen = freeze_spec(&request, &project_state)?;
+            integration_inputs.insert(
+                task_id,
+                (
+                    request.integrate.clone(),
+                    request.verify_merge,
+                    request.close_policy,
+                ),
+            );
             frozen.title = task.title.clone();
             let base = if let Some(parent) = parse_from_base(&request.base) {
                 DagBase::From {
@@ -235,7 +264,7 @@ pub fn freeze_laptop_batch(
         return Err(error);
     }
     let sources: Vec<LaptopBatchSourceStream> = source_rows.into_values().collect();
-    let body = FrozenBatchBody {
+    let mut body = FrozenBatchBody {
         kind,
         run_id,
         max_parallel,
@@ -263,7 +292,58 @@ pub fn freeze_laptop_batch(
         unpin_all(&transfer, runner, &dag_pins, &source_pins);
         return Err(error);
     }
-    Ok(LaptopFrozenBatch { body, sources })
+    let integration = (|| {
+        let parents: BTreeMap<_, _> = body
+            .nodes
+            .iter()
+            .map(|(name, node)| (name.clone(), node.task_id))
+            .collect();
+        let mut policies = BTreeMap::new();
+        for node in body.nodes.values_mut() {
+            let (base, parent) = match &node.base {
+                DagBase::Frozen { oid, .. } => (Some(oid.clone()), None),
+                DagBase::From { parent } => (
+                    None,
+                    Some(*parents.get(parent).ok_or_else(|| {
+                        WorkerError::task("TASK_CONFIG_INVALID", "missing integration parent")
+                    })?),
+                ),
+            };
+            let (integrate, verify, close) = &integration_inputs[&node.task_id];
+            let policy = crate::integration::config::freeze_source_policy(
+                runner,
+                &project_state,
+                integrate,
+                *verify,
+                *close,
+                base,
+                parent,
+            )?;
+            if let Some(policy) = &policy {
+                node.frozen.origin_url = Some(policy.origin.clone());
+            }
+            policies.insert(node.task_id, policy);
+        }
+        if policies.values().all(Option::is_none) {
+            return Ok(None);
+        }
+        let wrapper = super::integration::prepare_integrating_batch(body.clone(), policies)?;
+        crate::task_client::TaskClient::validate_integration_batch(&wrapper)?;
+        body = wrapper.batch.clone();
+        Ok(Some(wrapper))
+    })();
+    let integration = match integration {
+        Ok(wrapper) => wrapper,
+        Err(error) => {
+            unpin_all(&transfer, runner, &dag_pins, &source_pins);
+            return Err(error);
+        }
+    };
+    Ok(LaptopFrozenBatch {
+        body,
+        sources,
+        integration,
+    })
 }
 
 fn assigned_batch_id(task: &BatchTask, task_id: TaskId) -> String {

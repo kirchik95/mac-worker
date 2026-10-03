@@ -1,5 +1,38 @@
 //! Explicit integration-test access for controller contracts.
 
+pub fn acknowledge_controller_submit_pins(
+    cache: &std::path::Path,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), crate::error::WorkerError> {
+    crate::acknowledge_controller_submit_pins(cache, request)
+}
+pub fn record_controller_submit_pins(
+    paths: &crate::paths::PathLayout,
+    request: &crate::controller::ControllerRequest,
+    transfer: &crate::transfer_repo::TransferRepo,
+) -> Result<(), crate::error::WorkerError> {
+    crate::record_controller_submit_pins(paths, request, transfer)
+}
+pub fn reconcile_controller_submit_pins(
+    paths: &crate::paths::PathLayout,
+    runner: &dyn crate::process::ProcessRunner,
+    stderr: &mut dyn std::io::Write,
+) {
+    crate::reconcile_controller_submit_pins(paths, runner, stderr)
+}
+pub fn record_session_source_finished(
+    paths: &crate::paths::PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), crate::error::WorkerError> {
+    crate::record_session_source_finished(paths, request)
+}
+pub fn require_session_source_finished(
+    paths: &crate::paths::PathLayout,
+    request: &crate::controller::ControllerRequest,
+) -> Result<(), crate::error::WorkerError> {
+    crate::require_session_source_finished(paths, request)
+}
+
 pub use super::{channel, events};
 
 pub use crate::controller::batch::{
