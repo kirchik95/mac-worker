@@ -416,21 +416,13 @@ fn inner_facts_expired(
     now_millis: u64,
     probed_at: Option<Instant>,
 ) -> bool {
-    let Some(facts_age) = observation.facts_age_millis() else {
-        return true;
-    };
-    let elapsed = if let Some(probed_at) = probed_at {
-        duration_millis(probed_at.elapsed())
+    if let Some(probed_at) = probed_at {
+        observation
+            .facts_age_millis()
+            .is_none_or(|age| age.saturating_add(duration_millis(probed_at.elapsed())) > FACTS_TTL)
     } else {
-        let Some(started) = observation.final_probe_started_at_millis() else {
-            return true;
-        };
-        if started > now_millis {
-            return true;
-        }
-        now_millis - started
-    };
-    facts_age.saturating_add(elapsed) > FACTS_TTL
+        !observation.facts_fresh_at(now_millis)
+    }
 }
 
 fn candidate_at_return(
@@ -439,8 +431,12 @@ fn candidate_at_return(
     probed_at: Option<Instant>,
 ) -> Result<CandidateObservation, WorkerError> {
     let mut capabilities = observation.capabilities().to_vec();
-    if observation.ready() && inner_facts_expired(observation, now_millis, probed_at) {
-        capabilities.retain(|capability| !capability.starts_with("agent:"));
+    let mut agent_versions = observation.agent_versions().clone();
+    if inner_facts_expired(observation, now_millis, probed_at) {
+        if observation.ready() {
+            capabilities.retain(|capability| !capability.starts_with("agent:"));
+        }
+        agent_versions.clear();
     }
     CandidateObservation::new(
         observation.worker_name().to_owned(),
@@ -450,7 +446,11 @@ fn candidate_at_return(
         observation.available_memory_bytes(),
         observation.free_disk_bytes(),
     )
-    .map(|candidate| candidate.with_interactive_agents(observation.interactive_agents()))
+    .map(|candidate| {
+        candidate
+            .with_agent_versions(agent_versions)
+            .with_interactive_agents(observation.interactive_agents())
+    })
     .map_err(|_| WorkerError::Protocol("cached scheduler observation is invalid".into()))
 }
 
@@ -520,6 +520,7 @@ fn admission_from_health(
         candidate.free_disk_bytes(),
         observed_at,
     )?
+    .with_agent_versions(candidate.agent_versions().clone())
     .with_interactive_agents(candidate.interactive_agents()))
 }
 
@@ -614,6 +615,61 @@ mod tests {
         transfer::HostOperation,
     };
 
+    #[test]
+    fn review_b_fresh_agent_version_survives_admission_projection() {
+        use crate::scheduler::{AffinityHints, SchedulerPolicy, Selection};
+        let entry = worker("mini-1", "mac1");
+        let config = config(vec![entry.clone()]);
+        let mut probe: ProbeResponse =
+            serde_json::from_slice(&probe_bytes(Some(0), FactsKind::Authenticated, None)).unwrap();
+        probe.agent_facts.as_mut().unwrap().agents[0].version = Some("0.159.3".into());
+        let health = WorkerHealth {
+            name: entry.name.clone(),
+            ssh: entry.ssh.clone(),
+            status: HealthStatus::Ready,
+            probe: Some(probe),
+            missing_capabilities: vec![],
+            error_code: None,
+            error_message: None,
+        };
+        let requirements = vec!["agent-min:codex@0.160.0".into()];
+        let direct =
+            SchedulerProbeAdapter::observations_at(&config, std::slice::from_ref(&health), 1)
+                .unwrap();
+        assert!(matches!(
+            SchedulerPolicy::select(
+                &direct,
+                &requirements,
+                &WorkerPreference::Automatic,
+                &AffinityHints::none()
+            ),
+            Selection::Selected(_)
+        ));
+        let stored = admission_from_health(&config, &health, 1)
+            .unwrap()
+            .with_local_binding(
+                entry.ssh,
+                entry.remote_binary,
+                entry.capabilities,
+                entry.slots,
+                Some(0),
+                1,
+            );
+        let returned = candidate_at_return(&stored, 1, None).unwrap();
+        assert!(
+            matches!(
+                SchedulerPolicy::select(
+                    &[returned],
+                    &requirements,
+                    &WorkerPreference::Automatic,
+                    &AffinityHints::none()
+                ),
+                Selection::Selected(_)
+            ),
+            "a fresh eligible host became ineligible through admission"
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum FactsKind {
         Authenticated,
@@ -642,6 +698,7 @@ mod tests {
         observation_gate: Mutex<HashMap<String, ObservationGate>>,
         refresh_delay: Mutex<HashMap<String, Duration>>,
         herdr_interactive: Mutex<HashMap<String, u32>>,
+        agent_versions: Mutex<HashMap<String, String>>,
     }
 
     impl ScriptedRunner {
@@ -667,6 +724,7 @@ mod tests {
                 observation_gate: Mutex::new(HashMap::new()),
                 refresh_delay: Mutex::new(HashMap::new()),
                 herdr_interactive: Mutex::new(HashMap::new()),
+                agent_versions: Mutex::new(HashMap::new()),
             }
         }
 
@@ -845,7 +903,14 @@ mod tests {
                 .copied()
                 .unwrap_or(FactsKind::Authenticated);
             let interactive = self.herdr_interactive.lock().unwrap().get(&ssh).copied();
-            Ok(success(probe_bytes(age, kind, interactive)))
+            let mut probe: ProbeResponse =
+                serde_json::from_slice(&probe_bytes(age, kind, interactive)).unwrap();
+            if let Some(version) = self.agent_versions.lock().unwrap().get(&ssh)
+                && let Some(facts) = &mut probe.agent_facts
+            {
+                facts.agents[0].version = Some(version.clone());
+            }
+            Ok(success(serde_json::to_vec(&probe).unwrap()))
         }
     }
 
@@ -1547,6 +1612,155 @@ mod tests {
             "ready row without facts must miss and refresh, not skip SSH"
         );
         assert!(!runner.refreshes.lock().unwrap().is_empty());
+    }
+
+    fn assert_version_selected(observations: &[CandidateObservation]) {
+        use crate::scheduler::{AffinityHints, SchedulerPolicy, Selection};
+        assert!(matches!(
+            SchedulerPolicy::select(
+                observations,
+                &["agent-min:codex@0.160.0".into()],
+                &WorkerPreference::Automatic,
+                &AffinityHints::none(),
+            ),
+            Selection::Selected(_)
+        ));
+    }
+
+    #[test]
+    fn agent_versions_survive_live_admission_disk_and_warm_selection() {
+        let (dir, store) = temp_store();
+        let entry = worker("mini-1", "mac1");
+        let config = config(vec![entry]);
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", 0);
+        runner
+            .agent_versions
+            .lock()
+            .unwrap()
+            .insert("mac1".into(), "0.159.3".into());
+        let store = store.with_admission_clock(std::sync::Arc::new(|| Ok(1_000)));
+        let first =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert_version_selected(&first);
+        let stored = store.peek_admission_observation("mini-1").unwrap().unwrap();
+        assert_eq!(stored.agent_versions().get("codex").unwrap(), "0.159.3");
+        let bytes = serde_json::to_vec(&stored).unwrap();
+        let back: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, stored);
+        assert_version_selected(&[candidate_at_return(&back, 1_000, None).unwrap()]);
+        let store = ClientStateStore::open(&dir.path().canonicalize().unwrap().join("state"))
+            .unwrap()
+            .with_admission_clock(std::sync::Arc::new(|| Ok(1_000)));
+        let second =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert_version_selected(&second);
+        assert_eq!(
+            runner.probes.lock().unwrap().len(),
+            1,
+            "cache hit must not probe"
+        );
+    }
+
+    #[test]
+    fn agent_versions_live_probe_rejects_still_stale_facts_after_refresh() {
+        use crate::scheduler::{AffinityHints, SchedulerPolicy, Selection};
+        let (_dir, store) = temp_store();
+        let config = config(vec![worker("mini-1", "mac1")]);
+        let runner = ScriptedRunner::new();
+        runner.facts_age("mac1", FACTS_TTL + 1);
+        runner
+            .agent_versions
+            .lock()
+            .unwrap()
+            .insert("mac1".into(), "0.159.3".into());
+        let observations =
+            observe_admission(&runner, &config, &store, &WorkerPreference::Automatic).unwrap();
+        assert!(observations[0].ready());
+        assert!(observations[0].agent_versions().is_empty());
+        assert!(matches!(
+            SchedulerPolicy::select(
+                &observations,
+                &["agent-min:codex@0.160.0".into()],
+                &WorkerPreference::Automatic,
+                &AffinityHints::none(),
+            ),
+            Selection::NoEligible { .. }
+        ));
+        assert_eq!(runner.probes.lock().unwrap().len(), 2);
+        assert_eq!(runner.refreshes.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .peek_admission_observation("mini-1")
+                .unwrap()
+                .unwrap()
+                .agent_versions()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn agent_versions_expire_at_inner_facts_ttl_for_cached_and_live_returns() {
+        use std::collections::BTreeMap;
+        let entry = worker("mini-1", "mac1");
+        let versions = BTreeMap::from([("codex".into(), "0.159.3".into())]);
+        let stored =
+            bound_ready(&entry, 1_000, Some(FACTS_TTL - 10)).with_agent_versions(versions.clone());
+        let boundary = candidate_at_return(&stored, 1_010, None).unwrap();
+        assert_eq!(boundary.agent_versions(), &versions);
+        assert_version_selected(&[boundary]);
+        let stale = candidate_at_return(&stored, 1_011, None).unwrap();
+        assert!(stale.agent_versions().is_empty());
+        assert!(!stale.capabilities().contains(&"agent:codex".into()));
+        let missing_age = bound_ready(&entry, 1_000, None).with_agent_versions(versions.clone());
+        assert!(
+            candidate_at_return(&missing_age, 1_000, None)
+                .unwrap()
+                .agent_versions()
+                .is_empty()
+        );
+        assert!(
+            candidate_at_return(&stored, 999, None)
+                .unwrap()
+                .agent_versions()
+                .is_empty()
+        );
+        let live = bound_ready(&entry, 1_000, Some(FACTS_TTL - 10)).with_agent_versions(versions);
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(11))
+            .unwrap();
+        assert!(
+            candidate_at_return(&live, 1_000, Some(started))
+                .unwrap()
+                .agent_versions()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn old_admission_cache_without_versions_fails_closed() {
+        use crate::scheduler::{AffinityHints, SchedulerPolicy, Selection};
+        let entry = worker("mini-1", "mac1");
+        let old = bound_ready(&entry, 1_000, Some(0));
+        let bytes = serde_json::to_vec(&old).unwrap();
+        assert!(
+            !String::from_utf8(bytes.clone())
+                .unwrap()
+                .contains("agent_versions")
+        );
+        let back: AdmissionObservation = serde_json::from_slice(&bytes).unwrap();
+        assert!(back.agent_versions().is_empty());
+        assert!(reusable_for_admission(&back, &entry, 1_000));
+        let candidate = candidate_at_return(&back, 1_000, None).unwrap();
+        assert!(matches!(
+            SchedulerPolicy::select(
+                &[candidate],
+                &["agent-min:codex@0.160.0".into()],
+                &WorkerPreference::Automatic,
+                &AffinityHints::none(),
+            ),
+            Selection::NoEligible { .. }
+        ));
     }
 
     #[test]
