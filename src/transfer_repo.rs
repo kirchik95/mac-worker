@@ -2789,7 +2789,7 @@ fn reject_merge_in_progress(
     Ok(())
 }
 
-fn dirty_report(
+pub(crate) fn dirty_report(
     runner: &dyn ProcessRunner,
     context: &ProjectContext,
 ) -> Result<DirtyReport, WorkerError> {

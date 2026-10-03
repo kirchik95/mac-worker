@@ -145,6 +145,9 @@ pub enum Command {
 pub enum TaskCommand {
     #[command(about = "Submit a prompt as a durable agent task")]
     Submit {
+        /// Continue a laptop Claude Code or Codex session in the pool (claude[:<uuid>] or codex[:<uuid>])
+        #[arg(long, value_name = "SELECTOR")]
+        from_session: Option<crate::session_transfer::SessionSelector>,
         /// Agent to run: codex, cursor, opencode, or claude
         #[arg(long, value_parser = non_empty_text)]
         agent: Option<String>,

@@ -114,6 +114,35 @@ pub struct PreparedSubmit {
 impl FrozenSubmitBody {
     pub fn prepared(&self) -> Result<PreparedSubmit, WorkerError> {
         let agent = parse_frozen_agent(&self.agent)?;
+        let mut requirements = self.requires.clone();
+        if let Some(import) = &self.session_import {
+            import.validate()?;
+            if import.agent().agent_kind() != agent {
+                return Err(WorkerError::task(
+                    "SESSION_AGENT_MISMATCH",
+                    "frozen agent does not match imported session",
+                ));
+            }
+            if self.source == "origin" {
+                return Err(WorkerError::task(
+                    "SESSION_REQUIRES_SNAPSHOT",
+                    "imported session requires a snapshot source",
+                ));
+            }
+            if self.run_id.is_some() {
+                return Err(WorkerError::task(
+                    "TASK_CONFIG_INVALID",
+                    "session imports are not supported in batch or DAG tasks",
+                ));
+            }
+            requirements = crate::task_client::task_requirements(
+                &requirements,
+                agent,
+                self.env_profile.as_deref(),
+                None,
+            );
+            crate::task_client::add_session_requirements(&mut requirements, import);
+        }
         let policy = match self.permissions.as_str() {
             "workspace" => PermissionPolicy::Workspace,
             "unattended" => PermissionPolicy::Unattended,
@@ -163,7 +192,7 @@ impl FrozenSubmitBody {
             base_oid: self.base_oid.clone(),
             limits,
             policy,
-            requires: self.requires.clone(),
+            requires: requirements,
             wait_for_capacity: self.wait_for_capacity,
             attached: false,
             branch: self.branch.clone(),
@@ -221,6 +250,41 @@ mod tests {
             body["wait_for_capacity"] = json!(flag);
         }
         body
+    }
+
+    #[test]
+    fn session_import_prepared_enforces_identity_scope_and_requirements() {
+        let import = crate::session_transfer::SessionImportMeta::new(
+            crate::session_transfer::SessionAgent::Codex,
+            "a".repeat(40),
+            "0.160.0",
+        )
+        .unwrap();
+        let mut value = sample_body_json(None);
+        value["session_import"] = serde_json::to_value(import).unwrap();
+        let body: FrozenSubmitBody = serde_json::from_value(value.clone()).unwrap();
+        let prepared = body.prepared().unwrap();
+        for required in [
+            "agent:codex",
+            "feature:task.session-import",
+            "agent-min:codex@0.160.0",
+        ] {
+            assert!(prepared.requires.iter().any(|item| item == required));
+        }
+        for (key, bad, code) in [
+            ("agent", json!("claude"), "SESSION_AGENT_MISMATCH"),
+            ("source", json!("origin"), "SESSION_REQUIRES_SNAPSHOT"),
+            (
+                "run_id",
+                json!("218f0f4a6b5c7d8e9f00112233445566"),
+                "TASK_CONFIG_INVALID",
+            ),
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = bad;
+            let body: FrozenSubmitBody = serde_json::from_value(invalid).unwrap();
+            assert_eq!(body.prepared().unwrap_err().public_code(), code);
+        }
     }
 
     #[test]
