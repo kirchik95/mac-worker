@@ -408,6 +408,103 @@ impl<'a> OwnerIntegration<'a> {
         }
         self.schedule(task)
     }
+    pub(crate) fn redrive(
+        &self,
+        request: &IntegrationRedriveRequest,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        request.validate()?;
+        let task = request.task_id;
+        let root = task_root(self.ports.paths, task)?;
+        let _request = private_lock(&root, "redrive.lock", true)?
+            .ok_or_else(|| WorkerError::task("TASK_BUSY", "integration redrive is in progress"))?;
+        let name = format!("redrive-{}.json", request.request_id);
+        let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        let mut binding: RedriveBinding = match read(&root, &name)? {
+            Some(bytes) => {
+                let saved: RedriveBinding =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                if saved.request != *request
+                    || serde_json::to_vec(&saved).map_err(|_| invalid())? != bytes
+                {
+                    return Err(invalid());
+                }
+                saved
+            }
+            None => {
+                if record.snapshot.revision != request.expected {
+                    return Err(WorkerError::task(
+                        "TASK_REVISION_CONFLICT",
+                        "integration revision changed",
+                    ));
+                }
+                if self.ports.client.load_task(task)?.status().state() != TaskState::Open {
+                    return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
+                }
+                if record.snapshot.state != IntegrationStatus::Blocked {
+                    return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+                }
+                self.ports.require_helper(self.ports.worker(task)?)?;
+                let saved = RedriveBinding {
+                    request: request.clone(),
+                    intent: record.snapshot.integration_id,
+                    epoch: record.snapshot.epoch,
+                    result: None,
+                };
+                write(
+                    &root,
+                    &name,
+                    &serde_json::to_vec(&saved).map_err(|_| invalid())?,
+                    true,
+                )?;
+                saved
+            }
+        };
+        if let Some(result) = binding.result {
+            self.schedule(task)?;
+            return Ok(result);
+        }
+        if record.snapshot.integration_id != binding.intent {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "integration cycle changed",
+            ));
+        }
+        let result = if binding.epoch.checked_add(1) == Some(record.snapshot.epoch) {
+            // Epoch publication survived a crash before saving the operation result.
+            record.snapshot
+        } else if record.snapshot.epoch == binding.epoch {
+            self.ports.require_helper(self.ports.worker(task)?)?;
+            match self
+                .coordinator()
+                .resume_redrive(task, binding.intent, binding.epoch)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) if error.public_code() == "INTEGRATION_ALREADY_COMMITTED" => {
+                    record = self.state.load(task)?.ok_or_else(invalid)?;
+                    if record.snapshot.state != IntegrationStatus::Integrated {
+                        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                    }
+                    record.snapshot
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "integration epoch changed",
+            ));
+        };
+        binding.result = Some(result.clone());
+        write(
+            &root,
+            &name,
+            &serde_json::to_vec(&binding).map_err(|_| invalid())?,
+            false,
+        )?;
+        drop(_request);
+        self.schedule(task)?;
+        Ok(result)
+    }
     fn schedule(&self, task: TaskId) -> Result<(), WorkerError> {
         let Some(record) = self.state.load(task)? else {
             return Ok(());
@@ -529,6 +626,15 @@ struct DriverBinding {
     epoch: u32,
     actor: crate::job::ProcessIdentity,
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedriveBinding {
+    request: IntegrationRedriveRequest,
+    intent: IntegrationId,
+    epoch: u32,
+    result: Option<IntegrationSnapshot>,
+}
 fn invalid() -> WorkerError {
     IntegrationCode::IntegrationStateInvalid.error()
 }
@@ -559,7 +665,14 @@ fn write(root: &RootedDir, name: &str, bytes: &[u8], exact: bool) -> Result<(), 
     }
 }
 fn driver_lock(root: &RootedDir, nonblocking: bool) -> Result<Option<File>, WorkerError> {
-    let lock = root.open_private_lock("driver.lock")?;
+    private_lock(root, "driver.lock", nonblocking)
+}
+fn private_lock(
+    root: &RootedDir,
+    name: &str,
+    nonblocking: bool,
+) -> Result<Option<File>, WorkerError> {
+    let lock = root.open_private_lock(name)?;
     if unsafe {
         libc::flock(
             lock.as_raw_fd(),
@@ -573,8 +686,8 @@ fn driver_lock(root: &RootedDir, nonblocking: bool) -> Result<Option<File>, Work
         }
         return Err(error.into());
     }
-    let identity = root.private_entry_identity("driver.lock")?;
-    root.validate_private_regular_binding("driver.lock", &lock, identity)?;
+    let identity = root.private_entry_identity(name)?;
+    root.validate_private_regular_binding(name, &lock, identity)?;
     Ok(Some(lock))
 }
 pub(crate) fn record_source_base(
@@ -819,6 +932,106 @@ mod native_launch_tests {
             data: base.join("data"),
             cache: base.join("cache"),
         }
+    }
+
+    struct NoProcesses;
+    impl ProcessRunner for NoProcesses {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("a saved redrive result must not contact Git or the helper")
+        }
+    }
+
+    #[test]
+    fn native_redrive_recovers_the_published_epoch_without_advancing_again() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        client
+            .create_task(sample_ordinary(fixture_task(), fixture_source()))
+            .unwrap();
+        let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n").unwrap();
+        let owner =
+            OwnerIntegration::new(&NoProcesses, &config, &paths, &client, &NeverSpawn).unwrap();
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = IntegrationStatus::Blocked;
+        record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
+        owner
+            .state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        owner
+            .state
+            .replace(record.task_id, IntegrationRevision(0), &record)
+            .unwrap();
+        record.snapshot.revision = IntegrationRevision(2);
+        record.snapshot.state = IntegrationStatus::Revoked;
+        record.tombstone = Some(IntegrationTombstone {
+            epoch: 0,
+            revision: IntegrationRevision(2),
+            requested_at_millis: 1001,
+            acknowledged: true,
+        });
+        owner
+            .state
+            .replace(record.task_id, IntegrationRevision(1), &record)
+            .unwrap();
+        record.snapshot.epoch = 1;
+        record.snapshot.revision = IntegrationRevision(3);
+        record.snapshot.state = IntegrationStatus::Pending;
+        record.snapshot.blocked_code = None;
+        record.tombstone = None;
+        owner
+            .state
+            .replace(record.task_id, IntegrationRevision(2), &record)
+            .unwrap();
+        crate::controller::drain::set_drained(&paths.controller_state_root(), true).unwrap();
+        let request = IntegrationRedriveRequest {
+            task_id: record.task_id,
+            expected: IntegrationRevision(1),
+            request_id: "00000000000000000000000000000064".into(),
+        };
+        let binding = RedriveBinding {
+            request: request.clone(),
+            intent: record.snapshot.integration_id,
+            epoch: 0,
+            result: None,
+        };
+        let task_root = task_root(&paths, record.task_id).unwrap();
+        write(
+            &task_root,
+            &format!("redrive-{}.json", request.request_id),
+            &serde_json::to_vec(&binding).unwrap(),
+            true,
+        )
+        .unwrap();
+        let recovered = owner.redrive(&request).unwrap();
+        assert_eq!(recovered.epoch, 1);
+        assert_eq!(recovered.integration_id, record.snapshot.integration_id);
+        assert_eq!(
+            owner
+                .state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            IntegrationStatus::Parked
+        );
+        assert_eq!(owner.redrive(&request).unwrap(), recovered);
+        assert_eq!(
+            owner
+                .state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .epoch,
+            1
+        );
+        assert!(client.queue_snapshot().unwrap().entries().is_empty());
     }
 
     #[test]

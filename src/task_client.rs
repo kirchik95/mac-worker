@@ -3064,6 +3064,27 @@ impl<'a> TaskClient<'a> {
         self.close_from_expected(&record, discard)
     }
 
+    pub fn integrate(
+        &self,
+        task_id: TaskId,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        let (_, record) = RootedIntegrationState::read_task(self.paths, task_id)?;
+        let record = record.ok_or_else(crate::integration::contracts::integration_unavailable)?;
+        let request = crate::integration::contracts::IntegrationRedriveRequest {
+            task_id,
+            expected: record.snapshot.revision,
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        let native = crate::integration::runner::OwnerIntegration::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            self.executor,
+        )?;
+        native.redrive(&request)
+    }
+
     /// Re-drive failed or retrying origin intents after credentials are fixed.
     pub fn publish_retry(&self, task_id: TaskId) -> Result<PublishRetryReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;

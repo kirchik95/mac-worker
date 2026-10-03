@@ -602,6 +602,41 @@ fn native_close_revokes_a_parked_cycle_without_starting_a_git_phase() {
     );
 }
 
+#[test]
+fn native_explicit_redrive_advances_one_blocked_epoch_and_recovers_via_reexec() {
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut record = state.load(task).unwrap().unwrap();
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.resume_state = None;
+    record.snapshot.pause_reason = None;
+    record.pause = None;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
+    record.snapshot.retry_exhausted = true;
+    state.replace(task, expected, &record).unwrap();
+    let undrain = f.worker(&["--json", "controller", "drain", "--off"]);
+    assert!(undrain.status.success());
+    let redrive = f.worker(&["--json", "task", "integrate", &task.to_string()]);
+    assert!(
+        redrive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&redrive.stdout)
+    );
+    let pending: Value = serde_json::from_slice(&redrive.stdout).unwrap();
+    assert_eq!(pending["integration"]["epoch"], 1);
+    let done = wait_integrated(&f, task);
+    assert_eq!(done.snapshot.integration_id, record.snapshot.integration_id);
+    assert_eq!(done.snapshot.epoch, 1);
+    assert!(done.receipt.unwrap().imported);
+}
+
 fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> IntegrationRecord {
     let wait = f.worker(&[
         "--json",

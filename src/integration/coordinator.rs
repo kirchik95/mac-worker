@@ -1395,18 +1395,57 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.snapshot.state == IntegrationStatus::Integrated {
             return Ok(record.snapshot);
         }
+        self.redrive_record(record, false)
+    }
+    pub(crate) fn resume_redrive(
+        &self,
+        task: TaskId,
+        intent: IntegrationId,
+        epoch: u32,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.integration_id != intent || record.snapshot.epoch != epoch {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "integration cycle changed",
+            ));
+        }
+        self.redrive_record(record, true)
+    }
+    fn redrive_record(
+        &self,
+        record: IntegrationRecord,
+        resuming: bool,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let task = record.task_id;
         let facts = self.observer.facts(task)?;
         if facts.ordinary.status().state() != TaskState::Open
             || facts.stop_requested
             || facts.close_pending
+            || record.snapshot.blocked_code
+                == Some(IntegrationCode::IntegrationDependencyNotIntegrated)
+            || !facts.ordinary.status().turns().iter().any(|turn| {
+                turn.turn_id() == record.snapshot.source_turn_id
+                    && turn.outcome() == Some(&TaskOutcome::Done)
+            })
         {
             return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
         }
-        if record.snapshot.state != IntegrationStatus::Blocked {
+        let stopped = resuming
+            && record.snapshot.state == IntegrationStatus::Revoked
+            && record.tombstone.as_ref().is_some_and(|t| t.acknowledged);
+        if record.snapshot.state != IntegrationStatus::Blocked && !stopped {
             return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
         }
-        self.revoke(task, expected)?;
+        if !stopped {
+            self.revoke(task, record.snapshot.revision)?;
+        }
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.state != IntegrationStatus::Revoked
+            || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
+        {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+        }
         record.snapshot.epoch = record
             .snapshot
             .epoch

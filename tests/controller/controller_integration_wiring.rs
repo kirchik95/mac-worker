@@ -224,6 +224,54 @@ fn durable_cancel_retry_cannot_retarget_a_newer_integration_epoch() {
 }
 
 #[test]
+fn controller_redrive_freezes_the_request_without_running_an_owner_phase() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    tasks
+        .create_task(sample_ordinary(fixture_task(), fixture_source()))
+        .unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    integration.snapshot.state = IntegrationStatus::Blocked;
+    integration.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkerOffline);
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
+        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request_id = "00000000000000000000000000000063";
+    let request = parse_request(&serde_json::to_vec(&json!({"protocol_version": 7, "request_id": request_id, "command": "task.integrate", "body": {"task_id": fixture_task(), "expected": integration.snapshot.revision, "request_id": request_id}})).unwrap()).unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let saved = store.load(request_id).unwrap().unwrap();
+    assert_eq!(saved.prepared(), request.body());
+    assert_eq!(saved.body(), request.body());
+    assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    let old = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let unavailable = store
+        .handle_with(&request, &old, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(unavailable.public_code(), "INTEGRATION_UNAVAILABLE");
+    assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+}
+
+#[test]
 fn capable_controller_publishes_the_policy_before_ordinary_preparation() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,

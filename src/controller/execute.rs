@@ -115,6 +115,42 @@ impl<'a> TaskSubmitHandler<'a> {
 impl ControllerCommandHandler for TaskSubmitHandler<'_> {
     fn prepare(&self, request: &ControllerRequest) -> Result<OperationMeta, WorkerError> {
         match request.command() {
+            "task.integrate" => {
+                super::integration::require_controller_integration(&self.features)?;
+                let redrive: crate::integration::contracts::IntegrationRedriveRequest =
+                    serde_json::from_value(request.body().clone()).map_err(|_| {
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error()
+                    })?;
+                super::integration::prepare_integration_redrive(&redrive)?;
+                if redrive.request_id != request.request_id() {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error(),
+                    );
+                }
+                let (_, stored) = crate::integration::store::RootedIntegrationState::read_task(
+                    self.paths,
+                    redrive.task_id,
+                )?;
+                let stored =
+                    stored.ok_or_else(crate::integration::contracts::integration_unavailable)?;
+                if stored.snapshot.revision != redrive.expected {
+                    return Err(WorkerError::task(
+                        "TASK_REVISION_CONFLICT",
+                        "integration revision changed",
+                    ));
+                }
+                Ok(OperationMeta {
+                    task_id: Some(redrive.task_id.to_string()),
+                    turn_id: None,
+                    created_at_millis: now_millis()?,
+                    prepared: serde_json::to_value(redrive).map_err(|_| {
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error()
+                    })?,
+                })
+            }
             "task.submit-integrating" => {
                 let wrapper =
                     super::integration::parse_integrating_submit(request, &self.features)?;
@@ -228,6 +264,30 @@ impl TaskSubmitHandler<'_> {
         record: &crate::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
         match record.command() {
+            "task.integrate" => {
+                super::integration::require_controller_integration(&self.features)?;
+                let request: crate::integration::contracts::IntegrationRedriveRequest =
+                    serde_json::from_value(record.prepared().clone()).map_err(|_| {
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error()
+                    })?;
+                if request.request_id != record.request_id() || record.body() != record.prepared() {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error(),
+                    );
+                }
+                let owner = crate::integration::runner::OwnerIntegration::new(
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    self.client_state,
+                    &DETACHED_EXECUTOR,
+                )?;
+                serde_json::to_value(owner.redrive(&request)?).map_err(|_| {
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
+                })
+            }
             "checkpoint.submit" => Ok(json!({
                 "task_id": record.task_id(),
                 "turn_id": record.turn_id(),
@@ -840,7 +900,7 @@ pub fn serve_rpc_with_execution(
     let request = crate::controller::protocol::parse_request(&payload)?;
     if matches!(
         request.command(),
-        "task.submit-integrating" | "task.batch-integrating"
+        "task.submit-integrating" | "task.batch-integrating" | "task.integrate"
     ) || super::integration::is_integration_selector(&request)
     {
         let features = crate::features::CONTROLLER_FEATURES

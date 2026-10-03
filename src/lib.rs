@@ -2007,8 +2007,10 @@ fn run_task_subcommand(
             write_wait_report(&report, json, stdout)?;
             Ok(report.exit_code())
         }
-        TaskCommand::Integrate { .. } => {
-            Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error())
+        TaskCommand::Integrate { task_id } => {
+            let snapshot = client.integrate(task_id)?;
+            write_integration_redrive(task_id, &snapshot, json, stdout)?;
+            Ok(0)
         }
         TaskCommand::Reconcile => {
             let report = client.operator_reconcile()?;
@@ -2036,6 +2038,28 @@ fn run_task_subcommand(
             }
             Ok(0)
         }
+    }
+}
+
+fn write_integration_redrive(
+    task_id: crate::task::TaskId,
+    snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), WorkerError> {
+    if json {
+        write_json_line(
+            stdout,
+            &serde_json::json!({"protocol_version": PROTOCOL_VERSION, "task_id": task_id, "integration": snapshot}),
+        )
+    } else {
+        writeln!(
+            stdout,
+            "task {task_id}: integration epoch {} {:?}",
+            snapshot.epoch, snapshot.state
+        )?;
+        stdout.flush()?;
+        Ok(())
     }
 }
 
@@ -5240,8 +5264,26 @@ fn run_enabled_controller_task(
             Ok(report.exit_code())
         }
         Command::Task {
-            command: TaskCommand::Integrate { .. },
-        } => Err(crate::integration::contracts::IntegrationCode::IntegrationUnavailable.error()),
+            command: TaskCommand::Integrate { task_id },
+        } => {
+            require_controller_integration_peer(runner, config)?;
+            let selector = controller_read_request("task.list", serde_json::json!({"integration": {"task_ids": [task_id]}}))?;
+            let reply = crate::controller::send_controller_read::<crate::integration::contracts::IntegrationReadResult>(runner, &config.controller, &selector)?;
+            let facts = reply.into_result();
+            crate::integration::contracts::ValidateIntegration::validate(&facts)?;
+            if facts.integrations.len() != 1 {
+                return Err(crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error());
+            }
+            let snapshot = facts.integrations.get(&task_id).and_then(Option::as_ref)
+                .ok_or_else(crate::integration::contracts::integration_unavailable)?;
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            let request = crate::controller::parse_request(&serde_json::to_vec(&serde_json::json!({"protocol_version": PROTOCOL_VERSION, "request_id": request_id, "command": "task.integrate", "body": {"task_id": task_id, "expected": snapshot.revision, "request_id": request_id}})).map_err(|_| crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error())?)?;
+            let ack = crate::controller::send_controller_mutation(runner, &config.controller, &paths.controller_cache_root(), &request, stderr)?;
+            let snapshot: crate::integration::contracts::IntegrationSnapshot = serde_json::from_value(ack.result().cloned().ok_or_else(crate::integration::contracts::integration_unavailable)?).map_err(|_| crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error())?;
+            crate::integration::contracts::ValidateIntegration::validate(&snapshot)?;
+            write_integration_redrive(task_id, &snapshot, json, stdout)?;
+            Ok(0)
+        }
         Command::Task {
             command: TaskCommand::Reconcile,
         } => {
