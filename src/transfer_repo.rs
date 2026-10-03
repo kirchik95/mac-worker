@@ -1724,6 +1724,59 @@ impl TransferRepo {
         self.release_session(runner, task_id)
     }
 
+    /// Release an ACK-authorized laptop task by its frozen cache identity.
+    /// Unlike active-task release, retirement does not need the source checkout
+    /// or alternates to survive. Never create a missing repository, and hold its
+    /// shared GC lock from the existence check through both durable deletions.
+    pub(crate) fn release_retired_laptop_task_refs(
+        cache_root: &Path,
+        runner: &dyn ProcessRunner,
+        repo_id: &str,
+        task_id: TaskId,
+    ) -> Result<(), WorkerError> {
+        if !is_lower_hex(repo_id, 64) {
+            return Err(task_config("invalid retired transfer repository identity"));
+        }
+        let parent = match RootedDir::open(&cache_root.join("transfer")) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let _lock = lock_transfer_repo_shared(&parent, repo_id, WaitDeadline::default())?;
+        let path = cache_root.join("transfer").join(format!("{repo_id}.git"));
+        let root = match RootedDir::open(&path) {
+            Ok(root) => root,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !root.entry_exists("HEAD")? {
+            return Err(git_error(
+                "BASE_UNAVAILABLE",
+                "retired transfer repository is not initialized",
+            ));
+        }
+        for reference in [base_ref(task_id), format!("{SESSION_REF_PREFIX}{task_id}")] {
+            run_git(
+                runner,
+                Some(&path),
+                &[
+                    "-c".into(),
+                    "gc.auto=0".into(),
+                    "-c".into(),
+                    "core.fsync=reference".into(),
+                    "-c".into(),
+                    "core.fsyncMethod=fsync".into(),
+                    "update-ref".into(),
+                    "-d".into(),
+                    reference.into(),
+                ],
+                None,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn import_result(
         &self,

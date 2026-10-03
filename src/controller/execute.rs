@@ -388,7 +388,7 @@ impl<'a> ControllerSubmitPinGuard<'a> {
         record: &crate::controller::DurableRequest,
         body: &FrozenSubmitBody,
     ) -> Result<Self, WorkerError> {
-        let root = crate::rooted_fs::RootedDir::create(
+        let root = crate::controller::leader::open_controller_root(
             &handler
                 .paths
                 .controller_state_root()
@@ -939,8 +939,16 @@ fn send_controller_mutation_with_wait(
     for attempt in 0..=3 {
         match classify_mutation_exchange(request, runner.run(&ssh)) {
             MutationOutcome::Acknowledged(ack) => {
-                if let Err(error) =
-                    settle_operation_envelope(cache_root, request, OperationOutcome::Acknowledged)
+                // The non-expiring cleanup proof must precede envelope settlement.
+                // If it cannot be saved, leave the envelope pending for ACK replay.
+                if let Err(error) = crate::acknowledge_controller_submit_pins(cache_root, request)
+                    .and_then(|()| {
+                        settle_operation_envelope(
+                            cache_root,
+                            request,
+                            OperationOutcome::Acknowledged,
+                        )
+                    })
                 {
                     let _ = writeln!(
                         stderr,
