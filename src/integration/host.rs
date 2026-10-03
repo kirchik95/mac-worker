@@ -192,6 +192,15 @@ impl<'a> HostIntegrationService<'a> {
                 {
                     return Err(invalid());
                 }
+                let evidence = sidecars.revoke_evidence(&policy.project_id, request.task_id)?;
+                // The pre-phase journal is a fence even without a phase
+                // record. A delayed older revoke must never lower its epoch.
+                if evidence.as_ref().is_some_and(|proof| {
+                    proof.request.integration_id == request.integration_id
+                        && proof.request.epoch > request.epoch
+                }) {
+                    return Err(invalid());
+                }
                 let same_cycle = retained.as_ref().is_some_and(|record| {
                     Some(record.snapshot.integration_id) == request.integration_id
                         && record.snapshot.epoch == request.epoch
@@ -204,8 +213,7 @@ impl<'a> HostIntegrationService<'a> {
                     }) {
                         return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
                     }
-                    let mut proof = sidecars
-                        .revoke_evidence(&policy.project_id, request.task_id)?
+                    let mut proof = evidence
                         .filter(|proof| {
                             proof.request.integration_id == request.integration_id
                                 && proof.request.epoch == request.epoch

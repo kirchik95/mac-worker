@@ -263,6 +263,90 @@ fn owner_can_revoke_an_armed_cycle_before_the_first_host_phase_and_fence_late_fe
 }
 
 #[test]
+fn stale_prephase_revoke_preserves_the_newer_epoch_fence_across_crash_replay() {
+    for crash in [
+        None,
+        Some(IntegrationHook::AfterRevoke),
+        Some(IntegrationHook::BeforeRevokeAck),
+        Some(IntegrationHook::AfterRevokeAck),
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        f.commit_task();
+        let mut arm = request(
+            &f,
+            HostIntegrationAction::Arm {
+                policy: f.record.policy.clone(),
+            },
+        );
+        arm.integration_id = None;
+        arm.revision = IntegrationRevision(0);
+        execute(&f, &arm).unwrap();
+        let revoke = |epoch| HostIntegrationRequest {
+            epoch,
+            ..request(
+                &f,
+                HostIntegrationAction::Revoke {
+                    tombstone: IntegrationTombstone {
+                        epoch,
+                        revision: f.record.snapshot.revision,
+                        requested_at_millis: 1002,
+                        acknowledged: false,
+                    },
+                },
+            )
+        };
+        let old = revoke(0);
+        let newer = revoke(1);
+        assert!(matches!(
+            execute(&f, &old).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        if let Some(hook) = crash {
+            f.runtime.crash_at(hook);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(&f, &newer)))
+                    .is_err()
+            );
+            f.runtime.restart();
+        }
+        assert!(matches!(
+            execute(&f, &newer).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        let proof_path = f
+            .store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .join("integration/revoke.json");
+        let proof = std::fs::read(&proof_path).unwrap();
+        assert!(matches!(
+            execute(&f, &newer).unwrap(),
+            HostIntegrationResponse::Revoked { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&proof_path).unwrap(),
+            proof,
+            "identical replay changed its proof"
+        );
+        let stale = execute(&f, &old);
+        assert_eq!(
+            std::fs::read(&proof_path).unwrap(),
+            proof,
+            "stale revoke erased the acknowledged newer fence: {stale:?}"
+        );
+        f.record.snapshot.epoch = 1;
+        assert_eq!(
+            f.execute(IntegrationStep::Prepare)
+                .unwrap_err()
+                .public_code(),
+            IntegrationCode::IntegrationStopUnconfirmed.as_str()
+        );
+        assert_eq!(f.origin_tip(), target);
+    }
+}
+
+#[test]
 fn stale_revoke_cannot_acknowledge_or_rewrite_a_newer_ordinary_turn() {
     use mac_worker::test_support::{
         host::job::JobId,
