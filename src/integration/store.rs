@@ -244,19 +244,31 @@ impl RootedIntegrationState {
         turn: TurnId,
     ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
         let (_, record) = Self::read_task(paths, task)?;
-        let Some(record) = record else {
-            return Ok(None);
+        let referenced = record
+            .as_ref()
+            .is_some_and(|r| r.auxiliaries.iter().any(|a| a.turn_id == turn));
+        let root = match RootedDir::open_anchored_absolute(&paths.state.join("integrations")) {
+            Ok(root) => root,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(WorkerError::Io(e)),
         };
-        if !record.auxiliaries.iter().any(|a| a.turn_id == turn) {
-            return Ok(None);
-        }
-        let root = RootedDir::open_anchored_absolute(&paths.state.join("integrations"))
-            .map_err(WorkerError::Io)?;
-        let dir = child(&root, &format!("tasks/{task}/prepared"), false)?;
-        let bytes =
-            read(&dir, &prepared_name(turn), MAX_PREPARED_TURN_BYTES)?.ok_or_else(invalid)?;
+        let dir = match child(&root, &format!("tasks/{task}/prepared"), false) {
+            Ok(dir) => dir,
+            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound && !referenced => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(bytes) = read(&dir, &prepared_name(turn), MAX_PREPARED_TURN_BYTES)? else {
+            return if referenced { Err(invalid()) } else { Ok(None) };
+        };
         let prepared = decode_prepared_turn(&bytes)?;
-        reference(&prepared, &record)?;
+        if prepared.followup.task_id() != task || prepared.followup.turn_id() != turn {
+            return Err(invalid());
+        }
+        if let Some(record) = record {
+            reference(&prepared, &record)?;
+        }
         Ok(Some(prepared))
     }
 }
@@ -280,12 +292,15 @@ impl IntegrationState for RootedIntegrationState {
         policy: &FrozenIntegrationPolicy,
     ) -> Result<(), WorkerError> {
         let bytes = encode_bounded(policy, MAX_PRIVATE_RECORD_BYTES)?;
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
         exact(
             &self.task(task, true)?.ok_or_else(invalid)?,
             "policy.json",
             &bytes,
-        )
+        )?;
+        drop(lock);
+        self.runtime.reach(IntegrationHook::AfterPolicy);
+        Ok(())
     }
     fn publish_prepared(
         &self,

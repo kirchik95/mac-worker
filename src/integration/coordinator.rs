@@ -40,6 +40,8 @@ impl<'a> IntegrationCoordinator<'a> {
             let observation = self.turns.observe(source)?;
             observation.validate()?;
             let auxiliary = &mut record.auxiliaries[index];
+            let accepted = observation.accepted && !auxiliary.accepted;
+            let completed = observation.completed && !auxiliary.completed;
             if observation.turn_id != source
                 || auxiliary
                     .queue_position
@@ -64,6 +66,12 @@ impl<'a> IntegrationCoordinator<'a> {
             }
             record.ready_at_millis = self.runtime.now_millis();
             self.save(&mut record)?;
+            if accepted {
+                self.runtime.reach(IntegrationHook::AfterAuxAccepted);
+            }
+            if completed {
+                self.runtime.reach(IntegrationHook::AfterAuxCompleted);
+            }
             return Ok(());
         }
         let facts = self.observer.facts(task)?;
@@ -433,6 +441,33 @@ impl<'a> IntegrationCoordinator<'a> {
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
     }
+    pub(crate) fn set_run_position(&self, task: TaskId, position: u64) -> Result<(), WorkerError> {
+        let Some(mut record) = self.state.load(task)? else {
+            return Ok(());
+        };
+        if record.run_position != position {
+            record.run_position = position;
+            self.save(&mut record)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn mark_given_up(&self, task: TaskId) -> Result<(), WorkerError> {
+        let Some(mut record) = self.state.load(task)? else {
+            return Ok(());
+        };
+        if record.snapshot.state != IntegrationStatus::Revoked
+            || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
+        {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+        }
+        if record.snapshot.blocked_code != Some(IntegrationCode::IntegrationDependencyNotIntegrated)
+        {
+            record.snapshot.blocked_code =
+                Some(IntegrationCode::IntegrationDependencyNotIntegrated);
+            self.save(&mut record)?;
+        }
+        Ok(())
+    }
     pub(crate) fn ready_to_drive(&self, task: TaskId) -> Result<bool, WorkerError> {
         let record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
         Ok(!matches!(
@@ -462,6 +497,16 @@ impl<'a> IntegrationCoordinator<'a> {
                 IntegrationStatus::Integrated | IntegrationStatus::Revoked
             )
         {
+            if let Some(actor) = record.actor
+                && actor != self.runtime.actor()
+            {
+                if self.runtime.actor_verdict(actor)
+                    != crate::client_state::RunnerLivenessVerdict::Exited
+                {
+                    return Ok(record.snapshot);
+                }
+                self.release(&mut record)?;
+            }
             return self.settle_closed(record);
         }
         if record.tombstone.as_ref().is_some_and(|t| !t.acknowledged)
@@ -504,6 +549,18 @@ impl<'a> IntegrationCoordinator<'a> {
                 return Ok(record.snapshot);
             }
             self.release(&mut record)?;
+        }
+        if matches!(
+            record.snapshot.state,
+            IntegrationStatus::Resolving | IntegrationStatus::Verifying | IntegrationStatus::Parked
+        ) && let Some(auxiliary) = record
+            .auxiliaries
+            .last()
+            .filter(|a| a.attempt == record.snapshot.attempts)
+        {
+            // Retained completion is an observation, including while the launch gate is shut.
+            self.on_terminal(task, auxiliary.turn_id)?;
+            record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
         }
         let Some(permit) = self.permit(&mut record, IntegrationPhase::Drive)? else {
             return Ok(record.snapshot);
@@ -632,7 +689,9 @@ impl<'a> IntegrationCoordinator<'a> {
             self.runtime.reach(IntegrationHook::BeforePush);
         }
         if self.state.load(record.task_id)?.is_none_or(|r| {
-            r.snapshot.revision != record.snapshot.revision || r.tombstone.is_some()
+            r.snapshot.revision != record.snapshot.revision
+                || (r.tombstone.is_some()
+                    && !matches!(step, IntegrationStep::Fetch | IntegrationStep::Repair))
         }) {
             self.state.release(&reservation)?;
             return self
@@ -980,10 +1039,10 @@ impl<'a> IntegrationCoordinator<'a> {
             };
             return self.host_phase(record, IntegrationStep::AcceptTurn);
         }
+        self.runtime.reach(IntegrationHook::BeforeAuxAdmission);
         let Some(permit) = self.permit(&mut record, IntegrationPhase::AuxiliaryAdmission)? else {
             return Ok(record.snapshot);
         };
-        self.runtime.reach(IntegrationHook::BeforeAuxAdmission);
         if record.admission_deadline_millis.is_none() && !observation.accepted {
             record.admission_deadline_millis = Some(
                 self.runtime
@@ -1073,8 +1132,9 @@ impl<'a> IntegrationCoordinator<'a> {
                 return Err(IntegrationCode::IntegrationStateInvalid.error());
             }
         } else {
+            let revision = record.snapshot.revision;
             let snapshot = self.host_phase(record, IntegrationStep::Repair)?;
-            if snapshot.state != IntegrationStatus::Published {
+            if snapshot.state != IntegrationStatus::Published || snapshot.revision == revision {
                 return Ok(snapshot);
             }
             record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
@@ -1322,6 +1382,7 @@ impl<'a> IntegrationCoordinator<'a> {
                 record.snapshot.disposition = Some(receipt.disposition);
                 record.receipt = Some(receipt);
                 record.snapshot.state = IntegrationStatus::Published;
+                self.release(&mut record)?;
                 self.save(&mut record)?;
                 self.finish_receipt(record, false)?;
                 Err(IntegrationCode::IntegrationAlreadyCommitted.error())

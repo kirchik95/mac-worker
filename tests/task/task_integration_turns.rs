@@ -491,6 +491,27 @@ fn real_owner_auxiliary_admission_requires_the_authoritative_sidecar_and_replays
             .public_code(),
         "INTEGRATION_STATE_INVALID"
     );
+    // Superseding an epoch cannot erase the old runner's durable purpose/limit.
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next().unwrap();
+    record.snapshot.epoch = 1;
+    record.snapshot.state = IntegrationStatus::Pending;
+    record.snapshot.attempts = 0;
+    record.snapshot.resolve_turns = 0;
+    record.auxiliaries.clear();
+    record.candidates.clear();
+    state.replace(fixture_task(), expected, &record).unwrap();
+    let current = store.load_task(fixture_task()).unwrap();
+    let limits = mac_worker::test_support::task::turn_runner::TurnRunner::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &store,
+        &InlineRunnerExecutor,
+    )
+    .approved_turn_limits(&current, rebound.followup.turn_id())
+    .unwrap();
+    assert_eq!(limits.timeout_millis, 600000);
 }
 
 #[test]
@@ -550,4 +571,61 @@ fn auxiliary_terminal_wakes_its_existing_cycle_without_replacing_source_facts() 
     assert_eq!(after.source_summary, before.source_summary);
     assert_eq!(after.cycle_base, before.cycle_base);
     assert!(after.snapshot.revision > before.snapshot.revision);
+}
+
+#[test]
+fn parked_completion_is_observed_without_admitting_a_host_phase() {
+    use super::task_integration_lifecycle::driver_fixture::*;
+    use mac_worker::test_support::task::model::{ClosePolicy, TaskOutcome};
+    for reason in [
+        IntegrationPauseReason::ControllerDrained,
+        IntegrationPauseReason::ControllerDisabled,
+        IntegrationPauseReason::HelperUnavailable,
+    ] {
+        let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+        let turn = rig.queued();
+        rig.runtime.set_drive_gate(Some(reason));
+        rig.drive();
+        let calls = rig.host.calls.lock().unwrap().len();
+        rig.complete(turn, TaskOutcome::Done, vec![]);
+        rig.runtime.advance(std::time::Duration::from_secs(900));
+        rig.runtime.restart();
+        assert_eq!(rig.drive().state, IntegrationStatus::Parked);
+        let record = rig.record();
+        assert!(record.auxiliaries.last().unwrap().completed);
+        assert!(record.auxiliaries.last().unwrap().accepted);
+        assert_eq!(record.admission_deadline_millis, None);
+        assert_eq!(record.remaining_admission_millis, None);
+        assert_eq!(rig.host.calls.lock().unwrap().len(), calls);
+        assert_eq!(rig.turns.enqueue_count(turn), 1);
+    }
+}
+
+#[test]
+fn crash_after_park_retains_the_effective_timestamp_and_exact_remaining_budget() {
+    use super::task_integration_lifecycle::driver_fixture::*;
+    use mac_worker::test_support::task::model::ClosePolicy;
+    use std::time::Duration;
+    let rig = Rig::new(Mode::Resolve, ClosePolicy::Never);
+    let turn = rig.queued();
+    rig.runtime.advance(Duration::from_secs(120));
+    rig.runtime
+        .set_drive_gate(Some(IntegrationPauseReason::HelperUnavailable));
+    rig.runtime.advance(Duration::from_secs(900));
+    rig.runtime.crash_at(IntegrationHook::AfterPark);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.drive())).is_err());
+    let parked = rig.record();
+    assert_eq!(parked.remaining_admission_millis, Some(480000));
+    rig.runtime.restart();
+    rig.runtime.advance(Duration::from_secs(900));
+    rig.drive();
+    assert_eq!(rig.record().pause, parked.pause);
+    assert_eq!(rig.record().remaining_admission_millis, Some(480000));
+    rig.runtime.set_drive_gate(None);
+    rig.drive();
+    assert_eq!(
+        rig.record().admission_deadline_millis,
+        Some(rig.runtime.now_millis() + 480000)
+    );
+    assert_eq!(rig.turns.enqueue_count(turn), 1);
 }

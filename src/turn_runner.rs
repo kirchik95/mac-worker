@@ -648,6 +648,11 @@ impl<'a> TurnRunner<'a> {
         {
             // execute's journal, queue and transfer fences have all retired here.
             coordinator.on_terminal(task_id, turn_id)?;
+            crate::task_client::stamp_integration_run_position(
+                self.client_state,
+                coordinator,
+                task_id,
+            )?;
         }
         result
     }

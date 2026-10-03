@@ -159,6 +159,32 @@ pub(crate) fn stage_auto_continue_before_retirement(
     Ok(())
 }
 
+/// Called after ordinary finalizer fences retire; the run is the authoritative order.
+pub(crate) fn stamp_integration_run_position(
+    state: &ClientStateStore,
+    coordinator: &IntegrationCoordinator<'_>,
+    task: TaskId,
+) -> Result<(), WorkerError> {
+    if !coordinator.configured(task)? {
+        return Ok(());
+    }
+    let ordinary = state.load_task(task)?;
+    if let Some(run) = ordinary.meta().run_id() {
+        let run = state.load_run(run)?;
+        let position = run
+            .task_ids()
+            .iter()
+            .position(|id| *id == task)
+            .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        coordinator.set_run_position(
+            task,
+            u64::try_from(position)
+                .map_err(|_| IntegrationCode::IntegrationStateInvalid.error())?,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn log_auto_continue_failure(
     state: &ClientStateStore,
     paths: &PathLayout,
@@ -1286,6 +1312,9 @@ impl<'a> TaskClient<'a> {
                 if e.public_code() == "INTEGRATION_ALREADY_COMMITTED"
                     && !matches!(operation, IntegrationMutation::Cancel) => {}
             Err(e) => return Err(e),
+        }
+        if matches!(operation, IntegrationMutation::Cancel) {
+            coordinator.mark_given_up(task)?;
         }
         self.client_state.load_task(task)
     }
@@ -3090,6 +3119,7 @@ impl<'a> TaskClient<'a> {
                     && let Some(last) = record.status().turns().last()
                 {
                     coordinator.on_terminal(*task, last.turn_id())?;
+                    stamp_integration_run_position(self.client_state, coordinator, *task)?;
                 }
             }
         }
@@ -4050,6 +4080,18 @@ impl<'a> TaskClient<'a> {
         {
             if &auxiliary.followup != prepared {
                 return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+            let (_, record) = RootedIntegrationState::read_task(self.paths, task_id)?;
+            let record = record.ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+            if record.tombstone.is_some()
+                || record.snapshot.integration_id != auxiliary.integration_id
+                || record.snapshot.epoch != auxiliary.epoch
+                || !matches!(
+                    record.snapshot.state,
+                    IntegrationStatus::Resolving | IntegrationStatus::Verifying
+                )
+            {
+                return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
             }
         } else {
             self.before_integration_mutation(&current, IntegrationMutation::Say)?;

@@ -509,7 +509,10 @@ pub(crate) fn parent_gate_at(
             ParentGate::Waiting
         });
     }
-    if record.snapshot.state == IntegrationStatus::Revoked
+    if (record.snapshot.state == IntegrationStatus::Revoked
+        && (ordinary.status().state() == TaskState::Closed
+            || record.snapshot.blocked_code
+                == Some(IntegrationCode::IntegrationDependencyNotIntegrated)))
         || (ordinary.status().state() == TaskState::Closed
             && record.snapshot.state == IntegrationStatus::Blocked)
     {
