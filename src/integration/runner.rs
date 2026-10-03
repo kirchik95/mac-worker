@@ -985,6 +985,33 @@ pub(crate) fn recover_selected(
     Ok(())
 }
 
+/// Observe retained process identities before an operator's confirmation wait.
+/// A fresh CLI must prove death in its own cache before selected recovery can
+/// release a phase actor or replace a driver. This read creates no sidecars.
+pub(crate) fn retained_owner_identities(
+    paths: &PathLayout,
+    tasks: &[TaskId],
+) -> Result<Vec<crate::job::ProcessIdentity>, WorkerError> {
+    let mut actors = Vec::new();
+    for task in tasks {
+        let (_, record) = super::store::RootedIntegrationState::read_task(paths, *task)?;
+        let Some(record) = record else { continue };
+        if let Some(actor) = record.actor {
+            actor.validate()?;
+            actors.push(actor);
+        }
+        if let Some(bytes) = read(&task_root(paths, *task)?, "driver.json")? {
+            let binding: DriverBinding = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            binding.actor.validate()?;
+            if binding.task != *task {
+                return Err(invalid());
+            }
+            actors.push(binding.actor);
+        }
+    }
+    Ok(actors)
+}
+
 pub(crate) fn run_native_child(
     runner: &dyn ProcessRunner,
     config: &Config,

@@ -3889,13 +3889,28 @@ impl<'a> TaskClient<'a> {
 
     fn wait_to_confirm_absent_owners(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
         let mut saw_unconfirmed = false;
-        for entry in self.client_state.queue_snapshot()?.entries() {
-            if entry.kind() != QueueEntryKind::TaskTurn {
+        let mut identities = self
+            .client_state
+            .queue_snapshot()?
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() == QueueEntryKind::TaskTurn)
+            .filter_map(|entry| entry.owner_opt().copied())
+            .collect::<Vec<_>>();
+        let tasks = self
+            .client_state
+            .list_tasks()?
+            .iter()
+            .map(|record| record.meta().task_id())
+            .collect::<Vec<_>>();
+        identities.extend(crate::integration::runner::retained_owner_identities(
+            self.paths, &tasks,
+        )?);
+        let mut seen = HashSet::new();
+        for row_owner in identities {
+            if !seen.insert((row_owner.pid(), row_owner.start_time_micros())) {
                 continue;
             }
-            let Some(row_owner) = entry.owner_opt().copied() else {
-                continue;
-            };
             if row_owner == owner {
                 continue;
             }
@@ -9150,6 +9165,131 @@ mod session_submission_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod integration {
+        use super::*;
+        use crate::integration::{contracts::*, testing::*};
+        use crate::supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        };
+        use std::{os::unix::fs::OpenOptionsExt, sync::Arc};
+
+        struct Inspector(ProcessObservation);
+        impl ProcessInspector for Inspector {
+            fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+                ProcessIdentity::new(pid, 9999)
+            }
+            fn observe(&self, _: ProcessIdentity) -> ProcessObservation {
+                self.0
+            }
+            fn observe_group(&self, _: u32) -> ProcessGroupObservation {
+                ProcessGroupObservation::Ambiguous
+            }
+            fn observe_group_members(&self, _: u32) -> ProcessGroupMembership {
+                ProcessGroupMembership::Ambiguous
+            }
+        }
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("absence confirmation is read-only")
+            }
+        }
+
+        #[test]
+        fn reconcile_confirms_only_absent_integration_owners() {
+            for retained in ["actor", "driver"] {
+                for observation in [
+                    ProcessObservation::Absent,
+                    ProcessObservation::Reused,
+                    ProcessObservation::Matching {
+                        process_group: 424242,
+                    },
+                    ProcessObservation::Ambiguous,
+                ] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path().canonicalize().unwrap();
+                    let paths = PathLayout {
+                        config: root.join("config.toml"),
+                        state: root.join("state"),
+                        cache: root.join("cache"),
+                        data: root.join("data"),
+                    };
+                    // Zero interval avoids sleeping in this observation test;
+                    // the native regression covers the real confirmation interval.
+                    let client = ClientStateStore::open_with_owner_inspector(
+                        &paths.state,
+                        Inspector(observation),
+                    )
+                    .unwrap()
+                    .with_timings(crate::client_state::ClientStateTimings {
+                        runner_absence_confirmation: Duration::ZERO,
+                    });
+                    client
+                        .create_task(sample_ordinary(fixture_task(), fixture_source()))
+                        .unwrap();
+                    let state = RootedIntegrationState::open(
+                        &paths,
+                        Arc::new(ManualIntegrationRuntime::default()),
+                    )
+                    .unwrap();
+                    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+                    let actor = ProcessIdentity::new(424242, 9999).unwrap();
+                    if retained == "actor" {
+                        record.actor = Some(actor);
+                    }
+                    state
+                        .publish_policy(record.task_id, &record.policy)
+                        .unwrap();
+                    state
+                        .replace(record.task_id, IntegrationRevision(0), &record)
+                        .unwrap();
+                    let driver = paths
+                        .state
+                        .join(format!("integrations/tasks/{}/driver.json", record.task_id));
+                    if retained == "driver" {
+                        let binding = serde_json::json!({"task": record.task_id, "intent": record.snapshot.integration_id, "epoch": record.snapshot.epoch, "actor": actor});
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&driver)
+                            .unwrap();
+                        file.write_all(&serde_json::to_vec(&binding).unwrap())
+                            .unwrap();
+                        file.sync_all().unwrap();
+                    }
+                    let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+                    TaskClient::new(
+                        &NoProcesses,
+                        &config,
+                        &paths,
+                        &client,
+                        &crate::turn_runner::InlineRunnerExecutor,
+                    )
+                    .wait_to_confirm_absent_owners(current_process_identity().unwrap())
+                    .unwrap();
+                    let expected = match observation {
+                        ProcessObservation::Absent | ProcessObservation::Reused => {
+                            RunnerLivenessVerdict::Exited
+                        }
+                        ProcessObservation::Matching { .. } => RunnerLivenessVerdict::Live,
+                        ProcessObservation::Ambiguous => RunnerLivenessVerdict::Unverifiable,
+                    };
+                    assert_eq!(
+                        client.runner_identity_verdict(actor),
+                        expected,
+                        "{retained}: {observation:?}"
+                    );
+                    assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+                    assert!(client.queue_snapshot().unwrap().entries().is_empty());
+                }
+            }
+        }
+    }
 
     #[test]
     fn replacement_failure_observation_skips_missing_or_unsafe_runner_logs() {

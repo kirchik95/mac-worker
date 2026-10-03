@@ -562,6 +562,93 @@ fn native_recovery_reclaims_a_confirmed_dead_phase_actor_before_reexecuting_the_
 }
 
 #[test]
+fn fresh_operator_reconcile_confirms_dead_integration_driver_and_retained_actor() {
+    use mac_worker::test_support::{
+        client_state::RunnerLivenessVerdict, host::supervisor::SystemProcessInspector,
+    };
+    use std::{
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        process::{Command, Stdio},
+    };
+    for retained in ["driver", "actor"] {
+        let (f, task) = parked_source_fixture();
+        let paths = owner_paths(&f);
+        let runtime = std::sync::Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let mut record = state.load(task).unwrap().unwrap();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let actor = SystemProcessInspector.identity_for_pid(child.id()).unwrap();
+        let path = paths
+            .state
+            .join(format!("integrations/tasks/{task}/driver.json"));
+        if retained == "actor" {
+            runtime.set_actor_verdict(actor, RunnerLivenessVerdict::Live);
+            let expected = record.snapshot.revision;
+            record.actor = Some(actor);
+            record.snapshot.revision = expected.next().unwrap();
+            state.replace(task, expected, &record).unwrap();
+            state
+                .reserve(
+                    &record.target_key,
+                    record.snapshot.integration_id,
+                    record.snapshot.epoch,
+                    actor,
+                )
+                .unwrap()
+                .unwrap();
+        } else {
+            let binding = json!({"task": task, "intent": record.snapshot.integration_id, "epoch": record.snapshot.epoch, "actor": actor});
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(&serde_json::to_vec(&binding).unwrap())
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(
+            f.worker(&["--json", "controller", "drain", "--off"])
+                .status
+                .success()
+        );
+        // Exactly one fresh CLI invocation must confirm absence before its
+        // selected recovery. No prior process-local liveness cache is reused.
+        let result = f.worker(&["--json", "task", "reconcile"]);
+        assert!(
+            result.status.success(),
+            "out={} err={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_ne!(
+            state.load(task).unwrap().unwrap().actor,
+            Some(actor),
+            "fresh reconcile retained the dead {retained}"
+        );
+        if path.exists() {
+            let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_ne!(
+                after["actor"],
+                serde_json::to_value(actor).unwrap(),
+                "fresh reconcile retained the dead driver binding"
+            );
+        }
+        let settled = wait_integrated(&f, task);
+        assert!(settled.actor.is_none());
+        assert!(settled.receipt.unwrap().imported);
+    }
+}
+
+#[test]
 fn native_close_revokes_a_parked_cycle_without_starting_a_git_phase() {
     use mac_worker::test_support::client_state::ClientStateStore;
     let (f, task) = parked_source_fixture();
