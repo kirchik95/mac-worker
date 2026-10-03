@@ -150,6 +150,42 @@ fn latest_uses_mtime_and_skips_non_uuid_uppercase_and_nested_entries() {
 }
 
 #[test]
+fn latest_filters_first_cwd_with_a_bounded_probe() {
+    let fixture = Fixture::new();
+    let root = fixture.root();
+    let nested = root.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let older = fixture.session(ID, &root);
+    let newer = fixture.session(OTHER_ID, &root);
+    modified(&older, 10);
+    let valid = jsonl(&[serde_json::json!({"cwd": nested})]);
+    let with_header = [b"{\"type\":\"progress\"}\n".as_slice(), &valid].concat();
+    fs::write(&newer, with_header).unwrap();
+    modified(&newer, 20);
+    assert_eq!(discover(&fixture, &root, "claude").unwrap(), newer);
+
+    let too_long = jsonl(&[serde_json::json!({"cwd": root, "padding": "x".repeat(1 << 20)})]);
+    for bytes in [
+        jsonl(&[
+            serde_json::json!({"cwd": fixture.home.home()}),
+            serde_json::json!({"cwd": root}),
+        ]),
+        [b"{}\n".repeat(64), valid.clone()].concat(),
+        too_long,
+        b"{invalid JSON}\n".to_vec(),
+        b"{}\n{\"cwd\":\"partial".to_vec(),
+    ] {
+        fs::write(&newer, bytes).unwrap();
+        modified(&newer, 20);
+        assert_eq!(discover(&fixture, &root, "claude").unwrap(), older);
+    }
+    fs::remove_file(&newer).unwrap();
+    std::os::unix::fs::symlink(&older, &newer).unwrap();
+    assert_eq!(discover(&fixture, &root, "claude").unwrap(), older);
+    assert_code(capture(&fixture, &root, &newer), "SESSION_UNREADABLE");
+}
+
+#[test]
 fn latest_subdirectory_session_requires_explicit_id() {
     let fixture = Fixture::new();
     let root = fixture.root();
