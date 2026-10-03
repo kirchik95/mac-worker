@@ -11,7 +11,7 @@ description: "Dispatch independent coding tasks through the mac-worker pool and 
 - The user asks to run work in the pool or on the minis, in any wording: «отправь выполняться в пул», «отправь в пул», «запусти в пуле», «запусти на mini», «через worker task», "send it to the pool", "run it on the minis", "dispatch to the workers".
 - The user asks to check, follow, answer, or fetch a pool task: «что с задачей в пуле», «забери результат», «ответь агенту», "task status", "fetch the result".
 
-Before the first submit, write the brief with `pool-task-authoring` unless the user already supplied a prompt file. Do not send work to the pool on your own initiative without one of the triggers above; when work merely looks parallelisable, say so and ask.
+For fresh work, before the first submit write the brief with `pool-task-authoring` unless the user already supplied a prompt file. For an existing conversation, choose the context option below. Do not send work to the pool on your own initiative without one of the triggers above; when work merely looks parallelisable, say so and ask.
 
 This skill is the mechanical task loop. One task is one independent unit of work. The pool chooses workers. Never choose a worker yourself.
 
@@ -44,7 +44,7 @@ Watch the pool while tasks run: `worker dashboard --port 8765 --no-open`, then o
 
 ## Submit
 
-For each task, put its prompt in a Markdown file and submit it:
+For each fresh task, put its prompt in a Markdown file and submit it:
 
 ```text
 worker task submit --agent <name> --prompt-file <file> --json
@@ -57,6 +57,19 @@ worker task batch <file> --json
 ```
 
 Keep the returned run identifier and all task identifiers.
+
+### Choose The Context
+
+- **Native session:** use `worker task submit --from-session claude[:<uuid>]` or `codex[:<uuid>]` to continue an interactive conversation with lots of useful context. Start it in this project's root; omit the id for the latest matching session. Still supply `--prompt "<what to do next>"`; add `--wip` for a dirty checkout. The laptop original stays usable; the pool continues a copy under pool policy. Confirm the user is comfortable copying it: secret scrubbing is incomplete. Only snapshot-sourced `task submit` supports this, not batches or DAG children.
+- **Handoff note:** for Cursor, OpenCode, unsupported worker versions, or a different target agent, ask: “Write `.worker/handoff.md` with the goal, what is done, current state including uncommitted changes, decisions and constraints, open questions, and exact next steps. Do not include secrets.” Review it, then submit a fresh conversation:
+
+  ```text
+  worker task submit --wip --include .worker/handoff.md --prompt "Read .worker/handoff.md and continue the work it describes."
+  ```
+
+- **Fresh brief:** for independent work that does not need the old conversation, use `pool-task-authoring` and the normal prompt-file submit above.
+
+Check the installed grammar before using these forms. Details and failure hints: repository `docs/usage.md`, “Continue a laptop session in the pool”.
 
 ## Follow
 

@@ -108,6 +108,69 @@ Outcomes are recorded on the task, independent of the process exit code:
 
 If a worker job or its logs vanish after acceptance, the task outcome is `failed: LOG_DRAIN_UNAVAILABLE`. `worker task wait --task-id <id>` completes with exit 1, `worker task logs -f <id>` stops, and the dashboard shows the same outcome. A later `worker task say <id> --message "…"` starts a fresh turn. The result may still have been imported before the failure was finalized: inspect `worker task result <id>` and use `worker task fetch <id>` to check or import it.
 
+### Continue a laptop session in the pool
+
+Use `--from-session claude[:<uuid>]` or `--from-session codex[:<uuid>]` on `task submit` to continue an existing conversation. A next-step prompt (`--prompt "<what to do next>"`) is still required; it becomes the next user message, not a replacement for the conversation.
+
+```bash
+# Latest session for this project
+worker task submit --from-session claude --prompt "Add regression tests for the change we discussed."
+worker task submit --from-session codex --wip --prompt "Finish the current implementation and run its tests."
+
+# A specific session (replace <uuid> with its full session id)
+worker task submit --from-session claude:<uuid> --prompt "<what to do next>"
+worker task submit --from-session codex:<uuid> --prompt "<what to do next>"
+```
+
+Run submit from the project, and start the laptop session in this project's root. In v1 the pool resumes at the worker workspace root, not a subdirectory. Without an id, **latest** means the most recently modified matching session for this project, not the latest conversation anywhere on the laptop: Claude scans the project's encoded directory under `~/.claude/projects`; Codex checks the newest 200 rollouts under `~/.codex/sessions` against their recorded working directory. Submit shows the selected session and a first-prompt preview so you can check the choice. Use an explicit UUID if you want another one.
+
+This is a **copy, never a move**. Your laptop session stays usable, and the pool copy gets its own session id. The transcript travels alongside the checkout snapshot, including Claude's subagent transcripts and sidecar files. References to the laptop checkout path are rewritten to the worker workspace path throughout the package. A live session is captured through its last complete JSONL line; if it was modified less than ten seconds ago, submit warns that the pool receives a snapshot as of now.
+
+A dirty checkout needs `--wip`: the conversation assumes your uncommitted state, so sending only the committed base would lose that context. Without it, submit fails with `SESSION_NEEDS_WIP`. Include any required untracked inputs with the normal snapshot `--include` options.
+
+**Secret scrubbing is not a guarantee.** Before transfer, JSON string values are scrubbed to replace these high-confidence shapes with `[scrubbed]`:
+
+- `Bearer ` tokens (at least 16 token characters), `sk-ant-` tokens (at least 16), and `sk-` tokens (at least 20);
+- GitHub tokens: `ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_` (at least 30 characters after the prefix), and `github_pat_` (at least 40);
+- Slack tokens: `xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-` (at least 10 characters after the prefix);
+- AWS access-key ids shaped as `AKIA` plus 16 uppercase letters or digits, and PEM private-key blocks.
+
+Submit reports the scrub count. v1 does not fetch worker env-profile secrets for scrubbing and has no `--no-scrub` option. Secrets the agent read from files may remain if they do not match these patterns. **Use `--from-session` only for sessions you are comfortable copying to your workers.** It does not copy agent credentials or lend your laptop login.
+
+**Pool policy and eligibility:**
+
+- The pool's model and permission policy applies on the worker, not the laptop session's policy. If no model is configured for the task or project, the worker agent's default applies and may differ from the laptop's. Submit shows the model that will run.
+- Workers need the `task.session-import` feature. Upgrade the workers; in controller mode, upgrade and restart the controller too so it advertises `controller.session-import`.
+- The worker's agent may be at most **one minor version behind** the version that wrote the session, within the same major version; patch differences are ignored. For example, Codex 0.160.0 can continue on 0.159.3, but not 0.158.x. Missing, unparsable, or stale version facts (older than 15 minutes) make a worker ineligible. Profile-specific agent binaries are not version-checked in v1.
+- The selector chooses the task agent unless you pass `--agent`; an explicit `--agent` must match it. Sessions cannot be converted between agents.
+
+v1 supports only snapshot-sourced `task submit`, in direct or controller mode. `task batch`, DAG children, origin-sourced tasks (`--source origin`), Cursor and OpenCode session imports are out of scope.
+
+See the [`SESSION_*` rows in the error catalog](#exit-codes-and-errors) for exits and recovery hints: `SESSION_NOT_FOUND`, `SESSION_UNREADABLE`, `SESSION_TOO_LARGE`, `SESSION_OUTSIDE_PROJECT`, `SESSION_NEEDS_WIP`, `SESSION_REQUIRES_SNAPSHOT`, `SESSION_AGENT_MISMATCH`, `SESSION_IMPORT_UNSUPPORTED`, `SESSION_AGENT_TOO_OLD`, and `SESSION_PLACEMENT_FAILED`. Packages are limited to 64 MiB raw total, 64 MiB per file, and 2,000 files; use a handoff note for larger conversations.
+
+#### Handoff note instead of session transfer
+
+For unsupported agents or worker versions, or to continue with a different agent, send a note rather than a native transcript. Ask the laptop agent:
+
+```text
+Write .worker/handoff.md so another agent can continue this work. Include:
+- The goal.
+- What is done.
+- The current state, including uncommitted changes and relevant files.
+- Decisions and constraints.
+- Open questions.
+- Exact next steps, including commands and checks to run.
+Do not include secrets.
+```
+
+Review the note, then send it with the current checkout state:
+
+```bash
+worker task submit --wip --include .worker/handoff.md --prompt "Read .worker/handoff.md and continue the work it describes."
+```
+
+This starts a fresh conversation using the note as context; it does not transfer the original session. Add `--agent <name>` if you want a different agent from the configured default.
+
 ### Questions policy
 
 New tasks default to `decide`: every turn tells the agent to choose reasonable options, keep working, and summarize its decisions and assumptions. Use `worker task submit --questions ask` for interactive daytime work. The submit flag overrides `.worker.toml` `[task] questions = "ask"` or `"decide"`; without either, the policy is `decide`. Batch and DAG tasks accept `questions` on each `[[tasks]]` entry, overriding batch defaults and then the project setting. The effective policy is saved on the task, so later turns keep it even if configuration changes. Tasks created before this policy existed continue to use `ask`.
