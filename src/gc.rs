@@ -17,6 +17,7 @@ use crate::{
     process::{ProcessPolicy, ProcessRequest, ProcessRunner},
     protocol::PROTOCOL_VERSION,
     rooted_fs::{EntryKind, RootedDir},
+    session_transfer::SESSION_REF_PREFIX,
     task::{TaskId, TaskMeta, TaskState, TaskStatus},
     task_store::TaskStore,
 };
@@ -894,8 +895,9 @@ impl<'a> HostGc<'a> {
                     continue;
                 }
             };
-            let result =
-                self.collect_mirror_record(request, inventory, candidates, &repos, &name, project);
+            let result = self.collect_mirror_record(
+                request, inventory, candidates, warnings, &repos, &name, project,
+            );
             if let Err(error) = result {
                 push_record_warning(warnings, "mirror", project, record_failure_reason(&error));
             }
@@ -903,11 +905,13 @@ impl<'a> HostGc<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // Rooted context and shared diagnostics are explicit.
     fn collect_mirror_record(
         &self,
         request: &GcRequest,
         inventory: &GcInventory,
         candidates: &mut Vec<GcCandidate>,
+        warnings: &mut Vec<String>,
         repos: &RootedDir,
         name: &str,
         project: &str,
@@ -916,8 +920,41 @@ impl<'a> HostGc<'a> {
             .open_child_directory(&relative(name)?, false)
             .map_err(WorkerError::Io)?;
         let refs = git_ref_names(self.runner, mirror.path())?;
-        let ref_ages = git_task_ref_ages(self.runner, mirror.path())?;
+        let ref_ages = git_task_ref_ages(self.runner, mirror.path(), warnings)?;
         for (reference, created_at_millis) in ref_ages {
+            if let Some(task_text) = reference.strip_prefix(SESSION_REF_PREFIX) {
+                let task_id = match task_text.parse::<TaskId>() {
+                    Ok(task_id) => task_id,
+                    Err(_) => {
+                        push_warning(warnings, "malformed session ref skipped");
+                        continue;
+                    }
+                };
+                if inventory.uncertain_task_projects.contains(project)
+                    || inventory.lease_uncertain
+                    || inventory
+                        .live_task_scopes
+                        .contains(&(project.to_owned(), task_id))
+                {
+                    continue;
+                }
+                let identifier = format!("{project}/{task_id}");
+                let collectable = match inventory.tasks.get(&identifier) {
+                    Some(task) => task.state.is_terminal() && !task.active_work,
+                    None => {
+                        session_ref_age(&mirror, &reference, created_at_millis).is_some_and(|age| {
+                            expired(request.now_millis(), age, request.task_retention_millis())
+                        })
+                    }
+                };
+                if collectable {
+                    push_candidate(
+                        candidates,
+                        GcCandidate::new("session", identifier, 0, "session ref retention")?,
+                    )?;
+                }
+                continue;
+            }
             let Some(task_text) = reference
                 .strip_prefix("refs/heads/task/")
                 .or_else(|| reference.strip_prefix("refs/mac-worker/bases/"))
@@ -1057,6 +1094,7 @@ impl<'a> HostGc<'a> {
                 Ok(true)
             }
             "branch" => self.apply_branch(candidate, inventory, request, mirrors_pending_gc),
+            "session" => self.apply_session_ref(candidate, inventory, request, mirrors_pending_gc),
             "job" if candidate.reason() == GC_REASON_LEGACY_PROTOCOL => {
                 push_record_warning(
                     warnings,
@@ -1073,6 +1111,76 @@ impl<'a> HostGc<'a> {
                 "GC response contains an unsupported candidate",
             )),
         }
+    }
+
+    fn apply_session_ref(
+        &self,
+        candidate: &GcCandidate,
+        inventory: &GcInventory,
+        request: &GcRequest,
+        mirrors_pending_gc: &mut BTreeSet<String>,
+    ) -> Result<bool, WorkerError> {
+        let (project, task_id) = parse_task_identifier(candidate.identifier())?;
+        if inventory.uncertain_task_projects.contains(project)
+            || inventory.lease_uncertain
+            || inventory
+                .live_task_scopes
+                .contains(&(project.to_owned(), task_id))
+        {
+            return Ok(false);
+        }
+        // Recheck leases even for absent records. A push may precede prepare.
+        let occupied = match LeaseService::new(self.store).occupied_slots() {
+            Ok(slots) => slots,
+            Err(_) => return Ok(false),
+        };
+        if occupied.iter().any(|slot| slot.lease.project_id() == project
+            && matches!(slot.execution_scope, ExecutionScope::Task { task_id: live } if live == task_id))
+        { return Ok(false); }
+        let record = match self
+            .store
+            .open_directory(&format!("tasks/{project}/{task_id}"), false)
+        {
+            Ok(task) => Some(task),
+            Err(WorkerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Ok(false),
+        };
+        if let Some(task) = record {
+            let status: TaskStatus = match read_gc_json(&task, "status.json", "task status") {
+                Ok(status) => status,
+                Err(_) => return Ok(false),
+            };
+            if !status.state().is_terminal()
+                || self.task_id_has_active_work(project, task_id, request.now_millis())?
+            {
+                return Ok(false);
+            }
+        }
+        let Some(mirror) = self.store.mirror_if_present(project)? else {
+            return Ok(false);
+        };
+        let reference = format!("{SESSION_REF_PREFIX}{task_id}");
+        // Ref enumeration/deletion are under the GC lock. Still recheck the
+        // age of an absent-record ref before deleting, rather than a stale
+        // collection timestamp.
+        if !inventory.tasks.contains_key(candidate.identifier()) {
+            let mut ignored_warnings = Vec::new();
+            let ages = git_task_ref_ages(self.runner, mirror.path(), &mut ignored_warnings)?;
+            if !ages.iter().any(|(name, age)| {
+                name == &reference
+                    && session_ref_age(&mirror, name, *age).is_some_and(|age| {
+                        expired(request.now_millis(), age, request.task_retention_millis())
+                    })
+            }) {
+                return Ok(false);
+            }
+        }
+        if !git_ref_exists(self.runner, mirror.path(), &reference)? {
+            return Ok(false);
+        }
+        delete_git_ref(self.runner, mirror.path(), &reference)?;
+        mirrors_pending_gc.insert(project.to_owned());
+        Ok(true)
     }
 
     fn apply_branch(
@@ -1110,8 +1218,16 @@ impl<'a> HostGc<'a> {
         };
         let branch = format!("refs/heads/task/{task_id}");
         let base = format!("refs/mac-worker/bases/{task_id}");
+        let session = format!("{SESSION_REF_PREFIX}{task_id}");
         let mut removed = false;
-        for reference in [&branch, &base] {
+        for reference in [&branch, &base, &session] {
+            if reference == &session {
+                // Branch retention must not bypass the shorter but independent
+                // session-ref retention/live-lease checks for absent records.
+                removed |=
+                    self.apply_session_ref(candidate, inventory, request, mirrors_pending_gc)?;
+                continue;
+            }
             if git_ref_exists(self.runner, mirror.path(), reference)? {
                 delete_git_ref(self.runner, mirror.path(), reference)?;
                 removed = true;
@@ -1273,7 +1389,7 @@ struct TaskSnapshot {
 
 fn candidate_rank(candidate: &GcCandidate) -> u8 {
     match candidate.kind() {
-        "branch" => 0,
+        "branch" | "session" => 0,
         "job" => 1,
         "task" => 2,
         "mirror" => 3,
@@ -1517,9 +1633,28 @@ pub(crate) fn git_ref_names(
     Ok(refs)
 }
 
+// The commit's creator date is not the ref's age: a retained laptop package
+// can be pushed much later. Protect recent loose refs and recently repacked
+// refs, and treat missing/unreadable age evidence as uncertainty.
+fn session_ref_age(mirror: &RootedDir, reference: &str, object_millis: u64) -> Option<u64> {
+    let inspection = match mirror.inspect(&relative(reference).ok()?) {
+        Ok(inspection) => inspection,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            mirror.inspect(&relative("packed-refs").ok()?).ok()?
+        }
+        Err(_) => return None,
+    };
+    if inspection.kind != EntryKind::RegularFile {
+        return None;
+    }
+    modified_millis(inspection.modified_seconds, inspection.modified_nanoseconds)
+        .map(|ref_millis| ref_millis.max(object_millis))
+}
+
 fn git_task_ref_ages(
     runner: &dyn ProcessRunner,
     path: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<(String, u64)>, WorkerError> {
     let result = run_git(
         runner,
@@ -1529,6 +1664,7 @@ fn git_task_ref_ages(
             "--format=%(refname)%09%(creatordate:unix)",
             "refs/heads/task",
             "refs/mac-worker/bases",
+            "refs/mac-worker/sessions",
         ],
     )?;
     if result.stdout.len() > MAX_GC_REF_BYTES {
@@ -1544,6 +1680,21 @@ fn git_task_ref_ages(
         let (reference, seconds) = line
             .split_once('\t')
             .ok_or_else(|| gc_protocol("GC_REF_INVALID", "mirror task ref age is missing"))?;
+        if (reference.starts_with(SESSION_REF_PREFIX)
+            || reference == SESSION_REF_PREFIX.trim_end_matches('/'))
+            && (reference
+                .strip_prefix(SESSION_REF_PREFIX)
+                .and_then(|task| task.parse::<TaskId>().ok())
+                .is_none()
+                || seconds
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|seconds| seconds.checked_mul(1000))
+                    .is_none())
+        {
+            push_warning(warnings, "malformed session ref skipped");
+            continue;
+        }
         if reference.len() > 1024
             || reference.bytes().any(|byte| byte.is_ascii_control())
             || seconds.is_empty()
