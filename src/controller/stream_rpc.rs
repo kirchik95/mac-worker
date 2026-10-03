@@ -14,7 +14,9 @@ use crate::{
         read::{ControllerReadIdentity, ControllerReadReply, invalid_controller_reply},
         registry::ProjectRegistry,
         store::ControllerStore,
-        transfer::{ControllerReceiveIdentity, ControllerTransfer, VerifiedResultMeta},
+        transfer::{
+            ControllerReceiveIdentity, ControllerTransfer, VerifiedResultMeta, validate_session_oid,
+        },
     },
     dag::DagNode,
     error::WorkerError,
@@ -64,9 +66,14 @@ pub struct ControllerSourcePrepareResult {
     project_id: String,
     worktree_id: String,
     expected_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_oid: Option<String>,
 }
 
 impl ControllerSourcePrepareResult {
+    pub fn session_oid(&self) -> Option<&str> {
+        self.session_oid.as_deref()
+    }
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -93,7 +100,8 @@ impl ControllerReadIdentity for ControllerSourcePrepareResult {
         require_string(request, "fingerprint", &self.fingerprint)?;
         require_string(request, "project_id", &self.project_id)?;
         require_string(request, "worktree_id", &self.worktree_id)?;
-        require_string(request, "expected_oid", &self.expected_oid)
+        require_string(request, "expected_oid", &self.expected_oid)?;
+        require_optional_string(request, "session_oid", self.session_oid())
     }
 }
 
@@ -104,9 +112,14 @@ pub struct ControllerSourceFinishResult {
     request_id: String,
     oid: String,
     request_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_oid: Option<String>,
 }
 
 impl ControllerSourceFinishResult {
+    pub fn session_oid(&self) -> Option<&str> {
+        self.session_oid.as_deref()
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub fn token(&self) -> &str {
         &self.token
@@ -126,7 +139,8 @@ impl ControllerReadIdentity for ControllerSourceFinishResult {
     fn verify_payload(&self, request: &ControllerRequest) -> Result<(), WorkerError> {
         require_string(request, "token", &self.token)?;
         require_string(request, "request_id", &self.request_id)?;
-        require_string(request, "expected_oid", &self.oid)
+        require_string(request, "expected_oid", &self.oid)?;
+        require_optional_string(request, "session_oid", self.session_oid())
     }
 }
 
@@ -196,6 +210,8 @@ struct SourcePrepareBody {
     project_id: String,
     worktree_id: String,
     expected_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_oid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +223,8 @@ struct SourceFinishBody {
     project_id: String,
     worktree_id: String,
     expected_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_oid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,8 +247,9 @@ fn prepare_source_reply(
     let oid: BaseOid = body.expected_oid.parse().map_err(|_| {
         WorkerError::Protocol("CONTROLLER_TRANSPORT: source prepare OID is invalid".into())
     })?;
+    validate_session_oid(body.session_oid.as_deref())?;
     let transfer = ControllerTransfer::open(&paths.controller_state_root())?;
-    let identity = transfer.prepare_source_receive(
+    let identity = transfer.prepare_source_receive_with_session(
         &paths.cache,
         runner,
         &body.request_id,
@@ -238,6 +257,7 @@ fn prepare_source_reply(
         &body.project_id,
         &body.worktree_id,
         &oid,
+        body.session_oid.as_deref(),
     )?;
     Ok(ControllerReadReply::from_request(
         request,
@@ -248,6 +268,7 @@ fn prepare_source_reply(
             project_id: identity.project_id().to_owned(),
             worktree_id: identity.worktree_id().to_owned(),
             expected_oid: identity.expected_oid().as_str().to_owned(),
+            session_oid: identity.session_oid().map(str::to_owned),
         },
     ))
 }
@@ -273,7 +294,8 @@ fn finish_source_reply(
         body.project_id,
         body.worktree_id,
         oid,
-    );
+    )
+    .with_session_oid(body.session_oid)?;
     let transfer = ControllerTransfer::open(&paths.controller_state_root())?;
     let receipt = transfer.finish_source_receive(&paths.cache, runner, &identity)?;
     Ok(ControllerReadReply::from_request(
@@ -283,6 +305,7 @@ fn finish_source_reply(
             request_id: receipt.request_id().to_owned(),
             oid: receipt.oid().as_str().to_owned(),
             request_ref: receipt.request_ref().to_owned(),
+            session_oid: receipt.session_oid().map(str::to_owned),
         },
     ))
 }
@@ -491,6 +514,22 @@ fn prepare_result_reply(
             worker,
         },
     ))
+}
+
+fn require_optional_string(
+    request: &ControllerRequest,
+    key: &str,
+    expected: Option<&str>,
+) -> Result<(), WorkerError> {
+    let value = match request.body().get(key) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => return Err(invalid_controller_reply()),
+    };
+    if value != expected {
+        return Err(invalid_controller_reply());
+    }
+    Ok(())
 }
 
 fn require_string(

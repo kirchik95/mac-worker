@@ -27,6 +27,7 @@ use crate::{
     process::ProcessRunner,
     protocol::PROTOCOL_VERSION,
     rooted_fs::RootedDir,
+    session_transfer::REQUEST_SESSION_REF_PREFIX,
     task::{BaseOid, TaskId, TurnId},
     transfer_repo::{ImportReceipt, TransferRepo, apply_isolated_git_environment},
 };
@@ -50,6 +51,7 @@ pub struct ControllerReceiveIdentity {
     project_id: String,
     worktree_id: String,
     expected_oid: BaseOid,
+    session_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,7 @@ pub struct ControllerSourceReceipt {
     oid: BaseOid,
     request_ref: String,
     token: String,
+    session_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +95,8 @@ struct SourceRecord {
     project_id: String,
     worktree_id: String,
     expected_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_oid: Option<String>,
     cache_id: String,
     receipt_oid: Option<String>,
 }
@@ -147,6 +152,16 @@ impl ControllerReceiveIdentity {
         &self.expected_oid
     }
 
+    pub fn session_oid(&self) -> Option<&str> {
+        self.session_oid.as_deref()
+    }
+
+    pub fn with_session_oid(mut self, session_oid: Option<String>) -> Result<Self, WorkerError> {
+        validate_session_oid(session_oid.as_deref())?;
+        self.session_oid = session_oid;
+        Ok(self)
+    }
+
     pub fn from_parts(
         token: String,
         request_id: String,
@@ -162,11 +177,15 @@ impl ControllerReceiveIdentity {
             project_id,
             worktree_id,
             expected_oid,
+            session_oid: None,
         }
     }
 }
 
 impl ControllerSourceReceipt {
+    pub fn session_oid(&self) -> Option<&str> {
+        self.session_oid.as_deref()
+    }
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -228,17 +247,49 @@ pub fn frozen_result_ref(request_id: &str, turn_id: TurnId) -> Result<String, Wo
     TransferRepo::frozen_controller_result_ref(request_id, &turn_id.to_string())
 }
 
+// Compatibility entry for the pre-session transfer fixtures.
+#[cfg(any(test, feature = "test-support"))]
 pub fn source_digest(
     project_id: &str,
     worktree_id: &str,
     expected_oid: &BaseOid,
 ) -> Result<String, WorkerError> {
-    let body = json!({
+    source_digest_with_session(project_id, worktree_id, expected_oid, None)
+}
+
+fn source_digest_with_session(
+    project_id: &str,
+    worktree_id: &str,
+    expected_oid: &BaseOid,
+    session_oid: Option<&str>,
+) -> Result<String, WorkerError> {
+    validate_session_oid(session_oid)?;
+    let mut body = json!({
         "expected_oid": expected_oid.as_str(),
         "project_id": project_id,
         "worktree_id": worktree_id,
     });
+    if let Some(oid) = session_oid {
+        body["session_oid"] = json!(oid);
+    }
     canonical_request_sha256(PROTOCOL_VERSION, SOURCE_COMMAND, &body)
+}
+
+pub(super) fn validate_session_oid(oid: Option<&str>) -> Result<(), WorkerError> {
+    if let Some(oid) = oid
+        && (![40, 64].contains(&oid.len())
+            || !oid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    {
+        return Err(invalid_component("session OID"));
+    }
+    Ok(())
+}
+
+pub(super) fn request_session_ref(request_id: &str) -> Result<String, WorkerError> {
+    validate_request_id(request_id)?;
+    Ok(format!("{REQUEST_SESSION_REF_PREFIX}{request_id}"))
 }
 
 pub fn result_digest(
@@ -261,8 +312,32 @@ impl ControllerTransfer {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_source_receive(
+        &self,
+        cache_root: &Path,
+        runner: &dyn ProcessRunner,
+        request_id: &str,
+        fingerprint: &RequestFingerprint,
+        project_id: &str,
+        worktree_id: &str,
+        expected_oid: &BaseOid,
+    ) -> Result<ControllerReceiveIdentity, WorkerError> {
+        self.prepare_source_receive_with_session(
+            cache_root,
+            runner,
+            request_id,
+            fingerprint,
+            project_id,
+            worktree_id,
+            expected_oid,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_source_receive_with_session(
         &self,
         cache_root: &Path,
         _runner: &dyn ProcessRunner,
@@ -271,11 +346,13 @@ impl ControllerTransfer {
         project_id: &str,
         worktree_id: &str,
         expected_oid: &BaseOid,
+        session_oid: Option<&str>,
     ) -> Result<ControllerReceiveIdentity, WorkerError> {
         validate_request_id(request_id)?;
         validate_sha256_id(project_id, "project ID")?;
         validate_sha256_id(worktree_id, "worktree ID")?;
-        let digest = source_digest(project_id, worktree_id, expected_oid)?;
+        let digest =
+            source_digest_with_session(project_id, worktree_id, expected_oid, session_oid)?;
         let cache_id = controller_transfer_cache_id(project_id, worktree_id)?;
         let _lock = self.lock_transfers()?;
         TransferRepo::open_or_create_controller_cache(cache_root, project_id, worktree_id)?;
@@ -286,6 +363,7 @@ impl ControllerTransfer {
                 project_id,
                 worktree_id,
                 expected_oid,
+                session_oid,
                 &digest,
                 &cache_id,
             )?;
@@ -303,6 +381,7 @@ impl ControllerTransfer {
             project_id: project_id.to_owned(),
             worktree_id: worktree_id.to_owned(),
             expected_oid: expected_oid.as_str().to_owned(),
+            session_oid: session_oid.map(str::to_owned),
             cache_id,
             receipt_oid: None,
         };
@@ -321,7 +400,6 @@ impl ControllerTransfer {
             .load_source_by_request(&identity.request_id)?
             .ok_or_else(missing_token)?;
         self.require_source_match(&record, identity)?;
-        self.repair_source_lookup(&record)?;
         let transfer = TransferRepo::open_controller_cache(
             cache_root,
             &record.project_id,
@@ -336,6 +414,8 @@ impl ControllerTransfer {
             .expected_oid
             .parse()
             .map_err(|_| invalid_component("expected OID"))?;
+        // Verify both exact refs, including completed-receipt replays.
+        require_received_refs(&transfer, runner, &record)?;
         if let Some(existing) = &record.receipt_oid {
             if existing != oid.as_str() {
                 return Err(conflict("source receipt already names a different object"));
@@ -347,9 +427,23 @@ impl ControllerTransfer {
                 oid,
                 request_ref,
                 token: record.token,
+                session_oid: record.session_oid,
             });
         }
         transfer.pin_frozen_source(runner, &record.request_id, &oid)?;
+        if let Some(session_oid) = &record.session_oid {
+            let session: BaseOid = session_oid
+                .parse()
+                .map_err(|_| invalid_component("session OID"))?;
+            // Controller caches have no laptop alternates. Reuse the shared
+            // owned-graph check and durable create-or-same pin engine.
+            transfer.require_owned_frozen_commit(runner, &session)?;
+            transfer.pin_request_ref_cas(
+                runner,
+                &request_session_ref(&record.request_id)?,
+                &session,
+            )?;
+        }
         let previous = encode(&record)?;
         record.receipt_oid = Some(oid.as_str().to_owned());
         let next = encode(&record)?;
@@ -366,13 +460,14 @@ impl ControllerTransfer {
             request_ref: TransferRepo::frozen_request_ref(identity.request_id())?,
             oid,
             token: record.token,
+            session_oid: record.session_oid,
         })
     }
 
     /// Final submit binding: same outer fingerprint and nested source fields,
-    /// then finish (idempotent) so a crash between push and the finish RPC
-    /// still pins before ACK. Token is loaded from the durable record, never
-    /// from the frozen submit envelope.
+    /// then finish (idempotent) for ordinary sources. Imported submits require
+    /// a completed stream receipt: envelope-only retries cannot finish an
+    /// interrupted stream. Token comes from the durable record, not the envelope.
     pub fn bind_source_for_submit(
         &self,
         cache_root: &Path,
@@ -384,7 +479,12 @@ impl ControllerTransfer {
             let record = self
                 .load_source_by_request(bind.request_id)?
                 .ok_or_else(missing_token)?;
-            let digest = source_digest(bind.project_id, bind.worktree_id, bind.expected_oid)?;
+            let digest = source_digest_with_session(
+                bind.project_id,
+                bind.worktree_id,
+                bind.expected_oid,
+                bind.session_oid,
+            )?;
             let cache_id = controller_transfer_cache_id(bind.project_id, bind.worktree_id)?;
             reuse_source(
                 &record,
@@ -392,9 +492,15 @@ impl ControllerTransfer {
                 bind.project_id,
                 bind.worktree_id,
                 bind.expected_oid,
+                bind.session_oid,
                 &digest,
                 &cache_id,
             )?;
+            if bind.session_oid.is_some() && record.receipt_oid.is_none() {
+                return Err(conflict(
+                    "imported source stream has not finished; resume the source stream before retrying",
+                ));
+            }
             identity_from_source(&record)?
         };
         self.finish_source_receive(cache_root, runner, &identity)
@@ -490,7 +596,12 @@ impl ControllerTransfer {
         }
         self.repair_source_lookup(&record)?;
         let expected: BaseOid = oid.parse().map_err(|_| invalid_component("expected OID"))?;
-        let digest = source_digest(project_id, worktree_id, &expected)?;
+        let digest = source_digest_with_session(
+            project_id,
+            worktree_id,
+            &expected,
+            record.session_oid.as_deref(),
+        )?;
         if digest != record.source_digest {
             return Err(mismatch());
         }
@@ -499,7 +610,18 @@ impl ControllerTransfer {
             return Err(mismatch());
         }
         let request_ref = TransferRepo::frozen_request_ref(request_id)?;
-        let hook_dir = write_receive_hook(transfer.path(), token, &request_ref, oid)?;
+        let session_ref = record
+            .session_oid
+            .as_ref()
+            .map(|_| request_session_ref(request_id))
+            .transpose()?;
+        let hook_dir = write_receive_hook(
+            transfer.path(),
+            token,
+            &request_ref,
+            oid,
+            session_ref.as_deref().zip(record.session_oid.as_deref()),
+        )?;
         let mirror = RootedDir::open(transfer.path()).map_err(WorkerError::Io)?;
         mirror
             .verify_descriptors_cloexec()
@@ -753,16 +875,18 @@ impl ControllerTransfer {
             || record.project_id != identity.project_id
             || record.worktree_id != identity.worktree_id
             || record.expected_oid != identity.expected_oid.as_str()
+            || record.session_oid != identity.session_oid
         {
             return Err(mismatch());
         }
-        let digest = source_digest(
+        let digest = source_digest_with_session(
             &record.project_id,
             &record.worktree_id,
             &record
                 .expected_oid
                 .parse()
                 .map_err(|_| invalid_component("expected OID"))?,
+            record.session_oid.as_deref(),
         )?;
         if digest != record.source_digest {
             return Err(mismatch());
@@ -789,12 +913,46 @@ pub fn import_controller_result(
     )
 }
 
+fn require_received_refs(
+    transfer: &TransferRepo,
+    runner: &dyn ProcessRunner,
+    record: &SourceRecord,
+) -> Result<(), WorkerError> {
+    let request_ref = TransferRepo::frozen_request_ref(&record.request_id)?;
+    if transfer
+        .read_ref_oid(runner, &request_ref)?
+        .as_ref()
+        .map(BaseOid::as_str)
+        != Some(record.expected_oid.as_str())
+    {
+        return Err(conflict(
+            "streamed source ref is missing or does not match the expected OID",
+        ));
+    }
+    if let Some(oid) = &record.session_oid {
+        let reference = request_session_ref(&record.request_id)?;
+        if transfer
+            .read_ref_oid(runner, &reference)?
+            .as_ref()
+            .map(BaseOid::as_str)
+            != Some(oid.as_str())
+        {
+            return Err(conflict(
+                "streamed session ref is missing or does not match the expected OID",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn reuse_source(
     existing: &SourceRecord,
     fingerprint: &RequestFingerprint,
     project_id: &str,
     worktree_id: &str,
     expected_oid: &BaseOid,
+    session_oid: Option<&str>,
     digest: &str,
     cache_id: &str,
 ) -> Result<(), WorkerError> {
@@ -802,6 +960,7 @@ fn reuse_source(
         || existing.project_id != project_id
         || existing.worktree_id != worktree_id
         || existing.expected_oid != expected_oid.as_str()
+        || existing.session_oid.as_deref() != session_oid
         || existing.source_digest != digest
         || existing.cache_id != cache_id
         || existing.version != RECORD_VERSION
@@ -852,7 +1011,12 @@ fn validate_source_record(record: &SourceRecord, request_id: &str) -> Result<(),
         .expected_oid
         .parse()
         .map_err(|_| invalid_component("expected OID"))?;
-    let digest = source_digest(&record.project_id, &record.worktree_id, &expected)?;
+    let digest = source_digest_with_session(
+        &record.project_id,
+        &record.worktree_id,
+        &expected,
+        record.session_oid.as_deref(),
+    )?;
     if digest != record.source_digest {
         return Err(mismatch());
     }
@@ -905,6 +1069,7 @@ fn identity_from_source(record: &SourceRecord) -> Result<ControllerReceiveIdenti
             .expected_oid
             .parse()
             .map_err(|_| invalid_component("expected OID"))?,
+        session_oid: record.session_oid.clone(),
     })
 }
 
@@ -935,8 +1100,17 @@ fn write_receive_hook(
     token: &str,
     request_ref: &str,
     oid: &str,
+    session: Option<(&str, &str)>,
 ) -> Result<PathBuf, WorkerError> {
     validate_token(token)?;
+    validate_session_oid(session.map(|(_, oid)| oid))?;
+    if let Some((reference, _)) = session
+        && !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_component("receive hook session ref"));
+    }
     if !request_ref
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
@@ -953,8 +1127,11 @@ fn write_receive_hook(
     fs::create_dir_all(&dir).map_err(WorkerError::Io)?;
     let staged = dir.join("pre-receive.tmp");
     let hook = dir.join("pre-receive");
+    let session_case = session
+        .map(|(reference, oid)| format!("    '{reference}') expected='{oid}' ;;\n"))
+        .unwrap_or_default();
     let script = format!(
-        "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  if [ \"$ref\" != '{request_ref}' ]; then echo 'mac-worker: ref not allowed' >&2; status=1; fi\n  if [ \"$new\" = '0000000000000000000000000000000000000000' ]; then echo 'mac-worker: deletion not allowed' >&2; status=1; fi\n  if [ \"$new\" != '{oid}' ]; then echo 'mac-worker: oid mismatch' >&2; status=1; fi\ndone\nexit $status\n"
+        "#!/bin/sh\nstatus=0\nwhile read old new ref; do\n  case \"$ref\" in\n    '{request_ref}') expected='{oid}' ;;\n{session_case}    *) echo 'mac-worker: ref not allowed' >&2; status=1; continue ;;\n  esac\n  case \"$new\" in *[!0]*) ;; *) echo 'mac-worker: deletion not allowed' >&2; status=1 ;; esac\n  if [ \"$new\" != \"$expected\" ]; then echo 'mac-worker: oid mismatch' >&2; status=1; fi\ndone\nexit $status\n"
     );
     fs::write(&staged, script).map_err(WorkerError::Io)?;
     let mut permissions = fs::metadata(&staged)

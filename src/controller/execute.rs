@@ -41,13 +41,15 @@ use crate::{
         task_mutations::{
             PreparedTaskMutation, execute_task_mutation, mutation_task_id, prepare_task_mutation,
         },
-        transfer::{ControllerTransfer, SourceSubmitBind},
+        transfer::{ControllerTransfer, SourceSubmitBind, request_session_ref},
     },
     error::WorkerError,
     job::{HostControlError, RequestFingerprint},
     paths::PathLayout,
     prepared_submit::FrozenSubmitBody,
     process::{ProcessPolicy, ProcessRequest, ProcessResult, ProcessRunner},
+    session_transfer::SESSION_REF_PREFIX,
+    task::{BaseOid, TaskId},
     task_client::{TaskClient, validate_close_target},
     transfer_repo::TransferRepo,
     turn_runner::{DetachedRunnerExecutor, RunnerExecutor},
@@ -260,6 +262,7 @@ impl TaskSubmitHandler<'_> {
                 source.project_id(),
                 source.worktree_id(),
                 source.expected_oid(),
+                None,
             )?;
         }
         let identities: Vec<(String, String)> = prepared
@@ -326,7 +329,10 @@ impl TaskSubmitHandler<'_> {
             &self.paths.cache,
             self.runner,
             SourceSubmitBind {
-                session_oid: None,
+                session_oid: body
+                    .session_import
+                    .as_ref()
+                    .map(|import| import.package_oid()),
                 request_id: record.request_id(),
                 fingerprint: &fingerprint,
                 project_id: &body.project_id,
@@ -334,7 +340,13 @@ impl TaskSubmitHandler<'_> {
                 expected_oid: &body.base_oid,
             },
         )?;
-        if receipt.oid().as_str() != body.base_oid.as_str() {
+        if receipt.oid().as_str() != body.base_oid.as_str()
+            || receipt.session_oid()
+                != body
+                    .session_import
+                    .as_ref()
+                    .map(|import| import.package_oid())
+        {
             return Err(WorkerError::Protocol(
                 "CONTROLLER_REQUEST_CONFLICT: source receipt does not match the frozen base".into(),
             ));
@@ -386,6 +398,9 @@ fn materialize_frozen_checkout(
         &body.project_id,
         &body.worktree_id,
         &body.base_oid,
+        body.session_import
+            .as_ref()
+            .map(|import| (body.task_id, import.package_oid())),
     )
 }
 
@@ -396,7 +411,35 @@ fn materialize_controller_checkout(
     project_id: &str,
     worktree_id: &str,
     base_oid: &crate::task::BaseOid,
+    session: Option<(TaskId, &str)>,
 ) -> Result<std::path::PathBuf, WorkerError> {
+    // Resolve and compare the request-session ref before creating checkouts,
+    // registry rows, task pins, or starting the TaskClient submit transaction.
+    let verified_session = if let Some((task_id, expected)) = session {
+        let transfer = TransferRepo::open_controller_cache(&paths.cache, project_id, worktree_id)?;
+        let reference = request_session_ref(request_id)?;
+        let oid = transfer
+            .read_ref_oid(runner, &reference)?
+            .filter(|oid| oid.as_str() == expected)
+            .ok_or_else(|| {
+                WorkerError::Protocol(
+                    "CONTROLLER_REQUEST_CONFLICT: session ref does not match the frozen package"
+                        .into(),
+                )
+            })?;
+        transfer.require_owned_frozen_commit(runner, &oid)?;
+        let task_ref = format!("{SESSION_REF_PREFIX}{task_id}");
+        if let Some(existing) = transfer.read_ref_oid(runner, &task_ref)?
+            && existing != oid
+        {
+            return Err(WorkerError::Protocol(
+                "CONTROLLER_REQUEST_CONFLICT: task session pin names a different package".into(),
+            ));
+        }
+        Some((reference, task_ref, oid))
+    } else {
+        None
+    };
     let checkout =
         registry::checkout_path(&paths.controller_project_root(), project_id, worktree_id)?;
     registry::ensure_checkout_dir(&checkout)?;
@@ -412,20 +455,54 @@ fn materialize_controller_checkout(
         code: "BASE_UNAVAILABLE",
         message: "transfer repository path is not UTF-8".into(),
     })?;
-    git_with_dir(
-        runner,
-        &git_dir,
-        None,
-        &[
-            "-c",
-            "core.fsyncObjectFiles=true",
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            transfer_path,
-            &format!("{source_ref}:{checkout_ref}"),
-        ],
-    )?;
+    let base_spec = format!("{source_ref}:{checkout_ref}");
+    let session_spec = verified_session
+        .as_ref()
+        .map(|(reference, _, _)| format!("{reference}:{reference}"));
+    let mut fetch_args = vec![
+        "-c",
+        "core.fsyncObjectFiles=true",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        transfer_path,
+        &base_spec,
+    ];
+    if let Some(spec) = &session_spec {
+        fetch_args.push(spec);
+    }
+    git_with_dir(runner, &git_dir, None, &fetch_args)?;
+    if let Some((reference, task_ref, oid)) = &verified_session {
+        let fetched = run_git_output(
+            runner,
+            vec![
+                "--git-dir".into(),
+                git_dir.as_os_str().to_owned(),
+                "rev-parse".into(),
+                "--verify".into(),
+                "--end-of-options".into(),
+                reference.into(),
+            ],
+        )?;
+        let fetched: BaseOid = String::from_utf8(fetched)
+            .map_err(|_| {
+                WorkerError::Protocol("CONTROLLER_TRANSPORT: invalid fetched session OID".into())
+            })?
+            .trim()
+            .parse()
+            .map_err(|_| {
+                WorkerError::Protocol("CONTROLLER_TRANSPORT: invalid fetched session OID".into())
+            })?;
+        if fetched != *oid {
+            return Err(WorkerError::Protocol(
+                "CONTROLLER_REQUEST_CONFLICT: fetched session does not match the frozen package"
+                    .into(),
+            ));
+        }
+        // This is the same controller cache selected by submit_prepared and
+        // registry::open_transfer_repo for the shared runner's push_base.
+        transfer.pin_request_ref_cas(runner, task_ref, oid)?;
+    }
     let worktree = checkout.join("requests").join(request_id);
     ensure_request_worktree(runner, &git_dir, &worktree, &checkout_ref, base_oid)?;
     let registry = ProjectRegistry::open(&paths.controller_state_root())?;
@@ -512,6 +589,10 @@ fn git_with_dir(
 }
 
 fn run_git(runner: &dyn ProcessRunner, args: Vec<OsString>) -> Result<(), WorkerError> {
+    run_git_output(runner, args).map(|_| ())
+}
+
+fn run_git_output(runner: &dyn ProcessRunner, args: Vec<OsString>) -> Result<Vec<u8>, WorkerError> {
     let request = ProcessRequest {
         program: OsString::from(GIT_PROGRAM),
         args,
@@ -538,7 +619,7 @@ fn run_git(runner: &dyn ProcessRunner, args: Vec<OsString>) -> Result<(), Worker
     };
     let result = runner.run(&request)?;
     if result.status.success() {
-        Ok(())
+        Ok(result.stdout)
     } else {
         Err(WorkerError::Git {
             code: "BASE_UNAVAILABLE",
