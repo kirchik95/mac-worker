@@ -1007,6 +1007,32 @@ JSON error events keep a plain public `message`. Human-readable diagnostics on s
 <!-- error-catalog:start -->
 | Code | Exit | Hint |
 |---|---|---|
+| `INTEGRATION_AUTH_FAILED` | 69 | repair the worker origin login, then run worker task integrate |
+| `INTEGRATION_NETWORK` | 69 | restore origin connectivity, then retry integration |
+| `INTEGRATION_POLICY_REJECTED` | 69 | repair target branch policy or permissions, then retry integration |
+| `INTEGRATION_TARGET_MISSING` | 64 | create the configured origin branch or resubmit with a valid target |
+| `INTEGRATION_BASE_NOT_ON_TARGET` | 64 | resubmit from a committed base reachable from the configured target |
+| `INTEGRATION_WIP_BASE` | 64 | commit the intended task input and resubmit without --wip |
+| `INTEGRATION_TARGET_MOVED_EXHAUSTED` | 64 | retry integration when other target pushes have settled |
+| `INTEGRATION_CONFLICT_BUDGET_EXHAUSTED` | 64 | provide resolution guidance in a new task turn |
+| `INTEGRATION_RESOLUTION_INCOMPLETE` | 70 | resolve all unmerged paths and introduced conflict markers |
+| `INTEGRATION_CHECKS_FAILED` | 64 | repair the reported failing checks through a new agent turn |
+| `INTEGRATION_CHECKS_NOT_RUN` | 64 | repair check access or instructions and report all required recovery checks |
+| `INTEGRATION_RESOLVE_BLOCKED` | 64 | inspect the auxiliary result and logs before retrying integration |
+| `INTEGRATION_FOLLOWUP_LIMIT` | 64 | resubmit with sufficient task follow-up allowance |
+| `INTEGRATION_VERIFY_CHANGED_TREE` | 64 | use an ordinary follow-up to repair the candidate instead of editing during verification |
+| `INTEGRATION_VERIFY_TREE_MISMATCH` | 70 | retain the candidate diagnostics and repair merge or attribute handling |
+| `INTEGRATION_TURN_QUEUE_TIMEOUT` | 75 | retry integration when the pinned worker has capacity |
+| `INTEGRATION_WORKER_OFFLINE` | 69 | restore the original worker and retry integration |
+| `INTEGRATION_WORKSPACE_MISSING` | 70 | keep the retained task result and resubmit from published input |
+| `INTEGRATION_UNAVAILABLE` | 69 | restore compatible integration support and clear the controller stop gate |
+| `INTEGRATION_PUBLISH_TARGET_COLLISION` | 64 | choose a task publication branch separate from the integration target |
+| `INTEGRATION_CONFLICT_LIST_TOO_LARGE` | 64 | split the work or guide a new turn with fewer conflicts |
+| `INTEGRATION_STATE_INVALID` | 70 | retain the durable evidence and repair the integration installation |
+| `INTEGRATION_DEPENDENCY_BLOCKED` | 64 | recover the parent integration before running dependent tasks |
+| `INTEGRATION_DEPENDENCY_NOT_INTEGRATED` | 64 | resubmit dependent tasks after their parent has integrated |
+| `INTEGRATION_STOP_UNCONFIRMED` | 69 | restore worker connectivity so the pending stop and push outcome can be confirmed |
+| `INTEGRATION_ALREADY_COMMITTED` | 64 | keep the integration receipt and close the task if desired |
 | `SESSION_NOT_FOUND` | 64 | check the session id, or omit it to pick the newest session of this project |
 | `SESSION_UNREADABLE` | 64 | the session is not valid JSONL; pick another session |
 | `SESSION_TOO_LARGE` | 64 | the session exceeds 64 MiB; use the handoff-note recipe instead |

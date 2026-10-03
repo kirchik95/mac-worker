@@ -87,6 +87,22 @@ impl IntegrationId {
     pub fn as_uuid(self) -> uuid::Uuid {
         self.0
     }
+    pub fn derive(
+        task: TaskId,
+        source: TurnId,
+        head: &BaseOid,
+        key: &TargetKey,
+    ) -> Result<Self, WorkerError> {
+        let key = key.canonical_bytes()?;
+        let mut digest = Sha256::new();
+        digest.update(b"mac-worker/integration/v1\0");
+        digest.update(task.as_uuid().as_bytes());
+        digest.update(source.as_uuid().as_bytes());
+        digest.update(head.as_str().as_bytes());
+        digest.update((key.len() as u64).to_be_bytes());
+        digest.update(key);
+        Ok(Self(uuid_v8(digest)))
+    }
 }
 impl fmt::Display for IntegrationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,7 +248,8 @@ contract!(FrozenIntegrationPolicy {
     verify: VerifyPolicy,
     requested_close: ClosePolicy,
     base_kind: IntegrationBaseKind,
-    base_oid: BaseOid,
+    base_oid: Option<BaseOid>,
+    base_task: Option<TaskId>,
     base_preflight: IntegrationBasePreflight,
     project_id: String,
 });
@@ -243,7 +260,12 @@ impl FrozenIntegrationPolicy {
 }
 impl ValidateIntegration for FrozenIntegrationPolicy {
     fn validate(&self) -> Result<(), WorkerError> {
-        if self.schema_version != INTEGRATION_SCHEMA_VERSION || !valid_digest(&self.project_id) {
+        if self.schema_version != INTEGRATION_SCHEMA_VERSION
+            || !valid_digest(&self.project_id)
+            || (self.base_kind == IntegrationBaseKind::Committed
+                && (self.base_oid.is_none() || self.base_task.is_some()))
+            || (self.base_kind == IntegrationBaseKind::FromTask && self.base_task.is_none())
+        {
             return Err(invalid());
         }
         canonical_origin(&self.origin)?;
@@ -269,6 +291,174 @@ pub enum IntegrationStatus {
     Blocked,
     Revoked,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrationTransition {
+    pub from: Option<IntegrationStatus>,
+    pub next: &'static [IntegrationStatus],
+    pub resume: bool,
+    pub manual_redrive: bool,
+    pub legacy_settlement: bool,
+    pub new_cycle: bool,
+}
+pub const INTEGRATION_TRANSITIONS: &[IntegrationTransition] = &[
+    IntegrationTransition {
+        from: None,
+        next: &[IntegrationStatus::Armed],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: false,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Armed),
+        next: &[IntegrationStatus::Pending, IntegrationStatus::Revoked],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: false,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Pending),
+        next: &[
+            IntegrationStatus::Fetching,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Fetching),
+        next: &[
+            IntegrationStatus::Resolving,
+            IntegrationStatus::Verifying,
+            IntegrationStatus::CommitReady,
+            IntegrationStatus::Integrated,
+            IntegrationStatus::RetryWait,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Resolving),
+        next: &[
+            IntegrationStatus::Fetching,
+            IntegrationStatus::RetryWait,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Verifying),
+        next: &[
+            IntegrationStatus::Fetching,
+            IntegrationStatus::RetryWait,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::CommitReady),
+        next: &[
+            IntegrationStatus::Pushing,
+            IntegrationStatus::Fetching,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Pushing),
+        next: &[
+            IntegrationStatus::Published,
+            IntegrationStatus::Fetching,
+            IntegrationStatus::RetryWait,
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Published),
+        next: &[
+            IntegrationStatus::Integrated,
+            IntegrationStatus::RetryWait,
+            IntegrationStatus::Parked,
+        ],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::RetryWait),
+        next: &[
+            IntegrationStatus::Parked,
+            IntegrationStatus::Blocked,
+            IntegrationStatus::Revoked,
+        ],
+        resume: true,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Parked),
+        next: &[IntegrationStatus::Revoked],
+        resume: true,
+        manual_redrive: false,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Integrated),
+        next: &[],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: false,
+        new_cycle: true,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Blocked),
+        next: &[IntegrationStatus::Revoked],
+        resume: false,
+        manual_redrive: true,
+        legacy_settlement: true,
+        new_cycle: false,
+    },
+    IntegrationTransition {
+        from: Some(IntegrationStatus::Revoked),
+        next: &[],
+        resume: false,
+        manual_redrive: false,
+        legacy_settlement: false,
+        new_cycle: true,
+    },
+];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationPauseReason {
@@ -325,6 +515,70 @@ pub enum IntegrationCode {
     IntegrationDependencyNotIntegrated,
     IntegrationStopUnconfirmed,
     IntegrationAlreadyCommitted,
+}
+
+impl IntegrationCode {
+    pub const ALL: &'static [Self] = &[
+        Self::IntegrationAuthFailed,
+        Self::IntegrationNetwork,
+        Self::IntegrationPolicyRejected,
+        Self::IntegrationTargetMissing,
+        Self::IntegrationBaseNotOnTarget,
+        Self::IntegrationWipBase,
+        Self::IntegrationTargetMovedExhausted,
+        Self::IntegrationConflictBudgetExhausted,
+        Self::IntegrationResolutionIncomplete,
+        Self::IntegrationChecksFailed,
+        Self::IntegrationChecksNotRun,
+        Self::IntegrationResolveBlocked,
+        Self::IntegrationFollowupLimit,
+        Self::IntegrationVerifyChangedTree,
+        Self::IntegrationVerifyTreeMismatch,
+        Self::IntegrationTurnQueueTimeout,
+        Self::IntegrationWorkerOffline,
+        Self::IntegrationWorkspaceMissing,
+        Self::IntegrationUnavailable,
+        Self::IntegrationPublishTargetCollision,
+        Self::IntegrationConflictListTooLarge,
+        Self::IntegrationStateInvalid,
+        Self::IntegrationDependencyBlocked,
+        Self::IntegrationDependencyNotIntegrated,
+        Self::IntegrationStopUnconfirmed,
+        Self::IntegrationAlreadyCommitted,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IntegrationAuthFailed => "INTEGRATION_AUTH_FAILED",
+            Self::IntegrationNetwork => "INTEGRATION_NETWORK",
+            Self::IntegrationPolicyRejected => "INTEGRATION_POLICY_REJECTED",
+            Self::IntegrationTargetMissing => "INTEGRATION_TARGET_MISSING",
+            Self::IntegrationBaseNotOnTarget => "INTEGRATION_BASE_NOT_ON_TARGET",
+            Self::IntegrationWipBase => "INTEGRATION_WIP_BASE",
+            Self::IntegrationTargetMovedExhausted => "INTEGRATION_TARGET_MOVED_EXHAUSTED",
+            Self::IntegrationConflictBudgetExhausted => "INTEGRATION_CONFLICT_BUDGET_EXHAUSTED",
+            Self::IntegrationResolutionIncomplete => "INTEGRATION_RESOLUTION_INCOMPLETE",
+            Self::IntegrationChecksFailed => "INTEGRATION_CHECKS_FAILED",
+            Self::IntegrationChecksNotRun => "INTEGRATION_CHECKS_NOT_RUN",
+            Self::IntegrationResolveBlocked => "INTEGRATION_RESOLVE_BLOCKED",
+            Self::IntegrationFollowupLimit => "INTEGRATION_FOLLOWUP_LIMIT",
+            Self::IntegrationVerifyChangedTree => "INTEGRATION_VERIFY_CHANGED_TREE",
+            Self::IntegrationVerifyTreeMismatch => "INTEGRATION_VERIFY_TREE_MISMATCH",
+            Self::IntegrationTurnQueueTimeout => "INTEGRATION_TURN_QUEUE_TIMEOUT",
+            Self::IntegrationWorkerOffline => "INTEGRATION_WORKER_OFFLINE",
+            Self::IntegrationWorkspaceMissing => "INTEGRATION_WORKSPACE_MISSING",
+            Self::IntegrationUnavailable => "INTEGRATION_UNAVAILABLE",
+            Self::IntegrationPublishTargetCollision => "INTEGRATION_PUBLISH_TARGET_COLLISION",
+            Self::IntegrationConflictListTooLarge => "INTEGRATION_CONFLICT_LIST_TOO_LARGE",
+            Self::IntegrationStateInvalid => "INTEGRATION_STATE_INVALID",
+            Self::IntegrationDependencyBlocked => "INTEGRATION_DEPENDENCY_BLOCKED",
+            Self::IntegrationDependencyNotIntegrated => "INTEGRATION_DEPENDENCY_NOT_INTEGRATED",
+            Self::IntegrationStopUnconfirmed => "INTEGRATION_STOP_UNCONFIRMED",
+            Self::IntegrationAlreadyCommitted => "INTEGRATION_ALREADY_COMMITTED",
+        }
+    }
+    pub fn error(self) -> WorkerError {
+        integration_error(self.as_str())
+    }
 }
 contract!(IntegrationSnapshot {
     schema_version: u32, integration_id: IntegrationId, epoch: u32,
@@ -842,6 +1096,32 @@ contract!(HostIntegrationRequest {
     revision: IntegrationRevision,
     action: HostIntegrationAction,
 });
+contract!(IntegrationResponseIdentity {
+    protocol_version: u32,
+    task_id: TaskId,
+    integration_id: IntegrationId,
+    epoch: u32,
+    revision: IntegrationRevision,
+});
+impl ValidateIntegration for IntegrationResponseIdentity {
+    fn validate(&self) -> Result<(), WorkerError> {
+        if self.protocol_version != crate::protocol::PROTOCOL_VERSION || self.revision.0 == 0 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+impl IntegrationResponseIdentity {
+    pub fn for_request(request: &HostIntegrationRequest) -> Self {
+        Self {
+            protocol_version: request.protocol_version,
+            task_id: request.task_id,
+            integration_id: request.integration_id,
+            epoch: request.epoch,
+            revision: request.revision,
+        }
+    }
+}
 impl ValidateIntegration for HostIntegrationRequest {
     fn validate(&self) -> Result<(), WorkerError> {
         if self.protocol_version != crate::protocol::PROTOCOL_VERSION || self.revision.0 == 0 {
@@ -873,33 +1153,85 @@ impl ValidateIntegration for HostIntegrationRequest {
 #[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostIntegrationResponse {
     Progress {
+        identity: IntegrationResponseIdentity,
         snapshot: IntegrationSnapshot,
     },
     NeedTurn {
+        identity: IntegrationResponseIdentity,
         candidate: Box<IntegrationCandidate>,
         purpose: IntegrationTurnPurpose,
     },
     TargetMoved {
+        identity: IntegrationResponseIdentity,
         observed_target: BaseOid,
     },
     Integrated {
+        identity: IntegrationResponseIdentity,
         receipt: IntegrationReceipt,
     },
     Blocked {
+        identity: IntegrationResponseIdentity,
         code: IntegrationCode,
         retry_exhausted: bool,
     },
     Revoked {
-        integration_id: IntegrationId,
-        epoch: u32,
+        identity: IntegrationResponseIdentity,
     },
+}
+impl HostIntegrationResponse {
+    pub fn identity(&self) -> &IntegrationResponseIdentity {
+        match self {
+            Self::Progress { identity, .. }
+            | Self::NeedTurn { identity, .. }
+            | Self::TargetMoved { identity, .. }
+            | Self::Integrated { identity, .. }
+            | Self::Blocked { identity, .. }
+            | Self::Revoked { identity } => identity,
+        }
+    }
+    pub fn validate_for(&self, request: &HostIntegrationRequest) -> Result<(), WorkerError> {
+        request.validate()?;
+        self.validate()?;
+        if self.identity() != &IntegrationResponseIdentity::for_request(request) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 impl ValidateIntegration for HostIntegrationResponse {
     fn validate(&self) -> Result<(), WorkerError> {
+        self.identity().validate()?;
         match self {
-            Self::Progress { snapshot } => snapshot.validate()?,
-            Self::NeedTurn { candidate, .. } => candidate.validate()?,
-            Self::Integrated { receipt } => receipt.validate()?,
+            Self::Progress { snapshot, identity } => {
+                snapshot.validate()?;
+                if snapshot.integration_id != identity.integration_id
+                    || snapshot.epoch != identity.epoch
+                    || snapshot.revision != identity.revision
+                {
+                    return Err(invalid());
+                }
+            }
+            Self::NeedTurn {
+                candidate,
+                identity,
+                ..
+            } => {
+                candidate.validate()?;
+                if candidate.id.integration_id != identity.integration_id
+                    || candidate.id.epoch != identity.epoch
+                    || candidate.clean_h.branch != BranchName::for_task(identity.task_id)
+                {
+                    return Err(invalid());
+                }
+            }
+            Self::Integrated { receipt, identity } => {
+                receipt.validate()?;
+                if receipt.integration_id != identity.integration_id
+                    || receipt.epoch != identity.epoch
+                {
+                    return Err(invalid());
+                }
+            }
             _ => {}
         }
         check_size(self, MAX_INTEGRATION_RPC_BYTES)
@@ -915,7 +1247,11 @@ impl ValidateIntegration for FrozenIntegratingSubmit {
         if self.submit.close_on != ClosePolicy::Never
             || self.submit.wip
             || self.submit.project_id != self.integration.project_id
-            || self.submit.base_oid != self.integration.base_oid
+            || self
+                .integration
+                .base_oid
+                .as_ref()
+                .is_some_and(|base| base != &self.submit.base_oid)
             || self.submit.origin_url.as_deref() != Some(self.integration.origin.as_str())
             || self.submit.publish_branch.as_deref() == Some(self.integration.target.as_str())
         {
@@ -1118,4 +1454,207 @@ pub fn encode_host_response(value: &HostIntegrationResponse) -> Result<Vec<u8>, 
 }
 pub fn decode_host_response(bytes: &[u8]) -> Result<HostIntegrationResponse, WorkerError> {
     decode_bounded(bytes, MAX_INTEGRATION_RPC_BYTES)
+}
+
+pub fn auxiliary_turn_id(
+    id: IntegrationId,
+    epoch: u32,
+    attempt: u8,
+    purpose: IntegrationTurnPurpose,
+    ordinal: u8,
+) -> Result<TurnId, WorkerError> {
+    let cap = match purpose {
+        IntegrationTurnPurpose::Resolve => MAX_RESOLVE_TURNS,
+        IntegrationTurnPurpose::Verify => MAX_VERIFY_TURNS,
+    };
+    if attempt == 0 || attempt as usize > MAX_CANDIDATES || ordinal == 0 || ordinal > cap {
+        return Err(invalid());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"mac-worker/integration-turn/v1\0");
+    digest.update(id.as_uuid().as_bytes());
+    digest.update(epoch.to_be_bytes());
+    digest.update([
+        attempt,
+        match purpose {
+            IntegrationTurnPurpose::Resolve => 0,
+            IntegrationTurnPurpose::Verify => 1,
+        },
+        ordinal,
+    ]);
+    Ok(TurnId::new(uuid_v8(digest)))
+}
+fn uuid_v8(digest: Sha256) -> uuid::Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest.finalize()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn task() -> TaskId {
+        TaskId::new(uuid::Uuid::from_u128(2))
+    }
+    fn source() -> TurnId {
+        TurnId::new(uuid::Uuid::from_u128(3))
+    }
+    fn head() -> BaseOid {
+        "a".repeat(40).parse().unwrap()
+    }
+
+    #[test]
+    fn canonical_identity_binds_task_source_head_and_target() {
+        let key = TargetKey::new(
+            "https://user:password@EXAMPLE.test/repo.git?secret=x",
+            "main",
+        )
+        .unwrap();
+        assert_eq!(key.origin, "https://example.test/repo.git");
+        let id = IntegrationId::derive(task(), source(), &head(), &key).unwrap();
+        assert_eq!(id.to_string(), "df525afd-647b-82bb-884e-d5eb88429385");
+        assert_eq!(
+            id,
+            IntegrationId::derive(
+                task(),
+                source(),
+                &head(),
+                &TargetKey::new("https://example.test/repo.git", "main").unwrap()
+            )
+            .unwrap()
+        );
+        for (task, source, head, key) in [
+            (
+                TaskId::new(uuid::Uuid::from_u128(4)),
+                source(),
+                head(),
+                key.clone(),
+            ),
+            (
+                task(),
+                TurnId::new(uuid::Uuid::from_u128(4)),
+                head(),
+                key.clone(),
+            ),
+            (
+                task(),
+                source(),
+                "b".repeat(40).parse().unwrap(),
+                key.clone(),
+            ),
+            (
+                task(),
+                source(),
+                head(),
+                TargetKey::new("https://example.test/repo.git", "other").unwrap(),
+            ),
+            (
+                task(),
+                source(),
+                head(),
+                TargetKey::new("https://example.test/other.git", "main").unwrap(),
+            ),
+        ] {
+            assert_ne!(
+                id,
+                IntegrationId::derive(task, source, &head, &key).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_identity_binds_epoch_attempt_purpose_and_ordinal() {
+        let id: IntegrationId = "df525afd-647b-82bb-884e-d5eb88429385".parse().unwrap();
+        let turn = auxiliary_turn_id(id, 0, 1, IntegrationTurnPurpose::Resolve, 1).unwrap();
+        assert_eq!(turn.to_string(), "171ac900f4dc82d4987e2d7b0a1b7281");
+        for (epoch, attempt, purpose, ordinal) in [
+            (1, 1, IntegrationTurnPurpose::Resolve, 1),
+            (0, 2, IntegrationTurnPurpose::Resolve, 1),
+            (0, 1, IntegrationTurnPurpose::Verify, 1),
+            (0, 1, IntegrationTurnPurpose::Resolve, 2),
+        ] {
+            assert_ne!(
+                turn,
+                auxiliary_turn_id(id, epoch, attempt, purpose, ordinal).unwrap()
+            );
+        }
+        assert!(auxiliary_turn_id(id, 0, 4, IntegrationTurnPurpose::Resolve, 1).is_err());
+        assert!(auxiliary_turn_id(id, 0, 1, IntegrationTurnPurpose::Resolve, 3).is_err());
+    }
+
+    #[test]
+    fn from_task_policy_preserves_unresolved_base_provenance() {
+        let policy = json!({
+            "schema_version":1,"origin":"https://example.test/repo.git","target":"main",
+            "verify":"never","requested_close":"never","base_kind":"from_task",
+            "base_oid":null,"base_task":task(),"base_preflight":"unknown","project_id":"a".repeat(64),
+        });
+        assert!(serde_json::from_value::<FrozenIntegrationPolicy>(policy.clone()).is_ok());
+        let mut invalid = policy;
+        invalid["base_task"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<FrozenIntegrationPolicy>(invalid).is_err());
+    }
+
+    #[test]
+    fn every_host_reply_retains_protocol_task_intent_epoch_and_revision() {
+        let wire = json!({
+            "response":"target_moved","identity":{
+                "protocol_version":7,"task_id":task(),
+                "integration_id":"df525afd-647b-82bb-884e-d5eb88429385",
+                "epoch":2,"revision":9,
+            },"observed_target":"b".repeat(40),
+        });
+        let response = decode_host_response(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+        let mut invalid = wire;
+        invalid["identity"]["protocol_version"] = json!(6);
+        assert!(decode_host_response(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+
+    #[test]
+    fn transition_data_covers_every_state_and_keeps_push_stop_fenced() {
+        assert_eq!(INTEGRATION_TRANSITIONS.len(), 14);
+        let absent = INTEGRATION_TRANSITIONS
+            .iter()
+            .find(|row| row.from.is_none())
+            .unwrap();
+        assert_eq!(absent.next, [IntegrationStatus::Armed]);
+        let pushing = INTEGRATION_TRANSITIONS
+            .iter()
+            .find(|row| row.from == Some(IntegrationStatus::Pushing))
+            .unwrap();
+        assert_eq!(
+            pushing.next,
+            [
+                IntegrationStatus::Published,
+                IntegrationStatus::Fetching,
+                IntegrationStatus::RetryWait,
+                IntegrationStatus::Parked,
+                IntegrationStatus::Blocked,
+            ]
+        );
+        assert!(!pushing.next.contains(&IntegrationStatus::Revoked));
+        let parked = INTEGRATION_TRANSITIONS
+            .iter()
+            .find(|row| row.from == Some(IntegrationStatus::Parked))
+            .unwrap();
+        assert!(parked.resume && parked.legacy_settlement);
+        let blocked = INTEGRATION_TRANSITIONS
+            .iter()
+            .find(|row| row.from == Some(IntegrationStatus::Blocked))
+            .unwrap();
+        assert!(blocked.manual_redrive && blocked.legacy_settlement);
+        for state in [IntegrationStatus::Integrated, IntegrationStatus::Revoked] {
+            let row = INTEGRATION_TRANSITIONS
+                .iter()
+                .find(|row| row.from == Some(state))
+                .unwrap();
+            assert!(row.new_cycle);
+            assert!(row.next.is_empty());
+        }
+    }
 }
