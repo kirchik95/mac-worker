@@ -84,7 +84,7 @@ fn fixture_config(paths: &PathLayout) -> mac_worker::test_support::core::config:
 }
 
 #[test]
-fn native_controller_shutdown_keeps_the_pause_gate_closed_across_restart() {
+fn native_controller_shutdown_preserves_undrained_dispatch_across_restart() {
     let stop = |child: &mut crate::controller_process::OwnedChild| {
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
         assert!(
@@ -99,24 +99,44 @@ fn native_controller_shutdown_keeps_the_pause_gate_closed_across_restart() {
     let mut controller = fixture.spawn_controller_run();
     fixture.wait_until_leader_ready(&mut controller);
     stop(&mut controller);
-    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
-    let gate: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("integration-gate.json")).unwrap())
-            .unwrap();
-    assert_eq!(gate["windows"].as_array().unwrap().len(), 1);
-    assert_eq!(gate["windows"][0]["reason"], "controller_drained");
-    assert!(gate["windows"][0]["resumed_at_millis"].is_null());
+    assert!(!mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    assert!(!root.join("integration-gate.json").exists());
     let mut restored = fixture.spawn_controller_run();
     fixture.wait_until_leader_ready(&mut restored);
-    assert!(mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
-    stop(&mut restored);
-    let repeated: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("integration-gate.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        repeated, gate,
-        "restart or repeated shutdown renewed the pause"
+    assert!(!mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    let repo = crate::support::GitRepo::init();
+    repo.write("src.txt", b"ordinary source\n");
+    repo.commit_all("fixture");
+    let (status, stdout, stderr) = fixture.run_laptop(
+        &[
+            "--json",
+            "task",
+            "submit",
+            "--prompt",
+            "ordinary work after restart",
+            "--wip",
+            "--no-wait",
+        ],
+        Some(repo.root()),
     );
+    assert!(
+        status.success(),
+        "submit failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let submitted: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let task_id = submitted["task_id"].as_str().unwrap();
+    let (status, stdout, stderr) = fixture.wait_for_task_quiescence(Some(repo.root()), task_id);
+    assert!(
+        status.success(),
+        "ordinary dispatch needed undrain: stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(fixture.journal_task_turns().len(), 1);
+    stop(&mut restored);
+    assert!(!mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    assert!(!root.join("integration-gate.json").exists());
     let health: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("health.json")).unwrap()).unwrap();
     assert!(health["stopped_at_millis"].is_u64());
