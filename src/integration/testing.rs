@@ -248,6 +248,7 @@ pub fn sample_prepared_turn(
 struct MemoryStateData {
     policies: HashMap<TaskId, FrozenIntegrationPolicy>,
     records: HashMap<TaskId, IntegrationRecord>,
+    preparations: HashMap<(TaskId, TurnId), PreparedIntegrationTurn>,
     reservations: HashMap<Vec<u8>, TargetReservation>,
 }
 #[derive(Default)]
@@ -255,6 +256,62 @@ pub struct MemoryIntegrationState {
     data: Mutex<MemoryStateData>,
 }
 impl IntegrationState for MemoryIntegrationState {
+    fn publish_prepared(
+        &self,
+        task: TaskId,
+        prepared: &PreparedIntegrationTurn,
+    ) -> Result<(), WorkerError> {
+        prepared.validate()?;
+        if task != prepared.followup.task_id() {
+            return Err(integration_error("INTEGRATION_STATE_INVALID"));
+        }
+        let turn = prepared.followup.turn_id();
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        if let Some(old) = data.preparations.get(&(task, turn)) {
+            if old != prepared {
+                return Err(integration_error("INTEGRATION_STATE_INVALID"));
+            }
+            return Ok(());
+        }
+        if let Some(record) = data.records.get(&task) {
+            prepared.validate_for(record)?;
+            if let Some(intent) = record
+                .auxiliaries
+                .iter()
+                .find(|intent| intent.turn_id == turn)
+            {
+                validate_prepared_reference(prepared, intent, record)?;
+            }
+        }
+        data.preparations.insert((task, turn), prepared.clone());
+        Ok(())
+    }
+    fn load_prepared(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        let Some(prepared) = data.preparations.get(&(task, turn)) else {
+            return Ok(None);
+        };
+        prepared.validate()?;
+        if let Some(record) = data.records.get(&task)
+            && let Some(intent) = record
+                .auxiliaries
+                .iter()
+                .find(|intent| intent.turn_id == turn)
+        {
+            validate_prepared_reference(prepared, intent, record)?;
+        }
+        Ok(Some(prepared.clone()))
+    }
     fn load(&self, task: TaskId) -> Result<Option<IntegrationRecord>, WorkerError> {
         Ok(self
             .data
@@ -316,6 +373,11 @@ impl IntegrationState for MemoryIntegrationState {
         }
         if data.policies.get(&task).is_some_and(|p| p != &next.policy) {
             return Err(integration_error("INTEGRATION_STATE_INVALID"));
+        }
+        for intent in &next.auxiliaries {
+            if let Some(prepared) = data.preparations.get(&(task, intent.turn_id)) {
+                validate_prepared_reference(prepared, intent, next)?;
+            }
         }
         data.records.insert(task, next.clone());
         Ok(true)
@@ -390,10 +452,28 @@ impl IntegrationState for MemoryIntegrationState {
         Ok(rows.into_iter().take(limit).map(|r| r.task_id).collect())
     }
 }
+fn validate_prepared_reference(
+    prepared: &PreparedIntegrationTurn,
+    intent: &IntegrationAuxiliaryIntent,
+    record: &IntegrationRecord,
+) -> Result<(), WorkerError> {
+    prepared.validate_for(record)?;
+    let mut frozen = intent.clone();
+    frozen.queue_position = None;
+    frozen.accepted = false;
+    frozen.completed = false;
+    if frozen != prepared.intent()? {
+        return Err(integration_error("INTEGRATION_STATE_INVALID"));
+    }
+    Ok(())
+}
 #[derive(Default)]
 struct TurnsData {
     entries: HashMap<TurnId, PreparedIntegrationTurn>,
-    positions: HashMap<TurnId, u64>,
+    observations: HashMap<TurnId, IntegrationTurnObservation>,
+    imports: HashMap<TaskId, Vec<IntegrationReceipt>>,
+    closes: HashMap<TaskId, IntegrationReceipt>,
+    accepted_heads: HashMap<TaskId, BaseOid>,
     sequence: u64,
 }
 #[derive(Default)]
@@ -401,6 +481,68 @@ pub struct FakeIntegrationTurns {
     data: Mutex<TurnsData>,
 }
 impl FakeIntegrationTurns {
+    /// Inject retained runner evidence without changing the queue ticket or undoing completion.
+    pub fn set_observation(
+        &self,
+        observation: IntegrationTurnObservation,
+    ) -> Result<(), WorkerError> {
+        observation.validate()?;
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        let old = data
+            .observations
+            .get(&observation.turn_id)
+            .ok_or_else(|| integration_error("INTEGRATION_STATE_INVALID"))?;
+        if old.queue_position != observation.queue_position
+            || (old.accepted && !observation.accepted)
+            || (old.completed && !observation.completed)
+        {
+            return Err(integration_error("INTEGRATION_STATE_INVALID"));
+        }
+        data.observations.insert(observation.turn_id, observation);
+        Ok(())
+    }
+    pub fn observations(&self) -> Vec<IntegrationTurnObservation> {
+        let mut observations: Vec<_> = self
+            .data
+            .lock()
+            .expect("fixture queue")
+            .observations
+            .values()
+            .cloned()
+            .collect();
+        observations.sort_by_key(|entry| (entry.queue_position, entry.turn_id.to_string()));
+        observations
+    }
+    pub fn imports(&self, task: TaskId) -> Vec<IntegrationReceipt> {
+        self.data
+            .lock()
+            .expect("fixture task effects")
+            .imports
+            .get(&task)
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn closes(&self, task: TaskId) -> Vec<IntegrationReceipt> {
+        self.data
+            .lock()
+            .expect("fixture task effects")
+            .closes
+            .get(&task)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+    pub fn accepted_head(&self, task: TaskId) -> Option<BaseOid> {
+        self.data
+            .lock()
+            .expect("fixture task effects")
+            .accepted_heads
+            .get(&task)
+            .cloned()
+    }
     pub fn enqueue_count(&self, turn: TurnId) -> usize {
         usize::from(
             self.data
@@ -414,9 +556,9 @@ impl FakeIntegrationTurns {
         self.data
             .lock()
             .expect("fixture queue")
-            .positions
+            .observations
             .get(&turn)
-            .copied()
+            .and_then(|observation| observation.queue_position)
     }
     pub fn prepared(&self, turn: TurnId) -> Option<PreparedIntegrationTurn> {
         self.data
@@ -428,6 +570,82 @@ impl FakeIntegrationTurns {
     }
 }
 impl IntegrationTurns for FakeIntegrationTurns {
+    fn observe(&self, turn: TurnId) -> Result<IntegrationTurnObservation, WorkerError> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        Ok(data
+            .observations
+            .get(&turn)
+            .cloned()
+            .unwrap_or(IntegrationTurnObservation {
+                turn_id: turn,
+                queue_position: None,
+                accepted: false,
+                completed: false,
+            }))
+    }
+    fn import_receipt(
+        &self,
+        task: TaskId,
+        receipt: &IntegrationReceipt,
+    ) -> Result<IntegrationReceipt, WorkerError> {
+        receipt.validate()?;
+        let mut imported = receipt.clone();
+        imported.imported = true;
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        if data.imports.iter().any(|(owner, receipts)| {
+            *owner != task
+                && receipts
+                    .iter()
+                    .any(|old| old.integration_id == receipt.integration_id)
+        }) {
+            return Err(integration_error("INTEGRATION_STATE_INVALID"));
+        }
+        if let Some(old) = data.imports.get(&task).and_then(|receipts| {
+            receipts.iter().find(|old| {
+                old.integration_id == receipt.integration_id && old.epoch == receipt.epoch
+            })
+        }) {
+            if old != &imported {
+                return Err(integration_error("INTEGRATION_STATE_INVALID"));
+            }
+            return Ok(old.clone());
+        }
+        let head = imported
+            .merge_oid
+            .as_ref()
+            .unwrap_or(&imported.target_head)
+            .clone();
+        data.accepted_heads.insert(task, head);
+        data.imports.entry(task).or_default().push(imported.clone());
+        Ok(imported)
+    }
+    fn close_integrated(
+        &self,
+        task: TaskId,
+        receipt: &IntegrationReceipt,
+    ) -> Result<(), WorkerError> {
+        receipt.validate()?;
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| integration_error("INTEGRATION_STATE_INVALID"))?;
+        if !receipt.imported
+            || !data
+                .imports
+                .get(&task)
+                .is_some_and(|receipts| receipts.contains(receipt))
+        {
+            return Err(integration_error("INTEGRATION_STATE_INVALID"));
+        }
+        data.closes.entry(task).or_insert_with(|| receipt.clone());
+        Ok(())
+    }
     fn enqueue(&self, prepared: &PreparedIntegrationTurn) -> Result<TurnId, WorkerError> {
         prepared.validate()?;
         let turn = prepared.followup.turn_id();
@@ -440,9 +658,20 @@ impl IntegrationTurns for FakeIntegrationTurns {
                 return Err(integration_error("INTEGRATION_STATE_INVALID"));
             }
         } else {
-            data.sequence += 1;
+            data.sequence = data
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| integration_error("INTEGRATION_STATE_INVALID"))?;
             let position = data.sequence;
-            data.positions.insert(turn, position);
+            data.observations.insert(
+                turn,
+                IntegrationTurnObservation {
+                    turn_id: turn,
+                    queue_position: Some(position),
+                    accepted: false,
+                    completed: false,
+                },
+            );
             data.entries.insert(turn, prepared.clone());
         }
         Ok(turn)
@@ -751,6 +980,31 @@ impl IntegrationFixture {
     pub fn enqueue_count(&self, turn: TurnId) -> usize {
         self.turns.enqueue_count(turn)
     }
+    pub fn stored_preparation(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        self.state.load_prepared(task, turn)
+    }
+    pub fn turn_observation(
+        &self,
+        turn: TurnId,
+    ) -> Result<IntegrationTurnObservation, WorkerError> {
+        self.turns.observe(turn)
+    }
+    pub fn observations(&self) -> Vec<IntegrationTurnObservation> {
+        self.turns.observations()
+    }
+    pub fn imports(&self, task: TaskId) -> Vec<IntegrationReceipt> {
+        self.turns.imports(task)
+    }
+    pub fn closes(&self, task: TaskId) -> Vec<IntegrationReceipt> {
+        self.turns.closes(task)
+    }
+    pub fn accepted_head(&self, task: TaskId) -> Option<BaseOid> {
+        self.turns.accepted_head(task)
+    }
     pub fn admission_remaining(&self, task: TaskId) -> Option<Duration> {
         let record = self.state.load(task).ok().flatten()?;
         record
@@ -788,6 +1042,225 @@ impl Drop for IntegrationFixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_state_replays_the_authoritative_snapshot_and_refuses_rebinding() {
+        let state = MemoryIntegrationState::default();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let task = record.task_id;
+        let turn = prepared.followup.turn_id();
+        let port: &dyn IntegrationState = &state;
+        assert_eq!(port.load_prepared(task, turn).unwrap(), None);
+        port.publish_prepared(task, &prepared).unwrap();
+        port.publish_prepared(task, &prepared).unwrap();
+        let loaded = port.load_prepared(task, turn).unwrap().unwrap();
+        assert_eq!(
+            encode_prepared_turn(&loaded).unwrap(),
+            encode_prepared_turn(&prepared).unwrap()
+        );
+        let mut changed = prepared.clone();
+        changed.followup = PreparedFollowup::prepare(
+            prepared.followup.expected(),
+            "Changed prompt".into(),
+            turn,
+            1003,
+        )
+        .unwrap();
+        assert_eq!(
+            port.publish_prepared(task, &changed)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        let wrong_task = TaskId::new(uuid::Uuid::from_u128(9));
+        assert!(port.publish_prepared(wrong_task, &prepared).is_err());
+        assert_eq!(port.load_prepared(wrong_task, turn).unwrap(), None);
+        changed = prepared.clone();
+        changed.workspace_binding.clean_h.untracked_files = vec!["a".repeat(1024); 256];
+        assert!(serde_json::to_vec(&changed).unwrap().len() > MAX_PREPARED_TURN_BYTES);
+        assert!(port.publish_prepared(task, &changed).is_err());
+        assert_eq!(port.load_prepared(task, turn).unwrap(), Some(prepared));
+    }
+
+    #[test]
+    fn prepared_state_checks_compact_binding_in_both_publication_orders() {
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.candidates.push(sample_candidate(&record));
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Verify, 1, 1);
+        record.auxiliaries.push(prepared.intent().unwrap());
+        record.auxiliaries[0].prepared_binding = "f".repeat(64);
+        let state = MemoryIntegrationState::default();
+        state
+            .replace(record.task_id, IntegrationRevision(0), &record)
+            .unwrap();
+        assert_eq!(
+            state
+                .publish_prepared(record.task_id, &prepared)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        let other = MemoryIntegrationState::default();
+        other.publish_prepared(record.task_id, &prepared).unwrap();
+        assert!(
+            other
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .is_err()
+        );
+        record.auxiliaries[0] = prepared.intent().unwrap();
+        assert!(
+            other
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        other.publish_prepared(record.task_id, &prepared).unwrap();
+    }
+
+    #[test]
+    fn prepared_codec_refuses_inconsistent_frozen_followup_fields() {
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let mut wire = serde_json::to_value(&prepared).unwrap();
+        wire["followup"]["message"] = serde_json::json!("Different from composed prompt");
+        assert!(serde_json::from_value::<PreparedIntegrationTurn>(wire).is_err());
+    }
+
+    #[test]
+    fn auxiliary_observation_and_intent_share_strict_completion_invariants() {
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        for position in [None, Some(0), Some(1)] {
+            for accepted in [false, true] {
+                for completed in [false, true] {
+                    let observation = IntegrationTurnObservation {
+                        turn_id: prepared.followup.turn_id(),
+                        queue_position: position,
+                        accepted,
+                        completed,
+                    };
+                    let mut intent = prepared.intent().unwrap();
+                    intent.queue_position = position;
+                    intent.accepted = accepted;
+                    intent.completed = completed;
+                    let valid = (!completed || accepted) && (!accepted || position.is_some());
+                    assert_eq!(observation.validate().is_ok(), valid);
+                    assert_eq!(intent.validate().is_ok(), valid);
+                    let wire = serde_json::to_value(&observation).unwrap();
+                    assert_eq!(
+                        serde_json::from_value::<IntegrationTurnObservation>(wire.clone()).is_ok(),
+                        valid
+                    );
+                    let mut unknown = wire;
+                    unknown["extra"] = serde_json::json!(true);
+                    assert!(serde_json::from_value::<IntegrationTurnObservation>(unknown).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owner_queue_observes_retained_evidence_without_readmitting_a_completed_turn() {
+        let turns = FakeIntegrationTurns::default();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let turn = prepared.followup.turn_id();
+        let port: &dyn IntegrationTurns = &turns;
+        assert_eq!(
+            port.observe(turn).unwrap(),
+            IntegrationTurnObservation {
+                turn_id: turn,
+                queue_position: None,
+                accepted: false,
+                completed: false,
+            }
+        );
+        assert!(turns.observations().is_empty());
+        port.enqueue(&prepared).unwrap();
+        let queued = port.observe(turn).unwrap();
+        assert_eq!(queued.queue_position, Some(1));
+        assert!(!queued.accepted);
+        let completed = IntegrationTurnObservation {
+            accepted: true,
+            completed: true,
+            ..queued.clone()
+        };
+        turns.set_observation(completed.clone()).unwrap();
+        assert!(turns.set_observation(queued).is_err());
+        let moved = IntegrationTurnObservation {
+            queue_position: Some(2),
+            ..completed.clone()
+        };
+        assert!(turns.set_observation(moved).is_err());
+        port.enqueue(&prepared).unwrap();
+        assert_eq!(port.observe(turn).unwrap(), completed);
+        assert_eq!(turns.observations(), vec![completed]);
+        assert_eq!(turns.enqueue_count(turn), 1);
+    }
+
+    #[test]
+    fn owner_import_and_close_are_receipt_bound_and_idempotent_for_m_and_t() {
+        for disposition in [
+            IntegrationDisposition::Merged,
+            IntegrationDisposition::AlreadyIntegrated,
+        ] {
+            let turns = FakeIntegrationTurns::default();
+            let record = sample_record(fixture_task(), fixture_source(), "main");
+            let receipt = IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: record.cycle_base.clone(),
+                merge_oid: (disposition == IntegrationDisposition::Merged)
+                    .then(|| "e".repeat(40).parse().unwrap()),
+                disposition,
+                imported: false,
+                recorded_at_millis: 1004,
+            };
+            let port: &dyn IntegrationTurns = &turns;
+            assert!(port.close_integrated(record.task_id, &receipt).is_err());
+            let imported = port.import_receipt(record.task_id, &receipt).unwrap();
+            assert!(imported.imported);
+            assert_eq!(
+                port.import_receipt(record.task_id, &receipt).unwrap(),
+                imported
+            );
+            assert_eq!(
+                port.import_receipt(record.task_id, &imported).unwrap(),
+                imported
+            );
+            let head = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+            assert_eq!(turns.accepted_head(record.task_id).as_ref(), Some(head));
+            port.close_integrated(record.task_id, &imported).unwrap();
+            port.close_integrated(record.task_id, &imported).unwrap();
+            assert_eq!(turns.imports(record.task_id), vec![imported.clone()]);
+            assert_eq!(turns.closes(record.task_id), vec![imported.clone()]);
+            let mut changed = imported.clone();
+            changed.target_head = "f".repeat(40).parse().unwrap();
+            assert!(port.import_receipt(record.task_id, &changed).is_err());
+            assert!(port.close_integrated(record.task_id, &changed).is_err());
+            assert!(
+                port.import_receipt(TaskId::new(uuid::Uuid::from_u128(9)), &receipt)
+                    .is_err()
+            );
+            assert_eq!(turns.accepted_head(record.task_id).as_ref(), Some(head));
+            let mut later = receipt.clone();
+            later.epoch = 1;
+            later.target_head = "f".repeat(40).parse().unwrap();
+            if disposition == IntegrationDisposition::Merged {
+                later.merge_oid = Some("d".repeat(40).parse().unwrap());
+            }
+            let later = port.import_receipt(record.task_id, &later).unwrap();
+            port.import_receipt(record.task_id, &receipt).unwrap();
+            assert_eq!(
+                turns.accepted_head(record.task_id).as_ref(),
+                Some(later.merge_oid.as_ref().unwrap_or(&later.target_head))
+            );
+            port.close_integrated(record.task_id, &later).unwrap();
+            assert_eq!(turns.closes(record.task_id), vec![imported]);
+        }
+    }
 
     #[test]
     fn memory_state_enforces_policy_replay_revision_cas_and_target_ownership() {

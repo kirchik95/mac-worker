@@ -64,7 +64,8 @@ pub trait ValidateIntegration {
 // The same field list defines the public struct and its strict validating wire.
 // Validation also runs at encode boundaries, since callers can mutate fields.
 macro_rules! contract {
-    ($name:ident { $($(#[$attr:meta])* $field:ident: $ty:ty),* $(,)? }) => {
+    ($(#[$type_attr:meta])* $name:ident { $($(#[$attr:meta])* $field:ident: $ty:ty),* $(,)? }) => {
+        $(#[$type_attr])*
         #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
         pub struct $name { $($(#[$attr])* pub $field: $ty),* }
         impl<'de> Deserialize<'de> for $name {
@@ -858,6 +859,9 @@ impl PreparedIntegrationTurn {
 }
 impl ValidateIntegration for PreparedIntegrationTurn {
     fn validate(&self) -> Result<(), WorkerError> {
+        self.followup
+            .validate_self_consistency()
+            .map_err(|_| invalid())?;
         let binding = &self.workspace_binding;
         binding.validate()?;
         let ordinary = &self.followup.expected().meta().limits().turn;
@@ -1135,6 +1139,21 @@ contract!(IntegrationAuxiliaryIntent {
     purpose: IntegrationTurnPurpose, ordinal: u8, prepared_binding: String,
     created_at_millis: u64, queue_position: Option<u64>, accepted: bool, completed: bool,
 });
+contract!(
+    /// Retained owner queue evidence, including after the runner retires its row.
+    /// Completion implies acceptance; acceptance requires a retained queue position.
+    /// An unseen turn has no position and neither flag; queued positions may be zero.
+    IntegrationTurnObservation {
+    turn_id: TurnId, queue_position: Option<u64>, accepted: bool, completed: bool,
+});
+impl ValidateIntegration for IntegrationTurnObservation {
+    fn validate(&self) -> Result<(), WorkerError> {
+        if (self.completed && !self.accepted) || (self.accepted && self.queue_position.is_none()) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
 impl ValidateIntegration for IntegrationAuxiliaryIntent {
     fn validate(&self) -> Result<(), WorkerError> {
         if self.turn_id
@@ -1149,7 +1168,13 @@ impl ValidateIntegration for IntegrationAuxiliaryIntent {
         {
             return Err(invalid());
         }
-        Ok(())
+        IntegrationTurnObservation {
+            turn_id: self.turn_id,
+            queue_position: self.queue_position,
+            accepted: self.accepted,
+            completed: self.completed,
+        }
+        .validate()
     }
 }
 impl PreparedIntegrationTurn {
@@ -1272,6 +1297,14 @@ pub enum HostIntegrationResponse {
         candidate: Box<IntegrationCandidate>,
         purpose: IntegrationTurnPurpose,
     },
+    /// A clean tree, or an accepted auxiliary's tree, with frozen candidate inputs.
+    /// Tree is required; Build/Push/Repair also require the merge-object pin.
+    /// First completion may fill absent tree/merge pins; existing pins and all other
+    /// recorded fields are immutable. Subsequent replies replay the completed value.
+    CandidateReady {
+        identity: IntegrationResponseIdentity,
+        candidate: Box<IntegrationCandidate>,
+    },
     TargetMoved {
         identity: IntegrationResponseIdentity,
         observed_target: BaseOid,
@@ -1294,6 +1327,7 @@ impl HostIntegrationResponse {
         match self {
             Self::Progress { identity, .. }
             | Self::NeedTurn { identity, .. }
+            | Self::CandidateReady { identity, .. }
             | Self::TargetMoved { identity, .. }
             | Self::Integrated { identity, .. }
             | Self::Blocked { identity, .. }
@@ -1305,6 +1339,39 @@ impl HostIntegrationResponse {
         self.validate()?;
         if self.identity() != &IntegrationResponseIdentity::for_request(request) {
             return Err(invalid());
+        }
+        if let Self::CandidateReady { candidate, .. } = self {
+            let HostIntegrationAction::Step { step, record } = &request.action else {
+                return Err(invalid());
+            };
+            if candidate.source_head != record.snapshot.source_head
+                || candidate.identity != record.git_identity
+                || (matches!(
+                    step,
+                    IntegrationStep::Build | IntegrationStep::Push | IntegrationStep::Repair
+                ) && candidate.merge_oid.is_none())
+            {
+                return Err(invalid());
+            }
+            if let Some(recorded) = record.candidates.iter().find(|old| old.id == candidate.id) {
+                let mut completed = recorded.clone();
+                if completed.tree_oid.is_none() {
+                    completed.tree_oid = candidate.tree_oid.clone();
+                }
+                if completed.merge_oid.is_none() {
+                    completed.merge_oid = candidate.merge_oid.clone();
+                }
+                if completed != **candidate {
+                    return Err(invalid());
+                }
+            } else if record.candidates.len() >= MAX_CANDIDATES
+                || record
+                    .candidates
+                    .iter()
+                    .any(|old| old.id.attempt >= candidate.id.attempt)
+            {
+                return Err(invalid());
+            }
         }
         Ok(())
     }
@@ -1331,11 +1398,16 @@ impl ValidateIntegration for HostIntegrationResponse {
                 candidate,
                 identity,
                 ..
+            }
+            | Self::CandidateReady {
+                candidate,
+                identity,
             } => {
                 candidate.validate()?;
                 if Some(candidate.id.integration_id) != identity.integration_id
                     || candidate.id.epoch != identity.epoch
                     || candidate.clean_h.branch != BranchName::for_task(identity.task_id)
+                    || (matches!(self, Self::CandidateReady { .. }) && candidate.tree_oid.is_none())
                 {
                     return Err(invalid());
                 }
@@ -1426,6 +1498,20 @@ pub trait IntegrationState: Send + Sync {
         task: TaskId,
         policy: &FrozenIntegrationPolicy,
     ) -> Result<(), WorkerError>;
+    /// Persist the complete preparation before prompt write, task CAS, queue admission or launch.
+    /// Exact replay succeeds; another preparation for this task/TurnId is STATE_INVALID.
+    /// Validate its <=256 KiB size, frozen follow-up and compact intent binding.
+    fn publish_prepared(
+        &self,
+        task: TaskId,
+        prepared: &PreparedIntegrationTurn,
+    ) -> Result<(), WorkerError>;
+    /// Authoritative frozen preparation, or None if it has never been published.
+    fn load_prepared(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError>;
     fn replace(
         &self,
         task: TaskId,
@@ -1444,6 +1530,22 @@ pub trait IntegrationState: Send + Sync {
 }
 pub trait IntegrationTurns: Send + Sync {
     fn enqueue(&self, prepared: &PreparedIntegrationTurn) -> Result<TurnId, WorkerError>;
+    /// Side-effect-free retained observation of this auxiliary turn in the owner queue.
+    fn observe(&self, turn: TurnId) -> Result<IntegrationTurnObservation, WorkerError>;
+    /// Idempotently import M, or observed T for already-integrated, as the accepted task head.
+    /// Return the identical receipt with imported=true; never contact origin or rewind on old replay.
+    fn import_receipt(
+        &self,
+        task: TaskId,
+        receipt: &IntegrationReceipt,
+    ) -> Result<IntegrationReceipt, WorkerError>;
+    /// Ordinary non-discard close for requested Done, using its existing close intent and result.
+    /// Receipt must already be imported. Idempotent; an already closed task succeeds.
+    fn close_integrated(
+        &self,
+        task: TaskId,
+        receipt: &IntegrationReceipt,
+    ) -> Result<(), WorkerError>;
 }
 pub trait IntegrationRuntime: Send + Sync {
     fn now_millis(&self) -> u64;
