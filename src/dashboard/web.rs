@@ -34,7 +34,10 @@ use crate::{
             MonotonicClock,
         },
         settings::DashboardSettingsSource,
-        task::{DashboardTaskMutationSource, DashboardTaskSource, TaskMutationRequest},
+        task::{
+            DashboardTaskMutationSource, DashboardTaskSource, TaskIntegrationRequest,
+            TaskMutationRequest,
+        },
     },
     error::WorkerError,
     job::LogStream,
@@ -241,6 +244,10 @@ where
             get(task_log_chunk::<S, C, M>),
         )
         .route("/api/v1/tasks/{task_id}", get(task_detail::<S, C, M>))
+        .route(
+            "/api/v1/tasks/{task_id}/integrate",
+            post(task_integrate::<S, C, M>),
+        )
         .route("/api/v1/tasks/{task_id}/reply", post(task_reply::<S, C, M>))
         .route(
             "/api/v1/tasks/{task_id}/accept",
@@ -627,9 +634,28 @@ where
     task_mutation(state, raw_task_id, request, MutationKind::Accept).await
 }
 
+async fn task_integrate<S, C, M>(
+    State(state): State<AppState<S, C, M>>,
+    Path(raw_task_id): Path<String>,
+    request: Request,
+) -> Response
+where
+    S: DashboardDataSource,
+    C: Clock,
+    M: MonotonicClock,
+{
+    task_mutation(state, raw_task_id, request, MutationKind::Integrate).await
+}
+
 enum MutationKind {
     Reply,
     Accept,
+    Integrate,
+}
+enum TaskAction {
+    Reply(TaskMutationRequest),
+    Accept(TaskMutationRequest),
+    Integrate(TaskIntegrationRequest),
 }
 
 async fn task_mutation<S, C, M>(
@@ -674,7 +700,12 @@ where
             );
         }
     };
-    let mutation: TaskMutationRequest = match serde_json::from_slice(&body) {
+    let parsed = match kind {
+        MutationKind::Reply => serde_json::from_slice(&body).map(TaskAction::Reply),
+        MutationKind::Accept => serde_json::from_slice(&body).map(TaskAction::Accept),
+        MutationKind::Integrate => serde_json::from_slice(&body).map(TaskAction::Integrate),
+    };
+    let mutation = match parsed {
         Ok(mutation) => mutation,
         Err(_) => {
             return api_error(
@@ -683,9 +714,10 @@ where
             );
         }
     };
-    match tokio::task::spawn_blocking(move || match kind {
-        MutationKind::Reply => source.reply(task_id, &mutation),
-        MutationKind::Accept => source.accept(task_id, &mutation),
+    match tokio::task::spawn_blocking(move || match mutation {
+        TaskAction::Reply(mutation) => source.reply(task_id, &mutation),
+        TaskAction::Accept(mutation) => source.accept(task_id, &mutation),
+        TaskAction::Integrate(mutation) => source.integrate(task_id, &mutation),
     })
     .await
     {
@@ -883,7 +915,7 @@ fn task_mutation_error(error: ApiError) -> Response {
         }
         "TASK_NOT_FOUND" => StatusCode::NOT_FOUND,
         "TASK_REQUEST_INVALID" | "TASK_CONFIG_INVALID" => StatusCode::BAD_REQUEST,
-        "TASK_MUTATION_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        "TASK_MUTATION_UNAVAILABLE" | "INTEGRATION_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
     };
     api_error(status, error)

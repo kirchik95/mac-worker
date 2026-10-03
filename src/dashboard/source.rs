@@ -159,6 +159,7 @@ pub struct MacWorkerDashboardSource {
     pub remote: Arc<dyn DashboardRemoteReader>,
     pub queue: Arc<dyn DashboardQueueReader>,
     pub project_defaults: Option<DashboardProjectDefaults>,
+    integrations: Option<Arc<dyn crate::dashboard::task::DashboardIntegrationSource>>,
 }
 
 impl MacWorkerDashboardSource {
@@ -189,7 +190,16 @@ impl MacWorkerDashboardSource {
             remote,
             queue,
             project_defaults: None,
+            integrations: None,
         }
+    }
+
+    pub fn with_integrations(
+        mut self,
+        source: Arc<dyn crate::dashboard::task::DashboardIntegrationSource>,
+    ) -> Self {
+        self.integrations = Some(source);
+        self
     }
 
     pub fn with_project_settings(mut self, settings: ProjectSettings) -> Self {
@@ -266,11 +276,12 @@ impl DashboardDataSource for MacWorkerDashboardSource {
             &self.local_jobs,
             self.remote.as_ref(),
             deadline,
+            self.integrations.as_deref(),
         )
     }
 
     fn local_task_projection(&self) -> Result<DashboardTaskCollection, DashboardError> {
-        project_local_tasks(&self.config, &self.local_jobs)
+        project_local_tasks(&self.config, &self.local_jobs, self.integrations.as_deref())
     }
 
     fn refresh_worker_facts(&self, worker_name: &str) -> Result<(), WorkerError> {
