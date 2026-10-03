@@ -117,3 +117,60 @@ fn facts_decoder_refuses_an_invalid_or_oversized_annotation() {
     });
     assert!(serde_json::from_value::<TaskFacts>(wire).is_err());
 }
+
+#[test]
+fn rust_loads_the_same_public_views_codes_and_annotation_boundaries_as_typescript() {
+    use mac_worker::test_support::integration::{
+        IntegrationCode, IntegrationFactsAnnotation, IntegrationView, MAX_FACTS_ANNOTATION_BYTES,
+        decode_bounded, validate_integration_target,
+    };
+    let fixtures: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ui/src/lib/integration.fixtures.json"
+    )))
+    .unwrap();
+    let rows = fixtures["cases"].as_array().unwrap();
+    assert_eq!(rows.len(), 37);
+    for row in rows {
+        let view: IntegrationView = serde_json::from_value(row["view"].clone())
+            .unwrap_or_else(|error| panic!("{}: {error}", row["name"]));
+        assert_eq!(serde_json::to_value(view).unwrap(), row["view"]);
+    }
+    let codes: Vec<_> = IntegrationCode::ALL
+        .iter()
+        .map(|code| code.as_str())
+        .collect();
+    assert_eq!(serde_json::to_value(codes).unwrap(), fixtures["codes"]);
+    let at = fixtures["annotation_boundary_json"]
+        .as_str()
+        .unwrap()
+        .as_bytes();
+    let over = fixtures["annotation_overflow_json"]
+        .as_str()
+        .unwrap()
+        .as_bytes();
+    assert_eq!(at.len(), 512);
+    assert_eq!(over.len(), 513);
+    let annotation: IntegrationFactsAnnotation =
+        decode_bounded(at, MAX_FACTS_ANNOTATION_BYTES).unwrap();
+    assert_eq!(
+        serde_json::to_value(annotation).unwrap(),
+        fixtures["annotation"]
+    );
+    assert!(
+        decode_bounded::<IntegrationFactsAnnotation>(over, MAX_FACTS_ANNOTATION_BYTES).is_err()
+    );
+    for key in ["authoritative_255", "multibyte_255"] {
+        assert!(validate_integration_target(fixtures["targets"][key].as_str().unwrap()).is_ok());
+    }
+    for key in ["authoritative_256", "multibyte_256"] {
+        assert!(validate_integration_target(fixtures["targets"][key].as_str().unwrap()).is_err());
+    }
+    assert_eq!(
+        public_target_display(
+            fixtures["targets"]["display_source"].as_str().unwrap(),
+            &RedactionBoundary::new("/fixture/home")
+        ),
+        fixtures["targets"]["display_expected"].as_str().unwrap()
+    );
+}
