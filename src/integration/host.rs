@@ -67,7 +67,6 @@ impl<'a> HostIntegrationService<'a> {
         if meta.publish_branch() == Some(&policy.target) {
             return Err(IntegrationCode::IntegrationPublishTargetCollision.error());
         }
-        sidecars.arm(&policy.project_id, request.task_id, policy)?;
         if matches!(request.action, HostIntegrationAction::Arm { .. })
             && task_store
                 .load_status(&policy.project_id, request.task_id)?
@@ -76,6 +75,7 @@ impl<'a> HostIntegrationService<'a> {
         {
             return Err(IntegrationCode::IntegrationWorkspaceMissing.error());
         }
+        sidecars.arm(&policy.project_id, request.task_id, policy)?;
         // Policy retention is durable before releasing installation/session guards.
         // Only the per-task integration fence spans bounded Git effects.
         drop(session);
@@ -171,44 +171,112 @@ impl<'a> HostIntegrationService<'a> {
                     return Err(invalid());
                 }
                 let mut next = (**record).clone();
+                if next.git_identity != *meta.git_identity() {
+                    return Err(invalid());
+                }
                 if let Some(old) = sidecars.load(&policy.project_id, request.task_id)? {
-                    if old.snapshot.integration_id != next.snapshot.integration_id
-                        || old.snapshot.epoch != next.snapshot.epoch
-                        || old.snapshot.revision.0 > next.snapshot.revision.0
-                        || old.policy != next.policy
-                        || (old.tombstone.is_some() && *step != IntegrationStep::Repair)
+                    if old.policy != next.policy
+                        || (old.snapshot.integration_id == next.snapshot.integration_id
+                            && old.snapshot.epoch == next.snapshot.epoch
+                            && old.snapshot.revision.0 > next.snapshot.revision.0)
                     {
                         return Err(invalid());
                     }
-                    next.candidates = old.candidates;
-                    next.snapshot.verification = old.snapshot.verification;
-                    for auxiliary in old.auxiliaries {
-                        if let Some(incoming) = next
-                            .auxiliaries
-                            .iter_mut()
-                            .find(|aux| aux.turn_id == auxiliary.turn_id)
+                    if old.snapshot.integration_id != next.snapshot.integration_id
+                        || old.snapshot.epoch != next.snapshot.epoch
+                    {
+                        let stopped = old.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                            && old.push_intent.as_ref().is_none_or(|p| !p.uncertain);
+                        let imported = old.receipt.as_ref().is_some_and(|r| r.imported);
+                        if !(stopped || imported)
+                            || !matches!(step, IntegrationStep::Fetch | IntegrationStep::Prepare)
+                            || !next.candidates.is_empty()
+                            || !next.auxiliaries.is_empty()
+                            || next.push_intent.is_some()
+                            || next.receipt.is_some()
+                            || next.tombstone.is_some()
+                            || (old.snapshot.integration_id == next.snapshot.integration_id
+                                && old.snapshot.epoch.checked_add(1) != Some(next.snapshot.epoch))
                         {
-                            if incoming.prepared_binding != auxiliary.prepared_binding {
-                                return Err(invalid());
-                            }
-                            if incoming.queue_position.is_some()
-                                && auxiliary.queue_position.is_some()
-                                && incoming.queue_position != auxiliary.queue_position
-                            {
-                                return Err(invalid());
-                            }
-                            if incoming.queue_position.is_none() {
-                                incoming.queue_position = auxiliary.queue_position;
-                            }
-                            incoming.accepted |= auxiliary.accepted;
-                            incoming.completed |= auxiliary.completed;
-                        } else {
-                            next.auxiliaries.push(auxiliary);
+                            return Err(invalid());
                         }
+                        if let Some(receipt) = old.receipt {
+                            if !next.archived_receipts.contains(&receipt) {
+                                next.archived_receipts.push(receipt);
+                            }
+                            if next.archived_receipts.len() > MAX_ARCHIVED_RECEIPTS {
+                                next.archived_receipts.remove(0);
+                            }
+                        }
+                        next.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
+                    } else {
+                        if old.snapshot.source_head != next.snapshot.source_head
+                            || old.snapshot.source_turn_id != next.snapshot.source_turn_id
+                            || old.source_revision != next.source_revision
+                            || old.cycle_base != next.cycle_base
+                            || old.source_checks != next.source_checks
+                            || old.source_summary != next.source_summary
+                            || old.git_identity != next.git_identity
+                            || (old.tombstone.is_some() && *step != IntegrationStep::Repair)
+                        {
+                            return Err(invalid());
+                        }
+                        let import_ack =
+                            if let (Some(incoming), Some(stored)) = (&next.receipt, &old.receipt) {
+                                let mut expected = stored.clone();
+                                expected.imported = incoming.imported;
+                                if *incoming != expected {
+                                    return Err(invalid());
+                                }
+                                incoming.imported
+                            } else {
+                                false
+                            };
+                        next.candidates = old.candidates;
+                        next.snapshot.verification = old.snapshot.verification;
+                        for auxiliary in old.auxiliaries {
+                            if let Some(incoming) = next
+                                .auxiliaries
+                                .iter_mut()
+                                .find(|aux| aux.turn_id == auxiliary.turn_id)
+                            {
+                                if incoming.prepared_binding != auxiliary.prepared_binding {
+                                    return Err(invalid());
+                                }
+                                if incoming.queue_position.is_some()
+                                    && auxiliary.queue_position.is_some()
+                                    && incoming.queue_position != auxiliary.queue_position
+                                {
+                                    return Err(invalid());
+                                }
+                                if incoming.queue_position.is_none() {
+                                    incoming.queue_position = auxiliary.queue_position;
+                                }
+                                incoming.accepted |= auxiliary.accepted;
+                                incoming.completed |= auxiliary.completed;
+                            } else {
+                                next.auxiliaries.push(auxiliary);
+                            }
+                        }
+                        next.push_intent = old.push_intent;
+                        next.receipt = old.receipt;
+                        if import_ack && let Some(receipt) = &mut next.receipt {
+                            receipt.imported = true;
+                        }
+                        next.tombstone = old.tombstone;
                     }
-                    next.push_intent = old.push_intent;
-                    next.receipt = old.receipt;
-                    next.tombstone = old.tombstone;
+                } else {
+                    next.snapshot.verification = IntegrationVerification::SourceAgentReportOnly;
+                    next.receipt = None;
+                    next.tombstone = None;
+                }
+                next.snapshot.attempts = next.candidates.len() as u8;
+                next.snapshot.merge_oid = next
+                    .candidates
+                    .last()
+                    .and_then(|candidate| candidate.merge_oid.clone());
+                if *step != IntegrationStep::Repair {
+                    validate_source_checks(&next.source_checks)?;
                 }
                 sidecars.save(&next)?;
                 self.runtime.reach(IntegrationHook::AfterIntent);
@@ -249,6 +317,8 @@ impl<'a> HostIntegrationService<'a> {
                                 let previous = next.candidates.last().ok_or_else(invalid)?;
                                 git.restore_source(&next, previous)?;
                                 next.push_intent = None;
+                                next.snapshot.verification =
+                                    IntegrationVerification::SourceAgentReportOnly;
                             }
                             if next
                                 .candidates
@@ -267,14 +337,7 @@ impl<'a> HostIntegrationService<'a> {
                                     source_head: head.clone(),
                                     tree_oid: None,
                                     merge_oid: None,
-                                    message: format!(
-                                        "{}\n\n{}\n\nMac-Worker-Task: {}\nMac-Worker-Turn: {}\nMac-Worker-Integration: {}",
-                                        meta.title().as_str(),
-                                        next.source_summary,
-                                        next.task_id,
-                                        next.snapshot.source_turn_id,
-                                        next.snapshot.integration_id
-                                    ),
+                                    message: integration_message(meta.title().as_str(), &next),
                                     identity: next.git_identity.clone(),
                                     timestamp_millis: self.runtime.now_millis(),
                                     attribute_source: head.clone(),
@@ -344,13 +407,45 @@ impl<'a> HostIntegrationService<'a> {
                     }
                     IntegrationStep::Push => {
                         let candidate = next.candidates.last().ok_or_else(invalid)?.clone();
-                        next.push_intent = Some(IntegrationPushIntent {
-                            candidate: candidate.id,
-                            expected_target: candidate.target_head.clone(),
-                            merge_oid: candidate.merge_oid.clone().ok_or_else(invalid)?,
-                            started_at_millis: self.runtime.now_millis(),
-                            uncertain: true,
-                        });
+                        if !candidate.conflict_paths.is_empty()
+                            && next.snapshot.verification
+                                != IntegrationVerification::ResolveAgentReport
+                        {
+                            return Err(IntegrationCode::IntegrationResolutionIncomplete.error());
+                        }
+                        if next.policy.verify == VerifyPolicy::MovedTarget
+                            && candidate.target_head != next.cycle_base
+                            && !matches!(
+                                next.snapshot.verification,
+                                IntegrationVerification::VerifyAgentReport
+                                    | IntegrationVerification::ResolveAgentReport
+                            )
+                            && git.query(
+                                &git.mirror(policy)?,
+                                None,
+                                &["rev-parse", &format!("{}^{{tree}}", candidate.source_head)],
+                            )? != candidate.tree_oid.as_ref().ok_or_else(invalid)?.as_str()
+                        {
+                            return Err(IntegrationCode::IntegrationResolveBlocked.error());
+                        }
+                        if matches!(
+                            next.snapshot.verification,
+                            IntegrationVerification::VerifyAgentReport
+                                | IntegrationVerification::ResolveAgentReport
+                        ) {
+                            git.validate_accepted_workspace(&next, &candidate)?;
+                        }
+                        if let Some(intent) = &mut next.push_intent {
+                            intent.uncertain = true;
+                        } else {
+                            next.push_intent = Some(IntegrationPushIntent {
+                                candidate: candidate.id,
+                                expected_target: candidate.target_head.clone(),
+                                merge_oid: candidate.merge_oid.clone().ok_or_else(invalid)?,
+                                started_at_millis: self.runtime.now_millis(),
+                                uncertain: true,
+                            });
+                        }
                         sidecars.save(&next)?;
                         self.runtime.reach(IntegrationHook::AfterPushIntent);
                         match git.push(&next, &candidate)? {
@@ -358,6 +453,10 @@ impl<'a> HostIntegrationService<'a> {
                                 next.receipt = Some(receipt.clone());
                                 next.push_intent.as_mut().ok_or_else(invalid)?.uncertain = false;
                                 next.snapshot.state = IntegrationStatus::Published;
+                                next.snapshot.merge_oid = receipt.merge_oid.clone();
+                                next.snapshot.observed_target_oid =
+                                    Some(receipt.target_head.clone());
+                                next.snapshot.disposition = Some(receipt.disposition);
                                 sidecars.save(&next)?;
                                 self.runtime.reach(IntegrationHook::AfterReceipt);
                                 HostIntegrationResponse::Integrated { identity, receipt }
@@ -419,6 +518,18 @@ impl<'a> HostIntegrationService<'a> {
                             return Err(IntegrationCode::IntegrationResolveBlocked.error());
                         }
                         validate_checks(&next.source_checks, status.reported_checks())?;
+                        let observed_target = git.fetch_target(&next)?;
+                        if observed_target != candidate.target_head {
+                            next.snapshot.verification =
+                                IntegrationVerification::SourceAgentReportOnly;
+                            sidecars.save(&next)?;
+                            let response = HostIntegrationResponse::TargetMoved {
+                                identity,
+                                observed_target,
+                            };
+                            response.validate_for(request)?;
+                            return Ok(response);
+                        }
                         let purpose = prepared.purpose;
                         git.accept_workspace(&next, &mut candidate, purpose)?;
                         *next.candidates.last_mut().ok_or_else(invalid)? = candidate.clone();
@@ -451,7 +562,13 @@ impl<'a> HostIntegrationService<'a> {
                         sidecars.save(&next)?;
                         self.runtime.reach(IntegrationHook::AfterReceipt);
                         git.repair(&next, &receipt)?;
-                        next.snapshot.state = IntegrationStatus::Published;
+                        next.snapshot.state = if receipt.imported {
+                            IntegrationStatus::Integrated
+                        } else {
+                            IntegrationStatus::Published
+                        };
+                        next.snapshot.disposition = Some(receipt.disposition);
+                        next.snapshot.observed_target_oid = Some(receipt.target_head.clone());
                         sidecars.save(&next)?;
                         HostIntegrationResponse::Integrated { identity, receipt }
                     }
@@ -461,6 +578,33 @@ impl<'a> HostIntegrationService<'a> {
         response.validate_for(request)?;
         Ok(response)
     }
+}
+fn integration_message(title: &str, record: &IntegrationRecord) -> String {
+    let boundary = crate::redaction::RedactionBoundary::from_env();
+    let title = boundary.text(title, MAX_MESSAGE_TITLE_BYTES);
+    let summary = boundary.text(&record.source_summary, MAX_MESSAGE_SUMMARY_BYTES);
+    let summary = if summary.is_empty() {
+        "Task completed; see the retained task result."
+    } else {
+        &summary
+    };
+    format!(
+        "{title}\n\n{summary}\n\nMac-Worker-Task: {}\nMac-Worker-Turn: {}\nMac-Worker-Integration: {}",
+        record.task_id.as_uuid().hyphenated(),
+        record.snapshot.source_turn_id.as_uuid().hyphenated(),
+        record.snapshot.integration_id
+    )
+}
+fn validate_source_checks(checks: &[crate::agent::ReportedCheck]) -> Result<(), WorkerError> {
+    if checks.iter().any(|check| {
+        matches!(
+            check.status(),
+            crate::agent::ReportedCheckStatus::Fail | crate::agent::ReportedCheckStatus::Error
+        )
+    }) {
+        return Err(IntegrationCode::IntegrationChecksFailed.error());
+    }
+    Ok(())
 }
 fn validate_checks(
     source: &[crate::agent::ReportedCheck],

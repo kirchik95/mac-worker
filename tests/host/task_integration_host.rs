@@ -47,6 +47,176 @@ fn legacy_close(f: &GitIntegrationFixture) {
     std::fs::remove_dir_all(f.workspace()).unwrap();
 }
 
+fn host_record(f: &GitIntegrationFixture) -> IntegrationRecord {
+    HostIntegrationStore::new(&f.store)
+        .load(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn push_cannot_bypass_a_required_verifier_or_forge_its_evidence() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    let target = f.advance_target();
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    f.execute(IntegrationStep::Prepare).unwrap();
+    f.record = host_record(&f);
+    f.record.snapshot.verification = IntegrationVerification::VerifyAgentReport;
+    assert!(f.execute(IntegrationStep::Push).is_err());
+    assert_eq!(f.origin_tip(), target);
+}
+
+#[test]
+fn auxiliary_completion_refetches_target_and_invalidates_verification_on_movement() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.advance_target();
+    f.record.policy.verify = VerifyPolicy::MovedTarget;
+    f.execute(IntegrationStep::Prepare).unwrap();
+    f.complete_auxiliary(IntegrationTurnPurpose::Verify);
+    let moved = f.advance_target_with("new-target.txt", b"new target\n");
+    assert!(matches!(
+        f.execute(IntegrationStep::AcceptTurn).unwrap(),
+        HostIntegrationResponse::TargetMoved { observed_target, .. } if observed_target == moved
+    ));
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::NeedTurn { purpose: IntegrationTurnPurpose::Verify, candidate, .. }
+            if candidate.id.attempt == 2 && candidate.target_head == moved
+    ));
+}
+
+#[test]
+fn public_sender_refuses_legacy_closed_work() {
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    f.prepare();
+    legacy_close(&f);
+    let candidate = f.record.candidates.last().unwrap();
+    assert!(
+        IntegrationGit::new(&f.store, &SystemProcessRunner, &f.runtime)
+            .push_candidate(&f.record.policy, candidate)
+            .is_err()
+    );
+    assert_eq!(f.origin_tip(), target);
+}
+
+#[test]
+fn ordinary_resume_waits_for_confirmed_stop_even_for_a_clean_mirror_candidate() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    let prepared = f.prepared(IntegrationTurnPurpose::Verify);
+    acquire_auxiliary(&f, &prepared);
+    assert_eq!(
+        TaskStore::new(&f.store, &SystemProcessRunner)
+            .prepare_resume(
+                &f.record.policy.project_id,
+                f.record.task_id,
+                prepared.followup.turn_id(),
+                prepared.followup.turn_number(),
+                prepared.followup.worker(),
+                prepared.followup.base_oid()
+            )
+            .unwrap_err()
+            .public_code(),
+        IntegrationCode::IntegrationStopUnconfirmed.as_str()
+    );
+}
+
+#[test]
+fn confirmed_revoke_allows_a_new_epoch_but_never_the_old_push() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    execute(
+        &f,
+        &request(
+            &f,
+            HostIntegrationAction::Revoke {
+                tombstone: IntegrationTombstone {
+                    epoch: f.record.snapshot.epoch,
+                    revision: f.record.snapshot.revision,
+                    requested_at_millis: 1005,
+                    acknowledged: false,
+                },
+            },
+        ),
+    )
+    .unwrap();
+    assert!(f.execute(IntegrationStep::Push).is_err());
+    f.record = host_record(&f);
+    f.record.snapshot.epoch += 1;
+    f.record.snapshot.revision = f.record.snapshot.revision.next().unwrap();
+    f.record.snapshot.state = IntegrationStatus::Pending;
+    f.record.snapshot.attempts = 0;
+    f.record.snapshot.merge_oid = None;
+    f.record.snapshot.observed_target_oid = None;
+    f.record.tombstone = None;
+    f.record.push_intent = None;
+    f.record.candidates.clear();
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::CandidateReady { .. }
+    ));
+}
+
+#[test]
+fn owner_import_ack_is_retained_after_repair() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    f.push();
+    f.execute(IntegrationStep::Repair).unwrap();
+    f.record = host_record(&f);
+    let receipt = f.record.receipt.as_mut().unwrap();
+    receipt.imported = true;
+    f.record.snapshot.state = IntegrationStatus::Integrated;
+    f.record.snapshot.disposition = Some(receipt.disposition);
+    f.record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
+    f.execute(IntegrationStep::Repair).unwrap();
+    let retained = host_record(&f);
+    assert!(retained.receipt.unwrap().imported);
+    assert_eq!(retained.snapshot.state, IntegrationStatus::Integrated);
+}
+
+#[test]
+fn source_check_failures_block_before_native_merge() {
+    for state in ["fail", "error"] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        f.commit_task();
+        f.record.source_checks = serde_json::from_value(serde_json::json!([
+            { "name": "fixture", "command": "true", "status": state, "detail": "claim" }
+        ]))
+        .unwrap();
+        assert_eq!(
+            f.execute(IntegrationStep::Prepare)
+                .unwrap_err()
+                .public_code(),
+            IntegrationCode::IntegrationChecksFailed.as_str()
+        );
+        assert_eq!(f.origin_tip(), target);
+    }
+}
+
+#[test]
+fn frozen_source_identity_cannot_change_after_intent() {
+    let mut f = GitIntegrationFixture::new();
+    f.commit_base();
+    f.commit_task();
+    f.prepare();
+    f.record.source_summary = "rebound summary".into();
+    assert!(f.execute(IntegrationStep::Prepare).is_err());
+}
+
 fn acquire_auxiliary(
     f: &GitIntegrationFixture,
     prepared: &PreparedIntegrationTurn,

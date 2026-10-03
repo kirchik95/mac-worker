@@ -14,6 +14,144 @@ struct NativeRecordingRunner {
 }
 
 #[test]
+fn host_deadline_interrupts_push_and_retains_its_uncertain_intent() {
+    struct Expire<'a>(&'a ManualIntegrationRuntime);
+    impl ProcessRunner for Expire<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            SystemProcessRunner.run(request)
+        }
+        fn run_interruptible(
+            &self,
+            request: &ProcessRequest,
+            stop: &dyn Fn() -> bool,
+        ) -> Result<ProcessResult, WorkerError> {
+            if is_push(request) {
+                self.0.advance(HOST_DEADLINE);
+            }
+            SystemProcessRunner.run_interruptible(request, stop)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    let target = f.commit_base();
+    f.commit_task();
+    f.prepare();
+    assert!(
+        f.execute_with(IntegrationStep::Push, &Expire(&f.runtime))
+            .is_err()
+    );
+    assert_eq!(f.origin_tip(), target);
+    let record = HostIntegrationStore::new(&f.store)
+        .load(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .unwrap();
+    assert!(record.push_intent.unwrap().uncertain);
+    f.push();
+}
+
+#[test]
+fn workspace_merge_crash_replays_before_any_auxiliary_admission() {
+    struct CrashAfterMerge;
+    impl ProcessRunner for CrashAfterMerge {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            let result = SystemProcessRunner.run(request)?;
+            if request.args.iter().any(|arg| arg == "--no-commit") {
+                panic!("crash after native merge");
+            }
+            Ok(result)
+        }
+    }
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    let head = f.commit_task();
+    let target = f.advance_target_with("payload.txt", b"theirs\n");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || f.execute_with(IntegrationStep::Prepare, &CrashAfterMerge)
+        ))
+        .is_err()
+    );
+    assert!(matches!(
+        f.execute(IntegrationStep::Prepare).unwrap(),
+        HostIntegrationResponse::NeedTurn {
+            purpose: IntegrationTurnPurpose::Resolve,
+            ..
+        }
+    ));
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head.as_str());
+    assert_eq!(f.git(&["rev-parse", "MERGE_HEAD"]), target.as_str());
+}
+
+#[test]
+fn resolution_tree_is_frozen_before_commit_and_cannot_rebind_after_crash() {
+    let mut f = GitIntegrationFixture::new();
+    f.write("payload.txt", b"base\n");
+    f.commit_base();
+    f.write("payload.txt", b"ours\n");
+    f.commit_task();
+    f.advance_target_with("payload.txt", b"theirs\n");
+    f.execute(IntegrationStep::Prepare).unwrap();
+    f.write("payload.txt", b"resolved\n");
+    f.complete_auxiliary(IntegrationTurnPurpose::Resolve);
+    f.runtime.crash_at(IntegrationHook::AfterCommitBeforePin);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || f.execute(IntegrationStep::AcceptTurn)
+        ))
+        .is_err()
+    );
+    let tree = f.git(&["write-tree"]);
+    let record = HostIntegrationStore::new(&f.store)
+        .load(&f.record.policy.project_id, f.record.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record
+            .candidates
+            .last()
+            .unwrap()
+            .tree_oid
+            .as_ref()
+            .map(|tree| tree.as_str()),
+        Some(tree.as_str())
+    );
+    f.runtime.restart();
+    f.write("payload.txt", b"different resolution\n");
+    assert!(f.execute(IntegrationStep::AcceptTurn).is_err());
+}
+
+#[test]
+fn clean_candidate_crashes_keep_one_manifest_and_one_merge_oid() {
+    for hook in [
+        IntegrationHook::AfterIntent,
+        IntegrationHook::AfterFetchBeforePin,
+        IntegrationHook::AfterTargetPin,
+        IntegrationHook::AfterWorkspaceManifest,
+        IntegrationHook::AfterCommitBeforePin,
+        IntegrationHook::AfterMergePin,
+    ] {
+        let mut f = GitIntegrationFixture::new();
+        f.commit_base();
+        f.commit_task();
+        f.runtime.crash_at(hook);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || f.execute(IntegrationStep::Prepare)
+            ))
+            .is_err()
+        );
+        f.runtime.restart();
+        let first = f.prepare();
+        let second = f.prepare();
+        assert_eq!(first, second);
+        assert_eq!(f.record.candidates.len(), 1);
+        f.push();
+        assert_eq!(f.origin_tip(), first);
+    }
+}
+
+#[test]
 fn remote_host_uses_bounded_typed_transport_and_rejects_rebound_replies() {
     use mac_worker::test_support::{core::config::WorkerEntry, transfer::RemoteJobClient};
     use std::os::unix::process::ExitStatusExt;

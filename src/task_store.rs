@@ -1611,6 +1611,31 @@ impl<'a> TaskStore<'a> {
         worker: &str,
         base_oid: &BaseOid,
     ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        let sidecars = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        let retained = sidecars.load(project_id, task_id)?;
+        let _fence = if retained.is_some() || sidecars.policy(project_id, task_id)?.is_some() {
+            Some(sidecars.lock(project_id, task_id)?)
+        } else {
+            None
+        };
+        if retained.is_some() {
+            let record = sidecars
+                .load(project_id, task_id)?
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            let revoked = record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record.push_intent.as_ref().is_none_or(|p| !p.uncertain);
+            let integrated = record.receipt.as_ref().is_some_and(|receipt| {
+                receipt.imported
+                    && Some(base_oid)
+                        == Some(receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head))
+            });
+            if !revoked && !integrated {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                        .error(),
+                );
+            }
+        }
         self.prepare_resume_inner(
             project_id,
             task_id,

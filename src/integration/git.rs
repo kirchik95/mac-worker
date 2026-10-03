@@ -9,7 +9,11 @@ use crate::{
     rooted_fs::RootedDir,
     task::{BaseOid, TaskId},
 };
-use std::{collections::BTreeSet, ffi::OsString};
+use std::{
+    collections::BTreeSet,
+    ffi::OsString,
+    time::{Duration, Instant},
+};
 
 const HARDENING: &[(&str, &str)] = &[
     ("core.hooksPath", "/dev/null"),
@@ -37,10 +41,24 @@ pub(crate) enum PushOutcome {
     Integrated(IntegrationReceipt),
     Moved(BaseOid),
 }
+// Reuse the existing credential factory while including its 5 s reads in the
+// same interruptible host budget. Ordinary GitTransport behavior is unchanged.
+struct CredentialRunner<'a, 'b>(&'a IntegrationGit<'b>);
+impl ProcessRunner for CredentialRunner<'_, '_> {
+    fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+        let mut bounded = request.clone();
+        bounded.policy.deadline = bounded.policy.deadline.min(self.0.remaining());
+        self.0
+            .runner
+            .run_interruptible(&bounded, &|| self.0.stopped())
+    }
+}
 pub struct IntegrationGit<'a> {
     store: &'a HostStore,
     runner: &'a dyn ProcessRunner,
     runtime: Option<&'a dyn IntegrationRuntime>,
+    started: Instant,
+    runtime_started: u64,
 }
 impl<'a> IntegrationGit<'a> {
     pub fn new(
@@ -52,6 +70,8 @@ impl<'a> IntegrationGit<'a> {
             store,
             runner,
             runtime: Some(runtime),
+            started: Instant::now(),
+            runtime_started: runtime.now_millis(),
         }
     }
     pub(crate) fn for_workspace(store: &'a HostStore, runner: &'a dyn ProcessRunner) -> Self {
@@ -59,6 +79,8 @@ impl<'a> IntegrationGit<'a> {
             store,
             runner,
             runtime: None,
+            started: Instant::now(),
+            runtime_started: 0,
         }
     }
     fn reach(&self, hook: IntegrationHook) {
@@ -68,6 +90,18 @@ impl<'a> IntegrationGit<'a> {
     }
     fn now_millis(&self) -> u64 {
         self.runtime.map_or(0, IntegrationRuntime::now_millis)
+    }
+    fn remaining(&self) -> Duration {
+        let elapsed = self.started.elapsed().max(Duration::from_millis(
+            self.now_millis().saturating_sub(self.runtime_started),
+        ));
+        HOST_DEADLINE.saturating_sub(elapsed)
+    }
+    fn stopped(&self) -> bool {
+        self.remaining().is_zero()
+    }
+    fn credentials(&self, origin: &str) -> Vec<(String, String)> {
+        GitTransport::new(&CredentialRunner(self)).origin_credential_config(origin)
     }
     pub(crate) fn validate_prepared_workspace(
         &self,
@@ -118,9 +152,32 @@ impl<'a> IntegrationGit<'a> {
         let record = HostIntegrationStore::new(self.store)
             .load(&policy.project_id, task)?
             .ok_or_else(invalid)?;
-        match self.push(&record, candidate)? {
-            PushOutcome::Integrated(receipt) => Ok(receipt),
-            PushOutcome::Moved(_) => Err(IntegrationCode::IntegrationTargetMovedExhausted.error()),
+        if record.policy != *policy || record.candidates.last() != Some(candidate) {
+            return Err(invalid());
+        }
+        let request = HostIntegrationRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            task_id: task,
+            integration_id: Some(record.snapshot.integration_id),
+            epoch: record.snapshot.epoch,
+            revision: record.snapshot.revision,
+            action: HostIntegrationAction::Step {
+                step: IntegrationStep::Push,
+                record: Box::new(record),
+            },
+        };
+        match super::host::HostIntegrationService::new(
+            self.store,
+            self.runner,
+            self.runtime.ok_or_else(invalid)?,
+        )
+        .execute(&request)?
+        {
+            HostIntegrationResponse::Integrated { receipt, .. } => Ok(receipt),
+            HostIntegrationResponse::TargetMoved { .. } => {
+                Err(IntegrationCode::IntegrationTargetMovedExhausted.error())
+            }
+            _ => Err(invalid()),
         }
     }
     pub(crate) fn mirror(
@@ -146,6 +203,9 @@ impl<'a> IntegrationGit<'a> {
         operation: &[OsString],
         credentials: &[(String, String)],
     ) -> Result<ProcessRequest, WorkerError> {
+        if self.stopped() {
+            return Err(IntegrationCode::IntegrationNetwork.error());
+        }
         repo.verify_bound()?;
         self.require_no_info_attributes(repo)?;
         let mut config: Vec<_> = HARDENING
@@ -166,14 +226,14 @@ impl<'a> IntegrationGit<'a> {
                     .into(),
             ],
         );
-        probe.policy.deadline = GIT_DEADLINE;
+        probe.policy.deadline = GIT_DEADLINE.min(self.remaining());
         probe
             .environment
             .push(("GIT_ATTR_NOSYSTEM".into(), "1".into()));
         let names = self
             .runner
-            .run_interruptible(&probe, &|| false)
-            .map_err(|_| invalid())?;
+            .run_interruptible(&probe, &|| self.stopped())
+            .map_err(|_| IntegrationCode::IntegrationNetwork.error())?;
         if !matches!(names.status.code(), Some(0 | 1)) || names.stdout.len() > GIT_OUTPUT_BYTES {
             return Err(invalid());
         }
@@ -210,7 +270,7 @@ impl<'a> IntegrationGit<'a> {
         args.extend_from_slice(operation);
         let mut request =
             git_request_with_config(repo.path(), Some(origin_git_ssh_command()?), &config, args);
-        request.policy.deadline = GIT_DEADLINE;
+        request.policy.deadline = GIT_DEADLINE.min(self.remaining());
         request.policy.stdout_limit = GIT_OUTPUT_BYTES;
         request.policy.stderr_limit = GIT_OUTPUT_BYTES;
         request
@@ -256,7 +316,7 @@ impl<'a> IntegrationGit<'a> {
         )?;
         let result = self
             .runner
-            .run_interruptible(&request, &|| false)
+            .run_interruptible(&request, &|| self.stopped())
             .map_err(|_| IntegrationCode::IntegrationNetwork.error())?;
         repo.verify_bound()?;
         Ok(result)
@@ -300,8 +360,7 @@ impl<'a> IntegrationGit<'a> {
     }
     pub(crate) fn fetch_target(&self, record: &IntegrationRecord) -> Result<BaseOid, WorkerError> {
         let mirror = self.mirror(&record.policy)?;
-        let credentials =
-            GitTransport::new(self.runner).origin_credential_config(&record.policy.origin);
+        let credentials = self.credentials(&record.policy.origin);
         self.observe(record, &mirror, &credentials)?
             .ok_or_else(|| IntegrationCode::IntegrationTargetMissing.error())
     }
@@ -324,7 +383,7 @@ impl<'a> IntegrationGit<'a> {
         )?;
         let result = self
             .runner
-            .run_interruptible(&request, &|| false)
+            .run_interruptible(&request, &|| self.stopped())
             .map_err(|_| IntegrationCode::IntegrationNetwork.error())?;
         if !result.status.success() {
             return Err(IntegrationCode::IntegrationNetwork.error());
@@ -357,7 +416,7 @@ impl<'a> IntegrationGit<'a> {
         )?;
         let result = self
             .runner
-            .run_interruptible(&request, &|| false)
+            .run_interruptible(&request, &|| self.stopped())
             .map_err(|_| IntegrationCode::IntegrationNetwork.error())?;
         if !result.status.success() {
             return Err(IntegrationCode::IntegrationNetwork.error());
@@ -570,6 +629,28 @@ impl<'a> IntegrationGit<'a> {
         }
         Ok(())
     }
+    pub(crate) fn validate_accepted_workspace(
+        &self,
+        record: &IntegrationRecord,
+        candidate: &IntegrationCandidate,
+    ) -> Result<(), WorkerError> {
+        let workspace = self.workspace(record)?;
+        self.assert_workspace(&workspace, candidate, true)?;
+        self.verify_tree(&workspace, candidate)?;
+        let bytes = HostIntegrationStore::new(self.store)
+            .read(
+                &record.policy.project_id,
+                record.task_id,
+                "accepted-workspace.json",
+                MAX_PRIVATE_RECORD_BYTES,
+            )?
+            .ok_or_else(invalid)?;
+        let state: WorkspaceState = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if state != self.workspace_state(&workspace, candidate)? {
+            return Err(IntegrationCode::IntegrationVerifyChangedTree.error());
+        }
+        Ok(())
+    }
     pub(crate) fn prepare_workspace(
         &self,
         record: &IntegrationRecord,
@@ -596,6 +677,27 @@ impl<'a> IntegrationGit<'a> {
                 }
                 return Ok(());
             }
+        }
+        let merge_head = self.run(
+            &workspace,
+            Some(&candidate.attribute_source),
+            &["rev-parse", "--verify", "MERGE_HEAD"],
+        )?;
+        if merge_head.status.success() {
+            // A native merge may have completed before the baseline journal.
+            // No admitted auxiliary can have edited this unjournaled attempt.
+            if record
+                .auxiliaries
+                .iter()
+                .any(|aux| aux.attempt == candidate.id.attempt)
+                || std::str::from_utf8(&merge_head.stdout)
+                    .map_err(|_| invalid())?
+                    .trim()
+                    != candidate.target_head.as_str()
+            {
+                return Err(invalid());
+            }
+            self.restore_source(record, candidate)?;
         }
         let mirror = self.mirror(&record.policy)?;
         self.query(
@@ -651,6 +753,18 @@ impl<'a> IntegrationGit<'a> {
     ) -> Result<(), WorkerError> {
         let mirror = self.mirror(&record.policy)?;
         let tree = candidate.tree_oid.as_ref().ok_or_else(invalid)?;
+        let sidecars = HostIntegrationStore::new(self.store);
+        let mut journal = sidecars
+            .load(&record.policy.project_id, record.task_id)?
+            .ok_or_else(invalid)?;
+        let frozen = journal.candidates.last_mut().ok_or_else(invalid)?;
+        if frozen.id != candidate.id || frozen.tree_oid.as_ref().is_some_and(|old| old != tree) {
+            return Err(invalid());
+        }
+        frozen.tree_oid = Some(tree.clone());
+        // Freeze the accepted tree before creating an object or publishing its pin.
+        // Replays use the same parents/message/identity/time already in this record.
+        sidecars.save(&journal)?;
         let mut request = self.request(
             repo,
             Some(&candidate.attribute_source),
@@ -681,7 +795,7 @@ impl<'a> IntegrationGit<'a> {
         }
         let result = self
             .runner
-            .run_interruptible(&request, &|| false)
+            .run_interruptible(&request, &|| self.stopped())
             .map_err(|_| invalid())?;
         if !result.status.success() {
             return Err(invalid());
@@ -706,7 +820,29 @@ impl<'a> IntegrationGit<'a> {
             )?;
         }
         let pin = candidate_pin(candidate);
-        self.query(&mirror, None, &["update-ref", &pin, oid.as_str()])?;
+        let current = self.run(&mirror, None, &["rev-parse", "--verify", "--quiet", &pin])?;
+        if current.status.success() {
+            if std::str::from_utf8(&current.stdout)
+                .map_err(|_| invalid())?
+                .trim()
+                != oid.as_str()
+            {
+                return Err(invalid());
+            }
+        } else if current.status.code() == Some(1) {
+            self.query(
+                &mirror,
+                None,
+                &[
+                    "update-ref",
+                    &pin,
+                    oid.as_str(),
+                    &"0".repeat(oid.as_str().len()),
+                ],
+            )?;
+        } else {
+            return Err(invalid());
+        }
         mirror.sync_root()?;
         candidate.merge_oid = Some(oid);
         self.reach(IntegrationHook::AfterMergePin);
@@ -789,17 +925,31 @@ impl<'a> IntegrationGit<'a> {
             }
         }
         if purpose == IntegrationTurnPurpose::Resolve {
-            candidate.tree_oid = Some(
-                self.query(
+            let resolved_tree = self
+                .query(
                     &workspace,
                     Some(&candidate.attribute_source),
                     &["write-tree"],
                 )?
                 .parse()
-                .map_err(|_| invalid())?,
-            );
+                .map_err(|_| invalid())?;
+            if candidate
+                .tree_oid
+                .as_ref()
+                .is_some_and(|tree| tree != &resolved_tree)
+            {
+                return Err(invalid());
+            }
+            candidate.tree_oid = Some(resolved_tree);
         }
-        self.commit_in(record, candidate, &workspace)
+        self.commit_in(record, candidate, &workspace)?;
+        let state = self.workspace_state(&workspace, candidate)?;
+        HostIntegrationStore::new(self.store).write(
+            &record.policy.project_id,
+            record.task_id,
+            "accepted-workspace.json",
+            &serde_json::to_vec(&state).map_err(|_| invalid())?,
+        )
     }
     pub(crate) fn push(
         &self,
@@ -823,8 +973,7 @@ impl<'a> IntegrationGit<'a> {
         {
             return Err(invalid());
         }
-        let credentials =
-            GitTransport::new(self.runner).origin_credential_config(&record.policy.origin);
+        let credentials = self.credentials(&record.policy.origin);
         // Every replay observes first, including a durable intent whose original reply was lost.
         if let Some(outcome) = self.observed_outcome(record, candidate, &mirror, &credentials)? {
             return Ok(outcome);
@@ -833,6 +982,21 @@ impl<'a> IntegrationGit<'a> {
             return Err(IntegrationCode::IntegrationBaseNotOnTarget.error());
         }
         self.reach(IntegrationHook::BeforePush);
+        let status = self
+            .store
+            .task_status(&record.policy.project_id, record.task_id)?;
+        let current = HostIntegrationStore::new(self.store)
+            .load(&record.policy.project_id, record.task_id)?
+            .ok_or_else(invalid)?;
+        if status.state() != crate::task::TaskState::Open {
+            return Err(IntegrationCode::IntegrationWorkspaceMissing.error());
+        }
+        if status.head_oid() != Some(&candidate.source_head)
+            || current.tombstone.is_some()
+            || current.candidates.last() != Some(candidate)
+        {
+            return Err(invalid());
+        }
         let request = self.request(
             &mirror,
             None,
@@ -850,7 +1014,7 @@ impl<'a> IntegrationGit<'a> {
             ],
             &credentials,
         )?;
-        let result = self.runner.run_interruptible(&request, &|| false);
+        let result = self.runner.run_interruptible(&request, &|| self.stopped());
         if let Ok(result) = &result
             && result.status.success()
         {
@@ -923,8 +1087,7 @@ impl<'a> IntegrationGit<'a> {
         candidate: &IntegrationCandidate,
     ) -> Result<Option<IntegrationReceipt>, WorkerError> {
         let mirror = self.mirror(&record.policy)?;
-        let credentials =
-            GitTransport::new(self.runner).origin_credential_config(&record.policy.origin);
+        let credentials = self.credentials(&record.policy.origin);
         let target = self
             .observe(record, &mirror, &credentials)?
             .ok_or_else(|| IntegrationCode::IntegrationTargetMissing.error())?;

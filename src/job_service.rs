@@ -467,6 +467,7 @@ impl<'a> JobService<'a> {
                 )?;
                 let (meta, status) = self.read_exact_job(&submit, &lease)?;
                 if status.state().is_terminal() {
+                    drop(integration_fence.take());
                     let authoritative =
                         self.status_from_accepted_after(admission, disposition, true, false)?;
                     return Ok(TaskTurnResponse::new(
@@ -480,6 +481,16 @@ impl<'a> JobService<'a> {
                     && status.supervisor_identity().is_none()
                     && status.child_identity().is_none()
                 {
+                    if let Some(prepared) = integration {
+                        let record = sidecars
+                            .load(material.project_id(), turn.task_id())?
+                            .ok_or_else(crate::integration::host_store::invalid)?;
+                        crate::integration::git::IntegrationGit::for_workspace(
+                            self.store,
+                            &SystemProcessRunner,
+                        )
+                        .validate_prepared_workspace(&record, prepared)?;
+                    }
                     let job = self.store.open_directory(
                         &format!(
                             "jobs/{}/{}/{}",
@@ -525,6 +536,7 @@ impl<'a> JobService<'a> {
                     task_status,
                 ));
             }
+            drop(integration_fence.take());
             let authoritative =
                 self.status_from_accepted_after(admission, disposition, true, false)?;
             return Ok(TaskTurnResponse::new(
