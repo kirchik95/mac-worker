@@ -25,11 +25,12 @@ Default dispatch is the laptop queue (`[controller]` missing or `enabled = false
 
 Do not copy CLI flags from this file. Run `worker skills get pool-dispatch --grammar-only` (or `worker task <cmd> --help`) and use that output as the only grammar.
 
+That generated grammar includes `task integrate` for re-driving blocked configured tasks.
+
 Default laptop queue: without `--wait`, `submit`, `batch`, and `say` return as soon as the task record, the base commit in the transfer repository, and the queue row exist and a local turn runner has taken ownership of the row, or the row is parked behind the per-worker runner cap. With `--wait` the same work happens in the foreground and the command follows the turn's event log to its end.
 
 Enabled remote controller: without `--wait`, those commands return on a durable `host controller-rpc` ACK. That ACK means the request is persisted on the controller store. It does not mean a runner has started, or that the agent is running — enabled submit can stay queued (`park_only`) until the leader starts a runner. Keep `worker controller run` for autonomous progress. With `--wait` the CLI waits until the selected task or run is quiescent. Logs remain a separate command (`worker task logs`).
 
-<!-- Part 2: reconcile T6 stop ordering at public entry points. -->
 `list`, `status`, `result`, `diff`, and `logs` are read-only. `submit`, `batch`, `say`, `wait`, and `reconcile` drive ordinary recovery. Configured close/cancel/interrupt records its stop authority before integration recovery can start more work; do not run a separate reconcile before a requested stop.
 
 `--json` on any command emits the same typed records the dashboard consumes; `submit`, `say`, `logs -f`, and `wait` emit versioned NDJSON events. Serialized log chunks use standard padded base64 in the `data` field.
@@ -72,20 +73,17 @@ Keep the returned run identifier and all task identifiers.
 
 Check the installed grammar before using these forms. Details and failure hints: repository `docs/usage.md`, “Continue a laptop session in the pool”.
 
-<!-- Part 2: reconcile T6 nested source and paired-pin retry wiring. -->
 For an integrating session submit, retry the same frozen controller envelope only after the source stream is complete. Keep its paired base/session pins until acknowledgement or request retirement; do not capture the live laptop conversation again. Pre-record failure or submission rollback releases paired task pins idempotently. Auxiliary repair resumes the imported worker session without importing or replacing it again. Integration never sends session packages or transport refs to origin.
 
 ## Automatic Integration
 
 Use the project's configured automatic integration policy. It is opt-in and disabled by default. Do not enable it, pick another target, or disable an inherited policy merely to bypass a refusal. Submit/task overrides win over batch defaults, then `.worker.toml` `[task]` settings. The target is a short branch on the project's own canonical origin. An unavailable helper/controller refuses enabled work with `INTEGRATION_UNAVAILABLE`; there is no ordinary fallback.
 
-<!-- Part 2: reconcile T6 integration reads, finalization and re-drive wiring. -->
 Follow the `integration` snapshot and `workflow_state`, not ordinary `done` alone. Pending/parked work is still automatic; integrated success needs no accept or manual close. Conflicts use the same worker, agent and session. If integration is blocked, read its stable code, result and logs, repair the cause within the user's scope, then use the installed `worker task integrate <id>` grammar to re-drive the same source and target. If repair needs code changes, use a normal `say` with guidance after the stop barrier; its next Done result starts a new cycle.
 
 Verification defaults to `never`. Resolve and verify turns consume the ordinary `max_followups` allowance; re-drive cannot replenish it. A source with checks requires a nonempty all-pass recovery report; a source with no checks may have an empty recovery report. Any `fail` or `error` blocks. The host does not run project checks, and agent claims are not independent verification.
 
-<!-- Part 2: reconcile T6 pause, rollback and explicit resume. -->
-Controller drain, disable and helper rollback stop new integration phases and auxiliary admissions. Admitted steps and running turns finish before parking. Respect the operator's pause; resume requires compatible support and an explicitly reopened owner gate. Parking preserves remaining active admission time, auxiliary ID, queue position and spent follow-ups. A running auxiliary keeps its execution timeout. A pre-feature helper can lose the repair workspace after seven idle host-status days; see repository `docs/usage.md`, section "Pause, stop and rollback", for the operator warning and settlement limits.
+Controller drain pauses ordinary handoffs and integration; `worker controller drain --off` resumes both. Disable pauses integration only and leaves ordinary drain unchanged; re-enable preserves the integration pause until explicit `drain --off`. A controller restart creates no pause. Helper rollback also parks integration. Admitted steps and running turns finish before parking. Respect the operator's pause and restore compatible support before resuming. Parking preserves remaining active admission time, auxiliary ID, queue position and spent follow-ups; missing or reset pause history can expire admission early, never renew it. A running auxiliary keeps its execution timeout. A pre-feature helper can lose the repair workspace after seven idle host-status days; see repository `docs/usage.md`, section "Pause, stop and rollback", for the operator warning and settlement limits.
 
 ## Follow
 
@@ -106,6 +104,8 @@ For one task, use the release form:
 ```text
 worker task wait --task-id <id>
 ```
+
+When configured integration covers the latest ordinary work, `wait` waits for integration settlement and runner retirement. Integrated work returns exit 0 after receipt/result import, even when requested `never` leaves the task Open. Blocked work returns the integration code's exit status; read `status` or `result` for its cause. Pending or parked work keeps waiting; `--timeout` returns `WAIT_TIMEOUT` (70) without cancelling it. A newer ordinary turn follows ordinary wait rules until its own integration cycle starts. With integration disabled, ordinary wait behavior is unchanged.
 
 Inspect one task without mutating it:
 
@@ -157,7 +157,6 @@ For a settled manual result, close only when keeping the result or giving up int
 worker task close <id>
 ```
 
-<!-- Part 2: reconcile T6 direct driver recovery. -->
 `worker task reconcile` re-owns dead runners, re-enqueues orphaned tasks and recovers retained integration intents; it does not submit new work. In direct mode a dead integration child needs laptop `wait` or `reconcile`; a powered-off laptop provides no unattended recovery. Controller tasks remain with their controller owner after disable.
 
 ## Liveness And Settlement
@@ -176,7 +175,6 @@ and act on each row's blocking code. `worker task reconcile` is the operator's r
 
 A settled manual task needs a decision: follow up with `say`, keep it Open for inspection, or close while keeping the result (`--discard` also deletes the session and retained result on the worker). Automatic integrated success needs no accept. Manual close gives up unfinished integration or keeps its result; it is never permission to merge. Use `cancel` for a running ordinary turn.
 
-<!-- Part 2: reconcile T6 stop uncertainty and mutation acknowledgement. -->
 If an integration stop cannot be confirmed, `INTEGRATION_STOP_UNCONFIRMED` leaves the task nonterminal with the mutation pending. Restore connectivity and observe again; do not report close/cancel/discard as complete. A committed target update is retained, never undone by this skill. `INTEGRATION_ALREADY_COMMITTED` means integration won before cancellation.
 
 ## Rules
@@ -205,15 +203,16 @@ Stable public error codes are grouped by error class:
 - `agent`: `AGENT_NOT_INSTALLED`, `AGENT_NOT_AUTHENTICATED`, `AGENT_EXITED`, `AGENT_LIMIT_REACHED`, `RESULT_UNPARSEABLE`, `SESSION_UNBOUND`, `ENV_PROFILE_PERMISSIONS`.
 - `task`: `TASK_BUSY`, `FOLLOWUP_LIMIT`, `TASK_CLOSED`, `TASK_NOT_FOUND`, `RESULT_NOT_RETAINED` (closed task whose mirror commits are gone: `task workspace is closed and its result is no longer retained`), and `RUNNER_HANDOFF_FAILED`, which alone maps to the local I/O exit status `74`.
 
-CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70` protocol or infrastructure, `74` local I/O, `75` capacity. Commands that end with a turn map the turn's outcome as follows:
+CLI exit codes: `64` usage and configuration, `69` pre-acceptance transport, `70` protocol or infrastructure, `74` local I/O, `75` capacity. The table describes ordinary turn outcomes; configured integration wait follows the settlement rules above.
 
 | Turn outcome | `submit --wait`, `say --wait` | `wait` (any task in the set) |
 |---|---|---|
-| agent exited zero, status `done`, `needs_input`, or `unknown` | `0` | `0` if every task ended this way |
+| agent exited zero, status `done` or `needs_input` | `0` | `0` if every task ended this way |
+| status `unknown` | `70` | `70` |
 | agent exited zero, status `blocked` | `1` | `1` |
 | agent exited non-zero with code N | `N`, unchanged, public code `AGENT_EXITED` | `1` |
 | signalled, timed out, or cancelled | `1` | `1` |
 | turn `lost`, `PUBLISH_FAILED`, `ORIGIN_AUTH_FAILED`, `RESULT_UNPARSEABLE` | `70` | `1` |
 | `wait --timeout` elapsed | not applicable | `70`, nothing cancelled |
 
-The durable task record remains the authoritative distinction; JSON output always carries the outcome and code alongside the exit status.
+The durable task record remains the authoritative distinction. Read `status` or `result` JSON for its outcome and code; wait completion JSON reports selected `task_ids` and the aggregate `exit_code`.

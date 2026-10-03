@@ -93,6 +93,8 @@ The controller RPC handler freezes and acknowledges mutations; it does not run a
 
 `controller disable` persists the same stop gate before unloading; current disable confirms removal and retains configuration/state (`src/controller/init.rs:624`, `src/controller/init.rs:636`). Disabled controller tasks stay with that owner, never direct mode. Helper rollback parks the owner intent when its feature disappears; it retains identity/budgets but cannot constrain old host retention GC. Decision 13 documents the seven-day workspace-loss exposure without a layout barrier. With a compatible helper and an Open retained task, re-enable/undrain resumes the saved phase after observing uncertain effects. A host-closed task instead follows settlement only, never another push/turn. Revoke/close/cancel and stop observation remain available while parked.
 
+> **Superseded 2026-10-04 (orchestrator decision D-R8, T6(b) review):** Disable closes the integration gate only and leaves ordinary drain unchanged. After re-enable, integration stays paused until explicit `worker controller drain --off`. `drain` pauses both ordinary handoffs and integration; `drain --off` resumes both. A controller restart creates no pause. This supersedes the shared disable gate described above and the equivalent disable wording in Decisions 9 and 10.
+
 **Rejected:** integration on every terminal turn, inside the supervisor's occupied slot, before current-turn import, in a synchronous controller RPC, or continuing new integration phases while drained/disabled. These allow unfinished work, waste scarce slots, stall the controller or defeat the owner's kill switch.
 
 ## Decision 4 — base provenance is a hard gate

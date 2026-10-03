@@ -99,7 +99,7 @@ Integration is opt-in and disabled by default. With it disabled, the lifecycle b
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). Terminal controls in decoded events, plain stdout, and stderr (ESC, OSC including clipboard and title sequences, CSI, and other C0/C1 controls) are shown as visible text such as `\x1b`; newlines and tabs stay. It prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing. `--raw` stays byte-exact.
 
-With integration disabled, `worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. For configured integration, inspect its snapshot before choosing a mutation; ordinary Done is not target success. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
+With integration disabled, `worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. For configured tasks whose integration covers their latest ordinary work, `wait` also waits for integration settlement and runner retirement. Integrated work returns exit 0 after confirming the imported receipt and accepted result, even when requested `never` leaves the task Open. Blocked work returns its integration code's exit status; read `status` or `result` for the code and repair action. Pending or parked integration keeps waiting. `--timeout` returns `WAIT_TIMEOUT` (70) without cancelling work. A newer ordinary turn follows ordinary wait rules until its own integration cycle starts. `wait --run` aggregates the largest task exit status and is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
 
 `worker task reconcile` adopts, restarts, or finalizes a row only on positive proof that the previous runner exited: the pid was reused by a different process, or `Absent` was seen twice at least 750 ms apart. A single missed lookup, an ambiguous process-table read, or a transient error is unverifiable — the row is left alone, the report counts it, and `task list` shows `RUNNER_UNVERIFIABLE` only after that state has lasted 30 s. The operator path uses the same rule; it does not treat unverifiable as exited.
 
@@ -152,7 +152,6 @@ v1 supports only snapshot-sourced `task submit`, in direct or controller mode. `
 
 Integration also refuses every `--wip` base, including a dirty imported session (`INTEGRATION_WIP_BASE`). Use `--no-integrate` with the dirty-session example above, or commit the intended base on the target's ancestry before enabling integration. Auxiliary repair resumes the bound worker session; it does not capture or import the laptop conversation again.
 
-<!-- Part 2: reconcile T6 nested source and paired-pin retry wiring. -->
 An integrating session submit retains the same frozen base/session package and the paired pins while its controller request is retryable. Retry the original envelope only after its source stream is complete; do not recapture the live session. Pre-record failure or submission rollback releases paired task pins idempotently, while request pins remain until acknowledgement or request retirement. Integration never publishes the session package or its transport refs to origin.
 
 See the [`SESSION_*` rows in the error catalog](#exit-codes-and-errors) for exits and recovery hints: `SESSION_NOT_FOUND`, `SESSION_UNREADABLE`, `SESSION_TOO_LARGE`, `SESSION_OUTSIDE_PROJECT`, `SESSION_NEEDS_WIP`, `SESSION_REQUIRES_SNAPSHOT`, `SESSION_AGENT_MISMATCH`, `SESSION_IMPORT_UNSUPPORTED`, `SESSION_AGENT_TOO_OLD`, and `SESSION_PLACEMENT_FAILED`. Packages are limited to 64 MiB raw total, 64 MiB per file, and 2,000 files; use a handoff note for larger conversations.
@@ -237,7 +236,6 @@ lockfiles = ["Cargo.lock"]
 
 Integration is opt-in and disabled by default. Configure `[task] integrate = "main"` in the project's `.worker.toml`, then submit tasks or batches normally. The setting names a branch on this project's own canonical origin; there is no implicit `main`, origin-HEAD discovery, other-remote target, or laptop-wide enabling default. Settings are frozen before submission effects, so later agent edits to `.worker.toml` cannot change a task's policy.
 
-<!-- Part 2: reconcile T6 final-result, import, close and notifier wiring. -->
 After the final eligible ordinary Done result is imported and its runner retires, automatic integration adds one merge commit to the target without an accept action. Conflicts resume the same worker, agent and session. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Blocked and dependency-failure notices are titled `Integration blocked` and `Dependency not integrated`. Requested `--close-on done` closes only after the integration receipt and accepted result are imported; `--close-on never` retains the Open workspace and session for later `say`.
 
 ### Configuration and admission
@@ -248,8 +246,7 @@ Target and verify precedence is task/submit override, then batch defaults, then 
 
 Use a valid short branch name of at most **255 UTF-8 bytes**, not `refs/heads/main`. The branch must already exist. Submission observes only the exact origin branch: missing is `INTEGRATION_TARGET_MISSING`; locally available complete history can prove or refuse base ancestry. Missing local objects or failed network observation leave preflight unknown; submission does not fetch the target. The worker repeats the authoritative ancestry check on fetched target history for each candidate. A base outside that ancestry blocks with `INTEGRATION_BASE_NOT_ON_TARGET`. Every `--wip` base is refused with `INTEGRATION_WIP_BASE`.
 
-<!-- Part 2: reconcile T6 feature advertisement and installed-peer refusal. -->
-Enabled submission requires host `task.integration` and, in controller mode, `controller.integration`. Unknown or missing support returns `INTEGRATION_UNAVAILABLE`; it never falls back to ordinary execution. Check the installed grammar with `worker task submit --help` and `worker task batch --help` before using the new settings.
+Enabled submission requires advertised host `task.integration` and, in controller mode, `controller.integration`. Unknown or missing support returns `INTEGRATION_UNAVAILABLE`; it never falls back to ordinary execution. Grammar alone does not prove peer support. Check the installed grammar with `worker task submit --help` and `worker task batch --help` before using the new settings.
 
 The worker needs its own origin capability and Git login even with fetch-only task publication. Integration uses the configured canonical origin string as its identity. Different SSH/HTTPS spellings can still refer to one repository; they are not proved equivalent for serialization. One owner serializes Git drives by canonical origin and branch, with at most four drives across different targets. Separate owners rely on the exact-target lease.
 
@@ -273,50 +270,64 @@ Verify is read-only. Its index tree must match the pinned candidate before launc
 
 A cycle allows at most three candidates, two resolve turns and three verify turns. Resolve/verify turns also consume the task's ordinary `max_followups`; they are not a separate free allowance. Replay reuses the same auxiliary turn ID and does not spend it twice. Explicit re-drive resets cycle caps, not the task's already spent follow-ups. Retryable transport phases use an initial try plus three retries after 2, 10 and 30 seconds; retry exhaustion keeps the cause code and sets `retry_exhausted`.
 
-<!-- Part 2: reconcile T6 active admission, pause, restart and resume accounting. -->
-Auxiliary admission has **10 minutes of active admission time**. Pause is checked before timeout or retry accounting. Parking saves the remaining admission and backoff time. Time parked under the owner gate, including across a restart, does not consume that remainder. Resume keeps the same auxiliary ID, queue position and spent follow-up allowance, and restores only the saved time, not a new ten minutes. An already running auxiliary keeps its execution timeout of `min(task timeout, 10 minutes)` while the owner is paused.
+Auxiliary admission has **10 minutes of active admission time**. Pause is checked before timeout or retry accounting. Parking saves the remaining admission and backoff time. Retained pause history excludes time parked under the owner gate, including across a restart. Resume keeps the same auxiliary ID, queue position and spent follow-up allowance, and restores only the saved time, not a new ten minutes. Pause history keeps one active hour and at most 256 windows; pruning or resetting missing history can conservatively expire admission early with `INTEGRATION_TURN_QUEUE_TIMEOUT`, but never renews its budget. An already running auxiliary keeps its execution timeout of `min(task timeout, 10 minutes)` while the owner is paused.
 
 Ordinary task-ref publication stays separate from target integration. `publish = push` delivers `task/<id>` or the explicit `publish_branch` through the existing outbox; it does not mean integrate. Its effective publication branch must differ from the integration target, including the implicit `task/<id>` branch, or submission fails with `INTEGRATION_PUBLISH_TARGET_COLLISION`. `worker task publish-retry <id>` retries that outbox only. Task-ref delivery can remain pending independently of target success. Session packages and transport base refs are never pushed by integration.
 
-<!-- Part 2: reconcile T6 controller/direct driver and recovery entry points. -->
 Both controller and direct mode run Git on the original task worker. The controller owns detached integration recovery while the laptop is disconnected. In direct mode a spawned laptop child can finish without an interactive CLI, but a dead child needs `worker task wait --task-id <id>` or `worker task reconcile` on the laptop to recover. A powered-off direct-mode laptop provides no unattended recovery. Disabling a controller never transfers its tasks to the laptop owner.
 
 Configured DAG parents unlock children only after integration success and current result import, including requested `never` parents that remain Open. Disabled parents keep the Closed + Done gate. Pending/parked parents leave children queued; integration-blocked parents report `INTEGRATION_DEPENDENCY_BLOCKED`, and recovery can clear that wait. Giving up without integration blocks configured children with `INTEGRATION_DEPENDENCY_NOT_INTEGRATED`. An integrating `from:<id>` child requires an enabled parent with the same canonical target; its base is the imported accepted result, including the merge after repair.
 
 ### Observable state
 
-<!-- Part 2: reconcile T6 companion reads and dashboard source attachment. -->
 Task status/result JSON keeps `integration` as a companion object, separate from the strict ordinary `status` record. List rows and dashboard task rows use optional `integration` and `workflow_state`. Disabled tasks omit integration. An unavailable companion read means unknown/unavailable support, never proof that a task disabled it.
 
 The full snapshot includes `schema_version`, `integration_id`, `epoch`, `revision`, `target`, `state`, `resume_state`, `pause_reason`, `source_turn_id`, `source_head`, `merge_oid`, `observed_target_oid`, `disposition`, `attempts`, `resolve_turns`, `verify_turns`, `blocked_code`, `retry_exhausted`, `retry_at_millis`, `verification`, and `updated_at_millis`. Parked work shows its pause reason and resume phase. Success is `state = integrated`; `already_integrated` is a disposition, not a separate state. Admission remainder and queue binding are durable recovery data, not extra public snapshot fields.
 
-<!-- Part 2: reconcile T6 read and notifier projection wiring. -->
 `workflow_state` is `queued`, `running`, `integrating`, `needs_you`, or `done`. Pending/parked integration projects automatic work without an attention card; an auxiliary agent turn is running. Blocked integration needs you and shows its stable code and repair hint. Integrated success is done without an accept card, even if requested `never` keeps legacy task state Open. Once a newer ordinary turn starts, its running, question or failure state takes precedence; the earlier receipt remains history.
 
 The public target display is redacted and capped at **128 UTF-8 bytes**, including an ellipsis at a character boundary. It is a label, not an action identity; actions use the private exact target and IDs. Do not copy a shortened label back into configuration.
 
-<!-- Part 2: reconcile T6 companion confirmation and notice wiring. -->
 Controller facts carry a compact annotation of at most **512 serialized JSON bytes**: `integration_id`, `epoch`, `revision`, `state`, `code`, and `result_oid`. The entire facts object stays within **2,048 bytes**. The full companion snapshot is at most **4 KiB** and is read through the gated integration selector on `task.list`, up to 16 task IDs at a time. Notices require confirmation against that full snapshot's ID, epoch and revision; journal events are hints, not authority. Disabled facts keep their existing format and digest.
 
 ### Pause, stop and rollback
 
-<!-- Part 2: reconcile T6 drain, disable, helper rollback and explicit resume. -->
-`worker controller drain` is the integration kill switch: no new drive phase or auxiliary admission starts after drain is acknowledged. An already admitted bounded step persists its answer, then parks; a running auxiliary finishes before the next phase parks. `worker controller disable` closes that gate before unloading and retains controller state. Rolling the helper below `task.integration` parks its owner intent with `INTEGRATION_UNAVAILABLE`. Restore compatible support, re-enable the controller if needed, and use `worker controller drain --off` to resume retained Open work. Uncertain effects are observed before work resumes; reads and stop/revoke remain available while parked.
+`worker controller drain` pauses ordinary runner handoffs and new integration phases and auxiliary admissions. No new phase or auxiliary admission starts after drain is acknowledged. An already admitted bounded step persists its answer, then parks; a running auxiliary finishes before the next phase parks. `worker controller drain --off` resumes both ordinary handoffs and integration.
 
-<!-- Part 2: reconcile T6 close/cancel/discard/say stop acknowledgement. -->
+`worker controller disable` pauses integration only before unloading and retains controller state; it leaves ordinary drain unchanged. After re-enable, ordinary dispatch follows that existing drain flag, while integration stays paused until explicit `worker controller drain --off`. A controller restart, including launchd restart, `controller restart`, `worker setup`, reboot or upgrade, creates no pause and preserves any existing pause.
+
+While an integration pause window is open, `worker controller status` adds this line (the reason is `controller_drained` or `controller_disabled`):
+
+```text
+integration: paused (controller_disabled) since <milliseconds>; resume with: worker controller drain --off
+```
+
+Its JSON adds an `integration_pause` object with exactly these fields:
+
+```json
+{
+  "integration_pause": {
+    "reason": "controller_disabled",
+    "effective_at_millis": 1791072000000
+  }
+}
+```
+
+The timestamp is the effective pause time in Unix milliseconds. With no open window, the extra line and object are omitted.
+
+Invalid or unreadable `integration-gate.json` pause history prevents integration admission while ordinary handoffs still follow `drain.json`. When the file can be read safely but its JSON or metadata is invalid, the next `drain`, `drain --off` or `disable` saves its bytes as `integration-gate.json.corrupt` in controller state and replaces the history. The warning `warning: integration gate [CONTROLLER_TRANSPORT]; pause history was reset` means old timing evidence was discarded; missing history may conservatively expire an auxiliary's admission budget early. If an I/O or safety failure prevents recovery, `pause could not be persisted` means the history was not replaced. Ordinary drain changes or disable still complete; repair the cause before relying on the integration gate. A failed disable pause also warns `integration may resume after re-enable`.
+
+Rolling the helper below `task.integration` parks its owner intent with `INTEGRATION_UNAVAILABLE`. Restore compatible support, re-enable the controller if needed, and use `worker controller drain --off` to resume retained Open work. Uncertain effects are observed before work resumes; reads and stop/revoke remain available while parked.
+
 Manual `worker task close <id>` stops unfinished integration and keeps the result; it never grants merge permission. `close --discard` also drops retained task data after the stop barrier, but neither operation rewinds origin. `cancel` acknowledges a terminal cancellation only after revocation or a known committed outcome. If a push already won, cancellation returns `INTEGRATION_ALREADY_COMMITTED`; if the outcome or stop remains unknown, `INTEGRATION_STOP_UNCONFIRMED` leaves the task nonterminal with the mutation pending. Restore connectivity and retry observation; do not treat an SSH timeout as proof a push stopped. No new target update is authorized after terminal close/cancel/discard acknowledgement.
 
-<!-- Part 2: reconcile T6 re-drive and ordinary follow-up mutation wiring. -->
 For blocked Open tasks, repair the cause and run `worker task integrate <id>`. Re-drive keeps the source and target, starts a new epoch, and respects remaining task follow-ups; it cannot change targets or resurrect terminal tasks. Integrated re-drive is idempotent. `say` on blocked integration revokes the old epoch and restores the source workspace before starting an ordinary follow-up; active integration is busy unless an explicit interrupt completes its stop barrier.
 
-<!-- Part 2: reconcile T6 legacy seven-day retention and closed-task settlement. -->
 > **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
-<!-- Part 2: reconcile T6 legacy seven-day retention and closed-task settlement. -->
 Old GC measures seven idle days from the last host-status update, not the rollback date, so already-idle tasks can expire sooner after rollback. Non-discard retention close keeps result refs/history/session binding but removes the workspace. The integration-aware helper protects parked, blocked and uncertain repair state; a pre-feature helper cannot honor that protection. There is no host layout/version barrier to prevent an operational rollback.
 
-<!-- Part 2: reconcile T6 legacy seven-day retention and closed-task settlement. -->
-On compatible restore, a host-closed task is settled by observing origin first. A reachable retained merge M wins before source H, preserving a stronger existing receipt; otherwise reachable H proves `already_integrated` at observed T. The retained ref/status head is repaired and imported while the host remains Closed. If neither is reachable, block with `INTEGRATION_WORKSPACE_MISSING` and keep the retained result. Failed observation keeps the outcome uncertain. Closed never authorizes a new candidate, push, workspace recreation, reopen, or auxiliary turn.
+On compatible restore, a host-closed task is settled by observing origin first. A reachable retained merge M wins before source H and is imported, preserving a stronger existing receipt; otherwise reachable H proves `already_integrated` at observed T, which is imported. The retained ref/status head is repaired while the host remains Closed. If neither is reachable, block with `INTEGRATION_WORKSPACE_MISSING` and keep the retained result. Failed observation keeps the outcome uncertain and retries with bounded backoff; retry exhaustion blocks with its cause code. Closed never authorizes a new candidate, push, workspace recreation, reopen, or auxiliary turn. `worker task integrate <id>` refuses the Closed task.
 
 ## Capacity and slots
 
@@ -524,7 +535,7 @@ listed for that string.
 
   `<project-id>` is the directory under `tasks/` that holds the task id.
   Check that the fetched commit matches `head_oid` in the worker's
-  `status.json` before you merge it.
+  `status.json` before any manual merge.
 
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.
@@ -557,8 +568,7 @@ It shows workers (including slot occupancy and host load), the FIFO queue, activ
 
 Reply and accept use the same `TaskClient::say` / `close` paths as the CLI. They require the **current card**. A stale card is rejected (`TASK_REVISION_CONFLICT`, HTTP 409) and must not enqueue another turn.
 
-<!-- Part 2: reconcile T6 dashboard integration adapters and mutation guards. -->
-Configured pending or parked integration has no accept card; integrated success needs no attention. A blocked card shows the target, stable code and repair action, with re-drive and close actions. Re-drive uses the current integration identity and revision; stale integration state must be refreshed before retrying. The legacy accept action is close: keep the result or give up unfinished integration, never authorize a merge.
+Configured pending or parked integration has no accept card; integrated success needs no attention. A blocked card shows the target, stable code and repair action. Re-drive and Close work directly from Overview once the card's current detail is confirmed. Re-drive uses the current integration identity and revision; stale integration state must be refreshed before retrying. The legacy accept action is close: keep the result or give up unfinished integration, never authorize a merge.
 
 ```text
 POST /api/v1/tasks/{task_id}/reply
@@ -868,8 +878,7 @@ turn queued and wait for drain to lift, then retry admission. A wait timeout lea
 for recovery. The shared launch gate covers ordinary, recovery, replacement, and completion-triggered
 runners, plus reassignment to parked turns. `status` reports `drained`; unreadable drain state fails closed.
 
-<!-- Part 2: reconcile T6 integration drain and disable wiring. -->
-For configured integration, drain also fences each new host phase and auxiliary admission; the current admitted step or running turn finishes, then parks. Resume explicitly with `worker controller drain --off`, preserving saved admission/backoff time and auxiliary identity. Disable closes the same gate before unloading; see [Pause, stop and rollback](#pause-stop-and-rollback) before restoring work or downgrading a helper.
+For configured integration, drain also fences each new host phase and auxiliary admission; the current admitted step or running turn finishes, then parks. `worker controller drain --off` resumes ordinary handoffs and integration, preserving saved admission/backoff time and auxiliary identity. Disable pauses integration only and leaves ordinary drain unchanged; after re-enable, integration needs explicit `drain --off`. Restart creates no pause. See [Pause, stop and rollback](#pause-stop-and-rollback) for status, pause-history warnings and helper rollback.
 
 `worker controller disable` unloads the remote LaunchAgent and sets laptop `enabled = false`. It uses the enabled destination, or the pending destination after a failed first init. `worker controller disable --ssh <destination>` selects a destination explicitly, including when local configuration is missing; cleanup of a different destination preserves the configured controller mode. With no recorded or explicit destination, it prints an actionable error. A confirmed uninstall clears the matching pending record; a failed uninstall retains it for retry.
 It preserves both inventories, task state, keys, and trusted hosts. Finish controller work before

@@ -79,19 +79,15 @@ integrate = "main"
 verify_merge = "never"
 ```
 
-<!-- Part 2: reconcile T6 lifecycle and notification wiring. -->
 Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
 
 Task overrides take precedence over batch defaults, then project settings. Submit `--no-integrate` disables inherited integration. Verification defaults to `never`; resolve and verify turns share the task's `max_followups` allowance. Integration requires a committed base already reachable from the target; `--wip` cannot integrate.
 
-<!-- Part 2: reconcile T6 drain, disable, rollback and resume. -->
-Use `worker controller drain` to pause new integration phases and auxiliary admissions; an admitted step or running turn finishes before parking. Resume explicitly with `worker controller drain --off`. Controller disable and helper rollback also stop new integration work; restore compatible support and the owner gate before resuming retained Open tasks.
+Use `worker controller drain` to pause ordinary handoffs, new integration phases and auxiliary admissions; an admitted step or running turn finishes before parking. `worker controller drain --off` resumes both ordinary handoffs and integration. Controller disable pauses integration only; after re-enable, integration stays paused until `drain --off`. A controller restart creates no pause. Helper rollback also parks integration; restore compatible support before resuming retained Open tasks.
 
-<!-- Part 2: reconcile T6 legacy retention settlement. -->
 > **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
-<!-- Part 2: reconcile T6 legacy retention settlement. -->
-GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs; compatible restore observes any uncertain push while keeping a host-closed task Closed.
+GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs. Compatible restore imports a reachable retained merge, or settles a reachable source as already integrated; if neither is reachable, it blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation remains uncertain and retries with bounded backoff. The task stays Closed, with no new push, workspace recreation or repair turn; `task integrate` refuses it.
 
 When integration is disabled, blocked, or given up, you can still inspect and fetch the retained result for manual review. Manual `task close` keeps the result and gives up unfinished integration; it never authorizes a merge. [Integration settings, checks, safety limits and recovery](docs/usage.md#automatic-integration).
 
