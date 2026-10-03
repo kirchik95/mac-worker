@@ -21,7 +21,7 @@ pub mod scheduler {
     pub use crate::scheduler::{
         AffinityHints, CandidateObservation, CandidateObservationError, CandidateRejection,
         CandidateSlot, QueueBlockingReason, RankedCandidate, SchedulerPolicy, Selection,
-        WorkerPreference,
+        WorkerPreference, rejection_code_for_missing,
     };
 }
 pub mod scheduler_adapter {
