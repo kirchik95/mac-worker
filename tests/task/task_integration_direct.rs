@@ -655,13 +655,31 @@ fn native_explicit_redrive_advances_one_blocked_epoch_and_recovers_via_reexec() 
     let done = wait_integrated(&f, task);
     assert_eq!(done.snapshot.integration_id, record.snapshot.integration_id);
     assert_eq!(done.snapshot.epoch, 1);
-    assert!(done.receipt.unwrap().imported);
+    assert!(done.receipt.as_ref().unwrap().imported);
     assert_eq!(
         client
             .integration_parent_gate(&tasks.load_task(task).unwrap())
             .unwrap(),
         ParentGate::Ready
     );
+    let ordinary = tasks.load_task(task).unwrap();
+    for _ in 0..2 {
+        let repeated = f.worker(&["--json", "task", "integrate", &task.to_string()]);
+        assert!(
+            repeated.status.success(),
+            "out={} err={}",
+            String::from_utf8_lossy(&repeated.stdout),
+            String::from_utf8_lossy(&repeated.stderr)
+        );
+        let result: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+        assert_eq!(
+            result["integration"],
+            serde_json::to_value(&done.snapshot).unwrap()
+        );
+        assert_eq!(state.load(task).unwrap().unwrap(), done);
+        assert_eq!(tasks.load_task(task).unwrap(), ordinary);
+        assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    }
 }
 
 #[test]

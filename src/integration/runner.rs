@@ -492,18 +492,48 @@ impl<'a> OwnerIntegration<'a> {
                         "integration revision changed",
                     ));
                 }
-                if self.ports.client.load_task(task)?.status().state() != TaskState::Open {
+                let ordinary = self.ports.client.load_task(task)?;
+                if ordinary.status().state() != TaskState::Open {
                     return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
                 }
-                if record.snapshot.state != IntegrationStatus::Blocked {
+                let result = if record.snapshot.state == IntegrationStatus::Integrated {
+                    record.validate()?;
+                    if !self
+                        .coordinator()
+                        .covers_latest_ordinary_work(&ordinary, &record.snapshot)?
+                    {
+                        return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
+                    }
+                    let receipt = record.receipt.as_ref().ok_or_else(invalid)?;
+                    let accepted = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+                    if !receipt.imported
+                        || receipt.integration_id != record.snapshot.integration_id
+                        || receipt.epoch != record.snapshot.epoch
+                        || receipt.source_turn_id != record.snapshot.source_turn_id
+                        || receipt.source_head != record.snapshot.source_head
+                        || Some(&receipt.target_head)
+                            != record.snapshot.observed_target_oid.as_ref()
+                        || receipt.merge_oid != record.snapshot.merge_oid
+                        || Some(receipt.disposition) != record.snapshot.disposition
+                        || ordinary.status().head_oid() != Some(accepted)
+                        || ordinary.fetched_head() != Some(accepted)
+                        || ordinary.runner().is_some()
+                        || self.ports.client.queue_entry_for_task_turn(task)?.is_some()
+                    {
+                        return Err(invalid());
+                    }
+                    Some(record.snapshot.clone())
+                } else if record.snapshot.state == IntegrationStatus::Blocked {
+                    self.ports.require_helper(self.ports.worker(task)?)?;
+                    None
+                } else {
                     return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
-                }
-                self.ports.require_helper(self.ports.worker(task)?)?;
+                };
                 let saved = RedriveBinding {
                     request: request.clone(),
                     intent: record.snapshot.integration_id,
                     epoch: record.snapshot.epoch,
-                    result: None,
+                    result,
                 };
                 write(
                     &root,
@@ -1169,6 +1199,86 @@ pub(crate) mod native_launch_tests {
             1
         );
         assert!(client.queue_snapshot().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn native_integrated_redrive_refuses_inconsistent_confirmation() {
+        for bad in ["import", "epoch", "source", "target", "fetched", "latest"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(&temp.path().canonicalize().unwrap());
+            let client = ClientStateStore::open(&paths.state).unwrap();
+            let ordinary = match bad {
+                "fetched" => sample_ordinary(fixture_task(), fixture_source())
+                    .with_fetched_head(None)
+                    .unwrap(),
+                "latest" => sample_ordinary_followup(
+                    fixture_task(),
+                    fixture_source(),
+                    Some(crate::task::TaskOutcome::Done),
+                ),
+                _ => sample_ordinary(fixture_task(), fixture_source()),
+            };
+            client.create_task(ordinary.clone()).unwrap();
+            let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+            let owner =
+                OwnerIntegration::new(&NoProcesses, &config, &paths, &client, &NeverSpawn).unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Integrated;
+            record.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+            record.snapshot.observed_target_oid = Some(fixture_head());
+            let mut receipt = IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: fixture_head(),
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: true,
+                recorded_at_millis: 1002,
+            };
+            match bad {
+                "import" => receipt.imported = false,
+                "epoch" => receipt.epoch = 1,
+                "source" => receipt.source_turn_id = TurnId::generate(),
+                "target" => receipt.target_head = "e".repeat(40).parse().unwrap(),
+                _ => {}
+            }
+            record.receipt = Some(receipt);
+            owner
+                .state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            owner
+                .state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let request = IntegrationRedriveRequest {
+                task_id: record.task_id,
+                expected: record.snapshot.revision,
+                request_id: uuid::Uuid::new_v4().simple().to_string(),
+            };
+            let error = owner.redrive(&request).unwrap_err();
+            assert_eq!(
+                error.public_code(),
+                if bad == "latest" {
+                    "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+                } else {
+                    "INTEGRATION_STATE_INVALID"
+                },
+                "{bad}"
+            );
+            assert_eq!(owner.state.load(record.task_id).unwrap().unwrap(), record);
+            assert_eq!(client.load_task(record.task_id).unwrap(), ordinary);
+            assert!(
+                read(
+                    &task_root(&paths, record.task_id).unwrap(),
+                    &format!("redrive-{}.json", request.request_id)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 
     #[test]

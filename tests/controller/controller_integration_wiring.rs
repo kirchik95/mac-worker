@@ -404,6 +404,80 @@ fn controller_redrive_freezes_the_request_without_running_an_owner_phase() {
 }
 
 #[test]
+fn controller_redrive_binds_integrated_success_without_an_epoch_or_process() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+    record.snapshot.state = IntegrationStatus::Integrated;
+    record.snapshot.observed_target_oid = Some(fixture_head());
+    record.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    record.receipt = Some(IntegrationReceipt {
+        integration_id: record.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1002,
+    });
+    state
+        .publish_policy(record.task_id, &record.policy)
+        .unwrap();
+    state
+        .replace(record.task_id, IntegrationRevision(0), &record)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
+        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    for ordinal in 0..2 {
+        let request_id = format!("{:032x}", 100 + ordinal);
+        let request = parse_request(&serde_json::to_vec(&json!({
+            "protocol_version": 7, "request_id": request_id, "command": "task.integrate",
+            "body": {"task_id": record.task_id, "expected": record.snapshot.revision, "request_id": request_id}
+        })).unwrap()).unwrap();
+        for _ in 0..2 {
+            let ack = store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap();
+            assert_eq!(
+                ack.result(),
+                Some(&serde_json::to_value(&record.snapshot).unwrap())
+            );
+            assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+            assert_eq!(tasks.load_task(record.task_id).unwrap(), ordinary);
+            assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+            let saved: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(paths.state.join(format!(
+                    "integrations/tasks/{}/redrive-{request_id}.json",
+                    record.task_id
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                saved["result"],
+                serde_json::to_value(&record.snapshot).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn capable_controller_publishes_the_policy_before_ordinary_preparation() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
