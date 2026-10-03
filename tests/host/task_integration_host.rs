@@ -1685,16 +1685,23 @@ fn legacy_closed_clean_candidate_cannot_push_or_recreate_workspace() {
     f.prepare();
     legacy_close(&f);
     for step in [
+        IntegrationStep::Fetch,
         IntegrationStep::Prepare,
         IntegrationStep::Build,
         IntegrationStep::Push,
-        IntegrationStep::Repair,
     ] {
         assert_eq!(
             f.execute(step).unwrap_err().public_code(),
             IntegrationCode::IntegrationWorkspaceMissing.as_str()
         );
     }
+    assert!(matches!(
+        f.execute(IntegrationStep::Repair).unwrap(),
+        HostIntegrationResponse::Blocked {
+            code: IntegrationCode::IntegrationWorkspaceMissing,
+            ..
+        }
+    ));
     assert!(!f.workspace().exists());
     assert_eq!(f.origin_tip(), target);
     assert_eq!(
