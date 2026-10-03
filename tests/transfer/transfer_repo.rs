@@ -62,6 +62,8 @@ fn settings_including(patterns: &[&str]) -> ProjectSettings {
             max_total_bytes: None,
         },
         task: TaskSettings {
+            integrate: Default::default(),
+            verify_merge: None,
             questions: None,
             model: None,
             effort: None,

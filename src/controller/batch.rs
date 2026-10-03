@@ -396,7 +396,7 @@ fn mapped_nodes(
     Ok(nodes)
 }
 
-fn validate_wire_graph(body: &FrozenBatchBody) -> Result<(), WorkerError> {
+pub(crate) fn validate_wire_graph(body: &FrozenBatchBody) -> Result<(), WorkerError> {
     if body.nodes.is_empty() {
         return Err(WorkerError::task(
             "TASK_CONFIG_INVALID",

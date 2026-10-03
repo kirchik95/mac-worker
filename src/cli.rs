@@ -134,6 +134,8 @@ pub enum Command {
         slot_token: Option<HiddenComponent>,
     },
     #[command(hide = true)]
+    IntegrationRunner { task_id: TaskId },
+    #[command(hide = true)]
     Host {
         #[command(subcommand)]
         command: HostCommand,
@@ -202,6 +204,15 @@ pub enum TaskCommand {
         /// Questions policy: decide autonomously (default) or ask for human input; overrides [task] questions
         #[arg(long, value_enum)]
         questions: Option<crate::task::QuestionsPolicy>,
+        /// Integrate the completed task into this short branch on its own origin
+        #[arg(long, value_name = "BRANCH", value_parser = integration_target, conflicts_with = "no_integrate")]
+        integrate: Option<crate::task::BranchName>,
+        /// Disable inherited project integration
+        #[arg(long, conflicts_with = "integrate")]
+        no_integrate: bool,
+        /// Verify a clean merge after target movement (default: never)
+        #[arg(long, value_parser = verify_merge_policy)]
+        verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
         /// When to close the task: done or never
         #[arg(long, value_parser = non_empty_text)]
         close_on: Option<String>,
@@ -323,6 +334,11 @@ pub enum TaskCommand {
         /// Drop the retained result commits
         #[arg(long)]
         discard: bool,
+    },
+    #[command(about = "Re-drive a blocked integration after repairing its cause")]
+    Integrate {
+        /// Task whose configured integration to re-drive
+        task_id: TaskId,
     },
     #[command(about = "Re-drive a failed origin delivery after credentials are repaired")]
     PublishRetry {
@@ -490,6 +506,10 @@ pub enum HostCommand {
     TaskCancel,
     #[command(name = "task-turn")]
     TaskTurn,
+    #[command(name = "task-integration", hide = true)]
+    TaskIntegration,
+    #[command(name = "task-integration-turn", hide = true)]
+    TaskIntegrationTurn,
     #[command(name = "agent-settings-get")]
     AgentSettingsGet,
     #[command(name = "agent-settings-set")]
@@ -603,6 +623,20 @@ fn non_empty_text(value: &str) -> Result<String, String> {
         Err("value must not be empty".into())
     } else {
         Ok(value.to_owned())
+    }
+}
+
+fn integration_target(value: &str) -> Result<crate::task::BranchName, String> {
+    crate::integration::contracts::validate_integration_target(value)
+        .map_err(|_| "integration requires a short branch of at most 255 UTF-8 bytes".into())
+}
+
+fn verify_merge_policy(value: &str) -> Result<crate::integration::contracts::VerifyPolicy, String> {
+    use crate::integration::contracts::VerifyPolicy;
+    match value {
+        "never" => Ok(VerifyPolicy::Never),
+        "moved-target" => Ok(VerifyPolicy::MovedTarget),
+        _ => Err("verify-merge must be never or moved-target".into()),
     }
 }
 
