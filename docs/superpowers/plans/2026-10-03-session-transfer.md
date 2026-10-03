@@ -337,7 +337,7 @@ Each track has its own brief in the orchestrator's scratchpad (`briefs/st-w<N>-*
 ## Live acceptance — T8, with the owner
 
 - [ ] Deploy per `docs/releasing.md` and the dev CLI install gotcha (new inode, dated backup, then setup, refresh-facts, doctor). Coordinate with the parallel session first, so there are no open tasks of theirs.
-- [ ] Claude: an interactive laptop session of a few turns → `worker task submit --from-session claude --wip -p "continue: <next step>"`. The result shows earlier context was used, and a `worker task say` follow-up works.
+- [ ] Claude: an interactive laptop session of a few turns → `worker task submit --from-session claude --wip --prompt "continue: <next step>"`. The result shows earlier context was used, and a `worker task say` follow-up works.
 - [ ] Codex: the same. If laptop Codex is newer than the minis, expect `SESSION_AGENT_TOO_OLD` first, then align versions.
 - [ ] Controller mode: the same once via the mini-1 controller.
 - [ ] A host without the feature is excluded before the lease.
