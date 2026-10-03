@@ -141,11 +141,99 @@ pub(crate) fn reject_unrouted_settings(
     Ok(())
 }
 pub fn preflight_integration_base(
-    _runner: &dyn ProcessRunner,
-    _origin: &str,
-    _branch: &BranchName,
-    _base: Option<&BaseOid>,
-    _local_repo: &RootedDir,
+    runner: &dyn ProcessRunner,
+    origin: &str,
+    branch: &BranchName,
+    base: Option<&BaseOid>,
+    local_repo: &RootedDir,
 ) -> Result<IntegrationBasePreflight, WorkerError> {
-    Err(integration_unavailable())
+    use IntegrationBasePreflight::{Pass, Unknown};
+    // Pure validation precedes even the advertisement. Use the existing
+    // preflight environment and bounds, not a target fetch/transfer ref.
+    let key = TargetKey::new(origin, branch.as_str())
+        .map_err(|_| integration_error("TASK_CONFIG_INVALID"))?;
+    let reference = format!("refs/heads/{}", key.branch.as_str());
+    let request = crate::git_transport::origin_ref_request(key.origin, &reference)?;
+    let Ok(result) = runner.run(&request) else {
+        return Ok(Unknown);
+    };
+    if !result.status.success() {
+        return Ok(Unknown);
+    }
+    if result.stdout.is_empty() {
+        return Err(IntegrationCode::IntegrationTargetMissing.error());
+    }
+    let Ok(text) = std::str::from_utf8(&result.stdout) else {
+        return Ok(Unknown);
+    };
+    let mut lines = text.lines();
+    let Some((oid, advertised_ref)) = lines.next().and_then(|line| line.split_once('\t')) else {
+        return Ok(Unknown);
+    };
+    if advertised_ref != reference || lines.next().is_some() {
+        return Ok(Unknown);
+    }
+    let Ok(target) = oid.parse::<BaseOid>() else {
+        return Ok(Unknown);
+    };
+    let Some(base) = base else {
+        return Ok(Unknown);
+    };
+
+    let run_local = |operation: Vec<std::ffi::OsString>| {
+        let mut request = crate::git_transport::git_request_with_config(
+            local_repo.path(),
+            None,
+            &[
+                ("core.hooksPath".into(), "/dev/null".into()),
+                ("core.fsmonitor".into(), "false".into()),
+            ],
+            operation,
+        );
+        request.policy.deadline = std::time::Duration::from_secs(30);
+        request.environment.extend([
+            ("GIT_NO_LAZY_FETCH".into(), "1".into()),
+            ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+            ("GIT_GRAFT_FILE".into(), "/dev/null".into()),
+        ]);
+        runner.run(&request)
+    };
+    // A negative answer in shallow/incomplete history is not a proof. Traverse
+    // both commit histories before testing ancestry, without fetching missing
+    // promisor objects or accepting replace/graft identities.
+    let Ok(shallow) = run_local(vec!["rev-parse".into(), "--is-shallow-repository".into()]) else {
+        return Ok(Unknown);
+    };
+    if !shallow.status.success() || shallow.stdout != b"false\n" {
+        return Ok(Unknown);
+    }
+    let Ok(history) = run_local(vec![
+        "rev-list".into(),
+        "--count".into(),
+        target.as_str().into(),
+        base.as_str().into(),
+    ]) else {
+        return Ok(Unknown);
+    };
+    if !history.status.success()
+        || std::str::from_utf8(&history.stdout)
+            .ok()
+            .and_then(|count| count.trim().parse::<u64>().ok())
+            .is_none()
+    {
+        return Ok(Unknown);
+    }
+    let Ok(ancestry) = run_local(vec![
+        "merge-base".into(),
+        "--is-ancestor".into(),
+        base.as_str().into(),
+        target.as_str().into(),
+    ]) else {
+        return Ok(Unknown);
+    };
+    match ancestry.status.code() {
+        Some(0) => Ok(Pass),
+        Some(1) => Err(IntegrationCode::IntegrationBaseNotOnTarget.error()),
+        _ => Ok(Unknown),
+    }
 }

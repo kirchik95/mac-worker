@@ -893,7 +893,7 @@ fn git_request(
     git_request_with_config(transfer_repo, ssh, &[], operation)
 }
 
-fn git_request_with_config(
+pub(crate) fn git_request_with_config(
     transfer_repo: &Path,
     ssh: Option<String>,
     extra_config: &[(String, String)],
@@ -1046,7 +1046,10 @@ fn origin_request(origin: String) -> Result<ProcessRequest, WorkerError> {
     })
 }
 
-fn origin_ref_request(origin: String, reference: &str) -> Result<ProcessRequest, WorkerError> {
+pub(crate) fn origin_ref_request(
+    origin: String,
+    reference: &str,
+) -> Result<ProcessRequest, WorkerError> {
     let mut request = origin_request(origin)?;
     request.args.push(OsString::from(reference));
     Ok(request)

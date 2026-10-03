@@ -234,6 +234,131 @@ fn project_settings_parse_optional_integration_without_global_default() {
     }
 }
 
+struct PreflightRunner {
+    replies: std::sync::Mutex<std::collections::VecDeque<(i32, Vec<u8>)>>,
+    requests: std::sync::Mutex<Vec<mac_worker::test_support::host::process::ProcessRequest>>,
+}
+impl PreflightRunner {
+    fn new(replies: Vec<(i32, Vec<u8>)>) -> Self {
+        Self {
+            replies: std::sync::Mutex::new(replies.into()),
+            requests: Default::default(),
+        }
+    }
+}
+impl mac_worker::test_support::host::process::ProcessRunner for PreflightRunner {
+    fn run(
+        &self,
+        request: &mac_worker::test_support::host::process::ProcessRequest,
+    ) -> Result<
+        mac_worker::test_support::host::process::ProcessResult,
+        mac_worker::test_support::core::error::WorkerError,
+    > {
+        use std::os::unix::process::ExitStatusExt;
+        self.requests.lock().unwrap().push(request.clone());
+        let (code, stdout) = self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected command");
+        Ok(mac_worker::test_support::host::process::ProcessResult {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout,
+            stderr: vec![],
+        })
+    }
+}
+
+#[test]
+fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
+    use mac_worker::test_support::host::rooted_fs::RootedDir;
+    let root = tempfile::tempdir().unwrap();
+    let repo = RootedDir::open(root.path()).unwrap();
+    let branch = validate_integration_target("main").unwrap();
+    let advertised = format!("{}\trefs/heads/main\n", "c".repeat(40)).into_bytes();
+    for (replies, expected) in [
+        (
+            vec![
+                (0, advertised.clone()),
+                (0, b"false\n".to_vec()),
+                (0, b"3\n".to_vec()),
+                (0, vec![]),
+            ],
+            Ok(IntegrationBasePreflight::Pass),
+        ),
+        (
+            vec![
+                (0, advertised.clone()),
+                (0, b"false\n".to_vec()),
+                (0, b"3\n".to_vec()),
+                (1, vec![]),
+            ],
+            Err("INTEGRATION_BASE_NOT_ON_TARGET"),
+        ),
+        (
+            vec![(0, advertised.clone()), (0, b"true\n".to_vec())],
+            Ok(IntegrationBasePreflight::Unknown),
+        ),
+        (
+            vec![
+                (0, advertised.clone()),
+                (0, b"false\n".to_vec()),
+                (128, vec![]),
+            ],
+            Ok(IntegrationBasePreflight::Unknown),
+        ),
+        (vec![(128, vec![])], Ok(IntegrationBasePreflight::Unknown)),
+        (vec![(0, vec![])], Err("INTEGRATION_TARGET_MISSING")),
+        (
+            vec![(0, b"malformed\n".to_vec())],
+            Ok(IntegrationBasePreflight::Unknown),
+        ),
+    ] {
+        let runner = PreflightRunner::new(replies);
+        let result = preflight_integration_base(
+            &runner,
+            "https://example.test/repo.git",
+            &branch,
+            Some(&fixture_head()),
+            &repo,
+        )
+        .map_err(|error| error.public_code());
+        assert_eq!(result, expected.map_err(str::to_owned));
+        let requests = runner.requests.lock().unwrap();
+        let remote = requests
+            .iter()
+            .filter(|request| request.args.iter().any(|arg| arg == "ls-remote"))
+            .collect::<Vec<_>>();
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].args.last().unwrap(), "refs/heads/main");
+        assert_eq!(
+            remote[0].policy.deadline,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(remote[0].policy.stdout_limit, 8 * 1024 * 1024);
+        assert_eq!(remote[0].policy.stderr_limit, 64 * 1024);
+        for request in requests.iter() {
+            assert!(!request.args.iter().any(|arg| arg == "fetch"
+                || arg == "update-ref"
+                || arg.to_string_lossy().contains("refs/mac-worker/")));
+        }
+    }
+    let runner = PreflightRunner::new(vec![(0, advertised)]);
+    assert_eq!(
+        preflight_integration_base(
+            &runner,
+            "https://example.test/repo.git",
+            &branch,
+            None,
+            &repo
+        )
+        .unwrap(),
+        IntegrationBasePreflight::Unknown
+    );
+    assert_eq!(runner.requests.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn authoritative_target_accepts_255_bytes_and_rejects_256() {
     assert!(validate_integration_target(&"a".repeat(255)).is_ok());
