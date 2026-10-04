@@ -944,8 +944,13 @@ impl MacWorkerTaskMutationSource {
                 .redrive(&request.integration)
                 .map_err(map_mutation_error)?;
             next.validate().map_err(map_mutation_error)?;
+            // A pending native replay can recover an already-Integrated no-op
+            // whose validated receipt/result was saved at the same revision.
+            let recovered_noop = previous.is_none()
+                && next.state == IntegrationStatus::Integrated
+                && next.revision == request.integration.expected;
             if next.integration_id != request.expected_integration_id
-                || next.revision <= request.integration.expected
+                || (!recovered_noop && next.revision <= request.integration.expected)
                 || previous.is_some_and(|snapshot| next.epoch <= snapshot.epoch)
             {
                 return Err(ApiError::new(
@@ -1207,5 +1212,165 @@ mod read_cost_tests {
             "one policy and record read per task"
         );
         assert!(projection.tasks.iter().all(|row| row.integration.is_some()));
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+    use crate::turn_runner::InlineRunnerExecutor;
+
+    struct NoProbeProcesses;
+    impl ProcessRunner for NoProbeProcesses {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("this probe must not run an external process")
+        }
+    }
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        paths: PathLayout,
+        client: Arc<ClientStateStore>,
+        config: Arc<Config>,
+        state: RootedIntegrationState,
+        request: TaskIntegrationRequest,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let client = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+            let ordinary = sample_ordinary(fixture_task(), fixture_source());
+            client.create_task(ordinary.clone()).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Integrated;
+            record.snapshot.observed_target_oid = Some(record.snapshot.source_head.clone());
+            record.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+            record.receipt = Some(IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                source_turn_id: record.snapshot.source_turn_id,
+                source_head: record.snapshot.source_head.clone(),
+                target_head: record.snapshot.source_head.clone(),
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: true,
+                recorded_at_millis: 1001,
+            });
+            record.validate().unwrap();
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let request = serde_json::from_value(serde_json::json!({
+                "expected": {
+                    "expected_task_id":record.task_id,
+                    "expected_turn_id":ordinary.status().turns().last().unwrap().turn_id(),
+                    "expected_turn_count":ordinary.status().turns().len(),
+                    "expected_head_oid":ordinary.status().head_oid(),
+                    "expected_updated_at_millis":ordinary.status().updated_at_millis(),
+                    "expected_state":"open"
+                },
+                "expected_integration_id":record.snapshot.integration_id,
+                "integration":{"task_id":record.task_id,"expected":record.snapshot.revision,
+                    "request_id":uuid::Uuid::new_v4().simple().to_string()}
+            }))
+            .unwrap();
+            Self {
+                _temp: temp,
+                paths,
+                client,
+                config: Arc::new(Config::parse("version = 1\n").unwrap()),
+                state,
+                request,
+            }
+        }
+        fn native(&self) -> Arc<NativeDashboardIntegrations> {
+            Arc::new(NativeDashboardIntegrations {
+                config: self.config.clone(),
+                paths: self.paths.clone(),
+                client: self.client.clone(),
+                runner: Arc::new(NoProbeProcesses),
+            })
+        }
+        fn mutation(&self) -> MacWorkerTaskMutationSource {
+            MacWorkerTaskMutationSource::new(
+                self.config.clone(),
+                self.client.clone(),
+                self.paths.clone(),
+            )
+            .with_process_runner(Arc::new(NoProbeProcesses))
+            .with_executor(Arc::new(InlineRunnerExecutor))
+            .with_integrations(self.native())
+        }
+        fn binding(&self) -> std::path::PathBuf {
+            self.paths.state.join(format!(
+                "integrations/tasks/{}/dashboard-redrive-{}.json",
+                fixture_task(),
+                self.request.integration.request_id
+            ))
+        }
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ProbeBinding {
+        request: IntegrationRedriveRequest,
+        body: serde_json::Value,
+        result: Option<serde_json::Value>,
+    }
+
+    #[test]
+    fn review_pending_integrated_noop_replay_keeps_idempotent_success() {
+        let f = Fixture::new();
+        let mutation = f.mutation();
+        let original = f.state.load(fixture_task()).unwrap().unwrap();
+        let first = mutation
+            .integrate_response(fixture_task(), &f.request)
+            .unwrap();
+        let mut binding: ProbeBinding =
+            serde_json::from_slice(&std::fs::read(f.binding()).unwrap()).unwrap();
+        binding.result = None; // Crash after publishing the request, before saving its no-op response.
+        std::fs::write(f.binding(), serde_json::to_vec(&binding).unwrap()).unwrap();
+        let replay = mutation.integrate_response(fixture_task(), &f.request);
+
+        assert_eq!(
+            replay.unwrap(),
+            first,
+            "a pending already-integrated replay must not demand a new revision"
+        );
+        assert_eq!(f.state.load(fixture_task()).unwrap().unwrap(), original);
+        let mut changed = f.request.clone();
+        changed.expected.expected_turn_count += 1;
+        assert_eq!(
+            mutation
+                .integrate_response(fixture_task(), &changed)
+                .unwrap_err()
+                .code,
+            "INTEGRATION_STATE_INVALID"
+        );
+        let mut stale = changed;
+        stale.integration.request_id = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(
+            mutation
+                .integrate_response(fixture_task(), &stale)
+                .unwrap_err()
+                .code,
+            "TASK_REVISION_CONFLICT"
+        );
+        assert_eq!(f.state.load(fixture_task()).unwrap().unwrap(), original);
     }
 }
