@@ -348,6 +348,8 @@ mod policy {
         outcome: Option<SafeOutcome>,
     ) -> TaskFacts {
         TaskFacts {
+            integration_confirmation: None,
+            integration: None,
             task_id,
             run_id: None,
             state: state.to_owned(),
@@ -1451,6 +1453,59 @@ mod policy {
         assert!(results.is_empty());
         assert!(recorded.records().is_empty());
         assert_eq!(cache.load().expect("load").decisions.len(), 1);
+    }
+    #[test]
+    fn integration_epochs_notify_again_on_same_source_and_restart_deduplicates() {
+        use mac_worker::test_support::integration::*;
+        let mut h = NotifierHarness::new();
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        let mut enabled = done_facts(fixture_task(), fixture_source());
+        enabled.outcome = Some(SafeOutcome::Blocked);
+        enabled.code = Some(SafeCode::from_public_code("INTEGRATION_CHECKS_FAILED"));
+        for epoch in [1, 2] {
+            snapshot.epoch = epoch;
+            enabled.integration = Some(snapshot.annotation().unwrap());
+            assert!(enabled.confirm_integration(&snapshot));
+            let result = warm_complete(
+                h.journal_id,
+                epoch as u64 + 1,
+                vec![change(enabled.clone())],
+                vec![enabled.clone()],
+            );
+            h.consume(result.clone(), NotifyOptions::default());
+            assert_eq!(h.delivered.len(), epoch as usize);
+            assert_eq!(h.delivered.last().unwrap().sound, NoticeSound::Request);
+            let saved = h.cache.as_ref().unwrap().load().unwrap();
+            let repeated = plan_notifications(&saved, &result, &NotifyOptions::default(), h.now);
+            assert!(repeated.notices.is_empty());
+        }
+        snapshot.state = IntegrationStatus::Integrated;
+        snapshot.blocked_code = None;
+        snapshot.disposition = Some(IntegrationDisposition::Merged);
+        snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        enabled.integration = Some(snapshot.annotation().unwrap());
+        enabled.outcome = Some(SafeOutcome::Done);
+        enabled.code = None;
+        assert!(enabled.confirm_integration(&snapshot));
+        let plan = plan_warm(enabled);
+        assert_eq!(plan.notices[0].sound, NoticeSound::Done);
+    }
+
+    #[test]
+    fn integration_facts_and_journal_hints_alone_never_confirm_a_banner() {
+        use mac_worker::test_support::integration::*;
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.state = IntegrationStatus::Integrated;
+        snapshot.disposition = Some(IntegrationDisposition::Merged);
+        snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        let mut enabled = done_facts(fixture_task(), fixture_source());
+        enabled.integration = Some(snapshot.annotation().unwrap());
+        assert!(plan_warm(enabled.clone()).notices.is_empty());
+        snapshot.revision = snapshot.revision.next().unwrap();
+        assert!(!enabled.confirm_integration(&snapshot));
+        assert!(plan_warm(enabled).notices.is_empty());
     }
 }
 

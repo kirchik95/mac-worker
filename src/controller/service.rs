@@ -148,6 +148,11 @@ pub fn manage(
     match action {
         ServiceAction::Status => Ok(status),
         ServiceAction::Uninstall => {
+            match super::drain::close_for_disable(&paths.controller_state_root()) {
+                Ok(Some(warning)) => warning.print(),
+                Err(error) => super::drain::GateWarning::new(&error, false, true).print(),
+                Ok(None) => {}
+            }
             if status.loaded {
                 run_checked(runner, &["bootout".into(), target.into()])?;
                 if is_loaded(runner, uid)? {

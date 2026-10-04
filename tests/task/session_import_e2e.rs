@@ -21,22 +21,40 @@ use std::{
 
 const SOURCE_ID: &str = "018f0f4a-6b5c-7d8e-9f00-112233445566";
 
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    project: support::GitRepo,
-    laptop: PathBuf,
-    host: PathBuf,
-    ssh: PathBuf,
-    config: PathBuf,
+    pub(super) project: support::GitRepo,
+    pub(super) laptop: PathBuf,
+    pub(super) host: PathBuf,
+    pub(super) ssh: PathBuf,
+    pub(super) config: PathBuf,
+}
+
+pub(super) fn warm_executable(path: &Path) {
+    // Pay first-exec assessment outside the helper's bounded probe.
+    assert!(
+        Command::new(path)
+            .arg("--fixture-warm")
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
+    let (header, body) = content.split_once('\n').unwrap();
+    let warm = match header {
+        "#!/usr/bin/python3" => "import sys\nif sys.argv[1:] == ['--fixture-warm']: sys.exit(0)\n",
+        "#!/bin/sh" => "[ \"$1\" = --fixture-warm ] && exit 0\n",
+        _ => panic!("unsupported fixture interpreter"),
+    };
+    fs::write(path, format!("{header}\n{warm}{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    warm_executable(path);
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let laptop = root.join("laptop");
@@ -127,7 +145,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])
         fixture
     }
 
-    fn host_root(&self) -> PathBuf {
+    pub(super) fn host_root(&self) -> PathBuf {
         self.host.join(".local/share/mac-worker/host")
     }
 
@@ -172,7 +190,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])
         .unwrap();
     }
 
-    fn capture_fixture(&self, agent: SessionAgent) -> PathBuf {
+    pub(super) fn capture_fixture(&self, agent: SessionAgent) -> PathBuf {
         let cwd = self
             .project
             .root()
@@ -201,7 +219,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])
         path
     }
 
-    fn install_agent(&self, agent: SessionAgent) {
+    pub(super) fn install_agent(&self, agent: SessionAgent) {
         // No real provider binaries can be reached, even through login PATH rebuilding.
         for name in ["cursor-agent", "opencode", "herdr"] {
             executable(&self.host.join("bin").join(name), "#!/bin/sh\nexit 127\n");
@@ -266,7 +284,7 @@ done < "$HOME/placed-files"
         ])
     }
 
-    fn worker(&self, args: &[&str]) -> Output {
+    pub(super) fn worker(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_worker"))
             .env_clear()
             .env("HOME", &self.laptop)

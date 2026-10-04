@@ -328,6 +328,8 @@ fn open_done_record_for_project(
 fn mutation_request(record: &LocalTaskRecord, message: Option<&str>) -> TaskMutationRequest {
     let status = record.status();
     TaskMutationRequest {
+        expected_integration_id: None,
+        expected_integration_revision: None,
         message: message.map(str::to_owned),
         expected_task_id: record.meta().task_id(),
         expected_turn_id: status.turns().last().map(TurnSummary::turn_id),

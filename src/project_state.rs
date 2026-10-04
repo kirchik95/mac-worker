@@ -176,6 +176,8 @@ impl ProjectState {
                 max_total_bytes: None,
             },
             task: TaskSettings {
+                integrate: Default::default(),
+                verify_merge: None,
                 questions: prepared.questions,
                 source: prepared.source.clone(),
                 publish: prepared.publish.clone(),
@@ -212,6 +214,8 @@ impl ProjectState {
                 max_total_bytes: None,
             },
             task: TaskSettings {
+                integrate: Default::default(),
+                verify_merge: None,
                 questions: spec.questions,
                 source: spec.source.clone(),
                 publish: spec.publish.clone(),

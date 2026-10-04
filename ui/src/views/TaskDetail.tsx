@@ -10,11 +10,14 @@ import { duration, humanize, relativeTime, shortId } from '@/lib/format'
 import { Check, ChevronRight, History, Monitor, Reply, Terminal } from 'lucide-react'
 import { AgentMark } from '@/components/AgentMark'
 import { TaskBadge } from '@/components/TaskBadge'
+import { currentIntegration } from '@/lib/taskPresentation'
 import { Button } from '@/components/ui/button'
 import { ActionFeedback, type ActionState } from '@/components/ActionFeedback'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   acceptTask,
+  integrateTask,
+  taskMutationForDetail,
   ApiError,
   fetchTaskDetail,
   lastDelivery,
@@ -23,7 +26,6 @@ import {
   replyToTask,
   type ReportedCheck,
   type TaskDetail as TaskDetailPayload,
-  type TaskMutation,
   type TurnRow,
 } from '@/lib/api'
 import { FALLBACK_POLL_MS, HEALTHY_ANTI_ENTROPY_MS } from '@/lib/controllerEvents'
@@ -40,19 +42,6 @@ function checkMark(status: ReportedCheck['status']): string {
   if (status === 'fail') return 'FAIL'
   if (status === 'error') return 'ERROR'
   return 'NOT RUN'
-}
-
-function mutationBody(detail: TaskDetailPayload, message?: string): TaskMutation {
-  const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
-  return {
-    message,
-    expected_task_id: detail.task.task_id,
-    expected_turn_id: turns.at(-1)?.turn_id ?? null,
-    expected_turn_count: detail.task.turn_count,
-    expected_head_oid: detail.head_oid,
-    expected_updated_at_millis: detail.task.updated_at_millis,
-    expected_state: detail.task.state,
-  }
 }
 
 function turnSpan(turn: TurnRow): string {
@@ -142,7 +131,7 @@ export function TaskDetail({
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [action, setAction] = useState<{
-    kind: 'reply' | 'accept'
+    kind: 'reply' | 'accept' | 'integrate'
     state: ActionState
     message?: string
   } | null>(null)
@@ -291,7 +280,8 @@ export function TaskDetail({
     rescheduleRef.current()
   }, [healthy])
 
-  const runMutation = async (kind: 'reply' | 'accept', message?: string) => {
+  const redriveIntent = useRef<{ integration_id: string; revision: number; request_id: string } | null>(null)
+  const runMutation = async (kind: 'reply' | 'accept' | 'integrate', message?: string) => {
     if (!detail || mutationInFlight.current) return
     const generation = mutationGeneration.current
     mutationController.current?.abort()
@@ -305,10 +295,21 @@ export function TaskDetail({
     setAction({ kind, state: 'pending' })
     setActionError(null)
     try {
+      const integration = currentIntegration(detail.task)
+      if (kind === 'integrate' && (!integration || !Number.isSafeInteger(integration.revision)))
+        throw new ApiError(409, 'Integration revision is unavailable; refresh the task.')
+      if (kind === 'integrate' && (redriveIntent.current?.integration_id !== integration!.integration_id ||
+          redriveIntent.current?.revision !== integration!.revision))
+        redriveIntent.current = { integration_id: integration!.integration_id, revision: integration!.revision,
+          request_id: crypto.randomUUID().replaceAll('-', '') }
       const next =
-        kind === 'reply'
-          ? await replyToTask(taskId, mutationBody(detail, message), controller.signal)
-          : await acceptTask(taskId, mutationBody(detail), controller.signal)
+        kind === 'integrate'
+          ? await integrateTask(taskId, { expected: taskMutationForDetail(detail), expected_integration_id: integration!.integration_id,
+              integration: { task_id: detail.task.task_id, expected: integration!.revision,
+                request_id: redriveIntent.current!.request_id } }, controller.signal)
+        : kind === 'reply'
+          ? await replyToTask(taskId, taskMutationForDetail(detail, message), controller.signal)
+          : await acceptTask(taskId, taskMutationForDetail(detail), controller.signal)
       if (mutationGeneration.current !== generation || controller.signal.aborted) return
       detailEpoch.current += 1
       setDetail(next)
@@ -316,7 +317,9 @@ export function TaskDetail({
         kind,
         state: 'success',
         message:
-          kind === 'reply'
+          kind === 'integrate'
+            ? 'Integration re-drive requested.'
+            : kind === 'reply'
             ? 'Reply sent. A new turn has been requested.'
             : next.review_state === 'closed'
               ? 'Task accepted. You choose when to merge the branch.'
@@ -342,11 +345,15 @@ export function TaskDetail({
   const { task } = detail
   const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
 
-  const waiting = detail.review_state === 'waiting_on_you'
-  const reviewable = detail.review_state === 'ready_for_review'
+  const integration = detail.integration ?? task.integration
+  const current = currentIntegration(task)
+  const blocked = current?.state === 'blocked'
+  const ordinaryActions = !current || ['armed', 'revoked'].includes(current.state)
+  const waiting = ordinaryActions && detail.review_state === 'waiting_on_you'
+  const reviewable = ordinaryActions && detail.review_state === 'ready_for_review'
   const closing = detail.review_state === 'close_pending'
   const acceptState = action?.kind === 'accept' ? action.state : 'idle'
-  const replyable = waiting || reviewable || detail.review_state === 'ready_for_follow_up'
+  const replyable = waiting || reviewable || ((ordinaryActions || blocked) && task.state === 'open' && detail.review_state === 'ready_for_follow_up')
   const activeTurn =
     task.state === 'active'
       ? (turns.find((turn) => turn.turn_id === task.active_turn_id) ??
@@ -468,6 +475,23 @@ export function TaskDetail({
           </div>
         ) : null}
       </header>
+      {integration ? (
+        <section className="mw-panel" aria-label={current ? 'Integration' : 'Integration history'}>
+          {!current ? <p>Previous integration</p> : null}
+          <p>Integration target: {integration.target}</p>
+          <p>State: {integration.state}</p>
+          {integration.pause_reason ? <p>Paused: {integration.pause_reason} · Resume: {integration.resume_state}</p> : null}
+          {integration.blocked_code ? <p>{integration.blocked_code}</p> : null}
+          {integration.merge_oid ?? integration.observed_target_oid ? <p>Result: {integration.merge_oid ?? integration.observed_target_oid}</p> : null}
+          <p>Checks reported by {integration.verification === 'source_agent_report_only' ? 'the source agent' : integration.verification === 'resolve_agent_report' ? 'the resolve agent' : 'the verify agent'}</p>
+          {blocked && task.state === 'open' ? (
+            <div className="flex gap-3">
+              <Button disabled={busy || !Number.isSafeInteger(integration.revision)} onClick={() => void runMutation('integrate')}>Re-drive integration</Button>
+              <Button variant="outline" disabled={busy || !Number.isSafeInteger(integration.revision)} onClick={() => void runMutation('accept')}>Close task</Button>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       {actionError ? (
         <p role="alert" className="mw-banner" data-tone="error">
           {actionError}

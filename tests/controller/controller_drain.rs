@@ -261,6 +261,197 @@ impl ProcessRunner for NoProcesses {
 }
 
 #[test]
+fn gate_failures_do_not_block_operator_drain_or_ordinary_handoffs() {
+    use clap::Parser;
+    use mac_worker::test_support::{
+        cli::Cli,
+        runtime::{RuntimeContext, run_with_stdio_in_context},
+    };
+    for unreadable in [false, true] {
+        let fixture = Fixture::new();
+        let root = fixture.paths.controller_state_root();
+        ControllerStore::open(&root).unwrap();
+        fs::write(
+            &fixture.paths.config,
+            "version = 1\n[[workers]]\nname = \"fixture\"\nssh = \"fixture.invalid\"\nslots = 1\n",
+        )
+        .unwrap();
+        let home = fixture._temp.path().canonicalize().unwrap();
+        let runtime = RuntimeContext::isolated(
+            std::collections::BTreeMap::from([
+                ("HOME".into(), home.as_os_str().to_owned()),
+                ("XDG_STATE_HOME".into(), home.as_os_str().to_owned()),
+            ]),
+            home.clone(),
+            home.clone(),
+        );
+        let gate = root.join("integration-gate.json");
+        let target = home.join("gate-target");
+        let bad = b"invalid gate with private detail";
+        if unreadable {
+            fs::write(&target, bad).unwrap();
+            std::os::unix::fs::symlink(&target, &gate).unwrap();
+        }
+        for drained in [true, false] {
+            if !unreadable {
+                fs::write(&gate, bad).unwrap();
+                fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let mut args = vec![
+                "worker",
+                "--config",
+                fixture.paths.config.to_str().unwrap(),
+                "controller",
+                "drain",
+            ];
+            if !drained {
+                args.push("--off");
+            }
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = run_with_stdio_in_context(
+                Cli::try_parse_from(args).unwrap(),
+                &NoProcesses,
+                &runtime,
+                &mut std::io::Cursor::new(Vec::new()),
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(
+                exit,
+                0,
+                "gate failure blocked ordinary drain: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(is_drained(&root).unwrap(), drained);
+            let warning = String::from_utf8(stderr).unwrap();
+            assert_eq!(warning.lines().count(), 1);
+            assert!(warning.contains(if unreadable {
+                "[IO]"
+            } else {
+                "[CONTROLLER_TRANSPORT]"
+            }));
+            assert!(!warning.contains("private detail"));
+        }
+        if unreadable {
+            assert!(!root.join("integration-gate.json.corrupt").exists());
+            assert_eq!(fs::read(&target).unwrap(), bad);
+        } else {
+            assert_eq!(
+                fs::read(root.join("integration-gate.json.corrupt")).unwrap(),
+                bad
+            );
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(&gate).unwrap()).unwrap();
+            assert!(metadata["windows"].as_array().unwrap().is_empty());
+        }
+        let executor = CountingExecutor::new();
+        assert!(matches!(
+            fixture.launch(&executor, false).unwrap(),
+            RunnerStart::Started(_)
+        ));
+        assert_eq!(executor.starts(), 1);
+    }
+}
+
+#[test]
+fn ordinary_handoff_ignores_corrupt_integration_gate_before_operator_repair() {
+    let fixture = Fixture::new();
+    ControllerStore::open(&fixture.paths.controller_state_root()).unwrap();
+    let gate = fixture
+        .paths
+        .controller_state_root()
+        .join("integration-gate.json");
+    let bad = b"malformed integration metadata";
+    fs::write(&gate, bad).unwrap();
+    fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!is_drained(&fixture.paths.controller_state_root()).unwrap());
+    let executor = CountingExecutor::new();
+    assert!(matches!(
+        fixture.launch(&executor, false).unwrap(),
+        RunnerStart::Started(_)
+    ));
+    assert_eq!(executor.starts(), 1);
+    assert_eq!(fs::read(gate).unwrap(), bad);
+}
+
+#[test]
+fn disable_enable_keeps_integration_paused_and_allows_ordinary_dispatch() {
+    use mac_worker::test_support::controller::service::{ServiceAction, manage};
+    use std::os::unix::process::ExitStatusExt;
+    struct Service(std::sync::atomic::AtomicBool);
+    impl ProcessRunner for Service {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(request.program, "/bin/launchctl");
+            let code = match request.args[0].to_str().unwrap() {
+                "print" => {
+                    if self.0.load(Ordering::SeqCst) {
+                        0
+                    } else {
+                        113
+                    }
+                }
+                "bootout" => {
+                    self.0.store(false, Ordering::SeqCst);
+                    0
+                }
+                "bootstrap" => {
+                    self.0.store(true, Ordering::SeqCst);
+                    0
+                }
+                other => panic!("unexpected service action {other}"),
+            };
+            Ok(ProcessResult {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }
+    }
+    let fixture = Fixture::new();
+    let root = fixture.paths.controller_state_root();
+    ControllerStore::open(&root).unwrap();
+    let before = fs::read(root.join("drain.json")).unwrap();
+    let service = Service(std::sync::atomic::AtomicBool::new(true));
+    let home = fixture._temp.path().canonicalize().unwrap();
+    manage(
+        &home,
+        &fixture.paths,
+        &home.join("config"),
+        501,
+        &service,
+        ServiceAction::Uninstall,
+    )
+    .unwrap();
+    manage(
+        &home,
+        &fixture.paths,
+        &home.join("config"),
+        501,
+        &service,
+        ServiceAction::Install,
+    )
+    .unwrap();
+    ControllerStore::open(&root).unwrap();
+    assert_eq!(fs::read(root.join("drain.json")).unwrap(), before);
+    assert!(!is_drained(&root).unwrap());
+    let gate: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("integration-gate.json")).unwrap()).unwrap();
+    assert_eq!(gate["windows"][0]["reason"], "controller_disabled");
+    assert!(gate["windows"][0]["resumed_at_millis"].is_null());
+    let executor = CountingExecutor::new();
+    assert!(matches!(
+        fixture.launch(&executor, false).unwrap(),
+        RunnerStart::Started(_)
+    ));
+    assert_eq!(executor.starts(), 1);
+    set_drained(&root, false).unwrap();
+    let gate: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("integration-gate.json")).unwrap()).unwrap();
+    assert!(gate["windows"][0]["resumed_at_millis"].is_u64());
+}
+
+#[test]
 fn drained_requests_persist_across_leader_restart_and_recovery_resumes_after_off() {
     let fixture = Fixture::new();
     let root = fixture.paths.controller_state_root();

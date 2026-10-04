@@ -1326,6 +1326,43 @@ impl<'a> TaskStore<'a> {
     ) -> Result<(TaskCloseResponse, Option<TaskId>), WorkerError> {
         let task = self.open_existing_task(request.project_id(), request.task_id())?;
         let status = self.read_status(&task)?;
+        let integration = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        // Last in the installation/session lock order, and nonblocking. A sender
+        // owns this fence until its bounded observation/push has settled.
+        let _integration_fence = if integration
+            .load(request.project_id(), request.task_id())?
+            .is_some()
+            || integration
+                .policy(request.project_id(), request.task_id())?
+                .is_some()
+        {
+            Some(integration.lock(request.project_id(), request.task_id())?)
+        } else {
+            None
+        };
+        // The sender can update sidecars without the installation locks.
+        // Read settlement only after acquiring its per-task fence.
+        let retained = integration.load(request.project_id(), request.task_id())?;
+        let stopped_before_phase =
+            integration.revoke_proved_at(request.project_id(), request.task_id(), &status)?;
+        if let Some(record) = retained {
+            let revoked = record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record
+                    .push_intent
+                    .as_ref()
+                    .is_none_or(|push| !push.uncertain);
+            let settled = record.receipt.as_ref().is_some_and(|receipt| {
+                status.head_oid()
+                    == Some(receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head))
+                    && (!request.discard() || receipt.imported)
+            });
+            if !revoked && !settled && !stopped_before_phase {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                        .error(),
+                );
+            }
+        }
         if status.state() == TaskState::Active {
             return Err(task_error("TASK_BUSY", "task has an active turn"));
         }
@@ -1527,6 +1564,56 @@ impl<'a> TaskStore<'a> {
     /// recreating it from the original base. The caller must already hold
     /// the exact task-turn lease; this method is the host-side durable
     /// transition from Open back to Active.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepare_integration_resume(
+        &self,
+        prepared: &crate::integration::contracts::PreparedIntegrationTurn,
+    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        let project = prepared.followup.expected().meta().project_id();
+        let _fence = crate::integration::host_store::HostIntegrationStore::new(self.store)
+            .lock(project, prepared.followup.task_id())?;
+        self.prepare_integration_resume_after(prepared)
+    }
+    pub(crate) fn prepare_integration_resume_after(
+        &self,
+        prepared: &crate::integration::contracts::PreparedIntegrationTurn,
+    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        use crate::integration::{
+            git::IntegrationGit,
+            host_store::{HostIntegrationStore, invalid},
+        };
+        let project = prepared.followup.expected().meta().project_id();
+        let sidecars = HostIntegrationStore::new(self.store);
+        let mut record = sidecars
+            .load(project, prepared.followup.task_id())?
+            .ok_or_else(invalid)?;
+        IntegrationGit::for_workspace(self.store, self.runner)
+            .validate_prepared_workspace(&record, prepared)?;
+        if self.load_meta(project, prepared.followup.task_id())?
+            != *prepared.followup.expected().meta()
+        {
+            return Err(invalid());
+        }
+        sidecars.persist_prepared(project, prepared)?;
+        if !record
+            .auxiliaries
+            .iter()
+            .any(|aux| aux.turn_id == prepared.followup.turn_id())
+        {
+            record.auxiliaries.push(prepared.intent()?);
+            sidecars.save(&record)?;
+        }
+        self.prepare_resume_inner(
+            project,
+            prepared.followup.task_id(),
+            prepared.followup.turn_id(),
+            prepared.followup.turn_number(),
+            prepared.followup.worker(),
+            prepared.followup.base_oid(),
+            Some(prepared),
+        )
+    }
+
     pub fn prepare_resume(
         &self,
         project_id: &str,
@@ -1535,6 +1622,52 @@ impl<'a> TaskStore<'a> {
         turn_number: u32,
         worker: &str,
         base_oid: &BaseOid,
+    ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
+        let sidecars = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        let retained = sidecars.load(project_id, task_id)?;
+        let _fence = if retained.is_some() || sidecars.policy(project_id, task_id)?.is_some() {
+            Some(sidecars.lock(project_id, task_id)?)
+        } else {
+            None
+        };
+        if retained.is_some() {
+            let record = sidecars
+                .load(project_id, task_id)?
+                .ok_or_else(crate::integration::host_store::invalid)?;
+            let revoked = record.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                && record.push_intent.as_ref().is_none_or(|p| !p.uncertain);
+            let integrated = record.receipt.as_ref().is_some_and(|receipt| {
+                receipt.imported
+                    && Some(base_oid)
+                        == Some(receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head))
+            });
+            if !revoked && !integrated {
+                return Err(
+                    crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                        .error(),
+                );
+            }
+        }
+        self.prepare_resume_inner(
+            project_id,
+            task_id,
+            turn_id,
+            turn_number,
+            worker,
+            base_oid,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_resume_inner(
+        &self,
+        project_id: &str,
+        task_id: TaskId,
+        turn_id: JobId,
+        turn_number: u32,
+        worker: &str,
+        base_oid: &BaseOid,
+        integration: Option<&crate::integration::contracts::PreparedIntegrationTurn>,
     ) -> Result<(TaskMeta, TaskStatus), WorkerError> {
         validate_project_id(project_id)?;
         validate_worker_name(worker)?;
@@ -1616,36 +1749,43 @@ impl<'a> TaskStore<'a> {
             ));
         }
 
-        let workspace = self.open_workspace(&task)?;
-        let branch = self
-            .git_workspace_query(workspace.path(), vec!["rev-parse", "--abbrev-ref", "HEAD"])
-            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
-        let head = self
-            .git_workspace_query(workspace.path(), vec!["rev-parse", "HEAD"])
-            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
-        let expected_head = current
-            .head_oid()
-            .unwrap_or_else(|| meta.base_oid())
-            .as_str();
-        if branch != format!("task/{task_id}") || head != expected_head || base_oid.as_str() != head
-        {
-            return Err(task_error(
-                "WORKTREE_INCONSISTENT",
-                "task workspace branch or head does not match the resumable task",
-            ));
-        }
-        let clean = self
-            .git_workspace_query(
-                workspace.path(),
-                vec!["status", "--porcelain=v1", "--untracked-files=all"],
-            )
-            .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
-        if !clean.is_empty() {
-            return Err(task_error(
-                "WORKTREE_INCONSISTENT",
-                "task workspace contains local changes before resume",
-            ));
-        }
+        let head = if integration.is_some() {
+            base_oid.to_string()
+        } else {
+            let workspace = self.open_workspace(&task)?;
+            let branch = self
+                .git_workspace_query(workspace.path(), vec!["rev-parse", "--abbrev-ref", "HEAD"])
+                .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+            let head = self
+                .git_workspace_query(workspace.path(), vec!["rev-parse", "HEAD"])
+                .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+            let expected_head = current
+                .head_oid()
+                .unwrap_or_else(|| meta.base_oid())
+                .as_str();
+            if branch != format!("task/{task_id}")
+                || head != expected_head
+                || base_oid.as_str() != head
+            {
+                return Err(task_error(
+                    "WORKTREE_INCONSISTENT",
+                    "task workspace branch or head does not match the resumable task",
+                ));
+            }
+            let clean = self
+                .git_workspace_query(
+                    workspace.path(),
+                    vec!["status", "--porcelain=v1", "--untracked-files=all"],
+                )
+                .map_err(|error| task_error("WORKTREE_INCONSISTENT", error))?;
+            if !clean.is_empty() {
+                return Err(task_error(
+                    "WORKTREE_INCONSISTENT",
+                    "task workspace contains local changes before resume",
+                ));
+            }
+            head
+        };
 
         let expected_turn_number = u32::try_from(current.turns().len())
             .ok()

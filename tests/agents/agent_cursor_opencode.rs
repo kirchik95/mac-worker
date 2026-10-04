@@ -542,6 +542,8 @@ impl TaskHarness {
         )
         .submit(
             TaskSubmitRequest {
+                integrate: Default::default(),
+                verify_merge: None,
                 session_import: None,
                 questions: None,
                 agent: self.runner.agent,

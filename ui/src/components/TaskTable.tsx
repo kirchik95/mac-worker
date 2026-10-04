@@ -94,6 +94,11 @@ export function TaskTable({
                       ) : null}
                     </>
                   ) : null}
+                  {task.integration ? (
+                    <div className="text-xs text-muted-foreground"><span>Target: {task.integration.target}</span>
+                      {task.integration.blocked_code ? <div>{task.integration.blocked_code}</div> : null}
+                    </div>
+                  ) : null}
                   {delivery?.state === 'failed' || delivery?.state === 'retrying' ? (
                     <DeliveryChip task={task} freshness={task.freshness} className="mt-1" />
                   ) : null}

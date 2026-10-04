@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ControllerEventsProvider } from '@/hooks/ControllerEventsContext'
 import { MALICIOUS, originDelivery, task } from '@/test/fixtures'
 import { TaskDetail } from './TaskDetail'
+import integrationFixtures from '@/lib/integration.fixtures.json'
+import { decodeIntegrationView } from '@/lib/integration.contract'
+import type { TaskState } from '@/lib/api'
 
 function reviewable(overrides: Record<string, unknown> = {}) {
   return detail({
@@ -84,6 +87,60 @@ afterEach(() => {
 })
 
 describe('TaskDetail', () => {
+  it.each(integrationFixtures.followups)('keeps $name ordinary actions and the previous receipt as history', async followup => {
+    const view = decodeIntegrationView(followup.view)
+    const history = decodeIntegrationView({ ...view, integration: followup.history }).integration
+    serve(detail({ ...view, integration: history, close_policy: 'never',
+      task: { ...task({ state: followup.ordinary_state as TaskState, last_outcome: followup.last_outcome,
+        turn_count: 2, close_policy: 'never' }), ...view },
+      questions: followup.name === 'needs_input' ? ['Which follow-up option?'] : [] }))
+    render(<TaskDetail taskId="aaaa" />)
+    expect(await screen.findByRole('region', { name: 'Integration history' })).toHaveTextContent(`Result: ${history!.merge_oid}`)
+    expect(screen.getByText(followup.label)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Re-drive integration' })).not.toBeInTheDocument()
+    if (followup.name === 'running') {
+      expect(screen.queryByRole('button', { name: 'Send reply' })).not.toBeInTheDocument()
+    } else {
+      expect(screen.getByRole('button', { name: 'Send reply' })).toBeInTheDocument()
+      if (followup.name === 'needs_input') expect(screen.getByText('Which follow-up option?')).toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Follow-up' }), { target: { value: 'Continue the ordinary work' } })
+      expect(screen.getByRole('button', { name: 'Send reply' })).toBeEnabled()
+    }
+  })
+  it('renders automatic progress without accept, and integrated Open/Never without attention', async () => {
+    const view = decodeIntegrationView(integrationFixtures.cases.find(row => row.name === 'pending')!.view)
+    serve(reviewable({ ...view, task: { ...task({ state: 'open' }), ...view } }))
+    render(<TaskDetail taskId="aaaa" />)
+    await screen.findByText('Integration target: main')
+    expect(screen.queryByRole('button', { name: 'Accept task' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Re-drive integration' })).not.toBeInTheDocument()
+  })
+
+  it('re-drives by exact identity and revision and preserves the blocked card and draft on stale/unavailable replies', async () => {
+    const view = decodeIntegrationView(integrationFixtures.cases.find(row => row.name === 'blocked')!.view)
+    const payload = reviewable({ ...view, task: { ...task({ state: 'open' }), ...view } })
+    const fetch = vi.fn().mockImplementation(async (_url, init) => init?.method === 'POST'
+      ? { ok: false, status: 409, json: async () => ({ error: { code: 'TASK_REVISION_CONFLICT', message: 'Integration changed' } }) }
+      : jsonResponse(payload))
+    vi.stubGlobal('fetch', fetch)
+    render(<TaskDetail taskId="aaaa" />)
+    const recover = await screen.findByRole('button', { name: 'Re-drive integration' })
+    const draft = screen.getByRole('textbox', { name: 'Follow-up' })
+    fireEvent.change(draft, { target: { value: 'Keep my recovery draft' } })
+    fireEvent.click(recover)
+    await screen.findByText('Integration changed')
+    expect(draft).toHaveValue('Keep my recovery draft')
+    expect(screen.getByText(view.integration!.blocked_code!)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Close task' })).toBeInTheDocument()
+    const posted = fetch.mock.calls.find(([, init]) => init?.method === 'POST')!
+    expect(posted[0]).toBe('/api/v1/tasks/aaaa/integrate')
+    const body = JSON.parse(posted[1].body)
+    expect(body.expected_integration_id).toBe(view.integration!.integration_id)
+    expect(body.integration.expected).toBe(view.integration!.revision)
+    expect(body.integration.task_id).toBe(payload.task.task_id)
+    expect(body.integration.request_id).toMatch(/^[0-9a-f]{32}$/)
+    expect(body).not.toHaveProperty('target')
+  })
   it.each([
     ['keyboard', false, 'instant'],
     ['pointer', true, 'instant'],

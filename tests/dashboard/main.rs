@@ -21,3 +21,4 @@ mod dashboard_tunnel_reconnect;
 mod dashboard_web;
 mod herdr_client;
 mod herdr_reporter;
+mod task_integration_view;

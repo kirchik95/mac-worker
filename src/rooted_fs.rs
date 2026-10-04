@@ -20,6 +20,25 @@ use crate::{client_state::WaitDeadline, inputs::RelativePath, job::MAX_LOG_CHUNK
 
 const DIRECTORY_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+
+// Per-thread instrumentation observes the real read entry points without
+// changing production IO or coupling concurrent nextest cases.
+#[cfg(test)]
+thread_local! {
+    static READ_OPEN_COUNTS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+#[cfg(test)]
+pub(crate) fn read_open_counts() -> [u64; 3] {
+    READ_OPEN_COUNTS.get()
+}
+#[cfg(test)]
+fn count_read_open(kind: usize) {
+    READ_OPEN_COUNTS.set({
+        let mut counts = READ_OPEN_COUNTS.get();
+        counts[kind] += 1;
+        counts
+    });
+}
 const REGULAR_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
 const MAX_SYMLINK_TARGET: usize = 64 * 1024;
@@ -753,7 +772,7 @@ pub struct EntryInspection {
     pub inode: u64,
     pub modified_seconds: i64,
     pub modified_nanoseconds: i64,
-    file: Option<File>,
+    pub(crate) file: Option<File>,
 }
 
 impl EntryInspection {
@@ -921,6 +940,8 @@ impl RootedDir {
     }
 
     pub(crate) fn open_anchored_absolute(path: &Path) -> io::Result<Self> {
+        #[cfg(test)]
+        count_read_open(0);
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1406,6 +1427,8 @@ impl RootedDir {
         create: bool,
         security_device: Option<u64>,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        count_read_open(1);
         self.verify_root_name()?;
         let root_metadata = stat_fd(self.root.as_raw_fd())?;
         if let Some(device) = security_device {
@@ -1664,6 +1687,8 @@ impl RootedDir {
     }
 
     pub(crate) fn read_private_regular(&self, name: &str, maximum: u64) -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        count_read_open(2);
         self.read_private_regular_with_hook(name, maximum, || {})
     }
 

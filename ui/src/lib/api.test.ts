@@ -1,6 +1,38 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { ApiError, describeError, getJson, questionOptions, questionText, saveAgentSettings } from './api'
+import { ApiError, describeError, getJson, integrateTask, questionOptions, questionText, saveAgentSettings, taskMutationForDetail, type TaskDetail } from './api'
+import { task } from '@/test/fixtures'
+
+describe('integration actions', () => {
+  it('uses the task guard and preserves old-peer unavailable as a typed error', async () => {
+    const fetch = vi.fn().mockResolvedValue({ ok: false, status: 503, json: async () => ({
+      error: { code: 'INTEGRATION_UNAVAILABLE', message: 'Compatible owner unavailable' },
+    }) })
+    vi.stubGlobal('fetch', fetch)
+    const body = { expected: { expected_task_id: 'task', expected_turn_id: null, expected_turn_count: 1,
+      expected_head_oid: null, expected_updated_at_millis: 1, expected_state: 'open' as const },
+      expected_integration_id: 'integration', integration: { task_id: 'task', expected: 1, request_id: 'f'.repeat(32) } }
+    await expect(integrateTask('task/id', body)).rejects.toMatchObject({ status: 503, code: 'INTEGRATION_UNAVAILABLE' })
+    expect(fetch.mock.calls[0][0]).toBe('/api/v1/tasks/task%2Fid/integrate')
+    expect(fetch.mock.calls[0][1].headers).toEqual({ 'content-type': 'application/json', 'x-mac-worker-task': '1' })
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual(body)
+    vi.unstubAllGlobals()
+  })
+  it('refuses an unsafe integration revision for every detail mutation', () => {
+    const row = task({ state: 'open' })
+    const detail = { task: row, timeline: [], turns: [], head_oid: null,
+      integration: { integration_id: 'integration', revision: Number.MAX_SAFE_INTEGER + 2 } } as unknown as TaskDetail
+    expect(() => taskMutationForDetail(detail, 'preserved draft')).toThrow('Integration revision is unavailable')
+  })
+  it('keeps disabled mutation bytes and omits integration fences', () => {
+    const row = task({ state: 'open' })
+    const detail = { task: row, timeline: [], turns: [], head_oid: null } as unknown as TaskDetail
+    expect(JSON.stringify(taskMutationForDetail(detail))).toBe(JSON.stringify({
+      expected_task_id: row.task_id, expected_turn_id: null, expected_turn_count: row.turn_count,
+      expected_head_oid: null, expected_updated_at_millis: row.updated_at_millis, expected_state: row.state,
+    }))
+  })
+})
 
 describe('questions', () => {
   it('accepts both shapes the host emits', () => {

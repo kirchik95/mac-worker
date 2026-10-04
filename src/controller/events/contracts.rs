@@ -434,6 +434,12 @@ impl WireEvent {
                 hint.validate()?;
                 serde_json::to_value(hint)
             }
+            "task.integrating" | "task.integrated" | "task.integration_blocked" => {
+                let hint: IntegrationHintData = serde_json::from_value(data)
+                    .map_err(|_| invalid("invalid integration hint"))?;
+                hint.validate(&self.kind)?;
+                serde_json::to_value(hint)
+            }
             "turn.started" => serde_json::to_value(
                 serde_json::from_value::<AcceptedHint>(data)
                     .map_err(|_| invalid("invalid accepted hint"))?,
@@ -589,6 +595,13 @@ impl SafeCode {
             | "WORKER_BUSY"
             | "PROTOCOL"
             | "IO" => value,
+            known
+                if crate::integration::contracts::IntegrationCode::ALL
+                    .iter()
+                    .any(|code| code.as_str() == known) =>
+            {
+                known
+            }
             _ => "TURN_FAILED",
         };
         Self(code.into())
@@ -763,9 +776,40 @@ struct WorkerChangedData {
 struct DrainData {
     drained: bool,
 }
+/// Title-free hint. Authoritative state must be read through the companion selector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IntegrationHintData {
+    task_id: TaskId,
+    integration: crate::integration::contracts::IntegrationFactsAnnotation,
+}
+impl IntegrationHintData {
+    fn validate(&self, kind: &str) -> Result<(), WorkerError> {
+        use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
+        self.integration.validate()?;
+        let expected = match self.integration.state {
+            IntegrationStatus::Integrated => "task.integrated",
+            IntegrationStatus::Blocked => "task.integration_blocked",
+            _ => "task.integrating",
+        };
+        if kind != expected
+            || serde_json::to_vec(self)
+                .map_err(|_| invalid("hint encoding failed"))?
+                .len()
+                > crate::integration::contracts::MAX_JOURNAL_HINT_BYTES
+        {
+            return Err(invalid("invalid integration hint"));
+        }
+        Ok(())
+    }
+}
 /// The only producer input: typed identifiers and explicitly safe fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewEvent {
+    // Published by the serial T6 owner wiring after state durability.
+    IntegrationChanged {
+        task_id: TaskId,
+        integration: crate::integration::contracts::IntegrationFactsAnnotation,
+    },
     TaskCreated(TaskHint),
     TaskChanged(TaskHint),
     TaskRemoved(TaskHint),
@@ -803,6 +847,13 @@ pub enum NewEvent {
 impl NewEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::IntegrationChanged { integration, .. } => match integration.state {
+                crate::integration::contracts::IntegrationStatus::Integrated => "task.integrated",
+                crate::integration::contracts::IntegrationStatus::Blocked => {
+                    "task.integration_blocked"
+                }
+                _ => "task.integrating",
+            },
             Self::TaskCreated(_) => "task.created",
             Self::TaskChanged(_) => "task.changed",
             Self::TaskRemoved(_) => "task.removed",
@@ -827,6 +878,17 @@ impl NewEvent {
         millis: u64,
     ) -> Result<WireEvent, WorkerError> {
         let data = match self {
+            Self::IntegrationChanged {
+                task_id,
+                integration,
+            } => {
+                let hint = IntegrationHintData {
+                    task_id: *task_id,
+                    integration: integration.clone(),
+                };
+                hint.validate(self.kind())?;
+                serde_json::to_value(hint)
+            }
             Self::TaskCreated(hint)
             | Self::TaskChanged(hint)
             | Self::TaskRemoved(hint)
@@ -967,6 +1029,11 @@ pub trait JournalProvider: Send + Sync {
 /// Validated state facts, separate from the title-free journal envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskFacts {
+    /// In-memory companion proof, never accepted from the wire or persisted in facts.
+    #[serde(skip)]
+    pub integration_confirmation: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub state: String,
@@ -986,6 +1053,8 @@ pub struct TaskFacts {
 /// Tolerant wire facts; all required identity/proof fields remain required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskFactsWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
     pub task_id: TaskId,
     pub run_id: Option<RunId>,
     pub state: String,
@@ -1003,12 +1072,42 @@ pub struct TaskFactsWire {
     pub title: Option<String>,
 }
 impl TaskFacts {
+    pub fn confirm_integration(
+        &mut self,
+        snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    ) -> bool {
+        self.integration_confirmation = self
+            .integration
+            .as_ref()
+            .filter(|annotation| annotation.confirms(snapshot))
+            .cloned();
+        self.integration_confirmation.is_some()
+    }
     pub fn try_new(wire: TaskFactsWire) -> Result<Self, WorkerError> {
         wire.try_into()
     }
+    pub(crate) fn integration_notice_candidate(&self) -> bool {
+        use crate::integration::contracts::IntegrationStatus;
+        self.integration.as_ref().is_some_and(|annotation| {
+            matches!(
+                annotation.state,
+                IntegrationStatus::Integrated | IntegrationStatus::Blocked
+            ) || (matches!(
+                annotation.state,
+                IntegrationStatus::Armed | IntegrationStatus::Revoked
+            ) && (self
+                .outcome
+                .is_some_and(|outcome| outcome != SafeOutcome::Done)
+                || self.eligibility_signature().abandoned_without_turn)
+                && self.eligibility_signature().quiescent == Some(true))
+        })
+    }
     pub fn eligibility_signature(&self) -> TaskEligibilitySignature {
         let (busy, quiescent) = self.proof_flags();
-        let current_attention = self.state == "open"
+        let current_attention = (self.state == "open"
+            || self.integration.as_ref().is_some_and(|annotation| {
+                annotation.state == crate::integration::contracts::IntegrationStatus::Blocked
+            }))
             && self.latest_turn_id.is_some()
             && quiescent == Some(true)
             && matches!(
@@ -1020,6 +1119,7 @@ impl TaskFacts {
             && self.outcome.is_none()
             && quiescent == Some(true);
         TaskEligibilitySignature {
+            integration: self.integration.clone(),
             latest_turn_id: self.latest_turn_id,
             outcome: self.outcome,
             code: self.code.clone(),
@@ -1030,6 +1130,9 @@ impl TaskFacts {
         }
     }
     pub fn validate(&self) -> Result<(), WorkerError> {
+        if let Some(annotation) = &self.integration {
+            crate::integration::contracts::ValidateIntegration::validate(annotation)?;
+        }
         if self.state.is_empty()
             || self.state.len() > 32
             || !self
@@ -1061,7 +1164,15 @@ impl TaskFacts {
         if self.validate().is_err() {
             return (None, None);
         }
-        if self.runner_present
+        if self.integration.as_ref().is_some_and(|annotation| {
+            !matches!(
+                annotation.state,
+                crate::integration::contracts::IntegrationStatus::Integrated
+                    | crate::integration::contracts::IntegrationStatus::Blocked
+                    | crate::integration::contracts::IntegrationStatus::Revoked
+            ) && !(annotation.state == crate::integration::contracts::IntegrationStatus::Armed
+                && self.outcome != Some(SafeOutcome::Done))
+        }) || self.runner_present
             || self.close_intent
             || self.auto_continue_intent
             || self.state == "active"
@@ -1069,6 +1180,12 @@ impl TaskFacts {
             || self.busy == Some(true)
         {
             return (Some(true), Some(false));
+        }
+        if self.integration.as_ref().is_some_and(|annotation| {
+            annotation.state == crate::integration::contracts::IntegrationStatus::Integrated
+        }) && !self.result_imported
+        {
+            return (None, None);
         }
         if !known_task_state(&self.state)
             || self.queue_dispatching.is_none()
@@ -1130,6 +1247,14 @@ pub enum EventSupport {
 }
 /// Remote read abstraction. Discovery/read/state requests share the original absolute RPC deadline.
 pub trait EventSource: Send + Sync {
+    /// Safe, feature-gated task.list companion read; an unavailable peer is never disabled.
+    fn integrations(
+        &self,
+        _task_ids: &[TaskId],
+        _deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        Err(crate::integration::contracts::integration_unavailable())
+    }
     fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError>;
     fn read(&self, query: ReadQuery, deadline: Duration) -> Result<EventReadResult, WorkerError>;
     fn tasks(
@@ -1170,6 +1295,7 @@ pub enum BaselineKind {
 /// Notification-relevant facts only: latest outcome/proof/attention/abandonment, excluding title/metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskEligibilitySignature {
+    pub integration: Option<crate::integration::contracts::IntegrationFactsAnnotation>,
     pub latest_turn_id: Option<TurnId>,
     pub outcome: Option<SafeOutcome>,
     pub code: Option<SafeCode>,
@@ -1383,6 +1509,8 @@ impl TryFrom<TaskFactsWire> for TaskFacts {
         });
         let unknown_outcome = wire.outcome.is_some() && outcome.is_none();
         let mut facts = Self {
+            integration_confirmation: None,
+            integration: wire.integration,
             task_id: wire.task_id,
             run_id: wire.run_id,
             state: wire.state,

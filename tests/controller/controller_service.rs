@@ -45,6 +45,104 @@ const TARGET: &str = "gui/501/com.mac-worker.controller";
 const PLIST: &str = "Library/LaunchAgents/com.mac-worker.controller.plist";
 const LOG: &str = "Library/Logs/mac-worker/controller.log";
 
+#[test]
+fn uninstall_persists_the_integration_gate_before_unloading_the_service() {
+    struct GateChecked<'a> {
+        base: Launchctl,
+        root: &'a Path,
+    }
+    impl ProcessRunner for GateChecked<'_> {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.first().is_some_and(|arg| arg == "bootout") {
+                assert!(
+                    !mac_worker::test_support::controller::drain::is_drained(self.root).unwrap(),
+                    "integration disable changed ordinary dispatch"
+                );
+                let gate: serde_json::Value = serde_json::from_slice(
+                    &fs::read(self.root.join("integration-gate.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(gate["windows"][0]["reason"], "controller_disabled");
+            }
+            self.base.run(request)
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+        None,
+        &Default::default(),
+        &home,
+    )
+    .unwrap();
+    let root = paths.controller_state_root();
+    let runner = GateChecked {
+        base: Launchctl::loaded(),
+        root: &root,
+    };
+    manage(&home, 501, &runner, ServiceAction::Uninstall).unwrap();
+    assert!(
+        !root.join("drain.json").exists(),
+        "disable must not create ordinary drain state"
+    );
+    assert!(!mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+    // A service/owner reopen never clears the operator's persisted valve.
+    mac_worker::test_support::controller::ControllerStore::open(&root).unwrap();
+    assert!(!mac_worker::test_support::controller::drain::is_drained(&root).unwrap());
+}
+
+#[test]
+fn uninstall_survives_corrupt_and_unreadable_gate_without_changing_ordinary_drain() {
+    for unreadable in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let paths = mac_worker::test_support::core::paths::PathLayout::discover(
+            None,
+            &Default::default(),
+            &home,
+        )
+        .unwrap();
+        let root = paths.controller_state_root();
+        mac_worker::test_support::controller::ControllerStore::open(&root).unwrap();
+        let before = fs::read(root.join("drain.json")).unwrap();
+        let gate = root.join("integration-gate.json");
+        let corrupt = b"invalid gate with private detail";
+        let target = home.join("gate-target");
+        if unreadable {
+            fs::write(&target, corrupt).unwrap();
+            symlink(&target, &gate).unwrap();
+        } else {
+            fs::write(&gate, corrupt).unwrap();
+            fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let runner = Launchctl::loaded();
+        let status = manage(&home, 501, &runner, ServiceAction::Uninstall)
+            .expect("gate failure must not block service unload");
+        assert!(!status.installed && !status.loaded);
+        assert!(runner.calls().iter().any(|args| args[0] == "bootout"));
+        assert_eq!(fs::read(root.join("drain.json")).unwrap(), before);
+        if unreadable {
+            assert!(!root.join("integration-gate.json.corrupt").exists());
+            assert_eq!(fs::read(&target).unwrap(), corrupt);
+            assert!(
+                fs::symlink_metadata(&gate)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        } else {
+            assert_eq!(
+                fs::read(root.join("integration-gate.json.corrupt")).unwrap(),
+                corrupt
+            );
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&fs::read(&gate).unwrap()).unwrap();
+            assert_eq!(metadata["windows"][0]["reason"], "controller_disabled");
+            assert!(metadata["windows"][0]["resumed_at_millis"].is_null());
+        }
+    }
+}
+
 #[derive(Default)]
 struct Launchctl {
     loaded: Mutex<bool>,

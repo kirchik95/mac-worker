@@ -309,6 +309,32 @@ fn agent_exit_kind(code: &str) -> ExitKind {
 
 fn task_exit_kind(code: &str) -> ExitKind {
     match code {
+        "INTEGRATION_TARGET_MISSING"
+        | "INTEGRATION_BASE_NOT_ON_TARGET"
+        | "INTEGRATION_WIP_BASE"
+        | "INTEGRATION_TARGET_MOVED_EXHAUSTED"
+        | "INTEGRATION_CONFLICT_BUDGET_EXHAUSTED"
+        | "INTEGRATION_CHECKS_FAILED"
+        | "INTEGRATION_CHECKS_NOT_RUN"
+        | "INTEGRATION_RESOLVE_BLOCKED"
+        | "INTEGRATION_FOLLOWUP_LIMIT"
+        | "INTEGRATION_VERIFY_CHANGED_TREE"
+        | "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        | "INTEGRATION_CONFLICT_LIST_TOO_LARGE"
+        | "INTEGRATION_DEPENDENCY_BLOCKED"
+        | "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+        | "INTEGRATION_ALREADY_COMMITTED" => ExitKind::Usage,
+        "INTEGRATION_AUTH_FAILED"
+        | "INTEGRATION_NETWORK"
+        | "INTEGRATION_POLICY_REJECTED"
+        | "INTEGRATION_WORKER_OFFLINE"
+        | "INTEGRATION_UNAVAILABLE"
+        | "INTEGRATION_STOP_UNCONFIRMED" => ExitKind::Unavailable,
+        "INTEGRATION_RESOLUTION_INCOMPLETE"
+        | "INTEGRATION_VERIFY_TREE_MISMATCH"
+        | "INTEGRATION_WORKSPACE_MISSING"
+        | "INTEGRATION_STATE_INVALID" => ExitKind::Infrastructure,
+        "INTEGRATION_TURN_QUEUE_TIMEOUT" => ExitKind::Capacity,
         "RUNNER_HANDOFF_FAILED" => ExitKind::Io,
         "SESSION_AGENT_TOO_OLD" => ExitKind::Capacity,
         "SESSION_PLACEMENT_FAILED" | "WAIT_TIMEOUT" | "WAIT_BLOCKED" => ExitKind::Infrastructure,
@@ -338,6 +364,140 @@ pub struct PublicDiagnostic {
 const CONFIG_MISSING_HINT: &str = "connect your first Mac with `worker init user@mini.local` (keep --config if you use a custom path)";
 
 static CATALOG: &[PublicDiagnostic] = &[
+    PublicDiagnostic {
+        code: "INTEGRATION_AUTH_FAILED",
+        exit: 69,
+        hint: Some("repair the worker origin login, then run worker task integrate"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_NETWORK",
+        exit: 69,
+        hint: Some("restore origin connectivity, then retry integration"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_POLICY_REJECTED",
+        exit: 69,
+        hint: Some("repair target branch policy or permissions, then retry integration"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_TARGET_MISSING",
+        exit: 64,
+        hint: Some("create the configured origin branch or resubmit with a valid target"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_BASE_NOT_ON_TARGET",
+        exit: 64,
+        hint: Some("resubmit from a committed base reachable from the configured target"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_WIP_BASE",
+        exit: 64,
+        hint: Some("commit the intended task input and resubmit without --wip"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_TARGET_MOVED_EXHAUSTED",
+        exit: 64,
+        hint: Some("retry integration when other target pushes have settled"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_CONFLICT_BUDGET_EXHAUSTED",
+        exit: 64,
+        hint: Some("provide resolution guidance in a new task turn"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_RESOLUTION_INCOMPLETE",
+        exit: 70,
+        hint: Some("resolve all unmerged paths and introduced conflict markers"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_CHECKS_FAILED",
+        exit: 64,
+        hint: Some("repair the reported failing checks through a new agent turn"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_CHECKS_NOT_RUN",
+        exit: 64,
+        hint: Some("repair check access or instructions and report all required recovery checks"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_RESOLVE_BLOCKED",
+        exit: 64,
+        hint: Some("inspect the auxiliary result and logs before retrying integration"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_FOLLOWUP_LIMIT",
+        exit: 64,
+        hint: Some("resubmit with sufficient task follow-up allowance"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_VERIFY_CHANGED_TREE",
+        exit: 64,
+        hint: Some(
+            "use an ordinary follow-up to repair the candidate instead of editing during verification",
+        ),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_VERIFY_TREE_MISMATCH",
+        exit: 70,
+        hint: Some("retain the candidate diagnostics and repair merge or attribute handling"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_TURN_QUEUE_TIMEOUT",
+        exit: 75,
+        hint: Some("retry integration when the pinned worker has capacity"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_WORKER_OFFLINE",
+        exit: 69,
+        hint: Some("restore the original worker and retry integration"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_WORKSPACE_MISSING",
+        exit: 70,
+        hint: Some("keep the retained task result and resubmit from published input"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_UNAVAILABLE",
+        exit: 69,
+        hint: Some("restore compatible integration support and clear the controller stop gate"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_PUBLISH_TARGET_COLLISION",
+        exit: 64,
+        hint: Some("choose a task publication branch separate from the integration target"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_CONFLICT_LIST_TOO_LARGE",
+        exit: 64,
+        hint: Some("split the work or guide a new turn with fewer conflicts"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_STATE_INVALID",
+        exit: 70,
+        hint: Some("retain the durable evidence and repair the integration installation"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_DEPENDENCY_BLOCKED",
+        exit: 64,
+        hint: Some("recover the parent integration before running dependent tasks"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_DEPENDENCY_NOT_INTEGRATED",
+        exit: 64,
+        hint: Some("resubmit dependent tasks after their parent has integrated"),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_STOP_UNCONFIRMED",
+        exit: 69,
+        hint: Some(
+            "restore worker connectivity so the pending stop and push outcome can be confirmed",
+        ),
+    },
+    PublicDiagnostic {
+        code: "INTEGRATION_ALREADY_COMMITTED",
+        exit: 64,
+        hint: Some("keep the integration receipt and close the task if desired"),
+    },
     PublicDiagnostic {
         code: "SESSION_NOT_FOUND",
         exit: 64,
@@ -606,6 +766,7 @@ fn catalog_error(code: &str) -> Option<WorkerError> {
 
 fn build_catalog_error(code: &'static str) -> WorkerError {
     match code {
+        code if code.starts_with("INTEGRATION_") => WorkerError::task(code, "integration error"),
         "CONFIG" | "CONFIG_MISSING" => WorkerError::Config(format!("{code}: configuration error")),
         "SESSION_NOT_FOUND"
         | "SESSION_UNREADABLE"
@@ -688,6 +849,63 @@ pub(crate) fn operator_diagnostic(error: &WorkerError) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integration_catalog_has_every_code_and_static_category_hint() {
+        let groups: &[(u8, &[&str])] = &[
+            (
+                64,
+                &[
+                    "INTEGRATION_TARGET_MISSING",
+                    "INTEGRATION_BASE_NOT_ON_TARGET",
+                    "INTEGRATION_WIP_BASE",
+                    "INTEGRATION_TARGET_MOVED_EXHAUSTED",
+                    "INTEGRATION_CONFLICT_BUDGET_EXHAUSTED",
+                    "INTEGRATION_CHECKS_FAILED",
+                    "INTEGRATION_CHECKS_NOT_RUN",
+                    "INTEGRATION_RESOLVE_BLOCKED",
+                    "INTEGRATION_FOLLOWUP_LIMIT",
+                    "INTEGRATION_VERIFY_CHANGED_TREE",
+                    "INTEGRATION_PUBLISH_TARGET_COLLISION",
+                    "INTEGRATION_CONFLICT_LIST_TOO_LARGE",
+                    "INTEGRATION_DEPENDENCY_BLOCKED",
+                    "INTEGRATION_DEPENDENCY_NOT_INTEGRATED",
+                    "INTEGRATION_ALREADY_COMMITTED",
+                ],
+            ),
+            (
+                69,
+                &[
+                    "INTEGRATION_AUTH_FAILED",
+                    "INTEGRATION_NETWORK",
+                    "INTEGRATION_POLICY_REJECTED",
+                    "INTEGRATION_WORKER_OFFLINE",
+                    "INTEGRATION_UNAVAILABLE",
+                    "INTEGRATION_STOP_UNCONFIRMED",
+                ],
+            ),
+            (
+                70,
+                &[
+                    "INTEGRATION_RESOLUTION_INCOMPLETE",
+                    "INTEGRATION_VERIFY_TREE_MISMATCH",
+                    "INTEGRATION_WORKSPACE_MISSING",
+                    "INTEGRATION_STATE_INVALID",
+                ],
+            ),
+            (75, &["INTEGRATION_TURN_QUEUE_TIMEOUT"]),
+        ];
+        for (exit, codes) in groups {
+            for code in *codes {
+                let error = super::error_from_host_category(code, Some("usage")).expect(code);
+                assert_eq!(error.exit_code(), *exit, "{code}");
+                assert!(super::hint_for(code).is_some(), "{code}");
+                assert_eq!(
+                    WorkerError::task(code, "integration error").exit_code(),
+                    *exit
+                );
+            }
+        }
+    }
     use super::{ExitKind, WorkerError};
 
     #[test]

@@ -51,8 +51,9 @@ pub mod source {
 }
 pub mod task {
     pub use crate::dashboard::task::{
-        DashboardTaskMutationSource, DashboardTaskSource, MAX_TASK_LOG_LIMIT,
-        MacWorkerTaskMutationSource, MacWorkerTaskSource, TaskMutationRequest,
+        DashboardIntegrationSource, DashboardTaskMutationSource, DashboardTaskSource,
+        MAX_TASK_LOG_LIMIT, MacWorkerTaskMutationSource, MacWorkerTaskSource,
+        OwnerDashboardIntegrations, TaskIntegrationRequest, TaskMutationRequest,
     };
 }
 pub mod web {

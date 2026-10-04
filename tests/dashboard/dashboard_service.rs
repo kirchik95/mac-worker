@@ -610,6 +610,8 @@ fn task_queue_and_run_changes_publish_without_waiting_for_anti_entropy() {
     let task_id = TaskId::new(uuid::Uuid::from_u128(1));
     let mut tasks = TaskListProjection::empty();
     tasks.tasks.push(TaskListRow {
+        integration: None,
+        workflow_state: None,
         task_id,
         run_id: None,
         run_position: None,

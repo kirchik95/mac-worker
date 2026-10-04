@@ -22,7 +22,6 @@ use crate::{
     error::WorkerError,
     job::RequestFingerprint,
     paths::PathLayout,
-    prepared_submit::FrozenSubmitBody,
     process::ProcessRunner,
     task::{BaseOid, TaskId, TaskState, TurnId},
 };
@@ -350,13 +349,8 @@ fn prepare_result_reply(
     // request fingerprint stays bound for the immutable per-turn export.
     // The local record below must be that same frozen task.
     let resolved = match durable.command() {
-        "task.submit" => {
-            let frozen: FrozenSubmitBody =
-                serde_json::from_value(durable.body().clone()).map_err(|_| {
-                    WorkerError::Protocol(
-                        "CONTROLLER_TRANSPORT: bound request is not a frozen submit".into(),
-                    )
-                })?;
+        "task.submit" | "task.submit-integrating" => {
+            let frozen = super::integration::source_submit_body(durable.command(), durable.body())?;
             if frozen.task_id != body.task_id {
                 return Err(WorkerError::Protocol(
                     "CONTROLLER_REQUEST_CONFLICT: bound task does not match the frozen envelope"
@@ -368,13 +362,22 @@ fn prepare_result_reply(
                 worktree_id: frozen.worktree_id.clone(),
             }
         }
-        "task.batch" => {
-            let batch: FrozenBatchBody =
+        "task.batch" | "task.batch-integrating" => {
+            let batch: FrozenBatchBody = if durable.command() == "task.batch-integrating" {
+                let wrapper: crate::integration::contracts::FrozenIntegratingBatch =
+                    serde_json::from_value(durable.body().clone()).map_err(|_| {
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error()
+                    })?;
+                super::integration::validate_integrating_batch(&wrapper)?;
+                wrapper.batch
+            } else {
                 serde_json::from_value(durable.body().clone()).map_err(|_| {
                     WorkerError::Protocol(
                         "CONTROLLER_TRANSPORT: bound request is not a frozen batch".into(),
                     )
-                })?;
+                })?
+            };
             let matches: Vec<(&String, &DagNode)> = batch
                 .nodes
                 .iter()

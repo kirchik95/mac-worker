@@ -414,6 +414,13 @@ impl<'a> JobService<'a> {
     }
 
     pub fn submit_turn(&self, request: TaskTurnRequest) -> Result<TaskTurnResponse, WorkerError> {
+        self.submit_turn_inner(request, None)
+    }
+    fn submit_turn_inner(
+        &self,
+        request: TaskTurnRequest,
+        integration: Option<&crate::integration::contracts::PreparedIntegrationTurn>,
+    ) -> Result<TaskTurnResponse, WorkerError> {
         request.validate()?;
         let submit = request.submit().clone();
         let turn = request.turn().clone();
@@ -424,6 +431,18 @@ impl<'a> JobService<'a> {
         let job_id = material.job_id();
         let task_store = TaskStore::new(self.store, &SystemProcessRunner);
         let admission = self.store.admission_lock(job_id)?;
+        let sidecars = crate::integration::host_store::HostIntegrationStore::new(self.store);
+        let mut integration_fence = integration
+            .map(|_| sidecars.lock(material.project_id(), turn.task_id()))
+            .transpose()?;
+        if let Some(prepared) = integration {
+            sidecars.persist_prepared(material.project_id(), prepared)?;
+        } else if sidecars
+            .prepared(material.project_id(), turn.task_id(), job_id)?
+            .is_some()
+        {
+            return Err(crate::integration::host_store::invalid());
+        }
         // A completed first turn is still an idempotent replay. Check the
         // immutable job index before asking the task store for a pending
         // turn, because the latter is deliberately no longer pending after
@@ -448,6 +467,7 @@ impl<'a> JobService<'a> {
                 )?;
                 let (meta, status) = self.read_exact_job(&submit, &lease)?;
                 if status.state().is_terminal() {
+                    drop(integration_fence.take());
                     let authoritative =
                         self.status_from_accepted_after(admission, disposition, true, false)?;
                     return Ok(TaskTurnResponse::new(
@@ -461,6 +481,16 @@ impl<'a> JobService<'a> {
                     && status.supervisor_identity().is_none()
                     && status.child_identity().is_none()
                 {
+                    if let Some(prepared) = integration {
+                        let record = sidecars
+                            .load(material.project_id(), turn.task_id())?
+                            .ok_or_else(crate::integration::host_store::invalid)?;
+                        crate::integration::git::IntegrationGit::for_workspace(
+                            self.store,
+                            &SystemProcessRunner,
+                        )
+                        .validate_prepared_workspace(&record, prepared)?;
+                    }
                     let job = self.store.open_directory(
                         &format!(
                             "jobs/{}/{}/{}",
@@ -488,6 +518,7 @@ impl<'a> JobService<'a> {
                         .store
                         .supervisor_lock_after(&admission, job_id, false)?;
                     drop(admission);
+                    drop(integration_fence.take());
                     let submit_response = match supervisor {
                         Some(guard) => {
                             self.launch_and_observe(job_id, guard, &submit, &lease, false, meta)?
@@ -505,6 +536,7 @@ impl<'a> JobService<'a> {
                     task_status,
                 ));
             }
+            drop(integration_fence.take());
             let authoritative =
                 self.status_from_accepted_after(admission, disposition, true, false)?;
             return Ok(TaskTurnResponse::new(
@@ -535,7 +567,9 @@ impl<'a> JobService<'a> {
                 && current.turns().last().is_some_and(|pending| {
                     pending.turn_id() == job_id && pending.terminal().is_none()
                 });
-            if prepared {
+            if let Some(integration) = integration {
+                task_store.prepare_integration_resume_after(integration)?
+            } else if prepared {
                 (meta, current)
             } else if turn.resume() && current.state() == crate::task::TaskState::Open {
                 task_store.prepare_resume(
@@ -568,7 +602,10 @@ impl<'a> JobService<'a> {
             || turn.agent() != meta.agent()
             || turn.model() != meta.model()
             || turn.policy() != meta.policy()
-            || turn.limits() != &meta.limits().turn
+            || turn.limits()
+                != integration.map_or(&meta.limits().turn, |prepared| {
+                    &prepared.approved_turn_limits
+                })
             || turn.env_profile() != meta.env_profile()
             || turn.base_oid() != prepared_status.head_oid().unwrap_or(meta.base_oid())
         {
@@ -629,6 +666,7 @@ impl<'a> JobService<'a> {
                 self.store
                     .supervisor_lock_after(published.admission_guard(), job_id, false)?;
             drop(published);
+            drop(integration_fence.take());
             let submit_response = match supervisor {
                 Some(guard) => {
                     self.launch_and_observe(job_id, guard, &submit, &lease, true, job_meta)?
@@ -704,6 +742,7 @@ impl<'a> JobService<'a> {
             self.store
                 .supervisor_lock_after(published.admission_guard(), job_id, false)?;
         drop(published);
+        drop(integration_fence.take());
         let submit_response = match supervisor {
             Some(guard) => {
                 self.launch_and_observe(job_id, guard, &submit, &lease, true, job_meta)?
@@ -717,6 +756,43 @@ impl<'a> JobService<'a> {
             submit_response,
             task_store.load_status(material.project_id(), turn.task_id())?,
         ))
+    }
+
+    pub fn submit_integration_turn(
+        &self,
+        prepared: &crate::integration::contracts::PreparedIntegrationTurn,
+        request: TaskTurnRequest,
+    ) -> Result<TaskTurnResponse, WorkerError> {
+        use crate::integration::{contracts::ValidateIntegration, host_store::invalid};
+        prepared.validate()?;
+        prepared.followup.validate_self_consistency()?;
+        request.validate()?;
+        let expected = &prepared.followup;
+        let meta = expected.expected().meta();
+        let turn = request.turn();
+        let material = request.submit().material();
+        if material.job_id() != expected.turn_id()
+            || material.worker_name() != expected.worker()
+            || material.project_id() != meta.project_id()
+            || material.worktree_id() != meta.worktree_id()
+            || turn.task_id() != meta.task_id()
+            || turn.turn_number() != expected.turn_number()
+            || turn.base_oid() != expected.base_oid()
+            || !turn.resume()
+            || turn.agent() != meta.agent()
+            || turn.model() != meta.model()
+            || turn.effort() != meta.effort()
+            || turn.policy() != meta.policy()
+            || turn.effective_policy() != meta.effective_policy()
+            || turn.env_profile() != meta.env_profile()
+            || turn.limits() != &prepared.approved_turn_limits
+            || turn.session_seed() != expected.turn_id().as_uuid()
+            || turn.frozen_setup().is_some()
+            || request.prompt() != expected.composed_prompt()
+        {
+            return Err(invalid());
+        }
+        self.submit_turn_inner(request, Some(prepared))
     }
 
     pub fn status(&self, job_id: JobId) -> Result<StatusResponse, WorkerError> {

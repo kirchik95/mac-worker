@@ -76,12 +76,26 @@ pub struct TaskReadResult<T> {
 }
 
 pub struct TaskEventReadStore {
+    integrations: Option<EventIntegrationSource>,
     root: RootedDir,
     tasks: RootedDir,
     queue: RootedDir,
     turns: RootedDir,
     client_id: ClientId,
     runtime: Arc<dyn EventRuntime>,
+}
+
+#[derive(Clone)]
+enum EventIntegrationSource {
+    Native,
+    #[cfg(any(test, feature = "test-support"))]
+    Injected(Arc<dyn crate::integration::contracts::IntegrationState>),
+}
+
+enum EventIntegrationPoll {
+    Native(crate::integration::store::ExistingIntegrationReader),
+    #[cfg(any(test, feature = "test-support"))]
+    Injected(Arc<dyn crate::integration::contracts::IntegrationState>),
 }
 
 impl TaskProjectionReader for TaskEventReadStore {
@@ -120,13 +134,30 @@ impl TaskProjectionReader for TaskEventReadStore {
 }
 
 pub struct ExistingTaskProjectionProvider {
+    integrations: Option<EventIntegrationSource>,
     paths: PathLayout,
     runtime: Arc<dyn EventRuntime>,
 }
 
 impl ExistingTaskProjectionProvider {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_integrations(
+        mut self,
+        state: Arc<dyn crate::integration::contracts::IntegrationState>,
+    ) -> Self {
+        self.integrations = Some(EventIntegrationSource::Injected(state));
+        self
+    }
+    pub fn with_native_integrations(mut self) -> Self {
+        self.integrations = Some(EventIntegrationSource::Native);
+        self
+    }
     pub fn new(paths: PathLayout, runtime: Arc<dyn EventRuntime>) -> Self {
-        Self { paths, runtime }
+        Self {
+            paths,
+            runtime,
+            integrations: None,
+        }
     }
 }
 
@@ -144,12 +175,98 @@ impl TaskProjectionProvider for ExistingTaskProjectionProvider {
             return Err(invalid_state());
         }
         let store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
+        let store = match &self.integrations {
+            Some(EventIntegrationSource::Native) => store.with_native_integrations(),
+            #[cfg(any(test, feature = "test-support"))]
+            Some(EventIntegrationSource::Injected(state)) => store.with_integrations(state.clone()),
+            None => store,
+        };
         store.check_deadline(deadline)?;
         Ok(Arc::new(store))
     }
 }
 
 impl TaskEventReadStore {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_integrations(
+        mut self,
+        state: Arc<dyn crate::integration::contracts::IntegrationState>,
+    ) -> Self {
+        self.integrations = Some(EventIntegrationSource::Injected(state));
+        self
+    }
+    pub fn with_native_integrations(mut self) -> Self {
+        self.integrations = Some(EventIntegrationSource::Native);
+        self
+    }
+    fn integration_poll(&self) -> Result<Option<EventIntegrationPoll>, WorkerError> {
+        self.integrations
+            .as_ref()
+            .map(|source| match source {
+                EventIntegrationSource::Native => {
+                    crate::integration::store::ExistingIntegrationReader::open_at(self.root.path())
+                        .map(EventIntegrationPoll::Native)
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                EventIntegrationSource::Injected(state) => {
+                    Ok(EventIntegrationPoll::Injected(state.clone()))
+                }
+            })
+            .transpose()
+    }
+    fn facts(
+        &self,
+        record: &LocalTaskRecord,
+        dispatching: Option<bool>,
+        include_titles: bool,
+        integrations: Option<&EventIntegrationPoll>,
+    ) -> Result<TaskFacts, WorkerError> {
+        use crate::integration::contracts::ValidateIntegration;
+        let facts = record_facts(record, dispatching, include_titles)?;
+        let Some(source) = integrations else {
+            return Ok(facts);
+        };
+        let id = record.meta().task_id();
+        let (policy, integration) = match source {
+            EventIntegrationPoll::Native(reader) => reader.read_task(id)?,
+            #[cfg(any(test, feature = "test-support"))]
+            EventIntegrationPoll::Injected(state) => (None, state.load(id)?),
+        };
+        match integration {
+            Some(integration) => {
+                integration.validate()?;
+                if integration.task_id != id {
+                    return Err(invalid_state());
+                }
+                let current = crate::integration::view::snapshot_covers_latest_work(
+                    &integration.snapshot,
+                    record,
+                    |turn| match source {
+                        EventIntegrationPoll::Native(reader) => reader
+                            .read_auxiliary(id, turn, Some(&integration))
+                            .map(|prepared| prepared.is_some()),
+                        #[cfg(any(test, feature = "test-support"))]
+                        EventIntegrationPoll::Injected(state) => state
+                            .load_prepared(id, turn)
+                            .map(|prepared| prepared.is_some()),
+                    },
+                )?;
+                facts.with_current_integration(record, &integration.snapshot, current)
+            }
+            None => {
+                let armed = match source {
+                    EventIntegrationPoll::Native(_) => policy.is_some(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    EventIntegrationPoll::Injected(state) => state.load_policy(id)?.is_some(),
+                };
+                if armed {
+                    Err(crate::integration::contracts::integration_unavailable())
+                } else {
+                    Ok(facts)
+                }
+            }
+        }
+    }
     pub fn open_existing(
         paths: &PathLayout,
         runtime: Arc<dyn EventRuntime>,
@@ -163,6 +280,7 @@ impl TaskEventReadStore {
         let turns = open_directory(&root, "turns")?;
         let client_id = read_client_id(&root)?;
         Ok(Self {
+            integrations: None,
             root,
             tasks,
             queue,
@@ -190,6 +308,7 @@ impl TaskEventReadStore {
         }
         let token = proof_after.map(decode_token::<ProofToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
+        let integrations = self.integration_poll()?;
         #[cfg(any(test, feature = "test-support"))]
         let started = Instant::now();
         let binding = ProofBinding {
@@ -217,7 +336,7 @@ impl TaskEventReadStore {
                 result.missing.push(id);
                 continue;
             };
-            let facts = record_facts(&record, None, include_titles)?;
+            let facts = self.facts(&record, None, include_titles, integrations.as_ref())?;
             let known_busy = facts.busy == Some(true);
             let namespace = if known_busy {
                 None
@@ -317,13 +436,9 @@ impl TaskEventReadStore {
                     return Err(invalid_state());
                 }
             }
-            if serde_json::to_vec(&snapshot.facts)
-                .map_err(|_| invalid_state())?
-                .len()
-                > 2048
-            {
-                return Err(invalid_state());
-            }
+            ensure_produced_task_facts_bytes(
+                &serde_json::to_vec(&snapshot.facts).map_err(|_| invalid_state())?,
+            )?;
             result.rows.push(snapshot.facts.clone());
         }
         if progress.next_task < snapshots.len() {
@@ -398,6 +513,7 @@ impl TaskEventReadStore {
     ) -> Result<TaskRepairPage, WorkerError> {
         let token = after.map(decode_token::<RepairToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
+        let integrations = self.integration_poll()?;
         let binding = self.repair_binding()?;
         if token.as_ref().is_some_and(|token| {
             token.version != 1 || token.kind != "repair" || token.binding != binding
@@ -429,7 +545,14 @@ impl TaskEventReadStore {
             });
         }
         let work_started = Instant::now();
-        let result = self.repair_rows(&ids[start..], binding, limit, deadline, stats);
+        let result = self.repair_rows(
+            &ids[start..],
+            binding,
+            limit,
+            deadline,
+            stats,
+            integrations.as_ref(),
+        );
         stats.work_elapsed = work_started.elapsed();
         result
     }
@@ -441,6 +564,7 @@ impl TaskEventReadStore {
         limit: usize,
         deadline: Duration,
         stats: &mut TaskReadStats,
+        integrations: Option<&EventIntegrationPoll>,
     ) -> Result<TaskRepairPage, WorkerError> {
         let work_started = self.runtime.now();
         let (queue, _) = self.read_queue(deadline, stats)?;
@@ -462,7 +586,7 @@ impl TaskEventReadStore {
                     } else {
                         self.dispatching(id, &queue, deadline, stats)?
                     };
-                rows.push(record_facts(&record, dispatching, false)?);
+                rows.push(self.facts(&record, dispatching, false, integrations)?);
             }
             processed += 1;
         }
@@ -823,6 +947,7 @@ pub fn record_facts(
         TaskState::Lost => "lost",
     };
     let facts = TaskFacts::try_new(TaskFactsWire {
+        integration: None,
         task_id: record.meta().task_id(),
         run_id: record.meta().run_id(),
         state: state.into(),
@@ -844,14 +969,89 @@ pub fn record_facts(
             crate::redaction::RedactionBoundary::from_env().title(record.meta().title().as_str())
         }),
     })?;
-    if serde_json::to_vec(&facts)
-        .map_err(|_| invalid_state())?
-        .len()
-        > 2048
-    {
+    ensure_produced_task_facts_bytes(&serde_json::to_vec(&facts).map_err(|_| invalid_state())?)?;
+    Ok(facts)
+}
+
+/// The producer guard remains independent of tolerant decoder normalization.
+pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError> {
+    if bytes.len() > crate::controller::events::contracts::MAX_TASK_FACT_BYTES {
         return Err(invalid_state());
     }
-    Ok(facts)
+    Ok(())
+}
+
+impl TaskFacts {
+    /// Add only the compact companion annotation and bind its revision to the digest.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_integration(
+        self,
+        record: &LocalTaskRecord,
+        snapshot: &crate::integration::contracts::IntegrationSnapshot,
+    ) -> Result<Self, WorkerError> {
+        let current =
+            crate::integration::view::snapshot_covers_current_epoch_work(snapshot, record)?;
+        self.with_current_integration(record, snapshot, current)
+    }
+    fn with_current_integration(
+        mut self,
+        record: &LocalTaskRecord,
+        snapshot: &crate::integration::contracts::IntegrationSnapshot,
+        current: bool,
+    ) -> Result<Self, WorkerError> {
+        use crate::integration::contracts::IntegrationStatus;
+        if self.task_id != record.meta().task_id() {
+            return Err(invalid_state());
+        }
+        let annotation = snapshot.annotation()?;
+        if !current {
+            return Ok(self);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"mac-worker/integration-facts/v1\0");
+        let ordinary = record.canonical_bytes().map_err(|_| invalid_state())?;
+        hash.update((ordinary.len() as u64).to_be_bytes());
+        hash.update(ordinary);
+        hash.update(serde_json::to_vec(&annotation).map_err(|_| invalid_state())?);
+        self.fact_digest = format!("{:x}", hash.finalize());
+        match snapshot.state {
+            IntegrationStatus::Blocked => {
+                self.outcome = Some(crate::controller::events::SafeOutcome::Blocked);
+                self.code = annotation.code.map(|code| {
+                    crate::controller::events::SafeCode::from_public_code(code.as_str())
+                });
+            }
+            IntegrationStatus::Integrated => {
+                self.outcome = Some(crate::controller::events::SafeOutcome::Done);
+                self.code = None;
+            }
+            IntegrationStatus::Revoked => {}
+            IntegrationStatus::Armed
+                if self.outcome != Some(crate::controller::events::SafeOutcome::Done) => {}
+            _ => {
+                self.busy = Some(true);
+                self.quiescent = Some(false);
+            }
+        }
+        self.integration_confirmation = None;
+        self.integration = Some(annotation);
+        // Optional display text is the only field that may yield its byte budget.
+        loop {
+            let bytes = serde_json::to_vec(&self).map_err(|_| invalid_state())?;
+            if bytes.len() <= crate::controller::events::MAX_TASK_FACT_BYTES {
+                break;
+            }
+            let Some(title) = self.title.as_mut() else {
+                return Err(invalid_state());
+            };
+            if title.pop().is_none() {
+                self.title = None;
+            }
+        }
+        self.validate()?;
+        ensure_produced_task_facts_bytes(&serde_json::to_vec(&self).map_err(|_| invalid_state())?)?;
+        Ok(self)
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -1196,6 +1396,165 @@ mod tests {
     }
 
     #[test]
+    fn addressed_facts_restore_all_newer_ordinary_outcomes_with_a_rooted_receipt() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = fixture_task();
+        let state = Arc::new(
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap(),
+        );
+        let mut integration = sample_record(task, fixture_source(), "main");
+        integration.snapshot.state = IntegrationStatus::Integrated;
+        integration.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        integration.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        state.publish_policy(task, &integration.policy).unwrap();
+        assert!(
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        private_directory(&paths.state.join("turns").join(task.to_string()));
+        let baseline_reader = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_integrations(state);
+        for outcome in [
+            None,
+            Some(TaskOutcome::NeedsInput),
+            Some(TaskOutcome::failed("follow-up failed")),
+            Some(TaskOutcome::Cancelled),
+        ] {
+            let ordinary = sample_ordinary_followup(task, fixture_source(), outcome.clone());
+            write_record(&paths, &ordinary);
+            let actual = reader
+                .addressed_measured(&[task], false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+                .remove(0);
+            let expected = baseline_reader
+                .addressed_measured(&[task], false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+                .remove(0);
+            assert_eq!(actual, expected, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn addressed_facts_identify_prior_epoch_auxiliaries_from_rooted_preparations() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = fixture_task();
+        let state = Arc::new(
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap(),
+        );
+        let mut integration = sample_record(task, fixture_source(), "main");
+        let prepared = sample_prepared_turn(&integration, IntegrationTurnPurpose::Resolve, 1, 1);
+        state.publish_prepared(task, &prepared).unwrap();
+        integration.snapshot.epoch = 1;
+        integration.snapshot.state = IntegrationStatus::Integrated;
+        integration.snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        integration.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        state.publish_policy(task, &integration.policy).unwrap();
+        assert!(
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        private_directory(&paths.state.join("turns").join(task.to_string()));
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_integrations(state);
+        let mut wire = serde_json::to_value(sample_ordinary_followup(
+            task,
+            fixture_source(),
+            Some(TaskOutcome::Done),
+        ))
+        .unwrap();
+        wire["status"]["turns"][1]["turn_id"] = serde_json::json!(prepared.followup.turn_id());
+        let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+        write_record(&paths, &ordinary);
+        let actual = reader
+            .addressed_measured(&[task], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows
+            .remove(0);
+        assert_eq!(
+            actual.integration,
+            Some(integration.snapshot.annotation().unwrap())
+        );
+        let mut wire = serde_json::to_value(&ordinary).unwrap();
+        let mut next = wire["status"]["turns"][1].clone();
+        next["turn_number"] = serde_json::json!(3);
+        next["turn_id"] = serde_json::json!(TurnId::new(uuid::Uuid::from_u128(9)));
+        next["outcome"] = serde_json::json!({"kind":"needs_input"});
+        wire["status"]["turns"].as_array_mut().unwrap().push(next);
+        wire["status"]["last_outcome"] = serde_json::json!({"kind":"needs_input"});
+        let ordinary: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+        write_record(&paths, &ordinary);
+        let actual = reader
+            .addressed_measured(&[task], false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows
+            .remove(0);
+        assert_eq!(actual.integration, None);
+        assert_eq!(actual.outcome, Some(SafeOutcome::NeedsInput));
+    }
+
+    #[test]
+    fn addressed_facts_use_durable_companion_and_never_infer_disabled_from_missing_record() {
+        use crate::integration::{contracts::*, testing::*};
+        let (_root, paths, runtime) = fixture();
+        let task = record(1, TaskState::Open, TaskOutcome::Done);
+        let task_id = task.meta().task_id();
+        write_record(&paths, &task);
+        private_directory(&paths.state.join("turns").join(task_id.to_string()));
+        let reader = TaskEventReadStore::open_existing(&paths, runtime).unwrap();
+        let read = |reader: &TaskEventReadStore| {
+            reader.addressed_measured(&[task_id], false, None, Duration::from_secs(30))
+        };
+        let baseline = read(&reader).unwrap().value.rows.remove(0);
+        let state = Arc::new(MemoryIntegrationState::default());
+        let reader = reader.with_integrations(state.clone());
+        assert_eq!(read(&reader).unwrap().value.rows[0], baseline);
+        let mut integration = sample_record(task_id, task.status().turns()[0].turn_id(), "main");
+        state.publish_policy(task_id, &integration.policy).unwrap();
+        assert_eq!(
+            read(&reader).err().unwrap().public_code(),
+            "INTEGRATION_UNAVAILABLE"
+        );
+        assert!(
+            state
+                .replace(task_id, IntegrationRevision(0), &integration)
+                .unwrap()
+        );
+        let enabled = read(&reader).unwrap().value.rows.remove(0);
+        assert_eq!(
+            enabled.integration,
+            Some(integration.snapshot.annotation().unwrap())
+        );
+        assert_ne!(enabled.fact_digest, baseline.fact_digest);
+        integration.snapshot.revision = integration.snapshot.revision.next().unwrap();
+        assert!(
+            state
+                .replace(task_id, IntegrationRevision(1), &integration)
+                .unwrap()
+        );
+        let newer = read(&reader).unwrap().value.rows.remove(0);
+        assert_ne!(newer.fact_digest, enabled.fact_digest);
+        assert_ne!(
+            newer.eligibility_signature(),
+            enabled.eligibility_signature()
+        );
+    }
+
+    #[test]
     fn dispatch_proof_resumes_without_repeating_completed_associations() {
         let (_root, paths, runtime) = fixture();
         write_record(&paths, &record(1, TaskState::Open, TaskOutcome::Done));
@@ -1500,5 +1859,185 @@ mod tests {
         assert_eq!(second.rows[0].busy, Some(true));
         assert_eq!(second.rows[1].quiescent, Some(true));
         assert!(second.proof_after.is_none());
+    }
+    fn disabled_event_reader() -> (
+        tempfile::TempDir,
+        PathLayout,
+        Arc<ManualRuntime>,
+        Vec<TaskId>,
+    ) {
+        let (root, paths, runtime) = fixture();
+        let ids = (1..=16).map(id).collect::<Vec<_>>();
+        for number in 1..=16 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+            private_directory(&paths.state.join("turns").join(id(number).to_string()));
+        }
+        assert!(!paths.state.join("integrations").exists());
+        (root, paths, runtime, ids)
+    }
+
+    #[test]
+    fn review_disabled_addressed_event_poll_checks_absence_once() {
+        let (_root, paths, runtime, ids) = disabled_event_reader();
+        let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone())
+            .unwrap()
+            .addressed_measured(&ids, false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_native_integrations();
+        crate::integration::store::read_cost_counters::reset();
+        let actual = reader
+            .addressed_measured(&ids, false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let calls = crate::integration::store::read_cost_counters::calls();
+        assert_eq!(actual, baseline);
+        assert!(!paths.state.join("integrations").exists());
+        println!(
+            "addressed event poll: rows={}, actual symlink_metadata calls={calls}; unchanged facts; no integration root created",
+            actual.len()
+        );
+        assert_eq!(
+            calls, 1,
+            "disabled event poll must check integration-root absence once"
+        );
+    }
+
+    #[test]
+    fn review_disabled_repair_event_poll_checks_absence_once() {
+        let (_root, paths, runtime, _ids) = disabled_event_reader();
+        let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone())
+            .unwrap()
+            .repair_read(None, 16, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_native_integrations();
+        crate::integration::store::read_cost_counters::reset();
+        let actual = reader
+            .repair_read(None, 16, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let calls = crate::integration::store::read_cost_counters::calls();
+        assert_eq!(actual, baseline);
+        assert!(!paths.state.join("integrations").exists());
+        println!(
+            "repair event poll: rows={}, actual symlink_metadata calls={calls}; unchanged facts; no integration root created",
+            actual.len()
+        );
+        assert_eq!(
+            calls, 1,
+            "disabled repair poll must check integration-root absence once"
+        );
+    }
+
+    fn event_poll(reader: &TaskEventReadStore, ids: &[TaskId], repair: bool) -> Vec<TaskFacts> {
+        if repair {
+            reader
+                .repair_read(None, ids.len(), Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+        } else {
+            reader
+                .addressed_measured(ids, false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+        }
+    }
+
+    #[test]
+    fn native_event_polls_share_one_root_and_one_companion_pair_per_row() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        for repair in [false, true] {
+            let (_root, paths, runtime) = fixture();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let ids = (1..=16).map(id).collect::<Vec<_>>();
+            for &task in &ids {
+                write_record(&paths, &sample_ordinary(task, fixture_source()));
+                private_directory(&paths.state.join("turns").join(task.to_string()));
+                let integration = sample_record(task, fixture_source(), "main");
+                state.publish_policy(task, &integration.policy).unwrap();
+                state
+                    .replace(task, IntegrationRevision(0), &integration)
+                    .unwrap();
+            }
+            let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+            let native = TaskEventReadStore::open_existing(&paths, runtime)
+                .unwrap()
+                .with_native_integrations();
+            let before = crate::rooted_fs::read_open_counts();
+            event_poll(&baseline, &ids, repair);
+            let after = crate::rooted_fs::read_open_counts();
+            let ordinary = [after[0] - before[0], after[2] - before[2]];
+            let before = crate::rooted_fs::read_open_counts();
+            crate::integration::store::read_cost_counters::reset();
+            let rows = event_poll(&native, &ids, repair);
+            let after = crate::rooted_fs::read_open_counts();
+            assert_eq!(crate::integration::store::read_cost_counters::calls(), 1);
+            assert_eq!(after[0] - before[0], ordinary[0] + 1);
+            assert_eq!(after[2] - before[2], ordinary[1] + 32);
+            assert_eq!(rows.len(), 16);
+            assert!(rows.iter().all(|row| row.integration.is_some()));
+        }
+    }
+
+    #[test]
+    fn native_event_polls_reread_a_new_root_and_revision_on_the_next_poll() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        for repair in [false, true] {
+            let (_root, paths, runtime) = fixture();
+            let task = fixture_task();
+            write_record(&paths, &sample_ordinary(task, fixture_source()));
+            private_directory(&paths.state.join("turns").join(task.to_string()));
+            let native = TaskEventReadStore::open_existing(&paths, runtime)
+                .unwrap()
+                .with_native_integrations();
+            assert!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .is_none()
+            );
+            assert!(!paths.state.join("integrations").exists());
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut integration = sample_record(task, fixture_source(), "main");
+            state.publish_policy(task, &integration.policy).unwrap();
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap();
+            assert_eq!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                IntegrationRevision(1)
+            );
+            integration.snapshot.revision = IntegrationRevision(2);
+            integration.snapshot.updated_at_millis += 1;
+            state
+                .replace(task, IntegrationRevision(1), &integration)
+                .unwrap();
+            assert_eq!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                IntegrationRevision(2)
+            );
+        }
     }
 }

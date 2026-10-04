@@ -1,3 +1,4 @@
+import type { IntegrationSnapshot, WorkflowState } from './integration.contract'
 import { exampleResponse, wantsExample } from '@/lib/exampleSnapshot'
 /** Shapes mirror the Rust dashboard snapshot projection; see src/dashboard/model.rs. */
 
@@ -79,6 +80,9 @@ export interface Worker {
 }
 
 export interface TaskRow {
+  /** Present with a workflow only while the cycle covers the latest ordinary turn. */
+  integration?: IntegrationSnapshot
+  workflow_state?: WorkflowState
   task_id: string
   run_id: string | null
   run_position: number | null
@@ -230,6 +234,9 @@ export function lastDelivery(task: {
 }
 
 export interface TaskDetail {
+  /** Retained receipt history; current actions use task.integration and its workflow. */
+  integration?: IntegrationSnapshot
+  workflow_state?: WorkflowState
   task: TaskRow
   project_id: string
   worktree_id: string
@@ -294,7 +301,28 @@ export interface SaveSettings {
 export const fetchTaskDetail = (taskId: string, signal?: AbortSignal) =>
   getJson<TaskDetail>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, signal)
 
+/** Shared revision fence for detail and attention-card actions. */
+export function taskMutationForDetail(detail: TaskDetail, message?: string): TaskMutation {
+  const turns = detail.timeline.length > 0 ? detail.timeline : detail.turns
+  const integration = detail.integration ?? detail.task.integration
+  if (integration && (!Number.isSafeInteger(integration.revision) || integration.revision < 1))
+    throw new ApiError(409, 'Integration revision is unavailable; refresh the task.', 'TASK_REVISION_CONFLICT')
+  return {
+    message,
+    ...(integration ? { expected_integration_id: integration.integration_id,
+      expected_integration_revision: integration.revision } : {}),
+    expected_task_id: detail.task.task_id,
+    expected_turn_id: turns.at(-1)?.turn_id ?? null,
+    expected_turn_count: detail.task.turn_count,
+    expected_head_oid: detail.head_oid,
+    expected_updated_at_millis: detail.task.updated_at_millis,
+    expected_state: detail.task.state,
+  }
+}
+
 export interface TaskMutation {
+  expected_integration_id?: string
+  expected_integration_revision?: number
   message?: string
   expected_task_id: string
   expected_turn_id: string | null
@@ -306,7 +334,7 @@ export interface TaskMutation {
 
 async function postTaskMutation(
   path: string,
-  body: TaskMutation,
+  body: TaskMutation | TaskIntegrationMutation,
   signal?: AbortSignal,
 ): Promise<TaskDetail> {
   if (wantsExample())
@@ -333,6 +361,14 @@ async function postTaskMutation(
   }
   return payload as TaskDetail
 }
+
+export interface TaskIntegrationMutation {
+  expected: TaskMutation
+  expected_integration_id: string
+  integration: { task_id: string; expected: number; request_id: string }
+}
+export const integrateTask = (taskId: string, body: TaskIntegrationMutation, signal?: AbortSignal) =>
+  postTaskMutation(`/api/v1/tasks/${encodeURIComponent(taskId)}/integrate`, body, signal)
 
 export const replyToTask = (taskId: string, body: TaskMutation, signal?: AbortSignal) =>
   postTaskMutation(`/api/v1/tasks/${encodeURIComponent(taskId)}/reply`, body, signal)

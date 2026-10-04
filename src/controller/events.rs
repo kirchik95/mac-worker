@@ -35,6 +35,7 @@ mod tests {
     }
     fn facts_wire() -> TaskFactsWire {
         TaskFactsWire {
+            integration: None,
             task_id: task_id(),
             run_id: None,
             state: "open".into(),

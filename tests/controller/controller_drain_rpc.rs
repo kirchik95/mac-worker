@@ -89,6 +89,44 @@ fn drain_read_rpc_observes_false_without_creating_any_state() {
 }
 
 #[test]
+fn integration_pause_selector_is_read_only_and_keeps_ordinary_drain_replies() {
+    let fixture = Fixture::new();
+    let reply = fixture.rpc(json!({"integration_pause": true})).unwrap();
+    assert_eq!(reply.result(), &json!({"integration_pause": null}));
+    assert!(!fixture.paths.state.exists());
+    assert!(!fixture.paths.controller_state_root().exists());
+    mac_worker::test_support::controller::drain::set_drained(
+        &fixture.paths.controller_state_root(),
+        true,
+    )
+    .unwrap();
+    let reply = fixture.rpc(json!({"integration_pause": true})).unwrap();
+    assert_eq!(
+        reply.result()["integration_pause"]["reason"],
+        "controller_drained"
+    );
+    assert!(
+        reply.result()["integration_pause"]["effective_at_millis"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(reply.result().as_object().unwrap().len(), 1);
+    assert_eq!(
+        fixture.rpc(json!({})).unwrap().result(),
+        &json!({"drained": true})
+    );
+    assert!(!fixture.paths.state.exists());
+    assert!(
+        !fixture
+            .paths
+            .controller_state_root()
+            .join("requests.lock")
+            .exists()
+    );
+}
+
+#[test]
 fn drain_write_rpc_persists_flag_and_repeated_ids_use_direct_set_semantics() {
     let fixture = Fixture::new();
     for drained in [true, true, false, false, true] {
@@ -297,5 +335,120 @@ fn drain_client_rejects_malformed_results_and_mismatched_envelopes() {
         let error = drain_via_controller(&runner, &controller_config(), Some(true)).unwrap_err();
         assert_eq!(error.public_code(), "CONTROLLER_UNAVAILABLE", "{field}");
         assert!(!error.to_string().contains("private planted reply"));
+    }
+}
+
+#[test]
+fn operator_cli_forwards_only_public_gate_warnings_from_remote_commands() {
+    use clap::Parser;
+    use mac_worker::test_support::{
+        cli::Cli,
+        controller::service::ServiceStatus,
+        runtime::{RuntimeContext, run_with_stdio_in_context},
+    };
+
+    struct OperatorReply {
+        disable: bool,
+        warning: &'static str,
+    }
+    impl ProcessRunner for OperatorReply {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            assert_eq!(request.program, "/usr/bin/ssh");
+            let mut result = if self.disable {
+                let body: Value = serde_json::from_slice(request.stdin.as_ref().unwrap()).unwrap();
+                assert_eq!(body, json!({"action": "uninstall"}));
+                let service: ServiceStatus = serde_json::from_value(json!({
+                    "label": "com.mac-worker.controller", "domain": "gui/501",
+                    "installed": false, "loaded": false,
+                }))
+                .unwrap();
+                ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: serde_json::to_vec(&service).unwrap(),
+                    stderr: Vec::new(),
+                }
+            } else {
+                ReplyFixture {
+                    requested: Some(true),
+                    result: json!({"drained": true}),
+                    envelope_override: None,
+                }
+                .run(request)?
+            };
+            // Only the complete public line is safe to show to an operator.
+            // Duplicates and unrelated host diagnostics must not leak.
+            result.stderr = format!(
+                "private host detail\n{}\n{}\nwarning: integration gate [IO]; private detail\n",
+                self.warning, self.warning
+            )
+            .into_bytes();
+            Ok(result)
+        }
+    }
+    for (disable, warning) in [
+        (
+            false,
+            "warning: integration gate [CONTROLLER_TRANSPORT]; pause history was reset",
+        ),
+        (
+            true,
+            "warning: integration gate [IO]; pause could not be persisted; integration may resume after re-enable",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let config = home.join("config.toml");
+        std::fs::write(
+            &config,
+            "version = 1\n[controller]\nenabled = true\nssh = \"fixture-controller\"\n[[workers]]\nname = \"fixture\"\nssh = \"fixture.invalid\"\nslots = 1\n",
+        )
+        .unwrap();
+        let runtime = RuntimeContext::isolated(
+            std::collections::BTreeMap::from([
+                ("HOME".into(), home.as_os_str().to_owned()),
+                ("XDG_STATE_HOME".into(), home.as_os_str().to_owned()),
+            ]),
+            home.clone(),
+            home,
+        );
+        let cli = Cli::try_parse_from([
+            "worker",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+            "controller",
+            if disable { "disable" } else { "drain" },
+        ])
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_with_stdio_in_context(
+                cli,
+                &OperatorReply { disable, warning },
+                &runtime,
+                &mut Cursor::new(Vec::new()),
+                &mut stdout,
+                &mut stderr,
+            ),
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), format!("{warning}\n"));
+        if disable {
+            let output: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(output.as_object().unwrap().len(), 2);
+            assert_eq!(output["enabled"], false);
+            assert_eq!(output["service"]["loaded"], false);
+            assert!(
+                !Config::parse(&std::fs::read_to_string(config).unwrap())
+                    .unwrap()
+                    .controller
+                    .enabled
+            );
+        } else {
+            assert_eq!(stdout, b"{\"drained\":true}\n");
+        }
     }
 }

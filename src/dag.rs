@@ -31,6 +31,7 @@ pub enum ParentGate {
     Ready,
     Waiting,
     Failed,
+    IntegrationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +457,126 @@ pub fn parent_gate(record: &LocalTaskRecord) -> ParentGate {
     }
 }
 
+pub(crate) fn parent_gate_at(
+    state: &std::path::Path,
+    ordinary: &LocalTaskRecord,
+) -> Result<ParentGate, WorkerError> {
+    use crate::integration::{contracts::*, store::ExistingIntegrationReader};
+    let reader = match ExistingIntegrationReader::open_at(state) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(ParentGate::Waiting),
+    };
+    // Recovery could not decode this parent's optional evidence. Keep its
+    // children waiting through backoff; never infer success from Closed+Done.
+    if reader
+        .recovery()
+        .retains_evidence(ordinary.meta().task_id())
+    {
+        return Ok(ParentGate::Waiting);
+    }
+    let (policy, integration) = reader.read_task(ordinary.meta().task_id())?;
+    if policy.is_none() {
+        return Ok(parent_gate(ordinary));
+    }
+    if matches!(
+        ordinary.status().state(),
+        TaskState::Abandoned | TaskState::Lost
+    ) {
+        return Ok(ParentGate::IntegrationFailed);
+    }
+    let Some(record) = integration else {
+        return Ok(if ordinary.status().state() == TaskState::Closed {
+            ParentGate::IntegrationFailed
+        } else {
+            ParentGate::Waiting
+        });
+    };
+    if record.snapshot.state == IntegrationStatus::Integrated {
+        let ready = record.receipt.as_ref().is_some_and(|r| {
+            let head = r.merge_oid.as_ref().unwrap_or(&r.target_head);
+            r.imported
+                && ordinary.fetched_head() == Some(head)
+                && ordinary.status().head_oid() == Some(head)
+                && matches!(
+                    ordinary.status().state(),
+                    TaskState::Open | TaskState::Closed
+                )
+                && ordinary.status().last_outcome() == Some(&TaskOutcome::Done)
+                && ordinary.runner().is_none()
+                && ordinary.auto_continue_intent().is_none()
+                && ordinary.status().turns().last().is_some_and(|t| {
+                    t.terminal().is_some()
+                        && t.outcome() == Some(&TaskOutcome::Done)
+                        && (t.turn_id() == record.snapshot.source_turn_id
+                            || record
+                                .auxiliaries
+                                .iter()
+                                .any(|a| a.turn_id == t.turn_id() && a.completed))
+                })
+        });
+        return Ok(if ready {
+            ParentGate::Ready
+        } else {
+            ParentGate::Waiting
+        });
+    }
+    if (record.snapshot.state == IntegrationStatus::Revoked
+        && (ordinary.status().state() == TaskState::Closed
+            || record.snapshot.blocked_code
+                == Some(IntegrationCode::IntegrationDependencyNotIntegrated)))
+        || (ordinary.status().state() == TaskState::Closed
+            && record.snapshot.state == IntegrationStatus::Blocked)
+    {
+        return Ok(ParentGate::IntegrationFailed);
+    }
+    Ok(ParentGate::Waiting)
+}
+
+pub(crate) fn failed_parent_code(
+    node: &DagNode,
+    parents: &BTreeMap<String, ParentGate>,
+) -> &'static str {
+    if node
+        .depends_on
+        .iter()
+        .any(|dep| parents.get(dep) == Some(&ParentGate::IntegrationFailed))
+    {
+        "INTEGRATION_DEPENDENCY_NOT_INTEGRATED"
+    } else {
+        DAG_PARENT_FAILED
+    }
+}
+
+// T4/T6 attaches the early freeze gate; fixtures already exercise this seam.
+pub(crate) fn validate_integration_batch(
+    batch: &crate::integration::contracts::FrozenIntegratingBatch,
+) -> Result<(), WorkerError> {
+    use crate::integration::contracts::*;
+    batch.validate()?;
+    for node in batch.batch.nodes.values() {
+        let (Some(child), Some(parent_id)) =
+            (batch.integrations[&node.task_id].as_ref(), node.parent_id())
+        else {
+            continue;
+        };
+        let parent = batch
+            .batch
+            .nodes
+            .get(parent_id)
+            .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        let parent_policy = batch.integrations[&parent.task_id]
+            .as_ref()
+            .ok_or_else(|| IntegrationCode::IntegrationDependencyNotIntegrated.error())?;
+        if child.target_key()? != parent_policy.target_key()? {
+            return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
+        }
+        if child.base_task != Some(parent.task_id) {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parents_ready(
     _record: &DagRecord,
     node: &DagNode,
@@ -471,9 +592,12 @@ pub(crate) fn parents_ready(
 }
 
 pub(crate) fn parents_failed(node: &DagNode, parents: &BTreeMap<String, ParentGate>) -> bool {
-    node.depends_on
-        .iter()
-        .any(|dep| parents.get(dep) == Some(&ParentGate::Failed))
+    node.depends_on.iter().any(|dep| {
+        matches!(
+            parents.get(dep),
+            Some(ParentGate::Failed | ParentGate::IntegrationFailed)
+        )
+    })
 }
 
 /// Bind `from:` only to this accepted turn's imported object.
@@ -658,6 +782,8 @@ pub(crate) fn pending_list_row(
         DagNodeState::Submitted => None,
     };
     TaskListRow {
+        integration: None,
+        workflow_state: None,
         task_id: node.task_id,
         run_id: Some(run_id),
         run_position: None,

@@ -15,7 +15,7 @@ import { useSnapshot } from '@/hooks/useSnapshot'
 import { useTaskPreviews } from '@/hooks/useTaskPreviews'
 import { useInputModality } from '@/hooks/useInputModality'
 import { attentionCount } from '@/lib/attention'
-import { needsAnswer, readyForReview } from '@/lib/taskPresentation'
+import { blockedIntegration, integrationDependencyFailure, needsAnswer, readyForReview } from '@/lib/taskPresentation'
 import { relativeTime } from '@/lib/format'
 
 export const documentTitle = (attention: number) =>
@@ -79,7 +79,8 @@ function Dashboard() {
   const [route, setRoute] = useState(currentRoute)
   const attention = snapshot ? attentionCount(snapshot) : 0
   const previews = useTaskPreviews(
-    snapshot?.tasks.filter((task) => needsAnswer(task) || readyForReview(task)) ?? [],
+    snapshot?.tasks.filter((task) => needsAnswer(task) || readyForReview(task) ||
+      blockedIntegration(task) || integrationDependencyFailure(task)) ?? [],
   )
   useEffect(() => {
     document.title = documentTitle(attention)
