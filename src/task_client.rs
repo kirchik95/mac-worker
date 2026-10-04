@@ -7139,10 +7139,9 @@ impl<'a> TaskClient<'a> {
                             | IntegrationStatus::Blocked
                             | IntegrationStatus::Revoked
                     ) || (record.status().state() == TaskState::Closed
-                        && integration.snapshot.state == IntegrationStatus::Blocked
-                        && !integration.phase_retries.iter().any(|retry| {
-                            retry.phase == crate::integration::contracts::IntegrationPhase::Repair
-                        })))
+                        && crate::integration::coordinator::closed_observation_pending(
+                            &integration,
+                        )))
                 {
                     return Ok(false);
                 }
@@ -9358,6 +9357,12 @@ mod tests {
             let mut record = sample_record(fixture_task(), fixture_source(), "main");
             record.snapshot.state = IntegrationStatus::Blocked;
             record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 3,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 2000,
+            });
             state
                 .publish_policy(record.task_id, &record.policy)
                 .unwrap();
@@ -9381,7 +9386,7 @@ mod tests {
             record.snapshot.revision = previous.next().unwrap();
             record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkspaceMissing);
             record.phase_retries.push(IntegrationPhaseRetry {
-                phase: IntegrationPhase::Repair,
+                phase: IntegrationPhase::Drive,
                 retries: 0,
                 code: IntegrationCode::IntegrationWorkerOffline,
                 due_at_millis: 1002,
@@ -9406,6 +9411,12 @@ mod tests {
             let mut record = sample_record(fixture_task(), fixture_source(), "main");
             record.snapshot.state = IntegrationStatus::Blocked;
             record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 3,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 2000,
+            });
             state
                 .publish_policy(record.task_id, &record.policy)
                 .unwrap();
@@ -9435,7 +9446,7 @@ mod tests {
             record.snapshot.resume_state = Some(IntegrationStatus::Published);
             record.snapshot.retry_at_millis = Some(3000);
             record.phase_retries.push(IntegrationPhaseRetry {
-                phase: IntegrationPhase::Repair,
+                phase: IntegrationPhase::Drive,
                 retries: 1,
                 code: IntegrationCode::IntegrationNetwork,
                 due_at_millis: 3000,

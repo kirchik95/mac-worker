@@ -622,7 +622,7 @@ fn review_native_closed_observation_keeps_network_uncertainty_and_the_repair_ret
         Some(IntegrationCode::IntegrationNetwork)
     );
     let record = state.load(f.record.task_id).unwrap().unwrap();
-    assert_eq!(record.phase_retries[0].phase, IntegrationPhase::Repair);
+    assert_eq!(record.phase_retries[0].phase, IntegrationPhase::Drive);
     assert_eq!(
         record.phase_retries[0].code,
         IntegrationCode::IntegrationNetwork
@@ -3200,5 +3200,212 @@ mod rooted_git_concurrency {
             Some(actors[0].now_millis() + parked.remaining_admission_millis.unwrap())
         );
         assert_eq!(restored.followups_spent, parked.followups_spent);
+    }
+}
+
+mod review_fixes {
+    use super::*;
+    use mac_worker::test_support::{
+        client_state::{ActiveTaskConfig, ClientStateStore},
+        core::{error::WorkerError, paths::PathLayout},
+        host::process::SystemProcessRunner,
+        task::model::TaskState,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn probe_paths(root: &std::path::Path) -> PathLayout {
+        PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        }
+    }
+    struct FailOnlyOpenRepair<'a> {
+        fixture: &'a GitIntegrationFixture,
+        repairs: AtomicUsize,
+    }
+    impl IntegrationHost for FailOnlyOpenRepair<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            if matches!(
+                request.action,
+                HostIntegrationAction::Step {
+                    step: IntegrationStep::Repair,
+                    ..
+                }
+            ) {
+                self.repairs.fetch_add(1, Ordering::SeqCst);
+                if self
+                    .fixture
+                    .store
+                    .task_status(
+                        &self.fixture.record.policy.project_id,
+                        self.fixture.record.task_id,
+                    )?
+                    .state()
+                    == TaskState::Open
+                {
+                    return Err(IntegrationCode::IntegrationNetwork.error());
+                }
+            }
+            HostIntegrationService::new(
+                &self.fixture.store,
+                &SystemProcessRunner,
+                &self.fixture.runtime,
+            )
+            .execute(request)
+        }
+    }
+
+    #[test]
+    fn review_closed_restore_does_not_confuse_an_open_repair_retry_with_closed_settlement() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let mut f = GitIntegrationFixture::at(temp.path().join("git"));
+        f.commit_base();
+        f.commit_task();
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime)
+            .execute(&HostIntegrationRequest {
+                protocol_version: 7,
+                task_id: f.record.task_id,
+                integration_id: None,
+                epoch: 0,
+                revision: IntegrationRevision(0),
+                action: HostIntegrationAction::Arm {
+                    policy: f.record.policy.clone(),
+                },
+            })
+            .unwrap();
+        let ordinary = sample_ordinary(f.record.task_id, f.record.snapshot.source_turn_id)
+            .with_status(
+                f.store
+                    .task_status(&f.record.policy.project_id, f.record.task_id)
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_fetched_head(Some(f.record.snapshot.source_head.clone()))
+            .unwrap();
+        let mut facts = IntegrationTaskFacts::from_record(&ordinary, false);
+        facts.cycle_base = f.record.cycle_base.clone();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(facts.clone());
+        let turns = FakeIntegrationTurns::default();
+        let host = FailOnlyOpenRepair {
+            fixture: &f,
+            repairs: AtomicUsize::new(0),
+        };
+        for _ in 0..4 {
+            let saved = state.load(f.record.task_id).unwrap().unwrap();
+            if let Some(due) = saved.snapshot.retry_at_millis {
+                runtime.advance(std::time::Duration::from_millis(
+                    due.saturating_sub(runtime.now_millis()),
+                ));
+            }
+            IntegrationRunner::new(IntegrationCoordinator::new(
+                &state,
+                &host,
+                &turns,
+                runtime.as_ref(),
+                &observer,
+            ))
+            .run(f.record.task_id)
+            .unwrap();
+        }
+        let blocked = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
+        assert!(
+            blocked
+                .phase_retries
+                .iter()
+                .any(|r| r.phase == IntegrationPhase::Repair && r.retries == 3)
+        );
+        let receipt = blocked.receipt.as_ref().unwrap();
+        assert!(!receipt.imported);
+        assert_eq!(f.origin_tip(), receipt.merge_oid.clone().unwrap());
+        assert_eq!(host.repairs.load(Ordering::SeqCst), 4);
+        let close_at = f
+            .store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .updated_at_millis()
+            + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS
+            + 1;
+        assert!(
+            mac_worker::test_support::host::gc::apply_baseline_retention_close(
+                &f.store,
+                &SystemProcessRunner,
+                &f.record.policy.project_id,
+                f.record.task_id,
+                close_at
+            )
+            .unwrap()
+        );
+        facts.ordinary = ordinary
+            .with_status(
+                f.store
+                    .task_status(&f.record.policy.project_id, f.record.task_id)
+                    .unwrap(),
+            )
+            .unwrap();
+        observer.insert(facts.clone());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        client.create_task(facts.ordinary).unwrap();
+        client.bootstrap_active_task_index().unwrap();
+        let selected = client
+            .select_active_task_ids(&ActiveTaskConfig::default())
+            .unwrap()
+            .selected;
+        let settled =
+            IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer)
+                .drive_once(f.record.task_id)
+                .unwrap();
+        println!(
+            "real M={} on origin; host Closed/workspace gone; pre-close Repair retries=3; selected={selected:?}; after restore state={:?}, Repair calls={}, receipt imported={}",
+            f.origin_tip(),
+            settled.state,
+            host.repairs.load(Ordering::SeqCst),
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .receipt
+                .unwrap()
+                .imported
+        );
+        assert_eq!(
+            settled.state,
+            IntegrationStatus::Integrated,
+            "an Open repair retry is not evidence that Closed settlement was attempted"
+        );
+        assert_eq!(selected, vec![f.record.task_id]);
+        assert_eq!(host.repairs.load(Ordering::SeqCst), 5);
+        assert_eq!(turns.imports(f.record.task_id).len(), 1);
+        let saved = state.load(f.record.task_id).unwrap().unwrap();
+        assert!(
+            saved
+                .phase_retries
+                .iter()
+                .any(|retry| retry.phase == IntegrationPhase::Repair && retry.retries == 3)
+        );
+        assert!(
+            saved
+                .phase_retries
+                .iter()
+                .any(|retry| retry.phase == IntegrationPhase::Drive && retry.retries == 0)
+        );
     }
 }

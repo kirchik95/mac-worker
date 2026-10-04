@@ -630,12 +630,7 @@ impl<'a> OwnerIntegration<'a> {
             return Ok(());
         };
         let closed = self.ports.client.load_task(task)?.status().state() == TaskState::Closed;
-        let closed_observation = closed
-            && record.snapshot.state == IntegrationStatus::Blocked
-            && !record
-                .phase_retries
-                .iter()
-                .any(|retry| retry.phase == IntegrationPhase::Repair);
+        let closed_observation = closed && super::coordinator::closed_observation_pending(&record);
         if matches!(
             record.snapshot.state,
             IntegrationStatus::Integrated | IntegrationStatus::Blocked | IntegrationStatus::Revoked

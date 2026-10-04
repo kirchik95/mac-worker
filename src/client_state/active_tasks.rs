@@ -360,7 +360,6 @@ impl ClientStateStore {
     }
 
     fn closed_integration_needs_active_index(&self, record: &LocalTaskRecord) -> bool {
-        use crate::integration::contracts::{IntegrationPhase, IntegrationStatus};
         if record.status().state() != TaskState::Closed {
             return false;
         }
@@ -369,14 +368,7 @@ impl ClientStateStore {
             record.meta().task_id(),
         ) {
             Ok((_, Some(integration))) => {
-                !matches!(
-                    integration.snapshot.state,
-                    IntegrationStatus::Integrated | IntegrationStatus::Revoked
-                ) && (integration.snapshot.state != IntegrationStatus::Blocked
-                    || !integration
-                        .phase_retries
-                        .iter()
-                        .any(|retry| retry.phase == IntegrationPhase::Repair))
+                crate::integration::coordinator::closed_observation_pending(&integration)
             }
             Ok((_, None)) => false,
             // Unreadable optional evidence cannot prove a repair is finished.

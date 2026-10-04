@@ -6,6 +6,19 @@ use crate::{
     task::{TaskId, TaskOutcome, TaskState, TurnId},
 };
 use sha2::{Digest, Sha256};
+/// Closed settlement has its own driver budget, separate from Open Repair.
+/// Every consumer uses this proof before treating a Closed block as terminal.
+pub(crate) fn closed_observation_pending(record: &IntegrationRecord) -> bool {
+    !matches!(
+        record.snapshot.state,
+        IntegrationStatus::Integrated | IntegrationStatus::Revoked
+    ) && (record.snapshot.state != IntegrationStatus::Blocked
+        || !record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive))
+}
+
 pub struct IntegrationCoordinator<'a> {
     state: &'a dyn IntegrationState,
     host: &'a dyn IntegrationHost,
@@ -1402,23 +1415,22 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         step: IntegrationStep,
     ) -> Result<Option<HostIntegrationResponse>, WorkerError> {
-        if (record.snapshot.state == IntegrationStatus::Blocked
-            && record
-                .phase_retries
-                .iter()
-                .any(|retry| retry.phase == IntegrationPhase::Repair))
-            || record
-                .snapshot
-                .retry_at_millis
-                .is_some_and(|d| d > self.runtime.now_millis())
+        let started = record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive);
+        if !closed_observation_pending(record)
+            || (started
+                && record
+                    .snapshot
+                    .retry_at_millis
+                    .is_some_and(|d| d > self.runtime.now_millis()))
         {
             return Ok(None);
         }
-        let phase = if step == IntegrationStep::Repair {
-            IntegrationPhase::Repair
-        } else {
-            IntegrationPhase::Fetch
-        };
+        // Drive is the Closed observation budget. Host Repair keeps its Open
+        // transport history, and cannot spend or finish this later settlement.
+        let phase = IntegrationPhase::Drive;
         record.snapshot.state = if step == IntegrationStep::Repair {
             IntegrationStatus::Published
         } else {
