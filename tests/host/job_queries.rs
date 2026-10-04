@@ -2101,6 +2101,52 @@ fn terminal_status_and_log_chunk_succeed_when_mutable_cleanup_still_fails() {
 }
 
 #[test]
+fn terminal_log_drain_survives_cleanup_recovery() {
+    // A lawful cleanup retry must not turn an already succeeded command into
+    // a protocol failure at EOF. The real host supplies both observations.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("terminal-drain-cleanup-recovery");
+    let (store, lease, _) = indexed_identityless_job(&root);
+    let status = JobStatus::accepted(10)
+        .unwrap()
+        .with_supervisor(identity(97_101), 11)
+        .unwrap()
+        .with_child(identity(97_102), 12)
+        .unwrap()
+        .into_running(13)
+        .unwrap()
+        .into_succeeded(14, 0, 0)
+        .unwrap();
+    install_job_status(&store, &lease, &status, true);
+    drop(store);
+    let faulted =
+        HostStore::open_with_write_fault(&root, HostStoreWritePoint::AfterCleanupIntentCommit)
+            .unwrap();
+    let service = JobService::new(&faulted, &RejectLauncher);
+    let first = service
+        .status_logs(&StatusLogsRequest::new(lease.job_id(), 0, 64, 0, 64))
+        .unwrap();
+    assert_eq!(
+        first.status().status().cleanup_error_code(),
+        Some("MUTABLE_CLEANUP_FAILED")
+    );
+    let mut drain = TerminalLogDrain::new(
+        LogCursor::new(LogStream::Stdout, 0, 64).unwrap(),
+        LogCursor::new(LogStream::Stderr, 0, 64).unwrap(),
+    )
+    .unwrap();
+    drain.set_terminal_status(first.status()).unwrap();
+    drain.observe_chunk(first.stdout()).unwrap();
+    drain.observe_chunk(first.stderr()).unwrap();
+    let recovered = service.status(lease.job_id()).unwrap();
+    assert_eq!(recovered.status().state(), JobState::Succeeded);
+    assert_eq!(recovered.status().cleanup_error_code(), None);
+    assert_eq!(LeaseService::new(&faulted).load().unwrap(), None);
+    drain.revalidate_terminal_status(&recovered).unwrap();
+    assert!(drain.is_complete());
+}
+
+#[test]
 fn after_cleanup_intent_commit_whole_incoming_job_resolution_resumes() {
     // Break caught: resolution starts a new outer incoming/{job} delete
     // instead of resuming the already-published canonical Tree journal.
@@ -3824,9 +3870,12 @@ fn read_log_leaf_failures_preserve_job_evidence_unrelated_state_and_the_exact_le
 
 #[test]
 fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation() {
+    use serde_json::json;
+
     // Catches stopping on an empty preterminal read, coupling stdout/stderr
     // offsets, stopping at the recorded length without the extra EOF probes,
-    // or accepting a changed terminal status during final revalidation.
+    // rejecting cleanup recovery, or accepting changed immutable fields or
+    // a backward timestamp through either terminal status observation path.
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("terminal-log-drain");
     let stdout_length = 65_536 + 17;
@@ -3873,6 +3922,11 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
                 .unwrap();
             observed.extend_from_slice(&chunk.decoded_bytes().unwrap());
             drain.observe_chunk(&chunk).unwrap();
+            if !drain.cursor(LogStream::Stdout).is_drained()
+                || !drain.cursor(LogStream::Stderr).is_drained()
+            {
+                assert!(drain.revalidate_terminal_status(&terminal).is_err());
+            }
         }
     }
     assert_eq!(observed_stdout, vec![0; stdout_length as usize]);
@@ -3881,7 +3935,17 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
     assert_eq!(drain.cursor(LogStream::Stderr).next_offset(), stderr_length);
     assert!(!drain.is_complete());
 
-    let changed = StatusResponse::new(
+    let confirm_eofs = |drain: &mut TerminalLogDrain| {
+        for (stream, length) in [
+            (LogStream::Stdout, stdout_length),
+            (LogStream::Stderr, stderr_length),
+        ] {
+            drain
+                .observe_chunk(&LogChunk::new(stream, length, Vec::new()).unwrap())
+                .unwrap();
+        }
+    };
+    let enriched = StatusResponse::new(
         terminal.meta().clone(),
         terminal
             .status()
@@ -3893,10 +3957,158 @@ fn terminal_log_drain_requires_both_exact_eofs_and_unchanged_status_revalidation
             .unwrap(),
     )
     .unwrap();
-    assert!(drain.revalidate_terminal_status(&changed).is_err());
+    drain.set_terminal_status(&enriched).unwrap();
     assert!(!drain.is_complete());
-    drain.revalidate_terminal_status(&terminal).unwrap();
+    assert!(drain.revalidate_terminal_status(&enriched).is_err());
+    confirm_eofs(&mut drain);
+    drain.revalidate_terminal_status(&enriched).unwrap();
     assert!(drain.is_complete());
+
+    let recovered = StatusResponse::new(
+        enriched.meta().clone(),
+        enriched
+            .status()
+            .without_cleanup_error(enriched.status().updated_at_millis() + 1)
+            .unwrap(),
+    )
+    .unwrap();
+    drain.revalidate_terminal_status(&recovered).unwrap();
+    assert!(drain.is_complete());
+    // Revalidation must retain the recovered snapshot, not its older diagnostic.
+    assert!(drain.set_terminal_status(&enriched).is_err());
+    assert!(!drain.is_complete());
+    assert!(drain.revalidate_terminal_status(&enriched).is_err());
+    drain.set_terminal_status(&recovered).unwrap();
+    confirm_eofs(&mut drain);
+    drain.revalidate_terminal_status(&recovered).unwrap();
+
+    let mut advanced_wire = serde_json::to_value(&recovered).unwrap();
+    advanced_wire["status"]["updated_at_millis"] =
+        json!(recovered.status().updated_at_millis() + 1);
+    let advanced: StatusResponse = serde_json::from_value(advanced_wire.clone()).unwrap();
+    drain.set_terminal_status(&advanced).unwrap();
+    confirm_eofs(&mut drain);
+    // Installation must also retain timestamp-only advances.
+    assert!(drain.revalidate_terminal_status(&recovered).is_err());
+    assert!(!drain.is_complete());
+    drain.revalidate_terminal_status(&advanced).unwrap();
+    assert!(drain.is_complete());
+
+    // Use individually valid terminal shapes so outcome/state mutations reach
+    // the drainer's comparison instead of failing DTO validation first.
+    let mut failed_wire = advanced_wire.clone();
+    failed_wire["status"]["state"] = json!("failed");
+    failed_wire["status"]["exit_code"] = json!(1);
+    let failed_exit: StatusResponse = serde_json::from_value(failed_wire.clone()).unwrap();
+    failed_wire["status"]["exit_code"] = json!(null);
+    failed_wire["status"]["terminating_signal"] = json!(9);
+    let failed_signal: StatusResponse = serde_json::from_value(failed_wire).unwrap();
+    let mut cancelled_wire = advanced_wire;
+    cancelled_wire["status"]["state"] = json!("cancelled");
+    cancelled_wire["status"]["exit_code"] = json!(null);
+    let cancelled: StatusResponse = serde_json::from_value(cancelled_wire).unwrap();
+
+    let supervisor = advanced.status().supervisor_identity().unwrap();
+    let child = advanced.status().child_identity().unwrap();
+    for (baseline, section, field, value) in [
+        (&failed_exit, "status", "exit_code", json!(2)),
+        (&failed_signal, "status", "terminating_signal", json!(15)),
+        (&advanced, "status", "error_code", json!("CHANGED_OUTCOME")),
+        (&cancelled, "status", "state", json!("timed_out")),
+        (
+            &advanced,
+            "status",
+            "supervisor_pid",
+            json!(supervisor.pid() + 1),
+        ),
+        (
+            &advanced,
+            "status",
+            "supervisor_start_identity",
+            json!(supervisor.start_time_micros() + 1),
+        ),
+        (&advanced, "status", "child_pid", json!(child.pid() + 1)),
+        (
+            &advanced,
+            "status",
+            "child_start_identity",
+            json!(child.start_time_micros() + 1),
+        ),
+        (
+            &advanced,
+            "status",
+            "final_stdout_bytes",
+            json!(stdout_length + 1),
+        ),
+        (
+            &advanced,
+            "status",
+            "final_stderr_bytes",
+            json!(stderr_length + 1),
+        ),
+        (
+            &advanced,
+            "status",
+            "updated_at_millis",
+            json!(recovered.status().updated_at_millis()),
+        ),
+        (&advanced, "meta", "protocol_version", json!(6)),
+        (&advanced, "meta", "job_id", json!(JOB_ID_B)),
+        (&advanced, "meta", "client_id", json!(JOB_ID_B)),
+        (&advanced, "meta", "worker_name", json!("changed-worker")),
+        (&advanced, "meta", "project_id", json!("e".repeat(64))),
+        (&advanced, "meta", "worktree_id", json!("f".repeat(64))),
+        (&advanced, "meta", "manifest_digest", json!("1".repeat(64))),
+        (
+            &advanced,
+            "meta",
+            "request_fingerprint",
+            json!("2".repeat(64)),
+        ),
+        (
+            &advanced,
+            "meta",
+            "command_summary",
+            json!({"mode": "argv", "arg_count": 1}),
+        ),
+        (&advanced, "meta", "relative_working_dir", json!("changed")),
+        (&advanced, "meta", "timeout_millis", json!(1)),
+        (&advanced, "meta", "resource_class", json!("changed")),
+        (
+            &advanced,
+            "meta",
+            "created_at_millis",
+            json!(advanced.meta().created_at_millis() + 1),
+        ),
+    ] {
+        let mut wire = serde_json::to_value(baseline).unwrap();
+        assert_ne!(wire[section][field], value, "{section}.{field}");
+        wire[section][field] = value;
+        let changed: StatusResponse = serde_json::from_value(wire).unwrap();
+
+        let mut strict = TerminalLogDrain::new(
+            LogCursor::new(LogStream::Stdout, stdout_length, 64).unwrap(),
+            LogCursor::new(LogStream::Stderr, stderr_length, 64).unwrap(),
+        )
+        .unwrap();
+        strict.set_terminal_status(baseline).unwrap();
+        confirm_eofs(&mut strict);
+        strict.revalidate_terminal_status(baseline).unwrap();
+
+        assert!(
+            strict.set_terminal_status(&changed).is_err(),
+            "{section}.{field}"
+        );
+        assert!(!strict.is_complete(), "{section}.{field}");
+        strict.revalidate_terminal_status(baseline).unwrap();
+        assert!(
+            strict.revalidate_terminal_status(&changed).is_err(),
+            "{section}.{field}"
+        );
+        assert!(!strict.is_complete(), "{section}.{field}");
+        strict.revalidate_terminal_status(baseline).unwrap();
+        assert!(strict.is_complete(), "{section}.{field}");
+    }
 }
 
 #[test]

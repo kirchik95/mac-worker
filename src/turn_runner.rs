@@ -4966,6 +4966,16 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
                     .unwrap()
                     .clone()
                     .expect("status before a terminal job");
+                let response = if response.status().cleanup_error_code().is_some() {
+                    StatusResponse::new(
+                        response.meta().clone(),
+                        response
+                            .status()
+                            .without_cleanup_error(response.status().updated_at_millis() + 1)?,
+                    )?
+                } else {
+                    response
+                };
                 return ok(&response);
             }
             if operation == Some(HostOperation::TaskStatus.command()) {
@@ -5124,6 +5134,26 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
             statuses: script.statuses.load(Ordering::Relaxed),
             task_statuses: script.task_statuses.load(Ordering::Relaxed),
         }
+    }
+
+    #[test]
+    fn follow_survives_terminal_cleanup_recovery() {
+        use crate::job::JobStatus;
+        let pace = run_follow_script(vec![
+            FollowStep {
+                status: JobStatus::running(13, 1, 1, 2, 2).unwrap(),
+                stdout: b"{\"type\":\"item.completed\"}\n".to_vec(),
+            },
+            FollowStep {
+                status: JobStatus::succeeded(14, 26, 0)
+                    .unwrap()
+                    .with_cleanup_error("MUTABLE_CLEANUP_FAILED".into(), 15)
+                    .unwrap(),
+                stdout: Vec::new(),
+            },
+        ]);
+        assert_eq!(pace.status_logs, 2);
+        assert_eq!(pace.statuses, 1);
     }
 
     #[test]

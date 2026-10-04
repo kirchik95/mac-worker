@@ -4826,6 +4826,21 @@ impl TerminalLogDrain {
         Ok(())
     }
 
+    fn terminal_status_is_compatible(current: &StatusResponse, next: &StatusResponse) -> bool {
+        if next.status.updated_at_millis < current.status.updated_at_millis {
+            return false;
+        }
+        // Cleanup may change only its diagnostic and timestamp. Compare every
+        // other field strictly, including any future additions to the snapshot.
+        let mut comparable = next.clone();
+        comparable.status.updated_at_millis = current.status.updated_at_millis;
+        comparable
+            .status
+            .cleanup_error_code
+            .clone_from(&current.status.cleanup_error_code);
+        comparable == *current
+    }
+
     pub fn set_terminal_status(&mut self, response: &StatusResponse) -> Result<(), WorkerError> {
         response.validate()?;
         if !response.status().state().is_terminal() {
@@ -4834,7 +4849,7 @@ impl TerminalLogDrain {
         if self
             .terminal
             .as_ref()
-            .is_some_and(|current| current != response)
+            .is_some_and(|current| !Self::terminal_status_is_compatible(current, response))
         {
             self.status_revalidated = false;
             return Err(protocol_error("terminal log status changed"));
@@ -4873,9 +4888,10 @@ impl TerminalLogDrain {
             .terminal
             .as_ref()
             .ok_or_else(|| protocol_error("terminal log status is absent"))?;
-        if expected != response {
+        if !Self::terminal_status_is_compatible(expected, response) {
             return Err(protocol_error("terminal log status changed"));
         }
+        self.terminal = Some(response.clone());
         self.status_revalidated = true;
         Ok(())
     }

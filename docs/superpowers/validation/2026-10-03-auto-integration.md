@@ -176,6 +176,7 @@ Full landing gate, `NEXTEST_TEST_THREADS=4 CARGO_BUILD_JOBS=4 MAC_WORKER_GATE_RA
 | --- | --- | --- |
 | `8afa313` (T6, main `b3525cd`, T7) | 4354 run, 4352 passed, 1,554 s | Two native fixtures ran out of their 60 s in-test wait under full-suite load while the integration was still progressing; both passed alone. Fixed by `f72571f`. |
 | `22918a9` (adds `f72571f`, `ee671c1`, `f6d2a83`) | 4359 run, 4358 passed, 1,331 s | `native_legacy_retention_restores_a_reachable_source_without_resurrection` failed in fixture setup: its first `task submit --wait` returned `PROTOCOL` ("protocol error") after the agent message. The five retention schedules then passed 10/10 in two runs. |
+| `fe9fd38` (main `c950693` plus the terminal log drain fix) | 4361 run, **4361 passed**, 1,354 s | None. |
 
 On `22918a9`: UI 296/296 in 30 files (`npm --prefix ui test -- --maxWorkers=4`); `cargo fmt --all --check`, all-target Clippy and release no-default-features lib/bin Clippy all exit 0.
 
@@ -188,9 +189,9 @@ T8 has not run. It waits for the owner's acceptance-origin and pool authorizatio
 - Branch permissions, merge/signing rules, Git version and worker write access still need live checks. Canonical origin strings do not prove SSH/HTTPS repository equivalence; independent owners rely on the lease.
 - Unknown push/stop outcomes remain uncertain. A retained Closed task only settles existing effects; it cannot re-drive a new integration.
 - D-R9 permits observation-only Closed settlement during drain or disable, with the same target reservation and four-driver limit. The Low publication-boundary requirement from Round 3 was fixed by `0492264`; it changes no operator behavior.
-- One full-gate failure on the final integration head is not yet explained; see the PENDING line below.
+- The single `PROTOCOL` failure on `22918a9` most likely came from the terminal log drain bug fixed in `fe9fd38`. The final gate is green.
 
-PENDING: root cause of the intermittent `PROTOCOL` error from the `22918a9` gate. A separate investigation is reproducing it under load.
+Terminal log drain: an investigation found that `TerminalLogDrain` rejected a legal cleanup-diagnostic recovery as `Protocol("terminal log status changed")`. The host may clear `cleanup_error_code` and advance `updated_at_millis` on a terminal job, and an attached `task submit --wait` then reported "protocol error" although the turn succeeded. The bug predates wave 8: `src/job.rs` is identical at `b3525cd`, and the two red probes failed there too. Fixed by `fe9fd38` (`fix(job): accept cleanup-diagnostic recovery in the terminal log drain`), which keeps every other status field strict. Attributing the single gate event to this bug remains a hypothesis: the uninstrumented log could not show the inner message, and 50 loaded reruns did not reproduce it.
 
 PENDING: push to origin and the pool deploy, on the owner's instruction. The local `main` merge is the commit that brings this record into `main`.
 
