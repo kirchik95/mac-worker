@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+> Superseded 2026-10-03: the unconditional manual-accept flow below is replaced for configured tasks by [Automatic integration into the base branch](../specs/2026-10-03-auto-integration-design.md). Disabled integration retains the manual flow. Accept/close keeps the result or gives up unfinished integration; automatic integration needs no accept. Historical tasks remain as written.
+
 - Personal developer tool; English UI; existing API remains authoritative.
 - Inter, Menlo, white/cool canvas, graphite actions, amber questions, green review; DS controls supersede retained clone exceptions.
 - Buttons 38 px / radius 6 px; fields 40 px; panels radius 10 px; 40 px desktop insets; focus 2 px with offset 2 px.

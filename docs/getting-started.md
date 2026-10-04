@@ -4,7 +4,7 @@ For the short version, see [English](../README.md) or [Русский](../README
 
 **Send a coding task to another Mac. Get a Git branch back.**
 
-`mac-worker` runs coding agents on your spare Macs while you keep working on your laptop. Ask a local coding agent to prepare and dispatch the work, or submit a prompt yourself from a Git repository. A worker runs Codex, Cursor, OpenCode or Claude Code in a separate worktree and returns a branch you can review and merge. Start with one Mac and add more when you need them.
+`mac-worker` runs coding agents on your spare Macs while you keep working on your laptop. Ask a local coding agent to prepare and dispatch the work, or submit a prompt yourself from a Git repository. A worker runs Codex, Cursor, OpenCode or Claude Code in a separate worktree. Enable automatic integration into a branch on origin, or leave it disabled and review the returned branch manually. Start with one Mac and add more when you need them.
 
 ## Contents
 
@@ -51,7 +51,7 @@ worker --version
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` to make it available in new macOS terminal sessions. To choose a different location, pass `--bin-dir /your/bin` to the installer. The installer copies the `worker` binary only; laptop skills are a separate local install in [Get your first branch](#3-get-your-first-branch).
 
-The latest published release is [v0.1.0](https://github.com/kirchik95/mac-worker/releases) from 2026-09-13. It predates most of what these docs describe: the supervised controller commands (everything under `worker controller` except `run`), `worker events`, `worker notify`, `--questions`, `say --interrupt`, `setup --allow-debug`, and the batch retirement. For the current behavior, use [Build from source](#build-from-source) below. There is no public Homebrew tap; the repository only generates the formula.
+The latest published release is [v0.1.0](https://github.com/kirchik95/mac-worker/releases) from 2026-09-13. It predates most of what these docs describe: automatic integration, the supervised controller commands (everything under `worker controller` except `run`), `worker events`, `worker notify`, `--questions`, `say --interrupt`, `setup --allow-debug`, and the batch retirement. For the current behavior, use [Build from source](#build-from-source) below. There is no public Homebrew tap; the repository only generates the formula.
 
 ### 2. Connect one Mac
 
@@ -111,7 +111,7 @@ In a Git repository with at least one commit:
 Send this task to the pool: create SETUP_CHECK.md containing mac-worker works. Wait for the result and show me the branch.
 ```
 
-Expect a task ID, the outcome and summary, `worker task diff` / the card’s file list, and a result ref from `worker task fetch` when a branch was published. After the default close, that diff is the base commit compared with the result commit retained in the worker project mirror; the task workspace has already been removed. Agent-reported checks in the result are what the worker agent claimed, not independent verification — review the diff and ref yourself before you merge. Your current working tree stays unchanged. You can ask the same agent to follow up if the task needs input (`worker task say`). Confirm both skills are loaded before you dispatch.
+Expect a task ID, the outcome and summary, `worker task diff` / the card’s file list, and a result ref from `worker task fetch` when a branch was published. After the default close, that diff is the base commit compared with the result commit retained in the worker project mirror; the task workspace has already been removed. Agent-reported checks are the worker agent's claims, not independent verification. With integration disabled, review the diff and ref before merging manually. With it enabled, follow the integration state and any blocked repair action. Your current working tree stays unchanged. You can ask the same agent to follow up if the task needs input (`worker task say`). Confirm both skills are loaded before you dispatch.
 
 #### Manual CLI
 
@@ -122,6 +122,8 @@ worker task submit --agent codex --wait \
   --prompt "Create SETUP_CHECK.md containing: mac-worker works."
 ```
 
+If your project already sets `[task] integrate`, add `--no-integrate` to this submit so the check file does not land on the target.
+
 The command prints a task ID. Substitute it for `<task-id>` below:
 
 ```bash
@@ -130,18 +132,44 @@ worker task diff <task-id> --stat
 worker task fetch <task-id>
 ```
 
-`result` shows the outcome, summary, and any agent-reported checks. `worker task diff <task-id> --stat` lists the published change. Default `--close-on done` closes the task after a `done` turn and deletes the worker workspace; `diff` is then the base commit compared with the result commit retained in the worker project mirror. If those commits have been collected, the error is `RESULT_NOT_RETAINED` (`task workspace is closed and its result is no longer retained`). `fetch` prints the remote-tracking ref (`refs/remotes/mac-worker/…/task/<id>`) to inspect with `git show` or `git diff` — that ref is the current-turn import proof on the laptop. Your current working tree stays unchanged; you choose whether to merge. Use the same `--agent` you checked with `init`.
+`result` shows the outcome, summary, and any agent-reported checks. `worker task diff <task-id> --stat` lists the published change. With integration disabled in this example, default `--close-on done` closes the task after a `done` turn and deletes the worker workspace; `diff` is then the base commit compared with the result commit retained in the worker project mirror. If those commits have been collected, the error is `RESULT_NOT_RETAINED` (`task workspace is closed and its result is no longer retained`). `fetch` prints the remote-tracking ref (`refs/remotes/mac-worker/…/task/<id>`) to inspect with `git show` or `git diff` — that ref is the current-turn import proof on the laptop. Your current working tree stays unchanged. In this manual flow, you choose whether to merge. Use the same `--agent` you checked with `init`.
 
 Submit starts from HEAD by default. Pass `--base <ref>` to use another commit. Uncommitted edits stay on your laptop. To send tracked worktree changes as a temporary base:
 
 ```bash
-worker task submit --agent codex --wip --wait \
+worker task submit --agent codex --no-integrate --wip --wait \
   --prompt "Use the uncommitted edits and add a one-line note to SETUP_CHECK.md."
 ```
 
-`--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
+`--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. It cannot be combined with integration (`INTEGRATION_WIP_BASE`); use `--no-integrate` for a dirty session or commit its intended base before submitting with integration. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
 
-For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Preview also supports a controller-only laptop configuration: it preserves worker pins for the controller to validate at submit time. Named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Start with this small file task to check the connection and agent before running a build.
+For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Preview also supports a controller-only laptop configuration: it preserves worker pins for the controller to validate at submit time. With integration disabled, named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Configured parents instead need successful integration and result import, including with `close_on = "never"`. Start with this small file task to check the connection and agent before running a build.
+
+#### Automatic integration
+
+Integration is disabled until you opt in. Set the target once in the project's `.worker.toml`:
+
+```toml
+[task]
+integrate = "main"
+verify_merge = "never"
+```
+
+The target is a short branch name on this project's own canonical origin, not another remote or a full ref. It must exist, and the task's committed base must be reachable from it. There is no implicit `main` or laptop-wide enabling default. Submit overrides, then batch defaults, then project settings determine the target and verification policy. `--no-integrate` or task `integrate = false` disables inherited integration.
+
+Submit a task or batch normally. After the final ordinary Done result is imported and its runner retires, integration adds one merge commit per task to the target, with the old target first and the task result second. A result already reachable from the target needs no new merge. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. No accept action is needed. Requested `--close-on done` closes after integration and result import, while `never` keeps the workspace and session Open for later `say`.
+
+Conflicts use the same worker, agent and session to repair the merge. Verification defaults to `never`. Opt in with `--verify-merge moved-target` when you want an agent to check a changed clean combination after target movement. Resolve and verify turns consume `max_followups`. A source that reported checks requires a nonempty all-pass report from recovery; a source with no checks allows an empty recovery report. Any `fail` or `error` blocks integration. The host does not run project checks.
+
+Use `status`, `result`, `list --json`, or the dashboard to see `integration` and `workflow_state`. Pending or parked integration is automatic work, and success needs no review card. Blocked integration shows a stable code and repair action. Fix the cause, then run `worker task integrate <id>`, or close the task to keep the result and give up integration. Close never grants permission to merge.
+
+`worker controller drain` pauses ordinary handoffs, new integration phases and auxiliary admissions; admitted steps and running turns finish before parking. `worker controller drain --off` resumes both. Disable pauses integration only before unloading the controller; re-enable preserves that pause until explicit `drain --off`. A controller restart creates no pause. Helper rollback also parks integration. Restore compatible support before resuming retained Open work.
+
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
+
+GC counts seven idle days since the last host-status update, not since rollback; an already-idle task can expire sooner. Non-discard retention close keeps result refs but removes the workspace. Restore observes origin first: a reachable retained merge is imported; otherwise a reachable source settles as already integrated. If neither is reachable, integration blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation keeps uncertainty and retries with bounded backoff. Observation-only settlement remains available during drain or disable, under the same target reservation and four-driver Git limit. The task stays Closed: no reopen, workspace recreation, new push or repair turn, and `task integrate` refuses it.
+
+See [the integration reference](usage.md#automatic-integration) for exact-target leases, checks, admission budgets, branch restrictions, public fields and direct-mode recovery.
 
 ### 4. Follow the work
 
@@ -151,13 +179,13 @@ worker task list
 worker workers --refresh
 ```
 
-The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not start or cancel tasks. From a task card you can reply or accept using the same `say` / `close` paths as the CLI; a stale card is rejected. `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies. Details: [usage](usage.md#dashboard).
+The dashboard opens locally in your browser (`http://127.0.0.1:<port>`, deep link `#/tasks/<id>`). It does not submit or cancel tasks. From a task card you can reply or close using the same `say` / `close` paths as the CLI; a stale card is rejected. Overview also offers Re-drive and Close on blocked integration cards once their current detail is confirmed. The legacy accept action means close, retaining the result or giving up unfinished integration. `--no-facts-refresh` only skips stale agent-facts refresh; it does not disable replies. Details: [usage](usage.md#dashboard).
 
 To submit and return after admission, omit `--wait`. This still allows the task to wait for a free slot. `--no-wait` controls capacity instead: if eligible workers are at capacity, the submit fails with `CAPACITY_BUSY` and exit code **75**. In controller mode that rejection is final: the rejected task will not start when a slot becomes free. Submit a new request when you want to try again.
 
-`worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller. Then run `worker task result <task-id>` for the outcome (finished, needs input, or failed).
+With integration disabled, `worker task wait --task-id <task-id>` blocks until the task is quiescent and the previous runner has released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. When configured integration covers the task's latest ordinary work, it also waits for integration to settle and runners to retire. Integrated work returns exit 0 only after its receipt and accepted result are imported, including requested `never` tasks that remain Open. Blocked work returns the integration code's exit status; inspect `status` or `result` for that code. Pending or parked work keeps waiting; `--timeout` returns `WAIT_TIMEOUT` (70) without cancelling it. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller. Then run `worker task result <task-id>` for the ordinary outcome and integration snapshot.
 
-Default `--close-on done` closes the task after an agent `done` turn and removes the worker workspace. `worker task diff <task-id> --stat` still lists the change from the retained base and result commits on that worker. That is not human acceptance. For a review loop, submit with `--close-on never`, inspect summary/diff/ref while the workspace is still open, then `worker task close <id>` to accept or `worker task say` to follow up. `close --discard` drops the session and those retained commits.
+With integration disabled, default `--close-on done` closes the task after an agent `done` turn and removes the worker workspace. `worker task diff <task-id> --stat` still lists the change from the retained base and result commits on that worker. For a manual review loop, disable integration and submit with `--close-on never`, inspect summary/diff/ref while the workspace is still open, then `worker task close <id>` to keep the result or `worker task say` to follow up. Manual review also remains available for blocked or given-up integration. `close --discard` drops the session and those retained commits after any integration stop is confirmed; it never rewinds the target.
 
 If a turn fails, run `worker task logs <task-id>` to see agent diagnostics and the recorded failure reason. Use `--turn N` to inspect an earlier turn, or `--raw` for the original log bytes.
 
@@ -187,14 +215,14 @@ flowchart LR
     others <-->|Agent API| provider
 ```
 
-1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Each worker defaults to **one** slot (`1..=8` on that Mac). Combined detached runner capacity is the **sum** of those per-worker ceilings. A batch `--max-parallel` is a requested run cap (any positive value; default is that sum) and is not rejected for exceeding host capacity — extra tasks wait. The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot. A batch with `id` and `depends_on` (or `base = "from:<id>"`) holds later tasks until each parent is Closed and Done; `from:` binds that parent's current accepted imported OID on the laptop, not origin delivery. Independent batches (no those edges) still submit together.
+1. **Submit.** Ask your laptop agent or run the CLI. The CLI records your prompt and the repository's base commit in a local task queue. The scheduler selects an available Mac with a free execution slot, the required agent, and capabilities. Each worker defaults to **one** slot (`1..=8` on that Mac). Combined detached runner capacity is the **sum** of those per-worker ceilings. A batch `--max-parallel` is a requested run cap (any positive value; default is that sum) and is not rejected for exceeding host capacity — extra tasks wait. The same `task_id` stays serialized; distinct tasks from one checkout may overlap when a host has opted into more than one slot. A batch with `id` and `depends_on` (or `base = "from:<id>"`) waits for each parent: Closed and Done with integration disabled, or integrated and imported when configured. `from:` binds the parent's accepted imported OID, including the integrated result, not its task-ref origin delivery. Independent batches (no those edges) still submit together.
 2. **Run.** Over SSH, mac-worker transfers the base commit into the worker's project mirror, prepares a separate task worktree and launches the agent under a supervisor. The agent uses the worker's own login and project tools.
 3. **Follow or reply.** The CLI and dashboard read task status and logs. If the agent needs input, `worker task say <id> --message "…"` (or a dashboard reply on that card’s current revision) starts another turn in the same task workspace and agent session.
-4. **Review.** The worker publishes `task/<id>`, and the laptop fetches it as a remote-tracking ref. `worker task fetch <id>` prints the ref to inspect. Your current working tree stays unchanged; you decide what to merge. With `publish = push`, origin delivery is a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
+4. **Integrate or review.** The worker publishes `task/<id>`, and the queue owner imports it. Configured automatic integration updates the target on the worker; disabled integration leaves manual merging to you. `worker task fetch <id>` prints the remote-tracking ref to inspect. Your current working tree stays unchanged. With `publish = push`, separate task-ref origin delivery uses a durable per-turn outbox: the execution slot is released independently of a slow remote, and a `done` turn may still show origin `pending`.
 
 `--wip` preparation compares two fresh captures so concurrent edits are detected. Dashboard detail and logs read one task directly; listing the collection still scans history.
 
-The dashboard is embedded in the CLI and listens only on loopback. It does not start or cancel tasks; it can reply and accept through the same task APIs as the CLI. In the default mode the queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. When `[controller] enabled = true`, the same `worker dashboard` command is a managed SSH local-forward to the controller host and does not open laptop task state. Use `worker gc` to preview retained worker data that can be reclaimed.
+The dashboard is embedded in the CLI and listens only on loopback. It does not submit or cancel tasks; it can reply and close through the same task APIs as the CLI. In the default mode the queue and task records live on the laptop; project mirrors, task worktrees and agent sessions live on the workers. When `[controller] enabled = true`, the same `worker dashboard` command is a managed SSH local-forward to the controller host and does not open laptop task state. Use `worker gc` to preview retained worker data that can be reclaimed.
 
 Workers contact agent providers directly. No mac-worker cloud service or database server is required. If you prefer to get code from a Git remote or push result branches there, see the [origin and publication settings](usage.md#task-lifecycle). Host slot layout: [multiple execution slots](superpowers/specs/2026-09-10-slots-design.md).
 

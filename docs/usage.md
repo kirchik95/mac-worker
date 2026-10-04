@@ -1,6 +1,6 @@
 # Using mac-worker
 
-Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, review, batches, capacity, origin delivery, the dashboard, the remote controller, and its events and notifications. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
+Start with the [quick start](../README.md#quick-start) to install the CLI and connect one Mac. This reference covers agents, task settings, automatic integration, manual review, batches, capacity, origin delivery, the dashboard, the remote controller, and its events and notifications. Laptop skills live in the repository at [`.claude/skills/`](../.claude/skills/); they are a local-agent install, not a worker install.
 
 ## Agents
 
@@ -68,6 +68,8 @@ You own SDKs, language tools, agent logins, and secrets on each Mac. mac-worker 
 
 ## Task lifecycle
 
+The diagram shows the disabled integration flow. Configured tasks use [Automatic integration](#automatic-integration) below.
+
 <p align="center">
   <img src="images/task-lifecycle.png" alt="Task lifecycle: submit, queue, turn, publish, fetch, close, with done / needs_input / blocked outcomes" width="100%">
 </p>
@@ -87,7 +89,9 @@ worker gc [--apply]                # preview, then reclaim old tasks, branches, 
 
 Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
 
-`worker task say --interrupt` stops a running turn, waits up to 60 seconds for it to be cancelled and retired, then continues the same agent session and workspace with the new message. Files the cancelled turn already wrote in the workspace stay there for the next turn. A turn that is still queued has no agent session yet: `--interrupt` refuses it with `TASK_BUSY` instead of cancelling, which would abandon the task. With no running turn, `--interrupt` is the same as `say`. The follow-up is not sent if the cancel fails (its error), if the turn does not settle in time (`TASK_BUSY`), or if the turn finished on its own before the cancel landed (`TASK_REVISION_CONFLICT`; use a plain `say`). `--wait` waits for the new turn.
+Integration is opt-in and disabled by default. With it disabled, the lifecycle below keeps its manual review and close behavior. Configured tasks instead follow [Automatic integration](#automatic-integration), including `worker task integrate <id>` for explicit recovery.
+
+`worker task say --interrupt` stops a running turn, waits up to 60 seconds for it to be cancelled and retired, then continues the same agent session and workspace with the new message. Files the cancelled turn already wrote in the workspace stay there for the next turn. A turn that is still queued has no agent session yet: `--interrupt` refuses it with `TASK_BUSY` instead of cancelling, which would abandon the task. With no running turn, `--interrupt` follows the same rules as plain `say`, including the [integration busy fence below](#pause-stop-and-rollback). The follow-up is not sent if the cancel fails (its error), if the turn does not settle in time (`TASK_BUSY`), or if the turn finished on its own before the cancel landed (`TASK_REVISION_CONFLICT`; use a plain `say`). `--wait` waits for the new turn.
 
 `worker task batch FILE --preview` validates the file and prints the plan (`dag.status = "enforced"`). It does not open client state or dispatch. `--preview` conflicts with `--wait`. Submit of a named graph (`depends_on` or `base = "from:<id>"`) freezes that run and launches eligible roots; invalid or cyclic graphs are `TASK_CONFIG_INVALID` and create no run. Independent batches (empty `depends_on` and no `from:`) keep today's create-run-and-submit path.
 
@@ -95,13 +99,13 @@ Confirm the installed grammar with `worker task --help`. There is no `worker tas
 
 `worker task logs` without `--raw` prints recognised agent events one line at a time, hides per-token noise, and folds consecutive unrecognised structured events into `event: <type>[/<subtype>] ×N` summaries (the count is omitted for one event). Terminal controls in decoded events, plain stdout, and stderr (ESC, OSC including clipboard and title sequences, CSI, and other C0/C1 controls) are shown as visible text such as `\x1b`; newlines and tabs stay. It prints failure lines such as `turn 1 failed: …` even when the agent wrote nothing. `--raw` stays byte-exact.
 
-`worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. `wait --run` is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
+With integration disabled, `worker task wait` returns only when all selected tasks are quiescent and their runners have released ownership, so `worker task close`, `worker task say`, and `worker task fetch` can run immediately afterward. For configured tasks whose integration covers their latest ordinary work, `wait` also waits for integration settlement and runner retirement. Integrated work returns exit 0 after confirming the imported receipt and accepted result, even when requested `never` leaves the task Open. Blocked work returns its integration code's exit status; read `status` or `result` for the code and repair action. Pending or parked integration keeps waiting. `--timeout` returns `WAIT_TIMEOUT` (70) without cancelling work. A newer ordinary turn follows ordinary wait rules until its own integration cycle starts. `wait --run` aggregates the largest task exit status and is not complete while DAG nodes are still waiting or claimed; an empty materialized task list is not completion. After runner recovery, `worker task reconcile` also advances already-frozen eligible DAG nodes; it does not start a new operator batch. Capacity errors such as `CAPACITY_BUSY` and `CAPABILITY_MISSING` retain their public reason and exit code 75 through the controller.
 
 `worker task reconcile` adopts, restarts, or finalizes a row only on positive proof that the previous runner exited: the pid was reused by a different process, or `Absent` was seen twice at least 750 ms apart. A single missed lookup, an ambiguous process-table read, or a transient error is unverifiable — the row is left alone, the report counts it, and `task list` shows `RUNNER_UNVERIFIABLE` only after that state has lasted 30 s. The operator path uses the same rule; it does not treat unverifiable as exited.
 
 Outcomes are recorded on the task, independent of the process exit code:
 
-- `done`: the agent finished and the branch is published. That is **not** human acceptance. Default `--close-on done` then closes the task. Origin `delivery` may still be `pending` / `retrying`. For a human review loop (ready for review → follow-up → accepted), submit with `--close-on never`, then `worker task say` as needed and `worker task close` when you accept.
+- `done`: the agent finished and the branch is published. Integration disabled: default `--close-on done` then closes the task; for manual review, use `--close-on never`, `say` and `close`. Integration enabled: ordinary Done is the source result, not proof of target success; inspect the integration snapshot. Origin task-ref `delivery` may still be `pending` / `retrying` independently.
 - `needs_input`: the agent has a bounded question; the questions policy below determines whether it continues automatically or waits for `say`.
 - `blocked`: the agent could not finish. Read `result` and `logs`, then `say` guidance or `close --discard`.
 - `unknown`: the agent did not return a structured result; the branch is still published. Attached turn commands and `worker task wait` (including `--run`) exit **70** (`Infrastructure`) for this outcome. A run containing any `unknown` outcome also exits 70. `done` and `needs_input` keep exit 0; waits aggregate other unsuccessful outcomes as exit 1, while attached turns preserve a reported agent exit code.
@@ -145,6 +149,10 @@ Submit reports the scrub count. v1 does not fetch worker env-profile secrets for
 - The selector chooses the task agent unless you pass `--agent`; an explicit `--agent` must match it. Sessions cannot be converted between agents.
 
 v1 supports only snapshot-sourced `task submit`, in direct or controller mode. `task batch`, DAG children, origin-sourced tasks (`--source origin`), Cursor and OpenCode session imports are out of scope.
+
+Integration also refuses every `--wip` base, including a dirty imported session (`INTEGRATION_WIP_BASE`). Use `--no-integrate` with the dirty-session example above, or commit the intended base on the target's ancestry before enabling integration. Auxiliary repair resumes the bound worker session; it does not capture or import the laptop conversation again.
+
+An integrating session submit retains the same frozen base/session package and the paired pins while its controller request is retryable. Retry the original envelope only after its source stream is complete; do not recapture the live session. Pre-record failure or submission rollback releases paired task pins idempotently, while request pins remain until acknowledgement or request retirement. Integration never publishes the session package or its transport refs to origin.
 
 See the [`SESSION_*` rows in the error catalog](#exit-codes-and-errors) for exits and recovery hints: `SESSION_NOT_FOUND`, `SESSION_UNREADABLE`, `SESSION_TOO_LARGE`, `SESSION_OUTSIDE_PROJECT`, `SESSION_NEEDS_WIP`, `SESSION_REQUIRES_SNAPSHOT`, `SESSION_AGENT_MISMATCH`, `SESSION_IMPORT_UNSUPPORTED`, `SESSION_AGENT_TOO_OLD`, and `SESSION_PLACEMENT_FAILED`. Packages are limited to 64 MiB raw total, 64 MiB per file, and 2,000 files; use a handoff note for larger conversations.
 
@@ -191,7 +199,7 @@ When a replacement runner exits, its journal line distinguishes whether the work
 
 ### Review and close
 
-Default `--close-on done` auto-closes after agent `done`. For an explicit review loop:
+With integration disabled, default `--close-on done` auto-closes after agent `done`. For a manual review loop, disable integration with submit `--no-integrate` if the project enables it, then use:
 
 ```bash
 worker task submit --close-on never --agent <a> --prompt-file brief.md
@@ -199,7 +207,7 @@ worker task wait --task-id <id>
 worker task result <id>
 worker task diff <id> --stat
 worker task fetch <id>
-worker task close <id>            # human accept
+worker task close <id>            # keep the result
 # or: worker task say <id> --message-file followup.md --wait
 # or: worker task close <id> --discard
 ```
@@ -207,6 +215,8 @@ worker task close <id>            # human accept
 `worker task diff <id> --stat` in that loop reads the open workspace. The same command after `worker task close <id>` reads the retained mirror commits described above. `close --discard` removes those commits.
 
 Public CLI `say` / `close` have no revision flags. Wait first. Dashboard reply/accept are the same operations with a current-card check ([Dashboard](#dashboard)).
+
+For blocked or given-up integration, the same diff/fetch flow lets you review the retained result manually. Close gives up unfinished integration and keeps its result; the legacy accept label is this close action, never permission to merge. Automatic success needs no accept.
 
 ### Project setup
 
@@ -221,6 +231,103 @@ lockfiles = ["Cargo.lock"]
 ```
 
 `check` proves **this** workspace only. A matching identity in another worktree is not readiness. You own the toolchain. Profile **names** may appear in identity hashes; profile values and secrets do not.
+
+## Automatic integration
+
+Integration is opt-in and disabled by default. Configure `[task] integrate = "main"` in the project's `.worker.toml`, then submit tasks or batches normally. The setting names a branch on this project's own canonical origin; there is no implicit `main`, origin-HEAD discovery, other-remote target, or laptop-wide enabling default. Settings are frozen before submission effects, so later agent edits to `.worker.toml` cannot change a task's policy.
+
+After the final eligible ordinary Done result is imported and its runner retires, automatic integration adds one merge commit to the target without an accept action. Conflicts resume the same worker, agent and session. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Blocked and dependency-failure notices are titled `Integration blocked` and `Dependency not integrated`. Requested `--close-on done` closes only after the integration receipt and accepted result are imported; `--close-on never` retains the Open workspace and session for later `say`.
+
+### Configuration and admission
+
+Submit accepts mutually exclusive `--integrate <branch>` and `--no-integrate`, plus `--verify-merge never|moved-target`. Batch files accept `integrate` as a branch string or `false` and `verify_merge` as `"never"` or `"moved-target"`, at the top level or in `[defaults]`, and on each `[[tasks]]` entry. Do not combine flat defaults with `[defaults]`. These are batch-file keys, not extra flags on `task batch`.
+
+Target and verify precedence is task/submit override, then batch defaults, then project settings. The final defaults are integration disabled and verification `never`. Task `integrate = false` wins over inherited targets and disables inherited verification. An explicit task/submit verify override without an effective target is `TASK_CONFIG_INVALID`. Batch preview reports each effective target and verify policy without dispatching.
+
+Use a valid short branch name of at most **255 UTF-8 bytes**, not `refs/heads/main`. The branch must already exist. Submission observes only the exact origin branch: missing is `INTEGRATION_TARGET_MISSING`; locally available complete history can prove or refuse base ancestry. Missing local objects or failed network observation leave preflight unknown; submission does not fetch the target. The worker repeats the authoritative ancestry check on fetched target history for each candidate. A base outside that ancestry blocks with `INTEGRATION_BASE_NOT_ON_TARGET`. Every `--wip` base is refused with `INTEGRATION_WIP_BASE`.
+
+Helpers built from this release advertise `task.integration` in their host probe's `features` list. Controllers advertise `controller.integration` in `worker controller status` (the human `features:` line and JSON `features` array), controller health and the ready service hello. Enabled submission requires the host feature and, in controller mode, the controller feature. Unknown or missing support returns `INTEGRATION_UNAVAILABLE`; it never falls back to ordinary execution. Grammar alone does not prove peer support. Check the installed grammar with `worker task submit --help` and `worker task batch --help` before using the new settings.
+
+The worker needs its own origin capability and Git login even with fetch-only task publication. Integration uses the configured canonical origin string as its identity. Different SSH/HTTPS spellings can still refer to one repository; they are not proved equivalent for serialization. One owner serializes Git drives by canonical origin and branch, with at most four drives across different targets. Separate owners rely on the exact-target lease.
+
+### Merge and check evidence
+
+Let `H` be the frozen ordinary task result, `T` the freshly fetched target, and `B` the current ordinary turn's base. If H is already an ancestor of T, integration succeeds with disposition `already_integrated`, an `observed_target_oid`, and no new `merge_oid`. A squash or cherry-pick with an equivalent tree does not establish that ancestry.
+
+Otherwise the candidate freezes **H's committed attributes, ours H, theirs T**. Mirror merging uses H,T order; workspace repair keeps HEAD H and MERGE_HEAD T. The merge commit has exactly **T,H parents**, even when T is an ancestor of H. This side order matters for directional built-in merge drivers. Ambient attribute overrides are refused, and executable hooks, drivers, signing and other project Git commands are disabled. Integration host steps run controlled Git and do not run project setup recipes or checks. Resolve/verify checks run only in agent turns.
+
+The target update requires a lease pinned to the exact fetched T and a proof that T is the merge's first parent and ancestor. It updates one branch by fast-forward only. It never uses unrestricted force, an implicit lease, a `+` refspec, deletion, or a mirror push. The Git argument is `--force-with-lease=refs/heads/<branch>:<T>`; that exact lease does not authorize rewriting history. After any failed or uncertain push, origin is observed before classification or repetition. A reachable retained merge settles first, preserving its receipt; target movement invalidates the old candidate and its check evidence. A changed target is not automatically a branch-policy rejection.
+
+Branch rules must allow two-parent merges from the worker's frozen commit identity. Signing is disabled; a target requiring signed commits or disallowing merge commits can reject the push with `INTEGRATION_POLICY_REJECTED`. Repair policy or permissions outside the task workflow, then re-drive. Integration does not change its identity or enable signing to evade those rules.
+
+Verification defaults to `never`, recorded as `verification = source_agent_report_only`. `moved-target` requests a verify turn only for a clean candidate where T differs from B and the candidate tree differs from H's tree. A conflict requires a resolve turn regardless of verify policy; a successful resolve needs no redundant verify turn. These are agent-reported checks, not independent verification.
+
+Any source or auxiliary check with `fail` or `error` blocks with `INTEGRATION_CHECKS_FAILED`. An ordinary source with no checks or `not_run` is allowed. If the source reported at least one check, a resolve/verify turn must report at least one and all must be `pass`; empty or `not_run` blocks with `INTEGRATION_CHECKS_NOT_RUN`. If the source reported none, recovery may also report none. The host does not invent or run project checks.
+
+Verify is read-only. Its index tree must match the pinned candidate before launch and after completion; `INTEGRATION_VERIFY_TREE_MISMATCH` blocks instead of adopting a recomputed tree. Verify edits block with `INTEGRATION_VERIFY_CHANGED_TREE`. Resolution includes edits outside conflicts, but unresolved entries or introduced conflict markers cannot proceed.
+
+### Recovery budgets and task-ref publication
+
+A cycle allows at most three candidates, two resolve turns and three verify turns. Resolve/verify turns also consume the task's ordinary `max_followups`; they are not a separate free allowance. Replay reuses the same auxiliary turn ID and does not spend it twice. Explicit re-drive resets cycle caps, not the task's already spent follow-ups. Retryable transport phases use an initial try plus three retries after 2, 10 and 30 seconds; retry exhaustion keeps the cause code and sets `retry_exhausted`.
+
+Auxiliary admission has **10 minutes of active admission time**. Pause is checked before timeout or retry accounting. Parking saves the remaining admission and backoff time. Retained pause history excludes time parked under the owner gate, including across a restart. Resume keeps the same auxiliary ID, queue position and spent follow-up allowance, and restores only the saved time, not a new ten minutes. Pause history keeps one active hour and at most 256 windows; pruning or resetting missing history can conservatively expire admission early with `INTEGRATION_TURN_QUEUE_TIMEOUT`, but never renews its budget. An already running auxiliary keeps its execution timeout of `min(task timeout, 10 minutes)` while the owner is paused.
+
+Ordinary task-ref publication stays separate from target integration. `publish = push` delivers `task/<id>` or the explicit `publish_branch` through the existing outbox; it does not mean integrate. Its effective publication branch must differ from the integration target, including the implicit `task/<id>` branch, or submission fails with `INTEGRATION_PUBLISH_TARGET_COLLISION`. `worker task publish-retry <id>` retries that outbox only. Task-ref delivery can remain pending independently of target success. Session packages and transport base refs are never pushed by integration.
+
+Both controller and direct mode run Git on the original task worker. The controller owns detached integration recovery while the laptop is disconnected. In direct mode a spawned laptop child can finish without an interactive CLI, but a dead child needs `worker task wait --task-id <id>` or `worker task reconcile` on the laptop to recover. A powered-off direct-mode laptop provides no unattended recovery. Disabling a controller never transfers its tasks to the laptop owner.
+
+Configured DAG parents unlock children only after integration success and current result import, including requested `never` parents that remain Open. Disabled parents keep the Closed + Done gate. Pending/parked parents leave children queued; integration-blocked parents report `INTEGRATION_DEPENDENCY_BLOCKED`, and recovery can clear that wait. Giving up without integration blocks configured children with `INTEGRATION_DEPENDENCY_NOT_INTEGRATED`. An integrating `from:<id>` child requires an enabled parent with the same canonical target; its base is the imported accepted result, including the merge after repair.
+
+### Observable state
+
+Task status/result JSON keeps `integration` as a companion object, separate from the strict ordinary `status` record. List rows and dashboard task rows use optional `integration` and `workflow_state`. Disabled tasks omit integration. An unavailable companion read means unknown/unavailable support, never proof that a task disabled it.
+
+The full snapshot includes `schema_version`, `integration_id`, `epoch`, `revision`, `target`, `state`, `resume_state`, `pause_reason`, `source_turn_id`, `source_head`, `merge_oid`, `observed_target_oid`, `disposition`, `attempts`, `resolve_turns`, `verify_turns`, `blocked_code`, `retry_exhausted`, `retry_at_millis`, `verification`, and `updated_at_millis`. Parked work shows its pause reason and resume phase. Success is `state = integrated`; `already_integrated` is a disposition, not a separate state. Admission remainder and queue binding are durable recovery data, not extra public snapshot fields.
+
+`workflow_state` is `queued`, `running`, `integrating`, `needs_you`, or `done`. Pending/parked integration projects automatic work without an attention card; an auxiliary agent turn is running. Blocked integration needs you and shows its stable code and repair hint. Integrated success is done without an accept card, even if requested `never` keeps legacy task state Open. Once a newer ordinary turn starts, its running, question or failure state takes precedence; the earlier receipt remains history.
+
+The public target display is redacted and capped at **128 UTF-8 bytes**, including an ellipsis at a character boundary. It is a label, not an action identity; actions use the private exact target and IDs. Do not copy a shortened label back into configuration.
+
+Controller facts carry a compact annotation of at most **512 serialized JSON bytes**: `integration_id`, `epoch`, `revision`, `state`, `code`, and `result_oid`. The entire facts object stays within **2,048 bytes**. The full companion snapshot is at most **4 KiB** and is read through the gated integration selector on `task.list`, up to 16 task IDs at a time. Notices require confirmation against that full snapshot's ID, epoch and revision; journal events are hints, not authority. Disabled facts keep their existing format and digest.
+
+### Pause, stop and rollback
+
+`worker controller drain` pauses ordinary runner handoffs and new integration phases and auxiliary admissions. No new phase or auxiliary admission starts after drain is acknowledged. An already admitted bounded step persists its answer, then parks; a running auxiliary finishes before the next phase parks. `worker controller drain --off` resumes both ordinary handoffs and integration.
+
+`worker controller disable` pauses integration only before unloading and retains controller state; it leaves ordinary drain unchanged. After re-enable, ordinary dispatch follows that existing drain flag, while integration stays paused until explicit `worker controller drain --off`. A controller restart, including launchd restart, `controller restart`, `worker setup`, reboot or upgrade, creates no pause and preserves any existing pause.
+
+While an integration pause window is open, `worker controller status` adds this line (the reason is `controller_drained` or `controller_disabled`):
+
+```text
+integration: paused (controller_disabled) since <milliseconds>; resume with: worker controller drain --off
+```
+
+Its JSON adds an `integration_pause` object with exactly these fields:
+
+```json
+{
+  "integration_pause": {
+    "reason": "controller_disabled",
+    "effective_at_millis": 1791072000000
+  }
+}
+```
+
+The timestamp is the effective pause time in Unix milliseconds. With no open window, the extra line and object are omitted.
+
+Invalid or unreadable `integration-gate.json` pause history prevents integration admission while ordinary handoffs still follow `drain.json`. When the file can be read safely but its JSON or metadata is invalid, the next `drain`, `drain --off` or `disable` saves its bytes as `integration-gate.json.corrupt` in controller state and replaces the history. The warning `warning: integration gate [CONTROLLER_TRANSPORT]; pause history was reset` means old timing evidence was discarded; missing history may conservatively expire an auxiliary's admission budget early. If an I/O or safety failure prevents recovery, `pause could not be persisted` means the history was not replaced. Ordinary drain changes or disable still complete; repair the cause before relying on the integration gate. A failed disable pause also warns `integration may resume after re-enable`.
+
+Rolling the helper below `task.integration` parks its owner intent with `INTEGRATION_UNAVAILABLE`. Restore compatible support, re-enable the controller if needed, and use `worker controller drain --off` to resume retained Open work. Uncertain effects are observed before work resumes; reads and stop/revoke remain available while parked.
+
+Manual `worker task close <id>` stops unfinished integration and keeps the result; it never grants merge permission. `close --discard` also drops retained task data after the stop barrier, but neither operation rewinds origin. `cancel` acknowledges a terminal cancellation only after revocation or a known committed outcome. If a push already won, cancellation returns `INTEGRATION_ALREADY_COMMITTED`; if the outcome or stop remains unknown, `INTEGRATION_STOP_UNCONFIRMED` leaves the task nonterminal with the mutation pending. Restore connectivity and retry observation; do not treat an SSH timeout as proof a push stopped. No new target update is authorized after terminal close/cancel/discard acknowledgement.
+
+For blocked Open tasks, repair the cause and run `worker task integrate <id>`. Re-drive keeps the source and target, starts a new epoch, and respects remaining task follow-ups; it cannot change targets or resurrect terminal tasks. Integrated re-drive is idempotent. A plain `worker task say` on an enabled task returns `TASK_BUSY` (`INTEGRATION_IN_PROGRESS`) while the merge cycle can still push, including just after the ordinary turn finishes Done and before its first integration intent is published. `say` on a Blocked or Revoked cycle revokes it first and restores the source workspace before starting the ordinary follow-up. When a turn is running, `say --interrupt` stops it and completes the integration stop barrier before queuing the follow-up; an unconfirmed stop does not queue it. With no running turn, it follows the plain `say` rule.
+
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
+
+Old GC measures seven idle days from the last host-status update, not the rollback date, so already-idle tasks can expire sooner after rollback. Non-discard retention close keeps result refs/history/session binding but removes the workspace. The integration-aware helper protects parked, blocked and uncertain repair state; a pre-feature helper cannot honor that protection. There is no host layout/version barrier to prevent an operational rollback.
+
+On compatible restore, a host-closed task is settled by observing origin first. A reachable retained merge M wins before source H and is imported, preserving a stronger existing receipt; otherwise reachable H proves `already_integrated` at observed T, which is imported. The retained ref/status head is repaired while the host remains Closed. If neither is reachable, block with `INTEGRATION_WORKSPACE_MISSING` and keep the retained result. Failed observation keeps the outcome uncertain and retries after 2, 10 and 30 seconds; retry exhaustion blocks with its cause code. This observation-only settlement remains available during `drain` and `disable`, under the same canonical-target reservation and shared four-driver Git limit as other integration work. Its observation retry budget is separate from any earlier Open Repair failures. Closed never authorizes a new candidate, push, workspace recreation, reopen, or auxiliary turn. `worker task integrate <id>` refuses the Closed task.
 
 ## Capacity and slots
 
@@ -336,7 +443,7 @@ prompt = "Move the billing HTTP client into packages/billing-client …"
 agent = "opencode"
 ```
 
-Named dependencies execute when each parent is **Closed and Done** (including `close_on = never`, which needs human `close` after a Done turn). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`); they are not launched. `from:` copies that parent's current accepted imported OID on the laptop; origin `pending` does not block the bind when the local import proof is complete. Submit freezes each node's prompt, settings, and base OID; restart does not reread the batch file. List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
+With integration disabled, named dependencies execute when each parent is **Closed and Done** (including `close_on = never`, which needs human `close` after a Done turn). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`); they are not launched. Configured parents instead require integration success and current result import, even when requested `never` keeps them Open. `from:` copies the parent's accepted imported OID, including its integrated result; separate task-ref origin `pending` does not block a complete import proof. Submit freezes each node's prompt, settings, and base OID; restart does not reread the batch file. List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
 
 ```toml
 version = 1
@@ -380,7 +487,7 @@ Declare every file that setup or its check executes or consumes in `lockfiles` o
 
 For unchanged inputs the per-task receipt cache behaves as before: `check` proves **this** workspace is ready, and a failed check repairs it using the approved commands. A receipt in another worktree is not skip proof. Toolchains stay user-owned.
 
-`worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, and setup without creating tasks, opening client state, or talking to workers. Preview reports `dag.status = "enforced"` (`Dependencies execute when parents are Closed and Done.`). Submit of `depends_on` or `base = "from:<id>"` executes that graph; independent batches stay on today's path. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
+`worker task batch FILE --preview` resolves agent/model/worker, declared files, acceptance, setup and effective integration settings without creating tasks, opening client state, or talking to workers. Preview reports `dag.status = "enforced"`; the Closed + Done parent rule applies to disabled integration. Configured parents use the integration/import gate described above. Submit of `depends_on` or `base = "from:<id>"` executes that graph; independent batches stay independent. Declared `files` are advisory overlap hints. Declared `acceptance` is copied into the agent prompt as instructions, not proven by mac-worker.
 
 To use the exact base commit from your Git remote and push the result branch back to that remote, change these project settings:
 
@@ -428,7 +535,7 @@ listed for that string.
 
   `<project-id>` is the directory under `tasks/` that holds the task id.
   Check that the fetched commit matches `head_oid` in the worker's
-  `status.json` before you merge it.
+  `status.json` before any manual merge.
 
 `worker task wait` is also the gate before `say` and `fetch` after a busy
 turn.
@@ -453,13 +560,17 @@ worker dashboard --port 8765 --no-open
 worker dashboard --no-facts-refresh   # skip stale agent-facts refresh only
 ```
 
-The dashboard listens only on loopback. It does not start or cancel tasks. In the default (controller-disabled) mode it serves the laptop queue. When `[controller] enabled = true`, the same command does not open laptop task state: it starts a managed SSH local-forward to the controller host’s loopback dashboard, waits until that URL answers, prints `http://127.0.0.1:<port>`, and holds the tunnel until you stop the command. `--port`, `--no-open`, and `--no-facts-refresh` still apply. A first start that never becomes ready is `CONTROLLER_UNAVAILABLE` with no laptop-store fallback. After the tunnel has been ready once, the command reconnects; the Dashboard subsection under [Remote controller](#remote-controller) describes that recovery.
+The dashboard listens only on loopback. It does not submit or cancel tasks. In the default (controller-disabled) mode it serves the laptop queue. When `[controller] enabled = true`, the same command does not open laptop task state: it starts a managed SSH local-forward to the controller host’s loopback dashboard, waits until that URL answers, prints `http://127.0.0.1:<port>`, and holds the tunnel until you stop the command. `--port`, `--no-open`, and `--no-facts-refresh` still apply. A first start that never becomes ready is `CONTROLLER_UNAVAILABLE` with no laptop-store fallback. After the tunnel has been ready once, the command reconnects; the Dashboard subsection under [Remote controller](#remote-controller) describes that recovery.
 
 It shows workers (including slot occupancy and host load), the FIFO queue, active turns, the task ledger, per-task detail (outcome, summary, agent-reported checks, changed files, fetch ref, delivery), and run history. Deep link `#/tasks/<id>` selects that card. It never shows prompts, credentials, or profile values.
 
 `--no-facts-refresh` disables the optional fifteen-minute agent-facts refresh so Overview does not probe idle workers. It is **not** a read-only switch: Settings can still save native model/effort defaults, and task cards can still reply or accept.
 
 Reply and accept use the same `TaskClient::say` / `close` paths as the CLI. They require the **current card**. A stale card is rejected (`TASK_REVISION_CONFLICT`, HTTP 409) and must not enqueue another turn.
+
+Configured pending or parked integration has no accept card; integrated success needs no attention. A blocked card shows the target, stable code and repair action. Re-drive and Close work directly from Overview once the card's current detail is confirmed. Re-drive uses the current integration identity and revision; stale integration state must be refreshed before retrying. The legacy accept action is close: keep the result or give up unfinished integration, never authorize a merge.
+
+Dashboard Re-drive (`POST /api/v1/tasks/{task_id}/integrate`) returns the saved complete result when the same request ID and body are replayed; a changed body is refused with `INTEGRATION_STATE_INVALID`. Replay remains available after Closed while the binding and owner record exist. Each owner task has one shared budget of **32 binding files and 256 KiB (262,144 bytes)** across `integrations/tasks/<task-id>/dashboard-redrive-<request-id>.json` and `redrive-<request-id>.json` in owner state, including native-only requests. Required pairs count together before publication. The oldest completed bindings are evicted first; pending bindings and completed partners needed by pending requests are never evicted. Insufficient capacity returns `TASK_BUSY` before publishing a new binding or advancing an epoch; failed completion storage keeps the accepted pending binding. Completed bindings become eligible for pruning after 24 hours at the next binding write (exactly 24 hours is retained). Removing the owner task record removes both binding families first. Fresh request IDs still require the current task and integration revision; stale state returns `TASK_REVISION_CONFLICT`.
 
 ```text
 POST /api/v1/tasks/{task_id}/reply
@@ -769,6 +880,8 @@ turn queued and wait for drain to lift, then retry admission. A wait timeout lea
 for recovery. The shared launch gate covers ordinary, recovery, replacement, and completion-triggered
 runners, plus reassignment to parked turns. `status` reports `drained`; unreadable drain state fails closed.
 
+For configured integration, drain also fences each new host phase and auxiliary admission; the current admitted step or running turn finishes, then parks. `worker controller drain --off` resumes ordinary handoffs and integration, preserving saved admission/backoff time and auxiliary identity. Disable pauses integration only and leaves ordinary drain unchanged; after re-enable, integration needs explicit `drain --off`. Restart creates no pause. See [Pause, stop and rollback](#pause-stop-and-rollback) for status, pause-history warnings and helper rollback.
+
 `worker controller disable` unloads the remote LaunchAgent and sets laptop `enabled = false`. It uses the enabled destination, or the pending destination after a failed first init. `worker controller disable --ssh <destination>` selects a destination explicitly, including when local configuration is missing; cleanup of a different destination preserves the configured controller mode. With no recorded or explicit destination, it prints an actionable error. A confirmed uninstall clears the matching pending record; a failed uninstall retains it for retry.
 It preserves both inventories, task state, keys, and trusted hosts. Finish controller work before
 switching back: local mode does not import the controller's task store. Rerun init to re-enable it.
@@ -779,7 +892,7 @@ warnings as local task results.
 
 ### Submit, disconnect, reconnect
 
-Task commands use the same public grammar as today (`worker task --help`): `submit`, `batch`, `list`, `status`, `logs` (`-f` / `--raw` / `--turn`), `diff`, `say`, `cancel`, `result`, `fetch`, `close`, `wait`, `reconcile`. Confirm the installed form with `worker skills get pool-dispatch --grammar-only` rather than copying flags from a skill file.
+Task commands use the same public grammar in both modes (`worker task --help`): `submit`, `batch`, `list`, `status`, `logs` (`-f` / `--raw` / `--turn`), `diff`, `say`, `cancel`, `result`, `fetch`, `close`, `integrate`, `wait`, `reconcile`. Confirm the installed form with `worker skills get pool-dispatch --grammar-only` rather than copying flags from a skill file.
 
 On submit the laptop freezes the prompt, project identity, settings, and base (`HEAD`, `--base`, or `--wip` / `--include`) and transfers that snapshot before the controller accepts the request. A retry of the **same original envelope** keeps that freeze; it does not recapture a later HEAD or `.worker.toml`. After accept you can close the laptop CLI. That ACK means the request is persisted on the controller store; it does **not** mean a runner or the agent has started — enabled submit can stay queued until `worker controller run` advances it. Reconnect with `status`, `logs`, `wait`, `list`, and the dashboard.
 
@@ -824,7 +937,7 @@ The controller imports the worker’s published result so later DAG work can pro
 
 `worker task batch FILE --preview` stays local: it validates the file and does not open the controller store or dispatch. It works with a controller-only laptop configuration, including worker pins. The preview preserves those names; the controller checks its own inventory when you submit. A successful preview does not prove that a worker exists or is currently available.
 
-Named `depends_on` / `base = "from:<id>"` still wait for each parent to be **Closed and Done** (including `close_on = never`, which needs human `close` before a `from:` child may run). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`). `from:` binds that parent’s accepted **controller** import, not origin `pending` and not a laptop `fetch` you have not run.
+With integration disabled, named `depends_on` / `base = "from:<id>"` wait for each parent to be **Closed and Done** (including `close_on = never`, which needs human `close` before a `from:` child may run). Open+NeedsInput and Open+Done wait. Failed, Abandoned, Lost, or Closed without Done block descendants (`DAG_PARENT_FAILED`). Configured parents instead unlock after integration success and current controller import, even while Open under requested `never`. `from:` binds that accepted **controller** result, including the integration merge, not task-ref origin `pending` and not a laptop `fetch`.
 
 `--max-parallel` remains CLI-only (not a batch-file key). Omitted, the default is the **controller host** `sum(worker.slots)`, not an empty laptop `[[workers]]` list. An explicit positive value is accepted even when it is larger than that sum; extra tasks wait. Zero is `TASK_CONFIG_INVALID`. The CLI does not reject “too many” relative to host capacity. Host occupancy is still each Mac’s `slot_count`.
 
@@ -974,10 +1087,10 @@ The [persistent controller read channel](#persistent-controller-read-channel) ca
 ## What the pool will and will not do
 
 - A task worktree is isolation for your repository, not a security boundary: agent turns run with the worker account's full access. Only dispatch prompts you trust, on machines you own.
-- Your working tree is never modified. Results arrive as remote-tracking refs; merging is your decision.
+- Your working tree stays unchanged. Disabled integration returns refs for manual merging; enabled integration updates the configured own-origin target automatically. Blocked or given-up results remain available for manual review.
 - You own SDKs, tools, auth, and secrets. Optional `[setup]` does not install arbitrary packages.
-- Agent-reported checks are not independent verification. Review summary, diff, and fetch ref before you accept.
-- Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims them: idle open tasks after 7 days, result branches after 30 days or on `close --discard`. Unreachable objects in a mirror stay for two weeks, so objects another task is still writing remain available. Each host is reported as success, error, or unknown when its control request times out. The report includes every host, and the command exits non-zero after that report when any host is an error or unknown.
+- Agent-reported checks are not independent verification. Inspect summary, diff, fetch ref and integration evidence as needed; configured success needs no accept action.
+- Workers hold a bare mirror per project, a worktree per task, agent sessions, and bounded logs. `worker gc` previews and reclaims ordinary idle open tasks after 7 days, result branches after 30 days or on `close --discard`. Integration-aware GC protects pending, parked, blocked and uncertain repair state; [pre-feature rollback has a seven-idle-days limit](#pause-stop-and-rollback). Unreachable objects in a mirror stay for two weeks, so objects another task is still writing remain available. Each host is reported as success, error, or unknown when its control request times out. The report includes every host, and the command exits non-zero after that report when any host is an error or unknown.
 - The CLI adds no secrets to its own diagnostics, redacts worker paths from agent summaries, and refuses insecure profiles. Application logs can still contain whatever the agent printed.
 - `worker task reconcile` repairs task ownership after a laptop reboot (or on the controller host when enabled). It waits 750 ms to confirm an `Absent` owner in that same invocation; a still-unverifiable owner is not treated as dead. `worker setup` updates helpers; older host layouts may require the steps in [installation recovery](setup-recovery.md).
 - The laptop owns the queue unless you opt in to a remote controller (`[controller] enabled = true`). That mode is off by default. Setup: [Remote controller](#remote-controller).

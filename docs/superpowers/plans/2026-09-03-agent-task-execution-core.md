@@ -1505,6 +1505,8 @@ git commit -m "feat: cache agent facts as scheduler capabilities"
 
 - [ ] **Step 1: Write the skill**
 
+> Superseded 2026-10-03: the unconditional fetch-and-close loop below is replaced for configured tasks by [Automatic integration into the base branch](../specs/2026-10-03-auto-integration-design.md). The dispatch skill observes or re-drives integration; it does not run its own laptop Git merge/push. Manual close keeps the result or gives up integration. Historical tasks remain as written.
+
 `.claude/skills/pool-dispatch/SKILL.md` documents exactly: submit each task with `worker task submit --agent <name> --prompt-file <file> --json` and keep the `task_id`; poll with `worker task list --run <id> --json` or block with `worker task wait --run <id>`; on `needs_input`, answer with `worker task say <id> --message-file <file> --wait`; on `done`, run `worker task fetch <id>` and report the remote-tracking ref; on `blocked` or a failed turn, read `worker task result <id> --json` and `worker task logs <id>`, then either `say` with guidance or `close --discard`; close finished tasks. It states that the skill must never merge, check out, or push, and must never read env profiles.
 
 - [ ] **Step 2: Document Phase 5**
