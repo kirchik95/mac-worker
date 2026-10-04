@@ -32,6 +32,7 @@ pub(crate) struct OwnerIntegration<'a> {
     state: super::store::RootedIntegrationState,
     runtime: Arc<OwnerRuntime>,
     ports: OwnerPorts<'a>,
+    source: OwnerSource<'a>,
 }
 
 pub(crate) struct OwnerRuntime {
@@ -165,6 +166,53 @@ impl IntegrationHost for OwnerPorts<'_> {
         response
     }
 }
+/// Admission witnesses only the current owner record, queue and prepared sidecars.
+/// Remote observation stays at the normal drive/finalizer boundary.
+struct OwnerSource<'a> {
+    paths: &'a PathLayout,
+    client: &'a ClientStateStore,
+}
+impl IntegrationObserver for OwnerSource<'_> {
+    fn facts(&self, task: TaskId) -> Result<IntegrationTaskFacts, WorkerError> {
+        owner_facts(self.paths, self.client, self.client.load_task(task)?)
+    }
+}
+fn owner_facts(
+    paths: &PathLayout,
+    client: &ClientStateStore,
+    ordinary: crate::task::LocalTaskRecord,
+) -> Result<IntegrationTaskFacts, WorkerError> {
+    let task = ordinary.meta().task_id();
+    let last = ordinary.status().turns().last().map(|turn| turn.turn_id());
+    let auxiliary_purpose = last
+        .map(|turn| super::store::RootedIntegrationState::read_auxiliary(paths, task, turn))
+        .transpose()?
+        .flatten()
+        .map(|p| p.purpose);
+    let queue = client.queue_entry_for_task_turn(task)?;
+    let cycle_base = last
+        .map(|turn| read_source_base(paths, task, turn))
+        .transpose()?
+        .flatten()
+        .unwrap_or_else(|| ordinary.meta().base_oid().clone());
+    Ok(IntegrationTaskFacts {
+        cycle_base,
+        result_imported: ordinary.fetched_head().is_some()
+            && ordinary.fetched_head() == ordinary.status().head_oid(),
+        session_import_complete: ordinary.meta().session_import().is_none()
+            || (ordinary.status().session_present() && !ordinary.status().turns().is_empty()),
+        continuation_pending: ordinary.auto_continue_intent().is_some(),
+        runner_present: queue.is_some() || ordinary.runner().is_some(),
+        stop_requested: queue
+            .as_ref()
+            .is_some_and(|entry| entry.is_cancel_requested()),
+        close_pending: ordinary.close_intent().is_some(),
+        submission_pending: ordinary.submission_intent_turn_id().is_some()
+            || ordinary.submission_rollback_turn_id().is_some(),
+        auxiliary_purpose,
+        ordinary,
+    })
+}
 impl IntegrationObserver for OwnerPorts<'_> {
     fn facts(&self, task: TaskId) -> Result<IntegrationTaskFacts, WorkerError> {
         let mut ordinary = self.client.load_task(task)?;
@@ -196,37 +244,7 @@ impl IntegrationObserver for OwnerPorts<'_> {
                 }
             }
         }
-        let last = ordinary.status().turns().last().map(|turn| turn.turn_id());
-        let auxiliary_purpose = last
-            .map(|turn| {
-                super::store::RootedIntegrationState::read_auxiliary(self.paths, task, turn)
-            })
-            .transpose()?
-            .flatten()
-            .map(|p| p.purpose);
-        let queue = self.client.queue_entry_for_task_turn(task)?;
-        let cycle_base = last
-            .map(|turn| read_source_base(self.paths, task, turn))
-            .transpose()?
-            .flatten()
-            .unwrap_or_else(|| ordinary.meta().base_oid().clone());
-        Ok(IntegrationTaskFacts {
-            cycle_base,
-            result_imported: ordinary.fetched_head().is_some()
-                && ordinary.fetched_head() == ordinary.status().head_oid(),
-            session_import_complete: ordinary.meta().session_import().is_none()
-                || (ordinary.status().session_present() && !ordinary.status().turns().is_empty()),
-            continuation_pending: ordinary.auto_continue_intent().is_some(),
-            runner_present: queue.is_some() || ordinary.runner().is_some(),
-            stop_requested: queue
-                .as_ref()
-                .is_some_and(|entry| entry.is_cancel_requested()),
-            close_pending: ordinary.close_intent().is_some(),
-            submission_pending: ordinary.submission_intent_turn_id().is_some()
-                || ordinary.submission_rollback_turn_id().is_some(),
-            auxiliary_purpose,
-            ordinary,
-        })
+        owner_facts(self.paths, self.client, ordinary)
     }
 }
 impl IntegrationTurns for OwnerPorts<'_> {
@@ -400,6 +418,7 @@ impl<'a> OwnerIntegration<'a> {
         Ok(Self {
             state,
             runtime: runtime.clone(),
+            source: OwnerSource { paths, client },
             ports: OwnerPorts {
                 runner,
                 config,
@@ -418,6 +437,7 @@ impl<'a> OwnerIntegration<'a> {
             self.runtime.as_ref(),
             &self.ports,
         )
+        .with_source_observer(&self.source)
         .with_owner_gate(self.ports.paths)
     }
     pub(crate) fn stage(&self, task: TaskId) -> Result<(), WorkerError> {

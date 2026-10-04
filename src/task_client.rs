@@ -1331,7 +1331,9 @@ impl<'a> TaskClient<'a> {
         let mut snapshot = coordinator.snapshot(task)?;
         if matches!(
             operation,
-            IntegrationMutation::Cancel | IntegrationMutation::Close
+            IntegrationMutation::Cancel
+                | IntegrationMutation::Close
+                | IntegrationMutation::Say { new_turn: true }
         ) && record.status().state() == TaskState::Open
             && let Some(last) = record.status().turns().last()
             && last.terminal().is_some()
@@ -1340,8 +1342,8 @@ impl<'a> TaskClient<'a> {
                 || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
         {
             // Retirement can precede the finalizer's intent publication. Use
-            // the same source CAS before acknowledging a stop; a delayed wake
-            // then sees this cycle's durable tombstone instead of a fresh one.
+            // the same source CAS before a stop or ordinary follow-up. Say
+            // must observe the cycle's normal busy/revoke rules in this window.
             coordinator.on_terminal(task, last.turn_id())?;
             snapshot = coordinator.snapshot(task)?;
             if snapshot
