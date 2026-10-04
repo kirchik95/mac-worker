@@ -167,7 +167,7 @@ Use `status`, `result`, `list --json`, or the dashboard to see `integration` and
 
 > **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
-GC counts seven idle days since the last host-status update, not since rollback; an already-idle task can expire sooner. Non-discard retention close keeps result refs but removes the workspace. Restore observes origin first: a reachable retained merge is imported; otherwise a reachable source settles as already integrated. If neither is reachable, integration blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation keeps uncertainty and retries with bounded backoff. The task stays Closed: no reopen, workspace recreation, new push or repair turn, and `task integrate` refuses it.
+GC counts seven idle days since the last host-status update, not since rollback; an already-idle task can expire sooner. Non-discard retention close keeps result refs but removes the workspace. Restore observes origin first: a reachable retained merge is imported; otherwise a reachable source settles as already integrated. If neither is reachable, integration blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation keeps uncertainty and retries with bounded backoff. Observation-only settlement remains available during drain or disable, under the same target reservation and four-driver Git limit. The task stays Closed: no reopen, workspace recreation, new push or repair turn, and `task integrate` refuses it.
 
 See [the integration reference](usage.md#automatic-integration) for exact-target leases, checks, admission budgets, branch restrictions, public fields and direct-mode recovery.
 

@@ -87,7 +87,7 @@ Use `worker controller drain` to pause ordinary handoffs, new integration phases
 
 > **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
 
-GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs. Compatible restore imports a reachable retained merge, or settles a reachable source as already integrated; if neither is reachable, it blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation remains uncertain and retries with bounded backoff. The task stays Closed, with no new push, workspace recreation or repair turn; `task integrate` refuses it.
+GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs. Compatible restore imports a reachable retained merge, or settles a reachable source as already integrated; if neither is reachable, it blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation remains uncertain and retries with bounded backoff. Observation-only settlement remains available during drain or disable, with the same target reservation and four-driver Git limit. The task stays Closed, with no new push, workspace recreation or repair turn; `task integrate` refuses it.
 
 When integration is disabled, blocked, or given up, you can still inspect and fetch the retained result for manual review. Manual `task close` keeps the result and gives up unfinished integration; it never authorizes a merge. [Integration settings, checks, safety limits and recovery](docs/usage.md#automatic-integration).
 
