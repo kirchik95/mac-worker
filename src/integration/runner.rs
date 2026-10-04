@@ -496,6 +496,64 @@ impl<'a> OwnerIntegration<'a> {
         }
         Ok(())
     }
+    /// Save the complete dashboard body before the native re-drive binding can
+    /// advance an epoch. A completed replay performs no checks or scheduling.
+    pub(crate) fn dashboard_redrive(
+        &self,
+        request: &IntegrationRedriveRequest,
+        body: &serde_json::Value,
+        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
+        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+    ) -> Result<serde_json::Value, WorkerError> {
+        request.validate()?;
+        let root = task_root(self.ports.paths, request.task_id)?;
+        let _request = private_lock(&root, "dashboard-redrive.lock", true)?
+            .ok_or_else(|| WorkerError::task("TASK_BUSY", "integration redrive is in progress"))?;
+        let name = format!("dashboard-redrive-{}.json", request.request_id);
+        let old = match root.read_private_regular(&name, MAX_INTEGRATION_RPC_BYTES as u64) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let (mut binding, previous) = if let Some(bytes) = old {
+            let binding: DashboardRedriveBinding =
+                serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if binding.request != *request
+                || binding.body != *body
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != bytes
+            {
+                return Err(invalid());
+            }
+            if let Some(result) = &binding.result {
+                return Ok(result.clone());
+            }
+            (binding, bytes)
+        } else {
+            validate()?;
+            let binding = DashboardRedriveBinding {
+                request: request.clone(),
+                body: body.clone(),
+                result: None,
+            };
+            let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+            if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
+                return Err(invalid());
+            }
+            root.write_private_atomic_no_replace(&name, &bytes)?;
+            (binding, bytes)
+        };
+        // An interrupted pending response resumes/replays the underlying owner
+        // request, whose saved epoch/result prevents another epoch advance.
+        let result = execute()?;
+        binding.result = Some(result.clone());
+        let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+        if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
+            return Err(invalid());
+        }
+        root.replace_private_regular_exact(&name, &previous, &bytes)?;
+        Ok(result)
+    }
+
     pub(crate) fn redrive(
         &self,
         request: &IntegrationRedriveRequest,
@@ -750,6 +808,14 @@ struct DriverBinding {
     intent: IntegrationId,
     epoch: u32,
     actor: crate::job::ProcessIdentity,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardRedriveBinding {
+    request: IntegrationRedriveRequest,
+    body: serde_json::Value,
+    result: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

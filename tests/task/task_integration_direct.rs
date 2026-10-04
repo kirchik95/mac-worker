@@ -953,6 +953,17 @@ impl Drop for RunningDashboard {
 }
 
 fn dashboard_request(address: &str, method: &str, path: &str, body: Option<Value>) -> Value {
+    let (status, response) = dashboard_request_result(address, method, path, body);
+    assert!(status.contains("200"), "{status} {response}");
+    response
+}
+
+fn dashboard_request_result(
+    address: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (String, Value) {
     use std::io::{BufRead, Read, Write};
     let body = body.map(|body| body.to_string()).unwrap_or_default();
     loop {
@@ -985,12 +996,7 @@ fn dashboard_request(address: &str, method: &str, path: &str, body: Option<Value
             std::thread::yield_now();
             continue;
         }
-        assert!(
-            status.contains("200"),
-            "{status} {}",
-            String::from_utf8_lossy(&response)
-        );
-        return serde_json::from_slice(&response).unwrap();
+        return (status, serde_json::from_slice(&response).unwrap());
     }
 }
 
@@ -2633,4 +2639,136 @@ fn direct_integrating_batch_publishes_policies_and_requirements_before_drained_l
     }
     assert_eq!(configured, 1);
     assert!(!f.host.join("argv").exists());
+}
+
+#[test]
+fn review_native_dashboard_replay_returns_the_durable_request_result() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::sync::Arc;
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+    };
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let mut record = state.load(task).unwrap().unwrap();
+    let previous = record.snapshot.revision;
+    record.snapshot.revision = previous.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.pause_reason = None;
+    record.snapshot.resume_state = None;
+    record.pause = None;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+    state.replace(task, previous, &record).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    command
+        .env_clear()
+        .env("HOME", &f.laptop)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MAC_WORKER_TEST_SSH", &f.ssh)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(f.project.root())
+        .args([
+            "--config",
+            f.config.to_str().unwrap(),
+            "dashboard",
+            "--no-open",
+            "--no-facts-refresh",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut process = RunningDashboard(command.spawn().unwrap());
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let mut url = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+        let _ = send.send(url);
+    });
+    let url = receive
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    let address = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let ordinary = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    let request = json!({
+        "expected": {"expected_task_id":task,"expected_turn_id":ordinary.status().turns().last().unwrap().turn_id(),
+            "expected_turn_count":ordinary.status().turns().len(),"expected_head_oid":ordinary.status().head_oid(),
+            "expected_updated_at_millis":ordinary.status().updated_at_millis(),"expected_state":"open"},
+        "expected_integration_id":record.snapshot.integration_id,
+        "integration":{"task_id":task,"expected":record.snapshot.revision,"request_id":uuid::Uuid::new_v4().simple().to_string()}
+    });
+    let route = format!("/api/v1/tasks/{task}/integrate");
+    let first = dashboard_request(address, "POST", &route, Some(request.clone()));
+    let after = state.load(task).unwrap().unwrap();
+    assert_eq!(after.snapshot.epoch, record.snapshot.epoch + 1);
+    let second = dashboard_request(address, "POST", &route, Some(request.clone()));
+    assert_eq!(
+        second["integration"]["integration_id"],
+        first["integration"]["integration_id"]
+    );
+    assert_eq!(
+        state.load(task).unwrap().unwrap().snapshot.epoch,
+        after.snapshot.epoch
+    );
+    assert_eq!(
+        second, first,
+        "exact replay returns the saved complete response"
+    );
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
+    let mut changed = request.clone();
+    changed["expected"]["expected_updated_at_millis"] =
+        json!(ordinary.status().updated_at_millis() + 1);
+    let (status, error) = dashboard_request_result(address, "POST", &route, Some(changed));
+    assert!(status.contains("502"), "{status}: {error}");
+    assert_eq!(error["error"]["code"], "INTEGRATION_STATE_INVALID");
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
+    let mut fresh = request.clone();
+    fresh["integration"]["request_id"] = json!(uuid::Uuid::new_v4().simple().to_string());
+    let (status, error) = dashboard_request_result(address, "POST", &route, Some(fresh));
+    assert!(status.contains("409"), "{status}: {error}");
+    assert_eq!(error["error"]["code"], "TASK_REVISION_CONFLICT");
+    // Reopen a normal dashboard after the owner becomes Closed. The old request
+    // remains replayable; first requests keep their Open/revision fences.
+    drop(process);
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let before = client.load_task(task).unwrap();
+    let mut wire = serde_json::to_value(before.status()).unwrap();
+    wire["state"] = json!("closed");
+    let closed = before
+        .clone()
+        .with_status(serde_json::from_value(wire).unwrap())
+        .unwrap();
+    assert!(client.update_task_if_current(&before, closed).unwrap());
+    let mut process = RunningDashboard(command.spawn().unwrap());
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let mut url = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+        let _ = send.send(url);
+    });
+    let url = receive
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    let address = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    assert_eq!(
+        dashboard_request(address, "POST", &route, Some(request)),
+        first
+    );
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
 }

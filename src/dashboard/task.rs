@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     client_state::ClientStateStore,
@@ -53,6 +53,16 @@ pub trait DashboardIntegrationSource: Send + Sync + 'static {
         &self,
         task_id: TaskId,
     ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError>;
+    fn dashboard_redrive(
+        &self,
+        _request: &crate::integration::contracts::IntegrationRedriveRequest,
+        _body: &serde_json::Value,
+        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
+        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+    ) -> Result<serde_json::Value, WorkerError> {
+        validate()?;
+        execute()
+    }
     fn redrive(
         &self,
         request: &crate::integration::contracts::IntegrationRedriveRequest,
@@ -164,6 +174,26 @@ impl DashboardIntegrationSource for NativeDashboardIntegrations {
     ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError> {
         crate::integration::store::RootedIntegrationState::read_task(&self.paths, task)
             .map(|(_, record)| record.map(|record| record.snapshot))
+    }
+    fn dashboard_redrive(
+        &self,
+        request: &crate::integration::contracts::IntegrationRedriveRequest,
+        body: &serde_json::Value,
+        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
+        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+    ) -> Result<serde_json::Value, WorkerError> {
+        if crate::integration::store::RootedIntegrationState::read_task(
+            &self.paths,
+            request.task_id,
+        )?
+        .0
+        .is_none()
+        {
+            validate()?;
+            return Err(crate::integration::contracts::integration_unavailable());
+        }
+        self.owner()?
+            .dashboard_redrive(request, body, validate, execute)
     }
     fn redrive(
         &self,
@@ -545,7 +575,7 @@ fn map_task_view_api_error(error: TaskViewError) -> ApiError {
     dashboard_api_error(map_task_view_error(error))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskMutationRequest {
     #[serde(default)]
@@ -562,7 +592,7 @@ pub struct TaskMutationRequest {
     pub expected_state: TaskState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskIntegrationRequest {
     pub expected: TaskMutationRequest,
@@ -571,6 +601,14 @@ pub struct TaskIntegrationRequest {
 }
 
 pub trait DashboardTaskMutationSource: Send + Sync + 'static {
+    fn integrate_response(
+        &self,
+        task_id: TaskId,
+        request: &TaskIntegrationRequest,
+    ) -> Result<serde_json::Value, ApiError> {
+        serde_json::to_value(self.integrate(task_id, request)?)
+            .map_err(|_| ApiError::new("INTEGRATION_STATE_INVALID", "invalid integration response"))
+    }
     fn integrate(
         &self,
         _task_id: TaskId,
@@ -756,12 +794,12 @@ fn expected_status_matches(record: &LocalTaskRecord, expected: &TaskMutationRequ
         && status.state() == expected.expected_state
 }
 
-impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
-    fn integrate(
+impl MacWorkerTaskMutationSource {
+    fn validate_integration_request(
         &self,
         task_id: TaskId,
         request: &TaskIntegrationRequest,
-    ) -> Result<TaskDetailProjection, ApiError> {
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, ApiError> {
         use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
         let mut ordinary_expected = request.expected.clone();
         if ordinary_expected
@@ -821,20 +859,39 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
                 "terminal task cannot be re-driven",
             ));
         }
-        if snapshot.state != IntegrationStatus::Integrated {
-            if snapshot.state != IntegrationStatus::Blocked {
-                return Err(ApiError::new(
-                    "TASK_BUSY",
-                    "integration is already in progress",
-                ));
-            }
+        if !matches!(
+            snapshot.state,
+            IntegrationStatus::Blocked | IntegrationStatus::Integrated
+        ) {
+            return Err(ApiError::new(
+                "TASK_BUSY",
+                "integration is already in progress",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn drive_integration_request(
+        &self,
+        task_id: TaskId,
+        request: &TaskIntegrationRequest,
+        previous: Option<&crate::integration::contracts::IntegrationSnapshot>,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
+        let source = self.integrations.as_ref().ok_or_else(|| {
+            ApiError::new(
+                "INTEGRATION_UNAVAILABLE",
+                "compatible integration owner unavailable",
+            )
+        })?;
+        if previous.is_none_or(|snapshot| snapshot.state != IntegrationStatus::Integrated) {
             let next = source
                 .redrive(&request.integration)
                 .map_err(map_mutation_error)?;
             next.validate().map_err(map_mutation_error)?;
-            if next.integration_id != snapshot.integration_id
-                || next.epoch <= snapshot.epoch
-                || next.revision <= snapshot.revision
+            if next.integration_id != request.expected_integration_id
+                || next.revision <= request.integration.expected
+                || previous.is_some_and(|snapshot| next.epoch <= snapshot.epoch)
             {
                 return Err(ApiError::new(
                     "INTEGRATION_STATE_INVALID",
@@ -844,6 +901,72 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         }
         self.project(task_id)
     }
+}
+
+impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
+    fn integrate(
+        &self,
+        task_id: TaskId,
+        request: &TaskIntegrationRequest,
+    ) -> Result<TaskDetailProjection, ApiError> {
+        let snapshot = self.validate_integration_request(task_id, request)?;
+        self.drive_integration_request(task_id, request, Some(&snapshot))
+    }
+
+    fn integrate_response(
+        &self,
+        task_id: TaskId,
+        request: &TaskIntegrationRequest,
+    ) -> Result<serde_json::Value, ApiError> {
+        use crate::integration::contracts::ValidateIntegration;
+        request.integration.validate().map_err(map_mutation_error)?;
+        if request.integration.task_id != task_id || request.expected.expected_task_id != task_id {
+            return Err(ApiError::new(
+                "TASK_REVISION_CONFLICT",
+                "task changed before this action",
+            ));
+        }
+        let source = self.integrations.as_ref().ok_or_else(|| {
+            ApiError::new(
+                "INTEGRATION_UNAVAILABLE",
+                "compatible integration owner unavailable",
+            )
+        })?;
+        let body = serde_json::to_value(request)
+            .map_err(|_| ApiError::new("TASK_REQUEST_INVALID", "invalid integration request"))?;
+        let checked = std::cell::RefCell::new(None);
+        let api_failure = std::cell::RefCell::new(None);
+        let mut validate = || {
+            *checked.borrow_mut() = Some(
+                self.validate_integration_request(task_id, request)
+                    .map_err(|error| {
+                        *api_failure.borrow_mut() = Some(error);
+                        crate::integration::contracts::IntegrationCode::IntegrationStateInvalid
+                            .error()
+                    })?,
+            );
+            Ok(())
+        };
+        let mut execute = || {
+            let detail = self
+                .drive_integration_request(task_id, request, checked.borrow().as_ref())
+                .map_err(|error| {
+                    *api_failure.borrow_mut() = Some(error);
+                    crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
+                })?;
+            serde_json::to_value(detail).map_err(|_| {
+                crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
+            })
+        };
+        match source.dashboard_redrive(&request.integration, &body, &mut validate, &mut execute) {
+            Ok(result) => Ok(result),
+            Err(error) => Err(api_failure
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| map_mutation_error(error))),
+        }
+    }
+
     fn reply(
         &self,
         task_id: TaskId,
