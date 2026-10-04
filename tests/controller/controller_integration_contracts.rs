@@ -618,7 +618,7 @@ fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() 
 #[test]
 fn unavailable_execution_rejects_safe_selector_with_zero_durable_mutation_rows() {
     use mac_worker::test_support::{
-        controller::{ControllerFault, ControllerStore, encode_json_frame, serve_rpc_with_runtime},
+        controller::{ControllerStore, encode_json_frame, serve_rpc_with_integration_features},
         core::error::WorkerError,
         core::{config::Config, paths::PathLayout},
         host::process::{ProcessRequest, ProcessResult, ProcessRunner},
@@ -639,13 +639,13 @@ fn unavailable_execution_rejects_safe_selector_with_zero_durable_mutation_rows()
     };
     let config: Config = toml::from_str("version = 1").unwrap();
     let frame = encode_json_frame(&json!({"protocol_version":7,"request_id":"00000000000000000000000000000011", "command":"task.list", "body":{"integration":{"task_ids":[fixture_task()]}}})).unwrap();
-    let error = serve_rpc_with_runtime(
+    let error = serve_rpc_with_integration_features(
         &paths,
         &config,
         &NoProcesses,
         &mut std::io::Cursor::new(frame),
         &mut Vec::new(),
-        ControllerFault::None,
+        &[],
     )
     .unwrap_err();
     assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE", "{error:?}");

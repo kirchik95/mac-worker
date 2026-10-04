@@ -180,6 +180,8 @@ fn copied_baseline_meta_validates_titles_identities_limits_and_followup_records(
 }
 
 fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
+    use std::os::unix::fs::PermissionsExt;
+
     let f = super::session_import_e2e::Fixture::new();
     let origin = f.laptop.parent().unwrap().join("origin.git");
     f.project
@@ -193,14 +195,19 @@ fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
     let mut config = std::fs::read_to_string(&f.config).unwrap();
     config.push_str("capabilities = ['origin:file']\n");
     std::fs::write(&f.config, config).unwrap();
-    if capable {
+    // Keep native probes about the fixture's Git host instead of repeatedly
+    // launching unrelated installed tool version commands under gate load.
+    let tools = f.host_root().join("tool-capabilities.json");
+    std::fs::write(&tools, br#"{"tools":["git"]}"#).unwrap();
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if !capable {
         let ssh = std::fs::read_to_string(&f.ssh).unwrap().replace(
             "probe.update(memory_pressure",
-            "probe['features'].append('task.integration')\n    probe.update(memory_pressure",
+            "probe['features'] = [feature for feature in probe['features'] if feature != 'task.integration']\n    probe.update(memory_pressure",
         );
         std::fs::write(&f.ssh, ssh).unwrap();
-        super::session_import_e2e::warm_executable(&f.ssh);
     }
+    super::session_import_e2e::warm_executable(&f.ssh);
     f
 }
 
@@ -1408,12 +1415,12 @@ fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
     let before = state.load(task).unwrap().unwrap();
     let policy = state.load_policy(task).unwrap().unwrap();
     let ssh = std::fs::read_to_string(&f.ssh).unwrap();
-    assert!(ssh.contains("probe['features'].append('task.integration')"));
+    assert!(ssh.contains("probe.update(memory_pressure"));
     std::fs::write(
         &f.ssh,
         ssh.replace(
-            "probe['features'].append('task.integration')",
-            "pass # previous helper fixture",
+            "probe.update(memory_pressure",
+            "probe['features'] = [feature for feature in probe['features'] if feature != 'task.integration']\n    probe.update(memory_pressure",
         ),
     )
     .unwrap();
@@ -1797,7 +1804,7 @@ impl Drop for ReleaseFixtureFifo {
 fn native_rpc_leader_and_direct_recovery_share_the_detached_git_driver() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
-        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+        controller::{ControllerFault, decode_frame, encode_json_frame, serve_rpc_with_runtime},
         core::config::Config,
         core::error::WorkerError,
         host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -1868,7 +1875,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])"#;
         let rpc=scope.spawn(|| {
             let wire=serde_json::json!({"protocol_version":7,"request_id":uuid::Uuid::new_v4().simple().to_string(),"command":"task.wait.poll","body":{"task_id":task}});
             let input=encode_json_frame(&wire).unwrap(); let mut out=vec![];
-            serve_rpc_with_integration_features(&paths,&config,&runner,&mut std::io::Cursor::new(input),&mut out,&[CONTROLLER_FEATURE_INTEGRATION.into()]).unwrap();
+            serve_rpc_with_runtime(&paths,&config,&runner,&mut std::io::Cursor::new(input),&mut out,ControllerFault::None).unwrap();
             let reply:Value=serde_json::from_slice(decode_frame(&out).unwrap()).unwrap();
             assert_eq!(reply["result"]["quiescent"],false);
         });
