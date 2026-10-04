@@ -1709,6 +1709,154 @@ mod cancel_admission_tests {
 }
 
 #[cfg(test)]
+mod replay_handoff_tests {
+    use super::*;
+    use crate::client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint};
+    use crate::integration::{store::RootedIntegrationState, testing::fixture_task};
+    use crate::job::QueueEntry;
+    use crate::task::{LocalTaskRecord, RunnerIdentity};
+    use std::sync::Mutex;
+
+    struct NoIo;
+    impl ProcessRunner for NoIo {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("queued replay must not perform process I/O");
+        }
+    }
+
+    struct ReplayPublication {
+        ordinary: LocalTaskRecord,
+        active: LocalTaskRecord,
+        entry: QueueEntry,
+    }
+    struct PublishBeforeCas {
+        state: std::path::PathBuf,
+        publication: Mutex<Option<ReplayPublication>>,
+        reached: AtomicBool,
+    }
+    impl ClientStateConcurrencyHook for PublishBeforeCas {
+        fn reach(&self, point: ClientStateConcurrencyPoint) {
+            if point == ClientStateConcurrencyPoint::BeforeTaskMutation
+                && let Some(publication) = self.publication.lock().unwrap().take()
+            {
+                // Publish through the real store before the admitting CAS,
+                // forcing it to reload this same prepared turn as a replay.
+                let client = ClientStateStore::open(&self.state).unwrap();
+                assert!(
+                    client
+                        .update_task_if_current(&publication.ordinary, publication.active)
+                        .unwrap()
+                );
+                client.enqueue(publication.entry).unwrap();
+                self.reached.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct CheckHandoffFence;
+    impl RunnerExecutor for CheckHandoffFence {
+        fn start(
+            &self,
+            paths: &PathLayout,
+            task: TaskId,
+            turn: TurnId,
+        ) -> Result<RunnerIdentity, WorkerError> {
+            let client = ClientStateStore::open(&paths.state).unwrap();
+            assert!(
+                client
+                    .queue_entry_for_task_turn(task)
+                    .unwrap()
+                    .is_some_and(|row| row.job_id() == turn)
+            );
+            let available = auxiliary_admission_fence(paths, task).unwrap().is_some();
+            eprintln!("REPLAY HANDOFF: auxiliary admission fence available={available}");
+            assert!(
+                available,
+                "auxiliary replay must release its admission fence before runner handoff"
+            );
+            Ok(RunnerIdentity::new(
+                crate::turn_runner::current_process_identity().unwrap(),
+            ))
+        }
+    }
+
+    #[test]
+    fn direct_replay_releases_admission_fence_before_runner_handoff() {
+        replay_handoff(false);
+    }
+
+    #[test]
+    fn cas_conflict_replay_releases_admission_fence_before_runner_handoff() {
+        replay_handoff(true);
+    }
+
+    fn replay_handoff(conflict: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+        };
+        let hook = Arc::new(PublishBeforeCas {
+            state: paths.state.clone(),
+            publication: Mutex::new(None),
+            reached: AtomicBool::new(false),
+        });
+        let client =
+            ClientStateStore::open_with_concurrency_hook(&paths.state, hook.clone()).unwrap();
+        let (_state, record, prepared, entry) = native_launch_tests::queued_auxiliary(
+            &paths,
+            &client,
+            crate::controller::leader::now_millis().unwrap() + 600_000,
+        );
+        if conflict {
+            let active = client.load_task(fixture_task()).unwrap();
+            let ordinary = prepared.followup.expected().clone();
+            assert!(client.remove_queued(entry.job_id()).unwrap().is_some());
+            assert!(
+                client
+                    .update_task_if_current(&active, ordinary.clone())
+                    .unwrap()
+            );
+            let mut entry = entry;
+            entry.assign_queue_id(crate::job::QueueId::pending());
+            *hook.publication.lock().unwrap() = Some(ReplayPublication {
+                ordinary,
+                active,
+                entry,
+            });
+        }
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n",
+        )
+        .unwrap();
+        let report = TaskClient::new(&NoIo, &config, &paths, &client, &CheckHandoffFence)
+            .say_integration_prepared(&prepared)
+            .unwrap();
+        assert_eq!(hook.reached.load(Ordering::SeqCst), conflict);
+        assert_eq!(report.status().state(), TaskState::Active);
+        assert_eq!(report.status().turns().len(), 2);
+        assert_eq!(
+            report.status().turns().last().unwrap().turn_id(),
+            prepared.followup.turn_id()
+        );
+        let queue = client.queue_snapshot().unwrap();
+        assert_eq!(queue.entries().len(), 1);
+        assert_eq!(queue.entries()[0].job_id(), prepared.followup.turn_id());
+        let (_, after) = RootedIntegrationState::read_task(&paths, fixture_task()).unwrap();
+        assert_eq!(
+            after.unwrap().snapshot.integration_id,
+            record.snapshot.integration_id
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod native_launch_tests {
     use super::*;
     use crate::{

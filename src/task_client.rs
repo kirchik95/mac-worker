@@ -4543,14 +4543,8 @@ impl<'a> TaskClient<'a> {
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             drop(auxiliary_permit);
-            return self.resume_prepared_followup(
-                prepared,
-                &current,
-                attached,
-                stdout,
-                stderr,
-                admission.is_some(),
-            );
+            return self
+                .resume_prepared_followup(prepared, &current, attached, stdout, stderr, admission);
         }
         let current = self.resolve_followup_intent(prepared, current)?;
         if !operator_revision_matches(&current, expected) {
@@ -4650,24 +4644,14 @@ impl<'a> TaskClient<'a> {
                     .update_task_if_current(&current, rebased.clone())?
                 {
                     drop(auxiliary_permit);
-                    return self.reload_resume_or_conflict(
-                        prepared,
-                        attached,
-                        stdout,
-                        stderr,
-                        admission.is_some(),
-                    );
+                    return self
+                        .reload_resume_or_conflict(prepared, attached, stdout, stderr, admission);
                 }
                 rebased
             } else {
                 drop(auxiliary_permit);
-                return self.reload_resume_or_conflict(
-                    prepared,
-                    attached,
-                    stdout,
-                    stderr,
-                    admission.is_some(),
-                );
+                return self
+                    .reload_resume_or_conflict(prepared, attached, stdout, stderr, admission);
             }
         };
         drop(auxiliary_permit);
@@ -4758,7 +4742,7 @@ impl<'a> TaskClient<'a> {
         attached: bool,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
-        auxiliary: bool,
+        admission: Option<crate::integration::runner::AuxiliaryAdmissionFence>,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
@@ -4770,6 +4754,7 @@ impl<'a> TaskClient<'a> {
         };
         self.validate_materialized_followup(prepared, current, live_last)?;
         if live_last.terminal().is_some() {
+            drop(admission);
             let mut report = self.report_from_record(current)?;
             if attached {
                 self.wait_for_attached_continuation(&mut report, turn_id)?;
@@ -4814,9 +4799,12 @@ impl<'a> TaskClient<'a> {
                 if current.runner().is_some() {
                     return Err(task_error("TASK_BUSY", "task runner is still finishing"));
                 }
-                self.enqueue_prepared_followup(prepared, current, auxiliary)?
+                self.enqueue_prepared_followup(prepared, current, admission.is_some())?
             }
         };
+        // Publication and any compensation are fenced; the surviving queue
+        // row now carries stop evidence through handoff and attached execution.
+        drop(admission);
         let drained = match self.start_runner(task_id, turn_id, attached, false) {
             Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => false,
             Ok(RunnerStart::Drained) => true,
@@ -5033,14 +5021,14 @@ impl<'a> TaskClient<'a> {
         attached: bool,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
-        auxiliary: bool,
+        admission: Option<crate::integration::runner::AuxiliaryAdmissionFence>,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
         let current = self.client_state.load_task(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             return self
-                .resume_prepared_followup(prepared, &current, attached, stdout, stderr, auxiliary);
+                .resume_prepared_followup(prepared, &current, attached, stdout, stderr, admission);
         }
         Err(task_error(
             "TASK_REVISION_CONFLICT",
@@ -10445,7 +10433,7 @@ mod tests {
                 false,
                 &mut Vec::new(),
                 &mut Vec::new(),
-                false,
+                None,
             )
             .unwrap();
         assert_eq!(report.status().turns().len(), 2);
