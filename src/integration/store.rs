@@ -61,8 +61,13 @@ impl IntegrationRecovery {
         Ok(Some(failure))
     }
     pub(crate) fn ready(&self, task: TaskId, now: u64) -> bool {
-        self.failure(task)
-            .is_ok_and(|failure| failure.is_none_or(|failure| failure.retry_at_millis <= now))
+        match self.failure(task) {
+            Ok(failure) => failure.is_none_or(|failure| failure.retry_at_millis <= now),
+            // Restart the normal backoff after replacing an invalid advisory.
+            // If its directory cannot be repaired, it still cannot acquire
+            // permanent authority over the companion we need to reread.
+            Err(error) => self.failed(task, now, &error).is_err(),
+        }
     }
     pub(crate) fn retains_evidence(&self, task: TaskId) -> bool {
         !matches!(self.failure(task), Ok(None))
@@ -89,7 +94,14 @@ impl IntegrationRecovery {
             .map_err(WorkerError::Io)?;
         root.validate_private_regular_binding("recovery.lock", &lock, identity)
             .map_err(WorkerError::Io)?;
-        let old = self.failure(task)?;
+        let old = match self.failure(task) {
+            Ok(old) => old,
+            Err(_) => {
+                // Removing this advisory needs no readable/decodable body.
+                self.succeeded(task)?;
+                None
+            }
+        };
         if old.as_ref().is_some_and(|old| old.retry_at_millis > now) {
             return Ok(());
         }
@@ -111,7 +123,16 @@ impl IntegrationRecovery {
         let Some(dir) = self.directory(false)? else {
             return Ok(());
         };
-        match dir.remove_owned_regular(&format!("{task}.json")) {
+        let name = format!("{task}.json");
+        let binding = match dir.private_entry_identity(&name) {
+            Ok(binding) => binding,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        // This advisory has no authoritative Delete decision to recover.
+        // Exact rooted unlink preserves ownership/inode/no-follow fences and
+        // fsyncs the directory without opening an unreadable file for data.
+        match dir.channel_unlink_exact(&name, binding) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(WorkerError::Io(e)),

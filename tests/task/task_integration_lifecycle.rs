@@ -4086,6 +4086,164 @@ mod review_fixes {
         assert!(!diagnostic.exists());
         assert_eq!(std::fs::read(&pin).unwrap(), b"retain this evidence");
     }
+    fn corrupt_advisory_recovery(native: bool, corruption: &str) {
+        use mac_worker::test_support::{
+            core::config::Config,
+            task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let clock = now.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(clock.load(Ordering::SeqCst))));
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let bad = TaskId::new(uuid::Uuid::from_u128(1));
+        let healthy = TaskId::new(uuid::Uuid::from_u128(2));
+        let mut closed = sample_ordinary(bad, fixture_source());
+        let mut status = serde_json::to_value(closed.status()).unwrap();
+        status["state"] = "closed".into();
+        closed = closed
+            .with_status(serde_json::from_value(status).unwrap())
+            .unwrap();
+        client.create_task(closed).unwrap();
+        let mut bad_record = sample_record(bad, fixture_source(), "main");
+        if native {
+            bad_record.snapshot.state = IntegrationStatus::Blocked;
+            bad_record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            bad_record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Drive,
+                retries: 3,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 1_000,
+            });
+        }
+        state.publish_policy(bad, &bad_record.policy).unwrap();
+        state
+            .replace(bad, IntegrationRevision(0), &bad_record)
+            .unwrap();
+        let bad_path = paths
+            .state
+            .join(format!("integrations/tasks/{bad}/record.json"));
+        std::fs::write(&bad_path, b"{broken").unwrap();
+        let pin = paths
+            .state
+            .join(format!("integrations/tasks/{bad}/retained-proof"));
+        std::fs::write(&pin, b"retain this evidence").unwrap();
+        let ordinary = sample_ordinary(healthy, fixture_source());
+        client.create_task(ordinary.clone()).unwrap();
+        let policy = sample_policy("main");
+        if !native {
+            state.publish_policy(healthy, &policy).unwrap();
+        }
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(IntegrationTaskFacts::from_record(&ordinary, false));
+        observer.insert(IntegrationTaskFacts::from_record(
+            &client.load_task(bad).unwrap(),
+            false,
+        ));
+        let host = FakeIntegrationHost::default();
+        let turns = FakeIntegrationTurns::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        let config = Config::parse("version = 1\n").unwrap();
+        let task_client = TaskClient::new(
+            &NoProbeProcesses,
+            &config,
+            &paths,
+            &client,
+            &InlineRunnerExecutor,
+        );
+        let task_client = if native {
+            task_client
+        } else {
+            task_client.with_integration(&coordinator)
+        };
+        client.bootstrap_active_task_index().unwrap();
+        assert_eq!(
+            client
+                .select_active_task_ids(&ActiveTaskConfig::default())
+                .unwrap()
+                .selected,
+            vec![bad, healthy]
+        );
+        task_client.tick_selected_recovery().unwrap();
+        let diagnostic = paths
+            .state
+            .join(format!("integrations/recovery/{bad}.json"));
+        assert!(diagnostic.exists());
+        std::fs::write(&bad_path, encode_record(&bad_record).unwrap()).unwrap();
+        match corruption {
+            "malformed" => std::fs::write(&diagnostic, b"{broken advisory").unwrap(),
+            "oversized" => std::fs::write(&diagnostic, vec![b'x'; 300_000]).unwrap(),
+            "unreadable" => {
+                std::fs::set_permissions(&diagnostic, std::fs::Permissions::from_mode(0o000))
+                    .unwrap()
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            task_client
+                .integration_parent_gate(&client.load_task(bad).unwrap())
+                .unwrap(),
+            mac_worker::test_support::client_state::dag::ParentGate::Waiting
+        );
+        now.store(3_000, Ordering::SeqCst);
+        task_client.tick_selected_recovery().unwrap();
+        let fresh = std::fs::read(&diagnostic).unwrap();
+        assert!(fresh.len() < 512);
+        let wire: serde_json::Value = serde_json::from_slice(&fresh).unwrap();
+        assert_eq!(wire["failures"], 1);
+        assert_eq!(wire["retry_at_millis"], 5_000);
+        now.store(4_999, Ordering::SeqCst);
+        task_client.tick_selected_recovery().unwrap();
+        assert_eq!(std::fs::read(&diagnostic).unwrap(), fresh);
+        for at in [5_000, 43_000, 1_000_000, 10_000_000] {
+            now.store(at, Ordering::SeqCst);
+            task_client.tick_selected_recovery().unwrap();
+        }
+        assert_eq!(state.load(bad).unwrap().unwrap(), bad_record);
+        assert!(
+            !diagnostic.exists(),
+            "an advisory decode error must allow bounded retry of the repaired authoritative record ({native}, {corruption})"
+        );
+        assert_eq!(std::fs::read(&pin).unwrap(), b"retain this evidence");
+        let gate = task_client
+            .integration_parent_gate(&client.load_task(bad).unwrap())
+            .unwrap();
+        assert_eq!(
+            gate,
+            if native {
+                mac_worker::test_support::client_state::dag::ParentGate::IntegrationFailed
+            } else {
+                mac_worker::test_support::client_state::dag::ParentGate::Waiting
+            }
+        );
+        // Clearing an advisory is not settlement proof for this still-unintegrated parent.
+    }
+
+    #[test]
+    fn review_corrupt_advisory_cannot_permanently_mask_a_repaired_companion() {
+        corrupt_advisory_recovery(false, "malformed");
+    }
+
+    #[test]
+    fn corrupt_advisory_recovery_handles_unreadable_and_oversized_diagnostics() {
+        for corruption in ["unreadable", "oversized"] {
+            corrupt_advisory_recovery(false, corruption);
+        }
+    }
+
+    #[test]
+    fn native_corrupt_advisory_cannot_mask_a_repaired_companion() {
+        for corruption in ["malformed", "unreadable", "oversized"] {
+            corrupt_advisory_recovery(true, corruption);
+        }
+    }
+
     #[derive(Clone)]
     struct CountingInspector(Arc<AtomicUsize>);
     impl mac_worker::test_support::host::supervisor::ProcessInspector for CountingInspector {
