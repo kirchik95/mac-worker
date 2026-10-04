@@ -455,15 +455,23 @@ fn native_read_surfaces_expose_the_same_parked_companion_without_driving_git() {
 }
 
 #[test]
-fn native_legacy_retention_restore_observes_m_or_h_and_imports_without_resurrecting_closed_work() {
-    for (target, parked) in [
-        ("merge", true),
-        ("source", false),
-        ("neither", true),
-        ("failed_then_merge", false),
-    ] {
-        native_legacy_retention_restore_case(target, parked);
-    }
+fn native_legacy_retention_restores_a_retained_merge_without_resurrection() {
+    native_legacy_retention_restore_case("merge", true);
+}
+
+#[test]
+fn native_legacy_retention_restores_a_reachable_source_without_resurrection() {
+    native_legacy_retention_restore_case("source", false);
+}
+
+#[test]
+fn native_legacy_retention_restore_blocks_when_no_retained_result_is_reachable() {
+    native_legacy_retention_restore_case("neither", true);
+}
+
+#[test]
+fn native_legacy_retention_restore_retries_a_failed_observation_then_imports() {
+    native_legacy_retention_restore_case("failed_then_merge", false);
 }
 
 #[test]
@@ -857,91 +865,98 @@ fn native_union_uses_frozen_h_attributes_and_pinned_verification_before_receipt_
 }
 
 #[test]
-fn native_binary_h_attributes_resolve_in_the_same_session_and_verifier_index_tampering_blocks() {
-    for tamper in [false, true] {
-        let attributes = if tamper {
-            "payload.txt merge=union"
-        } else {
-            "payload.txt -merge"
-        };
-        let source =
-            format!("printf '{attributes}\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt");
-        let auxiliary = if tamper {
-            "printf 'changed\\n' > payload.txt\n/usr/bin/git add payload.txt"
-        } else {
-            "printf 'resolved\\n' > payload.txt\n/usr/bin/git add payload.txt"
-        };
-        let (f, task) = configured_parked_source_fixture(
-            if tamper { "moved-target" } else { "never" },
-            |f| {
-                f.project
-                    .write(".gitattributes", b"payload.txt merge=union\n");
-                f.project.write("payload.txt", b"base\n");
-                f.project.commit_all("attribute base");
-                f.project.git(&["push", "origin", "HEAD:main"]);
-            },
-            &source,
-            auxiliary,
+fn native_binary_h_attributes_resolve_in_the_same_session() {
+    native_attribute_resolution_case(false);
+}
+
+#[test]
+fn native_verifier_index_tampering_blocks_before_push() {
+    native_attribute_resolution_case(true);
+}
+
+fn native_attribute_resolution_case(tamper: bool) {
+    let attributes = if tamper {
+        "payload.txt merge=union"
+    } else {
+        "payload.txt -merge"
+    };
+    let source =
+        format!("printf '{attributes}\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt");
+    let auxiliary = if tamper {
+        "printf 'changed\\n' > payload.txt\n/usr/bin/git add payload.txt"
+    } else {
+        "printf 'resolved\\n' > payload.txt\n/usr/bin/git add payload.txt"
+    };
+    let (f, task) = configured_parked_source_fixture(
+        if tamper { "moved-target" } else { "never" },
+        |f| {
+            f.project
+                .write(".gitattributes", b"payload.txt merge=union\n");
+            f.project.write("payload.txt", b"base\n");
+            f.project.commit_all("attribute base");
+            f.project.git(&["push", "origin", "HEAD:main"]);
+        },
+        &source,
+        auxiliary,
+    );
+    f.project.write("payload.txt", b"theirs\n");
+    f.project.commit_all("outside target");
+    f.project.git(&["push", "origin", "HEAD:main"]);
+    let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    if tamper {
+        let wait = f.worker(&[
+            "--json",
+            "task",
+            "wait",
+            "--task-id",
+            &task.to_string(),
+            "--timeout",
+            "60s",
+        ]);
+        assert!(
+            !wait.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wait.stdout)
         );
-        f.project.write("payload.txt", b"theirs\n");
-        f.project.commit_all("outside target");
-        f.project.git(&["push", "origin", "HEAD:main"]);
-        let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
-        assert!(f.worker(&["controller", "drain", "--off"]).status.success());
-        if tamper {
-            let wait = f.worker(&[
-                "--json",
-                "task",
-                "wait",
-                "--task-id",
-                &task.to_string(),
-                "--timeout",
-                "60s",
-            ]);
-            assert!(
-                !wait.status.success(),
-                "{}",
-                String::from_utf8_lossy(&wait.stdout)
-            );
-            let owner = RootedIntegrationState::open(
-                &owner_paths(&f),
-                std::sync::Arc::new(ManualIntegrationRuntime::default()),
-            )
-            .unwrap();
-            let blocked = owner.load(task).unwrap().unwrap();
-            assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
-            assert_eq!(
-                blocked.snapshot.blocked_code,
-                Some(IntegrationCode::IntegrationVerifyTreeMismatch)
-            );
-            assert_eq!(
-                f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
-                target
-            );
-        } else {
-            let done = wait_integrated(&f, task);
-            assert_eq!(done.snapshot.resolve_turns, 1);
-            assert_eq!(done.snapshot.verify_turns, 0);
-            let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
-            assert_eq!(
-                f.project
-                    .git(&["show", &format!("{merge}:payload.txt")])
-                    .stdout,
-                b"resolved\n"
-            );
-            assert!(done.receipt.as_ref().unwrap().imported);
-        }
-        let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
-        assert_eq!(journal.matches("host task-prepare\n").count(), 1);
-        assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+        let owner = RootedIntegrationState::open(
+            &owner_paths(&f),
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let blocked = owner.load(task).unwrap().unwrap();
+        assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
         assert_eq!(
-            std::fs::read_to_string(f.host.join("placed-files"))
-                .unwrap()
-                .lines()
-                .count(),
-            1
+            blocked.snapshot.blocked_code,
+            Some(IntegrationCode::IntegrationVerifyTreeMismatch)
         );
+        assert_eq!(
+            f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
+            target
+        );
+    } else {
+        let done = wait_integrated(&f, task);
+        assert_eq!(done.snapshot.resolve_turns, 1);
+        assert_eq!(done.snapshot.verify_turns, 0);
+        let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
+        assert_eq!(
+            f.project
+                .git(&["show", &format!("{merge}:payload.txt")])
+                .stdout,
+            b"resolved\n"
+        );
+        assert!(done.receipt.as_ref().unwrap().imported);
     }
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(journal.matches("host task-prepare\n").count(), 1);
+    assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(f.host.join("placed-files"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 struct RunningDashboard(std::process::Child);
