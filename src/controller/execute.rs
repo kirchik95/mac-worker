@@ -1010,11 +1010,8 @@ pub fn serve_rpc_with_execution(
         let runtime: std::sync::Arc<dyn EventRuntime> = std::sync::Arc::new(RpcEventRuntime);
         let deadline = runtime.now().saturating_add(RPC_BUDGET);
         let journal = ExistingJournalProvider::new(paths.clone(), runtime.clone());
-        let tasks = ExistingTaskProjectionProvider::new(paths.clone(), runtime).with_integrations(
-            std::sync::Arc::new(crate::integration::store::ExistingIntegrationState::new(
-                paths,
-            )),
-        );
+        let tasks =
+            ExistingTaskProjectionProvider::new(paths.clone(), runtime).with_native_integrations();
         serve_selector_with(&request, &journal, &tasks, deadline)?
     } else if crate::controller::health_read::is_health_read(&request) {
         crate::controller::health_read::serve_health_read_with_paths(

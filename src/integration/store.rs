@@ -144,12 +144,30 @@ fn open_existing_root(state: &std::path::Path) -> Result<Option<Arc<RootedDir>>,
     let path = state.join("integrations");
     // Absence is the disabled fast path. It performs no rooted traversal,
     // creates nothing and is checked once by each batch reader.
+    #[cfg(test)]
+    read_cost_counters::before_metadata_call();
     match std::fs::symlink_metadata(&path) {
         Ok(_) => RootedDir::open_anchored_absolute(&path)
             .map(|root| Some(Arc::new(root)))
             .map_err(WorkerError::Io),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(WorkerError::Io(error)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod read_cost_counters {
+    thread_local! {
+        static METADATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) fn before_metadata_call() {
+        METADATA_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+    pub(crate) fn reset() {
+        METADATA_CALLS.with(|calls| calls.set(0));
+    }
+    pub(crate) fn calls() -> usize {
+        METADATA_CALLS.with(std::cell::Cell::get)
     }
 }
 
