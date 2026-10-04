@@ -1416,6 +1416,14 @@ impl<'a> TaskClient<'a> {
     /// Stop intent is durable before transport. Neither a remote cancel reply
     /// nor a dead PID substitutes for journal/queue retirement.
     pub(crate) fn settle_integration_stop(&self, task: TaskId) -> Result<bool, WorkerError> {
+        // The revoke tombstone is already durable. A live pre-queue admission
+        // must finish publication or compensation before stop can acknowledge.
+        let _hints = self.client_state.event_scope();
+        let Some(_admission) =
+            crate::integration::runner::auxiliary_admission_fence(self.paths, task)?
+        else {
+            return Ok(false);
+        };
         let record = self.client_state.load_task(task)?;
         if let Some(entry) = self.client_state.queue_entry_for_task_turn(task)? {
             let entry = self
@@ -1462,6 +1470,16 @@ impl<'a> TaskClient<'a> {
                 return Ok(false);
             }
             self.client_state.record_runner(task, None)?;
+        }
+        if record.status().state() == TaskState::Active
+            && let Some(turn) = record.status().turns().last()
+            && turn.terminal().is_none()
+            && let Some(auxiliary) =
+                RootedIntegrationState::read_auxiliary(self.paths, task, turn.turn_id())?
+        {
+            // Active plus its prepared binding is durable stop evidence even
+            // if the admitting process crashed before publishing a queue row.
+            return self.rollback_unqueued_auxiliary(&auxiliary.followup);
         }
         Ok(true)
     }
@@ -4476,6 +4494,17 @@ impl<'a> TaskClient<'a> {
             ));
         }
         prepared.validate_self_consistency()?;
+        let auxiliary = RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?;
+        // Keep deferred hints outside the new publication fence as well as
+        // the existing state, queue and journal fences. Ordinary Say is inert.
+        let _hints = auxiliary.as_ref().map(|_| self.client_state.event_scope());
+        let admission = auxiliary
+            .as_ref()
+            .map(|_| {
+                crate::integration::runner::auxiliary_admission_fence(self.paths, task_id)?
+                    .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())
+            })
+            .transpose()?;
         let Some(auxiliary_permit) = crate::integration::runner::auxiliary_launch_permit(
             self.paths,
             self.client_state,
@@ -4487,9 +4516,7 @@ impl<'a> TaskClient<'a> {
         };
         let current = self.client_state.load_task(task_id)?;
         // Auxiliary admission has its own authoritative, persisted wrapper.
-        if let Some(auxiliary) =
-            RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?
-        {
+        if let Some(auxiliary) = auxiliary {
             if &auxiliary.followup != prepared {
                 return Err(IntegrationCode::IntegrationStateInvalid.error());
             }
@@ -4516,7 +4543,14 @@ impl<'a> TaskClient<'a> {
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
             drop(auxiliary_permit);
-            return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
+            return self.resume_prepared_followup(
+                prepared,
+                &current,
+                attached,
+                stdout,
+                stderr,
+                admission.is_some(),
+            );
         }
         let current = self.resolve_followup_intent(prepared, current)?;
         if !operator_revision_matches(&current, expected) {
@@ -4616,12 +4650,24 @@ impl<'a> TaskClient<'a> {
                     .update_task_if_current(&current, rebased.clone())?
                 {
                     drop(auxiliary_permit);
-                    return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
+                    return self.reload_resume_or_conflict(
+                        prepared,
+                        attached,
+                        stdout,
+                        stderr,
+                        admission.is_some(),
+                    );
                 }
                 rebased
             } else {
                 drop(auxiliary_permit);
-                return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
+                return self.reload_resume_or_conflict(
+                    prepared,
+                    attached,
+                    stdout,
+                    stderr,
+                    admission.is_some(),
+                );
             }
         };
         drop(auxiliary_permit);
@@ -4630,8 +4676,9 @@ impl<'a> TaskClient<'a> {
             Some(_) => {
                 return Err(task_error("TASK_BUSY", "previous turn is still finalizing"));
             }
-            None => self.enqueue_prepared_followup(prepared, expected)?,
+            None => self.enqueue_prepared_followup(prepared, expected, admission.is_some())?,
         };
+        drop(admission);
         let drained = match self.start_runner(task_id, turn_id, attached, false) {
             Ok(RunnerStart::Started(_)) | Ok(RunnerStart::Pending) => false,
             Ok(RunnerStart::Drained) => true,
@@ -4711,6 +4758,7 @@ impl<'a> TaskClient<'a> {
         attached: bool,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
+        auxiliary: bool,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
@@ -4766,7 +4814,7 @@ impl<'a> TaskClient<'a> {
                 if current.runner().is_some() {
                     return Err(task_error("TASK_BUSY", "task runner is still finishing"));
                 }
-                self.enqueue_prepared_followup(prepared, current)?
+                self.enqueue_prepared_followup(prepared, current, auxiliary)?
             }
         };
         let drained = match self.start_runner(task_id, turn_id, attached, false) {
@@ -4985,12 +5033,14 @@ impl<'a> TaskClient<'a> {
         attached: bool,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
+        auxiliary: bool,
     ) -> Result<TaskReport, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
         let current = self.client_state.load_task(task_id)?;
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
-            return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
+            return self
+                .resume_prepared_followup(prepared, &current, attached, stdout, stderr, auxiliary);
         }
         Err(task_error(
             "TASK_REVISION_CONFLICT",
@@ -5018,10 +5068,11 @@ impl<'a> TaskClient<'a> {
         &self,
         prepared: &PreparedFollowup,
         record: &LocalTaskRecord,
+        auxiliary: bool,
     ) -> Result<QueueEntry, WorkerError> {
         let task_id = prepared.task_id();
         let turn_id = prepared.turn_id();
-        match self.enqueue_followup(record, turn_id, prepared.worker().to_owned()) {
+        let result = match self.enqueue_followup(record, turn_id, prepared.worker().to_owned()) {
             Ok(entry) => Ok(entry),
             Err(error) if error.public_code() == "QUEUE_JOB_CONFLICT" => {
                 let current = self.client_state.load_task(task_id)?;
@@ -5048,7 +5099,53 @@ impl<'a> TaskClient<'a> {
                 Err(error)
             }
             Err(error) => Err(error),
+        };
+        if result.is_err() && auxiliary && !self.rollback_unqueued_auxiliary(prepared)? {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
         }
+        result
+    }
+
+    /// Caller holds the auxiliary admission fence. Compensate only the exact
+    /// prepared, unaccepted turn with neither queue nor runner authority.
+    fn rollback_unqueued_auxiliary(
+        &self,
+        prepared: &PreparedFollowup,
+    ) -> Result<bool, WorkerError> {
+        let task = prepared.task_id();
+        let turn = prepared.turn_id();
+        let Some(log) = crate::runner_log::RunnerLog::try_open(&self.paths.state, task, turn)?
+        else {
+            return Ok(false);
+        };
+        if log.is_accepted() || log.completion().is_some() {
+            return Ok(false);
+        }
+        let current = self.client_state.load_task(task)?;
+        if current.status().state() != TaskState::Active {
+            return Ok(true);
+        }
+        if current.runner().is_some()
+            || self.client_state.queue_entry_for_task_turn(task)?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(last) = current.status().turns().last() else {
+            return Ok(false);
+        };
+        if last.turn_id() != turn || last.terminal().is_some() {
+            return Ok(false);
+        }
+        self.validate_materialized_followup(prepared, &current, last)?;
+        let restored = current.with_status(prepared.expected().status().clone())?;
+        if !self
+            .client_state
+            .update_task_if_current(&current, restored)?
+        {
+            return Ok(false);
+        }
+        self.client_state.remove_turn_prompt(task, turn)?;
+        Ok(true)
     }
 
     /// The live runner of a queued task only waits for capacity. Close cancels
@@ -10342,7 +10439,14 @@ mod tests {
             &crate::turn_runner::InlineRunnerExecutor,
         );
         let report = client
-            .resume_prepared_followup(&prepared, &saved, false, &mut Vec::new(), &mut Vec::new())
+            .resume_prepared_followup(
+                &prepared,
+                &saved,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                false,
+            )
             .unwrap();
         assert_eq!(report.status().turns().len(), 2);
         assert_eq!(report.status().turns().last().unwrap().turn_id(), turn_n);
