@@ -282,7 +282,7 @@ fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "60s",
+        "120s",
     ]);
     assert!(
         wait.status.success(),
@@ -920,7 +920,7 @@ fn native_attribute_resolution_case(tamper: bool) {
             "--task-id",
             &task.to_string(),
             "--timeout",
-            "60s",
+            "120s",
         ]);
         assert!(
             !wait.status.success(),
@@ -1510,7 +1510,7 @@ fn native_wait_returns_the_blocked_code_after_successful_source_import() {
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "60s",
+        "120s",
     ]);
     assert_eq!(
         wait.status.code(),
@@ -1600,7 +1600,7 @@ printf '%s\n' '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000
         "--run",
         &run.to_string(),
         "--timeout",
-        "90s",
+        "120s",
     ]);
     assert!(
         wait.status.success(),
@@ -2018,7 +2018,7 @@ fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> Inte
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "60s",
+        "120s",
     ]);
     assert!(
         wait.status.success(),
@@ -2328,7 +2328,7 @@ printf '%s\n' "$@" > "$HOME/argv""#,
 
 #[test]
 fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
-    use mac_worker::test_support::client_state::ClientStateStore;
+    use mac_worker::test_support::{client_state::ClientStateStore, host::store::HostStore};
     use std::io::Read;
     let RunningAuxiliaryFixture {
         f,
@@ -2345,29 +2345,40 @@ fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
         .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
         .stdout;
     let cancel = f.worker(&["--json", "task", "cancel", &task.to_string()]);
-    assert!(
-        !cancel.status.success(),
-        "a live auxiliary was acknowledged as cancelled"
-    );
-    assert!(String::from_utf8_lossy(&cancel.stdout).contains("INTEGRATION_STOP_UNCONFIRMED"));
     let client = ClientStateStore::open(&owner_paths(&f).state).unwrap();
     let owner = RootedIntegrationState::open(
         &owner_paths(&f),
         std::sync::Arc::new(ManualIntegrationRuntime::default()),
     )
     .unwrap();
-    let pending = owner.load(task).unwrap().unwrap();
-    assert!(
-        pending
-            .tombstone
-            .as_ref()
-            .is_some_and(|stop| !stop.acknowledged)
-    );
-    if let Some(entry) = client.queue_entry_for_task_turn(task).unwrap() {
-        assert!(
-            entry.is_cancel_requested(),
-            "stop did not reach the live auxiliary queue"
-        );
+    let assert_retired = || {
+        let local = client.load_task(task).unwrap();
+        assert!(local.runner().is_none());
+        assert!(client.queue_entry_for_task_turn(task).unwrap().is_none());
+        let host = HostStore::open(&f.host_root()).unwrap();
+        let status = host.task_status(local.meta().project_id(), task).unwrap();
+        assert_eq!(status.state(), TaskState::Open);
+        assert_eq!(status.last_outcome(), Some(&TaskOutcome::Cancelled));
+        let stopped = owner.load(task).unwrap().unwrap();
+        assert_eq!(stopped.snapshot.state, IntegrationStatus::Revoked);
+        assert!(stopped.tombstone.unwrap().acknowledged);
+    };
+    if cancel.status.success() {
+        // A runner may finish durable retirement before the first reply, even
+        // while its process is still unwinding without turn authority.
+        assert_retired();
+    } else {
+        assert_eq!(cancel.status.code(), Some(69));
+        assert!(String::from_utf8_lossy(&cancel.stdout).contains("INTEGRATION_STOP_UNCONFIRMED"));
+        assert!(owner.load(task).unwrap().unwrap().tombstone.is_some());
+        // Retirement can also finish between an unconfirmed reply and this
+        // sample. Only a surviving queue row must retain the cancel intent.
+        if let Some(entry) = client.queue_entry_for_task_turn(task).unwrap() {
+            assert!(
+                entry.is_cancel_requested(),
+                "stop did not reach the live auxiliary queue"
+            );
+        }
     }
     let wait = f.worker(&[
         "--json",
@@ -2388,19 +2399,34 @@ fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
     assert!(settled.tombstone.unwrap().acknowledged);
     assert!(client.queue_entry_for_task_turn(task).unwrap().is_none());
     assert!(client.load_task(task).unwrap().runner().is_none());
+    assert_retired();
     assert_eq!(
         f.project
             .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
             .stdout,
         origin_before
     );
-    assert_eq!(std::fs::read(source).unwrap(), original);
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    let reconcile = f.worker(&["--json", "task", "reconcile"]);
+    assert!(reconcile.status.success());
+    assert_retired();
     let close = f.worker(&["--json", "task", "close", &task.to_string(), "--discard"]);
     assert!(
         close.status.success(),
         "{}",
         String::from_utf8_lossy(&close.stdout)
     );
+    assert_eq!(
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout,
+        origin_before,
+        "recovery or close pushed after acknowledged cancellation"
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(journal.matches("host task-turn\n").count(), 1);
+    assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
 }
 
 #[test]

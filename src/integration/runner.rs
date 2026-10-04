@@ -1080,6 +1080,28 @@ fn write(root: &RootedDir, name: &str, bytes: &[u8], exact: bool) -> Result<(), 
 fn driver_lock(root: &RootedDir, nonblocking: bool) -> Result<Option<File>, WorkerError> {
     private_lock(root, "driver.lock", nonblocking)
 }
+
+/// Admission keeps this boundary until its Active record has a queue row or
+/// has been compensated. Stop settlement takes the same nonblocking fence.
+pub(crate) struct AuxiliaryAdmissionFence {
+    _lock: File,
+    _root: RootedDir,
+}
+pub(crate) fn auxiliary_admission_fence(
+    paths: &PathLayout,
+    task: TaskId,
+) -> Result<Option<AuxiliaryAdmissionFence>, WorkerError> {
+    let root = task_root(paths, task)?;
+    Ok(
+        private_lock(&root, "auxiliary-admission.lock", true)?.map(|lock| {
+            AuxiliaryAdmissionFence {
+                _lock: lock,
+                _root: root,
+            }
+        }),
+    )
+}
+
 fn private_lock(
     root: &RootedDir,
     name: &str,
@@ -1394,6 +1416,443 @@ impl<'a> IntegrationRunner<'a> {
             }
         }
         Ok(snapshot)
+    }
+}
+
+#[cfg(test)]
+mod cancel_admission_tests {
+    use super::*;
+    use crate::client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint};
+    use crate::integration::{store::RootedIntegrationState, testing::*};
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AdmissionWindow {
+        BeforeActive,
+        BeforeQueue,
+    }
+
+    struct AdmissionPause {
+        window: AdmissionWindow,
+        armed: AtomicBool,
+        entered: mpsc::Sender<()>,
+        released: Mutex<bool>,
+        release: Condvar,
+    }
+    impl AdmissionPause {
+        fn pause(&self) -> bool {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.send(()).unwrap();
+                let (released, _) = self
+                    .release
+                    .wait_timeout_while(
+                        self.released.lock().unwrap(),
+                        Duration::from_secs(15),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(*released, "admission barrier timed out");
+                return true;
+            }
+            false
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release.notify_all();
+        }
+    }
+    impl ClientStateConcurrencyHook for AdmissionPause {
+        fn reach(&self, point: ClientStateConcurrencyPoint) {
+            if self.window == AdmissionWindow::BeforeActive
+                && point == ClientStateConcurrencyPoint::BeforeTaskMutation
+            {
+                self.pause();
+            }
+        }
+    }
+
+    // Project inspection is the first external call after the real Active CAS
+    // and before queue publication. Pause there without holding a state lock.
+    struct NoIo {
+        pause: Arc<AdmissionPause>,
+        crash: bool,
+    }
+    impl ProcessRunner for NoIo {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            let parked = self.pause.window == AdmissionWindow::BeforeQueue && self.pause.pause();
+            assert!(
+                !(self.crash && parked),
+                "simulated admission crash after Active publication"
+            );
+            Err(WorkerError::task(
+                "PROBE_NO_IO",
+                "admission probe forbids external I/O",
+            ))
+        }
+    }
+    struct NoSpawn;
+    impl RunnerExecutor for NoSpawn {
+        fn start(
+            &self,
+            _: &PathLayout,
+            _: TaskId,
+            _: TurnId,
+        ) -> Result<crate::task::RunnerIdentity, WorkerError> {
+            panic!("revoked auxiliary reached the executor")
+        }
+    }
+
+    // The preacceptance host reply is gated by the REAL local stop predicate.
+    struct RetiredHost<'a> {
+        local: TaskClient<'a>,
+    }
+    impl IntegrationHost for RetiredHost<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            request.validate()?;
+            assert!(matches!(
+                request.action,
+                HostIntegrationAction::Revoke { .. }
+            ));
+            if !self.local.settle_integration_stop(request.task_id)? {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+            Ok(HostIntegrationResponse::Revoked {
+                identity: IntegrationResponseIdentity::for_request(request),
+            })
+        }
+    }
+
+    #[test]
+    fn cancel_ack_must_fence_auxiliary_active_record_publication() {
+        cancel_admission_race(AdmissionWindow::BeforeActive, false);
+    }
+
+    #[test]
+    fn cancel_ack_must_fence_auxiliary_queue_publication() {
+        cancel_admission_race(AdmissionWindow::BeforeQueue, false);
+    }
+
+    #[test]
+    fn cancelled_unqueued_auxiliary_is_rolled_back_after_admission_crash() {
+        cancel_admission_race(AdmissionWindow::BeforeQueue, true);
+    }
+
+    fn cancel_admission_race(window: AdmissionWindow, crash: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+        };
+        let (entered, waiting) = mpsc::channel();
+        let pause = Arc::new(AdmissionPause {
+            window,
+            armed: AtomicBool::new(false),
+            entered,
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        });
+        let client =
+            ClientStateStore::open_with_concurrency_hook(&paths.state, pause.clone()).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        client.create_task(ordinary.clone()).unwrap();
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n",
+        )
+        .unwrap();
+        let runtime = Arc::new(OwnerRuntime::new(&paths, &client).unwrap());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = IntegrationStatus::Resolving;
+        record.snapshot.attempts = 1;
+        record.snapshot.resolve_turns = 1;
+        record.followups_spent = 1;
+        let mut candidate = sample_candidate(&record);
+        candidate.merge_oid = None;
+        candidate.tree_oid = None;
+        candidate.conflict_paths = vec!["README".into()];
+        record.candidates.push(candidate);
+        let prepared = PreparedIntegrationTurn::prepare(
+            &ordinary,
+            &record,
+            IntegrationTurnPurpose::Resolve,
+            1,
+            1,
+        )
+        .unwrap();
+        record.auxiliaries.push(prepared.intent().unwrap());
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        state.publish_prepared(record.task_id, &prepared).unwrap();
+        let io = NoIo {
+            pause: pause.clone(),
+            crash,
+        };
+        let host = RetiredHost {
+            local: TaskClient::new(&io, &config, &paths, &client, &NoSpawn),
+        };
+        let source = OwnerSource {
+            paths: &paths,
+            client: &client,
+        };
+        let turns = FakeIntegrationTurns::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &source)
+                .with_owner_gate(&paths);
+        pause.armed.store(true, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            let admission = scope.spawn(|| {
+                TaskClient::new(&io, &config, &paths, &client, &NoSpawn)
+                    .say_integration_prepared(&prepared)
+            });
+            let reached = waiting.recv_timeout(Duration::from_secs(10));
+            if reached.is_err() {
+                pause.release();
+                panic!(
+                    "auxiliary missed its publication barrier: {:?}",
+                    admission.join()
+                );
+            }
+            let cancel = TaskClient::new(&io, &config, &paths, &client, &NoSpawn)
+                .with_integration(&coordinator)
+                .cancel(record.task_id);
+            let at_reply = client.load_task(record.task_id).unwrap();
+            let stopped = state.load(record.task_id).unwrap().unwrap();
+            let queue_at_reply = client.queue_entry_for_task_turn(record.task_id).unwrap();
+            let fresh = TaskClient::new(&io, &config, &paths, &client, &NoSpawn)
+                .say_integration_prepared(&prepared);
+            let launch = auxiliary_launch_permit(
+                &paths,
+                &client,
+                record.task_id,
+                prepared.followup.turn_id(),
+            );
+            let fresh_code = fresh.err().map(|error| error.public_code().to_owned());
+            let launch_code = launch.err().map(|error| error.public_code().to_owned());
+            pause.release();
+            let admission = admission.join();
+            let after = client.load_task(record.task_id).unwrap();
+            eprintln!(
+                "cancel={:?} at_reply={:?}/{} acknowledged={} after={:?}/{} crash={crash}",
+                cancel.as_ref().err().map(|error| error.public_code()),
+                at_reply.status().state(),
+                at_reply.status().turns().len(),
+                stopped
+                    .tombstone
+                    .as_ref()
+                    .is_some_and(|stop| stop.acknowledged),
+                after.status().state(),
+                after.status().turns().len(),
+            );
+            assert!(queue_at_reply.is_none() && at_reply.runner().is_none());
+            assert_eq!(fresh_code.as_deref(), Some("TASK_BUSY"));
+            assert_eq!(launch_code.as_deref(), Some("INTEGRATION_STOP_UNCONFIRMED"));
+            match cancel {
+                Ok(_) => {
+                    assert_eq!(stopped.snapshot.state, IntegrationStatus::Revoked);
+                    assert!(stopped.tombstone.as_ref().unwrap().acknowledged);
+                    assert_eq!(at_reply, ordinary);
+                    assert_eq!(
+                        after, at_reply,
+                        "an acknowledged cancellation must fence delayed auxiliary admission"
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+                    assert!(!stopped.tombstone.as_ref().unwrap().acknowledged);
+                }
+            }
+            if crash {
+                assert!(admission.is_err());
+                assert_eq!(after.status().state(), TaskState::Active);
+                assert_eq!(after.status().turns().len(), 2);
+            } else {
+                assert!(admission.unwrap().is_err());
+                assert_eq!(
+                    after, ordinary,
+                    "failed unqueued admission must restore the source"
+                );
+            }
+            // Retrying stop must compensate even an admission whose process
+            // died after publishing Active, before releasing acknowledgement.
+            TaskClient::new(&io, &config, &paths, &client, &NoSpawn)
+                .with_integration(&coordinator)
+                .cancel(record.task_id)
+                .unwrap();
+            assert_eq!(client.load_task(record.task_id).unwrap(), ordinary);
+            assert!(
+                client
+                    .queue_entry_for_task_turn(record.task_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let settled = state.load(record.task_id).unwrap().unwrap();
+            assert_eq!(settled.snapshot.state, IntegrationStatus::Revoked);
+            assert!(settled.tombstone.unwrap().acknowledged);
+        });
+    }
+}
+
+#[cfg(test)]
+mod replay_handoff_tests {
+    use super::*;
+    use crate::client_state::{ClientStateConcurrencyHook, ClientStateConcurrencyPoint};
+    use crate::integration::{store::RootedIntegrationState, testing::fixture_task};
+    use crate::job::QueueEntry;
+    use crate::task::{LocalTaskRecord, RunnerIdentity};
+    use std::sync::Mutex;
+
+    struct NoIo;
+    impl ProcessRunner for NoIo {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("queued replay must not perform process I/O");
+        }
+    }
+
+    struct ReplayPublication {
+        ordinary: LocalTaskRecord,
+        active: LocalTaskRecord,
+        entry: QueueEntry,
+    }
+    struct PublishBeforeCas {
+        state: std::path::PathBuf,
+        publication: Mutex<Option<ReplayPublication>>,
+        reached: AtomicBool,
+    }
+    impl ClientStateConcurrencyHook for PublishBeforeCas {
+        fn reach(&self, point: ClientStateConcurrencyPoint) {
+            if point == ClientStateConcurrencyPoint::BeforeTaskMutation
+                && let Some(publication) = self.publication.lock().unwrap().take()
+            {
+                // Publish through the real store before the admitting CAS,
+                // forcing it to reload this same prepared turn as a replay.
+                let client = ClientStateStore::open(&self.state).unwrap();
+                assert!(
+                    client
+                        .update_task_if_current(&publication.ordinary, publication.active)
+                        .unwrap()
+                );
+                client.enqueue(publication.entry).unwrap();
+                self.reached.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct CheckHandoffFence;
+    impl RunnerExecutor for CheckHandoffFence {
+        fn start(
+            &self,
+            paths: &PathLayout,
+            task: TaskId,
+            turn: TurnId,
+        ) -> Result<RunnerIdentity, WorkerError> {
+            let client = ClientStateStore::open(&paths.state).unwrap();
+            assert!(
+                client
+                    .queue_entry_for_task_turn(task)
+                    .unwrap()
+                    .is_some_and(|row| row.job_id() == turn)
+            );
+            let available = auxiliary_admission_fence(paths, task).unwrap().is_some();
+            eprintln!("REPLAY HANDOFF: auxiliary admission fence available={available}");
+            assert!(
+                available,
+                "auxiliary replay must release its admission fence before runner handoff"
+            );
+            Ok(RunnerIdentity::new(
+                crate::turn_runner::current_process_identity().unwrap(),
+            ))
+        }
+    }
+
+    #[test]
+    fn direct_replay_releases_admission_fence_before_runner_handoff() {
+        replay_handoff(false);
+    }
+
+    #[test]
+    fn cas_conflict_replay_releases_admission_fence_before_runner_handoff() {
+        replay_handoff(true);
+    }
+
+    fn replay_handoff(conflict: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+        };
+        let hook = Arc::new(PublishBeforeCas {
+            state: paths.state.clone(),
+            publication: Mutex::new(None),
+            reached: AtomicBool::new(false),
+        });
+        let client =
+            ClientStateStore::open_with_concurrency_hook(&paths.state, hook.clone()).unwrap();
+        let (_state, record, prepared, entry) = native_launch_tests::queued_auxiliary(
+            &paths,
+            &client,
+            crate::controller::leader::now_millis().unwrap() + 600_000,
+        );
+        if conflict {
+            let active = client.load_task(fixture_task()).unwrap();
+            let ordinary = prepared.followup.expected().clone();
+            assert!(client.remove_queued(entry.job_id()).unwrap().is_some());
+            assert!(
+                client
+                    .update_task_if_current(&active, ordinary.clone())
+                    .unwrap()
+            );
+            let mut entry = entry;
+            entry.assign_queue_id(crate::job::QueueId::pending());
+            *hook.publication.lock().unwrap() = Some(ReplayPublication {
+                ordinary,
+                active,
+                entry,
+            });
+        }
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'fixture.invalid'\nslots = 1\n",
+        )
+        .unwrap();
+        let report = TaskClient::new(&NoIo, &config, &paths, &client, &CheckHandoffFence)
+            .say_integration_prepared(&prepared)
+            .unwrap();
+        assert_eq!(hook.reached.load(Ordering::SeqCst), conflict);
+        assert_eq!(report.status().state(), TaskState::Active);
+        assert_eq!(report.status().turns().len(), 2);
+        assert_eq!(
+            report.status().turns().last().unwrap().turn_id(),
+            prepared.followup.turn_id()
+        );
+        let queue = client.queue_snapshot().unwrap();
+        assert_eq!(queue.entries().len(), 1);
+        assert_eq!(queue.entries()[0].job_id(), prepared.followup.turn_id());
+        let (_, after) = RootedIntegrationState::read_task(&paths, fixture_task()).unwrap();
+        assert_eq!(
+            after.unwrap().snapshot.integration_id,
+            record.snapshot.integration_id
+        );
     }
 }
 

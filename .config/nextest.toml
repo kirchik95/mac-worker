@@ -16,6 +16,8 @@ stress = { max-threads = 1 }
 # Real fork, signal and process-group tests. Keep a few in flight so they do not
 # starve each other of time slices around their deadlines.
 fork_heavy = { max-threads = 4 }
+# Native integration cycles share CPU with Git, workers and auxiliary turns.
+native_integration = { max-threads = 2 }
 
 [[profile.default.overrides]]
 filter = 'test(/_stress$/)'
@@ -27,6 +29,19 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 # unit tests such as supervisor::tests::*.
 filter = '(binary(host) | binary(task)) & test(/^(supervisor|job_queries|task_turn)::/)'
 test-group = 'fork_heavy'
+
+[[profile.default.overrides]]
+filter = '''
+  (binary(task) & test(/^task_integration_direct::/))
+  | (binary(controller) & (
+    test(/^controller_integration_wiring::native_controller_shutdown_preserves_undrained_dispatch_across_restart$/)
+    | test(/^controller_integration_wiring::verified_nested_source_keeps_request_pins_and_retires_the_unadopted_task_pin$/)
+    | test(/^controller_integration_wiring::acknowledged_nested_wrapper_releases_both_pins_and_replays_without_recapture$/)
+    | test(/^controller_integration_wiring::host_command_arms_the_prepared_task_without_running_a_merge$/)
+    | test(/^controller_integration_wiring::fetch_only_integrating_batch_freezes_own_origin_before_any_task_effect$/)
+  ))
+'''
+test-group = 'native_integration'
 
 [profile.ci]
 fail-fast = false
