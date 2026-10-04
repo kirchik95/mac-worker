@@ -2,7 +2,7 @@
 
 > **Local sources:** briefs, reports and logs cited below are in `.briefs/`, an excluded working directory. They are not published repository pages. T6 results are reported evidence; T7 checks are recorded separately.
 
-Date: 2026-10-04. Status: local documentation and asset validation record. The owner accepts T6(a), T6(b), T6(c) and its review fixes. Integration features are advertised in the locally committed release code; no deployment or live acceptance is claimed. The advertisement gate was not green on its single run; its failed selections and the skipped UI command were rerun separately.
+Date: 2026-10-04. Status: local documentation and asset validation record. The orchestrator accepted T6(a), T6(b), T6(c) and their review fixes after independent review rounds; the human owner has not reviewed the code. Integration features are advertised in the locally committed release code; no deployment or live acceptance is claimed. The advertisement gate was not green on its single run; its failed selections and the skipped UI command were rerun separately. The full landing gate on the integration branch is recorded under [Post-T7 fixes and the landing gate](#post-t7-fixes-and-the-landing-gate).
 
 Spec: [automatic integration design](../specs/2026-10-03-auto-integration-design.md). The dated D-R8 note supersedes its original disable semantics.
 
@@ -29,21 +29,21 @@ Plan: [automatic integration](../plans/2026-10-03-auto-integration.md), track T7
 | T6(b), lifecycle, pause, stop and recovery | `96eca15`, `f601b51`, `9e08d53`, `05afdf1`, `f93de5a`, `ff7fb90`, `36e7bb2` | Original implementation passed its gate, then review required fixes. Original shared disable/shutdown pause claims are superseded. |
 | T6(b) fixes | `5997484`, `5177f15`, `f96d856`, `ee93daa`, `435466c`, `1d4e8ad`, `b3ee41b`, `40133de`, `c07ffb6`, `d1b5aac`, final `66d238d` | Accepted checkpoint per the part 2b handoff. Final gate passed 1040/1040 Rust and 295/295 UI. D-R8: disable pauses integration only; restart creates no pause; drain/undrain pause/resume both. |
 | Separate R2-b1 source-identity fix | `76ac03b` | Fixed with a proper failing probe and 17/17 focused host tests before continuing (c). It retains stop evidence per ordinary source, including two sources at the same H. |
-| T6(c), reads, Git races and legacy settlement | `1c3b036`, `1c3748e`, final `a39bc02`, plus the separate fix above | Original `a39bc02` review verdict was `accept after fixes`; the owner now accepts the corrected T6(c) behavior. Its original once-only gate returned exit 100 with 1060/1061 Rust passing. A post-gate correction passed the affected 120/120 selection; UI passed 296/296 separately. This is not a green full gate on the final integration branch. |
+| T6(c), reads, Git races and legacy settlement | `1c3b036`, `1c3748e`, final `a39bc02`, plus the separate fix above | Original `a39bc02` review verdict was `accept after fixes`; the orchestrator accepted the corrected T6(c) behavior after the re-review rounds below. Its original once-only gate returned exit 100 with 1060/1061 Rust passing. A post-gate correction passed the affected 120/120 selection; UI passed 296/296 separately. This is not a green full gate on the final integration branch. |
 
 Source: `.briefs/ai-t6-report.md`, including T6(c) fixes, Round 2, Round 3: shared quota and Advertise. Archived review files were read from `../ai-t6/.briefs/` without editing that worktree; they are local evidence, not published links.
 
 
 | Final T6 stage | Commits | Review and verification outcome |
 | --- | --- | --- |
-| R3-b1 follow-up/source fence | `15f357b` | Accepted in the owner handoff and not reopened by later archived reviews. Final affected 284/284; pre-intent Say, supersession and same-source stop evidence retained. |
+| R3-b1 follow-up/source fence | `15f357b` | Accepted by the orchestrator after an independent round-4 re-review (`accept`). Final affected 284/284; pre-intent Say, supersession and same-source stop evidence retained. |
 | Frozen ce7f62f codecs | `ac91b3e`, merge `eda7e9d` | The original review found shape approximations; the rereview confirms actual independent transitive codecs/custom validation. The old-enum guard and 30 controller contract tests pass. |
 | Findings 1–5 and native split | `c728aa9`, `bb333af`, `d21c64d`, `0395a88`, `9db7e59`, `f65c3b6` | Author final affected 174/174. Rereview at `f65c3b6` says `accept after fixes`: separate Closed budget/reservation, frozen codecs and seven split schedules pass; advisory recovery, interrupted no-op replay, storage lifetime and event read cost need the next round. |
 | Round 2 | `b5e577d`, `6061696`, `024fa0b`, `12c6803`, `10c6b03` | Author affected 163/163 plus native/warm 19/19; independent 191/191. Archived verdict `accept after fixes`: findings 1/2/4 and warm-up proof pass; combined-family quota remains a Medium pre-advertise requirement. Dashboard-only accounting is superseded. |
-| Round 3 shared quota | `5a0f213` | Author affected 78/78; independent 78/78 plus 4/4 extra quota probes. Combined count/byte/age policy, paired admission, pending protection, Closed replay and cleanup pass. Archived verdict `accept after fixes` retains one Low deferred-hint release boundary; the Part 2c handoff accepts final operator behavior and notes a possible later hint-scope-only fix. |
+| Round 3 shared quota | `5a0f213` | Author affected 78/78; independent 78/78 plus 4/4 extra quota probes. Combined count/byte/age policy, paired admission, pending protection, Closed replay and cleanup pass. Archived verdict `accept after fixes` retains one Low deferred-hint release boundary; the hint-scope fix `0492264` followed and was verified by the orchestrator (4/4 targeted tests). |
 | Advertisement | `3134f718ba420c3eedad9a18687834b0d61f2258` | Committed locally after the accepted behavioral fixes. Focused 153/153; once-only broad Rust gate failed, with passing failed-case reruns and UI separately. Exact outcomes follow. |
 
-Archived reviews: `t6c-review-report.md` at `a39bc02` (`accept after fixes`, six findings); `t6c-rereview-report.md` at `f65c3b6` (`accept after fixes`, four remaining gaps); `t6c-rereview-r2-report.md` at `10c6b03` (`accept after fixes`, combined-family quota); and `t6c-rereview-r3-report.md` at `5a0f213` (`accept after fixes`, shared quota fixed, Low hint boundary). The acceptance statement is the owner's Part 2c handoff; these archived conditional verdicts are preserved rather than described as clean reviews. No hint-scope fix is included in the captured merge snapshot.
+Archived reviews: `t6c-review-report.md` at `a39bc02` (`accept after fixes`, six findings); `t6c-rereview-report.md` at `f65c3b6` (`accept after fixes`, four remaining gaps); `t6c-rereview-r2-report.md` at `10c6b03` (`accept after fixes`, combined-family quota); and `t6c-rereview-r3-report.md` at `5a0f213` (`accept after fixes`, shared quota fixed, Low hint boundary). Acceptance is the orchestrator's, after these rounds; the archived conditional verdicts are preserved rather than described as clean reviews. The hint-scope fix and the later post-T7 fixes below are included in the integration branch.
 
 ## Reported T6 verification
 
@@ -157,6 +157,28 @@ The UI delta from `a39bc02` to captured `3134f71` is empty (`git diff --stat a39
 
 `python3 .briefs/scanner_guard.py target/debug/worker` exited 0 before each final Rust selection: fresh executions 1.17 s, 1.16 s and 0.99 s; no HUNG. The sandbox blocked CPU sampling; the decisive fresh-execution check passed. The dashboard selection used disposable loopback sockets with approved sandbox escalation. The retained six-file SHA-256 manifest matches, totaling 1,733,277 bytes (`ai-t7-2c-assets.log`). All 70 frozen error rows remain byte-identical to Part 2b. Rendered command and proof tables were checked; docs dist was removed after link validation.
 
+## Post-T7 fixes and the landing gate
+
+These landed on `feat/ai-t6-wiring` after the T7 Part 2c snapshot and are in the integration branch.
+
+| Commit | Change | Verification |
+| --- | --- | --- |
+| `0492264` | Re-drive hints publish after the replay fences (the Round 3 Low). | Orchestrator: 4/4 targeted native-launch hint and re-drive tests. |
+| `f72571f` | Native integration fixtures run two at a time (`native_integration` nextest group). Five whole-cycle in-test waits rise to 120 s (from 60 s, and 90 s for the DAG case). The live-auxiliary cancel test accepts both legitimate outcomes and asserts safety in each. No production change. | 40/40 native cohort. |
+| `ee671c1` | Auxiliary admission and stop settlement share a per-task `auxiliary-admission.lock`. A cancel during admission stays `INTEGRATION_STOP_UNCONFIRMED` until the admission publishes its queue row or is compensated, so a cancelled task can no longer turn Active afterwards. Found by an independent focused review of the cancel-acknowledgement path. | 3 regressions red then green; 187/187 focused; independent re-check `accept after fixes` with one Low. |
+| `f6d2a83` | Replay paths release the admission fence before runner handoff (that Low). | Orchestrator: 5/5 targeted tests. |
+
+The same focused review confirmed that a cancel acknowledged after the auxiliary runner's durable retirement is safe while the process is still exiting. Journal and queue retirement, not process exit, is the authority boundary.
+
+Full landing gate, `NEXTEST_TEST_THREADS=4 CARGO_BUILD_JOBS=4 MAC_WORKER_GATE_RAMDISK_MB=0 scripts/test-gate.sh`, run by the orchestrator with no other builds on the machine:
+
+| Integration head | Result | Failures |
+| --- | --- | --- |
+| `8afa313` (T6, main `b3525cd`, T7) | 4354 run, 4352 passed, 1,554 s | Two native fixtures ran out of their 60 s in-test wait under full-suite load while the integration was still progressing; both passed alone. Fixed by `f72571f`. |
+| `22918a9` (adds `f72571f`, `ee671c1`, `f6d2a83`) | 4359 run, 4358 passed, 1,331 s | `native_legacy_retention_restores_a_reachable_source_without_resurrection` failed in fixture setup: its first `task submit --wait` returned `PROTOCOL` ("protocol error") after the agent message. The five retention schedules then passed 10/10 in two runs. |
+
+On `22918a9`: UI 296/296 in 30 files (`npm --prefix ui test -- --maxWorkers=4`); `cargo fmt --all --check`, all-target Clippy and release no-default-features lib/bin Clippy all exit 0.
+
 ## Live status and risks
 
 T8 has not run. It waits for the owner's acceptance-origin and pool authorization. Its checklist is in the [plan's T8 section](../plans/2026-10-03-auto-integration.md#t8--separately-authorized-disposable-origin-live-acceptance). No real pool, SSH host, service, keychain, notification channel, push or deployment was used by T7.
@@ -165,11 +187,11 @@ T8 has not run. It waits for the owner's acceptance-origin and pool authorizatio
 - Lost or capped pause history may conservatively end an auxiliary admission budget early. It cannot enlarge that budget.
 - Branch permissions, merge/signing rules, Git version and worker write access still need live checks. Canonical origin strings do not prove SSH/HTTPS repository equivalence; independent owners rely on the lease.
 - Unknown push/stop outcomes remain uncertain. A retained Closed task only settles existing effects; it cannot re-drive a new integration.
-- D-R9 permits observation-only Closed settlement during drain or disable, with the same target reservation and four-driver limit. The captured `3134f71` snapshot precedes the possible later hint-scope-only fix: archived Round 3 still records that Low publication-boundary requirement; no operator behavior change is claimed for it.
-- The final integration-branch full gate remains with the owner; the T6 post-gate affected selection and T7 focused checks do not replace it.
+- D-R9 permits observation-only Closed settlement during drain or disable, with the same target reservation and four-driver limit. The Low publication-boundary requirement from Round 3 was fixed by `0492264`; it changes no operator behavior.
+- One full-gate failure on the final integration head is not yet explained; see the PENDING line below.
 
-PENDING: Full gate on `integ/auto-integration`, with final commit, exact command, counts and outcome.
+PENDING: root cause of the intermittent `PROTOCOL` error from the `22918a9` gate. A separate investigation is reproducing it under load.
 
-PENDING: Main merge identity and outcome.
+PENDING: push to origin and the pool deploy, on the owner's instruction. The local `main` merge is the commit that brings this record into `main`.
 
 PENDING: T8 owner authorization, disposable acceptance origin, approved hosts and live results.
