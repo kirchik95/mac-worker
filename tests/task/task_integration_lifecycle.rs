@@ -3886,4 +3886,204 @@ mod review_fixes {
             0
         );
     }
+    struct NoProbeProcesses;
+    impl mac_worker::test_support::host::process::ProcessRunner for NoProbeProcesses {
+        fn run(
+            &self,
+            _: &mac_worker::test_support::host::process::ProcessRequest,
+        ) -> Result<mac_worker::test_support::host::process::ProcessResult, WorkerError> {
+            panic!("probe must not execute an external command");
+        }
+    }
+
+    #[test]
+    fn review_corrupt_closed_companion_does_not_poison_every_leader_tick() {
+        use mac_worker::test_support::{
+            core::config::Config,
+            task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        let mut status = serde_json::to_value(ordinary.status()).unwrap();
+        status["state"] = "closed".into();
+        client
+            .create_task(
+                ordinary
+                    .with_status(serde_json::from_value(status).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = IntegrationStatus::Blocked;
+        record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        state
+            .replace(record.task_id, IntegrationRevision(0), &record)
+            .unwrap();
+        std::fs::write(
+            paths
+                .state
+                .join(format!("integrations/tasks/{}/record.json", record.task_id)),
+            b"{broken",
+        )
+        .unwrap();
+        client.bootstrap_active_task_index().unwrap();
+        assert_eq!(
+            client
+                .select_active_task_ids(&ActiveTaskConfig::default())
+                .unwrap()
+                .selected,
+            vec![record.task_id]
+        );
+        let config = Config::parse("version = 1\n").unwrap();
+        let task_client = TaskClient::new(
+            &NoProbeProcesses,
+            &config,
+            &paths,
+            &client,
+            &InlineRunnerExecutor,
+        );
+        let mut errors = Vec::new();
+        for _ in 0..3 {
+            errors.push(
+                task_client
+                    .tick_selected_recovery()
+                    .err()
+                    .map(|e| e.public_code().to_owned()),
+            );
+        }
+        println!(
+            "three consecutive leader recoveries: {errors:?}; still selected: {:?}",
+            client
+                .select_active_task_ids(&ActiveTaskConfig::default())
+                .unwrap()
+                .selected
+        );
+        assert!(
+            errors.iter().all(Option::is_none),
+            "a corrupt optional Closed companion must not fail every leader recovery page"
+        );
+    }
+
+    #[test]
+    fn corrupt_closed_companion_keeps_its_evidence_while_a_healthy_selected_source_stages() {
+        use mac_worker::test_support::{
+            core::config::Config,
+            task::{client::TaskClient, turn_runner::InlineRunnerExecutor},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let clock = now.clone();
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_admission_clock(Arc::new(move || Ok(clock.load(Ordering::SeqCst))));
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let bad = TaskId::new(uuid::Uuid::from_u128(1));
+        let healthy = TaskId::new(uuid::Uuid::from_u128(2));
+        let mut closed = sample_ordinary(bad, fixture_source());
+        let mut status = serde_json::to_value(closed.status()).unwrap();
+        status["state"] = "closed".into();
+        closed = closed
+            .with_status(serde_json::from_value(status).unwrap())
+            .unwrap();
+        client.create_task(closed).unwrap();
+        let bad_record = sample_record(bad, fixture_source(), "main");
+        state.publish_policy(bad, &bad_record.policy).unwrap();
+        state
+            .replace(bad, IntegrationRevision(0), &bad_record)
+            .unwrap();
+        let bad_path = paths
+            .state
+            .join(format!("integrations/tasks/{bad}/record.json"));
+        std::fs::write(&bad_path, b"{broken").unwrap();
+        let pin = paths
+            .state
+            .join(format!("integrations/tasks/{bad}/retained-proof"));
+        std::fs::write(&pin, b"retain this evidence").unwrap();
+        let ordinary = sample_ordinary(healthy, fixture_source());
+        client.create_task(ordinary.clone()).unwrap();
+        let policy = sample_policy("main");
+        state.publish_policy(healthy, &policy).unwrap();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(IntegrationTaskFacts::from_record(&ordinary, false));
+        observer.insert(IntegrationTaskFacts::from_record(
+            &client.load_task(bad).unwrap(),
+            false,
+        ));
+        let host = FakeIntegrationHost::default();
+        let turns = FakeIntegrationTurns::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        let config = Config::parse("version = 1\n").unwrap();
+        let task_client = TaskClient::new(
+            &NoProbeProcesses,
+            &config,
+            &paths,
+            &client,
+            &InlineRunnerExecutor,
+        )
+        .with_integration(&coordinator);
+        client.bootstrap_active_task_index().unwrap();
+        assert_eq!(
+            client
+                .select_active_task_ids(&ActiveTaskConfig::default())
+                .unwrap()
+                .selected,
+            vec![bad, healthy]
+        );
+        task_client.tick_selected_recovery().unwrap();
+        assert_eq!(
+            state.load(healthy).unwrap().unwrap().snapshot.state,
+            IntegrationStatus::Pending
+        );
+        assert_eq!(std::fs::read(&bad_path).unwrap(), b"{broken");
+        assert_eq!(std::fs::read(&pin).unwrap(), b"retain this evidence");
+        let diagnostic = paths
+            .state
+            .join(format!("integrations/recovery/{bad}.json"));
+        let first = std::fs::read(&diagnostic).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(wire["failures"], 1);
+        assert_eq!(wire["retry_at_millis"], 3_000);
+        assert_eq!(wire["code"], "INTEGRATION_STATE_INVALID");
+        for _ in 0..3 {
+            task_client.tick_selected_recovery().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&diagnostic).unwrap(),
+            first,
+            "early ticks cannot repeat diagnostics or spend retries"
+        );
+        for (at, due, failures) in [(3_000, 13_000, 2), (13_000, 43_000, 3), (43_000, 73_000, 3)] {
+            now.store(at, Ordering::SeqCst);
+            task_client.tick_selected_recovery().unwrap();
+            let bytes = std::fs::read(&diagnostic).unwrap();
+            assert!(bytes.len() < 512);
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(wire["failures"], failures);
+            assert_eq!(wire["retry_at_millis"], due);
+        }
+        assert!(
+            client
+                .select_active_task_ids(&ActiveTaskConfig::default())
+                .unwrap()
+                .selected
+                .contains(&bad)
+        );
+        // Repairing the bytes is enough for the next due tick to clear the diagnostic.
+        std::fs::write(&bad_path, encode_record(&bad_record).unwrap()).unwrap();
+        now.store(73_000, Ordering::SeqCst);
+        task_client.tick_selected_recovery().unwrap();
+        assert!(!diagnostic.exists());
+        assert_eq!(std::fs::read(&pin).unwrap(), b"retain this evidence");
+    }
 }

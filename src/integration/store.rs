@@ -19,6 +19,110 @@ pub struct RootedIntegrationState {
     event_sink: Option<Arc<dyn crate::controller::events::EventSink>>,
 }
 
+/// Optional recovery failures are advisory and separate from the evidence they
+/// could not decode. A corrupt companion is retried, never treated as settled.
+pub(crate) struct IntegrationRecovery {
+    root: Option<RootedDir>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryFailure {
+    task: TaskId,
+    code: IntegrationCode,
+    failures: u8,
+    retry_at_millis: u64,
+}
+impl IntegrationRecovery {
+    pub(crate) fn open_at(state: &std::path::Path) -> Result<Self, WorkerError> {
+        let root = match RootedDir::open_anchored_absolute(&state.join("integrations")) {
+            Ok(root) => Some(root),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(WorkerError::Io(e)),
+        };
+        Ok(Self { root })
+    }
+    fn directory(&self, create: bool) -> Result<Option<RootedDir>, WorkerError> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        match child(root, "recovery", create) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    fn failure(&self, task: TaskId) -> Result<Option<RecoveryFailure>, WorkerError> {
+        let Some(dir) = self.directory(false)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = read(&dir, &format!("{task}.json"), 512)? else {
+            return Ok(None);
+        };
+        let failure: RecoveryFailure = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if failure.task != task || !(1..=3).contains(&failure.failures) {
+            return Err(invalid());
+        }
+        Ok(Some(failure))
+    }
+    pub(crate) fn ready(&self, task: TaskId, now: u64) -> bool {
+        self.failure(task)
+            .is_ok_and(|failure| failure.is_none_or(|failure| failure.retry_at_millis <= now))
+    }
+    pub(crate) fn retains_evidence(&self, task: TaskId) -> bool {
+        !matches!(self.failure(task), Ok(None))
+    }
+    pub(crate) fn failed(
+        &self,
+        task: TaskId,
+        now: u64,
+        error: &WorkerError,
+    ) -> Result<(), WorkerError> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        // Another recovery page may be recording the same failure. Refusing
+        // this advisory write cannot acquire authority over the bad evidence.
+        let lock = root
+            .open_private_lock("recovery.lock")
+            .map_err(WorkerError::Io)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(WorkerError::Io(io::Error::last_os_error()));
+        }
+        let identity = root
+            .private_entry_identity("recovery.lock")
+            .map_err(WorkerError::Io)?;
+        root.validate_private_regular_binding("recovery.lock", &lock, identity)
+            .map_err(WorkerError::Io)?;
+        let old = self.failure(task)?;
+        if old.as_ref().is_some_and(|old| old.retry_at_millis > now) {
+            return Ok(());
+        }
+        let failures = old.map_or(1, |old| old.failures.saturating_add(1).min(3));
+        let code = serde_json::from_value(serde_json::Value::String(error.public_code()))
+            .unwrap_or(IntegrationCode::IntegrationStateInvalid);
+        let failure = RecoveryFailure {
+            task,
+            code,
+            failures,
+            retry_at_millis: now
+                .saturating_add(TRANSPORT_RETRY_DELAYS_MILLIS[usize::from(failures - 1)]),
+        };
+        let bytes = serde_json::to_vec(&failure).map_err(|_| invalid())?;
+        let dir = self.directory(true)?.ok_or_else(invalid)?;
+        write(&dir, &format!("{task}.json"), &bytes)
+    }
+    pub(crate) fn succeeded(&self, task: TaskId) -> Result<(), WorkerError> {
+        let Some(dir) = self.directory(false)? else {
+            return Ok(());
+        };
+        match dir.remove_owned_regular(&format!("{task}.json")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(WorkerError::Io(e)),
+        }
+    }
+}
+
 /// The projection port opens only existing sidecars. Reads cannot initialize
 /// owner state, take a reservation or acquire Git authority.
 pub(crate) struct ExistingIntegrationState {

@@ -3459,12 +3459,34 @@ impl<'a> TaskClient<'a> {
 
     fn recover_integrations(&self, ids: &[TaskId]) -> Result<(), WorkerError> {
         if let Some(coordinator) = self.integration {
+            let recovery =
+                match crate::integration::store::IntegrationRecovery::open_at(&self.paths.state) {
+                    Ok(recovery) => recovery,
+                    Err(_) => return Ok(()),
+                };
+            let now = self
+                .client_state
+                .admission_time(crate::controller::leader::now_millis)?;
             for task in ids {
-                if let Some(record) = self.client_state.load_task_optional(*task)?
-                    && let Some(last) = record.status().turns().last()
-                {
-                    coordinator.on_terminal(*task, last.turn_id())?;
-                    stamp_integration_run_position(self.client_state, coordinator, *task)?;
+                if !recovery.ready(*task, now) {
+                    continue;
+                }
+                let result = (|| {
+                    if let Some(record) = self.client_state.load_task_optional(*task)?
+                        && let Some(last) = record.status().turns().last()
+                    {
+                        coordinator.on_terminal(*task, last.turn_id())?;
+                        stamp_integration_run_position(self.client_state, coordinator, *task)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        let _ = recovery.succeeded(*task);
+                    }
+                    Err(error) => {
+                        let _ = recovery.failed(*task, now, &error);
+                    }
                 }
             }
         } else {

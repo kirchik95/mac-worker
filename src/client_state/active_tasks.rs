@@ -363,6 +363,10 @@ impl ClientStateStore {
         if record.status().state() != TaskState::Closed {
             return false;
         }
+        match crate::integration::store::IntegrationRecovery::open_at(&self.inner.state_root) {
+            Ok(recovery) if !recovery.retains_evidence(record.meta().task_id()) => {}
+            _ => return true,
+        }
         match crate::integration::store::RootedIntegrationState::read_task_at(
             &self.inner.state_root,
             record.meta().task_id(),

@@ -1073,20 +1073,38 @@ pub(crate) fn recover_selected(
     executor: &dyn RunnerExecutor,
     tasks: &[TaskId],
 ) -> Result<(), WorkerError> {
-    let configured = tasks
-        .iter()
-        .map(|task| {
-            super::store::RootedIntegrationState::read_task(paths, *task)
-                .map(|(policy, _)| (*task, policy.is_some()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if !configured.iter().any(|(_, configured)| *configured) {
-        return Ok(());
-    }
-    let owner = OwnerIntegration::new(runner, config, paths, client, executor)?;
-    for (task, configured) in configured {
-        if configured {
-            owner.stage(task)?;
+    let recovery = match super::store::IntegrationRecovery::open_at(&paths.state) {
+        Ok(recovery) => recovery,
+        // Optional state cannot abort ordinary recovery or erase evidence.
+        Err(_) => return Ok(()),
+    };
+    let now = client.admission_time(crate::controller::leader::now_millis)?;
+    let mut owner = None;
+    for task in tasks {
+        if !recovery.ready(*task, now) {
+            continue;
+        }
+        let result = (|| {
+            if super::store::RootedIntegrationState::read_task(paths, *task)?
+                .0
+                .is_some()
+            {
+                if owner.is_none() {
+                    owner = Some(OwnerIntegration::new(
+                        runner, config, paths, client, executor,
+                    )?);
+                }
+                owner.as_ref().ok_or_else(invalid)?.stage(*task)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let _ = recovery.succeeded(*task);
+            }
+            Err(error) => {
+                let _ = recovery.failed(*task, now, &error);
+            }
         }
     }
     Ok(())
