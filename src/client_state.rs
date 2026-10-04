@@ -596,6 +596,7 @@ impl ClientStateLockContentionProbe {
 #[derive(Default)]
 #[cfg(any(test, feature = "test-support"))]
 struct SyncCounters {
+    state_locks: std::sync::atomic::AtomicU64,
     parent_directories: std::sync::atomic::AtomicU64,
     root: std::sync::atomic::AtomicU64,
     jobs: std::sync::atomic::AtomicU64,
@@ -662,6 +663,10 @@ impl ClientStateStore {
         self.event_sink
             .as_ref()
             .map(|sink| events::DeferredHints::begin(sink.clone()))
+    }
+
+    pub(crate) fn event_sink(&self) -> Option<Arc<dyn crate::controller::events::EventSink>> {
+        self.event_sink.clone()
     }
 
     fn capture_hint(&self, event: crate::controller::events::NewEvent) {
@@ -3635,6 +3640,7 @@ impl ClientStateStore {
         self.recover_task_replacement_residue(&tasks, &names)?;
         let task_name = task_file_name(task_id)?;
         let removed = self.load_task_locked(task_id).ok();
+        crate::integration::runner::remove_redrive_bindings(&self.inner.state_root, task_id)?;
         #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
             return Err(injected_failure(
@@ -5448,6 +5454,12 @@ impl ClientStateStore {
                 .concurrent_loser_parents
                 .load(Ordering::SeqCst),
         }
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn state_lock_count(&self) -> u64 {
+        self.inner.sync_counts.state_locks.load(Ordering::SeqCst)
     }
 
     fn require_local_client(&self, record: &LocalJobRecord) -> Result<(), WorkerError> {
@@ -7265,6 +7277,8 @@ impl StateLock {
                 .fetch_add(1, Ordering::SeqCst);
         }
         deadline.lock(marker.as_raw_fd(), operation)?;
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts.state_locks.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             authoritative,
             marker,

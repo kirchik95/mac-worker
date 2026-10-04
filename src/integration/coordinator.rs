@@ -6,12 +6,27 @@ use crate::{
     task::{TaskId, TaskOutcome, TaskState, TurnId},
 };
 use sha2::{Digest, Sha256};
+/// Closed settlement has its own driver budget, separate from Open Repair.
+/// Every consumer uses this proof before treating a Closed block as terminal.
+pub(crate) fn closed_observation_pending(record: &IntegrationRecord) -> bool {
+    !matches!(
+        record.snapshot.state,
+        IntegrationStatus::Integrated | IntegrationStatus::Revoked
+    ) && (record.snapshot.state != IntegrationStatus::Blocked
+        || !record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive))
+}
+
 pub struct IntegrationCoordinator<'a> {
     state: &'a dyn IntegrationState,
     host: &'a dyn IntegrationHost,
     turns: &'a dyn IntegrationTurns,
     runtime: &'a dyn IntegrationRuntime,
     observer: &'a dyn IntegrationObserver,
+    source_observer: &'a dyn IntegrationObserver,
+    owner_paths: Option<&'a crate::paths::PathLayout>,
 }
 impl<'a> IntegrationCoordinator<'a> {
     pub fn new(
@@ -27,7 +42,17 @@ impl<'a> IntegrationCoordinator<'a> {
             turns,
             runtime,
             observer,
+            source_observer: observer,
+            owner_paths: None,
         }
+    }
+    pub(crate) fn with_owner_gate(mut self, paths: &'a crate::paths::PathLayout) -> Self {
+        self.owner_paths = Some(paths);
+        self
+    }
+    pub(crate) fn with_source_observer(mut self, observer: &'a dyn IntegrationObserver) -> Self {
+        self.source_observer = observer;
+        self
     }
     pub fn on_terminal(&self, task: TaskId, source: TurnId) -> Result<(), WorkerError> {
         let Some(policy) = self.state.load_policy(task)? else {
@@ -82,35 +107,28 @@ impl<'a> IntegrationCoordinator<'a> {
         let facts = self.observer.facts(task)?;
         let ordinary = &facts.ordinary;
         let status = ordinary.status();
-        if status.state() != TaskState::Open
-            || status.last_outcome() != Some(&TaskOutcome::Done)
-            || status.turns().last().is_none_or(|t| {
-                t.turn_id() != source
-                    || t.terminal().is_none()
-                    || t.outcome() != Some(&TaskOutcome::Done)
-            })
-            || !facts.result_imported
-            || !facts.session_import_complete
-            || facts.continuation_pending
-            || facts.runner_present
-            || facts.stop_requested
-            || facts.close_pending
-            || facts.submission_pending
-            || facts.auxiliary_purpose.is_some()
-            || ordinary.runner().is_some()
-            || ordinary.close_intent().is_some()
-            || ordinary.auto_continue_intent().is_some()
-            || ordinary.submission_intent_turn_id().is_some()
-            || ordinary.submission_rollback_turn_id().is_some()
-            || status.head_oid().is_none()
-            || ordinary.fetched_head() != status.head_oid()
-        {
+        if !Self::terminal_source_ready(&facts, source) {
             return Ok(());
         }
         let head = status
             .head_oid()
             .cloned()
             .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+        // Import/repair changes the public head to M/T, while the ordinary
+        // source turn stays the same. A repeated terminal wake is that cycle's
+        // recovery, never a new source derived from the accepted merge.
+        if let Some(old) = &old
+            && old.snapshot.source_turn_id == source
+        {
+            if head != old.snapshot.source_head
+                && !old.receipt.as_ref().is_some_and(|receipt| {
+                    &head == receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head)
+                })
+            {
+                return Err(IntegrationCode::IntegrationStateInvalid.error());
+            }
+            return Ok(());
+        }
         let target_key = policy.target_key()?;
         let id = IntegrationId::derive(task, source, &head, &target_key)?;
         if let Some(old) = &old {
@@ -246,24 +264,113 @@ impl<'a> IntegrationCoordinator<'a> {
         };
         self.runtime.reach(IntegrationHook::AfterSourceImport);
         self.runtime.reach(IntegrationHook::AfterRunnerRetirement);
+        let current = self.source_observer.facts(task)?;
+        if !Self::terminal_source_ready(&current, source)
+            || current.ordinary.status().head_oid() != Some(&record.snapshot.source_head)
+        {
+            return Ok(());
+        }
         if self.state.replace(task, revision, &record)? {
             self.runtime.reach(IntegrationHook::AfterIntent);
             self.runtime.reach(IntegrationHook::AfterStateBeforeEvent);
         }
         Ok(())
     }
-    fn save(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
-        let expected = record.snapshot.revision;
-        record.snapshot.revision = expected.next()?;
-        record.snapshot.updated_at_millis = self.runtime.now_millis();
-        if !self.state.replace(record.task_id, expected, record)? {
-            return Err(WorkerError::task(
-                "TASK_REVISION_CONFLICT",
-                "integration changed before publication",
-            ));
+    fn terminal_source_ready(facts: &IntegrationTaskFacts, source: TurnId) -> bool {
+        let ordinary = &facts.ordinary;
+        let status = ordinary.status();
+        status.state() == TaskState::Open
+            && status.last_outcome() == Some(&TaskOutcome::Done)
+            && status.turns().last().is_some_and(|turn| {
+                turn.turn_id() == source
+                    && turn.terminal().is_some()
+                    && turn.outcome() == Some(&TaskOutcome::Done)
+            })
+            && facts.result_imported
+            && facts.session_import_complete
+            && !facts.continuation_pending
+            && !facts.runner_present
+            && !facts.stop_requested
+            && !facts.close_pending
+            && !facts.submission_pending
+            && facts.auxiliary_purpose.is_none()
+            && ordinary.runner().is_none()
+            && ordinary.close_intent().is_none()
+            && ordinary.auto_continue_intent().is_none()
+            && ordinary.submission_intent_turn_id().is_none()
+            && ordinary.submission_rollback_turn_id().is_none()
+            && status.head_oid().is_some()
+            && ordinary.fetched_head() == status.head_oid()
+    }
+    fn owner_source_is_current(
+        &self,
+        record: &IntegrationRecord,
+        facts: &IntegrationTaskFacts,
+    ) -> Result<bool, WorkerError> {
+        let ordinary = &facts.ordinary;
+        if !self.covers_latest_ordinary_work(ordinary, &record.snapshot)?
+            || facts.continuation_pending
+            || facts.submission_pending
+            || facts.stop_requested
+            || facts.close_pending
+            || ordinary.auto_continue_intent().is_some()
+            || ordinary.close_intent().is_some()
+            || ordinary.submission_intent_turn_id().is_some()
+            || ordinary.submission_rollback_turn_id().is_some()
+        {
+            return Ok(false);
         }
-        self.runtime.reach(IntegrationHook::AfterStateBeforeEvent);
-        Ok(())
+        let Some(last) = ordinary.status().turns().last() else {
+            return Ok(false);
+        };
+        if last.turn_id() == record.snapshot.source_turn_id {
+            return Ok(!matches!(
+                ordinary.status().state(),
+                TaskState::Active | TaskState::Queued
+            ) && !facts.runner_present
+                && ordinary.runner().is_none()
+                && facts.auxiliary_purpose.is_none());
+        }
+        // Only this cycle's persisted preparation permits an active auxiliary;
+        // a purpose hint or another epoch's sidecar is not admission evidence.
+        let Some(prepared) = self.state.load_prepared(record.task_id, last.turn_id())? else {
+            return Ok(false);
+        };
+        if prepared.validate_for(record).is_ok() {
+            return Ok(true);
+        }
+        // Re-drive retires old epoch references, but their completed sidecars
+        // still classify history. They never authorize another auxiliary run.
+        prepared.validate()?;
+        Ok(prepared.integration_id == record.snapshot.integration_id
+            && prepared.epoch < record.snapshot.epoch
+            && prepared.followup.task_id() == record.task_id
+            && prepared.workspace_binding.head == record.snapshot.source_head
+            && last.terminal().is_some()
+            && !matches!(
+                ordinary.status().state(),
+                TaskState::Active | TaskState::Queued
+            )
+            && !facts.runner_present
+            && ordinary.runner().is_none())
+    }
+    fn revoke_superseded(&self, record: &mut IntegrationRecord) -> Result<bool, WorkerError> {
+        let facts = self.source_observer.facts(record.task_id)?;
+        if self.owner_source_is_current(record, &facts)? {
+            return Ok(false);
+        }
+        self.revoke(record.task_id, record.snapshot.revision)?;
+        *record = self
+            .state
+            .load(record.task_id)?
+            .ok_or_else(integration_unavailable)?;
+        Ok(true)
+    }
+    fn save(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
+        if let Some(paths) = self.owner_paths {
+            extend_elapsed_pauses(self.state, self.runtime, paths, record)?;
+        }
+        persist_record(self.state, self.runtime, record)
     }
     fn release(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
         if let Some(actor) = record.actor {
@@ -276,6 +383,22 @@ impl<'a> IntegrationCoordinator<'a> {
             record.actor = None;
         }
         Ok(())
+    }
+    /// Reclaim in the observing parent: a re-exec starts with an empty absence cache.
+    pub(crate) fn reclaim_exited_actor(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let Some(mut record) = self.state.load(task)? else {
+            return Ok(true);
+        };
+        if let Some(actor) = record.actor {
+            if self.runtime.actor_verdict(actor)
+                != crate::client_state::RunnerLivenessVerdict::Exited
+            {
+                return Ok(false);
+            }
+            self.release(&mut record)?;
+            self.save(&mut record)?;
+        }
+        Ok(true)
     }
     fn release_failed_phase(
         &self,
@@ -300,46 +423,7 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         pause: IntegrationPauseEvidence,
     ) -> Result<(), WorkerError> {
-        if record.pause.is_some() {
-            return Ok(());
-        }
-        let resume = record.snapshot.state;
-        if matches!(
-            resume,
-            IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
-        ) {
-            return Ok(());
-        }
-        record.remaining_admission_millis = record
-            .admission_deadline_millis
-            .take()
-            .map(|deadline| {
-                deadline
-                    .saturating_sub(pause.effective_at_millis)
-                    .min(AUXILIARY_ADMISSION_MILLIS)
-            })
-            .or(record.remaining_admission_millis);
-        record.remaining_backoff_millis = record
-            .snapshot
-            .retry_at_millis
-            .take()
-            .map(|deadline| {
-                deadline
-                    .saturating_sub(pause.effective_at_millis)
-                    .min(30000)
-            })
-            .or(record.remaining_backoff_millis);
-        // RetryWait already has its actual host phase as resume_state.
-        if resume != IntegrationStatus::RetryWait {
-            record.snapshot.resume_state = Some(resume);
-        }
-        record.snapshot.state = IntegrationStatus::Parked;
-        record.snapshot.pause_reason = Some(pause.reason);
-        record.pause = Some(pause);
-        self.release(record)?;
-        self.save(record)?;
-        self.runtime.reach(IntegrationHook::AfterPark);
-        Ok(())
+        park_record(self.state, self.runtime, self.owner_paths, record, pause)
     }
     fn key(&self, record: &IntegrationRecord, phase: IntegrationPhase) -> IntegrationPhaseKey {
         IntegrationPhaseKey {
@@ -356,8 +440,16 @@ impl<'a> IntegrationCoordinator<'a> {
         phase: IntegrationPhase,
     ) -> Result<Option<IntegrationPhasePermit>, WorkerError> {
         self.runtime.reach(IntegrationHook::BeforePhasePermit);
+        if self.revoke_superseded(record)? {
+            return Ok(None);
+        }
         match self.runtime.begin_phase(&self.key(record, phase))? {
-            IntegrationDriveAdmission::Permit(p) => Ok(Some(p)),
+            IntegrationDriveAdmission::Permit(p) => {
+                if let Some(paths) = self.owner_paths {
+                    extend_elapsed_pauses(self.state, self.runtime, paths, record)?;
+                }
+                Ok(Some(p))
+            }
             IntegrationDriveAdmission::Park(p) => {
                 self.park(record, p)?;
                 Ok(None)
@@ -426,6 +518,7 @@ impl<'a> IntegrationCoordinator<'a> {
         retry.retries += 1;
         retry.code = code;
         retry.due_at_millis = self.runtime.now_millis().saturating_add(delay);
+        record.snapshot.updated_at_millis = self.runtime.now_millis();
         record.snapshot.retry_at_millis = Some(retry.due_at_millis);
         record.snapshot.resume_state = Some(if phase == IntegrationPhase::Push {
             IntegrationStatus::Fetching
@@ -438,28 +531,18 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(record)
     }
     fn resume(&self, record: &mut IntegrationRecord) -> Result<(), WorkerError> {
-        let now = self.runtime.now_millis();
-        record.snapshot.state = record
-            .snapshot
-            .resume_state
-            .take()
-            .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
-        record.pause = None;
-        record.snapshot.pause_reason = None;
-        if let Some(remaining) = record.remaining_admission_millis.take() {
-            record.admission_deadline_millis = Some(now.saturating_add(remaining));
-        }
-        if let Some(remaining) = record.remaining_backoff_millis.take() {
-            record.snapshot.resume_state = Some(record.snapshot.state);
-            record.snapshot.state = IntegrationStatus::RetryWait;
-            record.snapshot.retry_at_millis = Some(now.saturating_add(remaining));
-        } else {
-            record.snapshot.retry_at_millis = None;
-        }
-        self.save(record)
+        resume_record(self.state, self.runtime, self.owner_paths, record)
     }
     pub fn configured(&self, task: TaskId) -> Result<bool, WorkerError> {
         Ok(self.state.load_policy(task)?.is_some())
+    }
+    pub(crate) fn park_for_runtime(
+        &self,
+        task: TaskId,
+        pause: IntegrationPauseEvidence,
+    ) -> Result<(), WorkerError> {
+        let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        self.park(&mut record, pause)
     }
     pub fn snapshot(&self, task: TaskId) -> Result<Option<IntegrationSnapshot>, WorkerError> {
         Ok(self.state.load(task)?.map(|r| r.snapshot))
@@ -600,6 +683,13 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.tombstone.as_ref().is_some_and(|t| !t.acknowledged)
             || facts.stop_requested
             || facts.close_pending
+        {
+            return self.revoke(task, record.snapshot.revision);
+        }
+        if !matches!(
+            record.snapshot.state,
+            IntegrationStatus::Integrated | IntegrationStatus::Revoked
+        ) && !self.owner_source_is_current(&record, &facts)?
         {
             return self.revoke(task, record.snapshot.revision);
         }
@@ -787,6 +877,9 @@ impl<'a> IntegrationCoordinator<'a> {
                 .load(record.task_id)?
                 .map(|r| r.snapshot)
                 .ok_or_else(integration_unavailable);
+        }
+        if self.revoke_superseded(&mut record)? {
+            return Ok(record.snapshot);
         }
         let response = self.host.execute(&request);
         // Reservation remains durable on a process crash, and only confirmed absence reclaims it.
@@ -1051,6 +1144,14 @@ impl<'a> IntegrationCoordinator<'a> {
             return self.block(record, IntegrationCode::IntegrationConflictBudgetExhausted);
         }
         let facts = self.observer.facts(record.task_id)?;
+        if !self.owner_source_is_current(record, &facts)? {
+            self.revoke(record.task_id, record.snapshot.revision)?;
+            *record = self
+                .state
+                .load(record.task_id)?
+                .ok_or_else(integration_unavailable)?;
+            return Ok(());
+        }
         if record.followups_spent >= facts.ordinary.meta().limits().max_followups {
             return self.block(record, IntegrationCode::IntegrationFollowupLimit);
         }
@@ -1167,6 +1268,7 @@ impl<'a> IntegrationCoordinator<'a> {
             return Ok(record.snapshot);
         };
         if record.admission_deadline_millis.is_none() && !observation.accepted {
+            record.snapshot.updated_at_millis = self.runtime.now_millis();
             record.admission_deadline_millis = Some(
                 self.runtime
                     .now_millis()
@@ -1185,6 +1287,9 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(&mut record)?;
         drop(permit);
         self.runtime.reach(IntegrationHook::AfterPhaseAdmission);
+        if self.revoke_superseded(&mut record)? {
+            return Ok(record.snapshot);
+        }
         if observation.queue_position.is_none() {
             if self.turns.enqueue(&prepared)? != auxiliary.turn_id {
                 return Err(IntegrationCode::IntegrationStateInvalid.error());
@@ -1192,6 +1297,13 @@ impl<'a> IntegrationCoordinator<'a> {
             self.runtime.reach(IntegrationHook::AfterAuxPrompt);
             self.runtime.reach(IntegrationHook::AfterAuxCas);
             self.runtime.reach(IntegrationHook::AfterAuxEnqueue);
+            // Native publication/launch valves durably record their own gate
+            // and budget observations. Do not overwrite that revision.
+            record = self
+                .state
+                .load(record.task_id)?
+                .ok_or_else(integration_unavailable)?;
+            prepared.validate_for(&record)?;
         }
         let observation = self.turns.observe(auxiliary.turn_id)?;
         observation.validate()?;
@@ -1303,19 +1415,22 @@ impl<'a> IntegrationCoordinator<'a> {
         record: &mut IntegrationRecord,
         step: IntegrationStep,
     ) -> Result<Option<HostIntegrationResponse>, WorkerError> {
-        if record.snapshot.state == IntegrationStatus::Blocked
-            || record
-                .snapshot
-                .retry_at_millis
-                .is_some_and(|d| d > self.runtime.now_millis())
+        let started = record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive);
+        if !closed_observation_pending(record)
+            || (started
+                && record
+                    .snapshot
+                    .retry_at_millis
+                    .is_some_and(|d| d > self.runtime.now_millis()))
         {
             return Ok(None);
         }
-        let phase = if step == IntegrationStep::Repair {
-            IntegrationPhase::Repair
-        } else {
-            IntegrationPhase::Fetch
-        };
+        // Drive is the Closed observation budget. Host Repair keeps its Open
+        // transport history, and cannot spend or finish this later settlement.
+        let phase = IntegrationPhase::Drive;
         record.snapshot.state = if step == IntegrationStep::Repair {
             IntegrationStatus::Published
         } else {
@@ -1323,6 +1438,8 @@ impl<'a> IntegrationCoordinator<'a> {
         };
         record.snapshot.resume_state = None;
         record.snapshot.retry_at_millis = None;
+        record.snapshot.blocked_code = None;
+        record.snapshot.retry_exhausted = false;
         record.snapshot.pause_reason = None;
         record.pause = None;
         if !record.phase_retries.iter().any(|r| r.phase == phase) {
@@ -1358,6 +1475,67 @@ impl<'a> IntegrationCoordinator<'a> {
         }
     }
     fn settle_closed(
+        &self,
+        mut record: IntegrationRecord,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let now = self.runtime.now_millis();
+        let started = record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive);
+        if !closed_observation_pending(&record)
+            || (started && record.snapshot.retry_at_millis.is_some_and(|due| due > now))
+        {
+            return Ok(record.snapshot);
+        }
+        // D-R9 bypasses launch admission, never target serialization or the
+        // shared Git cap. Retain this slot through host Repair and owner import.
+        let actor = self.runtime.actor();
+        let Some(reservation) = self.state.reserve(
+            &record.target_key,
+            record.snapshot.integration_id,
+            record.snapshot.epoch,
+            actor,
+        )?
+        else {
+            let due = now.saturating_add(TRANSPORT_RETRY_DELAYS_MILLIS[0]);
+            if !started {
+                record.phase_retries.push(IntegrationPhaseRetry {
+                    phase: IntegrationPhase::Drive,
+                    retries: 0,
+                    code: IntegrationCode::IntegrationWorkerOffline,
+                    due_at_millis: due,
+                });
+            }
+            record.snapshot.state = IntegrationStatus::RetryWait;
+            record.snapshot.resume_state = Some(IntegrationStatus::Published);
+            record.snapshot.retry_at_millis = Some(due);
+            record.snapshot.pause_reason = None;
+            record.pause = None;
+            self.save(&mut record)?;
+            return Ok(record.snapshot);
+        };
+        let task = record.task_id;
+        record.actor = Some(actor);
+        let applied = (|| {
+            self.save(&mut record)?;
+            self.runtime.reach(IntegrationHook::TargetReserved);
+            self.settle_closed_reserved(record)
+        })();
+        // Release the known reservation even when response validation, import
+        // or state persistence fails. Clearing the saved actor is a separate CAS.
+        self.state.release(&reservation)?;
+        let mut latest = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if latest.actor == Some(actor)
+            && latest.snapshot.integration_id == reservation.integration_id
+            && latest.snapshot.epoch == reservation.epoch
+        {
+            latest.actor = None;
+            self.save(&mut latest)?;
+        }
+        applied.map(|_| latest.snapshot)
+    }
+    fn settle_closed_reserved(
         &self,
         mut record: IntegrationRecord,
     ) -> Result<IntegrationSnapshot, WorkerError> {
@@ -1400,18 +1578,57 @@ impl<'a> IntegrationCoordinator<'a> {
         if record.snapshot.state == IntegrationStatus::Integrated {
             return Ok(record.snapshot);
         }
+        self.redrive_record(record, false)
+    }
+    pub(crate) fn resume_redrive(
+        &self,
+        task: TaskId,
+        intent: IntegrationId,
+        epoch: u32,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.integration_id != intent || record.snapshot.epoch != epoch {
+            return Err(WorkerError::task(
+                "TASK_REVISION_CONFLICT",
+                "integration cycle changed",
+            ));
+        }
+        self.redrive_record(record, true)
+    }
+    fn redrive_record(
+        &self,
+        record: IntegrationRecord,
+        resuming: bool,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let task = record.task_id;
         let facts = self.observer.facts(task)?;
         if facts.ordinary.status().state() != TaskState::Open
             || facts.stop_requested
             || facts.close_pending
+            || record.snapshot.blocked_code
+                == Some(IntegrationCode::IntegrationDependencyNotIntegrated)
+            || !facts.ordinary.status().turns().iter().any(|turn| {
+                turn.turn_id() == record.snapshot.source_turn_id
+                    && turn.outcome() == Some(&TaskOutcome::Done)
+            })
         {
             return Err(IntegrationCode::IntegrationDependencyNotIntegrated.error());
         }
-        if record.snapshot.state != IntegrationStatus::Blocked {
+        let stopped = resuming
+            && record.snapshot.state == IntegrationStatus::Revoked
+            && record.tombstone.as_ref().is_some_and(|t| t.acknowledged);
+        if record.snapshot.state != IntegrationStatus::Blocked && !stopped {
             return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
         }
-        self.revoke(task, expected)?;
+        if !stopped {
+            self.revoke(task, record.snapshot.revision)?;
+        }
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if record.snapshot.state != IntegrationStatus::Revoked
+            || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
+        {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+        }
         record.snapshot.epoch = record
             .snapshot
             .epoch
@@ -1480,10 +1697,40 @@ impl<'a> IntegrationCoordinator<'a> {
             revision: tombstone.revision,
             action: HostIntegrationAction::Revoke { tombstone },
         };
-        let response = self
-            .host
-            .execute(&request)
-            .map_err(|_| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+        let response = match self.host.execute(&request) {
+            Ok(response) => response,
+            Err(error)
+                if error.public_code() == IntegrationCode::IntegrationStateInvalid.as_str() =>
+            {
+                let facts = self.source_observer.facts(task)?;
+                if facts.ordinary.meta().task_id() != task
+                    || !facts
+                        .ordinary
+                        .status()
+                        .turns()
+                        .iter()
+                        .any(|turn| turn.turn_id() == record.snapshot.source_turn_id)
+                    || self.covers_latest_ordinary_work(&facts.ordinary, &record.snapshot)?
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
+                // The owner durably advanced and the host structurally refuses
+                // this obsolete identity. Settle supersession without inventing
+                // a host stop acknowledgement or retrying the retired source.
+                record.tombstone = None;
+                record.snapshot.state = IntegrationStatus::Revoked;
+                record.snapshot.blocked_code = Some(IntegrationCode::IntegrationStateInvalid);
+                record.snapshot.resume_state = None;
+                record.snapshot.pause_reason = None;
+                record.pause = None;
+                record.admission_deadline_millis = None;
+                record.snapshot.retry_at_millis = None;
+                self.release(&mut record)?;
+                self.save(&mut record)?;
+                return Ok(record.snapshot);
+            }
+            Err(_) => return Err(IntegrationCode::IntegrationStopUnconfirmed.error()),
+        };
         response.validate_for(&request)?;
         self.runtime.reach(IntegrationHook::BeforeRevokeAck);
         match response {
@@ -1515,6 +1762,21 @@ impl<'a> IntegrationCoordinator<'a> {
                 record.snapshot.observed_target_oid = Some(receipt.target_head.clone());
                 record.snapshot.disposition = Some(receipt.disposition);
                 record.receipt = Some(receipt);
+                // Origin may already contain this cycle when a newer owner
+                // turn supersedes it. Retain that proof without importing over
+                // the new work or recursively admitting another Repair.
+                if !self.owner_source_is_current(&record, &self.source_observer.facts(task)?)? {
+                    record.snapshot.state = IntegrationStatus::Revoked;
+                    record.snapshot.resume_state = None;
+                    record.snapshot.pause_reason = None;
+                    record.pause = None;
+                    record.admission_deadline_millis = None;
+                    record.snapshot.retry_at_millis = None;
+                    self.release(&mut record)?;
+                    self.save(&mut record)?;
+                    self.runtime.reach(IntegrationHook::AfterRevokeAck);
+                    return Ok(record.snapshot);
+                }
                 record.snapshot.state = IntegrationStatus::Published;
                 self.release(&mut record)?;
                 self.save(&mut record)?;
@@ -1525,6 +1787,186 @@ impl<'a> IntegrationCoordinator<'a> {
         }
     }
 }
+
+pub(crate) fn persist_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    let expected = record.snapshot.revision;
+    record.snapshot.revision = expected.next()?;
+    record.snapshot.updated_at_millis = runtime.now_millis();
+    if !state.replace(record.task_id, expected, record)? {
+        return Err(WorkerError::task(
+            "TASK_REVISION_CONFLICT",
+            "integration changed before publication",
+        ));
+    }
+    runtime.reach(IntegrationHook::AfterStateBeforeEvent);
+    Ok(())
+}
+pub(crate) fn extend_elapsed_pauses(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: &crate::paths::PathLayout,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    extend_elapsed_pauses_through(state, runtime, paths, record, runtime.now_millis())
+}
+fn extend_elapsed_pauses_through(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: &crate::paths::PathLayout,
+    record: &mut IntegrationRecord,
+    through: u64,
+) -> Result<(), WorkerError> {
+    if record.pause.is_some()
+        || (record.admission_deadline_millis.is_none() && record.snapshot.retry_at_millis.is_none())
+    {
+        return Ok(());
+    }
+    let extra = crate::controller::drain::elapsed_pause_time(
+        &paths.controller_state_root(),
+        record.snapshot.updated_at_millis,
+        through,
+    )?;
+    if extra != 0 {
+        record.admission_deadline_millis = record
+            .admission_deadline_millis
+            .map(|d| d.saturating_add(extra));
+        record.snapshot.retry_at_millis = record
+            .snapshot
+            .retry_at_millis
+            .map(|d| d.saturating_add(extra));
+        persist_record(state, runtime, record)?;
+    }
+    Ok(())
+}
+pub(crate) fn park_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: Option<&crate::paths::PathLayout>,
+    record: &mut IntegrationRecord,
+    pause: IntegrationPauseEvidence,
+) -> Result<(), WorkerError> {
+    if let Some(previous) = record.pause {
+        if previous.reason == pause.reason {
+            return Ok(());
+        }
+        if pause.reason == IntegrationPauseReason::HelperUnavailable
+            && matches!(
+                previous.reason,
+                IntegrationPauseReason::ControllerDrained
+                    | IntegrationPauseReason::ControllerDisabled
+            )
+        {
+            // The persisted global gate may have reopened before this helper
+            // observation. Spend that active interval, then park the remainder.
+            let Some(paths) = paths else {
+                return Ok(());
+            };
+            if crate::controller::drain::resumed_at(
+                &paths.controller_state_root(),
+                previous.effective_at_millis,
+            )?
+            .is_none()
+            {
+                return Ok(());
+            }
+            resume_record(state, runtime, Some(paths), record)?;
+        } else {
+            // A newly closed global valve supersedes helper unavailability;
+            // both intervals stay paused and the saved remainder is unchanged.
+            record.pause = Some(pause);
+            record.snapshot.pause_reason = Some(pause.reason);
+            return persist_record(state, runtime, record);
+        }
+    }
+    if matches!(
+        record.snapshot.state,
+        IntegrationStatus::Blocked | IntegrationStatus::Integrated | IntegrationStatus::Revoked
+    ) {
+        return Ok(());
+    }
+    if let Some(paths) = paths {
+        extend_elapsed_pauses_through(state, runtime, paths, record, pause.effective_at_millis)?;
+    }
+    record.remaining_admission_millis = record
+        .admission_deadline_millis
+        .take()
+        .map(|d| {
+            d.saturating_sub(pause.effective_at_millis)
+                .min(AUXILIARY_ADMISSION_MILLIS)
+        })
+        .or(record.remaining_admission_millis);
+    record.remaining_backoff_millis = record
+        .snapshot
+        .retry_at_millis
+        .take()
+        .map(|d| d.saturating_sub(pause.effective_at_millis).min(30000))
+        .or(record.remaining_backoff_millis);
+    if record.snapshot.state != IntegrationStatus::RetryWait {
+        record.snapshot.resume_state = Some(record.snapshot.state);
+    }
+    record.snapshot.state = IntegrationStatus::Parked;
+    record.snapshot.pause_reason = Some(pause.reason);
+    record.pause = Some(pause);
+    if let Some(actor) = record.actor.take() {
+        state.release(&TargetReservation {
+            key: record.target_key.clone(),
+            integration_id: record.snapshot.integration_id,
+            epoch: record.snapshot.epoch,
+            actor,
+        })?;
+    }
+    persist_record(state, runtime, record)?;
+    runtime.reach(IntegrationHook::AfterPark);
+    Ok(())
+}
+pub(crate) fn resume_record(
+    state: &dyn IntegrationState,
+    runtime: &dyn IntegrationRuntime,
+    paths: Option<&crate::paths::PathLayout>,
+    record: &mut IntegrationRecord,
+) -> Result<(), WorkerError> {
+    let mut now = runtime.now_millis();
+    if let Some(paths) = paths
+        && let Some(pause) = &record.pause
+        && matches!(
+            pause.reason,
+            IntegrationPauseReason::ControllerDrained | IntegrationPauseReason::ControllerDisabled
+        )
+        && let Some(end) = crate::controller::drain::resumed_at(
+            &paths.controller_state_root(),
+            pause.effective_at_millis,
+        )?
+    {
+        now = end.saturating_add(crate::controller::drain::elapsed_pause_time(
+            &paths.controller_state_root(),
+            end,
+            now,
+        )?);
+    }
+    record.snapshot.state = record
+        .snapshot
+        .resume_state
+        .take()
+        .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+    record.pause = None;
+    record.snapshot.pause_reason = None;
+    if let Some(remaining) = record.remaining_admission_millis.take() {
+        record.admission_deadline_millis = Some(now.saturating_add(remaining));
+    }
+    if let Some(remaining) = record.remaining_backoff_millis.take() {
+        record.snapshot.resume_state = Some(record.snapshot.state);
+        record.snapshot.state = IntegrationStatus::RetryWait;
+        record.snapshot.retry_at_millis = Some(now.saturating_add(remaining));
+    } else {
+        record.snapshot.retry_at_millis = None;
+    }
+    persist_record(state, runtime, record)
+}
+
 fn auxiliary_checks(
     source: &[crate::agent::ReportedCheck],
     checks: &[crate::agent::ReportedCheck],
@@ -1633,5 +2075,430 @@ impl PreparedIntegrationTurn {
         };
         prepared.validate_for(integration)?;
         Ok(prepared)
+    }
+}
+
+#[cfg(test)]
+mod source_fence_tests {
+    use super::*;
+    use crate::integration::testing::*;
+    use crate::job::ProcessIdentity;
+    use std::sync::Mutex;
+
+    fn facts(ordinary: crate::task::LocalTaskRecord) -> IntegrationTaskFacts {
+        IntegrationTaskFacts {
+            cycle_base: ordinary.meta().base_oid().clone(),
+            ordinary,
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        }
+    }
+
+    #[derive(Default)]
+    struct StopOnlyHost(Mutex<Vec<HostIntegrationRequest>>);
+    impl IntegrationHost for StopOnlyHost {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            request.validate()?;
+            assert!(
+                matches!(request.action, HostIntegrationAction::Revoke { .. }),
+                "superseded cycle reached host phase: {request:?}"
+            );
+            self.0.lock().unwrap().push(request.clone());
+            Ok(HostIntegrationResponse::Revoked {
+                identity: IntegrationResponseIdentity::for_request(request),
+            })
+        }
+    }
+
+    fn phase_record(step: IntegrationStep) -> IntegrationRecord {
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = match step {
+            IntegrationStep::Fetch => IntegrationStatus::Pending,
+            IntegrationStep::Prepare | IntegrationStep::AcceptTurn => IntegrationStatus::Resolving,
+            IntegrationStep::Build | IntegrationStep::Push => IntegrationStatus::CommitReady,
+            IntegrationStep::Repair => IntegrationStatus::Published,
+        };
+        record.snapshot.attempts = 1;
+        let candidate = sample_candidate(&record);
+        if step == IntegrationStep::Repair {
+            record.receipt = Some(IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: candidate.target_head.clone(),
+                merge_oid: candidate.merge_oid.clone(),
+                disposition: IntegrationDisposition::Merged,
+                imported: false,
+                recorded_at_millis: 1002,
+            });
+            record.snapshot.merge_oid = candidate.merge_oid.clone();
+            record.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        }
+        record.candidates.push(candidate);
+        record
+    }
+
+    fn save_initial(state: &MemoryIntegrationState, record: &IntegrationRecord) {
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), record)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn every_phase_refuses_a_newer_or_pending_ordinary_owner_before_io() {
+        for step in [
+            IntegrationStep::Fetch,
+            IntegrationStep::Prepare,
+            IntegrationStep::AcceptTurn,
+            IntegrationStep::Build,
+            IntegrationStep::Push,
+            IntegrationStep::Repair,
+        ] {
+            for reason in ["new_done", "new_running", "queue"] {
+                let record = phase_record(step);
+                let state = MemoryIntegrationState::default();
+                save_initial(&state, &record);
+                let host = StopOnlyHost::default();
+                let turns = FakeIntegrationTurns::default();
+                let runtime = ManualIntegrationRuntime::default();
+                let observer = FakeIntegrationObserver::default();
+                let ordinary = match reason {
+                    "new_done" => sample_ordinary_followup(
+                        record.task_id,
+                        fixture_source(),
+                        Some(TaskOutcome::Done),
+                    ),
+                    "new_running" => {
+                        sample_ordinary_followup(record.task_id, fixture_source(), None)
+                    }
+                    _ => sample_ordinary(record.task_id, fixture_source()),
+                };
+                let mut current = facts(ordinary);
+                current.runner_present = reason != "new_done";
+                observer.insert(current);
+                let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+                let stopped = owner.host_phase(record, step).unwrap();
+                assert_eq!(
+                    stopped.state,
+                    IntegrationStatus::Revoked,
+                    "{step:?}/{reason}"
+                );
+                assert!(
+                    state
+                        .load(fixture_task())
+                        .unwrap()
+                        .unwrap()
+                        .tombstone
+                        .unwrap()
+                        .acknowledged
+                );
+                assert_eq!(owner.drive_once(fixture_task()).unwrap(), stopped);
+                assert_eq!(host.0.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    struct AdvanceAfterAdmission<'a> {
+        inner: ManualIntegrationRuntime,
+        observer: &'a FakeIntegrationObserver,
+        next: Mutex<Option<IntegrationTaskFacts>>,
+    }
+    impl IntegrationRuntime for AdvanceAfterAdmission<'_> {
+        fn now_millis(&self) -> u64 {
+            self.inner.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.inner.actor()
+        }
+        fn actor_verdict(
+            &self,
+            actor: ProcessIdentity,
+        ) -> crate::client_state::RunnerLivenessVerdict {
+            self.inner.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.inner.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            if hook == IntegrationHook::AfterPhaseAdmission
+                && let Some(next) = self.next.lock().unwrap().take()
+            {
+                self.observer.insert(next);
+            }
+        }
+    }
+
+    #[test]
+    fn refreshed_owner_fences_host_and_auxiliary_after_the_phase_permit() {
+        for auxiliary in [false, true] {
+            let mut record = phase_record(if auxiliary {
+                IntegrationStep::Prepare
+            } else {
+                IntegrationStep::Push
+            });
+            let state = MemoryIntegrationState::default();
+            let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+            if auxiliary {
+                state.publish_prepared(record.task_id, &prepared).unwrap();
+                record.auxiliaries.push(prepared.intent().unwrap());
+                record.snapshot.resolve_turns = 1;
+                record.followups_spent = 1;
+            }
+            save_initial(&state, &record);
+            let host = StopOnlyHost::default();
+            let turns = FakeIntegrationTurns::default();
+            let observer = FakeIntegrationObserver::default();
+            let initial = facts(sample_ordinary(record.task_id, fixture_source()));
+            observer.insert(initial.clone());
+            let mut next = facts(sample_ordinary_followup(
+                record.task_id,
+                fixture_source(),
+                None,
+            ));
+            next.runner_present = true;
+            let runtime = AdvanceAfterAdmission {
+                inner: ManualIntegrationRuntime::default(),
+                observer: &observer,
+                next: Mutex::new(Some(next)),
+            };
+            let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+            let stopped = if auxiliary {
+                owner.drive_auxiliary(record, &initial).unwrap()
+            } else {
+                owner.host_phase(record, IntegrationStep::Push).unwrap()
+            };
+            assert_eq!(stopped.state, IntegrationStatus::Revoked);
+            assert_eq!(turns.enqueue_count(prepared.followup.turn_id()), 0);
+            assert_eq!(host.0.lock().unwrap().len(), 1);
+            assert_eq!(owner.drive_once(fixture_task()).unwrap(), stopped);
+            assert_eq!(host.0.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn newer_owner_refuses_auxiliary_preparation_before_sidecar_publication() {
+        let mut record = phase_record(IntegrationStep::Prepare);
+        let state = MemoryIntegrationState::default();
+        save_initial(&state, &record);
+        let host = StopOnlyHost::default();
+        let turns = FakeIntegrationTurns::default();
+        let runtime = ManualIntegrationRuntime::default();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(facts(sample_ordinary_followup(
+            record.task_id,
+            fixture_source(),
+            Some(TaskOutcome::Done),
+        )));
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+        owner
+            .prepare_auxiliary(&mut record, IntegrationTurnPurpose::Resolve)
+            .unwrap();
+        assert_eq!(record.snapshot.state, IntegrationStatus::Revoked);
+        let turn = auxiliary_turn_id(
+            record.snapshot.integration_id,
+            0,
+            1,
+            IntegrationTurnPurpose::Resolve,
+            1,
+        )
+        .unwrap();
+        assert!(state.load_prepared(record.task_id, turn).unwrap().is_none());
+        assert_eq!(turns.enqueue_count(turn), 0);
+    }
+
+    #[test]
+    fn superseded_committed_reply_is_retained_without_import_or_another_phase() {
+        struct CommittedStop(IntegrationReceipt, Mutex<usize>);
+        impl IntegrationHost for CommittedStop {
+            fn execute(
+                &self,
+                request: &HostIntegrationRequest,
+            ) -> Result<HostIntegrationResponse, WorkerError> {
+                assert!(
+                    matches!(request.action, HostIntegrationAction::Revoke { .. }),
+                    "superseded cycle reached another phase"
+                );
+                *self.1.lock().unwrap() += 1;
+                Ok(HostIntegrationResponse::Integrated {
+                    identity: IntegrationResponseIdentity::for_request(request),
+                    receipt: self.0.clone(),
+                })
+            }
+        }
+        let record = phase_record(IntegrationStep::Repair);
+        let state = MemoryIntegrationState::default();
+        save_initial(&state, &record);
+        let receipt = record.receipt.clone().unwrap();
+        let host = CommittedStop(receipt.clone(), Mutex::new(0));
+        let turns = FakeIntegrationTurns::default();
+        let runtime = ManualIntegrationRuntime::default();
+        let observer = FakeIntegrationObserver::default();
+        let mut newer = facts(sample_ordinary_followup(
+            record.task_id,
+            fixture_source(),
+            None,
+        ));
+        newer.runner_present = true;
+        observer.insert(newer);
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+        let stopped = owner.drive_once(record.task_id).unwrap();
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+        let saved = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(saved.receipt, Some(receipt));
+        assert!(saved.tombstone.unwrap().acknowledged);
+        assert!(turns.imports(record.task_id).is_empty());
+        assert_eq!(owner.drive_once(record.task_id).unwrap(), stopped);
+        assert_eq!(*host.1.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn active_resolver_and_verifier_sidecars_keep_their_own_cycle_admitted() {
+        for purpose in [
+            IntegrationTurnPurpose::Resolve,
+            IntegrationTurnPurpose::Verify,
+        ] {
+            let mut record = phase_record(IntegrationStep::Prepare);
+            if purpose == IntegrationTurnPurpose::Verify {
+                record.policy.verify = VerifyPolicy::MovedTarget;
+                record.snapshot.state = IntegrationStatus::Verifying;
+                record.snapshot.verify_turns = 1;
+            } else {
+                record.snapshot.resolve_turns = 1;
+            }
+            record.followups_spent = 1;
+            let prepared = sample_prepared_turn(&record, purpose, 1, 1);
+            let state = MemoryIntegrationState::default();
+            state.publish_prepared(record.task_id, &prepared).unwrap();
+            let turns = FakeIntegrationTurns::default();
+            turns.enqueue(&prepared).unwrap();
+            let mut intent = prepared.intent().unwrap();
+            intent.queue_position = turns.queue_position(intent.turn_id);
+            record.auxiliaries.push(intent);
+            save_initial(&state, &record);
+            let mut current = facts(sample_ordinary(record.task_id, fixture_source()));
+            let mut wire = serde_json::to_value(current.ordinary.status()).unwrap();
+            wire["state"] = "active".into();
+            wire["turns"].as_array_mut().unwrap().push(
+                serde_json::to_value(crate::task::TurnSummary::new(
+                    2,
+                    prepared.followup.turn_id(),
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(1002),
+                    None,
+                ))
+                .unwrap(),
+            );
+            current.ordinary = current
+                .ordinary
+                .with_status(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            current.runner_present = true;
+            current.auxiliary_purpose = Some(purpose);
+            let observer = FakeIntegrationObserver::default();
+            observer.insert(current);
+            let host = StopOnlyHost::default();
+            let runtime = ManualIntegrationRuntime::default();
+            let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+            assert_eq!(
+                owner.drive_once(record.task_id).unwrap().state,
+                record.snapshot.state
+            );
+            assert_eq!(turns.enqueue_count(prepared.followup.turn_id()), 1);
+            assert!(host.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_retired_auxiliary_from_the_previous_epoch_does_not_supersede_its_ordinary_source() {
+        struct FetchOnly;
+        impl IntegrationHost for FetchOnly {
+            fn execute(
+                &self,
+                request: &HostIntegrationRequest,
+            ) -> Result<HostIntegrationResponse, WorkerError> {
+                let HostIntegrationAction::Step {
+                    step: IntegrationStep::Fetch,
+                    record,
+                } = &request.action
+                else {
+                    panic!(
+                        "retained auxiliary history was treated as a newer ordinary source: {request:?}"
+                    );
+                };
+                Ok(HostIntegrationResponse::CandidateReady {
+                    identity: IntegrationResponseIdentity::for_request(request),
+                    candidate: Box::new(sample_candidate(record)),
+                })
+            }
+        }
+        for purpose in [
+            IntegrationTurnPurpose::Resolve,
+            IntegrationTurnPurpose::Verify,
+        ] {
+            let mut previous = phase_record(IntegrationStep::Prepare);
+            if purpose == IntegrationTurnPurpose::Verify {
+                previous.policy.verify = VerifyPolicy::MovedTarget;
+            }
+            let prepared = sample_prepared_turn(&previous, purpose, 1, 1);
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.policy = previous.policy.clone();
+            record.snapshot.epoch = 1;
+            record.followups_spent = 1;
+            let state = MemoryIntegrationState::default();
+            state.publish_prepared(record.task_id, &prepared).unwrap();
+            save_initial(&state, &record);
+            let mut current = facts(sample_ordinary(record.task_id, fixture_source()));
+            let mut wire = serde_json::to_value(current.ordinary.status()).unwrap();
+            wire["turns"].as_array_mut().unwrap().push(
+                serde_json::to_value(crate::task::TurnSummary::new(
+                    2,
+                    prepared.followup.turn_id(),
+                    Some(crate::task::TurnTerminal::Succeeded),
+                    Some(TaskOutcome::Done),
+                    Some(false),
+                    false,
+                    Some(1002),
+                    Some(1003),
+                ))
+                .unwrap(),
+            );
+            current.ordinary = current
+                .ordinary
+                .with_status(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            current.auxiliary_purpose = Some(purpose);
+            let observer = FakeIntegrationObserver::default();
+            observer.insert(current);
+            let turns = FakeIntegrationTurns::default();
+            let runtime = ManualIntegrationRuntime::default();
+            let owner =
+                IntegrationCoordinator::new(&state, &FetchOnly, &turns, &runtime, &observer);
+            let snapshot = owner.drive_once(record.task_id).unwrap();
+            assert_eq!(snapshot.state, IntegrationStatus::CommitReady);
+            assert_eq!(snapshot.epoch, 1);
+            assert_eq!(snapshot.source_turn_id, fixture_source());
+            assert_eq!(turns.enqueue_count(prepared.followup.turn_id()), 0);
+        }
     }
 }

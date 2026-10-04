@@ -552,7 +552,7 @@ fn preview_prints_effective_per_task_target_verify_and_disable() {
 }
 
 #[test]
-fn explicit_controller_redrive_refuses_unwired_support_without_rpc_or_durable_rows() {
+fn explicit_controller_redrive_refuses_unavailable_support_after_read_only_probe() {
     use clap::Parser;
     use mac_worker::test_support::{
         cli::Cli,
@@ -576,7 +576,7 @@ fn explicit_controller_redrive_refuses_unwired_support_without_rpc_or_durable_ro
     ])
     .unwrap();
     let runtime = RuntimeContext::isolated(Default::default(), home.clone(), home.clone());
-    let runner = PreflightRunner::new(vec![]);
+    let runner = PreflightRunner::new(vec![(1, vec![])]);
     let mut stderr = Vec::new();
     let exit = run_with_io_in_context(cli, &runner, &runtime, &mut Vec::new(), &mut stderr);
     assert_eq!(exit, 69);
@@ -585,7 +585,18 @@ fn explicit_controller_redrive_refuses_unwired_support_without_rpc_or_durable_ro
             .unwrap()
             .contains("INTEGRATION_UNAVAILABLE")
     );
-    assert!(runner.requests.lock().unwrap().is_empty());
+    let calls = runner.requests.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let probe = mac_worker::test_support::controller::parse_request(
+        mac_worker::test_support::controller::decode_frame(calls[0].stdin.as_ref().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(probe.command(), "task.list");
+    assert_eq!(
+        probe.body(),
+        &serde_json::json!({"controller_health": true})
+    );
     assert!(!home.join(".local/state/mac-worker-controller").exists());
 }
 

@@ -21,7 +21,6 @@ use crate::{
     git_transport::{GitTransport, SessionRefPush},
     job::RequestFingerprint,
     paths::PathLayout,
-    prepared_submit::FrozenSubmitBody,
     process::ProcessRunner,
     project_state::ProjectState,
     protocol::PROTOCOL_VERSION,
@@ -40,8 +39,8 @@ pub fn stream_source_receive(
     worktree_id: &str,
     oid: &BaseOid,
 ) -> Result<(), WorkerError> {
-    let frozen: FrozenSubmitBody =
-        serde_json::from_value(operation.body().clone()).map_err(|_| source_conflict())?;
+    let frozen = super::integration::source_submit_body(operation.command(), operation.body())
+        .map_err(|_| source_conflict())?;
     if frozen.project_id != project_id
         || frozen.worktree_id != worktree_id
         || frozen.base_oid != *oid

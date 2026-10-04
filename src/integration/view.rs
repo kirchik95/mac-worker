@@ -4,6 +4,54 @@ use crate::error::WorkerError;
 use crate::task::{LocalTaskRecord, TaskOutcome, TaskState, TurnId};
 use crate::task_view::{ReviewState, review_state};
 
+pub(crate) fn read_owner_view(
+    paths: &crate::paths::PathLayout,
+    ordinary: &LocalTaskRecord,
+    runner: impl FnOnce() -> Result<bool, WorkerError>,
+) -> Result<Option<IntegrationView>, WorkerError> {
+    let reader = super::store::ExistingIntegrationReader::open_at(&paths.state)?;
+    let (policy, record) = reader.read_task(ordinary.meta().task_id())?;
+    if record.is_none() {
+        return Ok(None);
+    }
+    project_owner_view(
+        &reader,
+        ordinary,
+        runner()?,
+        policy.as_ref(),
+        record.as_ref(),
+    )
+    .map(Some)
+}
+
+pub(crate) fn project_owner_view(
+    reader: &super::store::ExistingIntegrationReader,
+    ordinary: &LocalTaskRecord,
+    runner: bool,
+    policy: Option<&FrozenIntegrationPolicy>,
+    record: Option<&IntegrationRecord>,
+) -> Result<IntegrationView, WorkerError> {
+    let task = ordinary.meta().task_id();
+    let current = record
+        .map(|record| {
+            snapshot_covers_latest_work(&record.snapshot, ordinary, |turn| {
+                reader
+                    .read_auxiliary(task, turn, Some(record))
+                    .map(|prepared| prepared.is_some())
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let facts = IntegrationTaskFacts::from_record(ordinary, runner);
+    let snapshot = record.map(|record| &record.snapshot);
+    let mut view = project_integration_for_current_work(snapshot, &facts, current)?;
+    if let Some(policy) = policy {
+        view.requested_close = policy.requested_close;
+    }
+    view.integration = snapshot.cloned();
+    Ok(view)
+}
+
 impl IntegrationTaskFacts {
     /// Ordinary read facts; an observer may add its admission/auxiliary evidence.
     pub fn from_record(ordinary: &LocalTaskRecord, runner_present: bool) -> Self {

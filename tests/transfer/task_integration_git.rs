@@ -703,6 +703,111 @@ fn server_cas_after_advertisement_is_movement_and_rebuilds() {
 }
 
 #[test]
+fn rooted_owner_rebuilds_the_exact_lease_before_and_after_native_advertisement() {
+    use mac_worker::test_support::{
+        core::paths::PathLayout,
+        task::{model::LocalTaskRecord, store::TaskStore},
+    };
+    use std::sync::Arc;
+    for after_advertisement in [false, true] {
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        f.write("intermediate.txt", b"intermediate\n");
+        let outside = f.commit("intermediate");
+        let source = f.commit_task();
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+        let ordinary = LocalTaskRecord::new(
+            tasks
+                .load_meta(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            tasks
+                .load_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            Some(1001),
+            None,
+            Some(source.clone()),
+            "c".repeat(64),
+            Some("fixture-worker".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(IntegrationTaskFacts::from_record(&ordinary, false));
+        let turns = FakeIntegrationTurns::default();
+        let receiver = NativeReceiver::new(
+            &f,
+            if after_advertisement {
+                outside.as_str()
+            } else {
+                ""
+            },
+        );
+        let host = HostIntegrationService::new(&f.store, &receiver, runtime.as_ref());
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        assert_eq!(
+            owner.drive_once(f.record.task_id).unwrap().state,
+            IntegrationStatus::CommitReady
+        );
+        let initial = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(
+            f.parents(initial.candidates[0].merge_oid.as_ref().unwrap()),
+            vec![target, source.clone()]
+        );
+        if !after_advertisement {
+            f.git(&[
+                "push",
+                &f.record.policy.origin,
+                &format!("{outside}:refs/heads/main"),
+            ]);
+        }
+        owner.drive_once(f.record.task_id).unwrap();
+        assert_eq!(f.origin_tip(), outside);
+        assert!(turns.imports(f.record.task_id).is_empty());
+        assert_eq!(state.load(f.record.task_id).unwrap().unwrap().actor, None);
+        let done = IntegrationRunner::new(owner).run(f.record.task_id).unwrap();
+        assert_eq!(done.state, IntegrationStatus::Integrated);
+        assert_eq!(done.attempts, 2);
+        let saved = state.load(f.record.task_id).unwrap().unwrap();
+        assert!(saved.receipt.as_ref().unwrap().imported);
+        assert_eq!(
+            f.parents(saved.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap()),
+            vec![outside, source]
+        );
+        let replies = receiver.replies.lock().unwrap();
+        if after_advertisement {
+            assert_eq!(replies.len(), 2);
+            assert!(!replies[0].status.success());
+            assert!(replies[1].status.success());
+            assert!(String::from_utf8_lossy(&replies[0].stdout).contains("[remote rejected]"));
+        } else {
+            assert_eq!(
+                replies.len(),
+                1,
+                "movement observed before advertisement must skip the stale push"
+            );
+            assert!(replies[0].status.success());
+        }
+    }
+}
+
+#[test]
 fn unchanged_target_native_policy_rejection_is_not_movement() {
     let mut f = GitIntegrationFixture::new();
     let target = f.commit_base();

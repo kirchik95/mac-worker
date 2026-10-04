@@ -208,6 +208,19 @@ pub fn prepare_task_batch(
     }
     let body: FrozenBatchBody = serde_json::from_value(request.body().clone())
         .map_err(|_| invalid("task.batch body is invalid"))?;
+    prepare_task_batch_body(request, body, transfer, cache_root, runner, config)
+}
+
+/// The wrapper owner passes the decoded ordinary body, retaining the original
+/// request's identity and whole-body source fingerprint.
+pub(crate) fn prepare_task_batch_body(
+    request: &ControllerRequest,
+    body: FrozenBatchBody,
+    transfer: &ControllerTransfer,
+    cache_root: &Path,
+    runner: &dyn ProcessRunner,
+    config: &Config,
+) -> Result<PreparedTaskBatch, WorkerError> {
     validate_wire_graph(&body)?;
     let max_parallel =
         resolve_batch_max_parallel(body.max_parallel, config.configured_runner_slots())?;

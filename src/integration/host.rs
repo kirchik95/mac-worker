@@ -16,6 +16,47 @@ pub struct HostIntegrationService<'a> {
     runner: &'a dyn ProcessRunner,
     runtime: &'a dyn IntegrationRuntime,
 }
+/// Native helper runtime. Owner phase/drain admission is supplied separately
+/// by the detached owner driver, never by this host endpoint.
+pub(crate) struct HostIntegrationRuntime(crate::job::ProcessIdentity);
+impl HostIntegrationRuntime {
+    pub(crate) fn new() -> Result<Self, WorkerError> {
+        Ok(Self(crate::turn_runner::current_process_identity()?))
+    }
+}
+impl IntegrationRuntime for HostIntegrationRuntime {
+    fn now_millis(&self) -> u64 {
+        crate::controller::leader::now_millis().unwrap_or(0)
+    }
+    fn actor(&self) -> crate::job::ProcessIdentity {
+        self.0
+    }
+    fn actor_verdict(
+        &self,
+        actor: crate::job::ProcessIdentity,
+    ) -> crate::client_state::RunnerLivenessVerdict {
+        use crate::client_state::RunnerLivenessVerdict;
+        use crate::supervisor::{ProcessInspector, ProcessObservation, SystemProcessInspector};
+        match SystemProcessInspector.observe(actor) {
+            ProcessObservation::Matching { .. } => RunnerLivenessVerdict::Live,
+            ProcessObservation::Reused => RunnerLivenessVerdict::Exited,
+            ProcessObservation::Absent => match SystemProcessInspector.observe(actor) {
+                ProcessObservation::Absent | ProcessObservation::Reused => {
+                    RunnerLivenessVerdict::Exited
+                }
+                _ => RunnerLivenessVerdict::Unverifiable,
+            },
+            ProcessObservation::Ambiguous => RunnerLivenessVerdict::Unverifiable,
+        }
+    }
+    fn begin_phase(
+        &self,
+        _key: &IntegrationPhaseKey,
+    ) -> Result<IntegrationDriveAdmission, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn reach(&self, _point: IntegrationHook) {}
+}
 impl<'a> HostIntegrationService<'a> {
     pub fn new(
         store: &'a HostStore,
@@ -117,9 +158,87 @@ impl<'a> HostIntegrationService<'a> {
                 }
             }
             HostIntegrationAction::Revoke { tombstone } => {
-                let mut record = sidecars
-                    .load(&policy.project_id, request.task_id)?
+                let retained = sidecars.load(&policy.project_id, request.task_id)?;
+                let status = task_store.load_status(&policy.project_id, request.task_id)?;
+                let source = sidecars
+                    .latest_ordinary_source(&policy.project_id, request.task_id, &status)?
                     .ok_or_else(invalid)?;
+                let retained_identity = retained.as_ref().is_some_and(|record| {
+                    Some(record.snapshot.integration_id) == request.integration_id
+                });
+                if retained_identity
+                    && retained.as_ref().is_some_and(|record| {
+                        record.snapshot.source_turn_id != source
+                            || request.epoch < record.snapshot.epoch
+                    })
+                {
+                    return Err(invalid());
+                }
+                if !retained_identity
+                    && Some(IntegrationId::derive(
+                        request.task_id,
+                        source,
+                        status.head_oid().ok_or_else(invalid)?,
+                        &policy.target_key()?,
+                    )?) != request.integration_id
+                {
+                    return Err(invalid());
+                }
+                let evidence = sidecars.revoke_evidence(&policy.project_id, request.task_id)?;
+                // The pre-phase journal is a fence even without a phase
+                // record. A delayed older revoke must never lower its epoch.
+                if evidence.as_ref().is_some_and(|proof| {
+                    proof.request.integration_id == request.integration_id
+                        && proof.request.epoch > request.epoch
+                }) {
+                    return Err(invalid());
+                }
+                let same_cycle = retained.as_ref().is_some_and(|record| {
+                    Some(record.snapshot.integration_id) == request.integration_id
+                        && record.snapshot.epoch == request.epoch
+                });
+                if !same_cycle {
+                    if retained.as_ref().is_some_and(|old| {
+                        !(old.tombstone.as_ref().is_some_and(|t| t.acknowledged)
+                            && old.push_intent.as_ref().is_none_or(|p| !p.uncertain)
+                            || old.receipt.as_ref().is_some_and(|r| r.imported))
+                    }) {
+                        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                    }
+                    let mut proof = evidence
+                        .filter(|proof| {
+                            proof.request.integration_id == request.integration_id
+                                && proof.request.epoch == request.epoch
+                        })
+                        .unwrap_or(super::host_store::HostRevokeEvidence {
+                            request: request.clone(),
+                            head: None,
+                            turn: None,
+                            acknowledged: false,
+                        });
+                    if proof.request != *request {
+                        return Err(invalid());
+                    }
+                    sidecars.save_revoke_evidence(&policy.project_id, &proof)?;
+                    self.runtime.reach(IntegrationHook::AfterRevoke);
+                    let status = task_store.load_status(&policy.project_id, request.task_id)?;
+                    if status.state() == TaskState::Active
+                        || crate::lease::LeaseService::new(self.store)
+                            .task_scope_is_live(&policy.project_id, request.task_id)?
+                    {
+                        return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                    }
+                    self.runtime.reach(IntegrationHook::BeforeRevokeAck);
+                    proof.head = status.head_oid().cloned();
+                    proof.turn = status.turns().last().map(|turn| turn.turn_id());
+                    proof.acknowledged = true;
+                    sidecars.save_revoke_evidence(&policy.project_id, &proof)?;
+                    self.runtime.reach(IntegrationHook::AfterRevokeAck);
+                    let response = HostIntegrationResponse::Revoked { identity };
+                    response.validate_for(request)?;
+                    return Ok(response);
+                }
+                let mut record = retained.ok_or_else(invalid)?;
                 if Some(record.snapshot.integration_id) != request.integration_id
                     || record.snapshot.epoch != request.epoch
                     || record.snapshot.revision.0 > request.revision.0
@@ -174,6 +293,15 @@ impl<'a> HostIntegrationService<'a> {
                 }
             }
             HostIntegrationAction::Step { step, record } => {
+                if sidecars
+                    .revoke_evidence(&policy.project_id, request.task_id)?
+                    .is_some_and(|proof| {
+                        proof.request.integration_id == request.integration_id
+                            && request.epoch <= proof.request.epoch
+                    })
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
                 let status = task_store.load_status(&policy.project_id, request.task_id)?;
                 if status.state() != TaskState::Open && *step != IntegrationStep::Repair {
                     return Err(IntegrationCode::IntegrationWorkspaceMissing.error());
@@ -185,6 +313,18 @@ impl<'a> HostIntegrationService<'a> {
                 }
                 if status.head_oid() != Some(&record.snapshot.source_head)
                     && *step != IntegrationStep::Repair
+                {
+                    return Err(invalid());
+                }
+                // A later ordinary turn durably retires all preceding source
+                // identities, including no-change turns with the same head.
+                // Repair keeps its retained-receipt observation authority.
+                if *step != IntegrationStep::Repair
+                    && sidecars.latest_ordinary_source(
+                        &policy.project_id,
+                        request.task_id,
+                        &status,
+                    )? != Some(record.snapshot.source_turn_id)
                 {
                     return Err(invalid());
                 }

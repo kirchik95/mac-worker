@@ -76,13 +76,26 @@ pub struct TaskReadResult<T> {
 }
 
 pub struct TaskEventReadStore {
-    integrations: Option<Arc<dyn crate::integration::contracts::IntegrationState>>,
+    integrations: Option<EventIntegrationSource>,
     root: RootedDir,
     tasks: RootedDir,
     queue: RootedDir,
     turns: RootedDir,
     client_id: ClientId,
     runtime: Arc<dyn EventRuntime>,
+}
+
+#[derive(Clone)]
+enum EventIntegrationSource {
+    Native,
+    #[cfg(any(test, feature = "test-support"))]
+    Injected(Arc<dyn crate::integration::contracts::IntegrationState>),
+}
+
+enum EventIntegrationPoll {
+    Native(crate::integration::store::ExistingIntegrationReader),
+    #[cfg(any(test, feature = "test-support"))]
+    Injected(Arc<dyn crate::integration::contracts::IntegrationState>),
 }
 
 impl TaskProjectionReader for TaskEventReadStore {
@@ -121,19 +134,22 @@ impl TaskProjectionReader for TaskEventReadStore {
 }
 
 pub struct ExistingTaskProjectionProvider {
-    integrations: Option<Arc<dyn crate::integration::contracts::IntegrationState>>,
+    integrations: Option<EventIntegrationSource>,
     paths: PathLayout,
     runtime: Arc<dyn EventRuntime>,
 }
 
 impl ExistingTaskProjectionProvider {
-    // The serial T6 entry-point wiring installs this adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_integrations(
         mut self,
         state: Arc<dyn crate::integration::contracts::IntegrationState>,
     ) -> Self {
-        self.integrations = Some(state);
+        self.integrations = Some(EventIntegrationSource::Injected(state));
+        self
+    }
+    pub fn with_native_integrations(mut self) -> Self {
+        self.integrations = Some(EventIntegrationSource::Native);
         self
     }
     pub fn new(paths: PathLayout, runtime: Arc<dyn EventRuntime>) -> Self {
@@ -158,36 +174,65 @@ impl TaskProjectionProvider for ExistingTaskProjectionProvider {
         if self.runtime.now() >= deadline {
             return Err(invalid_state());
         }
-        let mut store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
-        if let Some(integrations) = &self.integrations {
-            store = store.with_integrations(integrations.clone());
-        }
+        let store = TaskEventReadStore::open_existing(&self.paths, Arc::clone(&self.runtime))?;
+        let store = match &self.integrations {
+            Some(EventIntegrationSource::Native) => store.with_native_integrations(),
+            #[cfg(any(test, feature = "test-support"))]
+            Some(EventIntegrationSource::Injected(state)) => store.with_integrations(state.clone()),
+            None => store,
+        };
         store.check_deadline(deadline)?;
         Ok(Arc::new(store))
     }
 }
 
 impl TaskEventReadStore {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_integrations(
         mut self,
         state: Arc<dyn crate::integration::contracts::IntegrationState>,
     ) -> Self {
-        self.integrations = Some(state);
+        self.integrations = Some(EventIntegrationSource::Injected(state));
         self
+    }
+    pub fn with_native_integrations(mut self) -> Self {
+        self.integrations = Some(EventIntegrationSource::Native);
+        self
+    }
+    fn integration_poll(&self) -> Result<Option<EventIntegrationPoll>, WorkerError> {
+        self.integrations
+            .as_ref()
+            .map(|source| match source {
+                EventIntegrationSource::Native => {
+                    crate::integration::store::ExistingIntegrationReader::open_at(self.root.path())
+                        .map(EventIntegrationPoll::Native)
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                EventIntegrationSource::Injected(state) => {
+                    Ok(EventIntegrationPoll::Injected(state.clone()))
+                }
+            })
+            .transpose()
     }
     fn facts(
         &self,
         record: &LocalTaskRecord,
         dispatching: Option<bool>,
         include_titles: bool,
+        integrations: Option<&EventIntegrationPoll>,
     ) -> Result<TaskFacts, WorkerError> {
         use crate::integration::contracts::ValidateIntegration;
         let facts = record_facts(record, dispatching, include_titles)?;
-        let Some(state) = &self.integrations else {
+        let Some(source) = integrations else {
             return Ok(facts);
         };
         let id = record.meta().task_id();
-        match state.load(id)? {
+        let (policy, integration) = match source {
+            EventIntegrationPoll::Native(reader) => reader.read_task(id)?,
+            #[cfg(any(test, feature = "test-support"))]
+            EventIntegrationPoll::Injected(state) => (None, state.load(id)?),
+        };
+        match integration {
             Some(integration) => {
                 integration.validate()?;
                 if integration.task_id != id {
@@ -196,18 +241,30 @@ impl TaskEventReadStore {
                 let current = crate::integration::view::snapshot_covers_latest_work(
                     &integration.snapshot,
                     record,
-                    |turn| {
-                        state
+                    |turn| match source {
+                        EventIntegrationPoll::Native(reader) => reader
+                            .read_auxiliary(id, turn, Some(&integration))
+                            .map(|prepared| prepared.is_some()),
+                        #[cfg(any(test, feature = "test-support"))]
+                        EventIntegrationPoll::Injected(state) => state
                             .load_prepared(id, turn)
-                            .map(|prepared| prepared.is_some())
+                            .map(|prepared| prepared.is_some()),
                     },
                 )?;
                 facts.with_current_integration(record, &integration.snapshot, current)
             }
-            None if state.load_policy(id)?.is_some() => {
-                Err(crate::integration::contracts::integration_unavailable())
+            None => {
+                let armed = match source {
+                    EventIntegrationPoll::Native(_) => policy.is_some(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    EventIntegrationPoll::Injected(state) => state.load_policy(id)?.is_some(),
+                };
+                if armed {
+                    Err(crate::integration::contracts::integration_unavailable())
+                } else {
+                    Ok(facts)
+                }
             }
-            None => Ok(facts),
         }
     }
     pub fn open_existing(
@@ -251,6 +308,7 @@ impl TaskEventReadStore {
         }
         let token = proof_after.map(decode_token::<ProofToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
+        let integrations = self.integration_poll()?;
         #[cfg(any(test, feature = "test-support"))]
         let started = Instant::now();
         let binding = ProofBinding {
@@ -278,7 +336,7 @@ impl TaskEventReadStore {
                 result.missing.push(id);
                 continue;
             };
-            let facts = self.facts(&record, None, include_titles)?;
+            let facts = self.facts(&record, None, include_titles, integrations.as_ref())?;
             let known_busy = facts.busy == Some(true);
             let namespace = if known_busy {
                 None
@@ -455,6 +513,7 @@ impl TaskEventReadStore {
     ) -> Result<TaskRepairPage, WorkerError> {
         let token = after.map(decode_token::<RepairToken>).transpose()?;
         let _fence = self.acquire(deadline)?;
+        let integrations = self.integration_poll()?;
         let binding = self.repair_binding()?;
         if token.as_ref().is_some_and(|token| {
             token.version != 1 || token.kind != "repair" || token.binding != binding
@@ -486,7 +545,14 @@ impl TaskEventReadStore {
             });
         }
         let work_started = Instant::now();
-        let result = self.repair_rows(&ids[start..], binding, limit, deadline, stats);
+        let result = self.repair_rows(
+            &ids[start..],
+            binding,
+            limit,
+            deadline,
+            stats,
+            integrations.as_ref(),
+        );
         stats.work_elapsed = work_started.elapsed();
         result
     }
@@ -498,6 +564,7 @@ impl TaskEventReadStore {
         limit: usize,
         deadline: Duration,
         stats: &mut TaskReadStats,
+        integrations: Option<&EventIntegrationPoll>,
     ) -> Result<TaskRepairPage, WorkerError> {
         let work_started = self.runtime.now();
         let (queue, _) = self.read_queue(deadline, stats)?;
@@ -519,7 +586,7 @@ impl TaskEventReadStore {
                     } else {
                         self.dispatching(id, &queue, deadline, stats)?
                     };
-                rows.push(self.facts(&record, dispatching, false)?);
+                rows.push(self.facts(&record, dispatching, false, integrations)?);
             }
             processed += 1;
         }
@@ -916,7 +983,7 @@ pub fn ensure_produced_task_facts_bytes(bytes: &[u8]) -> Result<(), WorkerError>
 
 impl TaskFacts {
     /// Add only the compact companion annotation and bind its revision to the digest.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_integration(
         self,
         record: &LocalTaskRecord,
@@ -1792,5 +1859,185 @@ mod tests {
         assert_eq!(second.rows[0].busy, Some(true));
         assert_eq!(second.rows[1].quiescent, Some(true));
         assert!(second.proof_after.is_none());
+    }
+    fn disabled_event_reader() -> (
+        tempfile::TempDir,
+        PathLayout,
+        Arc<ManualRuntime>,
+        Vec<TaskId>,
+    ) {
+        let (root, paths, runtime) = fixture();
+        let ids = (1..=16).map(id).collect::<Vec<_>>();
+        for number in 1..=16 {
+            write_record(&paths, &record(number, TaskState::Open, TaskOutcome::Done));
+            private_directory(&paths.state.join("turns").join(id(number).to_string()));
+        }
+        assert!(!paths.state.join("integrations").exists());
+        (root, paths, runtime, ids)
+    }
+
+    #[test]
+    fn review_disabled_addressed_event_poll_checks_absence_once() {
+        let (_root, paths, runtime, ids) = disabled_event_reader();
+        let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone())
+            .unwrap()
+            .addressed_measured(&ids, false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_native_integrations();
+        crate::integration::store::read_cost_counters::reset();
+        let actual = reader
+            .addressed_measured(&ids, false, None, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let calls = crate::integration::store::read_cost_counters::calls();
+        assert_eq!(actual, baseline);
+        assert!(!paths.state.join("integrations").exists());
+        println!(
+            "addressed event poll: rows={}, actual symlink_metadata calls={calls}; unchanged facts; no integration root created",
+            actual.len()
+        );
+        assert_eq!(
+            calls, 1,
+            "disabled event poll must check integration-root absence once"
+        );
+    }
+
+    #[test]
+    fn review_disabled_repair_event_poll_checks_absence_once() {
+        let (_root, paths, runtime, _ids) = disabled_event_reader();
+        let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone())
+            .unwrap()
+            .repair_read(None, 16, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let reader = TaskEventReadStore::open_existing(&paths, runtime)
+            .unwrap()
+            .with_native_integrations();
+        crate::integration::store::read_cost_counters::reset();
+        let actual = reader
+            .repair_read(None, 16, Duration::from_secs(30))
+            .unwrap()
+            .value
+            .rows;
+        let calls = crate::integration::store::read_cost_counters::calls();
+        assert_eq!(actual, baseline);
+        assert!(!paths.state.join("integrations").exists());
+        println!(
+            "repair event poll: rows={}, actual symlink_metadata calls={calls}; unchanged facts; no integration root created",
+            actual.len()
+        );
+        assert_eq!(
+            calls, 1,
+            "disabled repair poll must check integration-root absence once"
+        );
+    }
+
+    fn event_poll(reader: &TaskEventReadStore, ids: &[TaskId], repair: bool) -> Vec<TaskFacts> {
+        if repair {
+            reader
+                .repair_read(None, ids.len(), Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+        } else {
+            reader
+                .addressed_measured(ids, false, None, Duration::from_secs(30))
+                .unwrap()
+                .value
+                .rows
+        }
+    }
+
+    #[test]
+    fn native_event_polls_share_one_root_and_one_companion_pair_per_row() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        for repair in [false, true] {
+            let (_root, paths, runtime) = fixture();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let ids = (1..=16).map(id).collect::<Vec<_>>();
+            for &task in &ids {
+                write_record(&paths, &sample_ordinary(task, fixture_source()));
+                private_directory(&paths.state.join("turns").join(task.to_string()));
+                let integration = sample_record(task, fixture_source(), "main");
+                state.publish_policy(task, &integration.policy).unwrap();
+                state
+                    .replace(task, IntegrationRevision(0), &integration)
+                    .unwrap();
+            }
+            let baseline = TaskEventReadStore::open_existing(&paths, runtime.clone()).unwrap();
+            let native = TaskEventReadStore::open_existing(&paths, runtime)
+                .unwrap()
+                .with_native_integrations();
+            let before = crate::rooted_fs::read_open_counts();
+            event_poll(&baseline, &ids, repair);
+            let after = crate::rooted_fs::read_open_counts();
+            let ordinary = [after[0] - before[0], after[2] - before[2]];
+            let before = crate::rooted_fs::read_open_counts();
+            crate::integration::store::read_cost_counters::reset();
+            let rows = event_poll(&native, &ids, repair);
+            let after = crate::rooted_fs::read_open_counts();
+            assert_eq!(crate::integration::store::read_cost_counters::calls(), 1);
+            assert_eq!(after[0] - before[0], ordinary[0] + 1);
+            assert_eq!(after[2] - before[2], ordinary[1] + 32);
+            assert_eq!(rows.len(), 16);
+            assert!(rows.iter().all(|row| row.integration.is_some()));
+        }
+    }
+
+    #[test]
+    fn native_event_polls_reread_a_new_root_and_revision_on_the_next_poll() {
+        use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+        for repair in [false, true] {
+            let (_root, paths, runtime) = fixture();
+            let task = fixture_task();
+            write_record(&paths, &sample_ordinary(task, fixture_source()));
+            private_directory(&paths.state.join("turns").join(task.to_string()));
+            let native = TaskEventReadStore::open_existing(&paths, runtime)
+                .unwrap()
+                .with_native_integrations();
+            assert!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .is_none()
+            );
+            assert!(!paths.state.join("integrations").exists());
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut integration = sample_record(task, fixture_source(), "main");
+            state.publish_policy(task, &integration.policy).unwrap();
+            state
+                .replace(task, IntegrationRevision(0), &integration)
+                .unwrap();
+            assert_eq!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                IntegrationRevision(1)
+            );
+            integration.snapshot.revision = IntegrationRevision(2);
+            integration.snapshot.updated_at_millis += 1;
+            state
+                .replace(task, IntegrationRevision(1), &integration)
+                .unwrap();
+            assert_eq!(
+                event_poll(&native, &[task], repair)[0]
+                    .integration
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                IntegrationRevision(2)
+            );
+        }
     }
 }

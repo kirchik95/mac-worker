@@ -574,6 +574,20 @@ fn real_owner_auxiliary_admission_requires_the_authoritative_sidecar_and_replays
         .unwrap();
     set_drained(&paths.controller_state_root(), true).unwrap();
     client.say_integration_prepared(&prepared).unwrap();
+    assert!(
+        store
+            .queue_entry(prepared.followup.turn_id())
+            .unwrap()
+            .is_none(),
+        "drain acknowledgement must precede auxiliary queue admission"
+    );
+    assert_eq!(store.load_task(fixture_task()).unwrap(), ordinary);
+    assert_eq!(
+        state.load(fixture_task()).unwrap().unwrap().snapshot.state,
+        IntegrationStatus::Parked
+    );
+    set_drained(&paths.controller_state_root(), false).unwrap();
+    client.say_integration_prepared(&prepared).unwrap();
     let first = store
         .queue_entry(prepared.followup.turn_id())
         .unwrap()

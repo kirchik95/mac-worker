@@ -27,7 +27,9 @@ use crate::{
     error::WorkerError,
     git_transport::GitTransport,
     integration::{
-        contracts::{FrozenIntegratingBatch, IntegrationCode, IntegrationStatus},
+        contracts::{
+            FrozenIntegratingBatch, IntegrationCode, IntegrationStatus, IntegrationTaskFacts,
+        },
         coordinator::IntegrationCoordinator,
         store::RootedIntegrationState,
     },
@@ -329,10 +331,7 @@ fn acquire_in_process_submit_guard(
 
 #[derive(Debug, Clone)]
 pub struct TaskSubmitRequest {
-    // Input-only T1 contracts; T4/T6 supply their production consumers.
-    #[allow(dead_code)]
     pub integrate: crate::integration::contracts::IntegrationOverride,
-    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     pub session_import: Option<crate::session_transfer::SessionImportMeta>,
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -410,6 +409,7 @@ impl PublishRetryReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
+    pub(crate) integration_view: Option<crate::integration::contracts::IntegrationView>,
     pub(crate) session_submission: Option<SessionSubmission>,
     task_id: TaskId,
     questions_policy: QuestionsPolicy,
@@ -427,6 +427,11 @@ pub struct TaskReport {
 }
 
 impl TaskReport {
+    pub(crate) fn integration_view(
+        &self,
+    ) -> Option<&crate::integration::contracts::IntegrationView> {
+        self.integration_view.as_ref()
+    }
     pub fn questions_policy(&self) -> QuestionsPolicy {
         self.questions_policy
     }
@@ -480,6 +485,12 @@ impl TaskReport {
     }
 
     pub(crate) fn from_controller(projection: ControllerTaskProjection) -> Self {
+        let integration_view = projection
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "integration")
+            .and_then(|event| serde_json::from_value(event["view"].clone()).ok());
         let questions_policy = projection
             .events
             .iter()
@@ -496,6 +507,7 @@ impl TaskReport {
             .unwrap_or_default();
         Self {
             session_submission: None,
+            integration_view,
             questions_policy,
             task_id: projection.task_id,
             run_id: projection.run_id,
@@ -563,6 +575,7 @@ impl TaskListReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskResultReport {
+    pub(crate) integration_view: Option<crate::integration::contracts::IntegrationView>,
     task_id: TaskId,
     status: TaskStatus,
     branch: String,
@@ -575,6 +588,11 @@ pub struct TaskResultReport {
 }
 
 impl TaskResultReport {
+    pub(crate) fn integration_view(
+        &self,
+    ) -> Option<&crate::integration::contracts::IntegrationView> {
+        self.integration_view.as_ref()
+    }
     pub fn task_id(&self) -> TaskId {
         self.task_id
     }
@@ -628,6 +646,7 @@ impl TaskResultReport {
             task_id,
             status,
             branch,
+            integration_view: None,
             fetch_instruction,
             failure_receipt,
             deliveries,
@@ -1073,10 +1092,8 @@ impl Default for BatchDefaults {
 #[serde(deny_unknown_fields)]
 pub struct BatchTask {
     #[serde(default)]
-    #[allow(dead_code)] // Input-only until T4/T6 wiring.
     pub integrate: crate::integration::contracts::IntegrationOverride,
     #[serde(default)]
-    #[allow(dead_code)]
     pub verify_merge: Option<crate::integration::contracts::VerifyPolicy>,
     #[serde(default)]
     pub questions: Option<crate::task::QuestionsPolicy>,
@@ -1247,7 +1264,6 @@ impl<'a> TaskClient<'a> {
     }
 
     /// T6 injects the owner ports; disabled callers retain the ordinary path.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn with_integration(mut self, coordinator: &'a IntegrationCoordinator<'a>) -> Self {
         self.integration = Some(coordinator);
         self
@@ -1268,7 +1284,6 @@ impl<'a> TaskClient<'a> {
     }
 
     /// T4/T6 calls this before an integrating batch can enter the ordinary DAG.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn validate_integration_batch(batch: &FrozenIntegratingBatch) -> Result<(), WorkerError> {
         crate::dag::validate_integration_batch(batch)
     }
@@ -1291,10 +1306,54 @@ impl<'a> TaskClient<'a> {
         if !self.integration_enabled(task)? {
             return Ok(record.clone());
         }
-        let coordinator = self
-            .integration
-            .ok_or_else(|| IntegrationCode::IntegrationUnavailable.error())?;
-        let Some(snapshot) = coordinator.snapshot(task)? else {
+        let coordinator = match self.integration {
+            Some(coordinator) => coordinator,
+            None => {
+                let native = crate::integration::runner::OwnerIntegration::new(
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    self.client_state,
+                    self.executor,
+                )?;
+                let coordinator = native.coordinator();
+                return TaskClient::new(
+                    self.runner,
+                    self.config,
+                    self.paths,
+                    self.client_state,
+                    self.executor,
+                )
+                .with_integration(&coordinator)
+                .before_integration_mutation(record, operation);
+            }
+        };
+        let mut snapshot = coordinator.snapshot(task)?;
+        if matches!(
+            operation,
+            IntegrationMutation::Cancel
+                | IntegrationMutation::Close
+                | IntegrationMutation::Say { new_turn: true }
+        ) && record.status().state() == TaskState::Open
+            && let Some(last) = record.status().turns().last()
+            && last.terminal().is_some()
+            && last.outcome() == Some(&TaskOutcome::Done)
+            && (snapshot.is_none()
+                || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
+        {
+            // Retirement can precede the finalizer's intent publication. Use
+            // the same source CAS before a stop or ordinary follow-up. Say
+            // must observe the cycle's normal busy/revoke rules in this window.
+            coordinator.on_terminal(task, last.turn_id())?;
+            snapshot = coordinator.snapshot(task)?;
+            if snapshot
+                .as_ref()
+                .is_none_or(|s| s.source_turn_id != last.turn_id())
+            {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+        }
+        let Some(snapshot) = snapshot else {
             return Ok(record.clone());
         };
         // A receipt remains history after a newer ordinary turn starts. Only
@@ -1329,13 +1388,82 @@ impl<'a> TaskClient<'a> {
             Ok(_) => {}
             Err(e)
                 if e.public_code() == "INTEGRATION_ALREADY_COMMITTED"
-                    && !matches!(operation, IntegrationMutation::Cancel) => {}
+                    && !matches!(operation, IntegrationMutation::Cancel) =>
+            {
+                if coordinator
+                    .snapshot(task)?
+                    .is_none_or(|snapshot| snapshot.state != IntegrationStatus::Integrated)
+                {
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
+            }
             Err(e) => return Err(e),
+        }
+        if coordinator.snapshot(task)?.is_none_or(|snapshot| {
+            !matches!(
+                snapshot.state,
+                IntegrationStatus::Revoked | IntegrationStatus::Integrated
+            )
+        }) {
+            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
         }
         if matches!(operation, IntegrationMutation::Cancel) {
             coordinator.mark_given_up(task)?;
         }
         self.client_state.load_task(task)
+    }
+
+    /// Stop intent is durable before transport. Neither a remote cancel reply
+    /// nor a dead PID substitutes for journal/queue retirement.
+    pub(crate) fn settle_integration_stop(&self, task: TaskId) -> Result<bool, WorkerError> {
+        let record = self.client_state.load_task(task)?;
+        if let Some(entry) = self.client_state.queue_entry_for_task_turn(task)? {
+            let entry = self
+                .client_state
+                .retain_task_turn_cancel(entry.job_id(), current_time_millis()?)?
+                .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+            if !matches!(entry.state(), QueueState::Dispatching { .. })
+                && self.finish_waiting_cancellation(&record, &entry)?
+            {
+                return Ok(true);
+            }
+            if record.status().state() == TaskState::Active {
+                let worker = task_worker(self.config, record.status())?;
+                let remote = RemoteJobClient::new(self.runner);
+                let observed = remote.task_status(
+                    worker,
+                    &crate::task_store::TaskStatusRequest::new(record.meta().project_id(), task),
+                )?;
+                if observed.status().state() == TaskState::Active
+                    && observed
+                        .status()
+                        .turns()
+                        .last()
+                        .is_some_and(|turn| turn.turn_id() == entry.job_id())
+                {
+                    remote.task_cancel(
+                        worker,
+                        &crate::task_store::TaskCancelRequest::new(
+                            record.meta().project_id(),
+                            task,
+                            entry.job_id(),
+                        ),
+                    )?;
+                }
+            }
+            return Ok(false);
+        }
+        if let Some(runner) = record.runner() {
+            if self
+                .client_state
+                .runner_identity_verdict(runner.process_identity())
+                != RunnerLivenessVerdict::Exited
+            {
+                return Ok(false);
+            }
+            self.client_state.record_runner(task, None)?;
+        }
+        Ok(true)
     }
 
     /// Herdr session the runners this client starts inline notify about
@@ -1520,6 +1648,7 @@ impl<'a> TaskClient<'a> {
         validate_preference(self.config, &request.preference)?;
 
         let identity = GitIdentity::new(DEFAULT_GIT_NAME, DEFAULT_GIT_EMAIL)?;
+        let mut direct_integration = None;
         let (
             context,
             limits,
@@ -1590,6 +1719,15 @@ impl<'a> TaskClient<'a> {
                 let requirements = spec.requires.clone();
                 let policy = spec.permission_policy()?;
                 let observations = self.observe_admission(&request.preference)?;
+                if crate::integration::store::RootedIntegrationState::read_task(
+                    self.paths,
+                    node.task_id,
+                )?
+                .0
+                .is_some()
+                {
+                    require_integration_helper(&observations)?;
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&context.project_id, &context.worktree_id)?;
@@ -1686,6 +1824,15 @@ impl<'a> TaskClient<'a> {
                 let requirements = prepared.requires.clone();
                 let policy = prepared.policy;
                 let observations = self.observe_admission(&request.preference)?;
+                if crate::integration::store::RootedIntegrationState::read_task(
+                    self.paths,
+                    prepared.task_id,
+                )?
+                .0
+                .is_some()
+                {
+                    require_integration_helper(&observations)?;
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&context.project_id, &context.worktree_id)?;
@@ -1743,7 +1890,17 @@ impl<'a> TaskClient<'a> {
                 let initial =
                     ProjectState::load(self.runner, &request.project, &request.cli_includes)?;
                 let settings = &initial.settings.task;
-                crate::integration::config::reject_unrouted_integration(settings, &request)?;
+                let integrating = crate::integration::config::resolve_integration_settings(
+                    &settings.into(),
+                    None,
+                    &request.integrate,
+                    request.verify_merge,
+                )?;
+                if integrating.is_some() && request.wip {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationWipBase.error(),
+                    );
+                }
                 let limits = effective_task_limits(&request.limits, settings)?;
                 let env_profile = request
                     .env_profile
@@ -1762,7 +1919,9 @@ impl<'a> TaskClient<'a> {
                         &initial.context,
                     )?;
                 }
-                let needs_origin = source_name == "origin" || publish.contains(&PublishMode::Push);
+                let needs_origin = integrating.is_some()
+                    || source_name == "origin"
+                    || publish.contains(&PublishMode::Push);
                 let origin_url = if needs_origin {
                     initial.origin.clone().ok_or_else(|| {
                         task_error("INVALID_ORIGIN", "project origin is not configured")
@@ -1784,13 +1943,28 @@ impl<'a> TaskClient<'a> {
                         "publish push requires a committed base",
                     ));
                 }
-                let requirements = task_requirements(
+                let mut requirements = task_requirements(
                     &initial.requirements,
                     request.agent,
                     env_profile.as_deref(),
                     source.origin_requirement()?.as_deref(),
                 );
                 let observations = self.observe_admission(&request.preference)?;
+                if integrating.is_some() {
+                    let requirement =
+                        format!("feature:{}", crate::features::HOST_FEATURE_INTEGRATION);
+                    require_integration_helper(&observations)?;
+                    requirements.push(requirement);
+                    let host = if crate::project::canonical_file_origin(&origin_url)?.is_some() {
+                        "file".to_owned()
+                    } else {
+                        crate::project::origin_host(&origin_url)?
+                    };
+                    let token = format!("origin:{host}");
+                    if !requirements.contains(&token) {
+                        requirements.push(token);
+                    }
+                }
                 let affinity = self
                     .client_state
                     .affinity_hints(&initial.context.project_id, &initial.context.worktree_id)?;
@@ -1821,7 +1995,43 @@ impl<'a> TaskClient<'a> {
 
                 let task_id = task_id_override.unwrap_or_else(TaskId::generate);
                 let turn_id = turn_id_override.unwrap_or_else(TurnId::generate);
-                let prepared_base = if let TaskSource::Origin { url } = &source {
+                let frozen_policy = crate::integration::config::freeze_source_policy(
+                    self.runner,
+                    &initial,
+                    &request.integrate,
+                    request.verify_merge,
+                    request.close_policy,
+                    integrating
+                        .as_ref()
+                        .map(|_| {
+                            TransferRepo::resolve_base_oid(
+                                self.runner,
+                                &initial.context,
+                                &request.base,
+                            )
+                        })
+                        .transpose()?,
+                    None,
+                )?;
+                if let Some(policy) = &frozen_policy {
+                    let default = BranchName::for_task(task_id);
+                    if publish.contains(&PublishMode::Push)
+                        && publish_branch.as_ref().unwrap_or(&default) == &policy.target
+                    {
+                        return Err(crate::integration::contracts::IntegrationCode::IntegrationPublishTargetCollision.error());
+                    }
+                    request.close_policy = crate::task::ClosePolicy::Never;
+                }
+                let prepared_base = if let Some(policy) = &frozen_policy {
+                    PreparedSubmitBase::Resolve {
+                        wip: false,
+                        request_base: policy
+                            .base_oid
+                            .as_ref()
+                            .ok_or_else(crate::integration::contracts::integration_unavailable)?
+                            .to_string(),
+                    }
+                } else if let TaskSource::Origin { url } = &source {
                     let oid = TransferRepo::resolve_base_oid(
                         self.runner,
                         &initial.context,
@@ -1835,6 +2045,7 @@ impl<'a> TaskClient<'a> {
                         request_base: request.base.clone(),
                     }
                 };
+                direct_integration = frozen_policy;
                 let policy = permission_policy(settings, request.agent);
                 (
                     initial.context,
@@ -1916,6 +2127,11 @@ impl<'a> TaskClient<'a> {
         } else {
             None
         };
+        if let Some(policy) = &direct_integration {
+            crate::integration::store::RootedIntegrationState::publish_task_policy(
+                self.paths, task_id, policy,
+            )?;
+        }
         if let Some(import) = &request.session_import {
             add_session_requirements(&mut requirements, import);
             let observations = self.observe_admission(&request.preference)?;
@@ -2525,6 +2741,31 @@ impl<'a> TaskClient<'a> {
             &blocking_codes,
         )
         .map_err(task_view_error)?;
+        let integration_reader =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.paths.state)?;
+        for row in &mut projection.tasks {
+            if let Some(record) = projected
+                .iter()
+                .find(|record| record.meta().task_id() == row.task_id)
+                && let (policy, Some(integration)) = integration_reader.read_task(row.task_id)?
+            {
+                let view = crate::integration::view::project_owner_view(
+                    &integration_reader,
+                    record,
+                    row.runner.is_some(),
+                    policy.as_ref(),
+                    Some(&integration),
+                )?;
+                let facts = IntegrationTaskFacts::from_record(record, row.runner.is_some());
+                let snapshot = view.integration.as_ref();
+                *row = row.clone().with_current_integration(
+                    snapshot,
+                    &facts,
+                    view.workflow_state.is_some(),
+                )?;
+                row.close_policy = view.requested_close;
+            }
+        }
         for dag in self.client_state.list_run_dags()? {
             if filter.run_id.is_none_or(|run_id| dag.run_id == run_id) {
                 merge_pending_into_projection(
@@ -2823,6 +3064,15 @@ impl<'a> TaskClient<'a> {
         let record = self.client_state.load_task(task_id)?;
         let observed = self.observe_task(&record)?;
         Ok(TaskResultReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &observed.record,
+                || {
+                    self.client_state
+                        .runner_liveness(task_id)
+                        .map(|runner| runner.is_some())
+                },
+            )?,
             task_id,
             status: observed.record.status().clone(),
             branch: format!("task/{task_id}"),
@@ -2892,6 +3142,27 @@ impl<'a> TaskClient<'a> {
         self.close_from_expected(&record, discard)
     }
 
+    pub fn integrate(
+        &self,
+        task_id: TaskId,
+    ) -> Result<crate::integration::contracts::IntegrationSnapshot, WorkerError> {
+        let (_, record) = RootedIntegrationState::read_task(self.paths, task_id)?;
+        let record = record.ok_or_else(crate::integration::contracts::integration_unavailable)?;
+        let request = crate::integration::contracts::IntegrationRedriveRequest {
+            task_id,
+            expected: record.snapshot.revision,
+            request_id: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        let native = crate::integration::runner::OwnerIntegration::new(
+            self.runner,
+            self.config,
+            self.paths,
+            self.client_state,
+            self.executor,
+        )?;
+        native.redrive(&request)
+    }
+
     /// Re-drive failed or retrying origin intents after credentials are fixed.
     pub fn publish_retry(&self, task_id: TaskId) -> Result<PublishRetryReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
@@ -2946,6 +3217,38 @@ impl<'a> TaskClient<'a> {
         let record = self.before_integration_mutation(&record, IntegrationMutation::Close)?;
         let barrier_expected = record.clone();
         let expected = if enabled { &barrier_expected } else { expected };
+        self.close_settled(record, expected, discard)
+    }
+
+    pub(crate) fn close_imported_integration(
+        &self,
+        task: TaskId,
+        receipt: &crate::integration::contracts::IntegrationReceipt,
+    ) -> Result<TaskReport, WorkerError> {
+        let (_, integration) = RootedIntegrationState::read_task(self.paths, task)?;
+        if !receipt.imported
+            || integration
+                .as_ref()
+                .and_then(|record| record.receipt.as_ref())
+                != Some(receipt)
+        {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+        let record = self.client_state.load_task(task)?;
+        let accepted = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+        if record.fetched_head() != Some(accepted) || record.status().head_oid() != Some(accepted) {
+            return Err(IntegrationCode::IntegrationStateInvalid.error());
+        }
+        self.close_settled(record.clone(), &record, false)
+    }
+
+    fn close_settled(
+        &self,
+        record: LocalTaskRecord,
+        expected: &LocalTaskRecord,
+        discard: bool,
+    ) -> Result<TaskReport, WorkerError> {
+        let task_id = expected.meta().task_id();
         let record = if record.auto_continue_intent().is_some() {
             self.clear_auto_continue_for_human(expected)?;
             let current = self.client_state.load_task(task_id)?;
@@ -3111,7 +3414,20 @@ impl<'a> TaskClient<'a> {
     }
 
     pub fn reconcile_runners(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(false, ReconcileScope::All, ReconcileAutomatic::Materialize)
+        let report = self.reconcile_runners_inner(
+            false,
+            ReconcileScope::All,
+            ReconcileAutomatic::Materialize,
+        )?;
+        self.recover_integrations(
+            &self
+                .client_state
+                .list_tasks()?
+                .iter()
+                .map(|record| record.meta().task_id())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(report)
     }
 
     /// Operator-driven `worker task reconcile`: clears the restart budget and
@@ -3124,7 +3440,20 @@ impl<'a> TaskClient<'a> {
     /// invocation sees an unconfirmed `Absent`, it waits the confirmation
     /// window so a second look in the same pass can prove `Exited`.
     pub fn operator_reconcile(&self) -> Result<ReconcileReport, WorkerError> {
-        self.reconcile_runners_inner(true, ReconcileScope::All, ReconcileAutomatic::Materialize)
+        let report = self.reconcile_runners_inner(
+            true,
+            ReconcileScope::All,
+            ReconcileAutomatic::Materialize,
+        )?;
+        self.recover_integrations(
+            &self
+                .client_state
+                .list_tasks()?
+                .iter()
+                .map(|record| record.meta().task_id())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(report)
     }
 
     pub fn reconcile_selected(&self, ids: &[TaskId]) -> Result<ReconcileReport, WorkerError> {
@@ -3133,17 +3462,53 @@ impl<'a> TaskClient<'a> {
             ReconcileScope::Selected(ids),
             ReconcileAutomatic::Materialize,
         )?;
+        self.recover_integrations(ids)?;
+        Ok(report)
+    }
+
+    fn recover_integrations(&self, ids: &[TaskId]) -> Result<(), WorkerError> {
         if let Some(coordinator) = self.integration {
+            let recovery =
+                match crate::integration::store::IntegrationRecovery::open_at(&self.paths.state) {
+                    Ok(recovery) => recovery,
+                    Err(_) => return Ok(()),
+                };
+            let now = self
+                .client_state
+                .admission_time(crate::controller::leader::now_millis)?;
             for task in ids {
-                if let Some(record) = self.client_state.load_task_optional(*task)?
-                    && let Some(last) = record.status().turns().last()
-                {
-                    coordinator.on_terminal(*task, last.turn_id())?;
-                    stamp_integration_run_position(self.client_state, coordinator, *task)?;
+                if !recovery.ready(*task, now) {
+                    continue;
+                }
+                let result = (|| {
+                    if let Some(record) = self.client_state.load_task_optional(*task)?
+                        && let Some(last) = record.status().turns().last()
+                    {
+                        coordinator.on_terminal(*task, last.turn_id())?;
+                        stamp_integration_run_position(self.client_state, coordinator, *task)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        let _ = recovery.succeeded(*task);
+                    }
+                    Err(error) => {
+                        let _ = recovery.failed(*task, now, &error);
+                    }
                 }
             }
+        } else {
+            crate::integration::runner::recover_selected(
+                self.runner,
+                self.config,
+                self.paths,
+                self.client_state,
+                self.executor,
+                ids,
+            )?;
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Retire completed dead owners before a human mutation, preserving any
@@ -3604,13 +3969,28 @@ impl<'a> TaskClient<'a> {
 
     fn wait_to_confirm_absent_owners(&self, owner: ProcessIdentity) -> Result<(), WorkerError> {
         let mut saw_unconfirmed = false;
-        for entry in self.client_state.queue_snapshot()?.entries() {
-            if entry.kind() != QueueEntryKind::TaskTurn {
+        let mut identities = self
+            .client_state
+            .queue_snapshot()?
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() == QueueEntryKind::TaskTurn)
+            .filter_map(|entry| entry.owner_opt().copied())
+            .collect::<Vec<_>>();
+        let tasks = self
+            .client_state
+            .list_tasks()?
+            .iter()
+            .map(|record| record.meta().task_id())
+            .collect::<Vec<_>>();
+        identities.extend(crate::integration::runner::retained_owner_identities(
+            self.paths, &tasks,
+        )?);
+        let mut seen = HashSet::new();
+        for row_owner in identities {
+            if !seen.insert((row_owner.pid(), row_owner.start_time_micros())) {
                 continue;
             }
-            let Some(row_owner) = entry.owner_opt().copied() else {
-                continue;
-            };
             if row_owner == owner {
                 continue;
             }
@@ -4096,6 +4476,15 @@ impl<'a> TaskClient<'a> {
             ));
         }
         prepared.validate_self_consistency()?;
+        let Some(auxiliary_permit) = crate::integration::runner::auxiliary_launch_permit(
+            self.paths,
+            self.client_state,
+            task_id,
+            turn_id,
+        )?
+        else {
+            return self.report_from_record(&self.client_state.load_task(task_id)?);
+        };
         let current = self.client_state.load_task(task_id)?;
         // Auxiliary admission has its own authoritative, persisted wrapper.
         if let Some(auxiliary) =
@@ -4126,6 +4515,7 @@ impl<'a> TaskClient<'a> {
             )?;
         }
         if current.status().turns().last().map(TurnSummary::turn_id) == Some(turn_id) {
+            drop(auxiliary_permit);
             return self.resume_prepared_followup(prepared, &current, attached, stdout, stderr);
         }
         let current = self.resolve_followup_intent(prepared, current)?;
@@ -4225,13 +4615,16 @@ impl<'a> TaskClient<'a> {
                     .client_state
                     .update_task_if_current(&current, rebased.clone())?
                 {
+                    drop(auxiliary_permit);
                     return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
                 }
                 rebased
             } else {
+                drop(auxiliary_permit);
                 return self.reload_resume_or_conflict(prepared, attached, stdout, stderr);
             }
         };
+        drop(auxiliary_permit);
         let entry = match self.client_state.queue_entry_for_task_turn(task_id)? {
             Some(existing) if existing.job_id() == turn_id => existing,
             Some(_) => {
@@ -4280,7 +4673,6 @@ impl<'a> TaskClient<'a> {
 
     /// Admit the already frozen auxiliary through the ordinary queue and allowance.
     /// T6 supplies the production IntegrationTurns adapter.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub fn say_integration_prepared(
         &self,
         prepared: &crate::integration::contracts::PreparedIntegrationTurn,
@@ -4297,7 +4689,9 @@ impl<'a> TaskClient<'a> {
         if record.tombstone.is_some()
             || !matches!(
                 record.snapshot.state,
-                IntegrationStatus::Resolving | IntegrationStatus::Verifying
+                IntegrationStatus::Resolving
+                    | IntegrationStatus::Verifying
+                    | IntegrationStatus::Parked
             )
         {
             return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
@@ -4793,7 +5187,13 @@ impl<'a> TaskClient<'a> {
     }
 
     fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
+        let runner = self.client_state.runner_liveness(record.meta().task_id())?;
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                record,
+                || Ok(runner.is_some()),
+            )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
             task_id: record.meta().task_id(),
@@ -4801,7 +5201,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             warnings: permission_warnings(record.meta()),
             events: Vec::new(),
-            runner: self.client_state.runner_liveness(record.meta().task_id())?,
+            runner,
             exit_code: None,
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
@@ -5083,12 +5483,7 @@ impl<'a> TaskClient<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let quiescent = !dag_pending && self.tasks_are_quiescent(&records)?;
         let exit_code = if quiescent {
-            records
-                .iter()
-                .filter_map(|record| record.status().last_outcome())
-                .map(|outcome| crate::task::classify_task_outcome(outcome).aggregate)
-                .max()
-                .unwrap_or(0)
+            self.wait_exit_code(&records)?
         } else {
             0
         };
@@ -5097,6 +5492,20 @@ impl<'a> TaskClient<'a> {
             quiescent,
             exit_code,
         })
+    }
+}
+
+fn require_integration_helper(
+    observations: &[crate::scheduler::CandidateObservation],
+) -> Result<(), WorkerError> {
+    let requirement = format!("feature:{}", crate::features::HOST_FEATURE_INTEGRATION);
+    if observations
+        .iter()
+        .any(|o| o.capabilities().contains(&requirement))
+    {
+        Ok(())
+    } else {
+        Err(crate::integration::contracts::integration_unavailable())
     }
 }
 
@@ -5303,6 +5712,17 @@ impl<'a> TaskClient<'a> {
         if batch.tasks.is_empty() {
             return Err(task_error("TASK_CONFIG_INVALID", "batch has no tasks"));
         }
+        let project = self.current_project(None)?;
+        let project_state = ProjectState::load(self.runner, &project, &[])?;
+        if crate::integration::config::batch_is_integrating(&project_state.settings.task, &batch)? {
+            return self.submit_integrating_batch(
+                file,
+                &batch,
+                &project_state,
+                run_name,
+                max_parallel,
+            );
+        }
         self.reconcile_runners()?;
         if batch_has_dag_edges(&batch.defaults, &batch.tasks) {
             return self.submit_dependent_batch(file, &batch, run_name, max_parallel);
@@ -5324,7 +5744,6 @@ impl<'a> TaskClient<'a> {
             .settings
             .task;
         for (request, _) in &requests {
-            crate::integration::config::reject_unrouted_integration(&settings, request)?;
             validate_prompt(&request.prompt)?;
             validate_preference(self.config, &request.preference)?;
             let _ = effective_task_limits(&request.limits, &settings)?;
@@ -5349,6 +5768,129 @@ impl<'a> TaskClient<'a> {
             )?;
         }
         Ok(RunReport { run_id, task_ids })
+    }
+
+    fn submit_integrating_batch(
+        &self,
+        file: &Path,
+        batch: &BatchFile,
+        project: &ProjectState,
+        name: Option<String>,
+        max_parallel: Option<u32>,
+    ) -> Result<RunReport, WorkerError> {
+        let batch_dir = file.parent().unwrap_or_else(|| Path::new("."));
+        // Refuse unsupported helpers before frozen DAG/source pins or run rows.
+        crate::integration::config::validate_batch_policy_inputs(&project.settings.task, batch)?;
+        for task in &batch.tasks {
+            let request = resolve_batch_task(
+                self.config,
+                &batch.defaults,
+                task,
+                batch_dir,
+                &project.context.root,
+                &project.settings.task,
+            )?;
+            validate_preference(self.config, &request.preference)?;
+            if crate::integration::config::resolve_integration_settings(
+                &(&project.settings.task).into(),
+                None,
+                &request.integrate,
+                request.verify_merge,
+            )?
+            .is_some()
+            {
+                if request.wip {
+                    return Err(IntegrationCode::IntegrationWipBase.error());
+                }
+                require_integration_helper(&self.observe_admission(&request.preference)?)?;
+            }
+        }
+        let frozen = crate::controller::batch_freeze::freeze_laptop_batch(
+            self.runner,
+            self.config,
+            self.paths,
+            &project.context.root,
+            file,
+            name,
+            max_parallel,
+        )?;
+        let transfer =
+            TransferRepo::open_or_create(&self.paths.cache, &project.context.common_dir)?;
+        let body = frozen.body();
+        let result = (|| {
+            let wrapper = frozen
+                .integrating()
+                .ok_or_else(crate::integration::contracts::integration_unavailable)?;
+            let state = crate::integration::store::RootedIntegrationState::open(
+                self.paths,
+                std::sync::Arc::new(crate::integration::host::HostIntegrationRuntime::new()?),
+            )?;
+            crate::controller::integration::publish_integrating_batch(&state, wrapper)?;
+            let parallel = resolve_batch_max_parallel(
+                body.max_parallel,
+                self.config.configured_runner_slots(),
+            )?;
+            let task_ids = body.nodes.values().map(|n| n.task_id).collect::<Vec<_>>();
+            if body.kind == crate::controller::batch::BatchKind::Dag {
+                let dag = DagRecord::new(
+                    body.run_id,
+                    body.nodes.clone(),
+                    parallel,
+                    body.name.clone(),
+                    body.created_at_millis,
+                )?;
+                let run = RunRecord::new(
+                    body.run_id,
+                    body.name.clone(),
+                    Vec::new(),
+                    parallel,
+                    body.created_at_millis,
+                )?;
+                self.client_state.create_run_with_dag(run, dag)?;
+                self.advance_pending_dags()?;
+                let run = self.client_state.load_run(body.run_id)?;
+                Ok(RunReport::from_parts(body.run_id, run.task_ids().to_vec()))
+            } else {
+                let run = RunRecord::new(
+                    body.run_id,
+                    body.name.clone(),
+                    task_ids.clone(),
+                    parallel,
+                    body.created_at_millis,
+                )?;
+                self.client_state.create_run(run)?;
+                for node in body.nodes.values() {
+                    self.submit_with_ids(
+                        request_from_frozen_node(node, Some(body.run_id))?,
+                        Some(node.task_id),
+                        Some(node.turn_id),
+                        node.frozen.title.clone(),
+                        &mut io::sink(),
+                        &mut io::sink(),
+                        true,
+                        Some(FrozenSubmit::Dag(node)),
+                        Some(body.created_at_millis),
+                    )?;
+                }
+                Ok(RunReport::from_parts(body.run_id, task_ids))
+            }
+        })();
+        // Source-stream pins belong only to the laptop transport; local run
+        // recovery uses the frozen DAG pins. Uncertain publication retains them.
+        for source in frozen.sources() {
+            transfer.unpin_object(self.runner, source.pin_ref())?;
+        }
+        if result.is_err()
+            && matches!(self.client_state.load_run(body.run_id), Err(WorkerError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound)
+            && matches!(self.client_state.load_run_dag(body.run_id), Ok(None))
+        {
+            for node in body.nodes.values() {
+                if let DagBase::Frozen { pin_ref, .. } = &node.base {
+                    transfer.unpin_object(self.runner, pin_ref)?;
+                }
+            }
+        }
+        result
     }
 
     fn batch_request(
@@ -5709,6 +6251,7 @@ impl<'a> TaskClient<'a> {
         turn_id: TurnId,
         worker: String,
     ) -> Result<QueueEntry, WorkerError> {
+        let task_id = record.meta().task_id();
         let project = self.load_project_for_record(record)?;
         let now = current_time_millis()?;
         let command = CommandSpec::argv(vec![TASK_COMMAND.to_owned()])?;
@@ -5723,13 +6266,30 @@ impl<'a> TaskClient<'a> {
                     .and_then(|job_run_id| QueueRunReference::new(job_run_id, run.max_parallel()))
             })
             .transpose()?;
+        let mut requirements = task_meta_requirements(&project.requirements, record.meta());
+        if RootedIntegrationState::read_auxiliary(self.paths, task_id, turn_id)?.is_some() {
+            let (policy, _) = RootedIntegrationState::read_task(self.paths, task_id)?;
+            let policy = policy.ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+            crate::controller::integration::add_requirements(&mut requirements, &policy)?;
+            requirements.sort();
+            requirements.dedup();
+        }
+        let Some(_permit) = crate::integration::runner::auxiliary_launch_permit(
+            self.paths,
+            self.client_state,
+            task_id,
+            turn_id,
+        )?
+        else {
+            return Err(IntegrationCode::IntegrationUnavailable.error());
+        };
         self.client_state.enqueue(QueueEntry::new(
             turn_id,
             self.client_state.client_id(),
             record.meta().project_id().to_owned(),
             record.meta().worktree_id().to_owned(),
             command.summary()?,
-            task_meta_requirements(&project.requirements, record.meta()),
+            requirements,
             preference,
             QueueEntryKind::TaskTurn,
             run,
@@ -5793,7 +6353,9 @@ impl<'a> TaskClient<'a> {
             TaskOutcome::Cancelled
         };
         log.finish_local(task, turn, outcome)?;
-        self.release_task_base(&record)?;
+        if RootedIntegrationState::read_auxiliary(self.paths, task, turn)?.is_none() {
+            self.release_task_base(&record)?;
+        }
         self.client_state.record_runner(task, None)?;
         self.client_state.remove_task_turn_after_terminal(
             turn,
@@ -6286,7 +6848,13 @@ impl<'a> TaskClient<'a> {
 
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        let runner = self.client_state.runner_liveness(task_id)?;
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &record,
+                || Ok(runner.is_some()),
+            )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
             task_id,
@@ -6294,7 +6862,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             warnings: permission_warnings(record.meta()),
             events: Vec::new(),
-            runner: self.client_state.runner_liveness(task_id)?,
+            runner,
             exit_code: None,
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
@@ -6306,7 +6874,13 @@ impl<'a> TaskClient<'a> {
 
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let observed = self.observe_task(record)?;
+        let runner = self.client_state.runner_liveness(record.meta().task_id())?;
         Ok(TaskReport {
+            integration_view: crate::integration::view::read_owner_view(
+                self.paths,
+                &observed.record,
+                || Ok(runner.is_some()),
+            )?,
             session_submission: None,
             questions_policy: observed.record.questions_policy(),
             task_id: observed.record.meta().task_id(),
@@ -6314,9 +6888,7 @@ impl<'a> TaskClient<'a> {
             status: observed.record.status().clone(),
             warnings: permission_warnings(observed.record.meta()),
             events: Vec::new(),
-            runner: self
-                .client_state
-                .runner_liveness(observed.record.meta().task_id())?,
+            runner,
             exit_code: None,
             delivery: observed.record.delivery().cloned(),
             deliveries: observed.record.deliveries().to_vec(),
@@ -6530,7 +7102,7 @@ impl<'a> TaskClient<'a> {
         std::env::current_dir().map_err(WorkerError::Io)
     }
 
-    fn load_project_for_record(
+    pub(crate) fn load_project_for_record(
         &self,
         record: &LocalTaskRecord,
     ) -> Result<ProjectState, WorkerError> {
@@ -6570,6 +7142,36 @@ impl<'a> TaskClient<'a> {
 
     fn tasks_are_quiescent(&self, records: &[LocalTaskRecord]) -> Result<bool, WorkerError> {
         for record in records {
+            if let Some(integration) =
+                RootedIntegrationState::read_task(self.paths, record.meta().task_id())?.1
+            {
+                let mut latest = None;
+                for turn in record.status().turns().iter().rev() {
+                    if RootedIntegrationState::read_auxiliary(
+                        self.paths,
+                        record.meta().task_id(),
+                        turn.turn_id(),
+                    )?
+                    .is_none()
+                    {
+                        latest = Some(turn);
+                        break;
+                    }
+                }
+                if latest.is_some_and(|turn| turn.turn_id() == integration.snapshot.source_turn_id)
+                    && (!matches!(
+                        integration.snapshot.state,
+                        IntegrationStatus::Integrated
+                            | IntegrationStatus::Blocked
+                            | IntegrationStatus::Revoked
+                    ) || (record.status().state() == TaskState::Closed
+                        && crate::integration::coordinator::closed_observation_pending(
+                            &integration,
+                        )))
+                {
+                    return Ok(false);
+                }
+            }
             if !is_wait_terminal(record.status().state())
                 || self
                     .operator_busy_reason(record.meta().task_id(), record)?
@@ -6579,6 +7181,61 @@ impl<'a> TaskClient<'a> {
             }
         }
         Ok(true)
+    }
+
+    fn wait_exit_code(&self, records: &[LocalTaskRecord]) -> Result<u8, WorkerError> {
+        let mut aggregate = 0;
+        for record in records {
+            let mut exit = record.status().last_outcome().map_or(0, |outcome| {
+                crate::task::classify_task_outcome(outcome).aggregate
+            });
+            let task = record.meta().task_id();
+            if let Some(integration) = RootedIntegrationState::read_task(self.paths, task)?.1 {
+                let mut latest = None;
+                for turn in record.status().turns().iter().rev() {
+                    if RootedIntegrationState::read_auxiliary(self.paths, task, turn.turn_id())?
+                        .is_none()
+                    {
+                        latest = Some(turn.turn_id());
+                        break;
+                    }
+                }
+                if latest == Some(integration.snapshot.source_turn_id) {
+                    match integration.snapshot.state {
+                        IntegrationStatus::Integrated => {
+                            let receipt = integration
+                                .receipt
+                                .as_ref()
+                                .filter(|r| r.imported)
+                                .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?;
+                            let accepted =
+                                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+                            // The detached driver may import between this poll's
+                            // ordinary read and its integration read. Verify the
+                            // durable import against the current local record.
+                            let imported = self.client_state.load_task(task)?;
+                            if imported.fetched_head() != Some(accepted)
+                                || imported.status().head_oid() != Some(accepted)
+                            {
+                                return Err(IntegrationCode::IntegrationStateInvalid.error());
+                            }
+                            exit = 0;
+                        }
+                        IntegrationStatus::Blocked => {
+                            exit = integration
+                                .snapshot
+                                .blocked_code
+                                .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?
+                                .error()
+                                .exit_code();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            aggregate = aggregate.max(exit);
+        }
+        Ok(aggregate)
     }
 }
 
@@ -7268,7 +7925,15 @@ pub(crate) fn freeze_spec(
     state: &ProjectState,
 ) -> Result<DagFrozenSpec, WorkerError> {
     let settings = &state.settings.task;
-    crate::integration::config::reject_unrouted_integration(settings, request)?;
+    let integration = crate::integration::config::resolve_integration_settings(
+        &settings.into(),
+        None,
+        &request.integrate,
+        request.verify_merge,
+    )?;
+    if integration.is_some() && request.wip {
+        return Err(IntegrationCode::IntegrationWipBase.error());
+    }
     let limits = effective_task_limits(&request.limits, settings)?;
     let env_profile = request
         .env_profile
@@ -7285,11 +7950,20 @@ pub(crate) fn freeze_spec(
         .clone()
         .unwrap_or_else(|| settings.source.clone());
     let parsed_publish = parse_publish_modes(&publish)?;
-    let origin_url = if source == "origin" || parsed_publish.contains(&PublishMode::Push) {
+    let origin_url = if integration.is_some()
+        || source == "origin"
+        || parsed_publish.contains(&PublishMode::Push)
+    {
         state.origin.clone()
     } else {
         None
     };
+    if integration.is_some() && origin_url.is_none() {
+        return Err(task_error(
+            "TASK_CONFIG_INVALID",
+            "integration requires own origin",
+        ));
+    }
     let parsed_source = parse_task_source(
         &source,
         request.wip,
@@ -7947,9 +8621,12 @@ mod session_submission_tests {
         version: std::sync::Mutex<String>,
         fail_after_pin: AtomicBool,
         fail_release: AtomicBool,
+        integration_capable: AtomicBool,
+        requests: std::sync::Mutex<Vec<ProcessRequest>>,
     }
     impl ProcessRunner for Remote {
         fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            self.requests.lock().unwrap().push(request.clone());
             if request.program == "/usr/bin/git" {
                 let session = request.args.iter().any(|arg| {
                     arg.to_str()
@@ -7982,10 +8659,14 @@ mod session_submission_tests {
                     .to_string_lossy()
                     .ends_with(" host probe")
             );
+            let mut features = vec![crate::features::HOST_FEATURE_SESSION_IMPORT];
+            if self.integration_capable.load(Ordering::SeqCst) {
+                features.push(crate::features::HOST_FEATURE_INTEGRATION);
+            }
             let probe = serde_json::json!({
                 "protocol_version":crate::protocol::PROTOCOL_VERSION,
                 "supervision_version":crate::protocol::SUPERVISION_VERSION,
-                "features":[crate::features::HOST_FEATURE_SESSION_IMPORT],
+                "features":features,
                 "hostname":"fixture", "arch":"arm64", "os_version":"26", "free_disk_bytes":100_u64 << 30,
                 "total_disk_bytes":200_u64 << 30, "memory_pressure":"normal", "swap_used_bytes":0,
                 "available_memory_bytes":8_u64 << 30, "slot_state":"idle", "active_lease":null,
@@ -8064,6 +8745,8 @@ mod session_submission_tests {
                     version: std::sync::Mutex::new("0.160.0".into()),
                     fail_after_pin: AtomicBool::new(false),
                     fail_release: AtomicBool::new(false),
+                    integration_capable: AtomicBool::new(false),
+                    requests: std::sync::Mutex::new(vec![]),
                 },
                 task: TaskId::generate(),
                 turn: TurnId::generate(),
@@ -8126,6 +8809,93 @@ mod session_submission_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn direct_implicit_push_branch_collision_refuses_before_source_pins_or_task_effects() {
+        let fixture = Fixture::new();
+        fixture
+            .remote
+            .integration_capable
+            .store(true, Ordering::SeqCst);
+        let origin = fixture
+            ._temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("origin.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(&fixture.project)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["clone", "--bare", ".", origin.to_str().unwrap()]);
+        let target = BranchName::for_task(fixture.task);
+        git(&[
+            "--git-dir",
+            origin.to_str().unwrap(),
+            "branch",
+            target.as_str(),
+            "main",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", origin.display()),
+        ]);
+        let state = ClientStateStore::open(&fixture.paths.state).unwrap();
+        let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture'\nssh = 'never-connect'\nslots = 1\ncapabilities = ['origin:file']\n").unwrap();
+        let client = TaskClient::new(
+            &fixture.remote,
+            &config,
+            &fixture.paths,
+            &state,
+            &crate::turn_runner::InlineRunnerExecutor,
+        );
+        let mut request = fixture.request();
+        request.wip = false;
+        request.publish = Some(vec!["fetch".into(), "push".into()]);
+        request.integrate = crate::integration::contracts::IntegrationOverride::Target(target);
+        let result = client.submit_with_ids(
+            request,
+            Some(fixture.task),
+            Some(fixture.turn),
+            None,
+            &mut vec![],
+            &mut vec![],
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err().public_code(),
+            "INTEGRATION_PUBLISH_TARGET_COLLISION"
+        );
+        assert!(state.list_tasks().unwrap().is_empty());
+        assert!(state.queue_snapshot().unwrap().entries().is_empty());
+        assert!(!fixture.paths.cache.join("transfer").exists());
+        assert!(
+            !fixture
+                .remote
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request
+                    .args
+                    .iter()
+                    .any(|arg| arg == "update-ref" || arg == "fetch"))
+        );
     }
 
     #[test]
@@ -8498,6 +9268,331 @@ mod session_submission_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod integration {
+        use super::*;
+        use crate::integration::{contracts::*, testing::*};
+        use crate::supervisor::{
+            ProcessGroupMembership, ProcessGroupObservation, ProcessInspector, ProcessObservation,
+        };
+        use std::{os::unix::fs::OpenOptionsExt, sync::Arc};
+
+        struct Inspector(ProcessObservation);
+        impl ProcessInspector for Inspector {
+            fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+                ProcessIdentity::new(pid, 9999)
+            }
+            fn observe(&self, _: ProcessIdentity) -> ProcessObservation {
+                self.0
+            }
+            fn observe_group(&self, _: u32) -> ProcessGroupObservation {
+                ProcessGroupObservation::Ambiguous
+            }
+            fn observe_group_members(&self, _: u32) -> ProcessGroupMembership {
+                ProcessGroupMembership::Ambiguous
+            }
+        }
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                _: &crate::process::ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("absence confirmation is read-only")
+            }
+        }
+
+        #[test]
+        fn wait_accepts_a_receipt_imported_after_its_ordinary_snapshot() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config.toml"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let before = sample_ordinary(fixture_task(), fixture_source());
+            store.create_task(before.clone()).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+            let accepted: BaseOid = "e".repeat(40).parse().unwrap();
+            integration.snapshot.state = IntegrationStatus::Integrated;
+            integration.snapshot.observed_target_oid = Some(accepted.clone());
+            integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+            integration.receipt = Some(IntegrationReceipt {
+                integration_id: integration.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: accepted.clone(),
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: true,
+                recorded_at_millis: 1002,
+            });
+            let mut status = serde_json::to_value(before.status()).unwrap();
+            status["head_oid"] = accepted.as_str().into();
+            let imported = before
+                .with_status(serde_json::from_value(status).unwrap())
+                .unwrap()
+                .with_fetched_head(Some(accepted))
+                .unwrap();
+            assert!(store.update_task_if_current(&before, imported).unwrap());
+            state
+                .publish_policy(integration.task_id, &integration.policy)
+                .unwrap();
+            state
+                .replace(integration.task_id, IntegrationRevision(0), &integration)
+                .unwrap();
+            let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+            let client = TaskClient::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &crate::turn_runner::InlineRunnerExecutor,
+            );
+            assert_eq!(client.wait_exit_code(&[before]).unwrap(), 0);
+        }
+
+        #[test]
+        fn wait_does_not_return_the_pre_retention_block_before_closed_observation() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let before = sample_ordinary(fixture_task(), fixture_source());
+            let mut wire = serde_json::to_value(before.status()).unwrap();
+            wire["state"] = "closed".into();
+            let closed = before
+                .with_status(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            store.create_task(closed.clone()).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 3,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 2000,
+            });
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let config=Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+            let client = TaskClient::new(
+                &NoProcesses,
+                &config,
+                &paths,
+                &store,
+                &crate::turn_runner::InlineRunnerExecutor,
+            );
+            assert!(
+                !client
+                    .tasks_are_quiescent(std::slice::from_ref(&closed))
+                    .unwrap()
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkspaceMissing);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Drive,
+                retries: 0,
+                code: IntegrationCode::IntegrationWorkerOffline,
+                due_at_millis: 1002,
+            });
+            state.replace(record.task_id, previous, &record).unwrap();
+            assert!(client.tasks_are_quiescent(&[closed]).unwrap());
+        }
+
+        #[test]
+        fn closed_integration_repair_stays_in_the_leader_index_until_settled() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Repair,
+                retries: 3,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 2000,
+            });
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap();
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let ordinary = sample_ordinary(fixture_task(), fixture_source());
+            let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+            wire["state"] = "closed".into();
+            store
+                .create_task(
+                    ordinary
+                        .with_status(serde_json::from_value(wire).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            store.bootstrap_active_task_index().unwrap();
+            let config = ActiveTaskConfig::default();
+            assert_eq!(
+                store.select_active_task_ids(&config).unwrap().selected,
+                vec![record.task_id]
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.state = IntegrationStatus::RetryWait;
+            record.snapshot.resume_state = Some(IntegrationStatus::Published);
+            record.snapshot.retry_at_millis = Some(3000);
+            record.phase_retries.push(IntegrationPhaseRetry {
+                phase: IntegrationPhase::Drive,
+                retries: 1,
+                code: IntegrationCode::IntegrationNetwork,
+                due_at_millis: 3000,
+            });
+            state.replace(record.task_id, previous, &record).unwrap();
+            let reopened = ClientStateStore::open(&paths.state).unwrap();
+            assert_eq!(
+                reopened
+                    .refresh_active_task_index(&[record.task_id], &config)
+                    .unwrap()
+                    .retained,
+                vec![record.task_id]
+            );
+            let previous = record.snapshot.revision;
+            record.snapshot.revision = previous.next().unwrap();
+            record.snapshot.state = IntegrationStatus::Blocked;
+            record.snapshot.resume_state = None;
+            record.snapshot.retry_at_millis = None;
+            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationWorkspaceMissing);
+            state.replace(record.task_id, previous, &record).unwrap();
+            assert_eq!(
+                reopened
+                    .refresh_active_task_index(&[record.task_id], &config)
+                    .unwrap()
+                    .retired,
+                vec![record.task_id]
+            );
+        }
+
+        #[test]
+        fn reconcile_confirms_only_absent_integration_owners() {
+            for retained in ["actor", "driver"] {
+                for observation in [
+                    ProcessObservation::Absent,
+                    ProcessObservation::Reused,
+                    ProcessObservation::Matching {
+                        process_group: 424242,
+                    },
+                    ProcessObservation::Ambiguous,
+                ] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path().canonicalize().unwrap();
+                    let paths = PathLayout {
+                        config: root.join("config.toml"),
+                        state: root.join("state"),
+                        cache: root.join("cache"),
+                        data: root.join("data"),
+                    };
+                    // Zero interval avoids sleeping in this observation test;
+                    // the native regression covers the real confirmation interval.
+                    let client = ClientStateStore::open_with_owner_inspector(
+                        &paths.state,
+                        Inspector(observation),
+                    )
+                    .unwrap()
+                    .with_timings(crate::client_state::ClientStateTimings {
+                        runner_absence_confirmation: Duration::ZERO,
+                    });
+                    client
+                        .create_task(sample_ordinary(fixture_task(), fixture_source()))
+                        .unwrap();
+                    let state = RootedIntegrationState::open(
+                        &paths,
+                        Arc::new(ManualIntegrationRuntime::default()),
+                    )
+                    .unwrap();
+                    let mut record = sample_record(fixture_task(), fixture_source(), "main");
+                    let actor = ProcessIdentity::new(424242, 9999).unwrap();
+                    if retained == "actor" {
+                        record.actor = Some(actor);
+                    }
+                    state
+                        .publish_policy(record.task_id, &record.policy)
+                        .unwrap();
+                    state
+                        .replace(record.task_id, IntegrationRevision(0), &record)
+                        .unwrap();
+                    let driver = paths
+                        .state
+                        .join(format!("integrations/tasks/{}/driver.json", record.task_id));
+                    if retained == "driver" {
+                        let binding = serde_json::json!({"task": record.task_id, "intent": record.snapshot.integration_id, "epoch": record.snapshot.epoch, "actor": actor});
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&driver)
+                            .unwrap();
+                        file.write_all(&serde_json::to_vec(&binding).unwrap())
+                            .unwrap();
+                        file.sync_all().unwrap();
+                    }
+                    let config = Config::parse("version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n").unwrap();
+                    TaskClient::new(
+                        &NoProcesses,
+                        &config,
+                        &paths,
+                        &client,
+                        &crate::turn_runner::InlineRunnerExecutor,
+                    )
+                    .wait_to_confirm_absent_owners(current_process_identity().unwrap())
+                    .unwrap();
+                    let expected = match observation {
+                        ProcessObservation::Absent | ProcessObservation::Reused => {
+                            RunnerLivenessVerdict::Exited
+                        }
+                        ProcessObservation::Matching { .. } => RunnerLivenessVerdict::Live,
+                        ProcessObservation::Ambiguous => RunnerLivenessVerdict::Unverifiable,
+                    };
+                    assert_eq!(
+                        client.runner_identity_verdict(actor),
+                        expected,
+                        "{retained}: {observation:?}"
+                    );
+                    assert_eq!(state.load(record.task_id).unwrap().unwrap(), record);
+                    assert!(client.queue_snapshot().unwrap().entries().is_empty());
+                }
+            }
+        }
+    }
 
     #[test]
     fn replacement_failure_observation_skips_missing_or_unsafe_runner_logs() {
@@ -9410,5 +10505,81 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, NewEvent::TaskClosed(_)))
         );
+    }
+}
+
+#[cfg(test)]
+mod read_cost_tests {
+    use super::*;
+    use crate::integration::testing::*;
+    use crate::turn_runner::InlineRunnerExecutor;
+    struct NoProcesses;
+    impl ProcessRunner for NoProcesses {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("disabled reads must not execute a process")
+        }
+    }
+    #[test]
+    fn disabled_status_and_result_keep_baseline_locks_opens_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        state.create_task(ordinary.clone()).unwrap();
+        let record_path = paths.state.join(format!("tasks/{}.json", fixture_task()));
+        let original = std::fs::read(&record_path).unwrap();
+        let config = Config::parse("version = 1\n").unwrap();
+        let client = TaskClient::new(&NoProcesses, &config, &paths, &state, &InlineRunnerExecutor);
+        let locks = state.state_lock_count();
+        let opens = crate::rooted_fs::read_open_counts();
+        let report = client.status(fixture_task()).unwrap();
+        assert_eq!(state.state_lock_count() - locks, 2);
+        let after = crate::rooted_fs::read_open_counts();
+        assert_eq!(after[0] - opens[0], 0);
+        assert_eq!(after[2] - opens[2], 2);
+        assert_eq!(
+            serde_json::to_vec(report.status()).unwrap(),
+            serde_json::to_vec(ordinary.status()).unwrap()
+        );
+        assert!(report.integration_view.is_none());
+        let wire = serde_json::to_vec(
+            &crate::controller::read::ControllerTaskStatusResult::from_report(&report),
+        )
+        .unwrap();
+        let again = client.status(fixture_task()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(
+                &crate::controller::read::ControllerTaskStatusResult::from_report(&again)
+            )
+            .unwrap(),
+            wire
+        );
+        let locks = state.state_lock_count();
+        let opens = crate::rooted_fs::read_open_counts();
+        let result = client.result(fixture_task()).unwrap();
+        assert_eq!(
+            state.state_lock_count() - locks,
+            1,
+            "disabled result had no baseline runner-liveness reload"
+        );
+        let after = crate::rooted_fs::read_open_counts();
+        assert_eq!(after[0] - opens[0], 0);
+        assert_eq!(after[2] - opens[2], 1);
+        assert_eq!(
+            serde_json::to_vec(result.status()).unwrap(),
+            serde_json::to_vec(ordinary.status()).unwrap()
+        );
+        assert!(result.integration_view.is_none());
+        assert_eq!(std::fs::read(record_path).unwrap(), original);
+        assert!(!paths.state.join("integrations").exists());
     }
 }

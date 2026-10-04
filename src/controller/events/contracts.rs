@@ -806,7 +806,6 @@ impl IntegrationHintData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewEvent {
     // Published by the serial T6 owner wiring after state durability.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     IntegrationChanged {
         task_id: TaskId,
         integration: crate::integration::contracts::IntegrationFactsAnnotation,

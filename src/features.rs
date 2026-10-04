@@ -6,15 +6,13 @@
 
 pub const HOST_FEATURE_SESSION_IMPORT: &str = "task.session-import";
 pub const CONTROLLER_FEATURE_SESSION_IMPORT: &str = "controller.session-import";
-// T6 alone adds these to the advertised registries after its acceptance gate.
-#[allow(dead_code)]
 pub const HOST_FEATURE_INTEGRATION: &str = "task.integration";
-#[allow(dead_code)]
 pub const CONTROLLER_FEATURE_INTEGRATION: &str = "controller.integration";
 
-pub const HOST_FEATURES: &[&str] = &[HOST_FEATURE_SESSION_IMPORT];
+pub const HOST_FEATURES: &[&str] = &[HOST_FEATURE_INTEGRATION, HOST_FEATURE_SESSION_IMPORT];
 pub const CONTROLLER_FEATURES: &[&str] = &[
     "controller.events",
+    CONTROLLER_FEATURE_INTEGRATION,
     CONTROLLER_FEATURE_SESSION_IMPORT,
     "controller.task-logs-wait",
 ];
@@ -27,13 +25,17 @@ mod tests {
 
     #[test]
     fn registries_are_sorted_unique_and_contain_the_supported_features() {
-        assert!(!HOST_FEATURES.contains(&HOST_FEATURE_INTEGRATION));
-        assert!(!CONTROLLER_FEATURES.contains(&CONTROLLER_FEATURE_INTEGRATION));
-        assert_eq!(HOST_FEATURES, [HOST_FEATURE_SESSION_IMPORT]);
+        assert!(HOST_FEATURES.contains(&HOST_FEATURE_INTEGRATION));
+        assert!(CONTROLLER_FEATURES.contains(&CONTROLLER_FEATURE_INTEGRATION));
+        assert_eq!(
+            HOST_FEATURES,
+            [HOST_FEATURE_INTEGRATION, HOST_FEATURE_SESSION_IMPORT]
+        );
         assert_eq!(
             CONTROLLER_FEATURES,
             [
                 "controller.events",
+                CONTROLLER_FEATURE_INTEGRATION,
                 CONTROLLER_FEATURE_SESSION_IMPORT,
                 "controller.task-logs-wait"
             ]

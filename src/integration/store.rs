@@ -16,6 +16,299 @@ use std::{fs::File, io, os::fd::AsRawFd, sync::Arc};
 pub struct RootedIntegrationState {
     root: RootedDir,
     runtime: Arc<dyn IntegrationRuntime>,
+    event_sink: Option<Arc<dyn crate::controller::events::EventSink>>,
+}
+
+/// Optional recovery failures are advisory and separate from the evidence they
+/// could not decode. A corrupt companion is retried, never treated as settled.
+pub(crate) struct IntegrationRecovery {
+    root: Option<Arc<RootedDir>>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryFailure {
+    task: TaskId,
+    code: IntegrationCode,
+    failures: u8,
+    retry_at_millis: u64,
+}
+impl IntegrationRecovery {
+    pub(crate) fn open_at(state: &std::path::Path) -> Result<Self, WorkerError> {
+        let root = open_existing_root(state)?;
+        Ok(Self { root })
+    }
+    fn directory(&self, create: bool) -> Result<Option<RootedDir>, WorkerError> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        match child(root, "recovery", create) {
+            Ok(dir) => Ok(Some(dir)),
+            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    fn failure(&self, task: TaskId) -> Result<Option<RecoveryFailure>, WorkerError> {
+        let Some(dir) = self.directory(false)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = read(&dir, &format!("{task}.json"), 512)? else {
+            return Ok(None);
+        };
+        let failure: RecoveryFailure = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if failure.task != task || !(1..=3).contains(&failure.failures) {
+            return Err(invalid());
+        }
+        Ok(Some(failure))
+    }
+    pub(crate) fn ready(&self, task: TaskId, now: u64) -> bool {
+        match self.failure(task) {
+            Ok(failure) => failure.is_none_or(|failure| failure.retry_at_millis <= now),
+            // Restart the normal backoff after replacing an invalid advisory.
+            // If its directory cannot be repaired, it still cannot acquire
+            // permanent authority over the companion we need to reread.
+            Err(error) => self.failed(task, now, &error).is_err(),
+        }
+    }
+    pub(crate) fn retains_evidence(&self, task: TaskId) -> bool {
+        !matches!(self.failure(task), Ok(None))
+    }
+    pub(crate) fn failed(
+        &self,
+        task: TaskId,
+        now: u64,
+        error: &WorkerError,
+    ) -> Result<(), WorkerError> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        // Another recovery page may be recording the same failure. Refusing
+        // this advisory write cannot acquire authority over the bad evidence.
+        let lock = root
+            .open_private_lock("recovery.lock")
+            .map_err(WorkerError::Io)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(WorkerError::Io(io::Error::last_os_error()));
+        }
+        let identity = root
+            .private_entry_identity("recovery.lock")
+            .map_err(WorkerError::Io)?;
+        root.validate_private_regular_binding("recovery.lock", &lock, identity)
+            .map_err(WorkerError::Io)?;
+        let old = match self.failure(task) {
+            Ok(old) => old,
+            Err(_) => {
+                // Removing this advisory needs no readable/decodable body.
+                self.succeeded(task)?;
+                None
+            }
+        };
+        if old.as_ref().is_some_and(|old| old.retry_at_millis > now) {
+            return Ok(());
+        }
+        let failures = old.map_or(1, |old| old.failures.saturating_add(1).min(3));
+        let code = serde_json::from_value(serde_json::Value::String(error.public_code()))
+            .unwrap_or(IntegrationCode::IntegrationStateInvalid);
+        let failure = RecoveryFailure {
+            task,
+            code,
+            failures,
+            retry_at_millis: now
+                .saturating_add(TRANSPORT_RETRY_DELAYS_MILLIS[usize::from(failures - 1)]),
+        };
+        let bytes = serde_json::to_vec(&failure).map_err(|_| invalid())?;
+        let dir = self.directory(true)?.ok_or_else(invalid)?;
+        write(&dir, &format!("{task}.json"), &bytes)
+    }
+    pub(crate) fn succeeded(&self, task: TaskId) -> Result<(), WorkerError> {
+        let Some(dir) = self.directory(false)? else {
+            return Ok(());
+        };
+        let name = format!("{task}.json");
+        let binding = match dir.private_entry_identity(&name) {
+            Ok(binding) => binding,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        // This advisory has no authoritative Delete decision to recover.
+        // Exact rooted unlink preserves ownership/inode/no-follow fences and
+        // fsyncs the directory without opening an unreadable file for data.
+        match dir.channel_unlink_exact(&name, binding) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(WorkerError::Io(e)),
+        }
+    }
+}
+
+fn open_existing_root(state: &std::path::Path) -> Result<Option<Arc<RootedDir>>, WorkerError> {
+    let path = state.join("integrations");
+    // Absence is the disabled fast path. It performs no rooted traversal,
+    // creates nothing and is checked once by each batch reader.
+    #[cfg(test)]
+    read_cost_counters::before_metadata_call();
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => RootedDir::open_anchored_absolute(&path)
+            .map(|root| Some(Arc::new(root)))
+            .map_err(WorkerError::Io),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WorkerError::Io(error)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod read_cost_counters {
+    thread_local! {
+        static METADATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) fn before_metadata_call() {
+        METADATA_CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+    pub(crate) fn reset() {
+        METADATA_CALLS.with(|calls| calls.set(0));
+    }
+    pub(crate) fn calls() -> usize {
+        METADATA_CALLS.with(std::cell::Cell::get)
+    }
+}
+
+/// One existing rooted handle for an entire read page. No writers or locks.
+pub(crate) struct ExistingIntegrationReader {
+    recovery: IntegrationRecovery,
+}
+impl ExistingIntegrationReader {
+    pub(crate) fn open_at(state: &std::path::Path) -> Result<Self, WorkerError> {
+        Ok(Self {
+            recovery: IntegrationRecovery::open_at(state)?,
+        })
+    }
+    pub(crate) fn present(&self) -> bool {
+        self.recovery.root.is_some()
+    }
+    pub(crate) fn recovery(&self) -> &IntegrationRecovery {
+        &self.recovery
+    }
+    pub(crate) fn read_task(
+        &self,
+        task: TaskId,
+    ) -> Result<(Option<FrozenIntegrationPolicy>, Option<IntegrationRecord>), WorkerError> {
+        let Some(root) = &self.recovery.root else {
+            return Ok((None, None));
+        };
+        let dir = match child(root, &format!("tasks/{task}"), false) {
+            Ok(dir) => dir,
+            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((None, None));
+            }
+            Err(e) => return Err(e),
+        };
+        let policy = read(&dir, "policy.json", MAX_PRIVATE_RECORD_BYTES)?
+            .map(|b| decode_bounded(&b, MAX_PRIVATE_RECORD_BYTES))
+            .transpose()?;
+        let record = read(&dir, "record.json", MAX_PRIVATE_RECORD_BYTES)?
+            .map(|b| decode_record(&b))
+            .transpose()?;
+        if record
+            .as_ref()
+            .is_some_and(|r| r.task_id != task || policy.as_ref() != Some(&r.policy))
+        {
+            return Err(invalid());
+        }
+        Ok((policy, record))
+    }
+    pub(crate) fn read_auxiliary(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+        record: Option<&IntegrationRecord>,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        let referenced = record.is_some_and(|r| r.auxiliaries.iter().any(|a| a.turn_id == turn));
+        let Some(root) = &self.recovery.root else {
+            return Ok(None);
+        };
+        let dir = match child(root, &format!("tasks/{task}/prepared"), false) {
+            Ok(dir) => dir,
+            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound && !referenced => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(bytes) = read(&dir, &prepared_name(turn), MAX_PREPARED_TURN_BYTES)? else {
+            return if referenced { Err(invalid()) } else { Ok(None) };
+        };
+        let prepared = decode_prepared_turn(&bytes)?;
+        if prepared.followup.task_id() != task || prepared.followup.turn_id() != turn {
+            return Err(invalid());
+        }
+        if let Some(record) = record {
+            reference(&prepared, record)?;
+        }
+        Ok(Some(prepared))
+    }
+    pub(crate) fn closed_pending(&self, task: TaskId) -> bool {
+        self.recovery.retains_evidence(task)
+            || match self.read_task(task) {
+                Ok((_, Some(record))) => super::coordinator::closed_observation_pending(&record),
+                Ok((_, None)) => false,
+                Err(_) => true,
+            }
+    }
+}
+
+/// The projection port opens only existing sidecars. Reads cannot initialize
+/// owner state, take a reservation or acquire Git authority.
+pub(crate) struct ExistingIntegrationState {
+    paths: PathLayout,
+}
+impl ExistingIntegrationState {
+    pub(crate) fn new(paths: &PathLayout) -> Self {
+        Self {
+            paths: paths.clone(),
+        }
+    }
+}
+impl IntegrationState for ExistingIntegrationState {
+    fn load_policy(&self, task: TaskId) -> Result<Option<FrozenIntegrationPolicy>, WorkerError> {
+        RootedIntegrationState::read_task(&self.paths, task).map(|(policy, _)| policy)
+    }
+    fn load(&self, task: TaskId) -> Result<Option<IntegrationRecord>, WorkerError> {
+        RootedIntegrationState::read_task(&self.paths, task).map(|(_, record)| record)
+    }
+    fn load_prepared(
+        &self,
+        task: TaskId,
+        turn: TurnId,
+    ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
+        RootedIntegrationState::read_auxiliary(&self.paths, task, turn)
+    }
+    fn publish_policy(&self, _: TaskId, _: &FrozenIntegrationPolicy) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn publish_prepared(&self, _: TaskId, _: &PreparedIntegrationTurn) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn replace(
+        &self,
+        _: TaskId,
+        _: IntegrationRevision,
+        _: &IntegrationRecord,
+    ) -> Result<bool, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn reserve(
+        &self,
+        _: &TargetKey,
+        _: IntegrationId,
+        _: u32,
+        _: ProcessIdentity,
+    ) -> Result<Option<TargetReservation>, WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn release(&self, _: &TargetReservation) -> Result<(), WorkerError> {
+        Err(integration_unavailable())
+    }
+    fn due(&self, _: u64, _: usize) -> Result<Vec<TaskId>, WorkerError> {
+        Err(integration_unavailable())
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +407,21 @@ fn reference(p: &PreparedIntegrationTurn, record: &IntegrationRecord) -> Result<
     Ok(())
 }
 impl RootedIntegrationState {
+    pub(crate) fn with_event_sink(
+        mut self,
+        sink: Option<Arc<dyn crate::controller::events::EventSink>>,
+    ) -> Self {
+        self.event_sink = sink;
+        self
+    }
+    pub(crate) fn publish_task_policy(
+        paths: &PathLayout,
+        task: TaskId,
+        policy: &FrozenIntegrationPolicy,
+    ) -> Result<(), WorkerError> {
+        let state = Self::open(paths, Arc::new(super::host::HostIntegrationRuntime::new()?))?;
+        state.publish_policy(task, policy)
+    }
     pub fn open(
         paths: &PathLayout,
         runtime: Arc<dyn IntegrationRuntime>,
@@ -121,7 +429,11 @@ impl RootedIntegrationState {
         let state =
             RootedDir::open_or_create_anchored_absolute(&paths.state).map_err(WorkerError::Io)?;
         let root = child(&state, "integrations", true)?;
-        let store = Self { root, runtime };
+        let store = Self {
+            root,
+            runtime,
+            event_sink: None,
+        };
         {
             let _lock = store.lock()?;
             for name in ["tasks", "due", "reservations"] {
@@ -211,31 +523,7 @@ impl RootedIntegrationState {
         state: &std::path::Path,
         task: TaskId,
     ) -> Result<(Option<FrozenIntegrationPolicy>, Option<IntegrationRecord>), WorkerError> {
-        let root = match RootedDir::open_anchored_absolute(&state.join("integrations")) {
-            Ok(root) => root,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
-            Err(e) => return Err(WorkerError::Io(e)),
-        };
-        let dir = match child(&root, &format!("tasks/{task}"), false) {
-            Ok(dir) => dir,
-            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok((None, None));
-            }
-            Err(e) => return Err(e),
-        };
-        let policy = read(&dir, "policy.json", MAX_PRIVATE_RECORD_BYTES)?
-            .map(|b| decode_bounded(&b, MAX_PRIVATE_RECORD_BYTES))
-            .transpose()?;
-        let record = read(&dir, "record.json", MAX_PRIVATE_RECORD_BYTES)?
-            .map(|b| decode_record(&b))
-            .transpose()?;
-        if record
-            .as_ref()
-            .is_some_and(|r| r.task_id != task || policy.as_ref() != Some(&r.policy))
-        {
-            return Err(invalid());
-        }
-        Ok((policy, record))
+        ExistingIntegrationReader::open_at(state)?.read_task(task)
     }
     /// Durable purpose read before ordinary follow-up/terminal effects. No creation or flock.
     pub(crate) fn read_auxiliary(
@@ -243,33 +531,9 @@ impl RootedIntegrationState {
         task: TaskId,
         turn: TurnId,
     ) -> Result<Option<PreparedIntegrationTurn>, WorkerError> {
-        let (_, record) = Self::read_task(paths, task)?;
-        let referenced = record
-            .as_ref()
-            .is_some_and(|r| r.auxiliaries.iter().any(|a| a.turn_id == turn));
-        let root = match RootedDir::open_anchored_absolute(&paths.state.join("integrations")) {
-            Ok(root) => root,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(WorkerError::Io(e)),
-        };
-        let dir = match child(&root, &format!("tasks/{task}/prepared"), false) {
-            Ok(dir) => dir,
-            Err(WorkerError::Io(e)) if e.kind() == io::ErrorKind::NotFound && !referenced => {
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
-        let Some(bytes) = read(&dir, &prepared_name(turn), MAX_PREPARED_TURN_BYTES)? else {
-            return if referenced { Err(invalid()) } else { Ok(None) };
-        };
-        let prepared = decode_prepared_turn(&bytes)?;
-        if prepared.followup.task_id() != task || prepared.followup.turn_id() != turn {
-            return Err(invalid());
-        }
-        if let Some(record) = record {
-            reference(&prepared, &record)?;
-        }
-        Ok(Some(prepared))
+        let reader = ExistingIntegrationReader::open_at(&paths.state)?;
+        let (_, record) = reader.read_task(task)?;
+        reader.read_auxiliary(task, turn, record.as_ref())
     }
 }
 impl IntegrationState for RootedIntegrationState {
@@ -345,6 +609,15 @@ impl IntegrationState for RootedIntegrationState {
         if next.task_id != task || next.snapshot.revision != expected.next()? {
             return Err(invalid());
         }
+        let hint = self
+            .event_sink
+            .as_ref()
+            .map(|_| next.snapshot.annotation())
+            .transpose()?;
+        let hints = self
+            .event_sink
+            .as_ref()
+            .map(|sink| crate::client_state::events::DeferredHints::begin(sink.clone()));
         let _lock = self.lock()?;
         let old = self.record(task)?;
         if old
@@ -380,6 +653,12 @@ impl IntegrationState for RootedIntegrationState {
             index
                 .remove_owned_regular(&due_name(&e))
                 .map_err(WorkerError::Io)?;
+        }
+        if let (Some(scope), Some(integration)) = (&hints, hint) {
+            scope.capture(crate::controller::events::NewEvent::IntegrationChanged {
+                task_id: task,
+                integration,
+            });
         }
         Ok(true)
     }
